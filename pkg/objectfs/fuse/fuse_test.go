@@ -24,7 +24,6 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
-	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -60,56 +59,46 @@ func createTestClient(t *testing.T) (pb.ObjectFSControllerClient, func()) {
 	return client, cleanup
 }
 
-func TestFSNodeOperations(t *testing.T) {
+func TestRawFileSystemOperations(t *testing.T) {
 	client, cleanup := createTestClient(t)
 	defer cleanup()
 
-	ctx := t.Context()
 	cache := NewNodeCache(1024 * 1024)
-	root := NewRootNode(client, "vol-1", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
-	_ = fs.NewNodeFS(root, &fs.Options{})
+	rawFS := NewObjectFS(client, "vol-1", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
 
 	// 1. Getattr on root
 	var attrOut fuse.AttrOut
-	if errno := root.Getattr(ctx, nil, &attrOut); errno != 0 {
-		t.Fatalf("Getattr on root failed: %v", errno)
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{NodeId: fuse.FUSE_ROOT_ID}, &attrOut); status != fuse.OK {
+		t.Fatalf("Getattr on root failed: %v", status)
 	}
-	if attrOut.Mode&syscall.S_IFDIR == 0 {
-		t.Fatalf("Expected root to have S_IFDIR mode, got: %o", attrOut.Mode)
+	if attrOut.Attr.Mode&syscall.S_IFDIR == 0 {
+		t.Fatalf("Expected root to have S_IFDIR mode, got: %o", attrOut.Attr.Mode)
 	}
 
 	// 2. Mkdir "docs"
-	var entryOut fuse.EntryOut
-	docsNode, errno := root.Mkdir(ctx, "docs", 0755, &entryOut)
-	if errno != 0 {
-		t.Fatalf("Mkdir docs failed: %v", errno)
+	var docsEntryOut fuse.EntryOut
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "docs", &docsEntryOut); status != fuse.OK {
+		t.Fatalf("Mkdir docs failed: %v", status)
 	}
-	if entryOut.NodeId == 0 {
+	if docsEntryOut.NodeId == 0 {
 		t.Fatalf("Expected valid Inode id in EntryOut")
 	}
 
 	// 3. Create file "docs/readme.txt"
-	docsEmbedder, ok := docsNode.Operations().(*FSNode)
-	if !ok {
-		t.Fatalf("Expected docsNode operations to be *FSNode")
+	var fileCreateOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: docsEntryOut.NodeId}, Mode: 0644}, "readme.txt", &fileCreateOut); status != fuse.OK {
+		t.Fatalf("Create file failed: %v", status)
 	}
-
-	var fileEntryOut fuse.EntryOut
-	fileNode, _, _, errno := docsEmbedder.Create(ctx, "readme.txt", 0, 0644, &fileEntryOut)
-	if errno != 0 {
-		t.Fatalf("Create file failed: %v", errno)
-	}
-
-	fileEmbedder, ok := fileNode.Operations().(*FSNode)
-	if !ok {
-		t.Fatalf("Expected fileNode operations to be *FSNode")
+	fileID := fileCreateOut.EntryOut.NodeId
+	if fileID == 0 {
+		t.Fatalf("Expected valid file Inode id")
 	}
 
 	// 4. Write data to file
-	testData := []byte("Hello ObjectFS FUSE!")
-	written, errno := fileEmbedder.Write(ctx, testData, 0)
-	if errno != 0 {
-		t.Fatalf("Write failed: %v", errno)
+	testData := []byte("Hello ObjectFS Raw FUSE!")
+	written, status := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}}, testData)
+	if status != fuse.OK {
+		t.Fatalf("Write failed: %v", status)
 	}
 	if int(written) != len(testData) {
 		t.Fatalf("Expected %d bytes written, got %d", len(testData), written)
@@ -117,50 +106,48 @@ func TestFSNodeOperations(t *testing.T) {
 
 	// 5. Read data back
 	readBuf := make([]byte, 64)
-	readRes, errno := fileEmbedder.Read(ctx, readBuf, 0)
-	if errno != 0 {
-		t.Fatalf("Read failed: %v", errno)
-	}
-	resBytes, status := readRes.Bytes(readBuf)
+	readRes, status := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Size: 64}, readBuf)
 	if status != fuse.OK {
-		t.Fatalf("Read status not OK: %v", status)
+		t.Fatalf("Read failed: %v", status)
+	}
+	resBytes, readStatus := readRes.Bytes(readBuf)
+	if readStatus != fuse.OK {
+		t.Fatalf("Read result status not OK: %v", readStatus)
 	}
 	if string(resBytes) != string(testData) {
 		t.Fatalf("Read data mismatch: got %q, want %q", string(resBytes), string(testData))
 	}
 
-	// 6. Readdir on "docs"
-	dirStream, errno := docsEmbedder.Readdir(ctx)
-	if errno != 0 {
-		t.Fatalf("Readdir failed: %v", errno)
-	}
-	var entries []string
-	for dirStream.HasNext() {
-		entry, statusErrno := dirStream.Next()
-		if statusErrno != fs.OK {
-			t.Fatalf("Next entry failed: %v", statusErrno)
-		}
-		entries = append(entries, entry.Name)
-	}
-	if len(entries) != 1 || entries[0] != "readme.txt" {
-		t.Fatalf("Readdir unexpected entries: %v", entries)
+	// 6. ReadDir on "docs"
+	dirEntries := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	if status := rawFS.ReadDir(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: docsEntryOut.NodeId}}, dirEntries); status != fuse.OK {
+		t.Fatalf("ReadDir failed: %v", status)
 	}
 
 	// 7. Flush / Fsync
-	if errno := fileEmbedder.Flush(ctx); errno != 0 {
-		t.Fatalf("Flush failed: %v", errno)
+	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Flush failed: %v", status)
 	}
-	if errno := fileEmbedder.Fsync(ctx, 0); errno != 0 {
-		t.Fatalf("Fsync failed: %v", errno)
-	}
-
-	// 8. Unlink "readme.txt"
-	if errno := docsEmbedder.Unlink(ctx, "readme.txt"); errno != 0 {
-		t.Fatalf("Unlink failed: %v", errno)
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
 	}
 
-	// 9. Rmdir "docs"
-	if errno := root.Rmdir(ctx, "docs"); errno != 0 {
-		t.Fatalf("Rmdir failed: %v", errno)
+	// 8. Lookup "readme.txt" in "docs"
+	var lookupOut fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: docsEntryOut.NodeId}, "readme.txt", &lookupOut); status != fuse.OK {
+		t.Fatalf("Lookup failed: %v", status)
+	}
+	if lookupOut.NodeId != fileID {
+		t.Fatalf("Lookup returned node %d, want %d", lookupOut.NodeId, fileID)
+	}
+
+	// 9. Unlink "readme.txt"
+	if status := rawFS.Unlink(nil, &fuse.InHeader{NodeId: docsEntryOut.NodeId}, "readme.txt"); status != fuse.OK {
+		t.Fatalf("Unlink failed: %v", status)
+	}
+
+	// 10. Rmdir "docs"
+	if status := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "docs"); status != fuse.OK {
+		t.Fatalf("Rmdir failed: %v", status)
 	}
 }

@@ -26,12 +26,10 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
-	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -226,17 +224,22 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	}
 
 	nodeCache := objectfuse.NewNodeCache(d.cacheBytes)
-	rootNode := objectfuse.NewRootNode(client, volumeID, writeMode, nodeCache)
+	rawFS := objectfuse.NewObjectFS(client, volumeID, writeMode, nodeCache)
 
-	sec := 1 * time.Second
-	opts := &fs.Options{
-		AttrTimeout:  &sec,
-		EntryTimeout: &sec,
+	mountOpts := &gofuse.MountOptions{
+		AllowOther: true,
+		FsName:     "objectfs",
+		Name:       "objectfs",
 	}
 
-	server, err := fs.Mount(targetPath, rootNode, opts)
+	server, err := gofuse.NewServer(rawFS, targetPath, mountOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount FUSE filesystem at %s: %w", targetPath, err)
+	}
+	go server.Serve()
+	if err := server.WaitMount(); err != nil {
+		_ = server.Unmount()
+		return nil, fmt.Errorf("failed waiting for FUSE mount at %s: %w", targetPath, err)
 	}
 
 	watchCtx, cancel := context.WithCancel(context.Background())

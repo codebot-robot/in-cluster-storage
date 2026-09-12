@@ -246,3 +246,39 @@ func TestControllerPushNotifications(t *testing.T) {
 		t.Fatalf("Timed out waiting for modify event")
 	}
 }
+
+func TestEventBroadcasterSlowSubscriber(t *testing.T) {
+	eb := NewEventBroadcaster()
+	volumeID := "test-slow-sub"
+
+	ch := eb.Subscribe(volumeID)
+	defer eb.Unsubscribe(volumeID, ch)
+
+	// Fill the buffer (128 items)
+	for i := 0; i < 128; i++ {
+		eb.Broadcast(volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_MODIFIED,
+			Path:      "/file.txt",
+		})
+	}
+
+	// Next broadcast should detect full channel and unsubscribe/close it asynchronously
+	eb.Broadcast(volumeID, &pb.WatchVolumeResponse{
+		EventType: pb.WatchEventType_EVENT_MODIFIED,
+		Path:      "/overflow.txt",
+	})
+
+	// Drain items from ch until closed
+	closed := false
+	timeout := time.After(2 * time.Second)
+	for !closed {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				closed = true
+			}
+		case <-timeout:
+			t.Fatalf("Timed out waiting for full subscriber channel to be closed")
+		}
+	}
+}

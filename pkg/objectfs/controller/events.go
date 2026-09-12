@@ -50,28 +50,40 @@ func (eb *EventBroadcaster) Unsubscribe(volumeID string, ch chan *pb.WatchVolume
 	defer eb.mu.Unlock()
 
 	if subs, ok := eb.subscribers[volumeID]; ok {
-		delete(subs, ch)
-		if len(subs) == 0 {
-			delete(eb.subscribers, volumeID)
+		if _, exists := subs[ch]; exists {
+			delete(subs, ch)
+			if len(subs) == 0 {
+				delete(eb.subscribers, volumeID)
+			}
+			close(ch)
 		}
 	}
-	close(ch)
 }
 
 func (eb *EventBroadcaster) Broadcast(volumeID string, event *pb.WatchVolumeResponse) {
 	eb.mu.RLock()
-	defer eb.mu.RUnlock()
-
 	subs, ok := eb.subscribers[volumeID]
 	if !ok {
+		eb.mu.RUnlock()
 		return
 	}
 
+	var toDrop []chan *pb.WatchVolumeResponse
 	for ch := range subs {
 		select {
 		case ch <- event:
 		default:
-			// If receiver channel buffer is full, drop or let next push happen
+			// If receiver channel buffer is full, close and unsubscribe subscriber asynchronously
+			toDrop = append(toDrop, ch)
 		}
+	}
+	eb.mu.RUnlock()
+
+	if len(toDrop) > 0 {
+		go func() {
+			for _, ch := range toDrop {
+				eb.Unsubscribe(volumeID, ch)
+			}
+		}()
 	}
 }
