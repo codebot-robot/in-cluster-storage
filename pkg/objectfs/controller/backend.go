@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -29,6 +30,7 @@ type ObjectStorageBackend interface {
 	GetObject(ctx context.Context, volumeID, key string, offset, length int64) (data []byte, err error)
 	DeleteObject(ctx context.Context, volumeID, key string) error
 	GetRedirectURL(ctx context.Context, volumeID, key string) (string, error)
+	ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error)
 }
 
 // MemoryBackend is an in-memory implementation of ObjectStorageBackend.
@@ -45,6 +47,9 @@ func NewMemoryBackend() *MemoryBackend {
 }
 
 func (m *MemoryBackend) storageKey(volumeID, key string) string {
+	if volumeID == "" || strings.HasPrefix(key, "volumes/") || strings.HasPrefix(key, "blobs/") {
+		return key
+	}
 	return fmt.Sprintf("%s/%s", volumeID, key)
 }
 
@@ -97,4 +102,18 @@ func (m *MemoryBackend) DeleteObject(ctx context.Context, volumeID, key string) 
 func (m *MemoryBackend) GetRedirectURL(ctx context.Context, volumeID, key string) (string, error) {
 	// For memory backend or when direct redirect is not used, returns empty string.
 	return "", nil
+}
+
+func (m *MemoryBackend) ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	fullPrefix := m.storageKey(volumeID, prefix)
+	var matches []string
+	for k := range m.objects {
+		if strings.HasPrefix(k, fullPrefix) {
+			matches = append(matches, k)
+		}
+	}
+	return matches, nil
 }

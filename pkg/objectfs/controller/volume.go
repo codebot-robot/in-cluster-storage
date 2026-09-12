@@ -17,10 +17,12 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"path"
 	"sort"
 	"strings"
@@ -30,6 +32,8 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -79,6 +83,7 @@ type Volume struct {
 	root         *FSNode
 	nextInode    uint64
 	backend      ObjectStorageBackend
+	blobStore    *blob.Store
 	broadcaster  *EventBroadcaster
 	maxInlineLen int64
 
@@ -87,10 +92,15 @@ type Volume struct {
 }
 
 func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *EventBroadcaster) *Volume {
+	var blobStore *blob.Store
+	if backend != nil {
+		blobStore = blob.NewStore(backend, 0)
+	}
 	v := &Volume{
 		volumeID:     volumeID,
 		nextInode:    1,
 		backend:      backend,
+		blobStore:    blobStore,
 		broadcaster:  broadcaster,
 		maxInlineLen: 4 * 1024 * 1024, // 4MB default inline threshold
 	}
@@ -130,6 +140,53 @@ func (n *FSNode) toEntryAttrLocked() *pb.EntryAttr {
 		Sha256:      n.sha256,
 		RedirectUrl: n.redirectURL,
 	}
+}
+
+func (n *FSNode) toErofsNodeLocked() erofs.Node {
+	if n.isDir {
+		var children []erofs.Node
+		var childNames []string
+		for name := range n.children {
+			childNames = append(childNames, name)
+		}
+		sort.Strings(childNames)
+		for _, name := range childNames {
+			child := n.children[name]
+			child.mu.RLock()
+			children = append(children, child.toErofsNodeLocked())
+			child.mu.RUnlock()
+		}
+		name := n.name
+		if name == "/" {
+			name = ""
+		}
+		return erofs.NewMemoryNode(
+			name,
+			true,
+			uint16(n.mode),
+			nil,
+			children,
+			erofs.WithMtime(uint64(n.modTime.Unix())),
+		)
+	}
+
+	xattrs := make(map[string]string)
+	if n.sha256 != "" {
+		xattrs["user.digest"] = n.sha256
+		xattrs["user.sha256"] = n.sha256
+	}
+
+	return erofs.NewMemoryNode(
+		n.name,
+		false,
+		uint16(n.mode),
+		nil,
+		nil,
+		erofs.WithMetadataOnly(true),
+		erofs.WithSize(uint64(n.size)),
+		erofs.WithMtime(uint64(n.modTime.Unix())),
+		erofs.WithXattrs(xattrs),
+	)
 }
 
 func (v *Volume) findNodeLocked(p string) (*FSNode, error) {
@@ -377,11 +434,19 @@ func (v *Volume) ReadFile(ctx context.Context, p string, offset, length int64) (
 		return nil, 0, "", fmt.Errorf("cannot read directory as file: %w", syscall.EISDIR)
 	}
 
-	// Lazy load data from backend if not currently in memory
-	if len(node.data) == 0 && node.size > 0 && v.backend != nil {
-		data, err := v.backend.GetObject(ctx, v.volumeID, strings.TrimPrefix(node.path, "/"), 0, node.size)
-		if err == nil {
-			node.data = data
+	// Lazy load data from blob store / backend if not currently in memory
+	if len(node.data) == 0 && node.size > 0 {
+		if node.sha256 != "" && v.blobStore != nil {
+			data, err := v.blobStore.GetBlob(ctx, node.sha256)
+			if err == nil {
+				node.data = data
+			}
+		}
+		if len(node.data) == 0 && v.backend != nil {
+			data, err := v.backend.GetObject(ctx, v.volumeID, strings.TrimPrefix(node.path, "/"), 0, node.size)
+			if err == nil {
+				node.data = data
+			}
 		}
 	}
 
@@ -652,6 +717,21 @@ func (v *Volume) Fsync(ctx context.Context, p string) error {
 	return err
 }
 
+type bufferWriterAt struct {
+	buf []byte
+}
+
+func (b *bufferWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	end := off + int64(len(p))
+	if end > int64(len(b.buf)) {
+		newBuf := make([]byte, end)
+		copy(newBuf, b.buf)
+		b.buf = newBuf
+	}
+	copy(b.buf[off:end], p)
+	return len(p), nil
+}
+
 func (v *Volume) FlushToBackend(ctx context.Context) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -667,8 +747,10 @@ func (v *Volume) FlushToBackend(ctx context.Context) error {
 	}
 	v.deletedPathsSinceFlush = nil
 
-	// 2. Traverse tree to collect all entries and upload dirty files
+	// 2. Traverse tree to collect all entries and dirty blobs
 	currentEntries := make(map[string]FileMetadata)
+	dirtyBlobs := make(map[string][]byte)
+
 	var walk func(node *FSNode) error
 	walk = func(node *FSNode) error {
 		node.mu.Lock()
@@ -694,13 +776,16 @@ func (v *Volume) FlushToBackend(ctx context.Context) error {
 				}
 			}
 			if needsUpload {
+				if len(node.data) > 0 && node.sha256 != "" {
+					dirtyBlobs[node.sha256] = node.data
+				}
+				// Also write legacy object path for backward compatibility
 				key := strings.TrimPrefix(node.path, "/")
 				etag, err := v.backend.PutObject(ctx, v.volumeID, key, node.data)
-				if err != nil {
-					return fmt.Errorf("failed to upload object %s: %w", key, err)
+				if err == nil {
+					node.etag = etag
+					meta.ETag = etag
 				}
-				node.etag = etag
-				meta.ETag = etag
 				node.isDirty = false
 			}
 		}
@@ -721,7 +806,44 @@ func (v *Volume) FlushToBackend(ctx context.Context) error {
 		return err
 	}
 
-	// 3. Write metadata file
+	// 3. Persist blobs to blob store (standalone >64MB, or packfiles)
+	if len(dirtyBlobs) > 0 && v.blobStore != nil {
+		if err := v.blobStore.PutBlobs(ctx, dirtyBlobs); err != nil {
+			return fmt.Errorf("failed to persist blobs: %w", err)
+		}
+	}
+
+	// 4. Compile composefs-style EROFS snapshot
+	v.root.mu.RLock()
+	erofsTree := v.root.toErofsNodeLocked()
+	v.root.mu.RUnlock()
+
+	var erofsBuf bufferWriterAt
+	if err := erofs.WriteImage(&erofsBuf, erofsTree); err != nil {
+		return fmt.Errorf("failed to compile EROFS snapshot: %w", err)
+	}
+
+	// Verify EROFS snapshot with Fsck
+	readerAt := bytes.NewReader(erofsBuf.buf)
+	if err := erofs.Fsck(readerAt); err != nil {
+		return fmt.Errorf("Fsck failed on generated EROFS snapshot: %w", err)
+	}
+
+	// Save EROFS snapshot: volumes/<volumeID>/meta/<timestamp>.erofs
+	timestamp := time.Now().UTC().Format("20060102T150405.000000Z")
+	snapshotName := fmt.Sprintf("%s.erofs", timestamp)
+	snapshotKey := path.Join("volumes", v.volumeID, "meta", snapshotName)
+	if _, err := v.backend.PutObject(ctx, "", snapshotKey, erofsBuf.buf); err != nil {
+		return fmt.Errorf("failed to save EROFS snapshot %s: %w", snapshotKey, err)
+	}
+
+	// Update latest snapshot pointer: volumes/<volumeID>/meta/latest
+	latestKey := path.Join("volumes", v.volumeID, "meta", "latest")
+	if _, err := v.backend.PutObject(ctx, "", latestKey, []byte(snapshotName)); err != nil {
+		return fmt.Errorf("failed to update latest snapshot: %w", err)
+	}
+
+	// 5. Write legacy metadata file for backward compatibility
 	newMeta := VolumeMetadata{
 		VolumeID:    v.volumeID,
 		Version:     1,
@@ -731,15 +853,129 @@ func (v *Volume) FlushToBackend(ctx context.Context) error {
 	}
 
 	metaBytes, err := json.MarshalIndent(newMeta, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %w", err)
-	}
-
-	if _, err := v.backend.PutObject(ctx, v.volumeID, MetadataFileName, metaBytes); err != nil {
-		return fmt.Errorf("failed to write metadata file: %w", err)
+	if err == nil {
+		_, _ = v.backend.PutObject(ctx, v.volumeID, MetadataFileName, metaBytes)
 	}
 
 	v.lastFlushedMetadata = &newMeta
+	return nil
+}
+
+func (v *Volume) findLatestSnapshotNameLocked(ctx context.Context) (string, error) {
+	// First check latest pointer file
+	latestKey := path.Join("volumes", v.volumeID, "meta", "latest")
+	latestBytes, err := v.backend.GetObject(ctx, "", latestKey, 0, 0)
+	if err == nil && len(latestBytes) > 0 {
+		return strings.TrimSpace(string(latestBytes)), nil
+	}
+
+	// Fallback to listing meta/ directory
+	metaPrefix := path.Join("volumes", v.volumeID, "meta") + "/"
+	objects, err := v.backend.ListObjects(ctx, "", metaPrefix)
+	if err != nil {
+		return "", err
+	}
+
+	var snapshots []string
+	for _, obj := range objects {
+		if strings.HasSuffix(obj, ".erofs") {
+			base := path.Base(obj)
+			snapshots = append(snapshots, base)
+		}
+	}
+	if len(snapshots) == 0 {
+		return "", fmt.Errorf("no snapshots found for volume %s", v.volumeID)
+	}
+	sort.Strings(snapshots)
+	return snapshots[len(snapshots)-1], nil
+}
+
+func (v *Volume) loadFromErofsSnapshotLocked(reader *erofs.Reader, rawReader io.ReaderAt) error {
+	rootNID := reader.GetRootNID()
+	rootInode, err := erofs.ReadInode(rawReader, reader.Superblock(), rootNID)
+	if err != nil {
+		return fmt.Errorf("failed to read root inode: %w", err)
+	}
+
+	newRoot := &FSNode{
+		inode:    v.allocInode(),
+		name:     "/",
+		path:     "/",
+		isDir:    true,
+		mode:     uint32(rootInode.Mode) | syscall.S_IFDIR,
+		modTime:  time.Unix(int64(rootInode.Mtime), int64(rootInode.MtimeNsec)),
+		children: make(map[string]*FSNode),
+	}
+
+	var walkErofs func(nid uint64, parentNode *FSNode, currentPath string) error
+	walkErofs = func(nid uint64, parentNode *FSNode, currentPath string) error {
+		dirents, err := reader.ListDirectory(nid)
+		if err != nil {
+			return err
+		}
+
+		for _, de := range dirents {
+			if de.Name == "." || de.Name == ".." {
+				continue
+			}
+
+			childPath := path.Join(currentPath, de.Name)
+			inode, err := erofs.ReadInode(rawReader, reader.Superblock(), de.NID)
+			if err != nil {
+				return fmt.Errorf("failed to read inode for %s: %w", childPath, err)
+			}
+
+			isDir := de.FileType == erofs.FTDir || (inode.Mode&erofs.S_IFMT) == erofs.S_IFDIR
+			mode := uint32(inode.Mode)
+			if isDir {
+				mode |= syscall.S_IFDIR
+			} else {
+				mode |= syscall.S_IFREG
+			}
+
+			mtime := time.Unix(int64(inode.Mtime), int64(inode.MtimeNsec))
+			if inode.Mtime == 0 {
+				mtime = time.Now()
+			}
+
+			var shaStr string
+			xattrs, err := reader.GetXattrs(de.NID)
+			if err == nil && xattrs != nil {
+				if d, ok := xattrs["user.digest"]; ok {
+					shaStr = d
+				} else if s, ok := xattrs["user.sha256"]; ok {
+					shaStr = s
+				}
+			}
+
+			child := &FSNode{
+				inode:   v.allocInode(),
+				name:    de.Name,
+				path:    childPath,
+				isDir:   isDir,
+				mode:    mode,
+				size:    int64(inode.Size),
+				modTime: mtime,
+				sha256:  shaStr,
+				parent:  parentNode,
+				isDirty: false,
+			}
+			if isDir {
+				child.children = make(map[string]*FSNode)
+				if err := walkErofs(de.NID, child, childPath); err != nil {
+					return err
+				}
+			}
+			parentNode.children[de.Name] = child
+		}
+		return nil
+	}
+
+	if err := walkErofs(rootNID, newRoot, "/"); err != nil {
+		return err
+	}
+
+	v.root = newRoot
 	return nil
 }
 
@@ -751,6 +987,23 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 		return nil
 	}
 
+	// 1. Try loading from latest EROFS snapshot
+	latestSnapshotName, err := v.findLatestSnapshotNameLocked(ctx)
+	if err == nil && latestSnapshotName != "" {
+		snapshotKey := path.Join("volumes", v.volumeID, "meta", latestSnapshotName)
+		imgBytes, err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0)
+		if err == nil && len(imgBytes) > 0 {
+			readerAt := bytes.NewReader(imgBytes)
+			reader, err := erofs.NewReader(readerAt)
+			if err == nil {
+				if err := v.loadFromErofsSnapshotLocked(reader, readerAt); err == nil {
+					return nil
+				}
+			}
+		}
+	}
+
+	// 2. Fallback to legacy JSON metadata file
 	metaBytes, err := v.backend.GetObject(ctx, v.volumeID, MetadataFileName, 0, 0)
 	if err != nil || len(metaBytes) == 0 {
 		return nil
@@ -806,4 +1059,60 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 
 	v.lastFlushedMetadata = &meta
 	return nil
+}
+
+// CreateSnapshot creates and returns a new EROFS snapshot of the current volume state.
+func (v *Volume) CreateSnapshot(ctx context.Context) (string, error) {
+	if err := v.FlushToBackend(ctx); err != nil {
+		return "", err
+	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.findLatestSnapshotNameLocked(ctx)
+}
+
+// ListSnapshots returns all EROFS snapshot filenames for this volume sorted chronologically.
+func (v *Volume) ListSnapshots(ctx context.Context) ([]string, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	metaPrefix := path.Join("volumes", v.volumeID, "meta") + "/"
+	objects, err := v.backend.ListObjects(ctx, "", metaPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	var snapshots []string
+	for _, obj := range objects {
+		if strings.HasSuffix(obj, ".erofs") {
+			base := path.Base(obj)
+			snapshots = append(snapshots, base)
+		}
+	}
+	sort.Strings(snapshots)
+	return snapshots, nil
+}
+
+// RestoreSnapshot restores the volume filesystem state to a specific EROFS snapshot.
+func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.backend == nil {
+		return fmt.Errorf("no backend configured")
+	}
+
+	snapshotKey := path.Join("volumes", v.volumeID, "meta", snapshotName)
+	imgBytes, err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0)
+	if err != nil {
+		return fmt.Errorf("failed to fetch snapshot %s: %w", snapshotKey, err)
+	}
+
+	readerAt := bytes.NewReader(imgBytes)
+	reader, err := erofs.NewReader(readerAt)
+	if err != nil {
+		return fmt.Errorf("failed to parse snapshot %s: %w", snapshotName, err)
+	}
+
+	return v.loadFromErofsSnapshotLocked(reader, readerAt)
 }

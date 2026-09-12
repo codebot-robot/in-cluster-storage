@@ -127,6 +127,29 @@ func (s *Server) StopPeriodicFlush() {
 	s.flushWg.Wait()
 }
 
+// GetVolume returns the Volume instance for the given volumeID.
+func (s *Server) GetVolume(volumeID string) *Volume {
+	return s.getOrCreateVolume(volumeID)
+}
+
+// CreateSnapshot triggers a backend flush and creates an EROFS snapshot for the volume.
+func (s *Server) CreateSnapshot(ctx context.Context, volumeID string) (string, error) {
+	vol := s.getOrCreateVolume(volumeID)
+	return vol.CreateSnapshot(ctx)
+}
+
+// ListSnapshots returns all EROFS snapshot filenames for the volume.
+func (s *Server) ListSnapshots(ctx context.Context, volumeID string) ([]string, error) {
+	vol := s.getOrCreateVolume(volumeID)
+	return vol.ListSnapshots(ctx)
+}
+
+// RestoreSnapshot restores the volume filesystem state to a specific EROFS snapshot.
+func (s *Server) RestoreSnapshot(ctx context.Context, volumeID, snapshotName string) error {
+	vol := s.getOrCreateVolume(volumeID)
+	return vol.RestoreSnapshot(ctx, snapshotName)
+}
+
 func (s *Server) GetAttr(ctx context.Context, req *pb.GetAttrRequest) (*pb.GetAttrResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
