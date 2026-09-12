@@ -151,3 +151,70 @@ func TestRawFileSystemOperations(t *testing.T) {
 		t.Fatalf("Rmdir failed: %v", status)
 	}
 }
+
+func TestLocalWriteBufferingAndSync(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, "vol-buffering", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Create file
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, "buffered.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Write locally
+	localData := []byte("buffered content not yet on service")
+	written, status := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}}, localData)
+	if status != fuse.OK || int(written) != len(localData) {
+		t.Fatalf("Write failed: status=%v, written=%d", status, written)
+	}
+
+	// Verify local cache has it and marks it dirty
+	entry, isDirty := cache.GetDirty("/buffered.txt")
+	if !isDirty || string(entry.Data) != string(localData) {
+		t.Fatalf("Expected dirty cache entry with local data")
+	}
+
+	// Direct controller ReadFile before sync should NOT have the written data yet (it has 0 bytes initial)
+	ctx := t.Context()
+	ctrlResp, err := client.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: "vol-buffering",
+		Path:     "/buffered.txt",
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil {
+		t.Fatalf("Controller read failed: %v", err)
+	}
+	if len(ctrlResp.GetData()) != 0 {
+		t.Fatalf("Expected controller to have 0 bytes before sync, got: %q", string(ctrlResp.GetData()))
+	}
+
+	// Now call Flush / Fsync on the FUSE layer
+	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Flush failed: %v", status)
+	}
+
+	// Controller should now have the synced data
+	ctrlResp2, err := client.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: "vol-buffering",
+		Path:     "/buffered.txt",
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil {
+		t.Fatalf("Controller read after flush failed: %v", err)
+	}
+	if string(ctrlResp2.GetData()) != string(localData) {
+		t.Fatalf("Expected controller to have %q, got %q", string(localData), string(ctrlResp2.GetData()))
+	}
+
+	// Cache entry should no longer be dirty
+	if _, isDirty := cache.GetDirty("/buffered.txt"); isDirty {
+		t.Fatalf("Expected cache entry to be marked clean after flush")
+	}
+}

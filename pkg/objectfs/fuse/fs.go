@@ -219,6 +219,11 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 	}
 
 	fillAttr(resp.GetAttr(), &out.Attr)
+	if entry, isDirty := fs.cache.GetDirty(p); isDirty {
+		out.Attr.Size = uint64(entry.Size)
+		out.Attr.Mtime = uint64(entry.ModTime.Unix())
+		out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
+	}
 	out.SetTimeout(1 * time.Second)
 	return fuse.OK
 }
@@ -233,6 +238,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	}
 
 	if input.Valid&fuse.FATTR_SIZE != 0 {
+		fs.cache.Truncate(p, int64(input.Size), time.Now())
 		resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
 			VolumeId: fs.volumeID,
 			Path:     p,
@@ -241,8 +247,8 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 		if err != nil {
 			return grpcErrorToStatus(err)
 		}
-		fs.cache.Invalidate(p)
 		fillAttr(resp.GetAttr(), &out.Attr)
+		out.Attr.Size = input.Size
 		out.SetTimeout(1 * time.Second)
 		return fuse.OK
 	}
@@ -255,6 +261,11 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 		return grpcErrorToStatus(err)
 	}
 	fillAttr(resp.GetAttr(), &out.Attr)
+	if entry, isDirty := fs.cache.GetDirty(p); isDirty {
+		out.Attr.Size = uint64(entry.Size)
+		out.Attr.Mtime = uint64(entry.ModTime.Unix())
+		out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
+	}
 	out.SetTimeout(1 * time.Second)
 	return fuse.OK
 }
@@ -305,6 +316,7 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 
 	attr := resp.GetAttr()
 	fs.setInode(attr.GetInode(), childPath)
+	fs.cache.Put(childPath, []byte{}, time.Now(), "")
 	fillEntryOut(attr, &out.EntryOut)
 	out.OpenOut.Fh = attr.GetInode()
 	return fuse.OK
@@ -331,6 +343,7 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 
 	attr := resp.GetAttr()
 	fs.setInode(attr.GetInode(), childPath)
+	fs.cache.Put(childPath, []byte{}, time.Now(), "")
 	fillEntryOut(attr, out)
 	return fuse.OK
 }
@@ -392,6 +405,10 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 
 	oldPath := path.Join(oldParent, oldName)
 	newPath := path.Join(newParent, newName)
+
+	if err := fs.syncFileToService(ctx, oldPath); err != nil {
+		return grpcErrorToStatus(err)
+	}
 
 	_, err := fs.client.Rename(ctx, &pb.RenameRequest{
 		VolumeId: fs.volumeID,
@@ -496,14 +513,12 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 }
 
 func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
-	ctx, cancelFunc := makeContext(cancel)
-	defer cancelFunc()
-
 	p, ok := fs.getPath(input.NodeId)
 	if !ok {
 		return nil, fuse.ENOENT
 	}
 
+	// Check local cache first (dirty or clean)
 	if cached, ok := fs.cache.Get(p); ok {
 		if input.Offset >= uint64(cached.Size) {
 			return fuse.ReadResultData([]byte{}), fuse.OK
@@ -514,6 +529,9 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		}
 		return fuse.ReadResultData(cached.Data[input.Offset:end]), fuse.OK
 	}
+
+	ctx, cancelFunc := makeContext(cancel)
+	defer cancelFunc()
 
 	resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
 		VolumeId: fs.volumeID,
@@ -533,47 +551,65 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 }
 
 func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
-	ctx, cancelFunc := makeContext(cancel)
-	defer cancelFunc()
-
 	p, ok := fs.getPath(input.NodeId)
 	if !ok {
 		return 0, fuse.ENOENT
 	}
 
-	resp, err := fs.client.WriteFile(ctx, &pb.WriteFileRequest{
+	// If not in cache and offset > 0, load existing content into cache first
+	if _, exists := fs.cache.Get(p); !exists && input.Offset > 0 {
+		ctx, cancelFunc := makeContext(cancel)
+		resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
+			VolumeId: fs.volumeID,
+			Path:     p,
+			Offset:   0,
+			Size:     int64(input.Offset),
+		})
+		cancelFunc()
+		if err == nil && len(resp.GetData()) > 0 {
+			fs.cache.Put(p, resp.GetData(), time.Now(), "")
+		}
+	}
+
+	// Buffer write locally and mark dirty
+	fs.cache.WriteAt(p, int64(input.Offset), data, time.Now())
+	return uint32(len(data)), fuse.OK
+}
+
+func (fs *ObjectFS) syncFileToService(ctx context.Context, p string) error {
+	entry, isDirty := fs.cache.GetDirty(p)
+	if !isDirty {
+		return nil
+	}
+
+	_, err := fs.client.WriteFile(ctx, &pb.WriteFileRequest{
 		VolumeId:  fs.volumeID,
 		Path:      p,
-		Offset:    int64(input.Offset),
-		Data:      data,
+		Offset:    0,
+		Data:      entry.Data,
 		WriteMode: fs.writeMode,
 	})
 	if err != nil {
-		return 0, grpcErrorToStatus(err)
+		return err
 	}
 
-	fs.cache.Invalidate(p)
-	return uint32(resp.GetBytesWritten()), fuse.OK
+	fs.cache.MarkClean(p)
+	return nil
 }
 
 func (fs *ObjectFS) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
-	if fs.writeMode == pb.WriteMode_WRITE_THROUGH_FSYNC {
-		ctx, cancelFunc := makeContext(cancel)
-		defer cancelFunc()
+	ctx, cancelFunc := makeContext(cancel)
+	defer cancelFunc()
 
-		p, ok := fs.getPath(input.NodeId)
-		if !ok {
-			return fuse.ENOENT
-		}
-
-		_, err := fs.client.Fsync(ctx, &pb.FsyncRequest{
-			VolumeId: fs.volumeID,
-			Path:     p,
-		})
-		if err != nil {
-			return grpcErrorToStatus(err)
-		}
+	p, ok := fs.getPath(input.NodeId)
+	if !ok {
+		return fuse.ENOENT
 	}
+
+	if err := fs.syncFileToService(ctx, p); err != nil {
+		return grpcErrorToStatus(err)
+	}
+
 	return fuse.OK
 }
 
@@ -586,6 +622,10 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 		return fuse.ENOENT
 	}
 
+	if err := fs.syncFileToService(ctx, p); err != nil {
+		return grpcErrorToStatus(err)
+	}
+
 	_, err := fs.client.Fsync(ctx, &pb.FsyncRequest{
 		VolumeId: fs.volumeID,
 		Path:     p,
@@ -594,6 +634,18 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 		return grpcErrorToStatus(err)
 	}
 	return fuse.OK
+}
+
+func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
+	ctx, cancelFunc := makeContext(cancel)
+	defer cancelFunc()
+
+	p, ok := fs.getPath(input.NodeId)
+	if !ok {
+		return
+	}
+
+	_ = fs.syncFileToService(ctx, p)
 }
 
 func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
@@ -637,10 +689,10 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 					break
 				}
 				if ev.GetPath() != "" {
-					cache.Invalidate(ev.GetPath())
+					cache.InvalidateIfNotDirty(ev.GetPath())
 				}
 				if ev.GetOldPath() != "" {
-					cache.Invalidate(ev.GetOldPath())
+					cache.InvalidateIfNotDirty(ev.GetOldPath())
 				}
 			}
 			time.Sleep(500 * time.Millisecond)

@@ -17,9 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
@@ -28,7 +30,8 @@ import (
 )
 
 var (
-	port = flag.Int("port", 50051, "The server port")
+	port          = flag.Int("port", 50051, "The server port")
+	flushInterval = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
 )
 
 func main() {
@@ -44,9 +47,14 @@ func main() {
 	backend := controller.NewMemoryBackend()
 	server := controller.NewServer(backend)
 
+	if *flushInterval > 0 {
+		server.StartPeriodicFlush(context.Background(), *flushInterval)
+		defer server.StopPeriodicFlush()
+	}
+
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
 
-	klog.Infof("ObjectFS Controller listening on port %d", *port)
+	klog.Infof("ObjectFS Controller listening on port %d (flushInterval=%v)", *port, *flushInterval)
 	if err := grpcServer.Serve(listener); err != nil {
 		klog.Fatalf("failed to serve: %v", err)
 	}
