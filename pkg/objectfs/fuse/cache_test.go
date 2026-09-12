@@ -63,3 +63,47 @@ func TestNodeCacheOperations(t *testing.T) {
 		t.Fatalf("Expected /fileB to be cleared")
 	}
 }
+
+func TestNodeCacheWriteAndDirtyTracking(t *testing.T) {
+	cache := NewNodeCache(1024)
+
+	// Write locally at offset 0
+	cache.WriteAt("/file1.txt", 0, []byte("hello "), time.Now())
+	// Write locally at offset 6
+	cache.WriteAt("/file1.txt", 6, []byte("world!"), time.Now())
+
+	entry, ok := cache.Get("/file1.txt")
+	if !ok {
+		t.Fatalf("Expected /file1.txt to be in cache")
+	}
+	if !entry.IsDirty {
+		t.Fatalf("Expected entry to be marked dirty")
+	}
+	if string(entry.Data) != "hello world!" {
+		t.Fatalf("Expected 'hello world!', got %q", string(entry.Data))
+	}
+	if entry.Size != 12 {
+		t.Fatalf("Expected size 12, got %d", entry.Size)
+	}
+
+	dirtyEntries := cache.GetDirtyEntries()
+	if len(dirtyEntries) != 1 || dirtyEntries[0].Path != "/file1.txt" {
+		t.Fatalf("Expected 1 dirty entry for /file1.txt, got %v", dirtyEntries)
+	}
+
+	// Mark clean
+	cache.MarkClean("/file1.txt")
+	if _, isDirty := cache.GetDirty("/file1.txt"); isDirty {
+		t.Fatalf("Expected /file1.txt to be clean after MarkClean")
+	}
+	if len(cache.GetDirtyEntries()) != 0 {
+		t.Fatalf("Expected 0 dirty entries after MarkClean")
+	}
+
+	// Truncate
+	cache.Truncate("/file1.txt", 5, time.Now())
+	entryTrunc, ok := cache.Get("/file1.txt")
+	if !ok || !entryTrunc.IsDirty || string(entryTrunc.Data) != "hello" {
+		t.Fatalf("Expected dirty truncated entry 'hello', got %q (dirty=%v)", string(entryTrunc.Data), entryTrunc.IsDirty)
+	}
+}

@@ -19,8 +19,10 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +32,28 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+const MetadataFileName = ".objectfs-metadata.json"
+
+type VolumeMetadata struct {
+	VolumeID    string                  `json:"volume_id"`
+	Version     int                     `json:"version"`
+	LastFlushed time.Time               `json:"last_flushed"`
+	NextInode   uint64                  `json:"next_inode"`
+	Entries     map[string]FileMetadata `json:"entries"`
+}
+
+type FileMetadata struct {
+	Inode   uint64    `json:"inode"`
+	Path    string    `json:"path"`
+	Name    string    `json:"name"`
+	IsDir   bool      `json:"is_dir"`
+	Mode    uint32    `json:"mode"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mod_time"`
+	Sha256  string    `json:"sha256,omitempty"`
+	ETag    string    `json:"etag,omitempty"`
+}
 
 type FSNode struct {
 	mu          sync.RWMutex
@@ -43,6 +67,8 @@ type FSNode struct {
 	data        []byte
 	sha256      string
 	redirectURL string
+	etag        string
+	isDirty     bool
 	children    map[string]*FSNode
 	parent      *FSNode
 }
@@ -55,6 +81,9 @@ type Volume struct {
 	backend      ObjectStorageBackend
 	broadcaster  *EventBroadcaster
 	maxInlineLen int64
+
+	lastFlushedMetadata    *VolumeMetadata
+	deletedPathsSinceFlush []string
 }
 
 func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *EventBroadcaster) *Volume {
@@ -297,6 +326,7 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 		child.data = dataCopy
 		child.modTime = now
 		child.sha256 = hashStr
+		child.isDirty = true
 		attr := child.toEntryAttrLocked()
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -316,6 +346,7 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 		modTime: now,
 		data:    dataCopy,
 		sha256:  hashStr,
+		isDirty: true,
 		parent:  parent,
 	}
 	parent.children[baseName] = child
@@ -339,11 +370,19 @@ func (v *Volume) ReadFile(ctx context.Context, p string, offset, length int64) (
 		return nil, 0, "", err
 	}
 
-	node.mu.RLock()
-	defer node.mu.RUnlock()
+	node.mu.Lock()
+	defer node.mu.Unlock()
 
 	if node.isDir {
 		return nil, 0, "", fmt.Errorf("cannot read directory as file: %w", syscall.EISDIR)
+	}
+
+	// Lazy load data from backend if not currently in memory
+	if len(node.data) == 0 && node.size > 0 && v.backend != nil {
+		data, err := v.backend.GetObject(ctx, v.volumeID, strings.TrimPrefix(node.path, "/"), 0, node.size)
+		if err == nil {
+			node.data = data
+		}
 	}
 
 	total := node.size
@@ -390,15 +429,10 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 	node.size = int64(len(node.data))
 	now := time.Now()
 	node.modTime = now
+	node.isDirty = true
 
 	h := sha256.Sum256(node.data)
 	node.sha256 = fmt.Sprintf("%x", h)
-
-	if writeMode == pb.WriteMode_WRITE_THROUGH_FSYNC || writeMode == pb.WriteMode_EAGER_REPLICATION {
-		if v.backend != nil {
-			_, _ = v.backend.PutObject(ctx, v.volumeID, strings.TrimPrefix(node.path, "/"), node.data)
-		}
-	}
 
 	attr := node.toEntryAttrLocked()
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -439,6 +473,7 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 	node.size = size
 	now := time.Now()
 	node.modTime = now
+	node.isDirty = true
 	h := sha256.Sum256(node.data)
 	node.sha256 = fmt.Sprintf("%x", h)
 
@@ -485,10 +520,7 @@ func (v *Volume) Unlink(ctx context.Context, p string) error {
 
 	delete(parent.children, baseName)
 	parent.modTime = time.Now()
-
-	if v.backend != nil {
-		_ = v.backend.DeleteObject(ctx, v.volumeID, strings.TrimPrefix(p, "/"))
-	}
+	v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, p)
 
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_DELETED,
@@ -594,11 +626,13 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 	child.path = newPath
 	child.parent = newParent
 	child.modTime = time.Now()
+	child.isDirty = true
 	child.mu.Unlock()
 
 	newParent.children[newBaseName] = child
 	oldParent.modTime = time.Now()
 	newParent.modTime = time.Now()
+	v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, oldPath)
 
 	attr := child.toEntryAttrLocked()
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -613,18 +647,163 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 
 func (v *Volume) Fsync(ctx context.Context, p string) error {
 	v.mu.RLock()
-	node, err := v.findNodeLocked(p)
+	_, err := v.findNodeLocked(p)
 	v.mu.RUnlock()
+	return err
+}
+
+func (v *Volume) FlushToBackend(ctx context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.backend == nil {
+		return nil
+	}
+
+	// 1. Process deleted paths
+	for _, delPath := range v.deletedPathsSinceFlush {
+		key := strings.TrimPrefix(delPath, "/")
+		_ = v.backend.DeleteObject(ctx, v.volumeID, key)
+	}
+	v.deletedPathsSinceFlush = nil
+
+	// 2. Traverse tree to collect all entries and upload dirty files
+	currentEntries := make(map[string]FileMetadata)
+	var walk func(node *FSNode) error
+	walk = func(node *FSNode) error {
+		node.mu.Lock()
+		defer node.mu.Unlock()
+
+		meta := FileMetadata{
+			Inode:   node.inode,
+			Path:    node.path,
+			Name:    node.name,
+			IsDir:   node.isDir,
+			Mode:    node.mode,
+			Size:    node.size,
+			ModTime: node.modTime,
+			Sha256:  node.sha256,
+			ETag:    node.etag,
+		}
+
+		if !node.isDir {
+			needsUpload := node.isDirty || node.etag == ""
+			if v.lastFlushedMetadata != nil {
+				if lastEntry, exists := v.lastFlushedMetadata.Entries[node.path]; !exists || lastEntry.Sha256 != node.sha256 {
+					needsUpload = true
+				}
+			}
+			if needsUpload {
+				key := strings.TrimPrefix(node.path, "/")
+				etag, err := v.backend.PutObject(ctx, v.volumeID, key, node.data)
+				if err != nil {
+					return fmt.Errorf("failed to upload object %s: %w", key, err)
+				}
+				node.etag = etag
+				meta.ETag = etag
+				node.isDirty = false
+			}
+		}
+
+		currentEntries[node.path] = meta
+
+		if node.isDir {
+			for _, child := range node.children {
+				if err := walk(child); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	if err := walk(v.root); err != nil {
+		return err
+	}
+
+	// 3. Write metadata file
+	newMeta := VolumeMetadata{
+		VolumeID:    v.volumeID,
+		Version:     1,
+		LastFlushed: time.Now(),
+		NextInode:   v.nextInode,
+		Entries:     currentEntries,
+	}
+
+	metaBytes, err := json.MarshalIndent(newMeta, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
-	node.mu.RLock()
-	defer node.mu.RUnlock()
-
-	if !node.isDir && v.backend != nil {
-		_, err := v.backend.PutObject(ctx, v.volumeID, strings.TrimPrefix(node.path, "/"), node.data)
-		return err
+	if _, err := v.backend.PutObject(ctx, v.volumeID, MetadataFileName, metaBytes); err != nil {
+		return fmt.Errorf("failed to write metadata file: %w", err)
 	}
+
+	v.lastFlushedMetadata = &newMeta
+	return nil
+}
+
+func (v *Volume) LoadFromBackend(ctx context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.backend == nil {
+		return nil
+	}
+
+	metaBytes, err := v.backend.GetObject(ctx, v.volumeID, MetadataFileName, 0, 0)
+	if err != nil || len(metaBytes) == 0 {
+		return nil
+	}
+
+	var meta VolumeMetadata
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return fmt.Errorf("failed to parse volume metadata: %w", err)
+	}
+
+	if meta.NextInode > v.nextInode {
+		v.nextInode = meta.NextInode
+	}
+
+	var paths []string
+	for p := range meta.Entries {
+		if p != "/" {
+			paths = append(paths, p)
+		}
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		return len(paths[i]) < len(paths[j])
+	})
+
+	for _, p := range paths {
+		entry := meta.Entries[p]
+		parentPath := path.Dir(p)
+		baseName := path.Base(p)
+
+		parent, err := v.findNodeLocked(parentPath)
+		if err != nil {
+			continue
+		}
+
+		child := &FSNode{
+			inode:   entry.Inode,
+			name:    baseName,
+			path:    entry.Path,
+			isDir:   entry.IsDir,
+			mode:    entry.Mode,
+			size:    entry.Size,
+			modTime: entry.ModTime,
+			sha256:  entry.Sha256,
+			etag:    entry.ETag,
+			parent:  parent,
+			isDirty: false,
+		}
+		if child.isDir {
+			child.children = make(map[string]*FSNode)
+		}
+		parent.children[baseName] = child
+	}
+
+	v.lastFlushedMetadata = &meta
 	return nil
 }

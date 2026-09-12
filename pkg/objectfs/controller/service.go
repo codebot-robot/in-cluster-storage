@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"google.golang.org/grpc/codes"
@@ -33,6 +34,10 @@ type Server struct {
 	volumes     map[string]*Volume
 	backend     ObjectStorageBackend
 	broadcaster *EventBroadcaster
+
+	flushTicker *time.Ticker
+	stopFlush   chan struct{}
+	flushWg     sync.WaitGroup
 }
 
 func NewServer(backend ObjectStorageBackend) *Server {
@@ -53,9 +58,73 @@ func (s *Server) getOrCreateVolume(volumeID string) *Volume {
 	vol, ok := s.volumes[volumeID]
 	if !ok {
 		vol = NewVolume(volumeID, s.backend, s.broadcaster)
+		_ = vol.LoadFromBackend(context.Background())
 		s.volumes[volumeID] = vol
 	}
 	return vol
+}
+
+func (s *Server) FlushAll(ctx context.Context) error {
+	s.mu.RLock()
+	vols := make([]*Volume, 0, len(s.volumes))
+	for _, v := range s.volumes {
+		vols = append(vols, v)
+	}
+	s.mu.RUnlock()
+
+	var firstErr error
+	for _, v := range vols {
+		if err := v.FlushToBackend(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (s *Server) StartPeriodicFlush(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.flushTicker != nil {
+		s.flushTicker.Stop()
+		close(s.stopFlush)
+	}
+	ticker := time.NewTicker(interval)
+	stopFlush := make(chan struct{})
+	s.flushTicker = ticker
+	s.stopFlush = stopFlush
+	s.flushWg.Add(1)
+	s.mu.Unlock()
+
+	go func() {
+		defer s.flushWg.Done()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				_ = s.FlushAll(context.Background())
+				return
+			case <-stopFlush:
+				_ = s.FlushAll(context.Background())
+				return
+			case <-ticker.C:
+				_ = s.FlushAll(ctx)
+			}
+		}
+	}()
+}
+
+func (s *Server) StopPeriodicFlush() {
+	s.mu.Lock()
+	if s.flushTicker != nil {
+		s.flushTicker.Stop()
+		close(s.stopFlush)
+		s.flushTicker = nil
+		s.stopFlush = nil
+	}
+	s.mu.Unlock()
+	s.flushWg.Wait()
 }
 
 func (s *Server) GetAttr(ctx context.Context, req *pb.GetAttrRequest) (*pb.GetAttrResponse, error) {

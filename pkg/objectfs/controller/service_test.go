@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -195,6 +196,147 @@ func TestControllerServiceOperations(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("Expected subdir to not exist after rmdir")
+	}
+}
+
+func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-flush-vol"
+
+	// Create files
+	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file1.txt",
+		Mode:           0644,
+		InitialContent: []byte("file 1 initial data"),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create file1: %v", err)
+	}
+
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file2.txt",
+		Mode:           0644,
+		InitialContent: []byte("file 2 initial data"),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create file2: %v", err)
+	}
+
+	// Before flush, backend should not have the raw objects
+	if _, err := backend.GetObject(ctx, volumeID, "file1.txt", 0, 0); err == nil {
+		t.Fatalf("Expected backend to not have file1 before flush")
+	}
+
+	// Flush to backend
+	if err := server.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+
+	// Verify raw objects and metadata file exist in backend
+	f1Data, err := backend.GetObject(ctx, volumeID, "file1.txt", 0, 100)
+	if err != nil || string(f1Data) != "file 1 initial data" {
+		t.Fatalf("Expected file1 in backend with initial data, got: %q, err: %v", string(f1Data), err)
+	}
+
+	metaBytes, err := backend.GetObject(ctx, volumeID, MetadataFileName, 0, 0)
+	if err != nil || len(metaBytes) == 0 {
+		t.Fatalf("Expected metadata file in backend, got err: %v", err)
+	}
+
+	var meta VolumeMetadata
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		t.Fatalf("Failed to unmarshal metadata: %v", err)
+	}
+	if len(meta.Entries) != 3 { // root /, /file1.txt, /file2.txt
+		t.Fatalf("Expected 3 entries in metadata, got %d", len(meta.Entries))
+	}
+	if meta.Entries["/file1.txt"].Size != int64(len("file 1 initial data")) {
+		t.Fatalf("Unexpected file1 metadata size: %d", meta.Entries["/file1.txt"].Size)
+	}
+
+	// Incremental write: modify only file2
+	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Path:     "/file2.txt",
+		Offset:   0,
+		Data:     []byte("file 2 updated content!"),
+	})
+	if err != nil {
+		t.Fatalf("Failed to update file2: %v", err)
+	}
+
+	// Unlink file1
+	_, err = server.Unlink(ctx, &pb.UnlinkRequest{
+		VolumeId: volumeID,
+		Path:     "/file1.txt",
+	})
+	if err != nil {
+		t.Fatalf("Failed to unlink file1: %v", err)
+	}
+
+	// Flush again
+	if err := server.FlushAll(ctx); err != nil {
+		t.Fatalf("Second FlushAll failed: %v", err)
+	}
+
+	// Verify file2 updated and file1 deleted in backend
+	f2Data, err := backend.GetObject(ctx, volumeID, "file2.txt", 0, 100)
+	if err != nil || string(f2Data) != "file 2 updated content!" {
+		t.Fatalf("Expected updated file2 in backend, got: %q, err: %v", string(f2Data), err)
+	}
+
+	if _, err := backend.GetObject(ctx, volumeID, "file1.txt", 0, 100); err == nil {
+		t.Fatalf("Expected file1 to be deleted from backend after unlink & flush")
+	}
+
+	// Test Recovery / LoadFromBackend
+	// Create a new server pointing to the same backend
+	newServer := NewServer(backend)
+	readResp, err := newServer.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Path:     "/file2.txt",
+		Offset:   0,
+		Size:     100,
+	})
+	if err != nil {
+		t.Fatalf("Failed to read file2 from recovered server: %v", err)
+	}
+	if string(readResp.GetData()) != "file 2 updated content!" {
+		t.Fatalf("Expected recovered server to read 'file 2 updated content!', got: %q", string(readResp.GetData()))
+	}
+}
+
+func TestPeriodicFlusherLifecycle(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-periodic-vol"
+
+	server.StartPeriodicFlush(ctx, 10*time.Millisecond)
+
+	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/auto-flushed.txt",
+		Mode:           0644,
+		InitialContent: []byte("auto flushed data"),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create file: %v", err)
+	}
+
+	// Wait for periodic flusher to run
+	time.Sleep(50 * time.Millisecond)
+
+	server.StopPeriodicFlush()
+
+	// Verify backend received the file
+	data, err := backend.GetObject(ctx, volumeID, "auto-flushed.txt", 0, 100)
+	if err != nil || string(data) != "auto flushed data" {
+		t.Fatalf("Expected periodic flusher to sync auto-flushed.txt to backend, got %q (err=%v)", string(data), err)
 	}
 }
 
