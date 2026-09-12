@@ -428,3 +428,117 @@ func TestErofsPhysicalDirectory(t *testing.T) {
 	// Recursively validate compiled EROFS tree against the physical fileSystemNode tree input!
 	compareTrees(t, fsNode, reader, reader.sb.GetRootNID())
 }
+
+func TestErofsXattrsAndComposeFS(t *testing.T) {
+	// 1. Create in-memory tree with xattrs and metadata-only files (composefs style)
+	file1Xattrs := map[string]string{
+		"user.digest":  "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+		"user.sha256":  "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+		"trusted.mime": "text/plain",
+	}
+
+	file1 := NewMemoryNode(
+		"largefile.bin",
+		false,
+		0644,
+		nil,
+		nil,
+		WithMetadataOnly(true),
+		WithSize(100*1024*1024), // 100MB declared size
+		WithXattrs(file1Xattrs),
+	)
+
+	file2 := NewMemoryNode(
+		"smallfile.txt",
+		false,
+		0644,
+		[]byte("hello world"),
+		nil,
+		WithXattrs(map[string]string{
+			"user.tag": "greeting",
+		}),
+	)
+
+	root := NewMemoryNode(
+		"",
+		true,
+		0755,
+		nil,
+		[]Node{file1, file2},
+	)
+
+	mw := &memoryWriterAt{}
+	err := WriteImage(mw, root)
+	if err != nil {
+		t.Fatalf("failed to write image with xattrs and composefs metadata: %v", err)
+	}
+
+	// Verify image size is tiny (not 100MB!)
+	if len(mw.buf) > 64*1024 {
+		t.Fatalf("expected metadata-only image to be under 64KB, got %d bytes", len(mw.buf))
+	}
+
+	// Run Fsck
+	readerAt := bytes.NewReader(mw.buf)
+	if err := Fsck(readerAt); err != nil {
+		t.Fatalf("Fsck failed on xattr & composefs image: %v", err)
+	}
+
+	// Read using Reader
+	reader, err := NewReader(readerAt)
+	if err != nil {
+		t.Fatalf("failed to create reader: %v", err)
+	}
+
+	dirents, err := reader.ListDirectory(reader.sb.GetRootNID())
+	if err != nil {
+		t.Fatalf("failed to list directory: %v", err)
+	}
+
+	var foundFile1, foundFile2 bool
+	for _, de := range dirents {
+		if de.Name == "largefile.bin" {
+			foundFile1 = true
+			inode, err := ReadInode(readerAt, reader.sb, de.NID)
+			if err != nil {
+				t.Fatalf("failed to read largefile inode: %v", err)
+			}
+			if inode.Size != 100*1024*1024 {
+				t.Fatalf("expected largefile size 100MB, got %d", inode.Size)
+			}
+
+			xattrs, err := reader.GetXattrs(de.NID)
+			if err != nil {
+				t.Fatalf("failed to get largefile xattrs: %v", err)
+			}
+			if xattrs["user.digest"] != file1Xattrs["user.digest"] {
+				t.Fatalf("expected user.digest %q, got %q", file1Xattrs["user.digest"], xattrs["user.digest"])
+			}
+			if xattrs["trusted.mime"] != "text/plain" {
+				t.Fatalf("expected trusted.mime 'text/plain', got %q", xattrs["trusted.mime"])
+			}
+		}
+		if de.Name == "smallfile.txt" {
+			foundFile2 = true
+			xattrs, err := reader.GetXattrs(de.NID)
+			if err != nil {
+				t.Fatalf("failed to get smallfile xattrs: %v", err)
+			}
+			if xattrs["user.tag"] != "greeting" {
+				t.Fatalf("expected user.tag 'greeting', got %q", xattrs["user.tag"])
+			}
+			rc, err := reader.ReadFileContent(de.NID)
+			if err != nil {
+				t.Fatalf("failed to read smallfile content: %v", err)
+			}
+			content, _ := io.ReadAll(rc)
+			if string(content) != "hello world" {
+				t.Fatalf("expected content 'hello world', got %q", string(content))
+			}
+		}
+	}
+
+	if !foundFile1 || !foundFile2 {
+		t.Fatalf("expected both files to be found in directory listing")
+	}
+}

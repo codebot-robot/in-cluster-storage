@@ -402,6 +402,12 @@ func (inode *Inode) DataReader(r io.ReaderAt, sb *Superblock) (io.Reader, error)
 			return bytes.NewReader(nil), nil
 		}
 
+		if inode.RawBlkaddr == 0 {
+			// In composefs / metadata-only images, regular files have RawBlkaddr == 0
+			// since file content resides externally in blob storage.
+			return bytes.NewReader(nil), nil
+		}
+
 		if uint64(inode.RawBlkaddr)+totalBlocks > uint64(sb.Blocks) {
 			return nil, fmt.Errorf("block address out of bounds: raw_blkaddr %d, totalBlocks %d, image total blocks %d", inode.RawBlkaddr, totalBlocks, sb.Blocks)
 		}
@@ -640,6 +646,16 @@ func NewReader(r io.ReaderAt) (*Reader, error) {
 	return &Reader{r: r, sb: sb}, nil
 }
 
+// Superblock returns the parsed Superblock.
+func (reader *Reader) Superblock() *Superblock {
+	return reader.sb
+}
+
+// GetRootNID returns the root directory NID.
+func (reader *Reader) GetRootNID() uint64 {
+	return reader.sb.GetRootNID()
+}
+
 // ReadFileContent returns an io.Reader to stream the content of a regular/symlink file.
 func (reader *Reader) ReadFileContent(nid uint64) (io.Reader, error) {
 	inode, err := ReadInode(reader.r, reader.sb, nid)
@@ -647,6 +663,15 @@ func (reader *Reader) ReadFileContent(nid uint64) (io.Reader, error) {
 		return nil, err
 	}
 	return inode.DataReader(reader.r, reader.sb)
+}
+
+// GetXattrs retrieves all extended attributes for the given NID.
+func (reader *Reader) GetXattrs(nid uint64) (map[string]string, error) {
+	inode, err := ReadInode(reader.r, reader.sb, nid)
+	if err != nil {
+		return nil, err
+	}
+	return ReadXattrs(reader.r, reader.sb, inode)
 }
 
 // ListDirectory lists all directory entries.
@@ -681,6 +706,155 @@ func (reader *Reader) ListDirectory(nid uint64) ([]Dirent, error) {
 		}
 	}
 	return allDirents, nil
+}
+
+// BuildInlineXattrs constructs an EROFS inline xattr body buffer and computes xattr_icount.
+func BuildInlineXattrs(xattrs map[string]string) ([]byte, uint16, error) {
+	if len(xattrs) == 0 {
+		return nil, 0, nil
+	}
+
+	var keys []string
+	for k := range xattrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var buf []byte
+	// 1. struct erofs_xattr_ibody_header (4 bytes)
+	// h_shared_count = 0, h_reserved2[3] = 0
+	buf = append(buf, 0, 0, 0, 0)
+
+	// 2. Entries
+	for _, k := range keys {
+		val := []byte(xattrs[k])
+		prefix := uint8(0)
+		suffix := k
+
+		if strings.HasPrefix(k, "user.") {
+			prefix = 1
+			suffix = strings.TrimPrefix(k, "user.")
+		} else if strings.HasPrefix(k, "system.posix_acl_access") {
+			prefix = 2
+			suffix = strings.TrimPrefix(k, "system.posix_acl_access")
+		} else if strings.HasPrefix(k, "posix_acl_access") {
+			prefix = 2
+			suffix = strings.TrimPrefix(k, "posix_acl_access")
+		} else if strings.HasPrefix(k, "system.posix_acl_default") {
+			prefix = 3
+			suffix = strings.TrimPrefix(k, "system.posix_acl_default")
+		} else if strings.HasPrefix(k, "posix_acl_default") {
+			prefix = 3
+			suffix = strings.TrimPrefix(k, "posix_acl_default")
+		} else if strings.HasPrefix(k, "trusted.") {
+			prefix = 4
+			suffix = strings.TrimPrefix(k, "trusted.")
+		} else if strings.HasPrefix(k, "security.") {
+			prefix = 5
+			suffix = strings.TrimPrefix(k, "security.")
+		}
+
+		nameBytes := []byte(suffix)
+		nameLen := len(nameBytes)
+		valLen := len(val)
+
+		entryHdr := make([]byte, 4)
+		entryHdr[0] = uint8(nameLen)
+		entryHdr[1] = prefix
+		binary.LittleEndian.PutUint16(entryHdr[2:4], uint16(valLen))
+		buf = append(buf, entryHdr...)
+
+		buf = append(buf, nameBytes...)
+		namePad := (4 - (nameLen % 4)) % 4
+		for i := 0; i < namePad; i++ {
+			buf = append(buf, 0)
+		}
+
+		buf = append(buf, val...)
+		valPad := (4 - (valLen % 4)) % 4
+		for i := 0; i < valPad; i++ {
+			buf = append(buf, 0)
+		}
+	}
+
+	xattrICount := uint16((len(buf) + 3) / 4)
+	return buf, xattrICount, nil
+}
+
+// ReadXattrs reads inline extended attributes for an inode.
+func ReadXattrs(r io.ReaderAt, sb *Superblock, inode *Inode) (map[string]string, error) {
+	if inode.XattrICount == 0 {
+		return make(map[string]string), nil
+	}
+
+	headerSize := int64(32)
+	if inode.Version != 0 {
+		headerSize = 64
+	}
+
+	offset := sb.InodeOffset(inode.NID) + headerSize
+	totalBytes := int(inode.XattrICount) * 4
+
+	buf := make([]byte, totalBytes)
+	n, err := r.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("failed to read inline xattrs: %w", err)
+	}
+	if n < 4 {
+		return nil, fmt.Errorf("truncated xattr header")
+	}
+
+	sharedCount := int(buf[0])
+	pos := 4 + sharedCount*4
+	if pos > n {
+		return nil, fmt.Errorf("shared xattr count exceeds buffer")
+	}
+
+	res := make(map[string]string)
+	for pos < n {
+		if pos+4 > n {
+			break
+		}
+		nameLen := int(buf[pos])
+		namePrefix := buf[pos+1]
+		valLen := int(binary.LittleEndian.Uint16(buf[pos+2 : pos+4]))
+		pos += 4
+
+		if nameLen == 0 && valLen == 0 {
+			break
+		}
+
+		namePad := (4 - (nameLen % 4)) % 4
+		valPad := (4 - (valLen % 4)) % 4
+
+		if pos+nameLen+namePad+valLen+valPad > n {
+			break
+		}
+
+		nameSuffix := string(buf[pos : pos+nameLen])
+		pos += nameLen + namePad
+
+		val := string(buf[pos : pos+valLen])
+		pos += valLen + valPad
+
+		fullName := nameSuffix
+		switch namePrefix {
+		case 1:
+			fullName = "user." + nameSuffix
+		case 2:
+			fullName = "system.posix_acl_access" + nameSuffix
+		case 3:
+			fullName = "system.posix_acl_default" + nameSuffix
+		case 4:
+			fullName = "trusted." + nameSuffix
+		case 5:
+			fullName = "security." + nameSuffix
+		}
+
+		res[fullName] = val
+	}
+
+	return res, nil
 }
 
 // BuildDirectoryBlock packs directory entries into an EROFS block buffer.
@@ -742,16 +916,31 @@ type Node interface {
 	Children() ([]Node, error)
 }
 
+// XattrNode is an optional interface for Nodes with extended attributes.
+type XattrNode interface {
+	Node
+	Xattrs() map[string]string
+}
+
+// MetadataOnlyNode is an optional interface for composefs-style metadata-only nodes.
+type MetadataOnlyNode interface {
+	Node
+	IsMetadataOnly() bool
+}
+
 // memoryNode implements the Node interface for virtual in-memory trees.
 type memoryNode struct {
-	name     string
-	isDir    bool
-	mode     uint16
-	uid      uint32
-	gid      uint32
-	mtime    uint64
-	content  []byte
-	children []Node
+	name           string
+	isDir          bool
+	mode           uint16
+	uid            uint32
+	gid            uint32
+	mtime          uint64
+	size           uint64
+	content        []byte
+	children       []Node
+	xattrs         map[string]string
+	isMetadataOnly bool
 }
 
 func (m *memoryNode) Name() string  { return m.name }
@@ -760,7 +949,14 @@ func (m *memoryNode) Mode() uint16  { return m.mode }
 func (m *memoryNode) UID() uint32   { return m.uid }
 func (m *memoryNode) GID() uint32   { return m.gid }
 func (m *memoryNode) Mtime() uint64 { return m.mtime }
-func (m *memoryNode) Size() uint64  { return uint64(len(m.content)) }
+func (m *memoryNode) Size() uint64 {
+	if m.isMetadataOnly || m.size > 0 {
+		return m.size
+	}
+	return uint64(len(m.content))
+}
+func (m *memoryNode) Xattrs() map[string]string { return m.xattrs }
+func (m *memoryNode) IsMetadataOnly() bool      { return m.isMetadataOnly }
 func (m *memoryNode) Children() ([]Node, error) {
 	if !m.isDir {
 		return nil, errors.New("not a directory")
@@ -773,6 +969,58 @@ func (m *memoryNode) Open() (io.ReadCloser, error) {
 		return nil, errors.New("cannot open directory")
 	}
 	return io.NopCloser(bytes.NewReader(m.content)), nil
+}
+
+type MemoryNodeOption func(*memoryNode)
+
+func WithXattrs(xattrs map[string]string) MemoryNodeOption {
+	return func(m *memoryNode) {
+		m.xattrs = xattrs
+	}
+}
+
+func WithMetadataOnly(metadataOnly bool) MemoryNodeOption {
+	return func(m *memoryNode) {
+		m.isMetadataOnly = metadataOnly
+	}
+}
+
+func WithSize(size uint64) MemoryNodeOption {
+	return func(m *memoryNode) {
+		m.size = size
+	}
+}
+
+func WithMtime(mtime uint64) MemoryNodeOption {
+	return func(m *memoryNode) {
+		m.mtime = mtime
+	}
+}
+
+func WithUID(uid uint32) MemoryNodeOption {
+	return func(m *memoryNode) {
+		m.uid = uid
+	}
+}
+
+func WithGID(gid uint32) MemoryNodeOption {
+	return func(m *memoryNode) {
+		m.gid = gid
+	}
+}
+
+func NewMemoryNode(name string, isDir bool, mode uint16, content []byte, children []Node, opts ...MemoryNodeOption) Node {
+	m := &memoryNode{
+		name:     name,
+		isDir:    isDir,
+		mode:     mode,
+		content:  content,
+		children: children,
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // fileSystemNode implements the Node interface for physical host directories.
@@ -968,19 +1216,23 @@ func splitPath(p string) []string {
 
 // nodeInfo represents the lightweight layout metadata collected during Pass 1.
 type nodeInfo struct {
-	node       Node
-	nid        uint64
-	parentNID  uint64
-	name       string
-	isDir      bool
-	mode       uint16
-	uid        uint32
-	gid        uint32
-	mtime      uint64
-	size       uint64
-	dataLen    uint64
-	dataOffset int64
-	dirData    []byte
+	node           Node
+	nid            uint64
+	parentNID      uint64
+	name           string
+	isDir          bool
+	mode           uint16
+	uid            uint32
+	gid            uint32
+	mtime          uint64
+	size           uint64
+	dataLen        uint64
+	dataOffset     int64
+	dirData        []byte
+	xattrData      []byte
+	xattrICount    uint16
+	slotCount      uint64
+	isMetadataOnly bool
 }
 
 type writerAtWrapper struct {
@@ -1000,7 +1252,7 @@ func marshalCompactNode(n *nodeInfo) []byte {
 
 	var format uint16 = 0
 	binary.LittleEndian.PutUint16(buf[0:2], format)
-	binary.LittleEndian.PutUint16(buf[2:4], 0) // xattr_icount
+	binary.LittleEndian.PutUint16(buf[2:4], n.xattrICount) // xattr_icount
 	binary.LittleEndian.PutUint16(buf[4:6], n.mode)
 
 	var nlink uint16 = 1
@@ -1008,9 +1260,13 @@ func marshalCompactNode(n *nodeInfo) []byte {
 		nlink = 2
 	}
 	binary.LittleEndian.PutUint16(buf[6:8], nlink)
-	binary.LittleEndian.PutUint32(buf[8:12], uint32(n.dataLen))
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(n.size))
 	binary.LittleEndian.PutUint32(buf[12:16], 0) // reserved
-	binary.LittleEndian.PutUint32(buf[16:20], uint32(n.dataOffset/BlockSize4K))
+	if n.dataLen > 0 {
+		binary.LittleEndian.PutUint32(buf[16:20], uint32(n.dataOffset/BlockSize4K))
+	} else {
+		binary.LittleEndian.PutUint32(buf[16:20], 0)
+	}
 	binary.LittleEndian.PutUint32(buf[20:24], uint32(n.nid))
 	binary.LittleEndian.PutUint16(buf[24:26], uint16(n.uid))
 	binary.LittleEndian.PutUint16(buf[26:28], uint16(n.gid))
@@ -1023,11 +1279,12 @@ func marshalCompactNode(n *nodeInfo) []byte {
 // Writes directly to w at exact offsets, avoiding any full disk image or file buffering in memory.
 func WriteImage(w io.WriterAt, root Node) error {
 	var nodes []*nodeInfo
+	var nextNID uint64 = 0
 
 	// Recursively collect metadata of the nodes
 	var visit func(n Node, parentNID uint64, name string) (*nodeInfo, error)
 	visit = func(n Node, parentNID uint64, name string) (*nodeInfo, error) {
-		nid := uint64(len(nodes))
+		nid := nextNID
 		info := &nodeInfo{
 			node:      n,
 			nid:       nid,
@@ -1044,6 +1301,26 @@ func WriteImage(w io.WriterAt, root Node) error {
 			info.mode |= S_IFDIR
 		} else if info.mode&S_IFMT == 0 {
 			info.mode |= S_IFREG
+		}
+
+		if xNode, ok := n.(XattrNode); ok {
+			xattrs := xNode.Xattrs()
+			if len(xattrs) > 0 {
+				xData, xICount, err := BuildInlineXattrs(xattrs)
+				if err != nil {
+					return nil, err
+				}
+				info.xattrData = xData
+				info.xattrICount = xICount
+			}
+		}
+
+		slots := (int(SlotSize) + 4*int(info.xattrICount) + int(SlotSize) - 1) / int(SlotSize)
+		info.slotCount = uint64(slots)
+		nextNID += uint64(slots)
+
+		if metaNode, ok := n.(MetadataOnlyNode); ok && metaNode.IsMetadataOnly() {
+			info.isMetadataOnly = true
 		}
 
 		nodes = append(nodes, info)
@@ -1111,11 +1388,15 @@ func WriteImage(w io.WriterAt, root Node) error {
 			n.size = uint64(len(dirBlock))
 			n.dataLen = uint64(len(dirBlock))
 		} else {
-			n.dataLen = n.size
+			if n.isMetadataOnly {
+				n.dataLen = 0
+			} else {
+				n.dataLen = n.size
+			}
 		}
 	}
 
-	inodesBytes := int64(len(nodes) * SlotSize)
+	inodesBytes := int64(nextNID * SlotSize)
 	inodesBlocks := (inodesBytes + blockSize - 1) / blockSize
 
 	metaBlkaddr := int64(1)
@@ -1168,6 +1449,19 @@ func WriteImage(w io.WriterAt, root Node) error {
 		inodeBuf := marshalCompactNode(n)
 		if _, err := w.WriteAt(inodeBuf, inodeOffset); err != nil {
 			return fmt.Errorf("failed to write inode for NID %d: %w", n.nid, err)
+		}
+		if len(n.xattrData) > 0 {
+			if _, err := w.WriteAt(n.xattrData, inodeOffset+SlotSize); err != nil {
+				return fmt.Errorf("failed to write xattr for NID %d: %w", n.nid, err)
+			}
+			usedBytes := int(SlotSize) + len(n.xattrData)
+			totalAllocated := int(n.slotCount * SlotSize)
+			if totalAllocated > usedBytes {
+				pad := make([]byte, totalAllocated-usedBytes)
+				if _, err := w.WriteAt(pad, inodeOffset+int64(usedBytes)); err != nil {
+					return fmt.Errorf("failed to write xattr padding for NID %d: %w", n.nid, err)
+				}
+			}
 		}
 	}
 
