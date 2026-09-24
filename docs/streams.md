@@ -8,8 +8,13 @@ This document describes the design, implementation, durability semantics, wire f
 
 **Streams** provides a lightweight, high-performance, tiered write-ahead log (WAL) and streaming ingestion system designed for Kubernetes clusters. It combines ultra-low latency local-disk commits, fast in-cluster network replication to a central witness buffer, and asynchronous batch flushing to permanent cloud object storage (e.g. Google Cloud Storage or Amazon S3).
 
+Streams supports flexible acknowledgement modes depending on application consistency and durability requirements:
+1. **Mode 1 — Write locally and ack (`Local`):** Acks immediately after appending and fsyncing to fast node-local disk (< 1 ms latency). Asynchronous replication streams records in the background to the central buffer service.
+2. **Mode 2 — Ack when written to central service (`Witness`):** Acks once the record is transmitted over gRPC, micro-batched into a group commit, and fsynced to the central witness buffer's local disk (~2–10 ms latency).
+3. **Mode 3 — Ack when flushed to permanent object storage (`Permanent`):** Acks only once the record is sealed into an immutable segment object and committed in cloud object storage (typical on-demand GCS/S3 write latency of ~200 ms – 2 s).
+
 Streams enables workloads to achieve:
-- **Sub-millisecond write latency:** Clients append and fsync to fast node-local storage immediately.
+- **Sub-millisecond write latency:** Workloads can write locally and achieve immediate durability against local process crashes.
 - **Resilient in-cluster durability:** Changes are asynchronously streamed over bidirectional gRPC to a central witness buffer (`wal-buffer`) that performs group commits with fsync.
 - **Cost-effective permanent retention:** The buffer service aggregates multiple client streams into consolidated log segments and periodically flushes them to object storage along with an atomic manifest.
 - **Unified catch-up and real-time tailing:** Consumers can tail merged records in global position order seamlessly across historical object storage segments, buffered local disk segments, and live in-flight memory commits.
@@ -89,7 +94,7 @@ Streams defines three progressive durability levels:
 | :--- | :--- | :--- | :--- |
 | **`Local`** | `localSeq` | Record is written and fsynced to the client node's local disk. | < 1 ms (NVMe / SSD) |
 | **`Witness`** | `witnessSeq` | Record is received by the central buffer service, assigned a global `position`, and fsynced to the buffer's disk. | Network RTT + Group Commit Fsync (~2–10 ms) |
-| **`Permanent`** | `s3Seq` | Record is included in a sealed segment uploaded to object storage and committed into `wal/manifest.json`. | Flush Interval (~10–60s) or on-demand `Flush()` |
+| **`Permanent`** | `s3Seq` | Record is included in a sealed segment uploaded to object storage and committed into `wal/manifest.json`. | Typical cloud object store write latency (~200 ms – 2 s on-demand `Flush()`, or 10–60 s periodic background flush) |
 
 ### Lifecycle of an Append
 
@@ -97,49 +102,32 @@ Streams defines three progressive durability levels:
 Client Appends Payload
        │
        ▼
-1. Write & Fsync to local client segment ────> Returns localSeq immediately
+1. Write & Fsync to local client segment ────> Returns localSeq immediately (Mode 1)
        │
        ▼
 2. Send AppendRecord over gRPC stream
        │
        ▼
-3. Server batches with other streams & fsyncs to local disk ──> Sends Ack(witnessSeq)
+3. Server batches with other streams & fsyncs to local disk ──> Sends Ack(witnessSeq) (Mode 2)
        │
        ▼
-4. Server uploads segment to Object Storage & updates manifest.json ──> Sends Ack(s3Seq)
+4. Server uploads segment to Object Storage & updates manifest.json ──> Sends Ack(s3Seq) (Mode 3)
        │
        ▼
 5. Client deletes local segments whose records <= s3Seq
 ```
 
-### Client API
+### Client API Reference
 
-```go
-type Stream interface {
-    // Append writes and fsyncs locally, then returns the stream_seq.
-    Append(ctx context.Context, payload []byte) (uint64, error)
-
-    // Wait blocks until seq has reached the specified durability level.
-    // If requestFlush is true and level is Permanent, an on-demand Flush RPC is issued.
-    Wait(ctx context.Context, seq uint64, level Level, requestFlush bool) error
-
-    // Flush forces a flush to permanent object storage and blocks until everything
-    // appended so far is durable in the manifest.
-    Flush(ctx context.Context) error
-
-    // Watermarks returns current local, witness, and permanent watermarks.
-    Watermarks() (local, witness, permanent uint64)
-
-    // Close stops background replication and flushes local buffers.
-    Close() error
-}
-```
+See [`pkg/wal/client/client.go`](../pkg/wal/client/client.go) for Go client definitions (`Stream` interface, `Open`, `Append`, `Wait`, `Flush`, `Watermarks`, and `Close`).
 
 ---
 
 ## Wire & Storage Formats
 
-Streams utilizes zero-overhead, length-prefixed binary records protected by Castagnoli CRC32C checksums.
+Streams utilizes zero-overhead, length-prefixed binary records protected by CRC32C (Castagnoli) checksums, leveraging hardware-accelerated CPU instructions on AMD64 (`SSE4.2` / `CRC32`) and ARM64 (`PMULL` / `CRC32`).
+
+All integer fields in record headers are serialized in **big-endian** format.
 
 ### 1. Client Record Format (`WALC`)
 
@@ -148,12 +136,12 @@ Stored in client node segment files (`stream-<uuid>-<firstSeq>.wal`):
 ```
 +---------------+-------------------+--------------------+------------------+------------------+-------------------------+
 |  Magic (4B)   |  StreamID (16B)   |  StreamSeq (8B)    |   Length (4B)    |   CRC32C (4B)    |     Payload (N bytes)   |
-|   "WALC"      |    (UUIDv4)       | (uint64 big-endian)|(uint32 big-endian|(uint32 big-endian|                         |
+|   "WALC"      |    (UUIDv4)       |      (uint64)      |     (uint32)     |     (uint32)     |                         |
 +---------------+-------------------+--------------------+------------------+------------------+-------------------------+
 |<--------------------------------- Fixed 36-Byte Header ------------------------------------->|
 ```
 
-- **Checksum:** Computed over the 36-byte header (with CRC32C field zeroed during calculation) and the payload bytes.
+- **Checksum:** Computed over the 36-byte header (with CRC32C field zeroed during calculation) and the payload bytes using Castagnoli CRC32C.
 - **Torn Write Protection:** On startup/recovery, `ScanClientSegmentFile` detects trailing partial or corrupted records, creates a backup snapshot (`<file>.<timestamp>.recover`), and truncates the file back to the last clean record boundary.
 
 ### 2. Witness & Segment Log Record Format (`WALL`)
@@ -163,7 +151,7 @@ Stored in buffer service local cache segments and permanent object store segment
 ```
 +---------------+--------------------+-------------------+--------------------+------------------+------------------+-------------------------+
 |  Magic (4B)   |   Position (8B)    |  StreamID (16B)   |  StreamSeq (8B)    |   Length (4B)    |   CRC32C (4B)    |     Payload (N bytes)   |
-|   "WALL"      | (uint64 big-endian)|    (UUIDv4)       | (uint64 big-endian)|(uint32 big-endian|(uint32 big-endian|                         |
+|   "WALL"      |      (uint64)      |    (UUIDv4)       |      (uint64)      |     (uint32)     |     (uint32)     |                         |
 +---------------+--------------------+-------------------+--------------------+------------------+------------------+-------------------------+
 |<------------------------------------------ Fixed 44-Byte Header ------------------------------------------------->|
 ```
@@ -196,20 +184,7 @@ Stored at `wal/manifest.json` in object storage:
 
 ## gRPC Protocol Specification
 
-Defined in `proto/wal.proto`:
-
-```protobuf
-service WalBuffer {
-  // Bidirectional streaming append. First message must be Hello.
-  rpc Append(stream AppendRequest) returns (stream AppendResponse);
-
-  // Force an immediate flush to permanent object storage.
-  rpc Flush(FlushRequest) returns (FlushResponse);
-
-  // Stream merged records in global position order.
-  rpc Tail(TailRequest) returns (stream TailResponse);
-}
-```
+The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) (`WalBuffer` service, `Append`, `Flush`, and `Tail`).
 
 ### Connection Handshake & Replay Semantics
 
@@ -251,6 +226,9 @@ service WalBuffer {
 ## Roadmap & TODO List
 
 - [ ] **Package & Name Refactoring:** Rename `wal` package, proto services, CLI binaries, Docker images, and Kubernetes manifests to `streams` (e.g. `streams-buffer`, `streams-client`, `proto/streams.proto`).
+- [ ] **Eliminate Manifest File:** Remove central `wal/manifest.json` from object storage to avoid atomic single-object contention, race conditions, and consistency bottlenecks; explore self-describing segments and prefix listing / atomic markers instead.
+- [ ] **Opaque Stream Offsets (Hide Global Monotonic Positions):** Hide global buffer monotonic positions from individual stream clients. Clients should only reason about their own `stream_id` and `stream_seq`. Expose global positions only as opaque resumption tokens/cookies for consumers.
+- [ ] **Endianness Standardization (Little-Endian vs Big-Endian):** Evaluate switching binary integer serialization from big-endian to little-endian to match native AMD64 and ARM64 memory representations without byte-swapping overhead.
 - [ ] **Stress & Chaos Testing:**
   - High-concurrency randomized multi-client benchmark tests to stress group commits and tail subscribers.
   - Chaos testing with simulated network partitions, abrupt client/server pod terminations (`SIGKILL`), and disk full conditions.
