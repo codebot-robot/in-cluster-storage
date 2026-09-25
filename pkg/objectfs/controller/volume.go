@@ -124,6 +124,7 @@ func WithStreamID(id uuid.UUID) VolumeOption {
 }
 
 // StreamIDForVolume generates a deterministic UUID for a given volume ID.
+// TODO: Should volume IDs be UUIDs (probably yes)
 func StreamIDForVolume(volumeID string) uuid.UUID {
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("objectfs:"+volumeID))
 }
@@ -196,7 +197,7 @@ func (v *Volume) logMutationLocked(ctx context.Context, record *MutationRecord, 
 	if v.stream == nil {
 		return nil
 	}
-	payload, err := record.Encode()
+	payload, err := EncodeMutationRecord(record)
 	if err != nil {
 		return fmt.Errorf("failed to encode mutation record: %w", err)
 	}
@@ -211,6 +212,7 @@ func (v *Volume) logMutationLocked(ctx context.Context, record *MutationRecord, 
 		durability = *reqLevel
 	}
 
+	// TODO: We normally will also want to write a blob and then wait for both.
 	switch durability {
 	case walclient.Permanent:
 		if err := v.stream.Wait(ctx, seq, walclient.Permanent, true); err != nil {
@@ -434,10 +436,10 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAtt
 
 	rec := &MutationRecord{
 		Type:     MutationMkdir,
-		VolumeID: v.volumeID,
+		VolumeId: v.volumeID,
 		Path:     p,
 		Mode:     mode,
-		ModTime:  now,
+		ModTime:  timestamppb.New(now),
 		Inode:    child.inode,
 	}
 	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
@@ -518,11 +520,11 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 
 		rec := &MutationRecord{
 			Type:     MutationCreateFile,
-			VolumeID: v.volumeID,
+			VolumeId: v.volumeID,
 			Path:     p,
 			Mode:     mode,
 			Size:     int64(len(dataCopy)),
-			ModTime:  now,
+			ModTime:  timestamppb.New(now),
 			Sha256:   hashStr,
 			Inode:    child.inode,
 			Data:     dataCopy,
@@ -556,13 +558,14 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 	parent.children[baseName] = child
 	parent.modTime = now
 
+	// TODO: Orient everything around the structure of these operations, there is no need to translate back-and-forth. We probably could replace our whole protocol with a "DoOperation" method, which then keys on Type to validate etc.
 	rec := &MutationRecord{
 		Type:     MutationCreateFile,
-		VolumeID: v.volumeID,
+		VolumeId: v.volumeID,
 		Path:     p,
 		Mode:     mode,
 		Size:     int64(len(dataCopy)),
-		ModTime:  now,
+		ModTime:  timestamppb.New(now),
 		Sha256:   hashStr,
 		Inode:    child.inode,
 		Data:     dataCopy,
@@ -706,11 +709,11 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 
 	rec := &MutationRecord{
 		Type:     MutationWriteFile,
-		VolumeID: v.volumeID,
+		VolumeId: v.volumeID,
 		Path:     p,
 		Offset:   offset,
 		Size:     node.size,
-		ModTime:  now,
+		ModTime:  timestamppb.New(now),
 		Sha256:   node.sha256,
 		Data:     data,
 	}
@@ -783,10 +786,10 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 
 	rec := &MutationRecord{
 		Type:     MutationTruncateFile,
-		VolumeID: v.volumeID,
+		VolumeId: v.volumeID,
 		Path:     p,
 		Size:     size,
-		ModTime:  now,
+		ModTime:  timestamppb.New(now),
 		Sha256:   node.sha256,
 	}
 	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
@@ -842,9 +845,10 @@ func (v *Volume) Unlink(ctx context.Context, p string) error {
 	parent.modTime = time.Now()
 	v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, p)
 
+	// TODO: Store items in the log more efficiently (e.g. parent inode/dnode and entry name instead of full path). FUSE operates on parent inode and name directly, so aligning record structure with FUSE operations avoids redundant path translations.
 	rec := &MutationRecord{
 		Type:     MutationUnlink,
-		VolumeID: v.volumeID,
+		VolumeId: v.volumeID,
 		Path:     p,
 	}
 	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
@@ -900,7 +904,7 @@ func (v *Volume) Rmdir(ctx context.Context, p string) error {
 
 	rec := &MutationRecord{
 		Type:     MutationRmdir,
-		VolumeID: v.volumeID,
+		VolumeId: v.volumeID,
 		Path:     p,
 	}
 	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
@@ -974,10 +978,10 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 
 	rec := &MutationRecord{
 		Type:     MutationRename,
-		VolumeID: v.volumeID,
+		VolumeId: v.volumeID,
 		Path:     newPath,
 		OldPath:  oldPath,
-		ModTime:  child.modTime,
+		ModTime:  timestamppb.New(child.modTime),
 	}
 	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
 		return nil, err
@@ -1341,7 +1345,10 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		if inode == 0 {
 			inode = v.allocInode()
 		}
-		modTime := record.ModTime
+		var modTime time.Time
+		if record.ModTime != nil {
+			modTime = record.ModTime.AsTime()
+		}
 		if modTime.IsZero() {
 			modTime = time.Now()
 		}
@@ -1387,7 +1394,10 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		if inode == 0 {
 			inode = v.allocInode()
 		}
-		modTime := record.ModTime
+		var modTime time.Time
+		if record.ModTime != nil {
+			modTime = record.ModTime.AsTime()
+		}
 		if modTime.IsZero() {
 			modTime = time.Now()
 		}
@@ -1462,8 +1472,8 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		if record.Sha256 != "" {
 			node.sha256 = record.Sha256
 		}
-		if !record.ModTime.IsZero() {
-			node.modTime = record.ModTime
+		if record.ModTime != nil {
+			node.modTime = record.ModTime.AsTime()
 		}
 		return nil
 
@@ -1479,8 +1489,8 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		if record.Sha256 != "" {
 			node.sha256 = record.Sha256
 		}
-		if !record.ModTime.IsZero() {
-			node.modTime = record.ModTime
+		if record.ModTime != nil {
+			node.modTime = record.ModTime.AsTime()
 		}
 		if node.data != nil {
 			_ = node.data.Rewind()
@@ -1558,8 +1568,8 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		child.name = newBase
 		child.path = newP
 		child.parent = newParent
-		if !record.ModTime.IsZero() {
-			child.modTime = record.ModTime
+		if record.ModTime != nil {
+			child.modTime = record.ModTime.AsTime()
 		}
 		child.mu.Unlock()
 		newParent.children[newBase] = child
@@ -1613,7 +1623,6 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 
 	if v.backend != nil {
 		// 1. Try loading from latest EROFS snapshot
-		snapshotLoaded := false
 		latestSnapshotName, err := v.findLatestSnapshotNameLocked(ctx)
 		if err == nil && latestSnapshotName != "" {
 			snapshotKey := path.Join("volumes", v.volumeID, "meta", latestSnapshotName)
@@ -1623,70 +1632,13 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 				readerAt := bytes.NewReader(imgBuf.Bytes())
 				reader, err := erofs.NewReader(readerAt)
 				if err == nil {
-					if err := v.loadFromErofsSnapshotLocked(reader, readerAt); err == nil {
-						snapshotLoaded = true
-					}
-				}
-			}
-		}
-
-		// 2. Fallback to legacy JSON metadata file
-		if !snapshotLoaded {
-			var metaBuf bytes.Buffer
-			err = v.backend.GetObject(ctx, v.volumeID, MetadataFileName, 0, 0, &metaBuf)
-			if err == nil && metaBuf.Len() > 0 {
-				var meta VolumeMetadata
-				if err := json.Unmarshal(metaBuf.Bytes(), &meta); err == nil {
-					if meta.NextInode > v.nextInode {
-						v.nextInode = meta.NextInode
-					}
-
-					var paths []string
-					for p := range meta.Entries {
-						if p != "/" {
-							paths = append(paths, p)
-						}
-					}
-					sort.Slice(paths, func(i, j int) bool {
-						return len(paths[i]) < len(paths[j])
-					})
-
-					for _, p := range paths {
-						entry := meta.Entries[p]
-						parentPath := path.Dir(p)
-						baseName := path.Base(p)
-
-						parent, err := v.findNodeLocked(parentPath)
-						if err != nil {
-							continue
-						}
-
-						child := &FSNode{
-							inode:   entry.Inode,
-							name:    baseName,
-							path:    entry.Path,
-							isDir:   entry.IsDir,
-							mode:    entry.Mode,
-							size:    entry.Size,
-							modTime: entry.ModTime,
-							sha256:  entry.Sha256,
-							etag:    entry.ETag,
-							parent:  parent,
-							isDirty: false,
-						}
-						if child.isDir {
-							child.children = make(map[string]*FSNode)
-						}
-						parent.children[baseName] = child
-					}
-
-					v.lastFlushedMetadata = &meta
+					_ = v.loadFromErofsSnapshotLocked(reader, readerAt)
 				}
 			}
 		}
 	}
 
-	// 3. Replay recovered records from local WAL stream if available
+	// 2. Replay recovered records from local WAL stream if available
 	if v.stream != nil {
 		recovered := v.stream.RecoveredRecords()
 		if len(recovered) > 0 {

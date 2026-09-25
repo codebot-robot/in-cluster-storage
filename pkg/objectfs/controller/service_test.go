@@ -1437,7 +1437,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	// Apply Mkdir
 	err := vol.ApplyRecordLocked(&MutationRecord{
 		Type:     MutationMkdir,
-		VolumeID: "apply-test",
+		VolumeId: "apply-test",
 		Path:     "/a/b/c",
 		Mode:     0755,
 		Inode:    10,
@@ -1454,7 +1454,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	// Apply CreateFile
 	err = vol.ApplyRecordLocked(&MutationRecord{
 		Type:     MutationCreateFile,
-		VolumeID: "apply-test",
+		VolumeId: "apply-test",
 		Path:     "/a/b/c/foo.txt",
 		Mode:     0644,
 		Size:     4,
@@ -1473,7 +1473,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	// Apply TruncateFile
 	err = vol.ApplyRecordLocked(&MutationRecord{
 		Type:     MutationTruncateFile,
-		VolumeID: "apply-test",
+		VolumeId: "apply-test",
 		Path:     "/a/b/c/foo.txt",
 		Size:     2,
 	})
@@ -1488,7 +1488,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	// Apply Rename
 	err = vol.ApplyRecordLocked(&MutationRecord{
 		Type:     MutationRename,
-		VolumeID: "apply-test",
+		VolumeId: "apply-test",
 		OldPath:  "/a/b/c/foo.txt",
 		Path:     "/a/b/c/bar.txt",
 	})
@@ -1507,7 +1507,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	// Apply Unlink
 	err = vol.ApplyRecordLocked(&MutationRecord{
 		Type:     MutationUnlink,
-		VolumeID: "apply-test",
+		VolumeId: "apply-test",
 		Path:     "/a/b/c/bar.txt",
 	})
 	if err != nil {
@@ -1521,7 +1521,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	// Apply Rmdir
 	err = vol.ApplyRecordLocked(&MutationRecord{
 		Type:     MutationRmdir,
-		VolumeID: "apply-test",
+		VolumeId: "apply-test",
 		Path:     "/a/b/c",
 	})
 	if err != nil {

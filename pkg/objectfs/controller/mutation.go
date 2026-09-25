@@ -17,49 +17,38 @@ limitations under the License.
 package controller
 
 import (
-	"encoding/json"
 	"fmt"
-	"time"
+
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"google.golang.org/protobuf/proto"
 )
 
-// MutationType identifies the kind of filesystem metadata mutation.
-type MutationType string
+// MutationType aliases the protobuf MutationType enum.
+type MutationType = pb.MutationType
 
 const (
-	MutationMkdir        MutationType = "MKDIR"
-	MutationCreateFile   MutationType = "CREATE_FILE"
-	MutationWriteFile    MutationType = "WRITE_FILE"
-	MutationTruncateFile MutationType = "TRUNCATE_FILE"
-	MutationUnlink       MutationType = "UNLINK"
-	MutationRmdir        MutationType = "RMDIR"
-	MutationRename       MutationType = "RENAME"
+	MutationTypeUnspecified = pb.MutationType_MUTATION_TYPE_UNSPECIFIED
+	MutationMkdir           = pb.MutationType_MUTATION_TYPE_MKDIR
+	MutationCreateFile      = pb.MutationType_MUTATION_TYPE_CREATE_FILE
+	MutationWriteFile       = pb.MutationType_MUTATION_TYPE_WRITE_FILE
+	MutationTruncateFile    = pb.MutationType_MUTATION_TYPE_TRUNCATE_FILE
+	MutationUnlink          = pb.MutationType_MUTATION_TYPE_UNLINK
+	MutationRmdir           = pb.MutationType_MUTATION_TYPE_RMDIR
+	MutationRename          = pb.MutationType_MUTATION_TYPE_RENAME
 )
 
-// MutationRecord represents a discrete metadata change-log record in the Streams WAL.
-type MutationRecord struct {
-	Type      MutationType `json:"type"`
-	VolumeID  string       `json:"volume_id"`
-	Path      string       `json:"path,omitempty"`
-	OldPath   string       `json:"old_path,omitempty"`
-	Mode      uint32       `json:"mode,omitempty"`
-	Size      int64        `json:"size,omitempty"`
-	Offset    int64        `json:"offset,omitempty"`
-	ModTime   time.Time    `json:"mod_time,omitempty"`
-	Sha256    string       `json:"sha256,omitempty"`
-	Inode     uint64       `json:"inode,omitempty"`
-	Data      []byte       `json:"data,omitempty"`
-	StreamSeq uint64       `json:"stream_seq,omitempty"`
+// MutationRecord aliases the protobuf MutationRecord message.
+type MutationRecord = pb.MutationRecord
+
+// EncodeMutationRecord serializes a MutationRecord to protobuf bytes.
+func EncodeMutationRecord(m *pb.MutationRecord) ([]byte, error) {
+	return proto.Marshal(m)
 }
 
-// Encode serializes the MutationRecord to JSON bytes.
-func (m *MutationRecord) Encode() ([]byte, error) {
-	return json.Marshal(m)
-}
-
-// DecodeMutationRecord parses a MutationRecord from JSON bytes.
-func DecodeMutationRecord(data []byte) (*MutationRecord, error) {
-	var record MutationRecord
-	if err := json.Unmarshal(data, &record); err != nil {
+// DecodeMutationRecord parses a MutationRecord from protobuf bytes.
+func DecodeMutationRecord(data []byte) (*pb.MutationRecord, error) {
+	var record pb.MutationRecord
+	if err := proto.Unmarshal(data, &record); err != nil {
 		return nil, fmt.Errorf("failed to decode mutation record: %w", err)
 	}
 	return &record, nil

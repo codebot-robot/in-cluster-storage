@@ -73,6 +73,7 @@ func main() {
 	}
 
 	var serverOpts []controller.ServerOption
+	// TODO: We always want to assume a WAL, and maybe it would be nice to have a wal-client mode that was local-only e.g. for testing.
 	if *walDir != "" {
 		durability := walclient.Local
 		switch strings.ToLower(*walDurability) {
