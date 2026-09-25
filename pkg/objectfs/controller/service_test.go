@@ -20,12 +20,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
+	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"google.golang.org/grpc"
 )
 
 func TestControllerServiceOperations(t *testing.T) {
@@ -1100,5 +1105,430 @@ func TestSnapshotsServicePagination(t *testing.T) {
 	}
 	if len(toTimeResp.GetSnapshots()) < 2 {
 		t.Fatalf("Expected at least 2 snapshots up to snap2, got %d", len(toTimeResp.GetSnapshots()))
+	}
+}
+
+func startTestWalBufferServer(t *testing.T, dir string) (*walbuffer.Server, string, func()) {
+	ctx := t.Context()
+	srv, err := walbuffer.NewServer(ctx, walbuffer.ServerConfig{
+		Backend:       NewMemoryBackend(),
+		DataDir:       dir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 2 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create walbuffer server: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for walbuffer: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	walpb.RegisterWalBufferServer(grpcServer, srv)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	cleanup := func() {
+		grpcServer.Stop()
+		_ = srv.Close()
+		_ = listener.Close()
+	}
+
+	return srv, listener.Addr().String(), cleanup
+}
+
+func TestStreamsChangeLogLogging(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	defer func() { _ = server.Close() }()
+
+	volumeID := "wal-vol-test"
+
+	// 1. Mkdir should append a mutation record
+	mkdirResp, err := server.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId: volumeID,
+		Path:     "/testdir",
+		Mode:     0755,
+	})
+	if err != nil {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+	if mkdirResp.Attr.Name != "testdir" {
+		t.Fatalf("Unexpected mkdir name: %s", mkdirResp.Attr.Name)
+	}
+
+	vol := server.GetVolume(volumeID)
+	if vol == nil || vol.Stream() == nil {
+		t.Fatalf("Expected volume to have an active WAL stream")
+	}
+
+	localSeq, _, _ := vol.Stream().Watermarks()
+	if localSeq < 1 {
+		t.Fatalf("Expected localSeq >= 1 after Mkdir, got %d", localSeq)
+	}
+
+	// 2. CreateFile should log to stream
+	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/testdir/data.txt",
+		Mode:           0644,
+		InitialContent: []byte("hello streams"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	if createResp.Attr.Size != int64(len("hello streams")) {
+		t.Fatalf("Unexpected size: %d", createResp.Attr.Size)
+	}
+
+	localSeq2, _, _ := vol.Stream().Watermarks()
+	if localSeq2 <= localSeq {
+		t.Fatalf("Expected localSeq to advance after CreateFile: %d -> %d", localSeq, localSeq2)
+	}
+
+	// 3. WriteFile should log to stream
+	writeResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Path:     "/testdir/data.txt",
+		Offset:   5,
+		Data:     []byte(" world!"),
+	})
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if writeResp.BytesWritten != int64(len(" world!")) {
+		t.Fatalf("Unexpected bytes written: %d", writeResp.BytesWritten)
+	}
+
+	// 4. TruncateFile should log to stream
+	truncResp, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{
+		VolumeId: volumeID,
+		Path:     "/testdir/data.txt",
+		Size:     5,
+	})
+	if err != nil {
+		t.Fatalf("TruncateFile failed: %v", err)
+	}
+	if truncResp.Attr.Size != 5 {
+		t.Fatalf("Unexpected truncated size: %d", truncResp.Attr.Size)
+	}
+
+	// 5. Rename should log to stream
+	renameResp, err := server.Rename(ctx, &pb.RenameRequest{
+		VolumeId: volumeID,
+		OldPath:  "/testdir/data.txt",
+		NewPath:  "/testdir/renamed.txt",
+	})
+	if err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+	if renameResp.Attr.Name != "renamed.txt" {
+		t.Fatalf("Unexpected rename name: %s", renameResp.Attr.Name)
+	}
+
+	// 6. Unlink should log to stream
+	_, err = server.Unlink(ctx, &pb.UnlinkRequest{
+		VolumeId: volumeID,
+		Path:     "/testdir/renamed.txt",
+	})
+	if err != nil {
+		t.Fatalf("Unlink failed: %v", err)
+	}
+
+	// 7. Rmdir should log to stream
+	_, err = server.Rmdir(ctx, &pb.RmdirRequest{
+		VolumeId: volumeID,
+		Path:     "/testdir",
+	})
+	if err != nil {
+		t.Fatalf("Rmdir failed: %v", err)
+	}
+
+	// Verify sequential records were logged
+	finalSeq, _, _ := vol.Stream().Watermarks()
+	if finalSeq < 7 {
+		t.Fatalf("Expected at least 7 mutation records logged, got %d", finalSeq)
+	}
+}
+
+func TestStreamsCrashRecoveryReplay(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "recovery-vol"
+
+	// Step 1: Initialize server 1 and perform initial changes
+	server1 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	_, err := server1.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId: volumeID,
+		Path:     "/base",
+		Mode:     0755,
+	})
+	if err != nil {
+		t.Fatalf("server1 Mkdir failed: %v", err)
+	}
+	_, err = server1.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/base/initial.txt",
+		Mode:           0644,
+		InitialContent: []byte("initial snapshot content"),
+	})
+	if err != nil {
+		t.Fatalf("server1 CreateFile failed: %v", err)
+	}
+
+	// Step 2: Flush EROFS snapshot to backend
+	vol1 := server1.GetVolume(volumeID)
+	snapName, err := vol1.CreateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+	if snapName == "" {
+		t.Fatalf("Empty snapshot name returned")
+	}
+
+	// Step 3: Perform mutations AFTER snapshot (these are in the WAL change-log, not in snapshot)
+	_, err = server1.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/base/post_snapshot.txt",
+		Mode:           0644,
+		InitialContent: []byte("post snapshot content"),
+	})
+	if err != nil {
+		t.Fatalf("server1 CreateFile post snapshot failed: %v", err)
+	}
+
+	_, err = server1.Rename(ctx, &pb.RenameRequest{
+		VolumeId: volumeID,
+		OldPath:  "/base/initial.txt",
+		NewPath:  "/base/renamed_initial.txt",
+	})
+	if err != nil {
+		t.Fatalf("server1 Rename failed: %v", err)
+	}
+
+	// Simulate crash: close server1 without flushing snapshot to backend
+	_ = server1.Close()
+
+	// Step 4: Start new server instance with same backend and walDir
+	server2 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	defer func() { _ = server2.Close() }()
+
+	vol2 := server2.GetVolume(volumeID)
+	if vol2 == nil {
+		t.Fatalf("Failed to get recovered volume")
+	}
+
+	// Verify that state reflects both the snapshot AND replayed WAL mutations:
+	// - /base should exist
+	baseAttr, err := server2.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/base"})
+	if err != nil || !baseAttr.Attr.IsDir {
+		t.Fatalf("Recovered base directory missing or not dir: %v", err)
+	}
+
+	// - /base/initial.txt should have been renamed to /base/renamed_initial.txt
+	_, err = server2.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/base/initial.txt"})
+	if err == nil {
+		t.Fatalf("Expected /base/initial.txt to not exist after rename replay")
+	}
+
+	renamedAttr, err := server2.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/base/renamed_initial.txt"})
+	if err != nil {
+		t.Fatalf("Expected /base/renamed_initial.txt to exist: %v", err)
+	}
+	if renamedAttr.Attr.Size != int64(len("initial snapshot content")) {
+		t.Fatalf("Unexpected size on renamed file: %d", renamedAttr.Attr.Size)
+	}
+
+	// - /base/post_snapshot.txt should exist and have correct size and content
+	readResp, err := server2.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Path:     "/base/post_snapshot.txt",
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil {
+		t.Fatalf("ReadFile on replayed post-snapshot file failed: %v", err)
+	}
+	if string(readResp.Data) != "post snapshot content" {
+		t.Fatalf("Unexpected data in replayed file: %q", string(readResp.Data))
+	}
+}
+
+func TestStreamsDurabilityModes(t *testing.T) {
+	bufDir := t.TempDir()
+	_, target, cleanup := startTestWalBufferServer(t, bufDir)
+	defer cleanup()
+
+	clientDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "durability-vol"
+
+	// Create server with Witness durability
+	server := NewServer(backend, WithServerWAL(clientDir, target, walclient.Witness))
+	defer func() { _ = server.Close() }()
+
+	ctx := t.Context()
+
+	// 1. Mkdir with default durability (Witness)
+	_, err := server.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId: volumeID,
+		Path:     "/witness_dir",
+		Mode:     0755,
+	})
+	if err != nil {
+		t.Fatalf("Mkdir with Witness durability failed: %v", err)
+	}
+
+	vol := server.GetVolume(volumeID)
+	local, witness, _ := vol.Stream().Watermarks()
+	if local < 1 || witness < 1 {
+		t.Fatalf("Expected local >= 1 and witness >= 1, got local=%d, witness=%d", local, witness)
+	}
+
+	// 2. WriteFile with WRITE_THROUGH_FSYNC (Permanent)
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/witness_dir/file.bin",
+		Mode:           0644,
+		InitialContent: []byte("data"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Path:      "/witness_dir/file.bin",
+		Offset:    4,
+		Data:      []byte("more"),
+		WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
+	})
+	if err != nil {
+		t.Fatalf("WriteFile with WRITE_THROUGH_FSYNC failed: %v", err)
+	}
+
+	_, _, permanent := vol.Stream().Watermarks()
+	if permanent < 1 {
+		t.Fatalf("Expected permanent watermark >= 1 after WRITE_THROUGH_FSYNC, got %d", permanent)
+	}
+
+	// 3. Fsync RPC flushes stream
+	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Path:     "/witness_dir/file.bin",
+	})
+	if err != nil || !fsyncResp.GetSuccess() {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+}
+
+func TestApplyRecordDirect(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	vol := NewVolume("apply-test", backend, NewEventBroadcaster())
+
+	// Apply Mkdir
+	err := vol.ApplyRecordLocked(&MutationRecord{
+		Type:     MutationMkdir,
+		VolumeID: "apply-test",
+		Path:     "/a/b/c",
+		Mode:     0755,
+		Inode:    10,
+	})
+	if err != nil {
+		t.Fatalf("Apply Mkdir failed: %v", err)
+	}
+
+	attr, err := vol.GetAttr(ctx, "/a/b/c")
+	if err != nil || !attr.IsDir {
+		t.Fatalf("Expected directory /a/b/c: %v", err)
+	}
+
+	// Apply CreateFile
+	err = vol.ApplyRecordLocked(&MutationRecord{
+		Type:     MutationCreateFile,
+		VolumeID: "apply-test",
+		Path:     "/a/b/c/foo.txt",
+		Mode:     0644,
+		Size:     4,
+		Inode:    11,
+		Data:     []byte("test"),
+	})
+	if err != nil {
+		t.Fatalf("Apply CreateFile failed: %v", err)
+	}
+
+	data, total, _, err := vol.ReadFile(ctx, "/a/b/c/foo.txt", 0, 100)
+	if err != nil || total != 4 || string(data) != "test" {
+		t.Fatalf("Unexpected file content: %s (err: %v)", string(data), err)
+	}
+
+	// Apply TruncateFile
+	err = vol.ApplyRecordLocked(&MutationRecord{
+		Type:     MutationTruncateFile,
+		VolumeID: "apply-test",
+		Path:     "/a/b/c/foo.txt",
+		Size:     2,
+	})
+	if err != nil {
+		t.Fatalf("Apply TruncateFile failed: %v", err)
+	}
+	data, total, _, err = vol.ReadFile(ctx, "/a/b/c/foo.txt", 0, 100)
+	if err != nil || total != 2 || string(data) != "te" {
+		t.Fatalf("Unexpected truncated content: %s (err: %v)", string(data), err)
+	}
+
+	// Apply Rename
+	err = vol.ApplyRecordLocked(&MutationRecord{
+		Type:     MutationRename,
+		VolumeID: "apply-test",
+		OldPath:  "/a/b/c/foo.txt",
+		Path:     "/a/b/c/bar.txt",
+	})
+	if err != nil {
+		t.Fatalf("Apply Rename failed: %v", err)
+	}
+	_, err = vol.GetAttr(ctx, "/a/b/c/foo.txt")
+	if err == nil {
+		t.Fatalf("Expected /a/b/c/foo.txt to be removed after rename")
+	}
+	barAttr, err := vol.GetAttr(ctx, "/a/b/c/bar.txt")
+	if err != nil || barAttr.Name != "bar.txt" {
+		t.Fatalf("Expected /a/b/c/bar.txt to exist: %v", err)
+	}
+
+	// Apply Unlink
+	err = vol.ApplyRecordLocked(&MutationRecord{
+		Type:     MutationUnlink,
+		VolumeID: "apply-test",
+		Path:     "/a/b/c/bar.txt",
+	})
+	if err != nil {
+		t.Fatalf("Apply Unlink failed: %v", err)
+	}
+	_, err = vol.GetAttr(ctx, "/a/b/c/bar.txt")
+	if err == nil {
+		t.Fatalf("Expected /a/b/c/bar.txt to be unlinked")
+	}
+
+	// Apply Rmdir
+	err = vol.ApplyRecordLocked(&MutationRecord{
+		Type:     MutationRmdir,
+		VolumeID: "apply-test",
+		Path:     "/a/b/c",
+	})
+	if err != nil {
+		t.Fatalf("Apply Rmdir failed: %v", err)
+	}
+	_, err = vol.GetAttr(ctx, "/a/b/c")
+	if err == nil {
+		t.Fatalf("Expected /a/b/c to be deleted")
 	}
 }

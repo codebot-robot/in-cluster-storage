@@ -30,6 +30,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
 )
@@ -39,6 +40,9 @@ var (
 	csiEndpoint   = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
 	backendFlag   = flag.String("backend", "memory://", "Object storage backend URL (e.g. memory://, file:///path, s3://bucket/prefix, gs://bucket/prefix)")
 	flushInterval = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
+	walDir        = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
+	walTarget     = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer:50051)")
+	walDurability = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
 )
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -68,8 +72,25 @@ func main() {
 		klog.Fatalf("failed to initialize backend %q: %v", *backendFlag, err)
 	}
 
+	var serverOpts []controller.ServerOption
+	if *walDir != "" {
+		durability := walclient.Local
+		switch strings.ToLower(*walDurability) {
+		case "witness":
+			durability = walclient.Witness
+		case "permanent":
+			durability = walclient.Permanent
+		case "local":
+			durability = walclient.Local
+		default:
+			klog.Fatalf("invalid wal-durability: %s (must be local, witness, or permanent)", *walDurability)
+		}
+		serverOpts = append(serverOpts, controller.WithServerWAL(*walDir, *walTarget, durability))
+	}
+
 	grpcServer := grpc.NewServer()
-	server := controller.NewServer(backend)
+	server := controller.NewServer(backend, serverOpts...)
+	defer server.Close()
 	csiController := controller.NewCSIController(server)
 
 	if *flushInterval > 0 {

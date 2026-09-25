@@ -35,6 +35,9 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal"
+	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -88,11 +91,44 @@ type Volume struct {
 	broadcaster  *EventBroadcaster
 	maxInlineLen int64
 
+	stream     walclient.Stream
+	durability walclient.Level
+	streamID   uuid.UUID
+
 	lastFlushedMetadata    *VolumeMetadata
 	deletedPathsSinceFlush []string
 }
 
-func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *EventBroadcaster) *Volume {
+// VolumeOption configures a Volume instance.
+type VolumeOption func(*Volume)
+
+// WithStream sets the WAL stream for metadata change-logging.
+func WithStream(stream walclient.Stream) VolumeOption {
+	return func(v *Volume) {
+		v.stream = stream
+	}
+}
+
+// WithDurability sets the default durability level for metadata changes.
+func WithDurability(level walclient.Level) VolumeOption {
+	return func(v *Volume) {
+		v.durability = level
+	}
+}
+
+// WithStreamID sets an explicit Stream UUID for this volume.
+func WithStreamID(id uuid.UUID) VolumeOption {
+	return func(v *Volume) {
+		v.streamID = id
+	}
+}
+
+// StreamIDForVolume generates a deterministic UUID for a given volume ID.
+func StreamIDForVolume(volumeID string) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("objectfs:"+volumeID))
+}
+
+func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *EventBroadcaster, opts ...VolumeOption) *Volume {
 	var blobStore *blob.Store
 	if backend != nil {
 		blobStore = blob.NewStore(backend, 0)
@@ -104,6 +140,11 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		blobStore:    blobStore,
 		broadcaster:  broadcaster,
 		maxInlineLen: 4 * 1024 * 1024, // 4MB default inline threshold
+		durability:   walclient.Local,
+		streamID:     StreamIDForVolume(volumeID),
+	}
+	for _, opt := range opts {
+		opt(v)
 	}
 	v.root = &FSNode{
 		inode:    v.allocInode(),
@@ -115,6 +156,74 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		children: make(map[string]*FSNode),
 	}
 	return v
+}
+
+// VolumeID returns the volume identifier.
+func (v *Volume) VolumeID() string {
+	return v.volumeID
+}
+
+// Stream returns the configured WAL stream, or nil.
+func (v *Volume) Stream() walclient.Stream {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.stream
+}
+
+// StreamID returns the stream UUID associated with this volume.
+func (v *Volume) StreamID() uuid.UUID {
+	return v.streamID
+}
+
+// Durability returns the default durability level configured on this volume.
+func (v *Volume) Durability() walclient.Level {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.durability
+}
+
+// Close closes the volume and any underlying WAL streams.
+func (v *Volume) Close() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.stream != nil {
+		return v.stream.Close()
+	}
+	return nil
+}
+
+func (v *Volume) logMutationLocked(ctx context.Context, record *MutationRecord, reqLevel *walclient.Level) error {
+	if v.stream == nil {
+		return nil
+	}
+	payload, err := record.Encode()
+	if err != nil {
+		return fmt.Errorf("failed to encode mutation record: %w", err)
+	}
+	seq, err := v.stream.Append(ctx, payload)
+	if err != nil {
+		return fmt.Errorf("failed to append mutation to WAL stream: %w", err)
+	}
+	record.StreamSeq = seq
+
+	durability := v.durability
+	if reqLevel != nil {
+		durability = *reqLevel
+	}
+
+	switch durability {
+	case walclient.Permanent:
+		if err := v.stream.Wait(ctx, seq, walclient.Permanent, true); err != nil {
+			return fmt.Errorf("failed waiting for permanent durability: %w", err)
+		}
+	case walclient.Witness:
+		if err := v.stream.Wait(ctx, seq, walclient.Witness, false); err != nil {
+			return fmt.Errorf("failed waiting for witness durability: %w", err)
+		}
+	case walclient.Local:
+		// Append already fsynced locally
+	}
+	return nil
 }
 
 func (v *Volume) allocInode() uint64 {
@@ -323,6 +432,19 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAtt
 	parent.children[baseName] = child
 	parent.modTime = now
 
+	rec := &MutationRecord{
+		Type:     MutationMkdir,
+		VolumeID: v.volumeID,
+		Path:     p,
+		Mode:     mode,
+		ModTime:  now,
+		Inode:    child.inode,
+	}
+	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
+		delete(parent.children, baseName)
+		return nil, err
+	}
+
 	attr := child.toEntryAttrLocked()
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_CREATED,
@@ -393,6 +515,22 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 		child.modTime = now
 		child.sha256 = hashStr
 		child.isDirty = true
+
+		rec := &MutationRecord{
+			Type:     MutationCreateFile,
+			VolumeID: v.volumeID,
+			Path:     p,
+			Mode:     mode,
+			Size:     int64(len(dataCopy)),
+			ModTime:  now,
+			Sha256:   hashStr,
+			Inode:    child.inode,
+			Data:     dataCopy,
+		}
+		if err := v.logMutationLocked(ctx, rec, nil); err != nil {
+			return nil, err
+		}
+
 		attr := child.toEntryAttrLocked()
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -417,6 +555,22 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 	}
 	parent.children[baseName] = child
 	parent.modTime = now
+
+	rec := &MutationRecord{
+		Type:     MutationCreateFile,
+		VolumeID: v.volumeID,
+		Path:     p,
+		Mode:     mode,
+		Size:     int64(len(dataCopy)),
+		ModTime:  now,
+		Sha256:   hashStr,
+		Inode:    child.inode,
+		Data:     dataCopy,
+	}
+	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
+		delete(parent.children, baseName)
+		return nil, err
+	}
 
 	attr := child.toEntryAttrLocked()
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -537,6 +691,33 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 		}
 	}
 
+	var reqLevel *walclient.Level
+	switch writeMode {
+	case pb.WriteMode_WRITE_THROUGH_FSYNC:
+		l := walclient.Permanent
+		reqLevel = &l
+	case pb.WriteMode_EAGER_REPLICATION:
+		l := walclient.Witness
+		reqLevel = &l
+	case pb.WriteMode_LAZY_WRITE:
+		l := walclient.Local
+		reqLevel = &l
+	}
+
+	rec := &MutationRecord{
+		Type:     MutationWriteFile,
+		VolumeID: v.volumeID,
+		Path:     p,
+		Offset:   offset,
+		Size:     node.size,
+		ModTime:  now,
+		Sha256:   node.sha256,
+		Data:     data,
+	}
+	if err := v.logMutationLocked(ctx, rec, reqLevel); err != nil {
+		return 0, 0, time.Time{}, err
+	}
+
 	attr := node.toEntryAttrLocked()
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -600,6 +781,18 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 		}
 	}
 
+	rec := &MutationRecord{
+		Type:     MutationTruncateFile,
+		VolumeID: v.volumeID,
+		Path:     p,
+		Size:     size,
+		ModTime:  now,
+		Sha256:   node.sha256,
+	}
+	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
+		return nil, err
+	}
+
 	attr := node.toEntryAttrLocked()
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -649,6 +842,15 @@ func (v *Volume) Unlink(ctx context.Context, p string) error {
 	parent.modTime = time.Now()
 	v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, p)
 
+	rec := &MutationRecord{
+		Type:     MutationUnlink,
+		VolumeID: v.volumeID,
+		Path:     p,
+	}
+	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
+		return err
+	}
+
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_DELETED,
 		Path:      p,
@@ -695,6 +897,15 @@ func (v *Volume) Rmdir(ctx context.Context, p string) error {
 
 	delete(parent.children, baseName)
 	parent.modTime = time.Now()
+
+	rec := &MutationRecord{
+		Type:     MutationRmdir,
+		VolumeID: v.volumeID,
+		Path:     p,
+	}
+	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
+		return err
+	}
 
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_DELETED,
@@ -761,6 +972,17 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 	newParent.modTime = time.Now()
 	v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, oldPath)
 
+	rec := &MutationRecord{
+		Type:     MutationRename,
+		VolumeID: v.volumeID,
+		Path:     newPath,
+		OldPath:  oldPath,
+		ModTime:  child.modTime,
+	}
+	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
+		return nil, err
+	}
+
 	attr := child.toEntryAttrLocked()
 	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_RENAMED,
@@ -776,7 +998,15 @@ func (v *Volume) Fsync(ctx context.Context, p string) error {
 	v.mu.RLock()
 	_, err := v.findNodeLocked(p)
 	v.mu.RUnlock()
-	return err
+	if err != nil {
+		return err
+	}
+	if v.stream != nil {
+		if err := v.stream.Flush(ctx); err != nil {
+			return fmt.Errorf("failed to flush WAL stream: %w", err)
+		}
+	}
+	return nil
 }
 
 type bufferWriterAt struct {
@@ -1054,87 +1284,418 @@ func (v *Volume) loadFromErofsSnapshotLocked(reader *erofs.Reader, rawReader io.
 	return nil
 }
 
+func (v *Volume) findOrCreateDirParentsLocked(p string) (*FSNode, error) {
+	p = cleanPath(p)
+	if p == "/" {
+		return v.root, nil
+	}
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	curr := v.root
+	currentPath := ""
+	for _, part := range parts {
+		currentPath = path.Join(currentPath, part)
+		curr.mu.Lock()
+		child, ok := curr.children[part]
+		if !ok {
+			child = &FSNode{
+				inode:    v.allocInode(),
+				name:     part,
+				path:     "/" + currentPath,
+				isDir:    true,
+				mode:     0755 | syscall.S_IFDIR,
+				modTime:  time.Now(),
+				children: make(map[string]*FSNode),
+				parent:   curr,
+			}
+			curr.children[part] = child
+		}
+		curr.mu.Unlock()
+		curr = child
+	}
+	return curr, nil
+}
+
+// ApplyRecordLocked applies a single mutation record to the in-memory filesystem tree.
+func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
+	if record.Inode >= v.nextInode {
+		v.nextInode = record.Inode + 1
+	}
+	switch record.Type {
+	case MutationMkdir:
+		p := cleanPath(record.Path)
+		if p == "/" {
+			return nil
+		}
+		parentPath := path.Dir(p)
+		baseName := path.Base(p)
+		parent, err := v.findOrCreateDirParentsLocked(parentPath)
+		if err != nil {
+			return err
+		}
+		mode := record.Mode
+		if mode == 0 {
+			mode = 0755
+		}
+		mode |= syscall.S_IFDIR
+		inode := record.Inode
+		if inode == 0 {
+			inode = v.allocInode()
+		}
+		modTime := record.ModTime
+		if modTime.IsZero() {
+			modTime = time.Now()
+		}
+		parent.mu.Lock()
+		defer parent.mu.Unlock()
+		child, exists := parent.children[baseName]
+		if !exists {
+			child = &FSNode{
+				inode:    inode,
+				name:     baseName,
+				path:     p,
+				isDir:    true,
+				mode:     mode,
+				modTime:  modTime,
+				children: make(map[string]*FSNode),
+				parent:   parent,
+			}
+			parent.children[baseName] = child
+		} else {
+			child.mode = mode
+			child.modTime = modTime
+		}
+		parent.modTime = modTime
+		return nil
+
+	case MutationCreateFile:
+		p := cleanPath(record.Path)
+		if p == "/" {
+			return fmt.Errorf("cannot create file at root: %w", syscall.EISDIR)
+		}
+		parentPath := path.Dir(p)
+		baseName := path.Base(p)
+		parent, err := v.findOrCreateDirParentsLocked(parentPath)
+		if err != nil {
+			return err
+		}
+		mode := record.Mode
+		if mode == 0 {
+			mode = 0644
+		}
+		mode |= syscall.S_IFREG
+		inode := record.Inode
+		if inode == 0 {
+			inode = v.allocInode()
+		}
+		modTime := record.ModTime
+		if modTime.IsZero() {
+			modTime = time.Now()
+		}
+		var stream blob.ByteStream
+		if len(record.Data) > 0 {
+			stream = blob.NewByteStreamFromBytes(record.Data)
+		}
+		parent.mu.Lock()
+		defer parent.mu.Unlock()
+		child, exists := parent.children[baseName]
+		if exists {
+			child.mu.Lock()
+			if child.data != nil {
+				_ = child.data.Close()
+			}
+			child.mode = mode
+			child.size = record.Size
+			child.modTime = modTime
+			child.sha256 = record.Sha256
+			child.data = stream
+			child.isDirty = false
+			child.mu.Unlock()
+		} else {
+			child = &FSNode{
+				inode:   inode,
+				name:    baseName,
+				path:    p,
+				isDir:   false,
+				mode:    mode,
+				size:    record.Size,
+				modTime: modTime,
+				data:    stream,
+				sha256:  record.Sha256,
+				parent:  parent,
+				isDirty: false,
+			}
+			parent.children[baseName] = child
+		}
+		parent.modTime = modTime
+		return nil
+
+	case MutationWriteFile:
+		p := cleanPath(record.Path)
+		node, err := v.findNodeLocked(p)
+		if err != nil {
+			return err
+		}
+		node.mu.Lock()
+		defer node.mu.Unlock()
+		if len(record.Data) > 0 {
+			var currentData []byte
+			if node.data != nil {
+				_ = node.data.Rewind()
+				currentData, _ = io.ReadAll(node.data)
+				_ = node.data.Close()
+			}
+			neededLen := record.Offset + int64(len(record.Data))
+			if neededLen > int64(len(currentData)) {
+				newBuf := make([]byte, neededLen)
+				copy(newBuf, currentData)
+				currentData = newBuf
+			}
+			copy(currentData[record.Offset:], record.Data)
+			if node.size < int64(len(currentData)) {
+				node.size = int64(len(currentData))
+			}
+			node.data = blob.NewByteStreamFromBytes(currentData)
+		}
+		if record.Size > 0 {
+			node.size = record.Size
+		}
+		if record.Sha256 != "" {
+			node.sha256 = record.Sha256
+		}
+		if !record.ModTime.IsZero() {
+			node.modTime = record.ModTime
+		}
+		return nil
+
+	case MutationTruncateFile:
+		p := cleanPath(record.Path)
+		node, err := v.findNodeLocked(p)
+		if err != nil {
+			return err
+		}
+		node.mu.Lock()
+		defer node.mu.Unlock()
+		node.size = record.Size
+		if record.Sha256 != "" {
+			node.sha256 = record.Sha256
+		}
+		if !record.ModTime.IsZero() {
+			node.modTime = record.ModTime
+		}
+		if node.data != nil {
+			_ = node.data.Rewind()
+			currentData, _ := io.ReadAll(node.data)
+			_ = node.data.Close()
+			if record.Size < int64(len(currentData)) {
+				currentData = currentData[:record.Size]
+			} else if record.Size > int64(len(currentData)) {
+				newBuf := make([]byte, record.Size)
+				copy(newBuf, currentData)
+				currentData = newBuf
+			}
+			node.data = blob.NewByteStreamFromBytes(currentData)
+		}
+		return nil
+
+	case MutationUnlink:
+		p := cleanPath(record.Path)
+		parentPath := path.Dir(p)
+		baseName := path.Base(p)
+		parent, err := v.findNodeLocked(parentPath)
+		if err != nil {
+			return nil
+		}
+		parent.mu.Lock()
+		defer parent.mu.Unlock()
+		if child, ok := parent.children[baseName]; ok {
+			if child.data != nil {
+				_ = child.data.Close()
+			}
+			delete(parent.children, baseName)
+		}
+		return nil
+
+	case MutationRmdir:
+		p := cleanPath(record.Path)
+		parentPath := path.Dir(p)
+		baseName := path.Base(p)
+		parent, err := v.findNodeLocked(parentPath)
+		if err != nil {
+			return nil
+		}
+		parent.mu.Lock()
+		defer parent.mu.Unlock()
+		delete(parent.children, baseName)
+		return nil
+
+	case MutationRename:
+		oldP := cleanPath(record.OldPath)
+		newP := cleanPath(record.Path)
+		oldParentPath := path.Dir(oldP)
+		oldBase := path.Base(oldP)
+		newParentPath := path.Dir(newP)
+		newBase := path.Base(newP)
+		oldParent, err := v.findNodeLocked(oldParentPath)
+		if err != nil {
+			return err
+		}
+		newParent, err := v.findOrCreateDirParentsLocked(newParentPath)
+		if err != nil {
+			return err
+		}
+		oldParent.mu.Lock()
+		defer oldParent.mu.Unlock()
+		child, ok := oldParent.children[oldBase]
+		if !ok {
+			return fmt.Errorf("rename source not found: %s", oldP)
+		}
+		if oldParent != newParent {
+			newParent.mu.Lock()
+			defer newParent.mu.Unlock()
+		}
+		delete(oldParent.children, oldBase)
+		child.mu.Lock()
+		child.name = newBase
+		child.path = newP
+		child.parent = newParent
+		if !record.ModTime.IsZero() {
+			child.modTime = record.ModTime
+		}
+		child.mu.Unlock()
+		newParent.children[newBase] = child
+		return nil
+
+	default:
+		return fmt.Errorf("unknown mutation type: %s", record.Type)
+	}
+}
+
+func (v *Volume) replayRecordsLocked(records []*MutationRecord) error {
+	for _, rec := range records {
+		if err := v.ApplyRecordLocked(rec); err != nil {
+			return fmt.Errorf("failed to apply record %v: %w", rec, err)
+		}
+	}
+	return nil
+}
+
+func (v *Volume) replayClientRecordsLocked(records []*wal.ClientRecord) error {
+	for _, cr := range records {
+		mut, err := DecodeMutationRecord(cr.Payload)
+		if err != nil {
+			return fmt.Errorf("failed to decode mutation record at seq %d: %w", cr.StreamSeq, err)
+		}
+		mut.StreamSeq = cr.StreamSeq
+		if err := v.ApplyRecordLocked(mut); err != nil {
+			return fmt.Errorf("failed to apply mutation record at seq %d: %w", cr.StreamSeq, err)
+		}
+	}
+	return nil
+}
+
+// ReplayRecords applies an ordered list of mutation records to the volume.
+func (v *Volume) ReplayRecords(records []*MutationRecord) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.replayRecordsLocked(records)
+}
+
+// ReplayClientRecords decodes and applies an ordered list of WAL client records to the volume.
+func (v *Volume) ReplayClientRecords(records []*wal.ClientRecord) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.replayClientRecordsLocked(records)
+}
+
 func (v *Volume) LoadFromBackend(ctx context.Context) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if v.backend == nil {
-		return nil
-	}
+	if v.backend != nil {
+		// 1. Try loading from latest EROFS snapshot
+		snapshotLoaded := false
+		latestSnapshotName, err := v.findLatestSnapshotNameLocked(ctx)
+		if err == nil && latestSnapshotName != "" {
+			snapshotKey := path.Join("volumes", v.volumeID, "meta", latestSnapshotName)
+			var imgBuf bytes.Buffer
+			err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0, &imgBuf)
+			if err == nil && imgBuf.Len() > 0 {
+				readerAt := bytes.NewReader(imgBuf.Bytes())
+				reader, err := erofs.NewReader(readerAt)
+				if err == nil {
+					if err := v.loadFromErofsSnapshotLocked(reader, readerAt); err == nil {
+						snapshotLoaded = true
+					}
+				}
+			}
+		}
 
-	// 1. Try loading from latest EROFS snapshot
-	latestSnapshotName, err := v.findLatestSnapshotNameLocked(ctx)
-	if err == nil && latestSnapshotName != "" {
-		snapshotKey := path.Join("volumes", v.volumeID, "meta", latestSnapshotName)
-		var imgBuf bytes.Buffer
-		err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0, &imgBuf)
-		if err == nil && imgBuf.Len() > 0 {
-			readerAt := bytes.NewReader(imgBuf.Bytes())
-			reader, err := erofs.NewReader(readerAt)
-			if err == nil {
-				if err := v.loadFromErofsSnapshotLocked(reader, readerAt); err == nil {
-					return nil
+		// 2. Fallback to legacy JSON metadata file
+		if !snapshotLoaded {
+			var metaBuf bytes.Buffer
+			err = v.backend.GetObject(ctx, v.volumeID, MetadataFileName, 0, 0, &metaBuf)
+			if err == nil && metaBuf.Len() > 0 {
+				var meta VolumeMetadata
+				if err := json.Unmarshal(metaBuf.Bytes(), &meta); err == nil {
+					if meta.NextInode > v.nextInode {
+						v.nextInode = meta.NextInode
+					}
+
+					var paths []string
+					for p := range meta.Entries {
+						if p != "/" {
+							paths = append(paths, p)
+						}
+					}
+					sort.Slice(paths, func(i, j int) bool {
+						return len(paths[i]) < len(paths[j])
+					})
+
+					for _, p := range paths {
+						entry := meta.Entries[p]
+						parentPath := path.Dir(p)
+						baseName := path.Base(p)
+
+						parent, err := v.findNodeLocked(parentPath)
+						if err != nil {
+							continue
+						}
+
+						child := &FSNode{
+							inode:   entry.Inode,
+							name:    baseName,
+							path:    entry.Path,
+							isDir:   entry.IsDir,
+							mode:    entry.Mode,
+							size:    entry.Size,
+							modTime: entry.ModTime,
+							sha256:  entry.Sha256,
+							etag:    entry.ETag,
+							parent:  parent,
+							isDirty: false,
+						}
+						if child.isDir {
+							child.children = make(map[string]*FSNode)
+						}
+						parent.children[baseName] = child
+					}
+
+					v.lastFlushedMetadata = &meta
 				}
 			}
 		}
 	}
 
-	// 2. Fallback to legacy JSON metadata file
-	var metaBuf bytes.Buffer
-	err = v.backend.GetObject(ctx, v.volumeID, MetadataFileName, 0, 0, &metaBuf)
-	if err != nil || metaBuf.Len() == 0 {
-		return nil
-	}
-
-	var meta VolumeMetadata
-	if err := json.Unmarshal(metaBuf.Bytes(), &meta); err != nil {
-		return fmt.Errorf("failed to parse volume metadata: %w", err)
-	}
-
-	if meta.NextInode > v.nextInode {
-		v.nextInode = meta.NextInode
-	}
-
-	var paths []string
-	for p := range meta.Entries {
-		if p != "/" {
-			paths = append(paths, p)
+	// 3. Replay recovered records from local WAL stream if available
+	if v.stream != nil {
+		recovered := v.stream.RecoveredRecords()
+		if len(recovered) > 0 {
+			if err := v.replayClientRecordsLocked(recovered); err != nil {
+				return fmt.Errorf("failed to replay recovered WAL records: %w", err)
+			}
 		}
 	}
-	sort.Slice(paths, func(i, j int) bool {
-		return len(paths[i]) < len(paths[j])
-	})
 
-	for _, p := range paths {
-		entry := meta.Entries[p]
-		parentPath := path.Dir(p)
-		baseName := path.Base(p)
-
-		parent, err := v.findNodeLocked(parentPath)
-		if err != nil {
-			continue
-		}
-
-		child := &FSNode{
-			inode:   entry.Inode,
-			name:    baseName,
-			path:    entry.Path,
-			isDir:   entry.IsDir,
-			mode:    entry.Mode,
-			size:    entry.Size,
-			modTime: entry.ModTime,
-			sha256:  entry.Sha256,
-			etag:    entry.ETag,
-			parent:  parent,
-			isDirty: false,
-		}
-		if child.isDir {
-			child.children = make(map[string]*FSNode)
-		}
-		parent.children[baseName] = child
-	}
-
-	v.lastFlushedMetadata = &meta
 	return nil
 }
 
