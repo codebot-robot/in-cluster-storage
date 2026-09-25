@@ -131,6 +131,8 @@ func EncodeInodeRecord(rec *InodeRecord) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// DecodeInodeRecord decodes an InodeRecord from binary representation.
+// TODO: optimize encoding/decoding by parsing slice offsets directly instead of allocating bytes.NewReader wrapper.
 func DecodeInodeRecord(data []byte) (*InodeRecord, error) {
 	if len(data) < 29 {
 		return nil, fmt.Errorf("data too short for InodeRecord: %d bytes", len(data))
@@ -245,6 +247,8 @@ func EncodeDirDeltaRecord(rec *DirDeltaRecord) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// DecodeDirDeltaRecord decodes a DirDeltaRecord from binary representation.
+// TODO: optimize encoding/decoding by parsing slice offsets directly instead of allocating bytes.NewReader wrapper.
 func DecodeDirDeltaRecord(data []byte) (*DirDeltaRecord, error) {
 	if len(data) < 16 {
 		return nil, fmt.Errorf("data too short for DirDeltaRecord: %d bytes", len(data))
@@ -342,60 +346,65 @@ func NewLocalStorage(dir string) (*LocalStorage, error) {
 		return nil, fmt.Errorf("failed to create local storage directory %s: %w", dir, err)
 	}
 
-	ls := &LocalStorage{
+	s := &LocalStorage{
 		dir:          dir,
 		activeFileID: 0,
 		activeOffset: HeaderLen,
 	}
 
-	for i := 0; i < MaxLocalFiles; i++ {
-		filePath := filepath.Join(dir, fmt.Sprintf("meta-%02d.dat", i))
-		f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
-		if err != nil {
-			_ = ls.Close()
-			return nil, fmt.Errorf("failed to open local storage file %s: %w", filePath, err)
-		}
-		ls.files[i] = f
+	return s, nil
+}
 
-		fi, err := f.Stat()
-		if err == nil && fi.Size() == 0 {
-			if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
-				_ = ls.Close()
-				return nil, fmt.Errorf("failed to write header to %s: %w", filePath, err)
-			}
+func (s *LocalStorage) getOrOpenFileLocked(fileID int) (*os.File, error) {
+	if fileID < 0 || fileID >= MaxLocalFiles {
+		return nil, fmt.Errorf("invalid file ID %d", fileID)
+	}
+	if s.files[fileID] != nil {
+		return s.files[fileID], nil
+	}
+
+	filePath := filepath.Join(s.dir, fmt.Sprintf("meta-%02d.dat", fileID))
+	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open local storage file %s: %w", filePath, err)
+	}
+	s.files[fileID] = f
+
+	fi, err := f.Stat()
+	if err == nil && fi.Size() == 0 {
+		if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
+			return nil, fmt.Errorf("failed to write header to %s: %w", filePath, err)
 		}
 	}
 
-	fi, err := ls.files[0].Stat()
-	if err == nil && fi.Size() > HeaderLen {
-		ls.activeOffset = fi.Size()
-	}
-
-	return ls, nil
+	return f, nil
 }
 
 // WriteRecord serializes and appends a record of recType with payload to the active local file.
-func (ls *LocalStorage) WriteRecord(recType byte, payload []byte) (LocalOffset, error) {
-	ls.mu.Lock()
-	defer ls.mu.Unlock()
+func (s *LocalStorage) WriteRecord(recType byte, payload []byte) (LocalOffset, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	payloadLen := uint32(len(payload))
 	recordLen := int64(1 + 4 + 4 + len(payload)) // [type (1B)][len (4B)][crc (4B)][payload]
 
 	// If active file would exceed max size, rotate to next file
-	if ls.activeOffset+recordLen > MaxFileSizeInBytes {
-		ls.activeFileID = (ls.activeFileID + 1) % MaxLocalFiles
-		f := ls.files[ls.activeFileID]
+	if s.activeOffset+recordLen > MaxFileSizeInBytes {
+		s.activeFileID = (s.activeFileID + 1) % MaxLocalFiles
+		f, err := s.getOrOpenFileLocked(s.activeFileID)
+		if err != nil {
+			return NoOffset, err
+		}
 		_ = f.Truncate(0)
 		if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
-			return NoOffset, fmt.Errorf("failed to initialize rotated file %d: %w", ls.activeFileID, err)
+			return NoOffset, fmt.Errorf("failed to initialize rotated file %d: %w", s.activeFileID, err)
 		}
-		ls.activeOffset = HeaderLen
+		s.activeOffset = HeaderLen
 	}
 
-	f := ls.files[ls.activeFileID]
-	if f == nil {
-		return NoOffset, fmt.Errorf("active file %d is closed", ls.activeFileID)
+	f, err := s.getOrOpenFileLocked(s.activeFileID)
+	if err != nil {
+		return NoOffset, err
 	}
 
 	crc := crc32.ChecksumIEEE(payload)
@@ -404,7 +413,7 @@ func (ls *LocalStorage) WriteRecord(recType byte, payload []byte) (LocalOffset, 
 	binary.BigEndian.PutUint32(headerBuf[1:5], payloadLen)
 	binary.BigEndian.PutUint32(headerBuf[5:9], crc)
 
-	recordOffset := ls.activeOffset
+	recordOffset := s.activeOffset
 	if _, err := f.WriteAt(headerBuf, recordOffset); err != nil {
 		return NoOffset, fmt.Errorf("failed to write record header: %w", err)
 	}
@@ -414,12 +423,12 @@ func (ls *LocalStorage) WriteRecord(recType byte, payload []byte) (LocalOffset, 
 		}
 	}
 
-	ls.activeOffset += recordLen
-	return PackOffset(ls.activeFileID, recordOffset), nil
+	s.activeOffset += recordLen
+	return PackOffset(s.activeFileID, recordOffset), nil
 }
 
 // ReadRecord retrieves and verifies a record from the specified LocalOffset.
-func (ls *LocalStorage) ReadRecord(off LocalOffset) (byte, []byte, error) {
+func (s *LocalStorage) ReadRecord(off LocalOffset) (byte, []byte, error) {
 	if off == NoOffset {
 		return 0, nil, fmt.Errorf("invalid offset %d", off)
 	}
@@ -428,12 +437,12 @@ func (ls *LocalStorage) ReadRecord(off LocalOffset) (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("invalid file ID %d in offset %d", fileID, off)
 	}
 
-	ls.mu.RLock()
-	f := ls.files[fileID]
-	ls.mu.RUnlock()
+	s.mu.Lock()
+	f, err := s.getOrOpenFileLocked(fileID)
+	s.mu.Unlock()
 
-	if f == nil {
-		return 0, nil, fmt.Errorf("file %d is closed", fileID)
+	if err != nil {
+		return 0, nil, err
 	}
 
 	headerBuf := make([]byte, 9)
@@ -461,12 +470,12 @@ func (ls *LocalStorage) ReadRecord(off LocalOffset) (byte, []byte, error) {
 }
 
 // Truncate truncates all local storage files and resets write pointers.
-func (ls *LocalStorage) Truncate() error {
-	ls.mu.Lock()
-	defer ls.mu.Unlock()
+func (s *LocalStorage) Truncate() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	for i := 0; i < MaxLocalFiles; i++ {
-		f := ls.files[i]
+		f := s.files[i]
 		if f != nil {
 			_ = f.Truncate(0)
 			if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
@@ -474,30 +483,30 @@ func (ls *LocalStorage) Truncate() error {
 			}
 		}
 	}
-	ls.activeFileID = 0
-	ls.activeOffset = HeaderLen
+	s.activeFileID = 0
+	s.activeOffset = HeaderLen
 	return nil
 }
 
 // ActiveFileSize returns the byte size of the currently active local file.
-func (ls *LocalStorage) ActiveFileSize() int64 {
-	ls.mu.RLock()
-	defer ls.mu.RUnlock()
-	return ls.activeOffset
+func (s *LocalStorage) ActiveFileSize() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.activeOffset
 }
 
 // Close closes all open local storage file descriptors.
-func (ls *LocalStorage) Close() error {
-	ls.mu.Lock()
-	defer ls.mu.Unlock()
+func (s *LocalStorage) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	var firstErr error
 	for i := 0; i < MaxLocalFiles; i++ {
-		if ls.files[i] != nil {
-			if err := ls.files[i].Close(); err != nil && firstErr == nil {
+		if s.files[i] != nil {
+			if err := s.files[i].Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
-			ls.files[i] = nil
+			s.files[i] = nil
 		}
 	}
 	return firstErr

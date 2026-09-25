@@ -86,8 +86,8 @@ type Volume struct {
 	dirtyDirs       map[uint64]LocalOffset
 
 	// Base EROFS snapshot reader
-	erofsReader    *erofs.Reader
-	erofsRawReader io.ReaderAt
+	snapshotReader *erofs.Reader
+	snapshotRaw    io.ReaderAt
 
 	// Snapshot trigger limits
 	maxDirtyRecords  int
@@ -190,57 +190,65 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		v.localStore = ls
 	}
 
-	// Initialize default root directory and root inode
-	rootInode := &CachedInode{
-		ID:      v.rootInodeID,
-		Mode:    0755 | syscall.S_IFDIR,
-		ModTime: time.Now(),
-		IsDir:   true,
-		IsDirty: false,
+	// Always initialize an initial base EROFS snapshot with empty root directory
+	rootNode := erofs.NewMemoryNode("", true, 0755, nil, nil, erofs.WithMtime(uint64(time.Now().Unix())))
+	var initialErofsBuf bufferWriterAt
+	if err := erofs.WriteImage(&initialErofsBuf, rootNode); err == nil {
+		v.snapshotRaw = bytes.NewReader(initialErofsBuf.buf)
+		if r, err := erofs.NewReader(v.snapshotRaw); err == nil {
+			v.snapshotReader = r
+			v.rootInodeID = r.GetRootNID()
+			v.nextInode = v.rootInodeID + 100
+		}
 	}
-	v.inodeCache.Put(v.rootInodeID, rootInode)
-
-	rootDir := &CachedDir{
-		ID:         v.rootInodeID,
-		Entries:    make(map[string]DirEntry),
-		Added:      make(map[string]DirEntry),
-		Deleted:    make(map[string]bool),
-		PrevOffset: NoOffset,
-		IsDirty:    false,
-	}
-	v.dirCache.Put(v.rootInodeID, rootDir)
 
 	return v
 }
 
-func (v *Volume) onEvictInode(inodeID uint64, node *CachedInode) {
-	if !node.IsDirty || v.localStore == nil {
-		return
+// persistInode uploads the inode's blob payload if dirty and writes the inode metadata record to local eviction storage.
+func (v *Volume) persistInode(ctx context.Context, node *CachedInode) error {
+	if !node.IsDirty {
+		return nil
 	}
+
 	if node.Data != nil && node.Sha256 != "" && v.blobStore != nil {
-		_ = node.Data.Rewind()
-		_ = v.blobStore.PutBlobs(context.Background(), map[string]blob.ByteStream{node.Sha256: node.Data})
+		if err := node.Data.Rewind(); err != nil {
+			return fmt.Errorf("failed to rewind node data: %w", err)
+		}
+		if err := v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{node.Sha256: node.Data}); err != nil {
+			return fmt.Errorf("failed to persist inode %d blob to blobStore: %w", node.ID, err)
+		}
 		_ = node.Data.Close()
 		node.Data = nil
 	}
-	rec := &InodeRecord{
-		InodeID: node.ID,
-		Mode:    node.Mode,
-		Size:    node.Size,
-		ModTime: node.ModTime,
-		IsDir:   node.IsDir,
-		Sha256:  node.Sha256,
-		ETag:    node.ETag,
-	}
-	payload, err := EncodeInodeRecord(rec)
-	if err != nil {
-		return
-	}
-	off, err := v.localStore.WriteRecord(RecordTypeInode, payload)
-	if err == nil {
+
+	if v.localStore != nil {
+		rec := &InodeRecord{
+			InodeID: node.ID,
+			Mode:    node.Mode,
+			Size:    node.Size,
+			ModTime: node.ModTime,
+			IsDir:   node.IsDir,
+			Sha256:  node.Sha256,
+			ETag:    node.ETag,
+		}
+		payload, err := EncodeInodeRecord(rec)
+		if err != nil {
+			return fmt.Errorf("failed to encode inode record %d: %w", node.ID, err)
+		}
+		off, err := v.localStore.WriteRecord(RecordTypeInode, payload)
+		if err != nil {
+			return fmt.Errorf("failed to write inode record %d to local storage: %w", node.ID, err)
+		}
 		v.dirtyInodes[node.ID] = off
-		node.IsDirty = false
 	}
+
+	node.IsDirty = false
+	return nil
+}
+
+func (v *Volume) onEvictInode(inodeID uint64, node *CachedInode) {
+	_ = v.persistInode(context.Background(), node)
 }
 
 func (v *Volume) onEvictDir(dirID uint64, dir *CachedDir) {
@@ -255,8 +263,10 @@ func (v *Volume) onEvictDir(dirID uint64, dir *CachedDir) {
 		deletedList = append(deletedList, del)
 	}
 	addedList := make([]DirEntry, 0, len(dir.Added))
-	for _, add := range dir.Added {
-		addedList = append(addedList, add)
+	for name := range dir.Added {
+		if entry, ok := dir.Entries[name]; ok {
+			addedList = append(addedList, entry)
+		}
 	}
 	rec := &DirDeltaRecord{
 		InodeID:    dir.ID,
@@ -272,7 +282,7 @@ func (v *Volume) onEvictDir(dirID uint64, dir *CachedDir) {
 	if err == nil {
 		v.dirtyDirs[dir.ID] = off
 		dir.PrevOffset = off
-		dir.Added = make(map[string]DirEntry)
+		dir.Added = make(map[string]bool)
 		dir.Deleted = make(map[string]bool)
 		dir.IsDirty = false
 	}
@@ -395,12 +405,12 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 		}
 	}
 
-	// 2. Fetch from base EROFS snapshot
-	if v.erofsReader != nil && v.erofsRawReader != nil {
-		erofsInode, err := erofs.ReadInode(v.erofsRawReader, v.erofsReader.Superblock(), inodeID)
+	// 2. Fetch from base snapshot
+	if v.snapshotReader != nil && v.snapshotRaw != nil {
+		erofsInode, err := erofs.ReadInode(v.snapshotRaw, v.snapshotReader.Superblock(), inodeID)
 		if err == nil {
 			var shaStr string
-			xattrs, xErr := v.erofsReader.GetXattrs(inodeID)
+			xattrs, xErr := v.snapshotReader.GetXattrs(inodeID)
 			if xErr == nil && !xattrs.IsEmpty() {
 				if xattrs.UserDigest != "" {
 					shaStr = xattrs.UserDigest
@@ -436,19 +446,6 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 		}
 	}
 
-	// Fallback for root inode if starting fresh without snapshot
-	if inodeID == v.rootInodeID {
-		node := &CachedInode{
-			ID:      v.rootInodeID,
-			Mode:    0755 | syscall.S_IFDIR,
-			ModTime: time.Now(),
-			IsDir:   true,
-			IsDirty: false,
-		}
-		v.inodeCache.Put(inodeID, node)
-		return node, nil
-	}
-
 	return nil, fmt.Errorf("inode %d not found: %w", inodeID, syscall.ENOENT)
 }
 
@@ -478,9 +475,9 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 			currOff = rec.PrevOffset
 		}
 
-		// Read base from EROFS if present
-		if v.erofsReader != nil {
-			dirents, err := v.erofsReader.ListDirectory(inodeID)
+		// Read base from base snapshot if present
+		if v.snapshotReader != nil {
+			dirents, err := v.snapshotReader.ListDirectory(inodeID)
 			if err == nil {
 				for _, de := range dirents {
 					if de.Name == "." || de.Name == ".." {
@@ -515,7 +512,7 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 		dir := &CachedDir{
 			ID:         inodeID,
 			Entries:    entries,
-			Added:      make(map[string]DirEntry),
+			Added:      make(map[string]bool),
 			Deleted:    make(map[string]bool),
 			PrevOffset: off,
 			IsDirty:    false,
@@ -524,9 +521,9 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 		return dir, nil
 	}
 
-	// 2. Fetch clean directory from EROFS snapshot
-	if v.erofsReader != nil {
-		dirents, err := v.erofsReader.ListDirectory(inodeID)
+	// 2. Fetch clean directory from snapshot
+	if v.snapshotReader != nil {
+		dirents, err := v.snapshotReader.ListDirectory(inodeID)
 		if err == nil {
 			for _, de := range dirents {
 				if de.Name == "." || de.Name == ".." {
@@ -547,7 +544,7 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 			dir := &CachedDir{
 				ID:         inodeID,
 				Entries:    entries,
-				Added:      make(map[string]DirEntry),
+				Added:      make(map[string]bool),
 				Deleted:    make(map[string]bool),
 				PrevOffset: NoOffset,
 				IsDirty:    false,
@@ -555,20 +552,6 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 			v.dirCache.Put(inodeID, dir)
 			return dir, nil
 		}
-	}
-
-	// Fallback for root dir if starting fresh without snapshot
-	if inodeID == v.rootInodeID {
-		dir := &CachedDir{
-			ID:         v.rootInodeID,
-			Entries:    entries,
-			Added:      make(map[string]DirEntry),
-			Deleted:    make(map[string]bool),
-			PrevOffset: NoOffset,
-			IsDirty:    false,
-		}
-		v.dirCache.Put(inodeID, dir)
-		return dir, nil
 	}
 
 	return nil, fmt.Errorf("directory inode %d not found: %w", inodeID, syscall.ENOENT)
@@ -628,6 +611,7 @@ func (v *Volume) findOrCreateDirParentsLocked(ctx context.Context, p string) (ui
 				IsDir:   true,
 				IsDirty: true,
 			}
+
 			newEntry := DirEntry{
 				Name:    part,
 				InodeID: childInodeID,
@@ -635,7 +619,7 @@ func (v *Volume) findOrCreateDirParentsLocked(ctx context.Context, p string) (ui
 				Mode:    0755 | syscall.S_IFDIR,
 			}
 			dir.Entries[part] = newEntry
-			dir.Added[part] = newEntry
+			dir.Added[part] = true
 			delete(dir.Deleted, part)
 			dir.IsDirty = true
 
@@ -644,7 +628,7 @@ func (v *Volume) findOrCreateDirParentsLocked(ctx context.Context, p string) (ui
 			childDir := &CachedDir{
 				ID:         childInodeID,
 				Entries:    make(map[string]DirEntry),
-				Added:      make(map[string]DirEntry),
+				Added:      make(map[string]bool),
 				Deleted:    make(map[string]bool),
 				PrevOffset: NoOffset,
 				IsDirty:    true,
@@ -802,7 +786,7 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAtt
 		Mode:    mode,
 	}
 	parentDir.Entries[baseName] = newEntry
-	parentDir.Added[baseName] = newEntry
+	parentDir.Added[baseName] = true
 	delete(parentDir.Deleted, baseName)
 	parentDir.IsDirty = true
 	parentInode.ModTime = now
@@ -820,7 +804,7 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAtt
 	childDir := &CachedDir{
 		ID:         childInodeID,
 		Entries:    make(map[string]DirEntry),
-		Added:      make(map[string]DirEntry),
+		Added:      make(map[string]bool),
 		Deleted:    make(map[string]bool),
 		PrevOffset: NoOffset,
 		IsDirty:    true,
@@ -971,7 +955,7 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 		Mode:    mode,
 	}
 	parentDir.Entries[baseName] = newEntry
-	parentDir.Added[baseName] = newEntry
+	parentDir.Added[baseName] = true
 	delete(parentDir.Deleted, baseName)
 	parentDir.IsDirty = true
 	parentInode.ModTime = now
@@ -1477,7 +1461,7 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 
 	entry.Name = newBaseName
 	newParentDir.Entries[newBaseName] = entry
-	newParentDir.Added[newBaseName] = entry
+	newParentDir.Added[newBaseName] = true
 	delete(newParentDir.Deleted, newBaseName)
 	newParentDir.IsDirty = true
 
@@ -1733,10 +1717,10 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 	}
 	_ = latestStream.Close()
 
-	// 5. Update base EROFS reader to newly generated snapshot
-	v.erofsRawReader = bytes.NewReader(erofsBuf.buf)
-	if r, err := erofs.NewReader(v.erofsRawReader); err == nil {
-		v.erofsReader = r
+	// 5. Update base snapshot reader to newly generated snapshot
+	v.snapshotRaw = bytes.NewReader(erofsBuf.buf)
+	if r, err := erofs.NewReader(v.snapshotRaw); err == nil {
+		v.snapshotReader = r
 		v.rootInodeID = r.GetRootNID()
 	}
 
@@ -1878,7 +1862,7 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		childDir := &CachedDir{
 			ID:         inodeID,
 			Entries:    make(map[string]DirEntry),
-			Added:      make(map[string]DirEntry),
+			Added:      make(map[string]bool),
 			Deleted:    make(map[string]bool),
 			PrevOffset: NoOffset,
 			IsDirty:    false,
@@ -2162,8 +2146,8 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 				readerAt := bytes.NewReader(snapBytes)
 				reader, err := erofs.NewReader(readerAt)
 				if err == nil {
-					v.erofsRawReader = readerAt
-					v.erofsReader = reader
+					v.snapshotRaw = readerAt
+					v.snapshotReader = reader
 					v.rootInodeID = reader.GetRootNID()
 					maxNID := (uint64(len(snapBytes)))/32 + 1000
 					if v.nextInode < maxNID {
@@ -2244,8 +2228,8 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 		return fmt.Errorf("failed to parse snapshot %s: %w", snapshotName, err)
 	}
 
-	v.erofsRawReader = readerAt
-	v.erofsReader = reader
+	v.snapshotRaw = readerAt
+	v.snapshotReader = reader
 	v.rootInodeID = reader.GetRootNID()
 	maxNID := (uint64(len(snapBytes)))/32 + 1000
 	if v.nextInode < maxNID {

@@ -22,19 +22,16 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 )
 
-type lruElement[K comparable, V any] struct {
-	key   K
-	value V
-	prev  *lruElement[K, V]
-	next  *lruElement[K, V]
+type cacheElement[K comparable, V any] struct {
+	key      K
+	value    V
+	lastUsed int64 // Unix nanoseconds
 }
 
-// LRUCache implements an in-memory least-recently-used cache with an eviction callback.
+// LRUCache implements an in-memory least-recently-used cache tracking access times.
 type LRUCache[K comparable, V any] struct {
 	capacity int
-	items    map[K]*lruElement[K, V]
-	head     *lruElement[K, V]
-	tail     *lruElement[K, V]
+	items    map[K]*cacheElement[K, V]
 	onEvict  func(key K, value V)
 }
 
@@ -45,23 +42,23 @@ func NewLRUCache[K comparable, V any](capacity int, onEvict func(key K, value V)
 	}
 	return &LRUCache[K, V]{
 		capacity: capacity,
-		items:    make(map[K]*lruElement[K, V]),
+		items:    make(map[K]*cacheElement[K, V]),
 		onEvict:  onEvict,
 	}
 }
 
-// Get returns the value associated with key, marking it as most recently used.
+// Get returns the value associated with key, updating its lastUsed timestamp.
 func (c *LRUCache[K, V]) Get(key K) (V, bool) {
 	elem, ok := c.items[key]
 	if !ok {
 		var zero V
 		return zero, false
 	}
-	c.moveToHead(elem)
+	elem.lastUsed = time.Now().UnixNano()
 	return elem.value, true
 }
 
-// Peek returns the value associated with key without modifying the LRU order.
+// Peek returns the value associated with key without modifying access time.
 func (c *LRUCache[K, V]) Peek(key K) (V, bool) {
 	elem, ok := c.items[key]
 	if !ok {
@@ -71,39 +68,35 @@ func (c *LRUCache[K, V]) Peek(key K) (V, bool) {
 	return elem.value, true
 }
 
-// Put inserts or updates key-value pair, evicting the least recently used item if capacity is exceeded.
+// Put inserts or updates key-value pair, evicting the least recently used item(s) if capacity is exceeded.
 func (c *LRUCache[K, V]) Put(key K, value V) {
+	now := time.Now().UnixNano()
 	if elem, ok := c.items[key]; ok {
 		elem.value = value
-		c.moveToHead(elem)
+		elem.lastUsed = now
 		return
 	}
 
-	elem := &lruElement[K, V]{
-		key:   key,
-		value: value,
+	elem := &cacheElement[K, V]{
+		key:      key,
+		value:    value,
+		lastUsed: now,
 	}
 	c.items[key] = elem
-	c.addToHead(elem)
 
 	if len(c.items) > c.capacity {
-		c.evictTail()
+		c.evictOldest()
 	}
 }
 
 // Remove deletes key from the cache without triggering eviction callback.
 func (c *LRUCache[K, V]) Remove(key K) {
-	if elem, ok := c.items[key]; ok {
-		c.removeElement(elem)
-		delete(c.items, key)
-	}
+	delete(c.items, key)
 }
 
 // Clear clears the cache without triggering eviction callback.
 func (c *LRUCache[K, V]) Clear() {
-	c.items = make(map[K]*lruElement[K, V])
-	c.head = nil
-	c.tail = nil
+	c.items = make(map[K]*cacheElement[K, V])
 }
 
 // Len returns the number of items currently in the cache.
@@ -116,66 +109,58 @@ func (c *LRUCache[K, V]) Capacity() int {
 	return c.capacity
 }
 
-// ForEach iterates over all items in MRU to LRU order.
+// ForEach iterates over all items in the cache.
 func (c *LRUCache[K, V]) ForEach(fn func(key K, value V)) {
-	curr := c.head
-	for curr != nil {
-		fn(curr.key, curr.value)
-		curr = curr.next
+	for k, elem := range c.items {
+		fn(k, elem.value)
 	}
 }
 
 // EvictAll evicts all elements currently in cache, invoking the onEvict callback for each.
 func (c *LRUCache[K, V]) EvictAll() {
-	for c.tail != nil {
-		c.evictTail()
+	type kv struct {
+		k K
+		v V
 	}
-}
-
-func (c *LRUCache[K, V]) addToHead(elem *lruElement[K, V]) {
-	elem.prev = nil
-	elem.next = c.head
-	if c.head != nil {
-		c.head.prev = elem
+	var toEvict []kv
+	for k, elem := range c.items {
+		toEvict = append(toEvict, kv{k: k, v: elem.value})
 	}
-	c.head = elem
-	if c.tail == nil {
-		c.tail = elem
-	}
-}
-
-func (c *LRUCache[K, V]) moveToHead(elem *lruElement[K, V]) {
-	if c.head == elem {
-		return
-	}
-	c.removeElement(elem)
-	c.addToHead(elem)
-}
-
-func (c *LRUCache[K, V]) removeElement(elem *lruElement[K, V]) {
-	if elem.prev != nil {
-		elem.prev.next = elem.next
-	} else {
-		c.head = elem.next
-	}
-	if elem.next != nil {
-		elem.next.prev = elem.prev
-	} else {
-		c.tail = elem.prev
-	}
-	elem.prev = nil
-	elem.next = nil
-}
-
-func (c *LRUCache[K, V]) evictTail() {
-	if c.tail == nil {
-		return
-	}
-	tail := c.tail
-	c.removeElement(tail)
-	delete(c.items, tail.key)
+	c.items = make(map[K]*cacheElement[K, V])
 	if c.onEvict != nil {
-		c.onEvict(tail.key, tail.value)
+		for _, item := range toEvict {
+			c.onEvict(item.k, item.v)
+		}
+	}
+}
+
+func (c *LRUCache[K, V]) evictOldest() {
+	if len(c.items) == 0 {
+		return
+	}
+
+	// Find element with oldest timestamp
+	var oldestKey K
+	var oldestVal V
+	var oldestTime int64 = 1<<63 - 1
+	var found bool
+
+	// Optimization: sample or scan. Since Go maps have pseudo-random iteration,
+	// if map size is large we could sample, but for precise LRU scan items
+	for k, elem := range c.items {
+		if elem.lastUsed < oldestTime {
+			oldestTime = elem.lastUsed
+			oldestKey = k
+			oldestVal = elem.value
+			found = true
+		}
+	}
+
+	if found {
+		delete(c.items, oldestKey)
+		if c.onEvict != nil {
+			c.onEvict(oldestKey, oldestVal)
+		}
 	}
 }
 
@@ -197,7 +182,7 @@ type CachedInode struct {
 type CachedDir struct {
 	ID         uint64
 	Entries    map[string]DirEntry
-	Added      map[string]DirEntry
+	Added      map[string]bool
 	Deleted    map[string]bool
 	PrevOffset LocalOffset
 	IsDirty    bool
