@@ -127,7 +127,7 @@ See [`pkg/wal/client/client.go`](../pkg/wal/client/client.go) for Go client defi
 
 Streams utilizes zero-overhead, length-prefixed binary records protected by CRC32C (Castagnoli) checksums, leveraging hardware-accelerated CPU instructions on AMD64 (`SSE4.2` / `CRC32`) and ARM64 (`PMULL` / `CRC32`).
 
-All integer fields in record headers are serialized in **big-endian** format.
+All integer fields in record headers are serialized in **big-endian** format (network byte order). Big-endian is standard for network wire formats (e.g. TCP/IP), ensures that natural lexicographical `[]byte` ordering matches numeric ordering, and incurs no measurable CPU overhead as modern AMD64 and ARM64 processors provide single-cycle byte-swapping instructions (`BSWAP` / `REV`).
 
 ### 1. Client Record Format (`WALC`)
 
@@ -228,7 +228,6 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 - [ ] **Package & Name Refactoring:** Rename `wal` package, proto services, CLI binaries, Docker images, and Kubernetes manifests to `streams` (e.g. `streams-buffer`, `streams-client`, `proto/streams.proto`).
 - [ ] **Eliminate Manifest File:** Remove central `wal/manifest.json` from object storage to avoid atomic single-object contention, race conditions, and consistency bottlenecks; explore self-describing segments and prefix listing / atomic markers instead.
 - [ ] **Opaque Stream Offsets (Hide Global Monotonic Positions):** Hide global buffer monotonic positions from individual stream clients. Clients should only reason about their own `stream_id` and `stream_seq`. Expose global positions only as opaque resumption tokens/cookies for consumers.
-- [ ] **Endianness Standardization (Little-Endian vs Big-Endian):** Evaluate switching binary integer serialization from big-endian to little-endian to match native AMD64 and ARM64 memory representations without byte-swapping overhead.
 - [ ] **Stress & Chaos Testing:**
   - High-concurrency randomized multi-client benchmark tests to stress group commits and tail subscribers.
   - Chaos testing with simulated network partitions, abrupt client/server pod terminations (`SIGKILL`), and disk full conditions.
