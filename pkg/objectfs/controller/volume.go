@@ -63,7 +63,29 @@ type FileMetadata struct {
 	ETag    string    `json:"etag,omitempty"`
 }
 
+// metadataResolver provides unified read methods for resolving inodes and directories
+// across active in-memory state/caches, local eviction storage, and immutable base EROFS snapshots.
+type metadataResolver struct {
+	localStore     *LocalStorage
+	snapshotReader *erofs.Reader
+	snapshotRaw    io.ReaderAt
+	inodeCache     *LRUCache[uint64, *CachedInode]
+	dirCache       *LRUCache[uint64, *CachedDir]
+
+	// dirtyInodes maps inode IDs to their latest eviction offset in LocalStorage for inodes
+	// that have changed since the last EROFS snapshot. Additional unflushed modifications
+	// may also reside in inodeCache.
+	dirtyInodes map[uint64]LocalOffset
+
+	// dirtyDirs maps directory inode IDs to their latest delta eviction offset in LocalStorage
+	// for directories that have changed since the last EROFS snapshot. Additional unflushed
+	// delta modifications may also reside in dirCache.
+	dirtyDirs map[uint64]LocalOffset
+}
+
 type Volume struct {
+	metadataResolver
+
 	mu           sync.RWMutex
 	volumeID     string
 	rootInodeID  uint64
@@ -77,27 +99,13 @@ type Volume struct {
 	durability walclient.Level
 	streamID   uuid.UUID
 
-	// Tiered metadata storage
-	localStore      *LocalStorage
 	localStorageDir string
-	inodeCache      *LRUCache[uint64, *CachedInode]
-	dirCache        *LRUCache[uint64, *CachedDir]
 
-	// dirtyInodes maps inode IDs to their latest eviction offset in LocalStorage for inodes
-	// that have changed since the last EROFS snapshot. Additional unflushed modifications
-	// may also reside in inodeCache.
-	dirtyInodes map[uint64]LocalOffset
-
-	// dirtyDirs maps directory inode IDs to their latest delta eviction offset in LocalStorage
-	// for directories that have changed since the last EROFS snapshot. Additional unflushed
-	// delta modifications may also reside in dirCache.
-	dirtyDirs map[uint64]LocalOffset
-
-	// Base EROFS snapshot reader
-	snapshotReader *erofs.Reader
-	snapshotRaw    io.ReaderAt
+	snapshotCutoff LocalOffset
+	snapshotMu     sync.Mutex
 
 	// Snapshot trigger limits
+	maxBufferFiles   int
 	maxDirtyRecords  int
 	maxLocalFileSize int64
 
@@ -148,6 +156,13 @@ func WithLocalStorageDir(dir string) VolumeOption {
 	}
 }
 
+// WithMaxBufferFiles sets the maximum number of buffer files before auto-triggering a snapshot.
+func WithMaxBufferFiles(count int) VolumeOption {
+	return func(v *Volume) {
+		v.maxBufferFiles = count
+	}
+}
+
 // WithSnapshotThreshold sets limits before auto-triggering a snapshot.
 func WithSnapshotThreshold(maxDirtyRecords int, maxFileSize int64) VolumeOption {
 	return func(v *Volume) {
@@ -168,6 +183,10 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 
 	v := &Volume{
+		metadataResolver: metadataResolver{
+			dirtyInodes: make(map[uint64]LocalOffset),
+			dirtyDirs:   make(map[uint64]LocalOffset),
+		},
 		volumeID:         volumeID,
 		rootInodeID:      1,
 		nextInode:        2,
@@ -177,8 +196,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		maxInlineLen:     4 * 1024 * 1024, // 4MB default inline threshold
 		durability:       walclient.Local,
 		streamID:         StreamIDForVolume(volumeID),
-		dirtyInodes:      make(map[uint64]LocalOffset),
-		dirtyDirs:        make(map[uint64]LocalOffset),
+		maxBufferFiles:   4,
 		maxDirtyRecords:  100000,
 		maxLocalFileSize: 250 * 1024 * 1024,
 	}
@@ -193,7 +211,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	if v.localStorageDir == "" {
 		v.localStorageDir = path.Join(os.TempDir(), fmt.Sprintf("objectfs-local-%s-%d", volumeID, time.Now().UnixNano()))
 	}
-	ls, err := NewLocalStorage(v.localStorageDir)
+	ls, err := NewLocalStorage(v.localStorageDir, WithMaxLocalFileSize(v.maxLocalFileSize))
 	if err == nil {
 		v.localStore = ls
 	}
@@ -386,14 +404,22 @@ func cleanPath(p string) string {
 	return cleaned
 }
 
-func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
-	if node, ok := v.inodeCache.Get(inodeID); ok {
-		return node, nil
+func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, populateCache bool) (*CachedInode, error) {
+	if r.inodeCache != nil {
+		if populateCache {
+			if node, ok := r.inodeCache.Get(inodeID); ok {
+				return node, nil
+			}
+		} else {
+			if node, ok := r.inodeCache.Peek(inodeID); ok {
+				return node, nil
+			}
+		}
 	}
 
 	// 1. Check if evicted to local storage
-	if off, isDirty := v.dirtyInodes[inodeID]; isDirty && off != NoOffset && v.localStore != nil {
-		_, payload, err := v.localStore.ReadRecord(off)
+	if off, isDirty := r.dirtyInodes[inodeID]; isDirty && off != NoOffset && r.localStore != nil {
+		_, payload, err := r.localStore.ReadRecord(off)
 		if err == nil {
 			rec, err := DecodeInodeRecord(payload)
 			if err == nil {
@@ -405,20 +431,22 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 					IsDir:   rec.IsDir,
 					Sha256:  rec.Sha256,
 					ETag:    rec.ETag,
-					IsDirty: true,
+					IsDirty: populateCache,
 				}
-				v.inodeCache.Put(inodeID, node)
+				if populateCache && r.inodeCache != nil {
+					r.inodeCache.Put(inodeID, node)
+				}
 				return node, nil
 			}
 		}
 	}
 
 	// 2. Fetch from base snapshot
-	if v.snapshotReader != nil && v.snapshotRaw != nil {
-		erofsInode, err := erofs.ReadInode(v.snapshotRaw, v.snapshotReader.Superblock(), inodeID)
+	if r.snapshotReader != nil && r.snapshotRaw != nil {
+		erofsInode, err := erofs.ReadInode(r.snapshotRaw, r.snapshotReader.Superblock(), inodeID)
 		if err == nil {
 			var shaStr string
-			xattrs, xErr := v.snapshotReader.GetXattrs(inodeID)
+			xattrs, xErr := r.snapshotReader.GetXattrs(inodeID)
 			if xErr == nil && !xattrs.IsEmpty() {
 				if xattrs.UserDigest != "" {
 					shaStr = xattrs.UserDigest
@@ -449,7 +477,9 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 				Sha256:  shaStr,
 				IsDirty: false,
 			}
-			v.inodeCache.Put(inodeID, node)
+			if populateCache && r.inodeCache != nil {
+				r.inodeCache.Put(inodeID, node)
+			}
 			return node, nil
 		}
 	}
@@ -457,21 +487,40 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 	return nil, fmt.Errorf("inode %d not found: %w", inodeID, syscall.ENOENT)
 }
 
-func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*CachedDir, error) {
-	if dir, ok := v.dirCache.Get(inodeID); ok {
-		return dir, nil
+func (r *metadataResolver) resolveDir(ctx context.Context, inodeID uint64, populateCache bool) (*CachedDir, error) {
+	if r.dirCache != nil {
+		if populateCache {
+			if dir, ok := r.dirCache.Get(inodeID); ok {
+				return dir, nil
+			}
+		} else {
+			if cached, ok := r.dirCache.Peek(inodeID); ok {
+				entriesCopy := make(map[string]DirEntry, len(cached.Entries))
+				for k, v := range cached.Entries {
+					entriesCopy[k] = v
+				}
+				return &CachedDir{
+					ID:         cached.ID,
+					Entries:    entriesCopy,
+					Added:      make(map[string]bool),
+					Deleted:    make(map[string]bool),
+					PrevOffset: cached.PrevOffset,
+					IsDirty:    false,
+				}, nil
+			}
+		}
 	}
 
 	entries := make(map[string]DirEntry)
 
 	// 1. Check if dirty delta exists in local storage
-	if off, isDirty := v.dirtyDirs[inodeID]; isDirty && off != NoOffset && v.localStore != nil {
+	if off, isDirty := r.dirtyDirs[inodeID]; isDirty && off != NoOffset && r.localStore != nil {
 		var deltas []*DirDeltaRecord
 		currOff := off
 		visited := make(map[LocalOffset]bool)
 		for currOff != NoOffset && !visited[currOff] {
 			visited[currOff] = true
-			_, payload, err := v.localStore.ReadRecord(currOff)
+			_, payload, err := r.localStore.ReadRecord(currOff)
 			if err != nil {
 				break
 			}
@@ -484,8 +533,8 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 		}
 
 		// Read base from base snapshot if present
-		if v.snapshotReader != nil {
-			dirents, err := v.snapshotReader.ListDirectory(inodeID)
+		if r.snapshotReader != nil {
+			dirents, err := r.snapshotReader.ListDirectory(inodeID)
 			if err == nil {
 				for _, de := range dirents {
 					if de.Name == "." || de.Name == ".." {
@@ -525,13 +574,15 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 			PrevOffset: off,
 			IsDirty:    false,
 		}
-		v.dirCache.Put(inodeID, dir)
+		if populateCache && r.dirCache != nil {
+			r.dirCache.Put(inodeID, dir)
+		}
 		return dir, nil
 	}
 
 	// 2. Fetch clean directory from snapshot
-	if v.snapshotReader != nil {
-		dirents, err := v.snapshotReader.ListDirectory(inodeID)
+	if r.snapshotReader != nil {
+		dirents, err := r.snapshotReader.ListDirectory(inodeID)
 		if err == nil {
 			for _, de := range dirents {
 				if de.Name == "." || de.Name == ".." {
@@ -557,12 +608,22 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 				PrevOffset: NoOffset,
 				IsDirty:    false,
 			}
-			v.dirCache.Put(inodeID, dir)
+			if populateCache && r.dirCache != nil {
+				r.dirCache.Put(inodeID, dir)
+			}
 			return dir, nil
 		}
 	}
 
 	return nil, fmt.Errorf("directory inode %d not found: %w", inodeID, syscall.ENOENT)
+}
+
+func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
+	return v.resolveInode(ctx, inodeID, true)
+}
+
+func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*CachedDir, error) {
+	return v.resolveDir(ctx, inodeID, true)
 }
 
 func (v *Volume) resolvePathLocked(ctx context.Context, p string) (uint64, uint64, string, error) {
@@ -1552,12 +1613,29 @@ func (b *bufferWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
-func (v *Volume) buildErofsTreeLocked(ctx context.Context, dirInodeID uint64, dirName, currentPath string, dirtyBlobs map[string]blob.ByteStream, currentEntries map[string]FileMetadata) (erofs.Node, error) {
-	dir, err := v.getOrLoadDirLocked(ctx, dirInodeID)
+type snapshotResolver struct {
+	metadataResolver
+	vol *Volume
+}
+
+func (r *snapshotResolver) getOrLoadInode(ctx context.Context, inodeID uint64) (*CachedInode, error) {
+	return r.resolveInode(ctx, inodeID, false)
+}
+
+func (r *snapshotResolver) getOrLoadDir(ctx context.Context, inodeID uint64) (map[string]DirEntry, error) {
+	dir, err := r.resolveDir(ctx, inodeID, false)
 	if err != nil {
 		return nil, err
 	}
-	dirInode, err := v.getOrLoadInodeLocked(ctx, dirInodeID)
+	return dir.Entries, nil
+}
+
+func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64, dirName, currentPath string, dirtyBlobs map[string]blob.ByteStream, currentEntries map[string]FileMetadata) (erofs.Node, error) {
+	entries, err := r.getOrLoadDir(ctx, dirInodeID)
+	if err != nil {
+		return nil, err
+	}
+	dirInode, err := r.getOrLoadInode(ctx, dirInodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1573,23 +1651,23 @@ func (v *Volume) buildErofsTreeLocked(ctx context.Context, dirInodeID uint64, di
 	}
 
 	var childNames []string
-	for name := range dir.Entries {
+	for name := range entries {
 		childNames = append(childNames, name)
 	}
 	sort.Strings(childNames)
 
 	var children []erofs.Node
 	for _, name := range childNames {
-		entry := dir.Entries[name]
+		entry := entries[name]
 		childPath := path.Join(currentPath, name)
 		if entry.IsDir {
-			childDirNode, err := v.buildErofsTreeLocked(ctx, entry.InodeID, name, childPath, dirtyBlobs, currentEntries)
+			childDirNode, err := r.buildErofsTree(ctx, entry.InodeID, name, childPath, dirtyBlobs, currentEntries)
 			if err != nil {
 				return nil, err
 			}
 			children = append(children, childDirNode)
 		} else {
-			childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+			childInode, err := r.getOrLoadInode(ctx, entry.InodeID)
 			if err != nil {
 				return nil, err
 			}
@@ -1606,27 +1684,23 @@ func (v *Volume) buildErofsTreeLocked(ctx context.Context, dirInodeID uint64, di
 				ETag:    childInode.ETag,
 			}
 
-			needsUpload := childInode.IsDirty || childInode.ETag == ""
-			if v.lastFlushedMetadata != nil {
-				if lastEntry, exists := v.lastFlushedMetadata.Entries[childPath]; !exists || lastEntry.Sha256 != childInode.Sha256 {
+			needsUpload := childInode.ETag == ""
+			if r.vol.lastFlushedMetadata != nil {
+				if lastEntry, exists := r.vol.lastFlushedMetadata.Entries[childPath]; !exists || lastEntry.Sha256 != childInode.Sha256 {
 					needsUpload = true
 				}
 			}
-			if needsUpload {
-				if childInode.Data != nil && childInode.Size > 0 && childInode.Sha256 != "" {
-					_ = childInode.Data.Rewind()
-					dirtyBlobs[childInode.Sha256] = childInode.Data
-				}
+			if needsUpload && childInode.Sha256 != "" && r.vol.blobStore != nil && r.vol.backend != nil {
 				key := strings.TrimPrefix(childPath, "/")
-				if childInode.Data != nil && v.backend != nil {
-					_ = childInode.Data.Rewind()
-					etag, err := v.backend.PutObject(ctx, v.volumeID, key, childInode.Data)
+				blobReader, bErr := r.vol.blobStore.GetBlob(ctx, childInode.Sha256)
+				if bErr == nil && blobReader != nil {
+					etag, err := r.vol.backend.PutObject(ctx, r.vol.volumeID, key, blobReader)
 					if err == nil {
 						childInode.ETag = etag
 						meta.ETag = etag
 					}
+					_ = blobReader.Close()
 				}
-				childInode.IsDirty = false
 			}
 
 			currentEntries[childPath] = meta
@@ -1671,79 +1745,143 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		return nil
 	}
 
-	// 1. Process deleted paths
-	for _, delPath := range v.deletedPathsSinceFlush {
-		key := strings.TrimPrefix(delPath, "/")
-		_ = v.backend.DeleteObject(ctx, v.volumeID, key)
+	// 1. Phase 1: Persist all in-memory dirty cache entries to local storage / blob store.
+	v.inodeCache.ForEach(func(id uint64, node *CachedInode) {
+		if node.IsDirty {
+			_ = v.persistInode(ctx, node)
+		}
+	})
+	v.dirCache.ForEach(func(id uint64, dir *CachedDir) {
+		if dir.IsDirty {
+			v.onEvictDir(id, dir)
+		}
+	})
+
+	// 2. Phase 2: Capture point-in-time metadata pointers.
+	var cutoffOffset LocalOffset
+	if v.localStore != nil {
+		cutoffOffset = v.localStore.CurrentOffset()
 	}
+
+	snapDirtyInodes := make(map[uint64]LocalOffset, len(v.dirtyInodes))
+	for k, off := range v.dirtyInodes {
+		snapDirtyInodes[k] = off
+	}
+
+	snapDirtyDirs := make(map[uint64]LocalOffset, len(v.dirtyDirs))
+	for k, off := range v.dirtyDirs {
+		snapDirtyDirs[k] = off
+	}
+
+	baseReader := v.snapshotReader
+	baseRaw := v.snapshotRaw
+	rootID := v.rootInodeID
+	delPaths := make([]string, len(v.deletedPathsSinceFlush))
+	copy(delPaths, v.deletedPathsSinceFlush)
 	v.deletedPathsSinceFlush = nil
 
-	// 2. Build full tree hierarchy from root inode
-	currentEntries := make(map[string]FileMetadata)
-	dirtyBlobs := make(map[string]blob.ByteStream)
+	// Release v.mu during snapshot compilation and cloud storage upload to avoid stopping the world
+	v.mu.Unlock()
 
-	erofsTree, err := v.buildErofsTreeLocked(ctx, v.rootInodeID, "/", "/", dirtyBlobs, currentEntries)
-	if err != nil {
-		return fmt.Errorf("failed to build hierarchy for snapshot: %w", err)
-	}
-
-	// 3. Persist blobs to blob store
-	if len(dirtyBlobs) > 0 && v.blobStore != nil {
-		if err := v.blobStore.PutBlobs(ctx, dirtyBlobs); err != nil {
-			return fmt.Errorf("failed to persist blobs: %w", err)
-		}
-	}
-
-	// 4. Compile composefs-style EROFS snapshot
 	var erofsBuf bufferWriterAt
-	if err := erofs.WriteImage(&erofsBuf, erofsTree); err != nil {
-		return fmt.Errorf("failed to compile EROFS snapshot: %w", err)
-	}
+	var currentEntries map[string]FileMetadata
 
-	readerAt := bytes.NewReader(erofsBuf.buf)
-	if err := erofs.Fsck(readerAt); err != nil {
-		return fmt.Errorf("Fsck failed on generated EROFS snapshot: %w", err)
-	}
+	snapErr := func() error {
+		for _, delPath := range delPaths {
+			key := strings.TrimPrefix(delPath, "/")
+			_ = v.backend.DeleteObject(ctx, v.volumeID, key)
+		}
 
-	// Save EROFS snapshot: volumes/<volumeID>/meta/<timestamp>.erofs
-	timestamp := time.Now().UTC().Format("20060102T150405.000000Z")
-	snapshotName := fmt.Sprintf("%s.erofs", timestamp)
-	snapshotKey := path.Join("volumes", v.volumeID, "meta", snapshotName)
-	erofsStream := blob.NewByteStreamFromBytes(erofsBuf.buf)
-	if _, err := v.backend.PutObject(ctx, "", snapshotKey, erofsStream); err != nil {
+		currentEntries = make(map[string]FileMetadata)
+		dirtyBlobs := make(map[string]blob.ByteStream)
+
+		resolver := &snapshotResolver{
+			vol: v,
+			metadataResolver: metadataResolver{
+				localStore:     v.localStore,
+				snapshotReader: baseReader,
+				snapshotRaw:    baseRaw,
+				dirtyInodes:    snapDirtyInodes,
+				dirtyDirs:      snapDirtyDirs,
+			},
+		}
+
+		erofsTree, err := resolver.buildErofsTree(ctx, rootID, "/", "/", dirtyBlobs, currentEntries)
+		if err != nil {
+			return fmt.Errorf("failed to build hierarchy for snapshot: %w", err)
+		}
+
+		if len(dirtyBlobs) > 0 && v.blobStore != nil {
+			if err := v.blobStore.PutBlobs(ctx, dirtyBlobs); err != nil {
+				return fmt.Errorf("failed to persist blobs: %w", err)
+			}
+		}
+
+		if err := erofs.WriteImage(&erofsBuf, erofsTree); err != nil {
+			return fmt.Errorf("failed to compile EROFS snapshot: %w", err)
+		}
+
+		readerAt := bytes.NewReader(erofsBuf.buf)
+		if err := erofs.Fsck(readerAt); err != nil {
+			return fmt.Errorf("Fsck failed on generated EROFS snapshot: %w", err)
+		}
+
+		timestamp := time.Now().UTC().Format("20060102T150405.000000Z")
+		snapshotName := fmt.Sprintf("%s.erofs", timestamp)
+		snapshotKey := path.Join("volumes", v.volumeID, "meta", snapshotName)
+		erofsStream := blob.NewByteStreamFromBytes(erofsBuf.buf)
+		if _, err := v.backend.PutObject(ctx, "", snapshotKey, erofsStream); err != nil {
+			_ = erofsStream.Close()
+			return fmt.Errorf("failed to save EROFS snapshot %s: %w", snapshotKey, err)
+		}
 		_ = erofsStream.Close()
-		return fmt.Errorf("failed to save EROFS snapshot %s: %w", snapshotKey, err)
-	}
-	_ = erofsStream.Close()
 
-	// Update latest snapshot pointer
-	latestKey := path.Join("volumes", v.volumeID, "meta", "latest")
-	latestStream := blob.NewByteStreamFromBytes([]byte(snapshotName))
-	if _, err := v.backend.PutObject(ctx, "", latestKey, latestStream); err != nil {
+		latestKey := path.Join("volumes", v.volumeID, "meta", "latest")
+		latestStream := blob.NewByteStreamFromBytes([]byte(snapshotName))
+		if _, err := v.backend.PutObject(ctx, "", latestKey, latestStream); err != nil {
+			_ = latestStream.Close()
+			return fmt.Errorf("failed to update latest snapshot: %w", err)
+		}
 		_ = latestStream.Close()
-		return fmt.Errorf("failed to update latest snapshot: %w", err)
-	}
-	_ = latestStream.Close()
 
-	// 5. Update base snapshot reader to newly generated snapshot
+		return nil
+	}()
+
+	// Re-acquire v.mu.Lock() for Phase 4
+	v.mu.Lock()
+
+	if snapErr != nil {
+		return snapErr
+	}
+
+	// 4. Phase 4: Update base snapshot reader, prune committed dirty maps, and trim circular buffer
 	v.snapshotRaw = bytes.NewReader(erofsBuf.buf)
 	if r, err := erofs.NewReader(v.snapshotRaw); err == nil {
 		v.snapshotReader = r
 		v.rootInodeID = r.GetRootNID()
 	}
+	v.snapshotCutoff = cutoffOffset
 
-	// 6. Delete and reset local eviction storage
-	if v.localStore != nil {
-		_ = v.localStore.DeleteAllAndReset()
+	for inodeID, snapOff := range snapDirtyInodes {
+		if currOff, ok := v.dirtyInodes[inodeID]; ok && currOff == snapOff {
+			delete(v.dirtyInodes, inodeID)
+		}
 	}
-	v.dirtyInodes = make(map[uint64]LocalOffset)
-	v.dirtyDirs = make(map[uint64]LocalOffset)
 
-	// Reset RAM cache
+	for dirID, snapOff := range snapDirtyDirs {
+		if currOff, ok := v.dirtyDirs[dirID]; ok && currOff == snapOff {
+			delete(v.dirtyDirs, dirID)
+		}
+	}
+
+	// Reset in-memory clean caches so all directory entries and inode IDs seamlessly rebind to the new EROFS snapshot's NIDs
 	v.inodeCache.Clear()
 	v.dirCache.Clear()
 
-	// 7. Write legacy metadata file for backward compatibility
+	if v.localStore != nil && cutoffOffset != NoOffset {
+		_ = v.localStore.TrimBefore(cutoffOffset)
+	}
+
 	newMeta := VolumeMetadata{
 		VolumeID:    v.volumeID,
 		Version:     1,
@@ -1758,8 +1896,8 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		_, _ = v.backend.PutObject(ctx, v.volumeID, MetadataFileName, metaStream)
 		_ = metaStream.Close()
 	}
-
 	v.lastFlushedMetadata = &newMeta
+
 	return nil
 }
 
@@ -1771,15 +1909,27 @@ func (v *Volume) checkAutoSnapshotTriggerLocked(ctx context.Context) {
 	if v.maxDirtyRecords > 0 && (len(v.dirtyInodes)+len(v.dirtyDirs)) >= v.maxDirtyRecords {
 		shouldSnapshot = true
 	}
-	if v.localStore != nil && v.maxLocalFileSize > 0 && v.localStore.ActiveFileSize() >= v.maxLocalFileSize {
-		shouldSnapshot = true
+	if v.localStore != nil {
+		if v.maxLocalFileSize > 0 && v.localStore.ActiveFileSize() >= v.maxLocalFileSize {
+			shouldSnapshot = true
+		}
+		if v.maxBufferFiles > 0 && v.localStore.FileCount() >= v.maxBufferFiles {
+			shouldSnapshot = true
+		}
 	}
 	if shouldSnapshot {
+		if !v.snapshotMu.TryLock() {
+			return
+		}
+		defer v.snapshotMu.Unlock()
 		_ = v.flushToBackendLocked(ctx)
 	}
 }
 
 func (v *Volume) FlushToBackend(ctx context.Context) error {
+	v.snapshotMu.Lock()
+	defer v.snapshotMu.Unlock()
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.flushToBackendLocked(ctx)
@@ -2216,6 +2366,9 @@ func (v *Volume) ListSnapshots(ctx context.Context) ([]string, error) {
 
 // RestoreSnapshot restores the volume filesystem state to a specific EROFS snapshot.
 func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error {
+	v.snapshotMu.Lock()
+	defer v.snapshotMu.Unlock()
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -2248,6 +2401,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 	v.dirCache.Clear()
 	v.dirtyInodes = make(map[uint64]LocalOffset)
 	v.dirtyDirs = make(map[uint64]LocalOffset)
+	v.snapshotCutoff = NoOffset
 	if v.localStore != nil {
 		_ = v.localStore.DeleteAllAndReset()
 	}

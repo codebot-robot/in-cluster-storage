@@ -143,12 +143,12 @@ To prevent unbounded RAM consumption when serving filesystems with millions of f
    - **Inodes Table:** Maps inode IDs to attributes (`mode`, `size`, `mtime`, `sha256`, `etag`). Clean entries are served directly from the base EROFS snapshot; modified entries are held in memory or loaded from local eviction files.
    - **Directories Table:** Maps directory inode IDs to child entries (`name -> childInodeID, isDir, mode`). For large directories, changes are recorded as incremental delta mutation records (deleted names + added/updated entries) rather than rewriting the entire directory structure.
 
-2. **LRU Cache & Local Eviction Storage:**
+2. **LRU Cache & Circular Buffer Eviction Storage:**
    - Active inodes and directories are cached in RAM up to configurable capacities (`WithMaxRAMEntries(maxInodes, maxDirs)`).
-   - When memory pressure triggers eviction, dirty inodes and directory deltas are serialized with CRC32 checksums and appended to 16 rotating local files (`meta-00.dat` ... `meta-15.dat`).
+   - When memory pressure triggers eviction, dirty inodes and directory deltas are serialized with CRC32 checksums and appended to 16 rotating circular local buffer files (`meta-00.dat` ... `meta-15.dat`).
    - Evicted entries are indexed in memory using compact 32-bit packed pointers (4 bits for file index, 28 bits for byte offset within a 256MB file), keeping memory footprint under a few bytes per evicted entry.
    - On cache miss, entries are transparently reloaded by following delta chains from local storage on top of the base EROFS snapshot.
-   - When dirty records or local file sizes exceed thresholds, an automatic snapshot is compiled to object storage, truncating local files and resetting write pointers.
+   - **Two-Phase Non-Blocking Snapshots & Circular Buffer Trimming:** When buffer file count (`WithMaxBufferFiles(4)`), dirty records, or file size thresholds are reached, an automatic snapshot is taken. During Phase 1 and 2, in-memory dirty records are persisted to the circular log and point-in-time metadata pointers are captured; the global volume lock is then released while the immutable EROFS snapshot is compiled and uploaded to cloud object storage. In Phase 4, the base snapshot reader is updated, committed in-memory dirty records are pruned, and older circular buffer files are trimmed and deleted from disk, capping local disk usage and preventing buffer overflow.
 
 ### 3. Periodic Snapshots in EROFS Format
 
