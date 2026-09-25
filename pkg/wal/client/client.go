@@ -38,7 +38,7 @@ type Level int
 const (
 	Local     Level = iota // fsynced on this node
 	Witness                // fsynced on the buffer service
-	Permanent              // referenced by permanent object storage manifest
+	Permanent              // flushed to permanent object storage
 )
 
 // Stream is the interface used by node daemons to append to the WAL.

@@ -246,7 +246,7 @@ func (*AppendResponse_Ack) isAppendResponse_Msg() {}
 type HelloAck struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
 	WitnessAckedStreamSeq uint64                 `protobuf:"varint,1,opt,name=witness_acked_stream_seq,json=witnessAckedStreamSeq,proto3" json:"witness_acked_stream_seq,omitempty"` // what the service has on local disk
-	S3AckedStreamSeq      uint64                 `protobuf:"varint,2,opt,name=s3_acked_stream_seq,json=s3AckedStreamSeq,proto3" json:"s3_acked_stream_seq,omitempty"`                // what the manifest says (permanent storage)
+	S3AckedStreamSeq      uint64                 `protobuf:"varint,2,opt,name=s3_acked_stream_seq,json=s3AckedStreamSeq,proto3" json:"s3_acked_stream_seq,omitempty"`                // permanent object storage watermark
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }

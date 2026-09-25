@@ -16,7 +16,7 @@ Streams supports flexible acknowledgement modes depending on application consist
 Streams enables workloads to achieve:
 - **Sub-millisecond write latency:** Workloads can write locally and achieve immediate durability against local process crashes.
 - **Resilient in-cluster durability:** Changes are asynchronously streamed over bidirectional gRPC to a central witness buffer (`wal-buffer`) that performs group commits with fsync.
-- **Cost-effective permanent retention:** The buffer service aggregates multiple client streams into consolidated log segments and periodically flushes them to object storage along with an atomic manifest.
+- **Cost-effective permanent retention:** The buffer service aggregates multiple client streams into consolidated log segments and periodically flushes them to object storage as immutable self-describing segments.
 - **Unified catch-up and real-time tailing:** Consumers can tail merged records in global position order seamlessly across historical object storage segments, buffered local disk segments, and live in-flight memory commits.
 
 ---
@@ -56,7 +56,6 @@ Streams enables workloads to achieve:
 +---------------------------------------------------------------------------------+
 |                             Permanent Object Storage                            |
 |                                                                                 |
-|  wal/manifest.json                                                              |
 |  wal/segments/000000000001-000000000500.wal                                     |
 |  wal/segments/000000000501-000000001000.wal                                     |
 +---------------------------------------------------------------------------------+
@@ -75,7 +74,7 @@ Streams enables workloads to achieve:
    - Deployed as a Kubernetes `StatefulSet` or Service (`wal-buffer`).
    - Merges concurrent appends from multiple independent client streams into a single globally ordered sequence of log records identified by a monotonic 64-bit `position`.
    - Uses a micro-batched **group commit loop** (`batchMaxDelay`, `batchMaxSize`) to fsync batches to local disk (`LogSegmentStore`).
-   - Maintains an in-memory `Manifest` and periodically packages committed records into immutable segment objects in cloud storage (`wal/segments/<first_pos>-<last_pos>.wal`), atomically publishing `wal/manifest.json`.
+   - Periodically packages committed records into immutable, self-describing segment objects in cloud storage (`wal/segments/<first_pos>-<last_pos>.wal`).
 
 3. **Unified Tail Reader (`WalBuffer.Tail`):**
    - Provides a continuous stream of merged records ordered by `position`.
@@ -94,7 +93,7 @@ Streams defines three progressive durability levels:
 | :--- | :--- | :--- | :--- |
 | **`Local`** | `localSeq` | Record is written and fsynced to the client node's local disk. | < 1 ms (NVMe / SSD) |
 | **`Witness`** | `witnessSeq` | Record is received by the central buffer service, assigned a global `position`, and fsynced to the buffer's disk. | Network RTT + Group Commit Fsync (~2–10 ms) |
-| **`Permanent`** | `s3Seq` | Record is included in a sealed segment uploaded to object storage and committed into `wal/manifest.json`. | Typical cloud object store write latency (~200 ms – 2 s on-demand `Flush()`, or 10–60 s periodic background flush) |
+| **`Permanent`** | `s3Seq` | Record is included in a sealed segment uploaded to object storage. | Typical cloud object store write latency (~200 ms – 2 s on-demand `Flush()`, or 10–60 s periodic background flush) |
 
 ### Lifecycle of an Append
 
@@ -111,7 +110,7 @@ Client Appends Payload
 3. Server batches with other streams & fsyncs to local disk ──> Sends Ack(witnessSeq) (Mode 2)
        │
        ▼
-4. Server uploads segment to Object Storage & updates manifest.json ──> Sends Ack(s3Seq) (Mode 3)
+4. Server uploads segment to Object Storage ──> Sends Ack(s3Seq) (Mode 3)
        │
        ▼
 5. Client deletes local segments whose records <= s3Seq
@@ -158,27 +157,18 @@ Stored in buffer service local cache segments and permanent object store segment
 
 - **Position:** 64-bit monotonically increasing sequence number assigned globally by the buffer service.
 
-### 3. Object Store Manifest (`wal/manifest.json`)
+### 3. Permanent Segment Storage & Discovery (`wal/segments/`)
 
-Stored at `wal/manifest.json` in object storage:
+Segments stored in permanent object storage are immutable, self-describing sealed files named by their position ranges:
 
-```json
-{
-  "segments": [
-    "wal/segments/000000000001-000000000500.wal",
-    "wal/segments/000000000501-000000001000.wal"
-  ],
-  "last_position": 1000,
-  "streams": {
-    "6ba7b810-9dad-11d1-80b4-00c04fd430c8": {
-      "s3_acked_stream_seq": 450
-    },
-    "7c9e6679-7425-40de-944b-e07fc1f90ae7": {
-      "s3_acked_stream_seq": 550
-    }
-  }
-}
 ```
+wal/segments/000000000001-000000000500.wal
+wal/segments/000000000501-000000001000.wal
+```
+
+- **Self-Describing Range:** Segment file keys use fixed-width, 12-digit zero-padded integers (`%012d-%012d.wal`). This guarantees that lexicographical key ordering matches numeric sequence position ordering across all object stores (GCS, S3, filesystem).
+- **Manifest-Free Discovery:** The buffer service and tail readers discover existing segments and calculate the current durable watermarks (`last_flushed_position` and per-stream `s3_acked_stream_seq`) via object storage prefix listing (`wal/segments/`) and segment record recovery.
+- **Skew Prevention & Contention Free:** Eliminating the separate central manifest file (`wal/manifest.json`) avoids dual-write consistency skew (where one file succeeds but the other fails) and removes single-object write contention/bottlenecks in cloud object storage.
 
 ---
 
@@ -194,7 +184,7 @@ The buffer service (`wal-buffer`) accepts a `--backend` URL configured via CLI f
 | :--- | :--- | :--- |
 | `gs://<bucket>/<prefix>` or `gcs://<bucket>/<prefix>` | **Google Cloud Storage (GCS)** | Uses Google Cloud SDK (`cloud.google.com/go/storage`). Authenticates automatically via Application Default Credentials (ADC) or Kubernetes Workload Identity. |
 | `s3://<bucket>/<prefix>?endpoint=<url>&region=<region>&use_path_style=true` | **Amazon S3 / MinIO** | Uses AWS SDK v2 (`github.com/aws/aws-sdk-go-v2/service/s3`). Supports standard AWS credentials, IRSA/EKS pod identities, and custom endpoints like MinIO (`endpoint=http://minio:9000`). |
-| `file:///path/to/dir` | **Local / HostPath Filesystem** | Persists segments and manifest atomically directly into a filesystem directory. |
+| `file:///path/to/dir` | **Local / HostPath Filesystem** | Persists segments directly into a filesystem directory. |
 | `memory://` or `memory` | **In-Memory Storage** | Ephemeral storage used for unit testing and local development. |
 
 ### Buffer Archiving Configuration
@@ -210,8 +200,8 @@ The `wal-buffer` daemon exposes the following flags to tune archiving and cache 
 
 1. **Micro-batched Group Commit:** Incoming client records are validated, assigned global monotonic sequence numbers (`position`), and appended to the local `LogSegmentStore` with `fsync`.
 2. **Segment Packaging:** When `flushBytes` accumulates or `flushInterval` elapses (or an explicit client `Flush` RPC is received), all unflushed `WALL` records are serialized into a sealed segment file: `wal/segments/<first_pos>-<last_pos>.wal`.
-3. **Atomic Object Put:** The segment is uploaded via `Backend.PutObject` to cloud object storage.
-4. **Manifest Publication:** The central manifest (`wal/manifest.json`) is updated with the new segment path, updated `last_position`, and latest per-stream `s3_acked_stream_seq` watermarks, then uploaded to object storage.
+3. **Atomic Object Put:** The sealed segment is uploaded via `Backend.PutObject` to cloud object storage as a single atomic transaction. No secondary manifest file is written.
+4. **Watermark Advancement & Local Cleanup:** The buffer service advances its in-memory flushed position and stream watermarks, and cleans up local segment files that are fully flushed.
 5. **Client Notification & GC:** Stream clients receive `Ack(s3Seq)` updates, permitting them to safely garbage-collect local client segment files (`stream-<id>-*.wal`) whose records have been durably committed to permanent object storage.
 
 ---
@@ -229,8 +219,8 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 
 ### Incarnation Safety & Tail Semantics
 
-- **Positions above `manifest.last_position` are provisional:** In the event of a witness crash before flushing to object storage, provisional positions may be reassigned upon restart.
-- **Tail clamping:** If a `Tail` request specifies `from_position > manifest.last_position + 1`, the server clamps it to `manifest.last_position + 1` and returns the effective starting position in `resumed_from`.
+- **Positions above `last_flushed_position` are provisional:** In the event of a witness crash before flushing to object storage, provisional positions may be reassigned upon restart.
+- **Tail clamping:** If a `Tail` request specifies `from_position > last_flushed_position + 1`, the server clamps it to `last_flushed_position + 1` and returns the effective starting position in `resumed_from`.
 - **Consumer deduplication:** Consumers of `Tail` must deduplicate records based on `(stream_id, stream_seq)`.
 
 ---
@@ -260,7 +250,7 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 ## Roadmap & TODO List
 
 - [ ] **Package & Name Refactoring:** Rename `wal` package, proto services, CLI binaries, Docker images, and Kubernetes manifests to `streams` (e.g. `streams-buffer`, `streams-client`, `proto/streams.proto`).
-- [ ] **Eliminate Manifest File:** Remove central `wal/manifest.json` from object storage to avoid atomic single-object contention, race conditions, and consistency bottlenecks; explore self-describing segments and prefix listing / atomic markers instead.
+- [x] **Eliminate Manifest File:** Remove central `wal/manifest.json` from object storage to avoid atomic single-object contention, race conditions, dual-write skew, and consistency bottlenecks; use self-describing segment files and object prefix listing instead.
 - [ ] **Opaque Stream Offsets (Hide Global Monotonic Positions):** Hide global buffer monotonic positions from individual stream clients. Clients should only reason about their own `stream_id` and `stream_seq`. Expose global positions only as opaque resumption tokens/cookies for consumers.
 - [ ] **Stress & Chaos Testing:**
   - High-concurrency randomized multi-client benchmark tests to stress group commits and tail subscribers.

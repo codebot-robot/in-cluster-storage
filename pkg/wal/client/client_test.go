@@ -382,7 +382,7 @@ func TestConsumerTailThroughCrashWithDedup(t *testing.T) {
 		t.Fatalf("tail 2 failed: %v", err)
 	}
 
-	// Server 2 clamps cursor 11 to manifest.last_position + 1 = 6, returning resumed_from = 6
+	// Server 2 clamps cursor 11 to last_flushed_position + 1 = 6, returning resumed_from = 6
 	// and re-delivers records 6..10.
 	var redeliveredCount int
 	for i := 1; i <= 5; i++ {
