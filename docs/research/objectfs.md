@@ -46,6 +46,6 @@ ObjectFS defines a comprehensive gRPC service (`ObjectFSController` in `proto/ob
 - [x] CSI Node & Identity driver implementation (`cmd/objectfs-node-daemon`).
 - [x] Kubernetes deployment manifests and Dockerfiles (`k8s/objectfs.yaml`, `images/`).
 - [x] End-to-end integration test harness (`tests/e2e/objectfs_e2e_test.go`).
-- [ ] Connect pluggable S3/GCS object storage backends into `ObjectStorageBackend`.
+- [x] Connect pluggable S3/GCS object storage backends into `ObjectStorageBackend`.
 - [ ] Support multipart upload streaming for files exceeding 100MB.
 - [ ] Extended attribute (xattr) support.
