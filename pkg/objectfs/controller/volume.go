@@ -63,7 +63,29 @@ type FileMetadata struct {
 	ETag    string    `json:"etag,omitempty"`
 }
 
+// metadataResolver provides unified read methods for resolving inodes and directories
+// across active in-memory state/caches, local eviction storage, and immutable base EROFS snapshots.
+type metadataResolver struct {
+	localStore     *LocalStorage
+	snapshotReader *erofs.Reader
+	snapshotRaw    io.ReaderAt
+	inodeCache     *LRUCache[uint64, *CachedInode]
+	dirCache       *LRUCache[uint64, *CachedDir]
+
+	// dirtyInodes maps inode IDs to their latest eviction offset in LocalStorage for inodes
+	// that have changed since the last EROFS snapshot. Additional unflushed modifications
+	// may also reside in inodeCache.
+	dirtyInodes map[uint64]LocalOffset
+
+	// dirtyDirs maps directory inode IDs to their latest delta eviction offset in LocalStorage
+	// for directories that have changed since the last EROFS snapshot. Additional unflushed
+	// delta modifications may also reside in dirCache.
+	dirtyDirs map[uint64]LocalOffset
+}
+
 type Volume struct {
+	metadataResolver
+
 	mu           sync.RWMutex
 	volumeID     string
 	rootInodeID  uint64
@@ -77,25 +99,8 @@ type Volume struct {
 	durability walclient.Level
 	streamID   uuid.UUID
 
-	// Tiered metadata storage
-	localStore      *LocalStorage
 	localStorageDir string
-	inodeCache      *LRUCache[uint64, *CachedInode]
-	dirCache        *LRUCache[uint64, *CachedDir]
 
-	// dirtyInodes maps inode IDs to their latest eviction offset in LocalStorage for inodes
-	// that have changed since the last EROFS snapshot. Additional unflushed modifications
-	// may also reside in inodeCache.
-	dirtyInodes map[uint64]LocalOffset
-
-	// dirtyDirs maps directory inode IDs to their latest delta eviction offset in LocalStorage
-	// for directories that have changed since the last EROFS snapshot. Additional unflushed
-	// delta modifications may also reside in dirCache.
-	dirtyDirs map[uint64]LocalOffset
-
-	// Base EROFS snapshot reader
-	snapshotReader *erofs.Reader
-	snapshotRaw    io.ReaderAt
 	snapshotCutoff LocalOffset
 	snapshotMu     sync.Mutex
 
@@ -178,6 +183,10 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 
 	v := &Volume{
+		metadataResolver: metadataResolver{
+			dirtyInodes: make(map[uint64]LocalOffset),
+			dirtyDirs:   make(map[uint64]LocalOffset),
+		},
 		volumeID:         volumeID,
 		rootInodeID:      1,
 		nextInode:        2,
@@ -187,8 +196,6 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		maxInlineLen:     4 * 1024 * 1024, // 4MB default inline threshold
 		durability:       walclient.Local,
 		streamID:         StreamIDForVolume(volumeID),
-		dirtyInodes:      make(map[uint64]LocalOffset),
-		dirtyDirs:        make(map[uint64]LocalOffset),
 		maxBufferFiles:   4,
 		maxDirtyRecords:  100000,
 		maxLocalFileSize: 250 * 1024 * 1024,
@@ -395,18 +402,6 @@ func cleanPath(p string) string {
 		cleaned = "/" + cleaned
 	}
 	return cleaned
-}
-
-// metadataResolver provides unified read methods for resolving inodes and directories
-// across active in-memory state/caches, local eviction storage, and immutable base EROFS snapshots.
-type metadataResolver struct {
-	localStore     *LocalStorage
-	snapshotReader *erofs.Reader
-	snapshotRaw    io.ReaderAt
-	inodeCache     *LRUCache[uint64, *CachedInode]
-	dirCache       *LRUCache[uint64, *CachedDir]
-	dirtyInodes    map[uint64]LocalOffset
-	dirtyDirs      map[uint64]LocalOffset
 }
 
 func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, populateCache bool) (*CachedInode, error) {
@@ -623,26 +618,12 @@ func (r *metadataResolver) resolveDir(ctx context.Context, inodeID uint64, popul
 	return nil, fmt.Errorf("directory inode %d not found: %w", inodeID, syscall.ENOENT)
 }
 
-func (v *Volume) resolverLocked() metadataResolver {
-	return metadataResolver{
-		localStore:     v.localStore,
-		snapshotReader: v.snapshotReader,
-		snapshotRaw:    v.snapshotRaw,
-		inodeCache:     v.inodeCache,
-		dirCache:       v.dirCache,
-		dirtyInodes:    v.dirtyInodes,
-		dirtyDirs:      v.dirtyDirs,
-	}
-}
-
 func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
-	r := v.resolverLocked()
-	return r.resolveInode(ctx, inodeID, true)
+	return v.resolveInode(ctx, inodeID, true)
 }
 
 func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*CachedDir, error) {
-	r := v.resolverLocked()
-	return r.resolveDir(ctx, inodeID, true)
+	return v.resolveDir(ctx, inodeID, true)
 }
 
 func (v *Volume) resolvePathLocked(ctx context.Context, p string) (uint64, uint64, string, error) {
