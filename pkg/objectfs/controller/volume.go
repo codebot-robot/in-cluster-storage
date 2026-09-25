@@ -397,14 +397,34 @@ func cleanPath(p string) string {
 	return cleaned
 }
 
-func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
-	if node, ok := v.inodeCache.Get(inodeID); ok {
-		return node, nil
+// metadataResolver provides unified read methods for resolving inodes and directories
+// across active in-memory state/caches, local eviction storage, and immutable base EROFS snapshots.
+type metadataResolver struct {
+	localStore     *LocalStorage
+	snapshotReader *erofs.Reader
+	snapshotRaw    io.ReaderAt
+	inodeCache     *LRUCache[uint64, *CachedInode]
+	dirCache       *LRUCache[uint64, *CachedDir]
+	dirtyInodes    map[uint64]LocalOffset
+	dirtyDirs      map[uint64]LocalOffset
+}
+
+func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, populateCache bool) (*CachedInode, error) {
+	if r.inodeCache != nil {
+		if populateCache {
+			if node, ok := r.inodeCache.Get(inodeID); ok {
+				return node, nil
+			}
+		} else {
+			if node, ok := r.inodeCache.Peek(inodeID); ok {
+				return node, nil
+			}
+		}
 	}
 
 	// 1. Check if evicted to local storage
-	if off, isDirty := v.dirtyInodes[inodeID]; isDirty && off != NoOffset && v.localStore != nil {
-		_, payload, err := v.localStore.ReadRecord(off)
+	if off, isDirty := r.dirtyInodes[inodeID]; isDirty && off != NoOffset && r.localStore != nil {
+		_, payload, err := r.localStore.ReadRecord(off)
 		if err == nil {
 			rec, err := DecodeInodeRecord(payload)
 			if err == nil {
@@ -416,20 +436,22 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 					IsDir:   rec.IsDir,
 					Sha256:  rec.Sha256,
 					ETag:    rec.ETag,
-					IsDirty: true,
+					IsDirty: populateCache,
 				}
-				v.inodeCache.Put(inodeID, node)
+				if populateCache && r.inodeCache != nil {
+					r.inodeCache.Put(inodeID, node)
+				}
 				return node, nil
 			}
 		}
 	}
 
 	// 2. Fetch from base snapshot
-	if v.snapshotReader != nil && v.snapshotRaw != nil {
-		erofsInode, err := erofs.ReadInode(v.snapshotRaw, v.snapshotReader.Superblock(), inodeID)
+	if r.snapshotReader != nil && r.snapshotRaw != nil {
+		erofsInode, err := erofs.ReadInode(r.snapshotRaw, r.snapshotReader.Superblock(), inodeID)
 		if err == nil {
 			var shaStr string
-			xattrs, xErr := v.snapshotReader.GetXattrs(inodeID)
+			xattrs, xErr := r.snapshotReader.GetXattrs(inodeID)
 			if xErr == nil && !xattrs.IsEmpty() {
 				if xattrs.UserDigest != "" {
 					shaStr = xattrs.UserDigest
@@ -460,7 +482,9 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 				Sha256:  shaStr,
 				IsDirty: false,
 			}
-			v.inodeCache.Put(inodeID, node)
+			if populateCache && r.inodeCache != nil {
+				r.inodeCache.Put(inodeID, node)
+			}
 			return node, nil
 		}
 	}
@@ -468,21 +492,40 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 	return nil, fmt.Errorf("inode %d not found: %w", inodeID, syscall.ENOENT)
 }
 
-func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*CachedDir, error) {
-	if dir, ok := v.dirCache.Get(inodeID); ok {
-		return dir, nil
+func (r *metadataResolver) resolveDir(ctx context.Context, inodeID uint64, populateCache bool) (*CachedDir, error) {
+	if r.dirCache != nil {
+		if populateCache {
+			if dir, ok := r.dirCache.Get(inodeID); ok {
+				return dir, nil
+			}
+		} else {
+			if cached, ok := r.dirCache.Peek(inodeID); ok {
+				entriesCopy := make(map[string]DirEntry, len(cached.Entries))
+				for k, v := range cached.Entries {
+					entriesCopy[k] = v
+				}
+				return &CachedDir{
+					ID:         cached.ID,
+					Entries:    entriesCopy,
+					Added:      make(map[string]bool),
+					Deleted:    make(map[string]bool),
+					PrevOffset: cached.PrevOffset,
+					IsDirty:    false,
+				}, nil
+			}
+		}
 	}
 
 	entries := make(map[string]DirEntry)
 
 	// 1. Check if dirty delta exists in local storage
-	if off, isDirty := v.dirtyDirs[inodeID]; isDirty && off != NoOffset && v.localStore != nil {
+	if off, isDirty := r.dirtyDirs[inodeID]; isDirty && off != NoOffset && r.localStore != nil {
 		var deltas []*DirDeltaRecord
 		currOff := off
 		visited := make(map[LocalOffset]bool)
 		for currOff != NoOffset && !visited[currOff] {
 			visited[currOff] = true
-			_, payload, err := v.localStore.ReadRecord(currOff)
+			_, payload, err := r.localStore.ReadRecord(currOff)
 			if err != nil {
 				break
 			}
@@ -495,8 +538,8 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 		}
 
 		// Read base from base snapshot if present
-		if v.snapshotReader != nil {
-			dirents, err := v.snapshotReader.ListDirectory(inodeID)
+		if r.snapshotReader != nil {
+			dirents, err := r.snapshotReader.ListDirectory(inodeID)
 			if err == nil {
 				for _, de := range dirents {
 					if de.Name == "." || de.Name == ".." {
@@ -536,13 +579,15 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 			PrevOffset: off,
 			IsDirty:    false,
 		}
-		v.dirCache.Put(inodeID, dir)
+		if populateCache && r.dirCache != nil {
+			r.dirCache.Put(inodeID, dir)
+		}
 		return dir, nil
 	}
 
 	// 2. Fetch clean directory from snapshot
-	if v.snapshotReader != nil {
-		dirents, err := v.snapshotReader.ListDirectory(inodeID)
+	if r.snapshotReader != nil {
+		dirents, err := r.snapshotReader.ListDirectory(inodeID)
 		if err == nil {
 			for _, de := range dirents {
 				if de.Name == "." || de.Name == ".." {
@@ -568,12 +613,36 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 				PrevOffset: NoOffset,
 				IsDirty:    false,
 			}
-			v.dirCache.Put(inodeID, dir)
+			if populateCache && r.dirCache != nil {
+				r.dirCache.Put(inodeID, dir)
+			}
 			return dir, nil
 		}
 	}
 
 	return nil, fmt.Errorf("directory inode %d not found: %w", inodeID, syscall.ENOENT)
+}
+
+func (v *Volume) resolverLocked() metadataResolver {
+	return metadataResolver{
+		localStore:     v.localStore,
+		snapshotReader: v.snapshotReader,
+		snapshotRaw:    v.snapshotRaw,
+		inodeCache:     v.inodeCache,
+		dirCache:       v.dirCache,
+		dirtyInodes:    v.dirtyInodes,
+		dirtyDirs:      v.dirtyDirs,
+	}
+}
+
+func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
+	r := v.resolverLocked()
+	return r.resolveInode(ctx, inodeID, true)
+}
+
+func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*CachedDir, error) {
+	r := v.resolverLocked()
+	return r.resolveDir(ctx, inodeID, true)
 }
 
 func (v *Volume) resolvePathLocked(ctx context.Context, p string) (uint64, uint64, string, error) {
@@ -1564,170 +1633,20 @@ func (b *bufferWriterAt) WriteAt(p []byte, off int64) (int, error) {
 }
 
 type snapshotResolver struct {
-	vol         *Volume
-	baseReader  *erofs.Reader
-	baseRaw     io.ReaderAt
-	dirtyInodes map[uint64]LocalOffset
-	dirtyDirs   map[uint64]LocalOffset
-	cutoff      LocalOffset
+	metadataResolver
+	vol *Volume
 }
 
 func (r *snapshotResolver) getOrLoadInode(ctx context.Context, inodeID uint64) (*CachedInode, error) {
-	if off, ok := r.dirtyInodes[inodeID]; ok && off != NoOffset && r.vol.localStore != nil {
-		_, payload, err := r.vol.localStore.ReadRecord(off)
-		if err == nil {
-			rec, err := DecodeInodeRecord(payload)
-			if err == nil {
-				return &CachedInode{
-					ID:      rec.InodeID,
-					Mode:    rec.Mode,
-					Size:    rec.Size,
-					ModTime: rec.ModTime,
-					IsDir:   rec.IsDir,
-					Sha256:  rec.Sha256,
-					ETag:    rec.ETag,
-					IsDirty: false,
-				}, nil
-			}
-		}
-	}
-
-	if r.baseReader != nil && r.baseRaw != nil {
-		erofsInode, err := erofs.ReadInode(r.baseRaw, r.baseReader.Superblock(), inodeID)
-		if err == nil {
-			var shaStr string
-			xattrs, xErr := r.baseReader.GetXattrs(inodeID)
-			if xErr == nil && !xattrs.IsEmpty() {
-				if xattrs.UserDigest != "" {
-					shaStr = xattrs.UserDigest
-				} else if xattrs.UserSHA256 != "" {
-					shaStr = xattrs.UserSHA256
-				}
-			}
-
-			isDir := (erofsInode.Mode & erofs.S_IFMT) == erofs.S_IFDIR
-			mode := uint32(erofsInode.Mode)
-			if isDir {
-				mode |= syscall.S_IFDIR
-			} else {
-				mode |= syscall.S_IFREG
-			}
-
-			mtime := time.Unix(int64(erofsInode.Mtime), int64(erofsInode.MtimeNsec))
-			if erofsInode.Mtime == 0 {
-				mtime = time.Now()
-			}
-
-			return &CachedInode{
-				ID:      inodeID,
-				Mode:    mode,
-				Size:    int64(erofsInode.Size),
-				ModTime: mtime,
-				IsDir:   isDir,
-				Sha256:  shaStr,
-				IsDirty: false,
-			}, nil
-		}
-	}
-
-	if r.vol.inodeCache != nil {
-		if node, ok := r.vol.inodeCache.Peek(inodeID); ok {
-			return node, nil
-		}
-	}
-
-	return nil, fmt.Errorf("inode %d not found in snapshot resolver: %w", inodeID, syscall.ENOENT)
+	return r.resolveInode(ctx, inodeID, false)
 }
 
 func (r *snapshotResolver) getOrLoadDir(ctx context.Context, inodeID uint64) (map[string]DirEntry, error) {
-	entries := make(map[string]DirEntry)
-
-	if off, ok := r.dirtyDirs[inodeID]; ok && off != NoOffset && r.vol.localStore != nil {
-		var deltas []*DirDeltaRecord
-		currOff := off
-		visited := make(map[LocalOffset]bool)
-		for currOff != NoOffset && !visited[currOff] {
-			visited[currOff] = true
-			_, payload, err := r.vol.localStore.ReadRecord(currOff)
-			if err != nil {
-				break
-			}
-			rec, err := DecodeDirDeltaRecord(payload)
-			if err != nil {
-				break
-			}
-			deltas = append(deltas, rec)
-			currOff = rec.PrevOffset
-		}
-
-		if r.baseReader != nil {
-			dirents, err := r.baseReader.ListDirectory(inodeID)
-			if err == nil {
-				for _, de := range dirents {
-					if de.Name == "." || de.Name == ".." {
-						continue
-					}
-					isDir := de.FileType == erofs.FTDir
-					mode := uint32(0644 | syscall.S_IFREG)
-					if isDir {
-						mode = uint32(0755 | syscall.S_IFDIR)
-					}
-					entries[de.Name] = DirEntry{
-						Name:    de.Name,
-						InodeID: de.NID,
-						IsDir:   isDir,
-						Mode:    mode,
-					}
-				}
-			}
-		}
-
-		for i := len(deltas) - 1; i >= 0; i-- {
-			d := deltas[i]
-			for _, del := range d.Deleted {
-				delete(entries, del)
-			}
-			for _, add := range d.Added {
-				entries[add.Name] = add
-			}
-		}
-
-		return entries, nil
+	dir, err := r.resolveDir(ctx, inodeID, false)
+	if err != nil {
+		return nil, err
 	}
-
-	if r.baseReader != nil {
-		dirents, err := r.baseReader.ListDirectory(inodeID)
-		if err == nil {
-			for _, de := range dirents {
-				if de.Name == "." || de.Name == ".." {
-					continue
-				}
-				isDir := de.FileType == erofs.FTDir
-				mode := uint32(0644 | syscall.S_IFREG)
-				if isDir {
-					mode = uint32(0755 | syscall.S_IFDIR)
-				}
-				entries[de.Name] = DirEntry{
-					Name:    de.Name,
-					InodeID: de.NID,
-					IsDir:   isDir,
-					Mode:    mode,
-				}
-			}
-			return entries, nil
-		}
-	}
-
-	if r.vol.dirCache != nil {
-		if cached, ok := r.vol.dirCache.Peek(inodeID); ok {
-			for k, v := range cached.Entries {
-				entries[k] = v
-			}
-			return entries, nil
-		}
-	}
-
-	return entries, nil
+	return dir.Entries, nil
 }
 
 func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64, dirName, currentPath string, dirtyBlobs map[string]blob.ByteStream, currentEntries map[string]FileMetadata) (erofs.Node, error) {
@@ -1896,12 +1815,14 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		dirtyBlobs := make(map[string]blob.ByteStream)
 
 		resolver := &snapshotResolver{
-			vol:         v,
-			baseReader:  baseReader,
-			baseRaw:     baseRaw,
-			dirtyInodes: snapDirtyInodes,
-			dirtyDirs:   snapDirtyDirs,
-			cutoff:      cutoffOffset,
+			vol: v,
+			metadataResolver: metadataResolver{
+				localStore:     v.localStore,
+				snapshotReader: baseReader,
+				snapshotRaw:    baseRaw,
+				dirtyInodes:    snapDirtyInodes,
+				dirtyDirs:      snapDirtyDirs,
+			},
 		}
 
 		erofsTree, err := resolver.buildErofsTree(ctx, rootID, "/", "/", dirtyBlobs, currentEntries)

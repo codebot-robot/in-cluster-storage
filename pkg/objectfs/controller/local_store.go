@@ -351,7 +351,9 @@ type LocalStorageOption func(*LocalStorage)
 // WithMaxLocalFileSize sets the maximum size in bytes before rotating to the next local buffer file.
 func WithMaxLocalFileSize(size int64) LocalStorageOption {
 	return func(s *LocalStorage) {
-		if size > 0 && size <= MaxFileSizeInBytes {
+		if size <= 0 || size > MaxFileSizeInBytes {
+			s.maxFileSize = MaxFileSizeInBytes
+		} else {
 			s.maxFileSize = size
 		}
 	}
@@ -373,6 +375,10 @@ func NewLocalStorage(dir string, opts ...LocalStorageOption) (*LocalStorage, err
 
 	for _, opt := range opts {
 		opt(s)
+	}
+
+	if s.maxFileSize <= 0 || s.maxFileSize > MaxFileSizeInBytes {
+		s.maxFileSize = MaxFileSizeInBytes
 	}
 
 	// Create initial active file with O_CREATE|O_EXCL. If it already exists, return the error.
@@ -433,13 +439,8 @@ func (s *LocalStorage) WriteRecord(recType byte, payload []byte) (LocalOffset, e
 	payloadLen := uint32(len(payload))
 	recordLen := int64(1 + 4 + 4 + len(payload)) // [type (1B)][len (4B)][crc (4B)][payload]
 
-	limit := s.maxFileSize
-	if limit <= 0 || limit > MaxFileSizeInBytes {
-		limit = MaxFileSizeInBytes
-	}
-
 	// If active file would exceed max size, rotate to next file with O_EXCL to prevent silent overwrites.
-	if s.activeOffset+recordLen > limit {
+	if s.activeOffset+recordLen > s.maxFileSize {
 		nextFileID := (s.activeFileID + 1) % MaxLocalFiles
 		if s.files[nextFileID] != nil {
 			return NoOffset, fmt.Errorf("local storage full: all %d buffer files in use", MaxLocalFiles)
@@ -522,8 +523,8 @@ func (s *LocalStorage) ReadRecord(off LocalOffset) (byte, []byte, error) {
 	return recType, payload, nil
 }
 
-// TrimBeforeFile closes and deletes all local storage buffer files strictly older than cutoffFileID in circular sequence.
-func (s *LocalStorage) TrimBeforeFile(cutoffFileID int) error {
+// trimBeforeFile closes and deletes all local storage buffer files strictly older than cutoffFileID in circular sequence.
+func (s *LocalStorage) trimBeforeFile(cutoffFileID int) error {
 	if cutoffFileID < 0 || cutoffFileID >= MaxLocalFiles {
 		return fmt.Errorf("invalid cutoff file ID %d", cutoffFileID)
 	}
@@ -534,7 +535,9 @@ func (s *LocalStorage) TrimBeforeFile(cutoffFileID int) error {
 	for s.oldestFileID != cutoffFileID && s.oldestFileID != s.activeFileID {
 		fileID := s.oldestFileID
 		if s.files[fileID] != nil {
-			_ = s.files[fileID].Close()
+			if err := s.files[fileID].Close(); err != nil {
+				klog.Warningf("Failed to close trimmed local storage file %d: %v", fileID, err)
+			}
 			s.files[fileID] = nil
 			filePath := filepath.Join(s.dir, fmt.Sprintf("meta-%02d.dat", fileID))
 			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
@@ -552,7 +555,7 @@ func (s *LocalStorage) TrimBefore(cutoff LocalOffset) error {
 		return nil
 	}
 	cutoffFileID, _ := UnpackOffset(cutoff)
-	return s.TrimBeforeFile(cutoffFileID)
+	return s.trimBeforeFile(cutoffFileID)
 }
 
 // CurrentOffset returns the current write pointer packed LocalOffset.

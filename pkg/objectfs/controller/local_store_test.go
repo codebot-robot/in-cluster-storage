@@ -523,7 +523,7 @@ func TestLocalStorageCircularBufferRotationAndTrimming(t *testing.T) {
 			activeFile, _ := UnpackOffset(currentOff)
 			// Trim to 2 files behind active file
 			trimTarget := (activeFile - 2 + MaxLocalFiles) % MaxLocalFiles
-			_ = ls.TrimBeforeFile(trimTarget)
+			_ = ls.trimBeforeFile(trimTarget)
 		}
 
 		rec := &InodeRecord{
