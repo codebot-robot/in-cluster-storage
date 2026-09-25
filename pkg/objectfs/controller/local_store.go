@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"k8s.io/klog/v2"
 )
 
 // LocalOffset represents a 32-bit packed pointer into local metadata eviction storage.
@@ -38,6 +40,7 @@ const (
 
 	MaxLocalFiles      = 16
 	MaxFileSizeInBytes = 256 * 1024 * 1024 // 256 MB per file (28 bits)
+	MaxRecordPayload   = 1 * 1024 * 1024   // 1 MB maximum payload size sanity check for metadata records
 	LocalFileHeader    = "OBJSLOG1"
 	HeaderLen          = 8
 )
@@ -352,22 +355,9 @@ func NewLocalStorage(dir string) (*LocalStorage, error) {
 		activeOffset: HeaderLen,
 	}
 
-	// Create initial active file with O_CREATE|O_EXCL (or open if already initialized)
+	// Create initial active file with O_CREATE|O_EXCL. If it already exists, return the error.
 	if _, err := s.createNewFileLocked(0); err != nil {
-		if os.IsExist(err) {
-			filePath := filepath.Join(s.dir, fmt.Sprintf("meta-%02d.dat", 0))
-			f, oErr := os.OpenFile(filePath, os.O_RDWR, 0644)
-			if oErr != nil {
-				return nil, fmt.Errorf("failed to open existing local storage file %s: %w", filePath, oErr)
-			}
-			s.files[0] = f
-			fi, sErr := f.Stat()
-			if sErr == nil && fi.Size() > HeaderLen {
-				s.activeOffset = fi.Size()
-			}
-		} else {
-			return nil, fmt.Errorf("failed to create initial local storage file: %w", err)
-		}
+		return nil, fmt.Errorf("failed to create initial local storage file: %w", err)
 	}
 
 	return s, nil
@@ -389,8 +379,7 @@ func (s *LocalStorage) createNewFileLocked(fileID int) (*os.File, error) {
 		return nil, fmt.Errorf("invalid file ID %d", fileID)
 	}
 	if s.files[fileID] != nil {
-		_ = s.files[fileID].Close()
-		s.files[fileID] = nil
+		return nil, fmt.Errorf("local storage file %d is already open", fileID)
 	}
 
 	filePath := filepath.Join(s.dir, fmt.Sprintf("meta-%02d.dat", fileID))
@@ -403,7 +392,9 @@ func (s *LocalStorage) createNewFileLocked(fileID int) (*os.File, error) {
 	if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
 		_ = f.Close()
 		s.files[fileID] = nil
-		_ = os.Remove(filePath)
+		if rErr := os.Remove(filePath); rErr != nil {
+			klog.Warningf("Failed to clean up uninitialized local storage file %s: %v", filePath, rErr)
+		}
 		return nil, fmt.Errorf("failed to write header to %s: %w", filePath, err)
 	}
 
@@ -412,6 +403,10 @@ func (s *LocalStorage) createNewFileLocked(fileID int) (*os.File, error) {
 
 // WriteRecord serializes and appends a record of recType with payload to the active local file.
 func (s *LocalStorage) WriteRecord(recType byte, payload []byte) (LocalOffset, error) {
+	if len(payload) > MaxRecordPayload {
+		return NoOffset, fmt.Errorf("payload size %d exceeds max allowed %d bytes", len(payload), MaxRecordPayload)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -480,6 +475,10 @@ func (s *LocalStorage) ReadRecord(off LocalOffset) (byte, []byte, error) {
 	recType := headerBuf[0]
 	payloadLen := binary.BigEndian.Uint32(headerBuf[1:5])
 	expectedCrc := binary.BigEndian.Uint32(headerBuf[5:9])
+
+	if payloadLen > MaxRecordPayload {
+		return 0, nil, fmt.Errorf("corrupted record payload length %d exceeds max allowed %d bytes at offset %d", payloadLen, MaxRecordPayload, off)
+	}
 
 	payload := make([]byte, payloadLen)
 	if payloadLen > 0 {
