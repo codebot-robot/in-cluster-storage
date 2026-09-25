@@ -172,12 +172,12 @@ func TestLocalStorageWriteAndReadRecords(t *testing.T) {
 		t.Errorf("Decoded rec2 mismatch: %+v (err: %v)", dec2, err)
 	}
 
-	// Truncate and verify offsets reset
-	if err := ls.Truncate(); err != nil {
-		t.Fatalf("Truncate failed: %v", err)
+	// Delete all files and verify offsets reset
+	if err := ls.DeleteAllAndReset(); err != nil {
+		t.Fatalf("DeleteAllAndReset failed: %v", err)
 	}
 	if ls.ActiveFileSize() != HeaderLen {
-		t.Errorf("Expected active file size %d after truncate, got %d", HeaderLen, ls.ActiveFileSize())
+		t.Errorf("Expected active file size %d after DeleteAllAndReset, got %d", HeaderLen, ls.ActiveFileSize())
 	}
 }
 

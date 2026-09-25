@@ -82,8 +82,16 @@ type Volume struct {
 	localStorageDir string
 	inodeCache      *LRUCache[uint64, *CachedInode]
 	dirCache        *LRUCache[uint64, *CachedDir]
-	dirtyInodes     map[uint64]LocalOffset
-	dirtyDirs       map[uint64]LocalOffset
+
+	// dirtyInodes maps inode IDs to their latest eviction offset in LocalStorage for inodes
+	// that have changed since the last EROFS snapshot. Additional unflushed modifications
+	// may also reside in inodeCache.
+	dirtyInodes map[uint64]LocalOffset
+
+	// dirtyDirs maps directory inode IDs to their latest delta eviction offset in LocalStorage
+	// for directories that have changed since the last EROFS snapshot. Additional unflushed
+	// delta modifications may also reside in dirCache.
+	dirtyDirs map[uint64]LocalOffset
 
 	// Base EROFS snapshot reader
 	snapshotReader *erofs.Reader
@@ -1724,9 +1732,9 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		v.rootInodeID = r.GetRootNID()
 	}
 
-	// 6. Truncate and reset local eviction storage
+	// 6. Delete and reset local eviction storage
 	if v.localStore != nil {
-		_ = v.localStore.Truncate()
+		_ = v.localStore.DeleteAllAndReset()
 	}
 	v.dirtyInodes = make(map[uint64]LocalOffset)
 	v.dirtyDirs = make(map[uint64]LocalOffset)
@@ -2241,7 +2249,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 	v.dirtyInodes = make(map[uint64]LocalOffset)
 	v.dirtyDirs = make(map[uint64]LocalOffset)
 	if v.localStore != nil {
-		_ = v.localStore.Truncate()
+		_ = v.localStore.DeleteAllAndReset()
 	}
 
 	return nil

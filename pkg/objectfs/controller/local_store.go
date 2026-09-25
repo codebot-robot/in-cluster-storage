@@ -388,17 +388,21 @@ func (s *LocalStorage) WriteRecord(recType byte, payload []byte) (LocalOffset, e
 	payloadLen := uint32(len(payload))
 	recordLen := int64(1 + 4 + 4 + len(payload)) // [type (1B)][len (4B)][crc (4B)][payload]
 
-	// If active file would exceed max size, rotate to next file
+	// If active file would exceed max size, rotate to next file.
+	// TODO: implement proactive background snapshotting/compaction to delete or recycle older files before wrapping file IDs.
 	if s.activeOffset+recordLen > MaxFileSizeInBytes {
-		s.activeFileID = (s.activeFileID + 1) % MaxLocalFiles
-		f, err := s.getOrOpenFileLocked(s.activeFileID)
+		nextFileID := (s.activeFileID + 1) % MaxLocalFiles
+		f, err := s.getOrOpenFileLocked(nextFileID)
 		if err != nil {
-			return NoOffset, err
+			return NoOffset, fmt.Errorf("failed to open rotated local file %d: %w", nextFileID, err)
 		}
-		_ = f.Truncate(0)
+		if err := f.Truncate(0); err != nil {
+			return NoOffset, fmt.Errorf("failed to truncate rotated local file %d: %w", nextFileID, err)
+		}
 		if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
-			return NoOffset, fmt.Errorf("failed to initialize rotated file %d: %w", s.activeFileID, err)
+			return NoOffset, fmt.Errorf("failed to initialize header in rotated file %d: %w", nextFileID, err)
 		}
+		s.activeFileID = nextFileID
 		s.activeOffset = HeaderLen
 	}
 
@@ -469,19 +473,18 @@ func (s *LocalStorage) ReadRecord(off LocalOffset) (byte, []byte, error) {
 	return recType, payload, nil
 }
 
-// Truncate truncates all local storage files and resets write pointers.
-func (s *LocalStorage) Truncate() error {
+// DeleteAllAndReset closes and deletes all local storage files on disk and resets write pointers.
+func (s *LocalStorage) DeleteAllAndReset() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for i := 0; i < MaxLocalFiles; i++ {
-		f := s.files[i]
-		if f != nil {
-			_ = f.Truncate(0)
-			if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
-				return fmt.Errorf("failed to reset file %d: %w", i, err)
-			}
+		if s.files[i] != nil {
+			_ = s.files[i].Close()
+			s.files[i] = nil
 		}
+		filePath := filepath.Join(s.dir, fmt.Sprintf("meta-%02d.dat", i))
+		_ = os.Remove(filePath)
 	}
 	s.activeFileID = 0
 	s.activeOffset = HeaderLen

@@ -22,10 +22,17 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 )
 
+// readMonotonicClock returns the current monotonic time in nanoseconds.
+// In Go, time.Now() contains a monotonic clock reading that is fast (VDSO syscall-free on modern Linux).
+// Extracted into a helper function to allow swapping clock implementations or benchmarking alternative timers.
+func readMonotonicClock() int64 {
+	return time.Now().UnixNano()
+}
+
 type cacheElement[K comparable, V any] struct {
 	key      K
 	value    V
-	lastUsed int64 // Unix nanoseconds
+	lastUsed int64 // Monotonic nanoseconds
 }
 
 // LRUCache implements an in-memory least-recently-used cache tracking access times.
@@ -54,7 +61,7 @@ func (c *LRUCache[K, V]) Get(key K) (V, bool) {
 		var zero V
 		return zero, false
 	}
-	elem.lastUsed = time.Now().UnixNano()
+	elem.lastUsed = readMonotonicClock()
 	return elem.value, true
 }
 
@@ -70,7 +77,7 @@ func (c *LRUCache[K, V]) Peek(key K) (V, bool) {
 
 // Put inserts or updates key-value pair, evicting the least recently used item(s) if capacity is exceeded.
 func (c *LRUCache[K, V]) Put(key K, value V) {
-	now := time.Now().UnixNano()
+	now := readMonotonicClock()
 	if elem, ok := c.items[key]; ok {
 		elem.value = value
 		elem.lastUsed = now
