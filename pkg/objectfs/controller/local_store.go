@@ -352,29 +352,59 @@ func NewLocalStorage(dir string) (*LocalStorage, error) {
 		activeOffset: HeaderLen,
 	}
 
+	// Create initial active file with O_CREATE|O_EXCL (or open if already initialized)
+	if _, err := s.createNewFileLocked(0); err != nil {
+		if os.IsExist(err) {
+			filePath := filepath.Join(s.dir, fmt.Sprintf("meta-%02d.dat", 0))
+			f, oErr := os.OpenFile(filePath, os.O_RDWR, 0644)
+			if oErr != nil {
+				return nil, fmt.Errorf("failed to open existing local storage file %s: %w", filePath, oErr)
+			}
+			s.files[0] = f
+			fi, sErr := f.Stat()
+			if sErr == nil && fi.Size() > HeaderLen {
+				s.activeOffset = fi.Size()
+			}
+		} else {
+			return nil, fmt.Errorf("failed to create initial local storage file: %w", err)
+		}
+	}
+
 	return s, nil
 }
 
-func (s *LocalStorage) getOrOpenFileLocked(fileID int) (*os.File, error) {
+func (s *LocalStorage) getFileLocked(fileID int) (*os.File, error) {
+	if fileID < 0 || fileID >= MaxLocalFiles {
+		return nil, fmt.Errorf("invalid file ID %d", fileID)
+	}
+	f := s.files[fileID]
+	if f == nil {
+		return nil, fmt.Errorf("local storage file %d is not open", fileID)
+	}
+	return f, nil
+}
+
+func (s *LocalStorage) createNewFileLocked(fileID int) (*os.File, error) {
 	if fileID < 0 || fileID >= MaxLocalFiles {
 		return nil, fmt.Errorf("invalid file ID %d", fileID)
 	}
 	if s.files[fileID] != nil {
-		return s.files[fileID], nil
+		_ = s.files[fileID].Close()
+		s.files[fileID] = nil
 	}
 
 	filePath := filepath.Join(s.dir, fmt.Sprintf("meta-%02d.dat", fileID))
-	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
+	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open local storage file %s: %w", filePath, err)
+		return nil, err
 	}
 	s.files[fileID] = f
 
-	fi, err := f.Stat()
-	if err == nil && fi.Size() == 0 {
-		if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
-			return nil, fmt.Errorf("failed to write header to %s: %w", filePath, err)
-		}
+	if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
+		_ = f.Close()
+		s.files[fileID] = nil
+		_ = os.Remove(filePath)
+		return nil, fmt.Errorf("failed to write header to %s: %w", filePath, err)
 	}
 
 	return f, nil
@@ -388,25 +418,18 @@ func (s *LocalStorage) WriteRecord(recType byte, payload []byte) (LocalOffset, e
 	payloadLen := uint32(len(payload))
 	recordLen := int64(1 + 4 + 4 + len(payload)) // [type (1B)][len (4B)][crc (4B)][payload]
 
-	// If active file would exceed max size, rotate to next file.
+	// If active file would exceed max size, rotate to next file with O_EXCL to prevent silent overwrites.
 	// TODO: implement proactive background snapshotting/compaction to delete or recycle older files before wrapping file IDs.
 	if s.activeOffset+recordLen > MaxFileSizeInBytes {
 		nextFileID := (s.activeFileID + 1) % MaxLocalFiles
-		f, err := s.getOrOpenFileLocked(nextFileID)
-		if err != nil {
-			return NoOffset, fmt.Errorf("failed to open rotated local file %d: %w", nextFileID, err)
-		}
-		if err := f.Truncate(0); err != nil {
-			return NoOffset, fmt.Errorf("failed to truncate rotated local file %d: %w", nextFileID, err)
-		}
-		if _, err := f.WriteAt([]byte(LocalFileHeader), 0); err != nil {
-			return NoOffset, fmt.Errorf("failed to initialize header in rotated file %d: %w", nextFileID, err)
+		if _, err := s.createNewFileLocked(nextFileID); err != nil {
+			return NoOffset, fmt.Errorf("failed to create rotated local file %d with O_EXCL: %w", nextFileID, err)
 		}
 		s.activeFileID = nextFileID
 		s.activeOffset = HeaderLen
 	}
 
-	f, err := s.getOrOpenFileLocked(s.activeFileID)
+	f, err := s.getFileLocked(s.activeFileID)
 	if err != nil {
 		return NoOffset, err
 	}
@@ -441,12 +464,12 @@ func (s *LocalStorage) ReadRecord(off LocalOffset) (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("invalid file ID %d in offset %d", fileID, off)
 	}
 
-	s.mu.Lock()
-	f, err := s.getOrOpenFileLocked(fileID)
-	s.mu.Unlock()
+	s.mu.RLock()
+	f := s.files[fileID]
+	s.mu.RUnlock()
 
-	if err != nil {
-		return 0, nil, err
+	if f == nil {
+		return 0, nil, fmt.Errorf("local storage file %d is not open", fileID)
 	}
 
 	headerBuf := make([]byte, 9)
@@ -488,6 +511,11 @@ func (s *LocalStorage) DeleteAllAndReset() error {
 	}
 	s.activeFileID = 0
 	s.activeOffset = HeaderLen
+
+	// Re-initialize active file 0
+	if _, err := s.createNewFileLocked(0); err != nil {
+		return fmt.Errorf("failed to create local storage file 0 on reset: %w", err)
+	}
 	return nil
 }
 
