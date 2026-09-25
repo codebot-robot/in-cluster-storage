@@ -18,6 +18,9 @@ package controller
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -443,5 +446,283 @@ func TestAutoSnapshotTriggerOnThreshold(t *testing.T) {
 	}
 	if len(snapshots) == 0 {
 		t.Fatalf("Expected auto-triggered snapshot in backend, got none")
+	}
+}
+
+func TestLocalStorageCircularBufferRotationAndTrimming(t *testing.T) {
+	dir := t.TempDir()
+	// Set small file limit to 150 bytes to force frequent file rotation
+	ls, err := NewLocalStorage(dir, WithMaxLocalFileSize(150))
+	if err != nil {
+		t.Fatalf("NewLocalStorage failed: %v", err)
+	}
+	defer ls.Close()
+
+	var offsets []LocalOffset
+	for i := 0; i < 20; i++ {
+		rec := &InodeRecord{
+			InodeID: uint64(i + 1),
+			Mode:    0644,
+			Size:    100,
+			ModTime: time.Now(),
+			Sha256:  fmt.Sprintf("sha-%d", i),
+		}
+		p, _ := EncodeInodeRecord(rec)
+		off, err := ls.WriteRecord(RecordTypeInode, p)
+		if err != nil {
+			t.Fatalf("WriteRecord %d failed: %v", i, err)
+		}
+		offsets = append(offsets, off)
+	}
+
+	// Should have multiple buffer files
+	initialFileCount := ls.FileCount()
+	if initialFileCount <= 1 {
+		t.Fatalf("Expected multiple files after writing 20 records with 150B limit, got %d", initialFileCount)
+	}
+
+	// Pick an offset in an intermediate file (e.g. offset #10)
+	trimCutoff := offsets[10]
+	cutoffFileID, _ := UnpackOffset(trimCutoff)
+
+	if cutoffFileID == 0 {
+		t.Fatalf("Expected cutoff file ID > 0, got %d", cutoffFileID)
+	}
+
+	// Verify file 0 exists before trim
+	f0Path := filepath.Join(dir, "meta-00.dat")
+	if _, err := os.Stat(f0Path); err != nil {
+		t.Fatalf("Expected meta-00.dat to exist before trim: %v", err)
+	}
+
+	// Trim before cutoff
+	if err := ls.TrimBefore(trimCutoff); err != nil {
+		t.Fatalf("TrimBefore failed: %v", err)
+	}
+
+	// Verify files older than cutoffFileID are deleted from disk
+	if _, err := os.Stat(f0Path); !os.IsNotExist(err) {
+		t.Fatalf("Expected meta-00.dat to be deleted after TrimBefore, got err: %v", err)
+	}
+
+	// Verify file at cutoffFileID still exists and can be read
+	_, p10, err := ls.ReadRecord(trimCutoff)
+	if err != nil {
+		t.Fatalf("ReadRecord at cutoff failed: %v", err)
+	}
+	dec10, err := DecodeInodeRecord(p10)
+	if err != nil || dec10.InodeID != 11 {
+		t.Fatalf("Decoded record 10 mismatch: %+v (err: %v)", dec10, err)
+	}
+
+	// Write more records to wrap through all 16 files
+	for i := 20; i < 100; i++ {
+		// Periodically trim older files so circular buffer does not overflow
+		if ls.FileCount() >= 10 {
+			currentOff := ls.CurrentOffset()
+			activeFile, _ := UnpackOffset(currentOff)
+			// Trim to 2 files behind active file
+			trimTarget := (activeFile - 2 + MaxLocalFiles) % MaxLocalFiles
+			_ = ls.TrimBeforeFile(trimTarget)
+		}
+
+		rec := &InodeRecord{
+			InodeID: uint64(i + 1),
+			Mode:    0644,
+			Size:    100,
+			ModTime: time.Now(),
+			Sha256:  fmt.Sprintf("sha-%d", i),
+		}
+		p, _ := EncodeInodeRecord(rec)
+		_, err := ls.WriteRecord(RecordTypeInode, p)
+		if err != nil {
+			t.Fatalf("WriteRecord %d failed during circular wrap: %v", i, err)
+		}
+	}
+}
+
+func TestSnapshotCircularBufferTrimmingAndCap(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	localDir := t.TempDir()
+
+	// Configure volume with small buffer file size (250 bytes) and max 4 buffer files
+	vol := NewVolume("snap-trim-test", backend, NewEventBroadcaster(),
+		WithMaxRAMEntries(2, 2),
+		WithLocalStorageDir(localDir),
+		WithSnapshotThreshold(0, 250),
+		WithMaxBufferFiles(4),
+	)
+	defer vol.Close()
+
+	// Create 15 files to produce multiple evicted buffer files
+	for i := 1; i <= 15; i++ {
+		filePath := fmt.Sprintf("/file_%02d.txt", i)
+		content := []byte(fmt.Sprintf("content-data-for-file-%02d", i))
+		_, err := vol.CreateFile(ctx, filePath, 0644, content)
+		if err != nil {
+			t.Fatalf("CreateFile %s failed: %v", filePath, err)
+		}
+	}
+
+	// Take snapshot
+	snapName, err := vol.CreateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+	if snapName == "" {
+		t.Fatalf("Expected non-empty snapshot name")
+	}
+
+	// Verify in-memory dirty maps are pruned
+	if len(vol.dirtyInodes) != 0 || len(vol.dirtyDirs) != 0 {
+		t.Fatalf("Expected dirty maps to be empty after snapshot, got %d inodes, %d dirs", len(vol.dirtyInodes), len(vol.dirtyDirs))
+	}
+
+	// Verify all 15 files can be read from the new base snapshot
+	for i := 1; i <= 15; i++ {
+		filePath := fmt.Sprintf("/file_%02d.txt", i)
+		expected := fmt.Sprintf("content-data-for-file-%02d", i)
+		data, total, _, err := vol.ReadFile(ctx, filePath, 0, 100)
+		if err != nil {
+			t.Fatalf("ReadFile %s failed: %v", filePath, err)
+		}
+		if total != int64(len(expected)) || string(data) != expected {
+			t.Fatalf("Content mismatch for %s: got %q, want %q", filePath, string(data), expected)
+		}
+	}
+
+	// Perform subsequent mutations and verify a second snapshot succeeds
+	_, _, _, err = vol.WriteFile(ctx, "/file_01.txt", 0, []byte("updated file 1"), pb.WriteMode_LAZY_WRITE)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	_, err = vol.CreateFile(ctx, "/file_new.txt", 0644, []byte("new file content"))
+	if err != nil {
+		t.Fatalf("CreateFile file_new failed: %v", err)
+	}
+
+	snapName2, err := vol.CreateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("Second CreateSnapshot failed: %v", err)
+	}
+	if snapName2 == "" || snapName2 == snapName {
+		t.Fatalf("Expected distinct 2nd snapshot, got %s (snap1=%s)", snapName2, snapName)
+	}
+
+	// Verify read on updated and new files
+	data1, _, _, err := vol.ReadFile(ctx, "/file_01.txt", 0, 100)
+	if err != nil || string(data1) != "updated file 1" {
+		t.Fatalf("Expected 'updated file 1', got %q (err: %v)", string(data1), err)
+	}
+	dataNew, _, _, err := vol.ReadFile(ctx, "/file_new.txt", 0, 100)
+	if err != nil || string(dataNew) != "new file content" {
+		t.Fatalf("Expected 'new file content', got %q (err: %v)", string(dataNew), err)
+	}
+}
+
+func TestAutoSnapshotTriggerOnMaxBufferFiles(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	localDir := t.TempDir()
+
+	// Trigger auto snapshot when buffer file count reaches 3
+	vol := NewVolume("buffer-cap-test", backend, NewEventBroadcaster(),
+		WithMaxRAMEntries(1, 1),
+		WithLocalStorageDir(localDir),
+		WithSnapshotThreshold(0, 200),
+		WithMaxBufferFiles(3),
+	)
+	defer vol.Close()
+
+	// Create files causing multiple file rotations
+	for i := 0; i < 25; i++ {
+		filePath := fmt.Sprintf("/capped_file_%d.txt", i)
+		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("some-data-payload-%d", i)))
+		if err != nil {
+			t.Fatalf("CreateFile %s failed: %v", filePath, err)
+		}
+	}
+
+	// Verify snapshots were automatically generated and buffer files were trimmed
+	snapshots, err := vol.ListSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshots failed: %v", err)
+	}
+	if len(snapshots) == 0 {
+		t.Fatalf("Expected auto-triggered snapshots due to max buffer files threshold")
+	}
+
+	// Buffer file count should be kept within cap
+	if vol.localStore.FileCount() > 3 {
+		t.Fatalf("Expected file count <= 3 after auto snapshot trimming, got %d", vol.localStore.FileCount())
+	}
+}
+
+func TestTwoPhaseSnapshotConcurrentOperations(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	localDir := t.TempDir()
+
+	vol := NewVolume("concurrent-snap-test", backend, NewEventBroadcaster(),
+		WithMaxRAMEntries(5, 5),
+		WithLocalStorageDir(localDir),
+	)
+	defer vol.Close()
+
+	// Seed initial files
+	for i := 0; i < 5; i++ {
+		_, err := vol.CreateFile(ctx, fmt.Sprintf("/init_%d.txt", i), 0644, []byte(fmt.Sprintf("initial-%d", i)))
+		if err != nil {
+			t.Fatalf("Initial CreateFile failed: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	// Goroutine 1: Continuously create and write files
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 20; i++ {
+			filePath := fmt.Sprintf("/concurrent_file_%d.txt", i)
+			_, _ = vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("concurrent-payload-%d", i)))
+			_, _, _, _ = vol.WriteFile(ctx, filePath, 0, []byte(fmt.Sprintf("updated-payload-%d", i)), pb.WriteMode_LAZY_WRITE)
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Goroutine 2: Continuously read files
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 20; i++ {
+			_, _, _, _ = vol.ReadFile(ctx, fmt.Sprintf("/init_%d.txt", i%5), 0, 50)
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Goroutine 3: Trigger snapshot midway
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		time.Sleep(5 * time.Millisecond)
+		_, _ = vol.CreateSnapshot(ctx)
+	}()
+
+	close(start)
+	wg.Wait()
+
+	// Verify volume remains in a consistent state and final snapshot can be taken
+	finalSnap, err := vol.CreateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("Final CreateSnapshot failed: %v", err)
+	}
+	if finalSnap == "" {
+		t.Fatalf("Expected non-empty final snapshot")
 	}
 }

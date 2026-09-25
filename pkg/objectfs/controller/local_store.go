@@ -339,20 +339,40 @@ type LocalStorage struct {
 	mu           sync.RWMutex
 	dir          string
 	files        [MaxLocalFiles]*os.File
+	oldestFileID int
 	activeFileID int
 	activeOffset int64
+	maxFileSize  int64
+}
+
+// LocalStorageOption configures LocalStorage instances.
+type LocalStorageOption func(*LocalStorage)
+
+// WithMaxLocalFileSize sets the maximum size in bytes before rotating to the next local buffer file.
+func WithMaxLocalFileSize(size int64) LocalStorageOption {
+	return func(s *LocalStorage) {
+		if size > 0 && size <= MaxFileSizeInBytes {
+			s.maxFileSize = size
+		}
+	}
 }
 
 // NewLocalStorage creates or opens a local storage instance in the specified directory.
-func NewLocalStorage(dir string) (*LocalStorage, error) {
+func NewLocalStorage(dir string, opts ...LocalStorageOption) (*LocalStorage, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create local storage directory %s: %w", dir, err)
 	}
 
 	s := &LocalStorage{
 		dir:          dir,
+		oldestFileID: 0,
 		activeFileID: 0,
 		activeOffset: HeaderLen,
+		maxFileSize:  MaxFileSizeInBytes,
+	}
+
+	for _, opt := range opts {
+		opt(s)
 	}
 
 	// Create initial active file with O_CREATE|O_EXCL. If it already exists, return the error.
@@ -413,10 +433,17 @@ func (s *LocalStorage) WriteRecord(recType byte, payload []byte) (LocalOffset, e
 	payloadLen := uint32(len(payload))
 	recordLen := int64(1 + 4 + 4 + len(payload)) // [type (1B)][len (4B)][crc (4B)][payload]
 
+	limit := s.maxFileSize
+	if limit <= 0 || limit > MaxFileSizeInBytes {
+		limit = MaxFileSizeInBytes
+	}
+
 	// If active file would exceed max size, rotate to next file with O_EXCL to prevent silent overwrites.
-	// TODO: implement proactive background snapshotting/compaction to delete or recycle older files before wrapping file IDs.
-	if s.activeOffset+recordLen > MaxFileSizeInBytes {
+	if s.activeOffset+recordLen > limit {
 		nextFileID := (s.activeFileID + 1) % MaxLocalFiles
+		if s.files[nextFileID] != nil {
+			return NoOffset, fmt.Errorf("local storage full: all %d buffer files in use", MaxLocalFiles)
+		}
 		if _, err := s.createNewFileLocked(nextFileID); err != nil {
 			return NoOffset, fmt.Errorf("failed to create rotated local file %d with O_EXCL: %w", nextFileID, err)
 		}
@@ -495,6 +522,73 @@ func (s *LocalStorage) ReadRecord(off LocalOffset) (byte, []byte, error) {
 	return recType, payload, nil
 }
 
+// TrimBeforeFile closes and deletes all local storage buffer files strictly older than cutoffFileID in circular sequence.
+func (s *LocalStorage) TrimBeforeFile(cutoffFileID int) error {
+	if cutoffFileID < 0 || cutoffFileID >= MaxLocalFiles {
+		return fmt.Errorf("invalid cutoff file ID %d", cutoffFileID)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for s.oldestFileID != cutoffFileID && s.oldestFileID != s.activeFileID {
+		fileID := s.oldestFileID
+		if s.files[fileID] != nil {
+			_ = s.files[fileID].Close()
+			s.files[fileID] = nil
+			filePath := filepath.Join(s.dir, fmt.Sprintf("meta-%02d.dat", fileID))
+			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+				klog.Warningf("Failed to remove trimmed local storage file %s: %v", filePath, err)
+			}
+		}
+		s.oldestFileID = (s.oldestFileID + 1) % MaxLocalFiles
+	}
+	return nil
+}
+
+// TrimBefore closes and deletes all local storage buffer files strictly older than the file ID of cutoff offset.
+func (s *LocalStorage) TrimBefore(cutoff LocalOffset) error {
+	if cutoff == NoOffset {
+		return nil
+	}
+	cutoffFileID, _ := UnpackOffset(cutoff)
+	return s.TrimBeforeFile(cutoffFileID)
+}
+
+// CurrentOffset returns the current write pointer packed LocalOffset.
+func (s *LocalStorage) CurrentOffset() LocalOffset {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return PackOffset(s.activeFileID, s.activeOffset)
+}
+
+// FileCount returns the number of currently active/open buffer files.
+func (s *LocalStorage) FileCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for i := 0; i < MaxLocalFiles; i++ {
+		if s.files[i] != nil {
+			count++
+		}
+	}
+	return count
+}
+
+// ActiveFileID returns the currently active file ID.
+func (s *LocalStorage) ActiveFileID() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.activeFileID
+}
+
+// OldestFileID returns the oldest open file ID in the circular buffer.
+func (s *LocalStorage) OldestFileID() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.oldestFileID
+}
+
 // DeleteAllAndReset closes and deletes all local storage files on disk and resets write pointers.
 func (s *LocalStorage) DeleteAllAndReset() error {
 	s.mu.Lock()
@@ -508,6 +602,7 @@ func (s *LocalStorage) DeleteAllAndReset() error {
 		filePath := filepath.Join(s.dir, fmt.Sprintf("meta-%02d.dat", i))
 		_ = os.Remove(filePath)
 	}
+	s.oldestFileID = 0
 	s.activeFileID = 0
 	s.activeOffset = HeaderLen
 
