@@ -79,10 +79,13 @@ func TestServerStartupReadOnlyUntilFlush(t *testing.T) {
 		t.Errorf("expected initial lastPosition 0, got %d", srv.LastPosition())
 	}
 
-	// Verify manifest is NOT created in backend on startup
-	var buf bytes.Buffer
-	if err := backend.GetObject(t.Context(), "", ManifestKey, 0, 0, &buf); err == nil {
-		t.Fatalf("expected manifest to not exist on startup, but GetObject succeeded")
+	// Verify no segments exist in backend on startup
+	segs, lastPos, err := ListSegmentsFromBackend(t.Context(), backend)
+	if err != nil {
+		t.Fatalf("ListSegmentsFromBackend failed: %v", err)
+	}
+	if len(segs) != 0 || lastPos != 0 {
+		t.Fatalf("expected 0 segments on startup, got %d (lastPos=%d)", len(segs), lastPos)
 	}
 
 	// Append a record and flush
@@ -110,10 +113,19 @@ func TestServerStartupReadOnlyUntilFlush(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	// Verify manifest now exists in backend
-	buf.Reset()
-	if err := backend.GetObject(t.Context(), "", ManifestKey, 0, 0, &buf); err != nil {
-		t.Fatalf("expected manifest to exist after flush: %v", err)
+	// Verify segment now exists in backend
+	segs, lastPos, err = ListSegmentsFromBackend(t.Context(), backend)
+	if err != nil {
+		t.Fatalf("ListSegmentsFromBackend failed: %v", err)
+	}
+	if len(segs) != 1 || lastPos != 1 {
+		t.Fatalf("expected 1 segment after flush with lastPos 1, got %d (lastPos=%d)", len(segs), lastPos)
+	}
+
+	// Verify manifest file does NOT exist
+	var buf bytes.Buffer
+	if err := backend.GetObject(t.Context(), "", "wal/manifest.json", 0, 0, &buf); err == nil {
+		t.Fatalf("expected manifest file to NOT exist, but GetObject succeeded")
 	}
 }
 
@@ -138,7 +150,7 @@ func TestTailClampingAndResumedFrom(t *testing.T) {
 	_ = stream.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Hello{Hello: &pb.Hello{StreamId: streamID[:]}}})
 	_, _ = stream.Recv()
 
-	// Append 5 records and flush (positions 1..5, manifest.last_position = 5)
+	// Append 5 records and flush (positions 1..5, last_flushed_position = 5)
 	for i := uint64(1); i <= 5; i++ {
 		_ = stream.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("rec-%d", i))}}})
 		_, _ = stream.Recv()
@@ -194,7 +206,7 @@ func TestTailClampingAndResumedFrom(t *testing.T) {
 		t.Errorf("expected ResumedFrom 0 on second message, got %d", second2.ResumedFrom)
 	}
 
-	// 3. Tail with provisional cursor from_position=20 (> manifest.last_position + 1 = 6)
+	// 3. Tail with provisional cursor from_position=20 (> last_flushed_position + 1 = 6)
 	// Should clamp to 6 and return resumed_from = 6
 	tailStream3, err := client.Tail(t.Context(), &pb.TailRequest{FromPosition: 20})
 	if err != nil {
@@ -286,16 +298,16 @@ func TestAppendGroupCommitAndFlush(t *testing.T) {
 		t.Errorf("expected last_position 3, got %d", flushResp.LastPosition)
 	}
 
-	// Verify manifest in backend
-	manifest, err := LoadManifest(t.Context(), backend)
+	// Verify segments in backend
+	segs, lastPos, err := ListSegmentsFromBackend(t.Context(), backend)
 	if err != nil {
-		t.Fatalf("failed to load manifest: %v", err)
+		t.Fatalf("failed to list segments: %v", err)
 	}
-	if len(manifest.Segments) != 1 {
-		t.Fatalf("expected 1 segment in manifest, got %d", len(manifest.Segments))
+	if len(segs) != 1 {
+		t.Fatalf("expected 1 segment in backend, got %d", len(segs))
 	}
-	if manifest.Streams[streamID.String()].S3AckedStreamSeq != 3 {
-		t.Errorf("expected s3_acked_stream_seq 3, got %d", manifest.Streams[streamID.String()].S3AckedStreamSeq)
+	if lastPos != 3 {
+		t.Errorf("expected last_position 3, got %d", lastPos)
 	}
 	_ = srv
 }
@@ -676,7 +688,7 @@ func TestRestartOnPersistentDataDir(t *testing.T) {
 		}
 	}
 
-	// Records 11..15 should have positions starting at manifest.last_position + 1 (11..15)
+	// Records 11..15 should have positions starting at last_flushed_position + 1 (11..15)
 	for i := 10; i < 15; i++ {
 		expectedPos := uint64(i + 1)
 		if receivedRecs[i].Position != expectedPos {

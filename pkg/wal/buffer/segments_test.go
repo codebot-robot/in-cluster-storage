@@ -35,47 +35,48 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-func TestManifestRoundTrip(t *testing.T) {
+func TestListSegmentsFromBackend(t *testing.T) {
 	ctx := t.Context()
 	backend := inmemorystorage.New()
 
-	// 1. Initial load should return empty manifest
-	m, err := LoadManifest(ctx, backend)
+	// 1. Initial list on empty backend
+	segs, lastPos, err := ListSegmentsFromBackend(ctx, backend)
 	if err != nil {
-		t.Fatalf("LoadManifest on empty backend failed: %v", err)
+		t.Fatalf("ListSegmentsFromBackend on empty backend failed: %v", err)
 	}
-	if m.LastPosition != 0 {
-		t.Errorf("expected LastPosition 0, got %d", m.LastPosition)
+	if len(segs) != 0 {
+		t.Errorf("expected 0 segments, got %d", len(segs))
 	}
-	if len(m.Segments) != 0 {
-		t.Errorf("expected 0 segments, got %d", len(m.Segments))
-	}
-	if len(m.Streams) != 0 {
-		t.Errorf("expected 0 streams, got %d", len(m.Streams))
+	if lastPos != 0 {
+		t.Errorf("expected lastPos 0, got %d", lastPos)
 	}
 
-	// 2. Save and reload
-	sid := uuid.New().String()
-	m.LastPosition = 100
-	m.Segments = []string{"wal/segments/000000000001-000000000100.wal"}
-	m.Streams[sid] = StreamState{S3AckedStreamSeq: 50}
+	// 2. Put segments out of order along with non-segment / invalid files
+	seg2 := "wal/segments/000000000501-000000001000.wal"
+	seg1 := "wal/segments/000000000001-000000000500.wal"
+	seg3 := "wal/segments/000000001001-000000001500.wal"
+	invalid1 := "wal/segments/not-a-segment.txt"
+	invalid2 := "wal/other/000000000001-000000000500.wal"
 
-	if err := SaveManifest(ctx, backend, m); err != nil {
-		t.Fatalf("SaveManifest failed: %v", err)
+	dummyData := []byte("dummy")
+	for _, k := range []string{seg2, invalid1, seg1, invalid2, seg3} {
+		if _, err := backend.PutObject(ctx, "", k, blob.NewByteStreamFromBytes(dummyData)); err != nil {
+			t.Fatalf("PutObject %s failed: %v", k, err)
+		}
 	}
 
-	m2, err := LoadManifest(ctx, backend)
+	segs, lastPos, err = ListSegmentsFromBackend(ctx, backend)
 	if err != nil {
-		t.Fatalf("LoadManifest failed: %v", err)
+		t.Fatalf("ListSegmentsFromBackend failed: %v", err)
 	}
-	if m2.LastPosition != 100 {
-		t.Errorf("expected LastPosition 100, got %d", m2.LastPosition)
+	if len(segs) != 3 {
+		t.Fatalf("expected 3 segments, got %d: %+v", len(segs), segs)
 	}
-	if len(m2.Segments) != 1 || m2.Segments[0] != "wal/segments/000000000001-000000000100.wal" {
-		t.Errorf("segments mismatch: %+v", m2.Segments)
+	if segs[0] != seg1 || segs[1] != seg2 || segs[2] != seg3 {
+		t.Errorf("unexpected segment ordering: %+v", segs)
 	}
-	if st, ok := m2.Streams[sid]; !ok || st.S3AckedStreamSeq != 50 {
-		t.Errorf("stream state mismatch: %+v", m2.Streams)
+	if lastPos != 1500 {
+		t.Errorf("expected lastPos 1500, got %d", lastPos)
 	}
 }
 
@@ -211,12 +212,13 @@ func TestArchivingToFilesystemStorage(t *testing.T) {
 		t.Errorf("expected LastPosition 5, got %d", flushResp.LastPosition)
 	}
 
-	// Verify files created in storeDir
+	// Verify no manifest file is created
 	manifestPath := filepath.Join(storeDir, "wal", "manifest.json")
-	if _, err := os.Stat(manifestPath); err != nil {
-		t.Fatalf("manifest file does not exist at %s: %v", manifestPath, err)
+	if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
+		t.Fatalf("expected manifest file to NOT exist at %s, but stat returned: %v", manifestPath, err)
 	}
 
+	// Verify segment file exists in storeDir
 	segPath := filepath.Join(storeDir, "wal", "segments", "000000000001-000000000005.wal")
 	if _, err := os.Stat(segPath); err != nil {
 		t.Fatalf("segment file does not exist at %s: %v", segPath, err)

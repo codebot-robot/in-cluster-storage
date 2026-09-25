@@ -21,11 +21,11 @@ option go_package = "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1
 service WalBuffer {
   // One bidi stream per client stream. First message must be Hello.
   rpc Append(stream AppendRequest) returns (stream AppendResponse);
-  // Force a flush to permanent object storage now. Returns once the manifest is written.
+  // Force a flush to permanent object storage now. Returns once the segment is durable.
   rpc Flush(FlushRequest) returns (FlushResponse);
   // Read merged records in position order. Positions are strictly increasing within a witness incarnation;
-  // positions above the last flushed position (manifest.last_position) are provisional and may be reassigned
-  // after a restart. Tail clamps from_position to manifest.last_position + 1 when it exceeds that, returning
+  // positions above the last flushed position are provisional and may be reassigned
+  // after a restart. Tail clamps from_position to last_flushed_position + 1 when it exceeds that, returning
   // the effective start in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq)
   // and must tolerate re-delivery from the last flushed position after reconnecting.
   rpc Tail(TailRequest) returns (stream TailResponse);
@@ -51,7 +51,7 @@ message AppendResponse {
 
 message HelloAck {
   uint64 witness_acked_stream_seq = 1;  // what the service has on local disk
-  uint64 s3_acked_stream_seq = 2;       // what the manifest says (permanent storage)
+  uint64 s3_acked_stream_seq = 2;       // permanent object storage watermark
 }
 
 message AppendRecord {

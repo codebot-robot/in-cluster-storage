@@ -91,10 +91,11 @@ type Server struct {
 	cfg     ServerConfig
 	backend objectstore.Backend
 
-	mu           sync.RWMutex
-	lastPosition uint64
-	manifest     *Manifest
-	streams      map[string]*streamState // streamID string -> streamState
+	mu                  sync.RWMutex
+	lastPosition        uint64
+	lastFlushedPosition uint64
+	flushedSegments     []string
+	streams             map[string]*streamState // streamID string -> streamState
 
 	localStore *wal.LogSegmentStore
 	tempDir    string
@@ -139,15 +140,29 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		cfg.BatchMaxSize = DefaultBatchSize
 	}
 
-	// 1. Read manifest from backend
-	m, err := LoadManifest(ctx, cfg.Backend)
+	// 1. Discover existing segments from backend
+	discoveredSegments, lastFlushedPos, err := ListSegmentsFromBackend(ctx, cfg.Backend)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load manifest: %w", err)
+		return nil, fmt.Errorf("failed to list segments from backend: %w", err)
 	}
 
-	nextPosition := m.LastPosition + 1
+	streamWatermarks := make(map[string]uint64)
+	for _, segPath := range discoveredSegments {
+		records, err := ReadSegmentFromBackend(ctx, cfg.Backend, segPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to recover stream watermarks from segment %s: %w", segPath, err)
+		}
+		for _, rec := range records {
+			sid := rec.StreamID.String()
+			if rec.StreamSeq > streamWatermarks[sid] {
+				streamWatermarks[sid] = rec.StreamSeq
+			}
+		}
+	}
 
-	klog.Infof("WAL Buffer initializing: assigning positions starting at %d (last_position=%d, segments=%d)", nextPosition, m.LastPosition, len(m.Segments))
+	nextPosition := lastFlushedPos + 1
+
+	klog.Infof("WAL Buffer initializing: assigning positions starting at %d (last_flushed_position=%d, segments=%d, streams=%d)", nextPosition, lastFlushedPos, len(discoveredSegments), len(streamWatermarks))
 
 	// 2. Setup local segment store with a fixed prefix
 	dataDir := cfg.DataDir
@@ -170,22 +185,23 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:          cfg,
-		backend:      cfg.Backend,
-		lastPosition: nextPosition - 1,
-		manifest:     m,
-		streams:      make(map[string]*streamState),
-		localStore:   localStore,
-		tempDir:      tempDir,
-		incomingChan: make(chan incomingItem, 1024),
-		tailWaiters:  make(map[chan struct{}]struct{}),
-		stopChan:     make(chan struct{}),
+		cfg:                 cfg,
+		backend:             cfg.Backend,
+		lastPosition:        nextPosition - 1,
+		lastFlushedPosition: lastFlushedPos,
+		flushedSegments:     discoveredSegments,
+		streams:             make(map[string]*streamState),
+		localStore:          localStore,
+		tempDir:             tempDir,
+		incomingChan:        make(chan incomingItem, 1024),
+		tailWaiters:         make(map[chan struct{}]struct{}),
+		stopChan:            make(chan struct{}),
 	}
 	s.flushCond = sync.NewCond(&s.flushMu)
 
-	// Populate initial streams state from manifest
-	for sid, st := range m.Streams {
-		s.streams[sid] = newStreamState(st.S3AckedStreamSeq, st.S3AckedStreamSeq)
+	// Populate initial streams state recovered from flushed segments
+	for sid, seq := range streamWatermarks {
+		s.streams[sid] = newStreamState(seq, seq)
 	}
 
 	// Start background group commit worker
@@ -242,6 +258,13 @@ func (s *Server) LastPosition() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastPosition
+}
+
+// LastFlushedPosition returns the latest position flushed to permanent storage.
+func (s *Server) LastFlushedPosition() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastFlushedPosition
 }
 
 func (s *Server) getOrCreateStream(streamID uuid.UUID) *streamState {
@@ -586,7 +609,7 @@ func (s *Server) commitItems(items []incomingItem) {
 	}
 }
 
-// Flush RPC forces an S3 flush and returns once the manifest is durable.
+// Flush RPC forces an S3 flush and returns once the segment is durable.
 func (s *Server) Flush(ctx context.Context, req *pb.FlushRequest) (*pb.FlushResponse, error) {
 	return s.flushInternal(ctx)
 }
@@ -704,16 +727,15 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 		return fmt.Errorf("failed to upload segment %s: %w", segPath, err)
 	}
 
-	// 3. Update manifest
+	// 3. Update flushed segments list and stream watermarks
 	s.mu.Lock()
-	s.manifest.Segments = append(s.manifest.Segments, segPath)
-	if lastPos > s.manifest.LastPosition {
-		s.manifest.LastPosition = lastPos
+	s.flushedSegments = append(s.flushedSegments, segPath)
+	if lastPos > s.lastFlushedPosition {
+		s.lastFlushedPosition = lastPos
 	}
 
 	var notifiedStreams []*streamState
 	for sid, maxSeq := range streamMaxSeq {
-		s.manifest.Streams[sid] = StreamState{S3AckedStreamSeq: maxSeq}
 		if st, exists := s.streams[sid]; exists {
 			st.mu.Lock()
 			if maxSeq > st.s3Seq {
@@ -723,20 +745,14 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 			st.mu.Unlock()
 		}
 	}
-
-	// 4. Save manifest to object storage
-	if err := SaveManifest(ctx, s.backend, s.manifest); err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("failed to save manifest after flushing %s: %w", segPath, err)
-	}
 	s.mu.Unlock()
 
-	// 5. Clean up local segment files that have been flushed to permanent storage
-	if err := s.localStore.DeleteSegmentsThrough(s.manifest.LastPosition, s.cfg.TailCacheBytes); err != nil {
+	// 4. Clean up local segment files that have been flushed to permanent storage
+	if err := s.localStore.DeleteSegmentsThrough(s.lastFlushedPosition, s.cfg.TailCacheBytes); err != nil {
 		klog.Warningf("Error cleaning local segment files: %v", err)
 	}
 
-	// 6. Notify streams whose S3 acks advanced
+	// 5. Notify streams whose S3 acks advanced
 	for _, st := range notifiedStreams {
 		st.cond.Broadcast()
 	}
@@ -747,8 +763,8 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 
 // Tail streams merged records in position order from object storage, local disk, and live incoming commits.
 // Positions are strictly increasing within a witness incarnation; positions above the last flushed position
-// (manifest.last_position) are provisional and may be reassigned after a restart.
-// Tail clamps from_position to manifest.last_position + 1 when it exceeds that, returning the effective start
+// are provisional and may be reassigned after a restart.
+// Tail clamps from_position to last_flushed_position + 1 when it exceeds that, returning the effective start
 // in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq) and must
 // tolerate re-delivery from the last flushed position after reconnecting.
 func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
@@ -759,7 +775,7 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 	}
 
 	s.mu.RLock()
-	lastFlushedPos := s.manifest.LastPosition
+	lastFlushedPos := s.lastFlushedPosition
 	s.mu.RUnlock()
 
 	maxAllowedFromPos := lastFlushedPos + 1
@@ -790,16 +806,16 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 	}()
 
 	for {
-		// 1. Snapshot manifest and lastPosition under s.mu.RLock
+		// 1. Snapshot flushed segments and lastPosition under s.mu.RLock
 		s.mu.RLock()
-		manifestLastPos := s.manifest.LastPosition
-		segments := make([]string, len(s.manifest.Segments))
-		copy(segments, s.manifest.Segments)
+		flushedLastPos := s.lastFlushedPosition
+		segments := make([]string, len(s.flushedSegments))
+		copy(segments, s.flushedSegments)
 		serverLastPos := s.lastPosition
 		s.mu.RUnlock()
 
-		// 2. Read flushed segments from object storage if currentPos <= manifestLastPos
-		if currentPos <= manifestLastPos {
+		// 2. Read flushed segments from object storage if currentPos <= flushedLastPos
+		if currentPos <= flushedLastPos {
 			for _, segPath := range segments {
 				_, segLast, err := wal.ParseSegmentPath(segPath)
 				if err != nil {
@@ -844,12 +860,12 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 
 		// 4. Re-snapshot to check if a flush moved records from local disk to object storage
 		s.mu.RLock()
-		latestManifestLastPos := s.manifest.LastPosition
+		latestFlushedLastPos := s.lastFlushedPosition
 		latestServerLastPos := s.lastPosition
 		s.mu.RUnlock()
 
-		if currentPos <= latestManifestLastPos {
-			// Manifest advanced past currentPos; continue from object storage without blocking
+		if currentPos <= latestFlushedLastPos {
+			// Flushed position advanced past currentPos; continue from object storage without blocking
 			continue
 		}
 

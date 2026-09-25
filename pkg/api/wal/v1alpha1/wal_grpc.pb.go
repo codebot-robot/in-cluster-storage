@@ -44,11 +44,11 @@ const (
 type WalBufferClient interface {
 	// One bidi stream per client stream. First message must be Hello.
 	Append(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[AppendRequest, AppendResponse], error)
-	// Force a flush to permanent object storage now. Returns once the manifest is written.
+	// Force a flush to permanent object storage now. Returns once the segment is durable.
 	Flush(ctx context.Context, in *FlushRequest, opts ...grpc.CallOption) (*FlushResponse, error)
 	// Read merged records in position order. Positions are strictly increasing within a witness incarnation;
-	// positions above the last flushed position (manifest.last_position) are provisional and may be reassigned
-	// after a restart. Tail clamps from_position to manifest.last_position + 1 when it exceeds that, returning
+	// positions above the last flushed position are provisional and may be reassigned
+	// after a restart. Tail clamps from_position to last_flushed_position + 1 when it exceeds that, returning
 	// the effective start in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq)
 	// and must tolerate re-delivery from the last flushed position after reconnecting.
 	Tail(ctx context.Context, in *TailRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TailResponse], error)
@@ -110,11 +110,11 @@ type WalBuffer_TailClient = grpc.ServerStreamingClient[TailResponse]
 type WalBufferServer interface {
 	// One bidi stream per client stream. First message must be Hello.
 	Append(grpc.BidiStreamingServer[AppendRequest, AppendResponse]) error
-	// Force a flush to permanent object storage now. Returns once the manifest is written.
+	// Force a flush to permanent object storage now. Returns once the segment is durable.
 	Flush(context.Context, *FlushRequest) (*FlushResponse, error)
 	// Read merged records in position order. Positions are strictly increasing within a witness incarnation;
-	// positions above the last flushed position (manifest.last_position) are provisional and may be reassigned
-	// after a restart. Tail clamps from_position to manifest.last_position + 1 when it exceeds that, returning
+	// positions above the last flushed position are provisional and may be reassigned
+	// after a restart. Tail clamps from_position to last_flushed_position + 1 when it exceeds that, returning
 	// the effective start in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq)
 	// and must tolerate re-delivery from the last flushed position after reconnecting.
 	Tail(*TailRequest, grpc.ServerStreamingServer[TailResponse]) error
