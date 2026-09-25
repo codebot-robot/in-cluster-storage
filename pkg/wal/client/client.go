@@ -51,6 +51,8 @@ type Stream interface {
 	// Flush asks the service to flush to permanent storage and waits for the permanent ack of everything appended so far.
 	Flush(ctx context.Context) error
 	Watermarks() (local, witness, permanent uint64)
+	// RecoveredRecords returns any existing records scanned from local segment files at open time.
+	RecoveredRecords() []*wal.ClientRecord
 	Close() error
 }
 
@@ -384,6 +386,15 @@ func (s *streamImpl) Watermarks() (local, witness, permanent uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.localSeq, s.witnessSeq, s.s3Seq
+}
+
+// RecoveredRecords returns any existing records scanned from local segment files at open time.
+func (s *streamImpl) RecoveredRecords() []*wal.ClientRecord {
+	s.retainedMu.RLock()
+	defer s.retainedMu.RUnlock()
+	recs := make([]*wal.ClientRecord, len(s.retainedRecords))
+	copy(recs, s.retainedRecords)
+	return recs
 }
 
 // Close closes the stream, stopping background tasks and closing local store.

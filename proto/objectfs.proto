@@ -267,4 +267,30 @@ message CreateSnapshotResponse {
   SnapshotInfo snapshot = 2;
 }
 
+enum MutationType {
+  MUTATION_TYPE_UNSPECIFIED = 0;
+  MUTATION_TYPE_MKDIR = 1;
+  MUTATION_TYPE_CREATE_FILE = 2;
+  MUTATION_TYPE_WRITE_FILE = 3;
+  MUTATION_TYPE_TRUNCATE_FILE = 4;
+  MUTATION_TYPE_UNLINK = 5;
+  MUTATION_TYPE_RMDIR = 6;
+  MUTATION_TYPE_RENAME = 7;
+}
+
+message MutationRecord {
+  MutationType type = 1;
+  string volume_id = 2;
+  string path = 3;
+  string old_path = 4;
+  uint32 mode = 5;
+  int64 size = 6;
+  int64 offset = 7;
+  google.protobuf.Timestamp mod_time = 8;
+  string sha256 = 9;
+  uint64 inode = 10;
+  bytes data = 11;
+  uint64 stream_seq = 12;
+}
+
 

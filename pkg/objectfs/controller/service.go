@@ -27,6 +27,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -40,21 +41,57 @@ type Server struct {
 	blobStore   *blob.Store
 	broadcaster *EventBroadcaster
 
+	walDir            string
+	walTarget         string
+	defaultDurability walclient.Level
+	streamFactory     func(volumeID string) (walclient.Stream, error)
+
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
 	flushWg     sync.WaitGroup
 }
 
-func NewServer(backend ObjectStorageBackend) *Server {
+// ServerOption configures the controller Server.
+type ServerOption func(*Server)
+
+// WithServerWAL configures the WAL directory, buffer target, and default durability level.
+func WithServerWAL(walDir, walTarget string, durability walclient.Level) ServerOption {
+	return func(s *Server) {
+		s.walDir = walDir
+		s.walTarget = walTarget
+		s.defaultDurability = durability
+	}
+}
+
+// WithServerStreamFactory sets a custom stream factory function (useful for testing).
+func WithServerStreamFactory(factory func(volumeID string) (walclient.Stream, error)) ServerOption {
+	return func(s *Server) {
+		s.streamFactory = factory
+	}
+}
+
+// WithServerDurability sets the default durability level for streams.
+func WithServerDurability(durability walclient.Level) ServerOption {
+	return func(s *Server) {
+		s.defaultDurability = durability
+	}
+}
+
+func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if backend == nil {
 		backend = NewMemoryBackend()
 	}
-	return &Server{
-		volumes:     make(map[string]*Volume),
-		backend:     backend,
-		blobStore:   blob.NewStore(backend, 0),
-		broadcaster: NewEventBroadcaster(),
+	s := &Server{
+		volumes:           make(map[string]*Volume),
+		backend:           backend,
+		blobStore:         blob.NewStore(backend, 0),
+		broadcaster:       NewEventBroadcaster(),
+		defaultDurability: walclient.Local,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *Server) getOrCreateVolume(volumeID string) *Volume {
@@ -63,11 +100,40 @@ func (s *Server) getOrCreateVolume(volumeID string) *Volume {
 
 	vol, ok := s.volumes[volumeID]
 	if !ok {
-		vol = NewVolume(volumeID, s.backend, s.broadcaster)
+		var volOpts []VolumeOption
+		if s.streamFactory != nil {
+			stream, err := s.streamFactory(volumeID)
+			if err == nil && stream != nil {
+				volOpts = append(volOpts, WithStream(stream))
+			}
+		} else if s.walDir != "" {
+			streamID := StreamIDForVolume(volumeID)
+			stream, err := walclient.Open(context.Background(), s.walDir, streamID, s.walTarget)
+			if err == nil {
+				volOpts = append(volOpts, WithStream(stream))
+			}
+		}
+		volOpts = append(volOpts, WithDurability(s.defaultDurability))
+
+		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
 		_ = vol.LoadFromBackend(context.Background())
 		s.volumes[volumeID] = vol
 	}
 	return vol
+}
+
+// Close stops periodic flushing and closes all active volumes and streams.
+func (s *Server) Close() error {
+	s.StopPeriodicFlush()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var firstErr error
+	for _, v := range s.volumes {
+		if err := v.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (s *Server) FlushAll(ctx context.Context) error {
