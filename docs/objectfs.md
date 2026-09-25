@@ -135,7 +135,22 @@ Every filesystem operation that mutates state—such as `mkdir`, `create`, `writ
 
 > **Note on Implementation Roadmap:** ObjectFS currently maintains volume state in memory and flushes snapshots periodically to object storage. Integrating the Streams layer ([`docs/streams.md`](streams.md)) as the live, authoritative change-log is the primary next step for ObjectFS metadata durability and multi-writer synchronization.
 
-### 2. Periodic Snapshots in EROFS Format
+### 2. Tiered Metadata Storage & In-Memory LRU Caching
+
+To prevent unbounded RAM consumption when serving filesystems with millions of files, ObjectFS decouples metadata storage into **two tables** (inodes and directories) backed by an active in-memory LRU cache and local append-only eviction storage:
+
+1. **Two-Table Architecture (Inodes & Directories):**
+   - **Inodes Table:** Maps inode IDs to attributes (`mode`, `size`, `mtime`, `sha256`, `etag`). Clean entries are served directly from the base EROFS snapshot; modified entries are held in memory or loaded from local eviction files.
+   - **Directories Table:** Maps directory inode IDs to child entries (`name -> childInodeID, isDir, mode`). For large directories, changes are recorded as incremental delta mutation records (deleted names + added/updated entries) rather than rewriting the entire directory structure.
+
+2. **LRU Cache & Local Eviction Storage:**
+   - Active inodes and directories are cached in RAM up to configurable capacities (`WithMaxRAMEntries(maxInodes, maxDirs)`).
+   - When memory pressure triggers eviction, dirty inodes and directory deltas are serialized with CRC32 checksums and appended to 16 rotating local files (`meta-00.dat` ... `meta-15.dat`).
+   - Evicted entries are indexed in memory using compact 32-bit packed pointers (4 bits for file index, 28 bits for byte offset within a 256MB file), keeping memory footprint under a few bytes per evicted entry.
+   - On cache miss, entries are transparently reloaded by following delta chains from local storage on top of the base EROFS snapshot.
+   - When dirty records or local file sizes exceed thresholds, an automatic snapshot is compiled to object storage, truncating local files and resetting write pointers.
+
+### 3. Periodic Snapshots in EROFS Format
 
 To prevent the metadata change-log from growing indefinitely and to provide instant point-in-time recovery, ObjectFS periodically compiles the filesystem hierarchy into an immutable **EROFS (Enhanced Read-Only File System)** snapshot image.
 
@@ -288,7 +303,7 @@ The following items represent the planned roadmap and architectural evolution fo
 - [ ] **Deterministic Crash Recovery:** Rebuild controller memory on startup by mounting the latest EROFS snapshot and replaying outstanding change-log records from the Streams log.
 - [ ] **Multi-Writer Ordering:** Use the central Streams buffer sequence numbers to establish linearizable ordering across multiple concurrent node writers.
 - [ ] **Eliminate "latest" Snapshot Pointer Object:** Remove the `volumes/<volID>/meta/latest` pointer file; discover the most recent valid snapshot via lexicographical listing or timestamp markers to avoid single-object update contention.
-- [ ] **Tiered Metadata Caching (Hot in Memory, Cold on Disk):** Refactor the controller metadata engine so only "hot" active directories and inodes are kept in RAM, while the full metadata state resides on fast local disk (replicated from cloud EROFS snapshots) to scale to millions of files without unbounded memory usage.
+- [x] **Tiered Metadata Caching (Hot in Memory, Cold on Disk):** Refactor the controller metadata engine so only "hot" active directories and inodes are kept in RAM, while the full metadata state resides on fast local disk (replicated from cloud EROFS snapshots) to scale to millions of files without unbounded memory usage.
 
 ### 2. Convergence with AgentFS (Kernel-Native EROFS Mounting)
 - [ ] **Bypass User-Space FUSE Overhead:** Instead of routing all node I/O through a user-space FUSE daemon, converge with AgentFS by distributing the compiled EROFS metadata snapshot directly to worker nodes.
