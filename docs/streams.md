@@ -182,6 +182,40 @@ Stored at `wal/manifest.json` in object storage:
 
 ---
 
+## Permanent Object Storage Archiving (GCS / S3)
+
+Streams integrates with cloud object storage backends through the unified `pkg/objectstore` abstraction (`objectstore.Backend`).
+
+### Supported Storage Backend Schemes
+
+The buffer service (`wal-buffer`) accepts a `--backend` URL configured via CLI flag or container args:
+
+| Scheme / URL Format | Backend Provider | Description & Parameters |
+| :--- | :--- | :--- |
+| `gs://<bucket>/<prefix>` or `gcs://<bucket>/<prefix>` | **Google Cloud Storage (GCS)** | Uses Google Cloud SDK (`cloud.google.com/go/storage`). Authenticates automatically via Application Default Credentials (ADC) or Kubernetes Workload Identity. |
+| `s3://<bucket>/<prefix>?endpoint=<url>&region=<region>&use_path_style=true` | **Amazon S3 / MinIO** | Uses AWS SDK v2 (`github.com/aws/aws-sdk-go-v2/service/s3`). Supports standard AWS credentials, IRSA/EKS pod identities, and custom endpoints like MinIO (`endpoint=http://minio:9000`). |
+| `file:///path/to/dir` | **Local / HostPath Filesystem** | Persists segments and manifest atomically directly into a filesystem directory. |
+| `memory://` or `memory` | **In-Memory Storage** | Ephemeral storage used for unit testing and local development. |
+
+### Buffer Archiving Configuration
+
+The `wal-buffer` daemon exposes the following flags to tune archiving and cache behavior:
+
+- `--backend`: Object storage backend URL (e.g. `gs://my-bucket/wal`, `s3://wal-bucket/logs?endpoint=http://minio:9000`, `file:///store`, or `memory://`).
+- `--flush-interval`: Maximum duration between automatic segment flushes to permanent storage (default: `60s`).
+- `--flush-bytes`: Accumulation byte threshold that triggers an immediate segment flush before the periodic interval (default: `64MB`).
+- `--tail-cache-bytes`: Minimum bytes of committed segment files retained on the witness node's local disk after flushing to object storage to accelerate hot `Tail` reads (default: `64MB`).
+
+### Archival Lifecycle
+
+1. **Micro-batched Group Commit:** Incoming client records are validated, assigned global monotonic sequence numbers (`position`), and appended to the local `LogSegmentStore` with `fsync`.
+2. **Segment Packaging:** When `flushBytes` accumulates or `flushInterval` elapses (or an explicit client `Flush` RPC is received), all unflushed `WALL` records are serialized into a sealed segment file: `wal/segments/<first_pos>-<last_pos>.wal`.
+3. **Atomic Object Put:** The segment is uploaded via `Backend.PutObject` to cloud object storage.
+4. **Manifest Publication:** The central manifest (`wal/manifest.json`) is updated with the new segment path, updated `last_position`, and latest per-stream `s3_acked_stream_seq` watermarks, then uploaded to object storage.
+5. **Client Notification & GC:** Stream clients receive `Ack(s3Seq)` updates, permitting them to safely garbage-collect local client segment files (`stream-<id>-*.wal`) whose records have been durably committed to permanent object storage.
+
+---
+
 ## gRPC Protocol Specification
 
 The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) (`WalBuffer` service, `Append`, `Flush`, and `Tail`).
