@@ -259,7 +259,11 @@ Each node daemon and controller maintains a local cache backed by memory and ded
 - **Dirty Write Buffering:** Writes are aggregated in memory to support high-throughput sequential and random modifications.
 - **Cache Invalidation:** Subscribes to the controller's `WatchVolume` gRPC push notification stream. When another node modifies, renames, or deletes a file, the node daemon invalidates its local cache entries.
 
-### 3. Configurable Write-Through Modes
+### 3. Trying It Locally
+
+`dev/tasks/fuse-start` runs the whole stack on one machine with no cloud credentials: it starts `objectfs-controller` against a `file://` object store in a temp directory and mounts a volume there with `objectfsctl mount`. On Linux it runs natively; on macOS it cross-compiles Linux binaries and runs them in a Docker container with `/dev/fuse`, opening a shell inside the container where the mount is visible. See the header of the script for the environment variables it accepts (volume ID, write mode, data directory, extra `objectfsctl mount` flags such as `--debug`).
+
+### 4. Configurable Write-Through Modes
 ObjectFS supports three distinct write synchronization modes:
 1. `WRITE_THROUGH_FSYNC`: Writes are buffered locally in node memory and synchronously flushed to the controller upon `fsync(2)` or `close(2)`.
 2. `LAZY_WRITE`: Writes are buffered asynchronously and flushed in background batches, maximizing write throughput for scratch and temporary workloads.

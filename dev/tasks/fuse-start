@@ -1,0 +1,291 @@
+#!/bin/bash
+
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# fuse-start: run objectfs entirely locally and mount a volume via FUSE.
+#
+# Starts objectfs-controller with a local filesystem object store (no S3/GCS
+# needed), then mounts a volume with `objectfsctl mount` in a temp directory. Ctrl-C (or exiting the shell with --shell) unmounts
+# and stops the controller.
+#
+# On Linux this runs natively. On macOS (no /dev/fuse) the script
+# cross-compiles static Linux binaries, re-runs itself inside a small Linux
+# container via Docker and drops you into a shell there; the mount is only
+# visible inside that container.
+#
+# Usage: dev/tasks/fuse-start [--shell]
+#
+#   --shell   after mounting, open an interactive shell in the mount
+#             directory instead of tailing the logs.
+#
+# Environment overrides:
+#   OBJECTFS_VOLUME       volume ID to mount (default: dev-vol)
+#   OBJECTFS_WRITE_MODE   fsync | lazy | eager (default: fsync)
+#   OBJECTFS_PORT         controller gRPC port (default: 50051)
+#   OBJECTFS_DEV_DIR      directory for object store, logs and the mount
+#                         (default: a fresh mktemp directory; set this to
+#                         reuse data across runs)
+#   OBJECTFS_MOUNT_ARGS   extra arguments for `objectfsctl mount`, e.g. --debug
+#                         to log every FUSE request
+#   OBJECTFS_DEV_IMAGE    container image for the macOS/Docker path
+#                         (default: debian:bookworm-slim)
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Avoid `git rev-parse`: inside the container the bind-mounted repo is owned
+# by a different uid and git refuses to look at it.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${REPO_ROOT}"
+
+OBJECTFS_VOLUME="${OBJECTFS_VOLUME:-dev-vol}"
+OBJECTFS_WRITE_MODE="${OBJECTFS_WRITE_MODE:-fsync}"
+OBJECTFS_PORT="${OBJECTFS_PORT:-50051}"
+
+OPEN_SHELL=0
+for arg in "$@"; do
+  case "${arg}" in
+    --shell) OPEN_SHELL=1 ;;
+    -h|--help) sed -n '17,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: ${arg}" >&2; exit 2 ;;
+  esac
+done
+
+goarch() {
+  case "$(uname -m)" in
+    aarch64|arm64) echo arm64 ;;
+    x86_64|amd64) echo amd64 ;;
+    *) uname -m ;;
+  esac
+}
+
+build_binaries() {
+  local goos="$1" arch="$2" bin_dir="$3"
+  mkdir -p "${bin_dir}"
+  echo "Building objectfs-controller and objectfsctl for ${goos}/${arch} into ${bin_dir}"
+  GOOS="${goos}" GOARCH="${arch}" CGO_ENABLED=0 \
+    go build -o "${bin_dir}/" ./cmd/objectfs-controller ./cmd/objectfsctl
+}
+
+# ---------------------------------------------------------------------------
+# No usable FUSE on this host? Re-run inside a Linux container.
+# ---------------------------------------------------------------------------
+if [[ "$(uname -s)" != "Linux" || ! -e /dev/fuse ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "FUSE is not available on this host ($(uname -s)) and docker was not found." >&2
+    echo "Install macFUSE (https://macfuse.github.io) or Docker and re-run." >&2
+    exit 1
+  fi
+
+  DOCKER_ARCH="$(docker version --format '{{.Server.Arch}}')"
+  BIN_DIR="${REPO_ROOT}/.build/bin/linux_${DOCKER_ARCH}"
+  build_binaries linux "${DOCKER_ARCH}" "${BIN_DIR}"
+
+  IMAGE="${OBJECTFS_DEV_IMAGE:-debian:bookworm-slim}"
+
+  TTY_FLAGS=(-i)
+  if [[ -t 0 && -t 1 ]]; then
+    TTY_FLAGS=(-it)
+  fi
+
+  DEV_DIR_MOUNT=()
+  if [[ -n "${OBJECTFS_DEV_DIR:-}" ]]; then
+    mkdir -p "${OBJECTFS_DEV_DIR}"
+    DEV_DIR_MOUNT=(-v "${OBJECTFS_DEV_DIR}:/var/lib/objectfs-dev")
+  fi
+
+  echo "No /dev/fuse on this host; running inside a ${IMAGE} container via docker."
+  echo "The FUSE mount will only be visible inside the container shell."
+  echo
+  exec docker run --rm "${TTY_FLAGS[@]}" \
+    --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor=unconfined \
+    --hostname objectfs-dev \
+    -v "${REPO_ROOT}:/src" -w /src \
+    ${DEV_DIR_MOUNT[@]+"${DEV_DIR_MOUNT[@]}"} \
+    -e OBJECTFS_DEV_DIR=/var/lib/objectfs-dev \
+    -e OBJECTFS_SKIP_BUILD=1 \
+    -e OBJECTFS_VOLUME -e OBJECTFS_WRITE_MODE -e OBJECTFS_PORT -e OBJECTFS_MOUNT_ARGS \
+    "${IMAGE}" ./dev/tasks/fuse-start --shell
+fi
+
+# ---------------------------------------------------------------------------
+# Native Linux path.
+# ---------------------------------------------------------------------------
+BIN_DIR="${REPO_ROOT}/.build/bin/linux_$(goarch)"
+if [[ "${OBJECTFS_SKIP_BUILD:-0}" != 1 ]] && command -v go >/dev/null 2>&1; then
+  build_binaries linux "$(goarch)" "${BIN_DIR}"
+elif [[ -x "${BIN_DIR}/objectfs-controller" && -x "${BIN_DIR}/objectfsctl" ]]; then
+  echo "Using prebuilt binaries in ${BIN_DIR}"
+else
+  echo "go is not on PATH and no prebuilt binaries were found in ${BIN_DIR}." >&2
+  echo "Build them on a machine with Go, e.g.:" >&2
+  echo "  GOOS=linux GOARCH=$(goarch) CGO_ENABLED=0 go build -o ${BIN_DIR}/ ./cmd/objectfs-controller ./cmd/objectfsctl" >&2
+  exit 1
+fi
+
+if [[ -z "${OBJECTFS_DEV_DIR:-}" ]]; then
+  OBJECTFS_DEV_DIR="$(mktemp -d -t objectfs-dev.XXXXXX)"
+fi
+mkdir -p "${OBJECTFS_DEV_DIR}"
+DEV_DIR="$(cd "${OBJECTFS_DEV_DIR}" && pwd)"
+
+STORE_DIR="${DEV_DIR}/objectstore"
+MOUNT_DIR="${DEV_DIR}/mnt"
+CONTROLLER_LOG="${DEV_DIR}/controller.log"
+MOUNT_LOG="${DEV_DIR}/mount.log"
+mkdir -p "${STORE_DIR}" "${MOUNT_DIR}"
+
+SERVER_ADDR="127.0.0.1:${OBJECTFS_PORT}"
+CONTROLLER_PID=""
+MOUNT_PID=""
+TAIL_PID=""
+
+is_mounted() {
+  grep -qs " ${MOUNT_DIR} fuse" /proc/mounts
+}
+
+cleanup() {
+  set +o errexit
+  trap - EXIT INT TERM
+  echo
+  echo "Shutting down..."
+
+  if [[ -n "${TAIL_PID}" ]]; then
+    kill "${TAIL_PID}" 2>/dev/null
+  fi
+
+  if [[ -n "${MOUNT_PID}" ]] && kill -0 "${MOUNT_PID}" 2>/dev/null; then
+    kill -TERM "${MOUNT_PID}" 2>/dev/null
+    for _ in $(seq 1 50); do
+      kill -0 "${MOUNT_PID}" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+  if is_mounted; then
+    echo "Forcing unmount of ${MOUNT_DIR}"
+    fusermount3 -u "${MOUNT_DIR}" 2>/dev/null \
+      || fusermount -u "${MOUNT_DIR}" 2>/dev/null \
+      || umount "${MOUNT_DIR}" 2>/dev/null
+  fi
+
+  if [[ -n "${CONTROLLER_PID}" ]] && kill -0 "${CONTROLLER_PID}" 2>/dev/null; then
+    # Best effort: persist the current metadata as a snapshot so the data in
+    # ${STORE_DIR} is complete if it is reused later.
+    if snap="$("${BIN_DIR}/objectfsctl" --server "${SERVER_ADDR}" snapshots create "${OBJECTFS_VOLUME}" 2>/dev/null)"; then
+      echo "Wrote final snapshot ${snap}"
+    fi
+    kill -TERM "${CONTROLLER_PID}" 2>/dev/null
+    wait "${CONTROLLER_PID}" 2>/dev/null
+  fi
+
+  echo "Data and logs kept in ${DEV_DIR} (delete it when you are done)."
+}
+trap cleanup EXIT INT TERM
+
+# Children are started with SIGINT ignored so that Ctrl-C reaches only this
+# script, which then shuts everything down in order via cleanup().
+# Note: the controller is started without --wal-dir. With a WAL but no
+# --wal-target, WRITE_THROUGH_FSYNC writes (the FUSE default) wait forever for
+# a "permanent" durability ack that nothing can provide, and the whole volume
+# stalls. Metadata therefore lives in memory and is persisted to the object
+# store by the periodic flush and by the snapshot taken on shutdown.
+echo "Starting objectfs-controller on ${SERVER_ADDR} (backend file://${STORE_DIR}, log ${CONTROLLER_LOG})"
+(
+  trap '' INT
+  exec "${BIN_DIR}/objectfs-controller" \
+    --port "${OBJECTFS_PORT}" \
+    --backend "file://${STORE_DIR}" \
+    --flush-interval 1m
+) >"${CONTROLLER_LOG}" 2>&1 &
+CONTROLLER_PID=$!
+
+for i in $(seq 1 100); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/${OBJECTFS_PORT}") 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "${CONTROLLER_PID}" 2>/dev/null; then
+    echo "objectfs-controller exited; log follows:" >&2
+    cat "${CONTROLLER_LOG}" >&2
+    exit 1
+  fi
+  if [[ "${i}" == 100 ]]; then
+    echo "timed out waiting for objectfs-controller on ${SERVER_ADDR}" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+echo "Mounting volume ${OBJECTFS_VOLUME} at ${MOUNT_DIR} (writeMode=${OBJECTFS_WRITE_MODE}, log ${MOUNT_LOG})"
+(
+  trap '' INT
+  exec "${BIN_DIR}/objectfsctl" --server "${SERVER_ADDR}" mount \
+    --volume "${OBJECTFS_VOLUME}" \
+    --write-mode "${OBJECTFS_WRITE_MODE}" \
+    ${OBJECTFS_MOUNT_ARGS:-} \
+    "${MOUNT_DIR}"
+) >"${MOUNT_LOG}" 2>&1 &
+MOUNT_PID=$!
+# Exported for convenience in the --shell case (e.g. kill -QUIT for a stack dump).
+export OBJECTFS_CONTROLLER_PID="${CONTROLLER_PID}" OBJECTFS_MOUNT_PID="${MOUNT_PID}"
+
+for i in $(seq 1 100); do
+  if is_mounted; then
+    break
+  fi
+  if ! kill -0 "${MOUNT_PID}" 2>/dev/null; then
+    echo "objectfsctl mount exited; log follows:" >&2
+    cat "${MOUNT_LOG}" >&2
+    exit 1
+  fi
+  if [[ "${i}" == 100 ]]; then
+    echo "timed out waiting for FUSE mount at ${MOUNT_DIR}" >&2
+    cat "${MOUNT_LOG}" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+cat <<EOM
+
+objectfs is up.
+
+  mount:        ${MOUNT_DIR}
+  controller:   ${SERVER_ADDR}
+  object store: ${STORE_DIR}
+  logs:         ${CONTROLLER_LOG}
+                ${MOUNT_LOG}
+
+  e.g.  ${BIN_DIR}/objectfsctl --server ${SERVER_ADDR} snapshots create ${OBJECTFS_VOLUME}
+
+EOM
+
+if [[ "${OPEN_SHELL}" == 1 ]]; then
+  echo "Opening a shell in ${MOUNT_DIR}; exit it to unmount and stop the controller."
+  echo
+  set +o errexit
+  (cd "${MOUNT_DIR}" && PS1="objectfs-dev:\\w\\$ " bash --norc --noprofile -i)
+  set -o errexit
+else
+  echo "Press Ctrl-C to unmount and stop. Tailing logs:"
+  echo
+  tail -n +1 -F "${CONTROLLER_LOG}" "${MOUNT_LOG}" &
+  TAIL_PID=$!
+  # Wait for Ctrl-C, or for either process to die.
+  while kill -0 "${CONTROLLER_PID}" 2>/dev/null && kill -0 "${MOUNT_PID}" 2>/dev/null; do
+    sleep 1
+  done
+  echo "controller or mount process exited" >&2
+fi
