@@ -70,6 +70,7 @@ func NewRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newBlobsCommand(opts))
 	rootCmd.AddCommand(newVolumesCommand(opts))
 	rootCmd.AddCommand(newSnapshotsCommand(opts))
+	rootCmd.AddCommand(newMountCommand(opts))
 
 	return rootCmd
 }
