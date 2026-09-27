@@ -86,6 +86,9 @@ func main() {
 		default:
 			klog.Fatalf("invalid wal-durability: %s (must be local, witness, or permanent)", *walDurability)
 		}
+		if *walTarget == "" && durability > walclient.Local {
+			klog.Fatalf("invalid configuration: wal-durability %s requires --wal-target", *walDurability)
+		}
 		serverOpts = append(serverOpts, controller.WithServerWAL(*walDir, *walTarget, durability))
 	}
 

@@ -1638,3 +1638,111 @@ func TestApplyRecordDirect(t *testing.T) {
 		t.Fatalf("Expected /a/b/c to be deleted")
 	}
 }
+
+func TestTargetlessWALDurabilityFastFail(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-vol-targetless-wal"
+
+	// Create file should succeed under default Local durability
+	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/test.txt",
+		Mode:           0644,
+		InitialContent: []byte("initial"),
+	})
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: err=%v, resp.Error=%d", err, createResp.GetError())
+	}
+
+	// Direct Volume.WriteFile with WRITE_THROUGH_FSYNC (Permanent) should fail promptly with typed error
+	vol := server.GetVolume(volumeID)
+	_, _, _, err = vol.WriteFile(ctx, "/test.txt", 0, []byte("data-permanent"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	if err == nil {
+		t.Fatalf("expected vol.WriteFile(WRITE_THROUGH_FSYNC) to fail on target-less WAL, got nil")
+	}
+	if !strings.Contains(err.Error(), "durability level permanent requested but WAL has no remote target") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// Server.WriteFile with WRITE_THROUGH_FSYNC (Permanent) should return error in response
+	writeResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Path:      "/test.txt",
+		Offset:    0,
+		Data:      []byte("data-permanent"),
+		WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
+	})
+	if err != nil {
+		t.Fatalf("unexpected gRPC error: %v", err)
+	}
+	if writeResp.GetError() == 0 {
+		t.Fatalf("expected WriteFile(WRITE_THROUGH_FSYNC) to return non-zero error on target-less WAL")
+	}
+
+	// Direct Volume.WriteFile with EAGER_REPLICATION (Witness) should fail promptly with typed error
+	_, _, _, err = vol.WriteFile(ctx, "/test.txt", 0, []byte("data-witness"), pb.WriteMode_EAGER_REPLICATION)
+	if err == nil {
+		t.Fatalf("expected vol.WriteFile(EAGER_REPLICATION) to fail on target-less WAL, got nil")
+	}
+	if !strings.Contains(err.Error(), "durability level witness requested but WAL has no remote target") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// Server.WriteFile with EAGER_REPLICATION (Witness) should return error in response
+	writeResp, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Path:      "/test.txt",
+		Offset:    0,
+		Data:      []byte("data-witness"),
+		WriteMode: pb.WriteMode_EAGER_REPLICATION,
+	})
+	if err != nil {
+		t.Fatalf("unexpected gRPC error: %v", err)
+	}
+	if writeResp.GetError() == 0 {
+		t.Fatalf("expected WriteFile(EAGER_REPLICATION) to return non-zero error on target-less WAL")
+	}
+
+	// WriteFile with LAZY_WRITE (Local) should succeed
+	writeResp, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Path:      "/test.txt",
+		Offset:    0,
+		Data:      []byte("data-local"),
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || writeResp.GetError() != 0 {
+		t.Fatalf("WriteFile(LAZY_WRITE) failed: err=%v, resp.Error=%d", err, writeResp.GetError())
+	}
+	if writeResp.BytesWritten != int64(len("data-local")) {
+		t.Fatalf("expected %d bytes written, got %d", len("data-local"), writeResp.BytesWritten)
+	}
+
+	// Direct Volume.Fsync should fail fast on target-less WAL because it flushes to permanent storage
+	err = vol.Fsync(ctx, "/test.txt")
+	if err == nil {
+		t.Fatalf("expected vol.Fsync to fail on target-less WAL with unflushed records, got nil")
+	}
+	if !strings.Contains(err.Error(), "durability level permanent requested but WAL has no remote target") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// Server.Fsync should return error in response
+	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Path:     "/test.txt",
+	})
+	if err != nil {
+		t.Fatalf("unexpected gRPC error: %v", err)
+	}
+	if fsyncResp.GetError() == 0 || fsyncResp.GetSuccess() {
+		t.Fatalf("expected Fsync to return non-zero error on target-less WAL with unflushed records")
+	}
+}
