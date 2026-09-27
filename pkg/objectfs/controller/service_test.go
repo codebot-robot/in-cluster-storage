@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"net"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -160,12 +161,15 @@ func TestControllerServiceOperations(t *testing.T) {
 	}
 
 	// Verify old path not found
-	_, err = server.GetAttr(ctx, &pb.GetAttrRequest{
+	oldResp, err := server.GetAttr(ctx, &pb.GetAttrRequest{
 		VolumeId: volumeID,
 		Path:     "/subdir/hello.txt",
 	})
-	if err == nil {
-		t.Fatalf("Expected old path to not exist after rename")
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if oldResp.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("Expected old path to not exist after rename, got error %d", oldResp.GetError())
 	}
 
 	// 9. Truncate
@@ -199,12 +203,108 @@ func TestControllerServiceOperations(t *testing.T) {
 	}
 
 	// Verify subdir gone
-	_, err = server.GetAttr(ctx, &pb.GetAttrRequest{
+	goneResp, err := server.GetAttr(ctx, &pb.GetAttrRequest{
 		VolumeId: volumeID,
 		Path:     "/subdir",
 	})
-	if err == nil {
-		t.Fatalf("Expected subdir to not exist after rmdir")
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if goneResp.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("Expected subdir to not exist after rmdir, got error %d", goneResp.GetError())
+	}
+}
+
+func TestServerRmdirAndUnlinkErrorCodes(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-error-codes-vol"
+
+	// Create /parent/child.txt
+	mkdirResp, err := server.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId: volumeID,
+		Path:     "/parent",
+		Mode:     0755,
+	})
+	if err != nil || mkdirResp.GetError() != 0 {
+		t.Fatalf("Mkdir failed: err=%v, resp=%v", err, mkdirResp)
+	}
+
+	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId: volumeID,
+		Path:     "/parent/child.txt",
+		Mode:     0644,
+	})
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: err=%v, resp=%v", err, createResp)
+	}
+
+	// 1. Rmdir non-empty directory -> returns non-error gRPC response with error = ENOTEMPTY
+	rmdirResp, err := server.Rmdir(ctx, &pb.RmdirRequest{
+		VolumeId: volumeID,
+		Path:     "/parent",
+	})
+	if err != nil {
+		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
+	}
+	if rmdirResp.GetError() != int32(syscall.ENOTEMPTY) {
+		t.Fatalf("Expected error code ENOTEMPTY (%d), got %d", syscall.ENOTEMPTY, rmdirResp.GetError())
+	}
+	if rmdirResp.GetSuccess() {
+		t.Fatalf("Expected success to be false for non-empty rmdir")
+	}
+
+	// 2. Unlink directory -> returns non-error gRPC response with error = EISDIR
+	unlinkResp, err := server.Unlink(ctx, &pb.UnlinkRequest{
+		VolumeId: volumeID,
+		Path:     "/parent",
+	})
+	if err != nil {
+		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
+	}
+	if unlinkResp.GetError() != int32(syscall.EISDIR) {
+		t.Fatalf("Expected error code EISDIR (%d), got %d", syscall.EISDIR, unlinkResp.GetError())
+	}
+	if unlinkResp.GetSuccess() {
+		t.Fatalf("Expected success to be false for unlinking directory")
+	}
+
+	// 3. Rmdir regular file -> returns non-error gRPC response with error = ENOTDIR
+	rmdirFileResp, err := server.Rmdir(ctx, &pb.RmdirRequest{
+		VolumeId: volumeID,
+		Path:     "/parent/child.txt",
+	})
+	if err != nil {
+		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
+	}
+	if rmdirFileResp.GetError() != int32(syscall.ENOTDIR) {
+		t.Fatalf("Expected error code ENOTDIR (%d), got %d", syscall.ENOTDIR, rmdirFileResp.GetError())
+	}
+
+	// 4. Rmdir nonexistent -> returns non-error gRPC response with error = ENOENT
+	rmdirNoneResp, err := server.Rmdir(ctx, &pb.RmdirRequest{
+		VolumeId: volumeID,
+		Path:     "/nonexistent",
+	})
+	if err != nil {
+		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
+	}
+	if rmdirNoneResp.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("Expected error code ENOENT (%d), got %d", syscall.ENOENT, rmdirNoneResp.GetError())
+	}
+
+	// 5. Mkdir already exists -> returns non-error gRPC response with error = EEXIST
+	mkdirExistResp, err := server.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId: volumeID,
+		Path:     "/parent",
+		Mode:     0755,
+	})
+	if err != nil {
+		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
+	}
+	if mkdirExistResp.GetError() != int32(syscall.EEXIST) {
+		t.Fatalf("Expected error code EEXIST (%d), got %d", syscall.EEXIST, mkdirExistResp.GetError())
 	}
 }
 
@@ -648,12 +748,15 @@ func TestErofsSnapshotRollback(t *testing.T) {
 	}
 
 	// /doc2.txt should not exist
-	_, err = server.GetAttr(ctx, &pb.GetAttrRequest{
+	doc2Resp, err := server.GetAttr(ctx, &pb.GetAttrRequest{
 		VolumeId: volumeID,
 		Path:     "/doc2.txt",
 	})
-	if err == nil {
-		t.Fatalf("Expected /doc2.txt to not exist after rollback to snap1")
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if doc2Resp.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("Expected /doc2.txt to not exist after rollback to snap1, got error %d", doc2Resp.GetError())
 	}
 
 	// Now roll forward to snap2
@@ -1333,9 +1436,12 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	}
 
 	// - /base/initial.txt should have been renamed to /base/renamed_initial.txt
-	_, err = server2.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/base/initial.txt"})
-	if err == nil {
-		t.Fatalf("Expected /base/initial.txt to not exist after rename replay")
+	initResp, err := server2.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/base/initial.txt"})
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if initResp.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("Expected /base/initial.txt to not exist after rename replay, got error %d", initResp.GetError())
 	}
 
 	renamedAttr, err := server2.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/base/renamed_initial.txt"})

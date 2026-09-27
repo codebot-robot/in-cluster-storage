@@ -18,11 +18,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
@@ -32,6 +34,53 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func volErrToSyscall(err error) int32 {
+	if err == nil {
+		return 0
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return int32(errno)
+	}
+	if errors.Is(err, syscall.ENOENT) {
+		return int32(syscall.ENOENT)
+	}
+	if errors.Is(err, syscall.EEXIST) {
+		return int32(syscall.EEXIST)
+	}
+	if errors.Is(err, syscall.ENOTEMPTY) {
+		return int32(syscall.ENOTEMPTY)
+	}
+	if errors.Is(err, syscall.EISDIR) {
+		return int32(syscall.EISDIR)
+	}
+	if errors.Is(err, syscall.ENOTDIR) {
+		return int32(syscall.ENOTDIR)
+	}
+	if errors.Is(err, syscall.EBUSY) {
+		return int32(syscall.EBUSY)
+	}
+	if errors.Is(err, syscall.EINVAL) {
+		return int32(syscall.EINVAL)
+	}
+	if errors.Is(err, syscall.EACCES) {
+		return int32(syscall.EACCES)
+	}
+	if errors.Is(err, syscall.EPERM) {
+		return int32(syscall.EPERM)
+	}
+	if errors.Is(err, syscall.ENOSYS) {
+		return int32(syscall.ENOSYS)
+	}
+	if errors.Is(err, syscall.ETIMEDOUT) {
+		return int32(syscall.ETIMEDOUT)
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return int32(syscall.ENOSPC)
+	}
+	return int32(syscall.EIO)
+}
 
 type Server struct {
 	pb.UnimplementedObjectFSControllerServer
@@ -217,7 +266,7 @@ func (s *Server) GetAttr(ctx context.Context, req *pb.GetAttrRequest) (*pb.GetAt
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.GetAttr(ctx, req.GetPath())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "failed to get attr: %v", err)
+		return &pb.GetAttrResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.GetAttrResponse{Attr: attr}, nil
 }
@@ -229,7 +278,7 @@ func (s *Server) Lookup(ctx context.Context, req *pb.LookupRequest) (*pb.LookupR
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.Lookup(ctx, req.GetParentPath(), req.GetName())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "lookup failed: %v", err)
+		return &pb.LookupResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.LookupResponse{Attr: attr}, nil
 }
@@ -241,7 +290,7 @@ func (s *Server) ReadDir(ctx context.Context, req *pb.ReadDirRequest) (*pb.ReadD
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	entries, err := vol.ReadDir(ctx, req.GetPath())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "readdir failed: %v", err)
+		return &pb.ReadDirResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.ReadDirResponse{Entries: entries}, nil
 }
@@ -253,7 +302,7 @@ func (s *Server) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MkdirResp
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.Mkdir(ctx, req.GetPath(), req.GetMode())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "mkdir failed: %v", err)
+		return &pb.MkdirResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.MkdirResponse{Attr: attr}, nil
 }
@@ -265,7 +314,7 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.CreateFile(ctx, req.GetPath(), req.GetMode(), req.GetInitialContent())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "create file failed: %v", err)
+		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.CreateFileResponse{Attr: attr}, nil
 }
@@ -277,7 +326,7 @@ func (s *Server) ReadFile(ctx context.Context, req *pb.ReadFileRequest) (*pb.Rea
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	data, totalSize, redirectURL, err := vol.ReadFile(ctx, req.GetPath(), req.GetOffset(), req.GetSize())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "read file failed: %v", err)
+		return &pb.ReadFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 
 	eof := (req.GetOffset() + int64(len(data))) >= totalSize
@@ -296,7 +345,7 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	bytesWritten, newSize, modTime, err := vol.WriteFile(ctx, req.GetPath(), req.GetOffset(), req.GetData(), req.GetWriteMode())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "write file failed: %v", err)
+		return &pb.WriteFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.WriteFileResponse{
 		BytesWritten: bytesWritten,
@@ -312,7 +361,7 @@ func (s *Server) TruncateFile(ctx context.Context, req *pb.TruncateFileRequest) 
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.TruncateFile(ctx, req.GetPath(), req.GetSize())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "truncate failed: %v", err)
+		return &pb.TruncateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.TruncateFileResponse{Attr: attr}, nil
 }
@@ -323,7 +372,7 @@ func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkR
 	}
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	if err := vol.Unlink(ctx, req.GetPath()); err != nil {
-		return nil, status.Errorf(codes.Internal, "unlink failed: %v", err)
+		return &pb.UnlinkResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.UnlinkResponse{Success: true}, nil
 }
@@ -334,7 +383,7 @@ func (s *Server) Rmdir(ctx context.Context, req *pb.RmdirRequest) (*pb.RmdirResp
 	}
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	if err := vol.Rmdir(ctx, req.GetPath()); err != nil {
-		return nil, status.Errorf(codes.Internal, "rmdir failed: %v", err)
+		return &pb.RmdirResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.RmdirResponse{Success: true}, nil
 }
@@ -346,7 +395,7 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.Rename(ctx, req.GetOldPath(), req.GetNewPath())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "rename failed: %v", err)
+		return &pb.RenameResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.RenameResponse{Attr: attr}, nil
 }
@@ -357,7 +406,7 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	}
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	if err := vol.Fsync(ctx, req.GetPath()); err != nil {
-		return nil, status.Errorf(codes.Internal, "fsync failed: %v", err)
+		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.FsyncResponse{Success: true}, nil
 }
