@@ -67,6 +67,7 @@ message GetAttrRequest {
 
 message GetAttrResponse {
   EntryAttr attr = 1;
+  int32 error = 2;
 }
 
 message LookupRequest {
@@ -77,6 +78,7 @@ message LookupRequest {
 
 message LookupResponse {
   EntryAttr attr = 1;
+  int32 error = 2;
 }
 
 message ReadDirRequest {
@@ -86,6 +88,7 @@ message ReadDirRequest {
 
 message ReadDirResponse {
   repeated EntryAttr entries = 1;
+  int32 error = 2;
 }
 
 message MkdirRequest {
@@ -96,6 +99,7 @@ message MkdirRequest {
 
 message MkdirResponse {
   EntryAttr attr = 1;
+  int32 error = 2;
 }
 
 message CreateFileRequest {
@@ -107,6 +111,7 @@ message CreateFileRequest {
 
 message CreateFileResponse {
   EntryAttr attr = 1;
+  int32 error = 2;
 }
 
 message ReadFileRequest {
@@ -121,6 +126,7 @@ message ReadFileResponse {
   string redirect_url = 2;
   bool eof = 3;
   int64 total_size = 4;
+  int32 error = 5;
 }
 
 message WriteFileRequest {
@@ -135,6 +141,7 @@ message WriteFileResponse {
   int64 bytes_written = 1;
   int64 new_size = 2;
   google.protobuf.Timestamp mod_time = 3;
+  int32 error = 4;
 }
 
 message TruncateFileRequest {
@@ -145,6 +152,7 @@ message TruncateFileRequest {
 
 message TruncateFileResponse {
   EntryAttr attr = 1;
+  int32 error = 2;
 }
 
 message UnlinkRequest {
@@ -154,6 +162,7 @@ message UnlinkRequest {
 
 message UnlinkResponse {
   bool success = 1;
+  int32 error = 2;
 }
 
 message RmdirRequest {
@@ -163,6 +172,7 @@ message RmdirRequest {
 
 message RmdirResponse {
   bool success = 1;
+  int32 error = 2;
 }
 
 message RenameRequest {
@@ -173,6 +183,7 @@ message RenameRequest {
 
 message RenameResponse {
   EntryAttr attr = 1;
+  int32 error = 2;
 }
 
 message FsyncRequest {
@@ -182,6 +193,7 @@ message FsyncRequest {
 
 message FsyncResponse {
   bool success = 1;
+  int32 error = 2;
 }
 
 message WatchVolumeRequest {
