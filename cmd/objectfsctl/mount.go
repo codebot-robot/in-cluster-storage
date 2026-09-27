@@ -104,8 +104,10 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 	defer closeConn()
 
 	// Fail early with a clear error if the controller is not reachable.
-	if _, err := client.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: opts.volumeID, Path: "/"}); err != nil {
+	if resp, err := client.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: opts.volumeID, Path: "/"}); err != nil {
 		return fmt.Errorf("failed to reach controller at %s for volume %s: %w", opts.serverAddr, opts.volumeID, err)
+	} else if resp.GetError() != 0 {
+		return fmt.Errorf("failed to get root directory from controller at %s for volume %s: %w", opts.serverAddr, opts.volumeID, syscall.Errno(resp.GetError()))
 	}
 
 	nodeCache := objectfuse.NewNodeCache(opts.cacheSizeMB * 1024 * 1024)
