@@ -245,6 +245,9 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 ### 4. Distributed State Machine Replication
 - Serves as the shared append-only log for distributed controllers, leader election state synchronization, and reproducible workflow execution logs.
 
+### 5. Structured Data Streams (SQL / OLTP / OLAP)
+- A typed payload format (varint type id + proto body, with table schemas defined in-band) turns a stream into a logical row-change log, with SQLite and Parquet snapshots as derived projections. See [`docs/structured-data-streams.md`](structured-data-streams.md).
+
 ---
 
 ## Roadmap & TODO List
