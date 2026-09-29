@@ -300,7 +300,7 @@ func (s *Server) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MkdirResp
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
 	vol := s.getOrCreateVolume(req.GetVolumeId())
-	attr, err := vol.Mkdir(ctx, req.GetPath(), req.GetMode())
+	attr, err := vol.Mkdir(ctx, req.GetPath(), req.GetMode(), req.GetUid(), req.GetGid())
 	if err != nil {
 		return &pb.MkdirResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -312,7 +312,7 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
 	vol := s.getOrCreateVolume(req.GetVolumeId())
-	attr, err := vol.CreateFile(ctx, req.GetPath(), req.GetMode(), req.GetInitialContent())
+	attr, err := vol.CreateFile(ctx, req.GetPath(), req.GetMode(), req.GetInitialContent(), req.GetUid(), req.GetGid())
 	if err != nil {
 		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
 	}

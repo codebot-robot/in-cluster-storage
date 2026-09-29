@@ -182,6 +182,8 @@ type CachedInode struct {
 	ETag        string
 	RedirectURL string
 	Data        blob.ByteStream
+	Uid         uint32
+	Gid         uint32
 	IsDirty     bool
 }
 
