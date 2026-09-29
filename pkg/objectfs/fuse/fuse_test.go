@@ -76,24 +76,57 @@ func TestRawFileSystemOperations(t *testing.T) {
 	if attrOut.Attr.Mode&syscall.S_IFDIR == 0 {
 		t.Fatalf("Expected root to have S_IFDIR mode, got: %o", attrOut.Attr.Mode)
 	}
+	if attrOut.Attr.Nlink != 2 {
+		t.Fatalf("Expected root Nlink to be 2, got: %d", attrOut.Attr.Nlink)
+	}
+	if attrOut.Attr.Owner.Uid != 0 || attrOut.Attr.Owner.Gid != 0 {
+		t.Fatalf("Expected root Owner to be 0/0, got: %d/%d", attrOut.Attr.Owner.Uid, attrOut.Attr.Owner.Gid)
+	}
+
+	const testUID = 1001
+	const testGID = 1002
 
 	// 2. Mkdir "docs"
 	var docsEntryOut fuse.EntryOut
-	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "docs", &docsEntryOut); status != fuse.OK {
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{
+		InHeader: fuse.InHeader{
+			NodeId: fuse.FUSE_ROOT_ID,
+			Caller: fuse.Caller{Owner: fuse.Owner{Uid: testUID, Gid: testGID}},
+		},
+		Mode: 0755,
+	}, "docs", &docsEntryOut); status != fuse.OK {
 		t.Fatalf("Mkdir docs failed: %v", status)
 	}
 	if docsEntryOut.NodeId == 0 {
 		t.Fatalf("Expected valid Inode id in EntryOut")
 	}
+	if docsEntryOut.Attr.Nlink != 2 {
+		t.Fatalf("Expected dir Nlink to be 2, got: %d", docsEntryOut.Attr.Nlink)
+	}
+	if docsEntryOut.Attr.Owner.Uid != testUID || docsEntryOut.Attr.Owner.Gid != testGID {
+		t.Fatalf("Expected dir Owner to match caller UID/GID, got: %d/%d", docsEntryOut.Attr.Owner.Uid, docsEntryOut.Attr.Owner.Gid)
+	}
 
 	// 3. Create file "docs/readme.txt"
 	var fileCreateOut fuse.CreateOut
-	if status := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: docsEntryOut.NodeId}, Mode: 0644}, "readme.txt", &fileCreateOut); status != fuse.OK {
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{
+			NodeId: docsEntryOut.NodeId,
+			Caller: fuse.Caller{Owner: fuse.Owner{Uid: testUID, Gid: testGID}},
+		},
+		Mode: 0644,
+	}, "readme.txt", &fileCreateOut); status != fuse.OK {
 		t.Fatalf("Create file failed: %v", status)
 	}
 	fileID := fileCreateOut.EntryOut.NodeId
 	if fileID == 0 {
 		t.Fatalf("Expected valid file Inode id")
+	}
+	if fileCreateOut.EntryOut.Attr.Nlink != 1 {
+		t.Fatalf("Expected file Nlink to be 1, got: %d", fileCreateOut.EntryOut.Attr.Nlink)
+	}
+	if fileCreateOut.EntryOut.Attr.Owner.Uid != testUID || fileCreateOut.EntryOut.Attr.Owner.Gid != testGID {
+		t.Fatalf("Expected file Owner to match caller UID/GID, got: %d/%d", fileCreateOut.EntryOut.Attr.Owner.Uid, fileCreateOut.EntryOut.Attr.Owner.Gid)
 	}
 
 	// 4. Write data to file
@@ -141,6 +174,12 @@ func TestRawFileSystemOperations(t *testing.T) {
 	}
 	if lookupOut.NodeId != fileID {
 		t.Fatalf("Lookup returned node %d, want %d", lookupOut.NodeId, fileID)
+	}
+	if lookupOut.Attr.Nlink != 1 {
+		t.Fatalf("Expected file Nlink to be 1 in lookup, got: %d", lookupOut.Attr.Nlink)
+	}
+	if lookupOut.Attr.Owner.Uid != testUID || lookupOut.Attr.Owner.Gid != testGID {
+		t.Fatalf("Expected file Owner to match test UID/GID in lookup, got: %d/%d", lookupOut.Attr.Owner.Uid, lookupOut.Attr.Owner.Gid)
 	}
 
 	// 8a. Rmdir "docs" while non-empty should fail with ENOTEMPTY
@@ -314,5 +353,148 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 	// Cache entry should no longer be dirty
 	if _, isDirty := cache.GetDirty("/buffered.txt"); isDirty {
 		t.Fatalf("Expected cache entry to be marked clean after flush")
+	}
+}
+
+func TestFUSEAttributesOwnerAndNlink(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	const callerUID = 553677
+	const callerGID = 1000
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, "vol-attrs", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Root directory GetAttr (root has default 0/0 UID/GID in EROFS)
+	var rootAttrOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, &rootAttrOut); status != fuse.OK {
+		t.Fatalf("GetAttr root failed: %v", status)
+	}
+	if rootAttrOut.Attr.Nlink != 2 {
+		t.Fatalf("Root directory Nlink = %d, want 2", rootAttrOut.Attr.Nlink)
+	}
+
+	// 2. Mkdir with caller UID/GID
+	var dirOut fuse.EntryOut
+	mkdirIn := &fuse.MkdirIn{
+		InHeader: fuse.InHeader{
+			NodeId: fuse.FUSE_ROOT_ID,
+			Caller: fuse.Caller{Owner: fuse.Owner{Uid: callerUID, Gid: callerGID}},
+		},
+		Mode: 0755,
+	}
+	if status := rawFS.Mkdir(nil, mkdirIn, "sub", &dirOut); status != fuse.OK {
+		t.Fatalf("Mkdir failed: %v", status)
+	}
+	if dirOut.Attr.Nlink != 2 {
+		t.Fatalf("Mkdir Nlink = %d, want 2", dirOut.Attr.Nlink)
+	}
+	if dirOut.Attr.Owner.Uid != callerUID || dirOut.Attr.Owner.Gid != callerGID {
+		t.Fatalf("Mkdir Owner = %d/%d, want %d/%d", dirOut.Attr.Owner.Uid, dirOut.Attr.Owner.Gid, callerUID, callerGID)
+	}
+
+	// 3. Create regular file with caller UID/GID
+	var createOut fuse.CreateOut
+	createIn := &fuse.CreateIn{
+		InHeader: fuse.InHeader{
+			NodeId: fuse.FUSE_ROOT_ID,
+			Caller: fuse.Caller{Owner: fuse.Owner{Uid: callerUID, Gid: callerGID}},
+		},
+		Mode: 0644,
+	}
+	if status := rawFS.Create(nil, createIn, "hello.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	if createOut.EntryOut.Attr.Nlink != 1 {
+		t.Fatalf("Create Nlink = %d, want 1", createOut.EntryOut.Attr.Nlink)
+	}
+	if createOut.EntryOut.Attr.Owner.Uid != callerUID || createOut.EntryOut.Attr.Owner.Gid != callerGID {
+		t.Fatalf("Create Owner = %d/%d, want %d/%d", createOut.EntryOut.Attr.Owner.Uid, createOut.EntryOut.Attr.Owner.Gid, callerUID, callerGID)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// 4. Mknod file with caller UID/GID
+	var mknodOut fuse.EntryOut
+	mknodIn := &fuse.MknodIn{
+		InHeader: fuse.InHeader{
+			NodeId: fuse.FUSE_ROOT_ID,
+			Caller: fuse.Caller{Owner: fuse.Owner{Uid: callerUID, Gid: callerGID}},
+		},
+		Mode: 0644,
+	}
+	if status := rawFS.Mknod(nil, mknodIn, "mknod.txt", &mknodOut); status != fuse.OK {
+		t.Fatalf("Mknod failed: %v", status)
+	}
+	if mknodOut.Attr.Nlink != 1 {
+		t.Fatalf("Mknod Nlink = %d, want 1", mknodOut.Attr.Nlink)
+	}
+	if mknodOut.Attr.Owner.Uid != callerUID || mknodOut.Attr.Owner.Gid != callerGID {
+		t.Fatalf("Mknod Owner = %d/%d, want %d/%d", mknodOut.Attr.Owner.Uid, mknodOut.Attr.Owner.Gid, callerUID, callerGID)
+	}
+
+	// 5. GetAttr on file
+	var fileAttrOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &fileAttrOut); status != fuse.OK {
+		t.Fatalf("GetAttr file failed: %v", status)
+	}
+	if fileAttrOut.Attr.Nlink != 1 {
+		t.Fatalf("GetAttr file Nlink = %d, want 1", fileAttrOut.Attr.Nlink)
+	}
+	if fileAttrOut.Attr.Owner.Uid != callerUID || fileAttrOut.Attr.Owner.Gid != callerGID {
+		t.Fatalf("GetAttr file Owner = %d/%d, want %d/%d", fileAttrOut.Attr.Owner.Uid, fileAttrOut.Attr.Owner.Gid, callerUID, callerGID)
+	}
+
+	// 6. SetAttr (truncate)
+	var setAttrTruncOut fuse.AttrOut
+	if status := rawFS.SetAttr(nil, &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: fileID}, Valid: fuse.FATTR_SIZE, Size: 10}}, &setAttrTruncOut); status != fuse.OK {
+		t.Fatalf("SetAttr truncate failed: %v", status)
+	}
+	if setAttrTruncOut.Attr.Nlink != 1 {
+		t.Fatalf("SetAttr truncate Nlink = %d, want 1", setAttrTruncOut.Attr.Nlink)
+	}
+	if setAttrTruncOut.Attr.Owner.Uid != callerUID || setAttrTruncOut.Attr.Owner.Gid != callerGID {
+		t.Fatalf("SetAttr truncate Owner = %d/%d, want %d/%d", setAttrTruncOut.Attr.Owner.Uid, setAttrTruncOut.Attr.Owner.Gid, callerUID, callerGID)
+	}
+
+	// 7. SetAttr (non-truncate / touch / mode)
+	var setAttrOut fuse.AttrOut
+	if status := rawFS.SetAttr(nil, &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: fileID}, Valid: fuse.FATTR_MODE, Mode: 0600}}, &setAttrOut); status != fuse.OK {
+		t.Fatalf("SetAttr failed: %v", status)
+	}
+	if setAttrOut.Attr.Nlink != 1 {
+		t.Fatalf("SetAttr Nlink = %d, want 1", setAttrOut.Attr.Nlink)
+	}
+	if setAttrOut.Attr.Owner.Uid != callerUID || setAttrOut.Attr.Owner.Gid != callerGID {
+		t.Fatalf("SetAttr Owner = %d/%d, want %d/%d", setAttrOut.Attr.Owner.Uid, setAttrOut.Attr.Owner.Gid, callerUID, callerGID)
+	}
+
+	// 8. Lookup directory and file
+	var lookupDirOut fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "sub", &lookupDirOut); status != fuse.OK {
+		t.Fatalf("Lookup sub failed: %v", status)
+	}
+	if lookupDirOut.Attr.Nlink != 2 {
+		t.Fatalf("Lookup dir Nlink = %d, want 2", lookupDirOut.Attr.Nlink)
+	}
+	if lookupDirOut.Attr.Owner.Uid != callerUID || lookupDirOut.Attr.Owner.Gid != callerGID {
+		t.Fatalf("Lookup dir Owner = %d/%d, want %d/%d", lookupDirOut.Attr.Owner.Uid, lookupDirOut.Attr.Owner.Gid, callerUID, callerGID)
+	}
+
+	var lookupFileOut fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "hello.txt", &lookupFileOut); status != fuse.OK {
+		t.Fatalf("Lookup hello.txt failed: %v", status)
+	}
+	if lookupFileOut.Attr.Nlink != 1 {
+		t.Fatalf("Lookup file Nlink = %d, want 1", lookupFileOut.Attr.Nlink)
+	}
+	if lookupFileOut.Attr.Owner.Uid != callerUID || lookupFileOut.Attr.Owner.Gid != callerGID {
+		t.Fatalf("Lookup file Owner = %d/%d, want %d/%d", lookupFileOut.Attr.Owner.Uid, lookupFileOut.Attr.Owner.Gid, callerUID, callerGID)
+	}
+
+	// 9. ReadDirPlus on root
+	dirList := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	if status := rawFS.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, dirList); status != fuse.OK {
+		t.Fatalf("ReadDirPlus failed: %v", status)
 	}
 }

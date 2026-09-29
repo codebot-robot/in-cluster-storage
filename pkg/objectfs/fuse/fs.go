@@ -155,14 +155,29 @@ func grpcErrorToStatus(err error) fuse.Status {
 	}
 }
 
-func fillAttr(attr *pb.EntryAttr, out *fuse.Attr) {
+func (fs *ObjectFS) fillAttr(attr *pb.EntryAttr, out *fuse.Attr) {
 	out.Ino = attr.GetInode()
 	out.Size = uint64(attr.GetSize())
 	out.Mode = attr.GetMode()
 	if attr.GetIsDir() {
 		out.Mode |= syscall.S_IFDIR
+		// In POSIX filesystems, a directory's link count is 2 (from "." and the parent
+		// entry) plus 1 for each child subdirectory (".."). Computing the exact count
+		// on every getattr/lookup would require scanning all directory children from the
+		// controller, which is prohibitively expensive for a remote/object filesystem.
+		// Setting Nlink = 2 satisfies tools like `find` and backup utilities (preventing
+		// leaf-optimization bugs or treating directories as deleted) and is the standard
+		// convention for network and virtual filesystems (e.g. s3fs, 9p, EROFS).
+		out.Nlink = 2
 	} else {
 		out.Mode |= syscall.S_IFREG
+		// ObjectFS does not support hard links, so every regular file has exactly 1 link.
+		out.Nlink = 1
+	}
+	// Use UID and GID persisted on the inode/entry attr.
+	out.Owner = fuse.Owner{
+		Uid: attr.GetUid(),
+		Gid: attr.GetGid(),
 	}
 	if attr.GetModTime() != nil {
 		t := attr.GetModTime().AsTime()
@@ -175,8 +190,8 @@ func fillAttr(attr *pb.EntryAttr, out *fuse.Attr) {
 	}
 }
 
-func fillEntryOut(attr *pb.EntryAttr, out *fuse.EntryOut) {
-	fillAttr(attr, &out.Attr)
+func (fs *ObjectFS) fillEntryOut(attr *pb.EntryAttr, out *fuse.EntryOut) {
+	fs.fillAttr(attr, &out.Attr)
 	out.NodeId = attr.GetInode()
 	out.Generation = 1
 	out.SetEntryTimeout(1 * time.Second)
@@ -208,7 +223,7 @@ func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 	childPath := path.Join(parentPath, name)
 	fs.setInode(attr.GetInode(), childPath)
 
-	fillEntryOut(attr, out)
+	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
 
@@ -232,7 +247,7 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 		return fuse.Status(resp.GetError())
 	}
 
-	fillAttr(resp.GetAttr(), &out.Attr)
+	fs.fillAttr(resp.GetAttr(), &out.Attr)
 	if entry, isDirty := fs.cache.GetDirty(p); isDirty {
 		out.Attr.Size = uint64(entry.Size)
 		out.Attr.Mtime = uint64(entry.ModTime.Unix())
@@ -264,7 +279,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
 		}
-		fillAttr(resp.GetAttr(), &out.Attr)
+		fs.fillAttr(resp.GetAttr(), &out.Attr)
 		out.Attr.Size = input.Size
 		out.SetTimeout(1 * time.Second)
 		return fuse.OK
@@ -280,7 +295,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
-	fillAttr(resp.GetAttr(), &out.Attr)
+	fs.fillAttr(resp.GetAttr(), &out.Attr)
 	if entry, isDirty := fs.cache.GetDirty(p); isDirty {
 		out.Attr.Size = uint64(entry.Size)
 		out.Attr.Mtime = uint64(entry.ModTime.Unix())
@@ -304,6 +319,8 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 		VolumeId: fs.volumeID,
 		Path:     childPath,
 		Mode:     input.Mode,
+		Uid:      input.Uid,
+		Gid:      input.Gid,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -314,7 +331,7 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 
 	attr := resp.GetAttr()
 	fs.setInode(attr.GetInode(), childPath)
-	fillEntryOut(attr, out)
+	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
 
@@ -332,6 +349,8 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 		VolumeId: fs.volumeID,
 		Path:     childPath,
 		Mode:     input.Mode,
+		Uid:      input.Uid,
+		Gid:      input.Gid,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -343,7 +362,7 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 	attr := resp.GetAttr()
 	fs.setInode(attr.GetInode(), childPath)
 	fs.cache.Put(childPath, []byte{}, time.Now(), "")
-	fillEntryOut(attr, &out.EntryOut)
+	fs.fillEntryOut(attr, &out.EntryOut)
 	out.OpenOut.Fh = attr.GetInode()
 	return fuse.OK
 }
@@ -362,6 +381,8 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 		VolumeId: fs.volumeID,
 		Path:     childPath,
 		Mode:     input.Mode,
+		Uid:      input.Uid,
+		Gid:      input.Gid,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -373,7 +394,7 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 	attr := resp.GetAttr()
 	fs.setInode(attr.GetInode(), childPath)
 	fs.cache.Put(childPath, []byte{}, time.Now(), "")
-	fillEntryOut(attr, out)
+	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
 
@@ -551,7 +572,7 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 		if entryOut == nil {
 			break
 		}
-		fillEntryOut(e, entryOut)
+		fs.fillEntryOut(e, entryOut)
 	}
 	return fuse.OK
 }
