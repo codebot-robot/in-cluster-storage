@@ -1,0 +1,134 @@
+{
+  "name": "03_schema_evolution_add_field",
+  "description": "Schema evolution: adding a new optional field",
+  "payloads_hex": [
+    "010810120c74657374706b672e557365721a202f988c6a055855ed3ac5d97ba30565309bb423d1f41c9cc3c6f2b7b75c8204a022410a3f0a0a557365722e70726f746f120774657374706b6722200a0455736572120a0a026964180120012803120c0a046e616d65180220012809620670726f746f332a0101",
+    "051010220208012a071205416c696365",
+    "010810120c74657374706b672e557365721a203275724efb5f34fab0c11f590dc3c6594431c16bedfdb1140dda7f9c7832e05822500a4e0a0a557365722e70726f746f120774657374706b67222f0a0455736572120a0a026964180120012803120c0a046e616d65180220012809120d0a05656d61696c180320012809620670726f746f332a0101",
+    "051010220208022a161203426f621a0f626f62406578616d706c652e636f6d"
+  ],
+  "expected_records": [
+    {
+      "seq": 1,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.User",
+        "fingerprint": "L5iMagVYVe06xdl7owVlMJu0I9H0HJzDxvK3t1yCBKA=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "User.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "User",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "name",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    },
+    {
+      "seq": 2,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "CAE=",
+        "value": "EgVBbGljZQ=="
+      }
+    },
+    {
+      "seq": 3,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.User",
+        "fingerprint": "MnVyTvtfNPqwwR9ZDcPGWUQxwWvt/bEUDdp/nHgy4Fg=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "User.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "User",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "name",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    },
+                    {
+                      "name": "email",
+                      "number": 3,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    },
+    {
+      "seq": 4,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "CAI=",
+        "value": "EgNCb2IaD2JvYkBleGFtcGxlLmNvbQ=="
+      }
+    }
+  ],
+  "expected_tables": {
+    "testpkg.User": [
+      {
+        "id": "1",
+        "name": "Alice"
+      },
+      {
+        "id": "2",
+        "name": "Bob",
+        "email": "bob@example.com"
+      }
+    ]
+  },
+  "expected_safe_position": 4
+}

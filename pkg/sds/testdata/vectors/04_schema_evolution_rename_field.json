@@ -1,0 +1,127 @@
+{
+  "name": "04_schema_evolution_rename_field",
+  "description": "Schema evolution: renaming a field while preserving field tag number",
+  "payloads_hex": [
+    "010810120c74657374706b672e4974656d1a206e11c57f903718676d3974ea1ce9e9adc35384c6476374fc36784f9736bd523722410a3f0a0a4974656d2e70726f746f120774657374706b6722200a044974656d120a0a026964180120012803120c0a046e616d65180220012809620670726f746f332a0101",
+    "051010220208012a081206576964676574",
+    "010810120c74657374706b672e4974656d1a2037071deb151720c509d5e64ad7e09749c5af2fd4cea0030d2942a725114620b922420a400a0a4974656d2e70726f746f120774657374706b6722210a044974656d120a0a026964180120012803120d0a057469746c65180220012809620670726f746f332a0101",
+    "051010220208022a081206476164676574"
+  ],
+  "expected_records": [
+    {
+      "seq": 1,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.Item",
+        "fingerprint": "bhHFf5A3GGdtOXTqHOnprcNThMZHY3T8NnhPlza9Ujc=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "Item.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "Item",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "name",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    },
+    {
+      "seq": 2,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "CAE=",
+        "value": "EgZXaWRnZXQ="
+      }
+    },
+    {
+      "seq": 3,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.Item",
+        "fingerprint": "Nwcd6xUXIMUJ1eZK1+CXScWvL9TOoAMNKUKnJRFGILk=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "Item.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "Item",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "title",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    },
+    {
+      "seq": 4,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "CAI=",
+        "value": "EgZHYWRnZXQ="
+      }
+    }
+  ],
+  "expected_tables": {
+    "testpkg.Item": [
+      {
+        "id": "1",
+        "name": "Widget"
+      },
+      {
+        "id": "2",
+        "title": "Gadget"
+      }
+    ]
+  },
+  "expected_safe_position": 4
+}

@@ -1,0 +1,10 @@
+{
+  "name": "09_error_use_before_define",
+  "description": "Error case: OpRecord referencing table Type ID 16 before TypeDefinition",
+  "payloads_hex": [
+    "051010220208012a06120474657374"
+  ],
+  "expected_safe_position": 0,
+  "expected_error": "type ID used before definition",
+  "error_at_seq": 1
+}

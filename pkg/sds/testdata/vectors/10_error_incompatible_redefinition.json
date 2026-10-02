@@ -1,0 +1,54 @@
+{
+  "name": "10_error_incompatible_redefinition",
+  "description": "Error case: incompatible schema evolution (field type changed from double to string)",
+  "payloads_hex": [
+    "010810120e74657374706b672e4d65747269631a20e8cc92ea38f994a40fde8013ce0eefe43498e42fe05e54f42161fd0926bb7cd022440a420a0c4d65747269632e70726f746f120774657374706b6722210a064d6574726963120a0a026964180120012803120b0a0376616c180220012801620670726f746f332a0101",
+    "010810120e74657374706b672e4d65747269631a20f8669554fbfad3713838b4cf102d556c5a5993efe7b98a22539b4ddf8866c07f22440a420a0c4d65747269632e70726f746f120774657374706b6722210a064d6574726963120a0a026964180120012803120b0a0376616c180220012809620670726f746f332a0101"
+  ],
+  "expected_records": [
+    {
+      "seq": 1,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.Metric",
+        "fingerprint": "6MyS6jj5lKQP3oATzg7v5DSY5C/gXlT0IWH9CSa7fNA=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "Metric.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "Metric",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "val",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_DOUBLE"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    }
+  ],
+  "expected_safe_position": 0,
+  "expected_error": "incompatible schema evolution",
+  "error_at_seq": 2
+}

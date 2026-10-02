@@ -2,7 +2,7 @@
 title: "The Wire Format"
 kicker: "Framing & Encodings"
 summary: "Layer 1 record typing and Layer 2 logical change log framing, with a byte-by-byte wire example."
-status_note: "Draft specification. A normative spec and test vectors will land in Issue #106."
+status_note: "Draft specification. See the normative specification in docs/sds-spec.md."
 next_url: "/projections/"
 next_title: "Projections"
 ---
@@ -11,7 +11,7 @@ The Structured Data Streams wire format is split into two clean layers:
 - **Layer 1 (Record Typing):** How different record kinds are multiplexed into one opaque stream.
 - **Layer 2 (Logical Change Log):** How relational mutations (tables, rows, transactions) are represented.
 
-> **Normative Specification:** A formal, normative specification document with golden test vectors is tracked in [Issue #106](https://github.com/gke-labs/in-cluster-storage/issues/106). This page provides an intuitive, high-level guide.
+> **Normative Specification:** A formal, normative specification document with golden test vectors is available in [`docs/sds-spec.md`](https://github.com/gke-labs/in-cluster-storage/blob/main/docs/sds-spec.md). This page provides an intuitive, high-level guide.
 
 ---
 
@@ -30,8 +30,9 @@ $$\text{payload} := \text{varint}(\text{type\_id}) \mathbin{\Vert} \text{body}$$
 | `2` | **TxCommit** | Commits a multi-record transaction. | `TxCommit` |
 | `3` | **SnapshotPointer** | Announces the creation of an immutable snapshot. | `SnapshotPointer` |
 | `4` | **Padding** | No-op used for fixed-bucket size obfuscation under encryption. | Arbitrary bytes |
-| `5`–`15` | *Reserved* | Reserved for future core framework extensions. | — |
-| `16`+ | **Application Types** | Defined by a preceding `TypeDefinition`. Costs only 1 byte for IDs $\le 127$. | `RowChange` wrapping user proto |
+| `5` | **OpRecord** | Relational row mutation (`CREATE`, `UPDATE`, `DELETE`). | `OpRecord` |
+| `6`–`15` | *Reserved* | Reserved for future core framework extensions. | — |
+| `16`+ | **Application Types** | Defined by a preceding `TypeDefinition`. Costs only 1 byte for IDs $\le 127$. | Bare registered user proto |
 
 ### Type Definition Schema
 
@@ -58,19 +59,20 @@ message TypeDefinition {
 
 ## Layer 2: The Logical Change Log
 
-Application tables are simply existing Protobuf messages. Writers do not need generated table wrappers; mutations are represented by a generic framework envelope:
+Application tables are simply existing Protobuf messages. Relational mutations are represented by a framework `OpRecord` (type ID `5`):
 
 ```protobuf
-message RowChange {
+message OpRecord {
   enum Op {
-    INSERT = 0;
+    CREATE = 0;
     UPDATE = 1;
     DELETE = 2;
   }
   Op     op = 1;
-  uint64 tx_id = 2;   // 0 for autocommit; non-zero held pending until TxCommit
-  bytes  before = 3;  // Key fields for DELETE/UPDATE (or full image for undo/CDC)
-  bytes  after = 4;   // Full row image for INSERT/UPDATE
+  uint32 type_id = 2; // Target table type ID (>= 16)
+  uint64 tx_id = 3;   // 0 for autocommit; non-zero held pending until TxCommit
+  bytes  key = 4;     // Canonical binary proto encoding of key fields
+  bytes  value = 5;   // Binary proto encoding of non-key fields
 }
 ```
 
@@ -90,7 +92,7 @@ message TxCommit {
 
 ## Worked Example: A Row Change on the Wire
 
-Let us trace an application inserting a new order row into table `shop.Order` (registered as type ID `16`).
+Let us trace an application creating a new order row in table `shop.Order` (registered as type ID `16`).
 
 ### 1. The Application Protobuf Message
 
@@ -107,55 +109,49 @@ message Order {
 
 We insert: `Order{ id: 42, customer: "Alice", total: 19.99 }`.
 
-### 2. Encoded `Order` Body (`after`)
+### 2. Encoded Key and Value Fields
 
-In protobuf wire format:
-- Field 1 (`id = 42`): tag `(1 << 3) | 0 = 0x08`, varint `42` (`0x2a`) $\rightarrow$ `08 2a` (2 bytes)
-- Field 2 (`customer = "Alice"`): tag `(2 << 3) | 2 = 0x12`, length `5` (`0x05`), UTF-8 `"Alice"` (`41 6c 69 63 65`) $\rightarrow$ `12 05 41 6c 69 63 65` (7 bytes)
-- Field 3 (`total = 19.99`): tag `(3 << 3) | 1 = 0x19`, 64-bit IEEE-754 float `19.99` (`71 3d 0a d7 a3 f0 33 40`) $\rightarrow$ `19 71 3d 0a d7 a3 f0 33 40` (9 bytes)
+- **Key proto (`Order{ id: 42 }`):**
+  - Field 1 (`id = 42`): tag `(1 << 3) | 0 = 0x08`, varint `42` (`0x2a`) $\rightarrow$ `08 2a` (2 bytes)
+- **Value proto (`Order{ customer: "Alice", total: 19.99 }`):**
+  - Field 2 (`customer = "Alice"`): tag `(2 << 3) | 2 = 0x12`, length `5` (`0x05`), UTF-8 `"Alice"` (`41 6c 69 63 65`) $\rightarrow$ `12 05 41 6c 69 63 65` (7 bytes)
+  - Field 3 (`total = 19.99`): tag `(3 << 3) | 1 = 0x19`, 64-bit IEEE-754 float `19.99` (`71 3d 0a d7 a3 f0 33 40`) $\rightarrow$ `19 71 3d 0a d7 a3 f0 33 40` (9 bytes)
 
-Total serialized `Order` length = **18 bytes**.
+### 3. Encoded `OpRecord` Framework Record
 
-### 3. Encoded `RowChange` Envelope
-
-- Field 1 (`op = INSERT = 0`): default value, 0 bytes on wire.
-- Field 2 (`tx_id = 0`): default value (autocommit), 0 bytes on wire.
-- Field 4 (`after`): tag `(4 << 3) | 2 = 0x22`, length `18` (`0x12`), followed by the 18 bytes above $\rightarrow$ `22 12 ...` (20 bytes total).
+- Frame Type ID: varint `5` (`0x05`)
+- `type_id = 16`: tag `(2 << 3) | 0 = 0x10`, varint `16` (`0x10`) $\rightarrow$ `10 10`
+- `key`: tag `(4 << 3) | 2 = 0x22`, length `2` (`0x02`), `08 2a` $\rightarrow$ `22 02 08 2a`
+- `value`: tag `(5 << 3) | 2 = 0x2a`, length `16` (`0x10`), followed by value bytes $\rightarrow$ `2a 10 12 05 41 6c 69 63 65 19 71 3d 0a d7 a3 f0 33 40`
 
 ### 4. Complete Wire Payload
 
-Prepending the Layer 1 type ID (`16 = 0x10`):
-
 ```
-10 22 12 08 2a 12 05 41 6c 69 63 65 19 71 3d 0a d7 a3 f0 33 40
+05 10 10 22 02 08 2a 2a 10 12 05 41 6c 69 63 65 19 71 3d 0a d7 a3 f0 33 40
 ```
 
 <div class="byte-breakdown">
-  <div class="byte-breakdown-title">Byte-by-Byte Wire Breakdown (21 bytes total)</div>
+  <div class="byte-breakdown-title">Byte-by-Byte Wire Breakdown (25 bytes total)</div>
   <div class="byte-row">
-    <div class="byte-hex">10</div>
-    <div class="byte-desc"><strong>Layer 1 Type ID:</strong> Varint 16 (resolves to registered table <code>shop.Order</code>)</div>
+    <div class="byte-hex">05</div>
+    <div class="byte-desc"><strong>Layer 1 Type ID:</strong> Varint 5 (OpRecord framework record)</div>
   </div>
   <div class="byte-row">
-    <div class="byte-hex">22 12</div>
-    <div class="byte-desc"><strong>RowChange.after:</strong> Tag 4 (wire type 2: length-delimited), length 18 bytes</div>
+    <div class="byte-hex">10 10</div>
+    <div class="byte-desc"><strong>OpRecord.type_id:</strong> Tag 2 (varint), table type ID 16 (<code>shop.Order</code>)</div>
   </div>
   <div class="byte-row">
-    <div class="byte-hex">08 2a</div>
-    <div class="byte-desc"><strong>Order.id:</strong> Tag 1 (varint), value 42 (Primary Key)</div>
+    <div class="byte-hex">22 02 08 2a</div>
+    <div class="byte-desc"><strong>OpRecord.key:</strong> Tag 4, length 2 bytes, canonically encoded <code>Order.id = 42</code></div>
   </div>
   <div class="byte-row">
-    <div class="byte-hex">12 05 41 6c 69 63 65</div>
-    <div class="byte-desc"><strong>Order.customer:</strong> Tag 2 (length-delimited), length 5, string <code>"Alice"</code></div>
-  </div>
-  <div class="byte-row">
-    <div class="byte-hex">19 71 3d 0a d7 a3 f0 33 40</div>
-    <div class="byte-desc"><strong>Order.total:</strong> Tag 3 (64-bit fixed), float <code>19.99</code></div>
+    <div class="byte-hex">2a 10 ...</div>
+    <div class="byte-desc"><strong>OpRecord.value:</strong> Tag 5, length 16 bytes, non-key fields <code>customer="Alice"</code>, <code>total=19.99</code></div>
   </div>
 </div>
 
 ### Why This is Powerful
 
-1. **Minimal Overhead:** Only **3 bytes** of framing overhead (1 byte type ID + 2 bytes `RowChange` tag & length) for the entire record.
+1. **Minimal Overhead:** Only **5 bytes** of framing overhead (1 byte frame type ID + 2 bytes `type_id` + 2 bytes key/value length delimiters) for the entire record.
 2. **Zero Code Generation for Generic Consumers:** Decoders walk the raw proto tags or parse into `dynamicpb.Message` using the in-band `FileDescriptorSet`.
-3. **Sparse Updates:** An update touching only `total` serializes only fields 1 and 3 in `after`, keeping wire size minimal.
+3. **Canonical Key Indexing:** Key bytes are directly usable as map keys and index entries without decoding.

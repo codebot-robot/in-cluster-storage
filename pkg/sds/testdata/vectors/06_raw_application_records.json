@@ -1,0 +1,68 @@
+{
+  "name": "06_raw_application_records",
+  "description": "Raw application-typed records (Type IDs 16+) representing keyless events",
+  "payloads_hex": [
+    "010810121074657374706b672e4c6f674576656e741a20b4b84d109b8dc5355e2d8fa84f0e1e0dcd8416368f1a515d6eef14b9575d07d022520a500a0e4c6f674576656e742e70726f746f120774657374706b67222d0a084c6f674576656e7412100a086576656e745f6964180120012809120f0a076d657373616765180220012809620670726f746f33",
+    "100a056576742d31121073657276696365207374617274696e67",
+    "100a056576742d3212057265616479"
+  ],
+  "expected_records": [
+    {
+      "seq": 1,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.LogEvent",
+        "fingerprint": "tLhNEJuNxTVeLY+oTw4eDc2EFjaPGlFdbu8UuVddB9A=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "LogEvent.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "LogEvent",
+                  "field": [
+                    {
+                      "name": "event_id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    },
+                    {
+                      "name": "message",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "type_id": 16,
+      "type_name": "testpkg.LogEvent",
+      "protojson": {
+        "eventId": "evt-1",
+        "message": "service starting"
+      }
+    },
+    {
+      "seq": 3,
+      "type_id": 16,
+      "type_name": "testpkg.LogEvent",
+      "protojson": {
+        "eventId": "evt-2",
+        "message": "ready"
+      }
+    }
+  ],
+  "expected_safe_position": 3
+}

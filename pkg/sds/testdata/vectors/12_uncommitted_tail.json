@@ -1,0 +1,89 @@
+{
+  "name": "12_uncommitted_tail",
+  "description": "Uncommitted transaction at stream tail is discarded on reader recovery",
+  "payloads_hex": [
+    "010810120d74657374706b672e4f726465721a204cc756c39ef368b618c2b75a9ccea8a3e1d2095ee7f1267cafb696ded593ba8e22560a540a0b4f726465722e70726f746f120774657374706b6722340a054f72646572120a0a02696418012001280312100a08637573746f6d6572180220012809120d0a05746f74616c180320012801620670726f746f332a0101",
+    "051010220208012a101205416c696365190000000000005940",
+    "0510101801220208022a0e1203426f62190000000000006940"
+  ],
+  "expected_records": [
+    {
+      "seq": 1,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.Order",
+        "fingerprint": "TMdWw57zaLYYwrdanM6oo+HSCV7n8SZ8r7aW3tWTuo4=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "Order.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "Order",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "customer",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    },
+                    {
+                      "name": "total",
+                      "number": 3,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_DOUBLE"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    },
+    {
+      "seq": 2,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "CAE=",
+        "value": "EgVBbGljZRkAAAAAAABZQA=="
+      }
+    },
+    {
+      "seq": 3,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "txId": "1",
+        "key": "CAI=",
+        "value": "EgNCb2IZAAAAAAAAaUA="
+      }
+    }
+  ],
+  "expected_tables": {
+    "testpkg.Order": [
+      {
+        "id": "1",
+        "customer": "Alice",
+        "total": 100
+      }
+    ]
+  },
+  "expected_safe_position": 2
+}

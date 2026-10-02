@@ -1,0 +1,121 @@
+{
+  "name": "02_multi_row_tx",
+  "description": "Multi-row atomic transaction committed by TxCommit",
+  "payloads_hex": [
+    "010810120f74657374706b672e4163636f756e741a200939f495f56df3a01324e179f2fd0d7dbdee7c025123952ed3ac39e0856fa363224a0a480a0d4163636f756e742e70726f746f120774657374706b6722260a074163636f756e74120a0a026964180120012803120f0a0762616c616e6365180220012801620670726f746f332a0101",
+    "051010220208012a09110000000000006940",
+    "051010220208022a09110000000000005940",
+    "05080110101801220208012a09110000000000c06240",
+    "05080110101801220208022a09110000000000c06240",
+    "02080112060880f09dc706"
+  ],
+  "expected_records": [
+    {
+      "seq": 1,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.Account",
+        "fingerprint": "CTn0lfVt86ATJOF58v0Nfb3ufAJRI5Uu06w54IVvo2M=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "Account.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "Account",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "balance",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_DOUBLE"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    },
+    {
+      "seq": 2,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "CAE=",
+        "value": "EQAAAAAAAGlA"
+      }
+    },
+    {
+      "seq": 3,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "CAI=",
+        "value": "EQAAAAAAAFlA"
+      }
+    },
+    {
+      "seq": 4,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "op": "UPDATE",
+        "typeId": 16,
+        "txId": "1",
+        "key": "CAE=",
+        "value": "EQAAAAAAwGJA"
+      }
+    },
+    {
+      "seq": 5,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "op": "UPDATE",
+        "typeId": 16,
+        "txId": "1",
+        "key": "CAI=",
+        "value": "EQAAAAAAwGJA"
+      }
+    },
+    {
+      "seq": 6,
+      "type_id": 2,
+      "type_name": "sds.v1.TxCommit",
+      "protojson": {
+        "txId": "1",
+        "commitTime": "2025-10-09T08:53:20Z"
+      }
+    }
+  ],
+  "expected_tables": {
+    "testpkg.Account": [
+      {
+        "id": "1",
+        "balance": 150
+      },
+      {
+        "id": "2",
+        "balance": 150
+      }
+    ]
+  },
+  "expected_safe_position": 6
+}

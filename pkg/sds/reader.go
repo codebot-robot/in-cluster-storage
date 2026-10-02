@@ -135,9 +135,13 @@ func (r *ChangeReader) Feed(seq uint64, payload []byte) ([]Change, error) {
 			return nil, fmt.Errorf("missing OpRecord for TypeIDOpRecord")
 		}
 
-		def, _, ok := r.decoder.Registry().LookupByID(opRec.GetTypeId())
+		def, md, ok := r.decoder.Registry().LookupByID(opRec.GetTypeId())
 		if !ok {
 			return nil, fmt.Errorf("%w: %d", record.ErrTypeNotRegistered, opRec.GetTypeId())
+		}
+
+		if err := ValidateKeyBytes(md, def.GetKeyFields(), opRec.GetKey()); err != nil {
+			return nil, err
 		}
 
 		msgType, err := r.decoder.Registry().ResolveMessageType(opRec.GetTypeId())

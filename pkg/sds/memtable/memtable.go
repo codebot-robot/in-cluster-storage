@@ -72,14 +72,22 @@ func (t *MemTable) Delete(key sds.Key) {
 	delete(t.rows, key)
 }
 
-// Rows returns a slice of all row messages in the table.
+// Rows returns a slice of all row messages in the table, sorted deterministically by primary key.
 func (t *MemTable) Rows() []proto.Message {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	rows := make([]proto.Message, 0, len(t.rows))
-	for _, msg := range t.rows {
-		rows = append(rows, proto.Clone(msg))
+	keys := make([]sds.Key, 0, len(t.rows))
+	for k := range t.rows {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].String() < keys[j].String()
+	})
+
+	rows := make([]proto.Message, 0, len(keys))
+	for _, k := range keys {
+		rows = append(rows, proto.Clone(t.rows[k]))
 	}
 	return rows
 }

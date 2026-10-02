@@ -1,0 +1,140 @@
+{
+  "name": "05_schema_evolution_reserved_field",
+  "description": "Schema evolution: removing a field and reserving its field tag number",
+  "payloads_hex": [
+    "010810120f74657374706b672e50726f647563741a209385e322e5064558da36ed82d47be09eb3dacbb9461e335a3504a9575b216ce322550a530a0d50726f647563742e70726f746f120774657374706b6722310a0750726f64756374120a0a026964180120012803120b0a03736b75180220012809120d0a057072696365180320012801620670726f746f332a0101",
+    "051010220208012a0e1203414243190000000000002440",
+    "010810120f74657374706b672e50726f647563741a20d44283e7dbe18873451380506cb2a1adc21308ff66f38129149c9a9ea797ab7a224c0a4a0a0d50726f647563742e70726f746f120774657374706b6722280a0750726f64756374120a0a026964180120012803120b0a03736b751802200128094a0408031004620670726f746f332a0101",
+    "051010220208022a05120358595a"
+  ],
+  "expected_records": [
+    {
+      "seq": 1,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.Product",
+        "fingerprint": "k4XjIuUGRVjaNu2C1HvgnrPay7lGHjNaNQSpV1shbOM=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "Product.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "Product",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "sku",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    },
+                    {
+                      "name": "price",
+                      "number": 3,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_DOUBLE"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    },
+    {
+      "seq": 2,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "CAE=",
+        "value": "EgNBQkMZAAAAAAAAJEA="
+      }
+    },
+    {
+      "seq": 3,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.Product",
+        "fingerprint": "1EKD59vhiHNFE4BQbLKhrcITCP9m84EpFJyanqeXq3o=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "Product.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "Product",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "sku",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    }
+                  ],
+                  "reservedRange": [
+                    {
+                      "start": 3,
+                      "end": 4
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    },
+    {
+      "seq": 4,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "CAI=",
+        "value": "EgNYWVo="
+      }
+    }
+  ],
+  "expected_tables": {
+    "testpkg.Product": [
+      {
+        "id": "1",
+        "sku": "ABC",
+        "price": 10
+      },
+      {
+        "id": "2",
+        "sku": "XYZ"
+      }
+    ]
+  },
+  "expected_safe_position": 4
+}
