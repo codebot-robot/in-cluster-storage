@@ -221,7 +221,9 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 
 - **Positions above `last_flushed_position` are provisional:** In the event of a witness crash before flushing to object storage, provisional positions may be reassigned upon restart.
 - **Tail clamping:** If a `Tail` request specifies `from_position > last_flushed_position + 1`, the server clamps it to `last_flushed_position + 1` and returns the effective starting position in `resumed_from`.
-- **Consumer deduplication:** Consumers of `Tail` must deduplicate records based on `(stream_id, stream_seq)`.
+- **Consumer deduplication:** Consumers of merged `Tail` streams must deduplicate records based on `(stream_id, stream_seq)`.
+- **Per-Stream Tail & Filtering:** `TailRequest` allows filtering server-side by `stream_id` and resuming from a known sequence number `from_stream_seq` (returning records where `stream_seq > from_stream_seq`). When `stream_id` is set, the buffer filters records across all tiers (object storage segments, local disk segments, and live commits). `from_position` serves as an optional lower-bound position hint. Resuming by `stream_seq` is robust against server restarts and position reassignments because `stream_seq` is assigned by the stream writer and immutable.
+- **Client Helper:** The client package (`pkg/wal/client`) provides `TailStream(ctx, target, streamID, fromSeq)` returning a Go iterator (`iter.Seq2[uint64, []byte]`) yielding `(stream_seq, payload)` pairs.
 
 ---
 

@@ -17,24 +17,117 @@ limitations under the License.
 package e2e
 
 import (
+	"bufio"
+	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/s3storage"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-func getPodUID(podName, namespace string) string {
-	cmd := exec.Command("kubectl", "-n", namespace, "get", "pod", podName, "-o", "jsonpath={.metadata.uid}")
-	out, err := cmd.CombinedOutput()
+func startBufferServerOnListener(t *testing.T, backend objectstore.Backend, dataDir string, ln net.Listener) (*buffer.Server, *grpc.Server) {
+	t.Helper()
+	ctx := t.Context()
+	srv, err := buffer.NewServer(ctx, buffer.ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 2 * time.Millisecond,
+	})
 	if err != nil {
-		return ""
+		t.Fatalf("failed to create WAL buffer server: %v", err)
 	}
-	return strings.TrimSpace(string(out))
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterWalBufferServer(grpcServer, srv)
+
+	go func() {
+		_ = grpcServer.Serve(ln)
+	}()
+
+	return srv, grpcServer
+}
+
+func startFakeS3(t *testing.T, bucket string) string {
+	t.Helper()
+
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not found on PATH; cannot build fakes3 for WAL S3 test")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	fakes3Dir := filepath.Join(filepath.Dir(thisFile), "..", "..", "fakes3")
+	if _, err := os.Stat(filepath.Join(fakes3Dir, "go.mod")); err != nil {
+		t.Fatalf("fakes3 module not found at %s: %v", fakes3Dir, err)
+	}
+
+	bin := filepath.Join(t.TempDir(), "fakes3")
+	build := exec.Command(goBin, "build", "-o", bin, "./cmd/fakes3")
+	build.Dir = fakes3Dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building fakes3: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(bin, "--listen=127.0.0.1:0", "--buckets="+bucket, "--quiet")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting fakes3: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	addrCh := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if _, addr, found := strings.Cut(line, "listening on "); found {
+				addrCh <- strings.TrimSpace(addr)
+				return
+			}
+		}
+		addrCh <- ""
+	}()
+	var endpoint string
+	select {
+	case endpoint = <-addrCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for fakes3 to report its address")
+	}
+	if endpoint == "" {
+		t.Fatal("fakes3 exited before reporting its address")
+	}
+
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
+		t.Setenv("AWS_ACCESS_KEY_ID", "fakes3")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "fakes3")
+	}
+	return endpoint
 }
 
 func TestWALE2E(t *testing.T) {
@@ -42,192 +135,145 @@ func TestWALE2E(t *testing.T) {
 		t.Skip("Skipping WAL E2E test; RUN_E2E not set")
 	}
 
-	h := NewHarness(t, "wal-e2e")
-	h.Setup()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
 
-	gitRoot := h.GetGitRoot()
-	experimentRoot := gitRoot
-
-	// Build images
-	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
-	h.DockerBuild("wal-client-test:e2e", filepath.Join(experimentRoot, "images/wal-client-test/Dockerfile"), experimentRoot)
-
-	// Load images into Kind
-	h.KindLoad("wal-buffer:e2e")
-	h.KindLoad("wal-client-test:e2e")
-
-	// Read and adapt manifest to use hostPath for store directory to verify durability across pod restart
-	manifestPath := filepath.Join(experimentRoot, "k8s/wal.yaml")
-	b, err := os.ReadFile(manifestPath)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("Failed to read manifest: %v", err)
+		t.Fatalf("failed to listen: %v", err)
 	}
-	manifest := string(b)
-	manifest = strings.ReplaceAll(manifest, "namespace: kube-objectfs-system", "namespace: default")
-	manifest = strings.ReplaceAll(manifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
+	addr := ln.Addr().String()
 
-	// Replace store-dir emptyDir with a hostPath volume
-	manifest = strings.ReplaceAll(manifest, "- name: store-dir\n          emptyDir: {}", `- name: store-dir
-          hostPath:
-            path: /tmp/wal-store-e2e
-            type: DirectoryOrCreate`)
+	srv1, grpcServer1 := startBufferServerOnListener(t, backend, dataDir, ln)
 
-	// Apply WAL buffer manifests
-	h.KubectlApplyContent("wal", manifest)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
 
-	// Wait for wal-buffer StatefulSet
-	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("WAL buffer failed to start: %v", err)
+	// Step 1: Open stream 1 and append 10 records with witness ack
+	clientDir1 := t.TempDir()
+	streamID1 := uuid.New()
+	stream1, err := client.Open(ctx, clientDir1, streamID1, addr)
+	if err != nil {
+		t.Fatalf("open stream 1 failed: %v", err)
+	}
+	defer stream1.Close()
+
+	for i := 1; i <= 10; i++ {
+		payload := []byte(fmt.Sprintf("wal-record-%s-%d", streamID1.String(), i))
+		seq, err := stream1.Append(ctx, payload)
+		if err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+		if err := stream1.Wait(ctx, seq, client.Witness, false); err != nil {
+			t.Fatalf("wait %d failed: %v", i, err)
+		}
 	}
 
-	streamID1 := uuid.New().String()
+	// Step 2: Stop buffer server abruptly to test restart resilience
+	t.Logf("Stopping WAL buffer server (simulating pod crash/restart)")
+	grpcServer1.Stop()
+	_ = srv1.Close()
+	_ = ln.Close()
 
-	// Step 1: Run Client Pod 1 appending 10 records with witness ack and holding stream open across buffer restart
-	clientPod1Yaml := fmt.Sprintf(`
-apiVersion: v1
-kind: Pod
-metadata:
-  name: wal-client-1
-spec:
-  restartPolicy: Never
-  containers:
-    - name: client
-      image: wal-client-test:e2e
-      imagePullPolicy: Never
-      args:
-        - "append"
-        - "--dir=/data/wal"
-        - "--stream-id=%s"
-        - "--target=wal-buffer:50051"
-        - "--count=10"
-        - "--wait-level=witness"
-        - "--hold-open=60s"
-      volumeMounts:
-        - name: wal-data
-          mountPath: /data/wal
-  volumes:
-    - name: wal-data
-      emptyDir: {}
-`, streamID1)
+	// Rebind to the exact same TCP address
+	ln2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to re-listen on %s: %v", addr, err)
+	}
+	srv2, grpcServer2 := startBufferServerOnListener(t, backend, dataDir, ln2)
+	defer func() {
+		grpcServer2.Stop()
+		_ = srv2.Close()
+		_ = ln2.Close()
+	}()
 
-	t.Logf("Creating Client Pod 1")
-	h.KubectlApplyContent("wal-client-1", clientPod1Yaml)
+	// Wait for stream1 to reconnect and confirm durability after restart
+	if err := stream1.Wait(ctx, 10, client.Witness, false); err != nil {
+		t.Fatalf("failed waiting for stream 1 after buffer restart: %v", err)
+	}
 
-	// Wait for Client 1 to start and perform initial appends
-	time.Sleep(5 * time.Second)
+	// Step 3: Open stream 2 and append 10 records with permanent ack and flush
+	clientDir2 := t.TempDir()
+	streamID2 := uuid.New()
+	stream2, err := client.Open(ctx, clientDir2, streamID2, addr)
+	if err != nil {
+		t.Fatalf("open stream 2 failed: %v", err)
+	}
+	defer stream2.Close()
 
-	// Step 2: Delete buffer pod wal-buffer-0 while Client 1 is still running
-	oldBufferUID := getPodUID("wal-buffer-0", "default")
-	t.Logf("Deleting WAL buffer pod (old UID=%s) to test restart resilience with surviving client", oldBufferUID)
-	h.DeletePod("wal-buffer-0", "default")
+	for i := 1; i <= 10; i++ {
+		payload := []byte(fmt.Sprintf("wal-record-%s-%d", streamID2.String(), i))
+		seq, err := stream2.Append(ctx, payload)
+		if err != nil {
+			t.Fatalf("append stream 2 record %d failed: %v", i, err)
+		}
+		if err := stream2.Wait(ctx, seq, client.Permanent, true); err != nil {
+			t.Fatalf("wait stream 2 record %d failed: %v", i, err)
+		}
+	}
 
-	// Wait for old buffer pod UID to disappear before waiting on readiness
-	deadline := time.Now().Add(1 * time.Minute)
-	for time.Now().Before(deadline) {
-		currentUID := getPodUID("wal-buffer-0", "default")
-		if currentUID != "" && currentUID != oldBufferUID {
+	if err := stream2.Flush(ctx); err != nil {
+		t.Fatalf("flush stream 2 failed: %v", err)
+	}
+
+	// Step 4: Verify merged tail of all 20 records
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial %s failed: %v", addr, err)
+	}
+	defer conn.Close()
+
+	walClient := pb.NewWalBufferClient(conn)
+	tailStream, err := walClient.Tail(ctx, &pb.TailRequest{FromPosition: 1})
+	if err != nil {
+		t.Fatalf("tail RPC failed: %v", err)
+	}
+
+	var lastPos uint64
+	for i := 1; i <= 20; i++ {
+		resp, err := tailStream.Recv()
+		if err != nil {
+			t.Fatalf("tail recv record %d failed: %v", i, err)
+		}
+		rec := resp.GetRecord()
+		if rec == nil {
+			t.Fatalf("nil record in tail response %d", i)
+		}
+		if rec.Position <= lastPos {
+			t.Fatalf("position out of order: prev=%d, curr=%d", lastPos, rec.Position)
+		}
+		lastPos = rec.Position
+	}
+
+	// Step 5: Verify per-stream tail for stream 1 starting from from_stream_seq=5 (expect seqs 6..10)
+	stream1Iter, err := client.TailStream(ctx, addr, streamID1, 5)
+	if err != nil {
+		t.Fatalf("TailStream failed: %v", err)
+	}
+
+	var receivedSeqs []uint64
+	for seq, payload := range stream1Iter {
+		receivedSeqs = append(receivedSeqs, seq)
+		expectedPayload := fmt.Sprintf("wal-record-%s-%d", streamID1.String(), seq)
+		if string(payload) != expectedPayload {
+			t.Errorf("expected payload %s, got %s", expectedPayload, string(payload))
+		}
+		if seq == 10 {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
 	}
 
-	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
-		t.Fatalf("Recreated WAL buffer failed to start: %v", err)
+	expectedSeqs := []uint64{6, 7, 8, 9, 10}
+	if len(receivedSeqs) != len(expectedSeqs) {
+		t.Fatalf("expected seqs %v, got %v", expectedSeqs, receivedSeqs)
+	}
+	for i, seq := range receivedSeqs {
+		if seq != expectedSeqs[i] {
+			t.Errorf("index %d: expected seq %d, got %d", i, expectedSeqs[i], seq)
+		}
 	}
 
-	// Wait for Client 1 pod to finish holding open
-	if err := waitForPodCompletion(h, "wal-client-1", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Logf("Buffer Logs:\n%s\n", h.GetPodLogsByName("wal-buffer-0", "default"))
-		t.Fatalf("Client Pod 1 failed: %v", err)
-	}
-
-	logs1 := h.GetPodLogsByName("wal-client-1", "default")
-	t.Logf("Client 1 Logs: %s", logs1)
-	if !strings.Contains(logs1, "SUCCESS") {
-		t.Fatalf("Client 1 did not report SUCCESS: %s", logs1)
-	}
-	h.DeletePod("wal-client-1", "default")
-
-	// Step 3: Run Client Pod 2 appending 10 more records with permanent ack
-	streamID2 := uuid.New().String()
-	clientPod2Yaml := fmt.Sprintf(`
-apiVersion: v1
-kind: Pod
-metadata:
-  name: wal-client-2
-spec:
-  restartPolicy: Never
-  containers:
-    - name: client
-      image: wal-client-test:e2e
-      imagePullPolicy: Never
-      args:
-        - "append"
-        - "--dir=/data/wal"
-        - "--stream-id=%s"
-        - "--target=wal-buffer:50051"
-        - "--count=10"
-        - "--wait-level=permanent"
-        - "--flush"
-      volumeMounts:
-        - name: wal-data
-          mountPath: /data/wal
-  volumes:
-    - name: wal-data
-      emptyDir: {}
-`, streamID2)
-
-	t.Logf("Creating Client Pod 2")
-	h.KubectlApplyContent("wal-client-2", clientPod2Yaml)
-
-	if err := waitForPodCompletion(h, "wal-client-2", "default", 2*time.Minute); err != nil {
-		t.Logf("Buffer Logs:\n%s\n", h.GetPodLogsByName("wal-buffer-0", "default"))
-		t.Fatalf("Client Pod 2 failed: %v", err)
-	}
-
-	logs2 := h.GetPodLogsByName("wal-client-2", "default")
-	t.Logf("Client 2 Logs: %s", logs2)
-	if !strings.Contains(logs2, "SUCCESS") {
-		t.Fatalf("Client 2 did not report SUCCESS: %s", logs2)
-	}
-	h.DeletePod("wal-client-2", "default")
-
-	// Step 4: Run Tail Pod to verify records from Client 1 (replayed after restart) and Client 2 appear
-	tailPodYaml := `
-apiVersion: v1
-kind: Pod
-metadata:
-  name: wal-tail
-spec:
-  restartPolicy: Never
-  containers:
-    - name: tail
-      image: wal-client-test:e2e
-      imagePullPolicy: Never
-      args:
-        - "tail"
-        - "--target=wal-buffer:50051"
-        - "--from-pos=1"
-        - "--count=20"
-`
-	t.Logf("Running Tail verification pod")
-	h.KubectlApplyContent("wal-tail", tailPodYaml)
-
-	if err := waitForPodCompletion(h, "wal-tail", "default", 2*time.Minute); err != nil {
-		t.Logf("Tail Pod Logs:\n%s\n", h.GetPodLogsByName("wal-tail", "default"))
-		t.Fatalf("Tail verification pod failed: %v", err)
-	}
-
-	tailLogs := h.GetPodLogsByName("wal-tail", "default")
-	t.Logf("Tail Logs: %s", tailLogs)
-	if !strings.Contains(tailLogs, "SUCCESS") {
-		t.Fatalf("Tail did not succeed: %s", tailLogs)
-	}
-
-	h.DeletePod("wal-tail", "default")
-	t.Logf("Successfully verified WAL E2E with buffer restart and replay!")
+	t.Logf("Successfully verified WAL E2E with in-process components, buffer restart, replay, and per-stream tail!")
 }
 
 func TestWALS3E2E(t *testing.T) {
@@ -235,274 +281,155 @@ func TestWALS3E2E(t *testing.T) {
 		t.Skip("Skipping WAL S3 E2E test; RUN_E2E not set")
 	}
 
-	h := NewHarness(t, "wal-s3-e2e")
-	h.Setup()
+	endpoint := startFakeS3(t, "wal-bucket")
 
-	gitRoot := h.GetGitRoot()
-	experimentRoot := gitRoot
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
 
-	// Build images
-	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
-	h.DockerBuild("wal-client-test:e2e", filepath.Join(experimentRoot, "images/wal-client-test/Dockerfile"), experimentRoot)
-	// fakes3 is its own module; its image builds from that directory.
-	fakes3Root := filepath.Join(gitRoot, "fakes3")
-	h.DockerBuild("fakes3:e2e", filepath.Join(fakes3Root, "images/fakes3/Dockerfile"), fakes3Root)
-
-	// Load images into Kind
-	h.KindLoad("wal-buffer:e2e")
-	h.KindLoad("wal-client-test:e2e")
-	h.KindLoad("fakes3:e2e")
-
-	// 1. Deploy fakes3 (in-memory S3 API) in Kind with the bucket pre-created
-	fakes3Yaml := `
-apiVersion: v1
-kind: Service
-metadata:
-  name: fakes3
-  namespace: default
-spec:
-  selector:
-    app: fakes3
-  ports:
-    - port: 9000
-      targetPort: 9000
-      name: s3
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: fakes3
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: fakes3
-  template:
-    metadata:
-      labels:
-        app: fakes3
-    spec:
-      containers:
-        - name: fakes3
-          image: fakes3:e2e
-          imagePullPolicy: Never
-          args:
-            - "--listen=:9000"
-            - "--buckets=wal-bucket"
-          ports:
-            - containerPort: 9000
-              name: s3
-          readinessProbe:
-            httpGet:
-              path: /
-              port: 9000
-`
-	h.KubectlApplyContent("fakes3", fakes3Yaml)
-	if err := h.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("fakes3 deployment failed to start: %v", err)
+	s3Backend, err := s3storage.New(ctx, s3storage.Config{
+		Bucket:       "wal-bucket",
+		Endpoint:     endpoint,
+		UsePathStyle: true,
+		Region:       "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create s3 storage backend: %v", err)
 	}
 
-	// 2. Deploy WAL Buffer configured with S3 backend pointing to fakes3
-	walBufferS3Yaml := `
-apiVersion: v1
-kind: Service
-metadata:
-  name: wal-buffer
-  namespace: default
-spec:
-  clusterIP: None
-  selector:
-    app: wal-buffer
-  ports:
-    - port: 50051
-      targetPort: 50051
-      name: grpc
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: wal-buffer
-  namespace: default
-spec:
-  serviceName: wal-buffer
-  replicas: 1
-  selector:
-    matchLabels:
-      app: wal-buffer
-  template:
-    metadata:
-      labels:
-        app: wal-buffer
-    spec:
-      containers:
-        - name: wal-buffer
-          image: wal-buffer:e2e
-          imagePullPolicy: Never
-          args:
-            - "--v=5"
-            - "--port=50051"
-            - "--data-dir=/data"
-            - "--backend=s3://wal-bucket/e2e?endpoint=http://fakes3:9000&region=us-east-1"
-          env:
-            - name: AWS_ACCESS_KEY_ID
-              value: "fakes3"
-            - name: AWS_SECRET_ACCESS_KEY
-              value: "fakes3"
-            - name: AWS_REGION
-              value: "us-east-1"
-          ports:
-            - containerPort: 50051
-              name: grpc
-          volumeMounts:
-            - name: data-dir
-              mountPath: /data
-      volumes:
-        - name: data-dir
-          emptyDir: {}
-`
-	h.KubectlApplyContent("wal-s3", walBufferS3Yaml)
-	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("WAL buffer S3 failed to start: %v", err)
+	dataDir := t.TempDir()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	addr := ln.Addr().String()
+
+	srv1, grpcServer1 := startBufferServerOnListener(t, s3Backend, dataDir, ln)
+
+	// Step 1: Open stream 1 and append 10 records
+	clientDir1 := t.TempDir()
+	streamID1 := uuid.New()
+	stream1, err := client.Open(ctx, clientDir1, streamID1, addr)
+	if err != nil {
+		t.Fatalf("open stream 1 failed: %v", err)
+	}
+	defer stream1.Close()
+
+	for i := 1; i <= 10; i++ {
+		payload := []byte(fmt.Sprintf("wal-record-%s-%d", streamID1.String(), i))
+		seq, err := stream1.Append(ctx, payload)
+		if err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+		if err := stream1.Wait(ctx, seq, client.Witness, false); err != nil {
+			t.Fatalf("wait %d failed: %v", i, err)
+		}
 	}
 
-	// 4. Run Client 1 appending records
-	streamID1 := uuid.New().String()
-	clientPod1Yaml := fmt.Sprintf(`
-apiVersion: v1
-kind: Pod
-metadata:
-  name: wal-client-s3-1
-spec:
-  restartPolicy: Never
-  containers:
-    - name: client
-      image: wal-client-test:e2e
-      imagePullPolicy: Never
-      args:
-        - "append"
-        - "--dir=/data/wal"
-        - "--stream-id=%s"
-        - "--target=wal-buffer:50051"
-        - "--count=10"
-        - "--wait-level=witness"
-        - "--hold-open=60s"
-      volumeMounts:
-        - name: wal-data
-          mountPath: /data/wal
-  volumes:
-    - name: wal-data
-      emptyDir: {}
-`, streamID1)
+	// Step 2: Stop buffer server abruptly and restart pointing to same S3 backend and dataDir
+	t.Logf("Stopping WAL buffer server with S3 backend")
+	grpcServer1.Stop()
+	_ = srv1.Close()
+	_ = ln.Close()
 
-	h.KubectlApplyContent("wal-client-s3-1", clientPod1Yaml)
-	time.Sleep(5 * time.Second)
+	ln2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to re-listen on %s: %v", addr, err)
+	}
+	srv2, grpcServer2 := startBufferServerOnListener(t, s3Backend, dataDir, ln2)
+	defer func() {
+		grpcServer2.Stop()
+		_ = srv2.Close()
+		_ = ln2.Close()
+	}()
 
-	// Step 5: Delete buffer pod to test restart with S3 backend
-	oldBufferUID := getPodUID("wal-buffer-0", "default")
-	t.Logf("Deleting WAL buffer pod (old UID=%s) with S3 backend", oldBufferUID)
-	h.DeletePod("wal-buffer-0", "default")
+	if err := stream1.Wait(ctx, 10, client.Witness, false); err != nil {
+		t.Fatalf("failed waiting for stream 1 after S3 buffer restart: %v", err)
+	}
 
-	deadline := time.Now().Add(1 * time.Minute)
-	for time.Now().Before(deadline) {
-		currentUID := getPodUID("wal-buffer-0", "default")
-		if currentUID != "" && currentUID != oldBufferUID {
+	// Step 3: Open stream 2 and append 10 records with permanent flush
+	clientDir2 := t.TempDir()
+	streamID2 := uuid.New()
+	stream2, err := client.Open(ctx, clientDir2, streamID2, addr)
+	if err != nil {
+		t.Fatalf("open stream 2 failed: %v", err)
+	}
+	defer stream2.Close()
+
+	for i := 1; i <= 10; i++ {
+		payload := []byte(fmt.Sprintf("wal-record-%s-%d", streamID2.String(), i))
+		seq, err := stream2.Append(ctx, payload)
+		if err != nil {
+			t.Fatalf("append stream 2 record %d failed: %v", i, err)
+		}
+		if err := stream2.Wait(ctx, seq, client.Permanent, true); err != nil {
+			t.Fatalf("wait stream 2 record %d failed: %v", i, err)
+		}
+	}
+
+	if err := stream2.Flush(ctx); err != nil {
+		t.Fatalf("flush stream 2 failed: %v", err)
+	}
+
+	// Step 4: Verify merged tail
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial %s failed: %v", addr, err)
+	}
+	defer conn.Close()
+
+	walClient := pb.NewWalBufferClient(conn)
+	tailStream, err := walClient.Tail(ctx, &pb.TailRequest{FromPosition: 1})
+	if err != nil {
+		t.Fatalf("tail RPC failed: %v", err)
+	}
+
+	var lastPos uint64
+	for i := 1; i <= 20; i++ {
+		resp, err := tailStream.Recv()
+		if err != nil {
+			t.Fatalf("tail recv record %d failed: %v", i, err)
+		}
+		rec := resp.GetRecord()
+		if rec == nil {
+			t.Fatalf("nil record in tail response %d", i)
+		}
+		if rec.Position <= lastPos {
+			t.Fatalf("position out of order: prev=%d, curr=%d", lastPos, rec.Position)
+		}
+		lastPos = rec.Position
+	}
+
+	// Step 5: Verify per-stream tail for stream 1 and stream 2
+	stream1Iter, err := client.TailStream(ctx, addr, streamID1, 5)
+	if err != nil {
+		t.Fatalf("TailStream 1 failed: %v", err)
+	}
+	var s1Seqs []uint64
+	for seq := range stream1Iter {
+		s1Seqs = append(s1Seqs, seq)
+		if seq == 10 {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+	}
+	if len(s1Seqs) != 5 {
+		t.Fatalf("expected 5 records for stream 1 tail, got %v", s1Seqs)
 	}
 
-	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
-		t.Fatalf("Recreated WAL buffer failed to start: %v", err)
+	stream2Iter, err := client.TailStream(ctx, addr, streamID2, 0)
+	if err != nil {
+		t.Fatalf("TailStream 2 failed: %v", err)
 	}
-
-	if err := waitForPodCompletion(h, "wal-client-s3-1", "default", 2*time.Minute); err != nil {
-		t.Logf("Buffer Logs:\n%s\n", h.GetPodLogsByName("wal-buffer-0", "default"))
-		t.Fatalf("Client Pod 1 S3 failed: %v", err)
-	}
-	h.DeletePod("wal-client-s3-1", "default")
-
-	// Step 6: Run Client 2 appending 10 records with permanent ack
-	streamID2 := uuid.New().String()
-	clientPod2Yaml := fmt.Sprintf(`
-apiVersion: v1
-kind: Pod
-metadata:
-  name: wal-client-s3-2
-spec:
-  restartPolicy: Never
-  containers:
-    - name: client
-      image: wal-client-test:e2e
-      imagePullPolicy: Never
-      args:
-        - "append"
-        - "--dir=/data/wal"
-        - "--stream-id=%s"
-        - "--target=wal-buffer:50051"
-        - "--count=10"
-        - "--wait-level=permanent"
-        - "--flush"
-      volumeMounts:
-        - name: wal-data
-          mountPath: /data/wal
-  volumes:
-    - name: wal-data
-      emptyDir: {}
-`, streamID2)
-
-	h.KubectlApplyContent("wal-client-s3-2", clientPod2Yaml)
-	if err := waitForPodCompletion(h, "wal-client-s3-2", "default", 2*time.Minute); err != nil {
-		t.Logf("Buffer Logs:\n%s\n", h.GetPodLogsByName("wal-buffer-0", "default"))
-		t.Fatalf("Client Pod 2 S3 failed: %v", err)
-	}
-	h.DeletePod("wal-client-s3-2", "default")
-
-	// Step 7: Verify all 20 records with Tail pod
-	tailPodYaml := `
-apiVersion: v1
-kind: Pod
-metadata:
-  name: wal-tail-s3
-spec:
-  restartPolicy: Never
-  containers:
-    - name: tail
-      image: wal-client-test:e2e
-      imagePullPolicy: Never
-      args:
-        - "tail"
-        - "--target=wal-buffer:50051"
-        - "--from-pos=1"
-        - "--count=20"
-`
-	h.KubectlApplyContent("wal-tail-s3", tailPodYaml)
-	if err := waitForPodCompletion(h, "wal-tail-s3", "default", 2*time.Minute); err != nil {
-		t.Logf("Tail Pod Logs:\n%s\n", h.GetPodLogsByName("wal-tail-s3", "default"))
-		t.Fatalf("Tail verification pod S3 failed: %v", err)
-	}
-
-	tailLogs := h.GetPodLogsByName("wal-tail-s3", "default")
-	if !strings.Contains(tailLogs, "SUCCESS") {
-		t.Fatalf("Tail S3 did not succeed: %s", tailLogs)
-	}
-	h.DeletePod("wal-tail-s3", "default")
-	t.Logf("Successfully verified WAL E2E with S3 (fakes3) backend!")
-}
-
-func waitForPodCompletion(h *Harness, podName, namespace string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		phase := getPodPhase(podName, namespace)
-		if phase == "Succeeded" {
-			return nil
+	var s2Seqs []uint64
+	for seq := range stream2Iter {
+		s2Seqs = append(s2Seqs, seq)
+		if seq == 10 {
+			break
 		}
-		if phase == "Failed" {
-			return fmt.Errorf("pod %s failed", podName)
-		}
-		time.Sleep(1 * time.Second)
 	}
-	return fmt.Errorf("timeout waiting for pod %s completion", podName)
+	if len(s2Seqs) != 10 {
+		t.Fatalf("expected 10 records for stream 2 tail, got %v", s2Seqs)
+	}
+
+	t.Logf("Successfully verified WAL E2E with in-process S3 (fakes3) backend!")
 }

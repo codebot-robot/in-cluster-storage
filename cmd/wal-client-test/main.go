@@ -31,25 +31,30 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: wal-client-test <append|tail> [flags]")
-		os.Exit(1)
-	}
-
-	cmd := os.Args[1]
-	switch cmd {
-	case "append":
-		runAppend(os.Args[2:])
-	case "tail":
-		runTail(os.Args[2:])
-	default:
-		fmt.Printf("Unknown command: %s\n", cmd)
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runAppend(args []string) {
-	fs := flag.NewFlagSet("append", flag.ExitOnError)
+func run(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: wal-client-test <append|tail> [flags]")
+	}
+
+	cmd := args[0]
+	switch cmd {
+	case "append":
+		return runAppend(args[1:])
+	case "tail":
+		return runTail(args[1:])
+	default:
+		return fmt.Errorf("unknown command: %s", cmd)
+	}
+}
+
+func runAppend(args []string) error {
+	fs := flag.NewFlagSet("append", flag.ContinueOnError)
 	dir := fs.String("dir", "/data/wal", "Local WAL directory")
 	streamIDStr := fs.String("stream-id", "", "Stream UUID")
 	target := fs.String("target", "wal-buffer:50051", "WAL buffer service target")
@@ -57,15 +62,16 @@ func runAppend(args []string) {
 	waitLevelStr := fs.String("wait-level", "witness", "Durability level to wait for (local, witness, permanent)")
 	doFlush := fs.Bool("flush", false, "Whether to call Flush to permanent storage at the end")
 	holdOpen := fs.Duration("hold-open", 0, "Duration to hold stream open before exiting")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	var streamID uuid.UUID
 	var err error
 	if *streamIDStr != "" {
 		streamID, err = uuid.Parse(*streamIDStr)
 		if err != nil {
-			fmt.Printf("invalid stream-id %q: %v\n", *streamIDStr, err)
-			os.Exit(1)
+			return fmt.Errorf("invalid stream-id %q: %w", *streamIDStr, err)
 		}
 	} else {
 		streamID = uuid.New()
@@ -82,8 +88,7 @@ func runAppend(args []string) {
 		waitLevel = client.Permanent
 		requestFlush = true
 	default:
-		fmt.Printf("invalid wait-level %q\n", *waitLevelStr)
-		os.Exit(1)
+		return fmt.Errorf("invalid wait-level %q", *waitLevelStr)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -91,8 +96,7 @@ func runAppend(args []string) {
 
 	stream, err := client.Open(ctx, *dir, streamID, *target)
 	if err != nil {
-		fmt.Printf("Failed to open stream: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to open stream: %w", err)
 	}
 	defer stream.Close()
 
@@ -100,20 +104,17 @@ func runAppend(args []string) {
 		payload := []byte(fmt.Sprintf("wal-record-%s-%d", streamID.String(), i))
 		seq, err := stream.Append(ctx, payload)
 		if err != nil {
-			fmt.Printf("Append error on record %d: %v\n", i, err)
-			os.Exit(1)
+			return fmt.Errorf("append error on record %d: %w", i, err)
 		}
 
 		if err := stream.Wait(ctx, seq, waitLevel, requestFlush); err != nil {
-			fmt.Printf("Wait error on record %d: %v\n", i, err)
-			os.Exit(1)
+			return fmt.Errorf("wait error on record %d: %w", i, err)
 		}
 	}
 
 	if *doFlush {
 		if err := stream.Flush(ctx); err != nil {
-			fmt.Printf("Flush error: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("flush error: %w", err)
 		}
 	}
 
@@ -124,45 +125,69 @@ func runAppend(args []string) {
 
 	local, witness, permanent := stream.Watermarks()
 	fmt.Printf("SUCCESS stream_id=%s count=%d local=%d witness=%d permanent=%d\n", streamID.String(), *count, local, witness, permanent)
+	return nil
 }
 
-func runTail(args []string) {
-	fs := flag.NewFlagSet("tail", flag.ExitOnError)
+func runTail(args []string) error {
+	fs := flag.NewFlagSet("tail", flag.ContinueOnError)
 	target := fs.String("target", "wal-buffer:50051", "WAL buffer service target")
 	fromPos := fs.Uint64("from-pos", 1, "Starting position")
+	streamIDStr := fs.String("stream-id", "", "Optional stream UUID to filter")
+	fromSeq := fs.Uint64("from-seq", 0, "Optional stream_seq lower bound (with stream-id)")
 	count := fs.Int("count", 10, "Number of records to read")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	var streamIDBytes []byte
+	if *streamIDStr != "" {
+		sid, err := uuid.Parse(*streamIDStr)
+		if err != nil {
+			return fmt.Errorf("invalid stream-id %q: %w", *streamIDStr, err)
+		}
+		streamIDBytes = sid[:]
+	}
+
 	conn, err := grpc.NewClient(*target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		fmt.Printf("Failed to dial target %s: %v\n", *target, err)
-		os.Exit(1)
+		return fmt.Errorf("failed to dial target %s: %w", *target, err)
 	}
 	defer conn.Close()
 
 	walClient := pb.NewWalBufferClient(conn)
-	tailStream, err := walClient.Tail(ctx, &pb.TailRequest{FromPosition: *fromPos})
+	tailStream, err := walClient.Tail(ctx, &pb.TailRequest{
+		FromPosition:  *fromPos,
+		StreamId:      streamIDBytes,
+		FromStreamSeq: *fromSeq,
+	})
 	if err != nil {
-		fmt.Printf("Tail RPC error: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("tail RPC error: %w", err)
 	}
 
 	var lastPos uint64 = 0
+	var lastSeq uint64 = 0
 	for i := 1; i <= *count; i++ {
 		resp, err := tailStream.Recv()
 		if err != nil {
-			fmt.Printf("Tail recv error on record %d: %v\n", i, err)
-			os.Exit(1)
+			return fmt.Errorf("tail recv error on record %d: %w", i, err)
 		}
-		if resp.Record.Position <= lastPos {
-			fmt.Printf("Invalid order: prev=%d, curr=%d\n", lastPos, resp.Record.Position)
-			os.Exit(1)
+		rec := resp.GetRecord()
+		if rec == nil {
+			continue
 		}
-		lastPos = resp.Record.Position
+		if rec.Position <= lastPos {
+			return fmt.Errorf("invalid position order: prev=%d, curr=%d", lastPos, rec.Position)
+		}
+		if len(streamIDBytes) > 0 && rec.StreamSeq <= lastSeq {
+			return fmt.Errorf("invalid stream_seq order: prev=%d, curr=%d", lastSeq, rec.StreamSeq)
+		}
+		lastPos = rec.Position
+		lastSeq = rec.StreamSeq
 	}
 
-	fmt.Printf("SUCCESS tailed=%d last_position=%d\n", *count, lastPos)
+	fmt.Printf("SUCCESS tailed=%d last_position=%d last_seq=%d\n", *count, lastPos, lastSeq)
+	return nil
 }
