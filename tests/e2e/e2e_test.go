@@ -247,7 +247,10 @@ spec:
 	t.Logf("Pod 4 deleted")
 
 	// Verify snapshot has file1.txt and file2.txt
-	snap1 := getLatestSnapshot(t, h, incVolumeID)
+	snap1, err := getLatestSnapshot(h, incVolumeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot 1: %v", err)
+	}
 	t.Logf("Snapshot 1: %v", snap1)
 	if len(snap1.Files) != 2 {
 		t.Fatalf("Expected 2 files in initial snapshot, got %d", len(snap1.Files))
@@ -316,7 +319,10 @@ spec:
 	t.Logf("Pod 5 deleted")
 
 	// Verify second snapshot
-	snap2 := getLatestSnapshot(t, h, incVolumeID)
+	snap2, err := getLatestSnapshot(h, incVolumeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot 2: %v", err)
+	}
 	t.Logf("Snapshot 2: %v", snap2)
 
 	// It should have exactly file2.txt and file3.txt, but NOT file1.txt (which was deleted)
@@ -579,7 +585,7 @@ spec:
 	t.Logf("Successfully verified EROFS layers stacking, client-side dynamic flattening, and full correctness!")
 }
 
-func tryGetLatestSnapshot(h *Harness, volumeID string) (*pb.SnapshotMetadata, error) {
+func getLatestSnapshot(h *Harness, volumeID string) (*pb.SnapshotMetadata, error) {
 	out, err := h.RunInPod("agentfs-controller-0", "default", "base64", filepath.Join("/data/snapshots", volumeID, "latest.pb"))
 	if err != nil {
 		return nil, err
@@ -600,7 +606,7 @@ func waitForSnapshotLayers(t *testing.T, h *Harness, volumeID string, expectedCo
 	t.Helper()
 	start := time.Now()
 	for {
-		snap, err := tryGetLatestSnapshot(h, volumeID)
+		snap, err := getLatestSnapshot(h, volumeID)
 		if err == nil && snap != nil && len(snap.ErofsLayers) == expectedCount {
 			return snap
 		}
@@ -610,12 +616,4 @@ func waitForSnapshotLayers(t *testing.T, h *Harness, volumeID string, expectedCo
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-}
-
-func getLatestSnapshot(t *testing.T, h *Harness, volumeID string) *pb.SnapshotMetadata {
-	snap, err := tryGetLatestSnapshot(h, volumeID)
-	if err != nil {
-		t.Fatalf("Failed to get snapshot from controller: %v", err)
-	}
-	return snap
 }

@@ -307,7 +307,7 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 	// Persist logical volume ID to volume directory so it survives daemon restarts
 	volumeIDFile := filepath.Join(volumeDir, "volume_id")
 	if err := os.WriteFile(volumeIDFile, []byte(logicalVolumeID), 0644); err != nil {
-		klog.Warningf("failed to write volume_id file at %s: %v", volumeIDFile, err)
+		return nil, fmt.Errorf("failed to write volume_id file at %s: %w", volumeIDFile, err)
 	}
 
 	// Pull snapshot from controller to lower directory
@@ -488,9 +488,14 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 		lowerPath := filepath.Join(*storagePath, k8sVolumeID, "lower")
 		if err := syscall.Unmount(lowerPath, 0); err != nil {
 			if err == syscall.EBUSY {
-				_ = syscall.Unmount(lowerPath, syscall.MNT_DETACH)
+				klog.Warningf("Lower path %s busy, attempting lazy unmount (MNT_DETACH)", lowerPath)
+				if detachErr := syscall.Unmount(lowerPath, syscall.MNT_DETACH); detachErr != nil && detachErr != syscall.EINVAL {
+					return nil, fmt.Errorf("failed to lazy unmount lower EROFS mount %s: %w", lowerPath, detachErr)
+				}
 			} else if err != syscall.EINVAL {
-				return nil, fmt.Errorf("failed to unmount lower EROFS mount %s: %v", lowerPath, err)
+				return nil, fmt.Errorf("failed to unmount lower EROFS mount %s: %w", lowerPath, err)
+			} else {
+				klog.Infof("Lower path %s not mounted (or already unmounted)", lowerPath)
 			}
 		}
 	}
@@ -501,9 +506,14 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 		for _, ld := range layerDirs {
 			if err := syscall.Unmount(ld, 0); err != nil {
 				if err == syscall.EBUSY {
-					_ = syscall.Unmount(ld, syscall.MNT_DETACH)
+					klog.Warningf("Layer mount %s busy, attempting lazy unmount (MNT_DETACH)", ld)
+					if detachErr := syscall.Unmount(ld, syscall.MNT_DETACH); detachErr != nil && detachErr != syscall.EINVAL {
+						return nil, fmt.Errorf("failed to lazy unmount EROFS layer mount %s: %w", ld, detachErr)
+					}
 				} else if err != syscall.EINVAL {
-					klog.Warningf("failed to unmount EROFS layer mount %s: %v", ld, err)
+					return nil, fmt.Errorf("failed to unmount EROFS layer mount %s: %w", ld, err)
+				} else {
+					klog.Infof("Layer mount %s not mounted (or already unmounted)", ld)
 				}
 			}
 		}
@@ -647,7 +657,8 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 
 	if d.enableEROFS {
 		if resp.Snapshot.ErofsSha256 == "" {
-			return fmt.Errorf("controller did not return an EROFS SHA256 for volume %s", volumeID)
+			klog.Infof("No EROFS image for volume %s, using empty lower path", volumeID)
+			return nil
 		}
 		volumeDir := filepath.Dir(sourcePath)
 		imagePath := filepath.Join(volumeDir, "erofs.img")
@@ -752,7 +763,7 @@ func (d *agentFSDriver) pushErofsLayersSnapshot(ctx context.Context, volumeID, v
 	var localSnapshot pb.SnapshotMetadata
 	if data, err := os.ReadFile(snapshotPBPath); err == nil {
 		if err := proto.Unmarshal(data, &localSnapshot); err != nil {
-			klog.Warningf("failed to unmarshal local snapshot metadata from %s: %v", snapshotPBPath, err)
+			return fmt.Errorf("failed to unmarshal local snapshot metadata from %s: %w", snapshotPBPath, err)
 		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("failed to read local snapshot metadata from %s: %w", snapshotPBPath, err)
@@ -886,8 +897,10 @@ func (d *agentFSDriver) pushErofsLayersSnapshot(ctx context.Context, volumeID, v
 	}
 
 	// Update local snapshot.pb on disk so retries are aware of the uploaded snapshot state
-	if snapshotData, err := proto.Marshal(snapshot); err == nil {
-		_ = os.WriteFile(snapshotPBPath, snapshotData, 0644)
+	if snapshotData, err := proto.Marshal(snapshot); err != nil {
+		return fmt.Errorf("failed to marshal snapshot metadata for caching: %w", err)
+	} else if err := os.WriteFile(snapshotPBPath, snapshotData, 0644); err != nil {
+		return fmt.Errorf("failed to write cached snapshot metadata to %s: %w", snapshotPBPath, err)
 	}
 
 	return nil

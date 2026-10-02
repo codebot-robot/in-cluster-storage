@@ -159,7 +159,15 @@ func startMockController(t *testing.T, srv *mockControllerServer) (*grpc.ClientC
 	return conn, cleanup
 }
 
+func MustRemoveFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("failed to remove file %s: %v", path, err)
+	}
+}
+
 func TestPushErofsLayersSnapshot_EmptyUpper(t *testing.T) {
+	ctx := t.Context()
 	tmpDir := t.TempDir()
 	volumeDir := filepath.Join(tmpDir, "vol-1")
 	upperDir := filepath.Join(volumeDir, "upper")
@@ -168,13 +176,14 @@ func TestPushErofsLayersSnapshot_EmptyUpper(t *testing.T) {
 	}
 
 	d := &agentFSDriver{}
-	err := d.pushErofsLayersSnapshot(context.Background(), "vol-1", volumeDir, upperDir)
+	err := d.pushErofsLayersSnapshot(ctx, "vol-1", volumeDir, upperDir)
 	if err != nil {
 		t.Fatalf("expected nil error for empty upper dir, got: %v", err)
 	}
 }
 
 func TestPushErofsLayersSnapshot_SuccessAndIdempotency(t *testing.T) {
+	ctx := t.Context()
 	mockSrv := &mockControllerServer{
 		uploadedBlobs: make(map[string][]byte),
 	}
@@ -202,7 +211,7 @@ func TestPushErofsLayersSnapshot_SuccessAndIdempotency(t *testing.T) {
 	}
 
 	// First push - should succeed
-	err := d.pushErofsLayersSnapshot(context.Background(), "vol-1", volumeDir, targetPath)
+	err := d.pushErofsLayersSnapshot(ctx, "vol-1", volumeDir, targetPath)
 	if err != nil {
 		t.Fatalf("pushErofsLayersSnapshot failed: %v", err)
 	}
@@ -218,20 +227,21 @@ func TestPushErofsLayersSnapshot_SuccessAndIdempotency(t *testing.T) {
 	}
 
 	// Case A: Unpublish retry where snapshot.pb is deleted/stale (existingLayers = []), but server already has target layers [sha]
-	_ = os.Remove(snapshotPBPath)
-	err = d.pushErofsLayersSnapshot(context.Background(), "vol-1", volumeDir, targetPath)
+	MustRemoveFile(t, snapshotPBPath)
+	err = d.pushErofsLayersSnapshot(ctx, "vol-1", volumeDir, targetPath)
 	if err != nil {
 		t.Fatalf("idempotent retry with server already matching target layers failed: %v", err)
 	}
 
 	// Case B: Subsequent call where snapshot.pb has the updated state
-	err = d.pushErofsLayersSnapshot(context.Background(), "vol-1", volumeDir, targetPath)
+	err = d.pushErofsLayersSnapshot(ctx, "vol-1", volumeDir, targetPath)
 	if err != nil {
 		t.Fatalf("idempotent retry with updated snapshot.pb failed: %v", err)
 	}
 }
 
 func TestPushErofsLayersSnapshot_OptimisticConcurrencyConflict(t *testing.T) {
+	ctx := t.Context()
 	mockSrv := &mockControllerServer{
 		latestSnapshot: &pb.SnapshotMetadata{
 			ErofsLayers: []string{"server-layer-sha-123"},
@@ -266,7 +276,7 @@ func TestPushErofsLayersSnapshot_OptimisticConcurrencyConflict(t *testing.T) {
 		controllerConn: conn,
 	}
 
-	err := d.pushErofsLayersSnapshot(context.Background(), "vol-1", volumeDir, targetPath)
+	err := d.pushErofsLayersSnapshot(ctx, "vol-1", volumeDir, targetPath)
 	if err == nil || !strings.Contains(err.Error(), "optimistic concurrency conflict") {
 		t.Fatalf("expected optimistic concurrency conflict error, got: %v", err)
 	}
