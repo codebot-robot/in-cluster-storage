@@ -311,7 +311,10 @@ spec:
 
 	// CAS CSI Driver E2E Test
 	t.Logf("[CAS TEST] Getting snapshot metadata to find SHA256 of 'test.txt'...")
-	snapInfo := getLatestSnapshot(t, h, volumeID)
+	snapInfo, err := getLatestSnapshot(h, volumeID)
+	if err != nil {
+		t.Fatalf("[CAS TEST] Failed to get snapshot from controller: %v", err)
+	}
 	var testFileSha string
 	for _, file := range snapInfo.Files {
 		if file.Path == "test.txt" {
