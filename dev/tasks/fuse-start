@@ -25,10 +25,12 @@
 # container via Docker and drops you into a shell there; the mount is only
 # visible inside that container.
 #
-# Usage: dev/tasks/fuse-start [--shell]
+# Usage: dev/tasks/fuse-start [--shell] [-- <cmd> [args...]]
 #
 #   --shell   after mounting, open an interactive shell in the mount
 #             directory instead of tailing the logs.
+#   -- <cmd>  after mounting, run the specified command in the mount directory
+#             and exit with its exit code.
 #
 # Environment overrides:
 #   OBJECTFS_VOLUME       volume ID to mount (default: dev-vol)
@@ -56,11 +58,12 @@ OBJECTFS_WRITE_MODE="${OBJECTFS_WRITE_MODE:-fsync}"
 OBJECTFS_PORT="${OBJECTFS_PORT:-50051}"
 
 OPEN_SHELL=0
-for arg in "$@"; do
-  case "${arg}" in
-    --shell) OPEN_SHELL=1 ;;
-    -h|--help) sed -n '17,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown argument: ${arg}" >&2; exit 2 ;;
+EXEC_CMD=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --shell) OPEN_SHELL=1; shift ;;
+    --) shift; EXEC_CMD=("$@"); break ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -158,6 +161,7 @@ is_mounted() {
 }
 
 cleanup() {
+  local exit_code=$?
   set +o errexit
   trap - EXIT INT TERM
   echo
@@ -192,6 +196,7 @@ cleanup() {
   fi
 
   echo "Data and logs kept in ${DEV_DIR} (delete it when you are done)."
+  exit "${exit_code}"
 }
 trap cleanup EXIT INT TERM
 
@@ -272,11 +277,18 @@ objectfs is up.
 
 EOM
 
-if [[ "${OPEN_SHELL}" == 1 ]]; then
+if [[ "${#EXEC_CMD[@]}" -gt 0 ]]; then
+  echo "Running command in ${MOUNT_DIR}..."
+  set +o errexit
+  (cd "${MOUNT_DIR}" && "${EXEC_CMD[@]}")
+  cmd_exit=$?
+  set -o errexit
+  exit "${cmd_exit}"
+elif [[ "${OPEN_SHELL}" == 1 ]]; then
   echo "Opening a shell in ${MOUNT_DIR}; exit it to unmount and stop the controller."
   echo
   set +o errexit
-  (cd "${MOUNT_DIR}" && PS1="objectfs-dev:\\w\\$ " bash --norc --noprofile -i)
+  (cd "${MOUNT_DIR}" && PS1="objectfs-dev:\w\$ " bash --norc --noprofile -i)
   set -o errexit
 else
   echo "Press Ctrl-C to unmount and stop. Tailing logs:"

@@ -344,6 +344,10 @@ func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkId
 
 	_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 
+	if chunkIdx < len(node.Chunks) && node.Chunks[chunkIdx] == "" {
+		return nil, nil
+	}
+
 	if chunkIdx < len(node.Chunks) && node.Chunks[chunkIdx] != "" {
 		if v.recoveredContent != nil {
 			if data, ok := v.recoveredContent[node.Chunks[chunkIdx]]; ok {
@@ -1637,17 +1641,27 @@ func (v *Volume) ReadFile(ctx context.Context, p string, offset, length int64) (
 			if err != nil {
 				return nil, 0, "", fmt.Errorf("failed to read chunk %d: %w", i, err)
 			}
+			chunkLen := cs
+			if int64(i+1)*cs > total {
+				chunkLen = total - int64(i)*cs
+			}
 			chunkStart := int64(i) * cs
 			rStart := offset - chunkStart
 			if rStart < 0 {
 				rStart = 0
 			}
 			rEnd := end - chunkStart
-			if rEnd > int64(len(chunkData)) {
-				rEnd = int64(len(chunkData))
+			if rEnd > chunkLen {
+				rEnd = chunkLen
 			}
-			if rStart < int64(len(chunkData)) && rEnd > rStart {
-				res.Write(chunkData[rStart:rEnd])
+			if rEnd > rStart {
+				for b := rStart; b < rEnd; b++ {
+					if b < int64(len(chunkData)) {
+						res.WriteByte(chunkData[b])
+					} else {
+						res.WriteByte(0)
+					}
+				}
 			}
 		}
 		return res.Bytes(), total, "", nil
@@ -1798,8 +1812,12 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 				}
 
 				chunkData, _ := v.readChunkLocked(ctx, node, i)
-				if int64(len(chunkData)) < wEnd {
-					newBuf := make([]byte, wEnd)
+				expectedChunkLen := cs
+				if int64(i+1)*cs > calculatedSize {
+					expectedChunkLen = calculatedSize - int64(i)*cs
+				}
+				if int64(len(chunkData)) < expectedChunkLen {
+					newBuf := make([]byte, expectedChunkLen)
 					copy(newBuf, chunkData)
 					chunkData = newBuf
 				}
@@ -2053,6 +2071,10 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 						}
 					}
 					node.Chunks = node.Chunks[:numChunks]
+				} else {
+					for len(node.Chunks) < numChunks {
+						node.Chunks = append(node.Chunks, "")
+					}
 				}
 				if numChunks > 0 {
 					lastIdx := numChunks - 1

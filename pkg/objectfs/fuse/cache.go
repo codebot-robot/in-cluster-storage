@@ -84,9 +84,17 @@ func (c *NodeCache) GetRange(path string, offset, length int64) ([]byte, bool) {
 		end = entry.Size
 	}
 
-	if len(entry.Data) > 0 && int64(len(entry.Data)) >= end {
+	if len(entry.Data) > 0 {
+		if offset >= int64(len(entry.Data)) {
+			res := make([]byte, end-offset)
+			return res, true
+		}
 		res := make([]byte, end-offset)
-		copy(res, entry.Data[offset:end])
+		copyLen := end
+		if copyLen > int64(len(entry.Data)) {
+			copyLen = int64(len(entry.Data))
+		}
+		copy(res, entry.Data[offset:copyLen])
 		return res, true
 	}
 
@@ -101,17 +109,27 @@ func (c *NodeCache) GetRange(path string, offset, length int64) ([]byte, bool) {
 			if !ok {
 				return nil, false
 			}
+			chunkLen := cs
+			if int64(i+1)*cs > entry.Size {
+				chunkLen = entry.Size - int64(i)*cs
+			}
 			chunkStart := int64(i) * cs
 			rStart := offset - chunkStart
 			if rStart < 0 {
 				rStart = 0
 			}
 			rEnd := end - chunkStart
-			if rEnd > int64(len(chunk)) {
-				rEnd = int64(len(chunk))
+			if rEnd > chunkLen {
+				rEnd = chunkLen
 			}
-			if rStart < int64(len(chunk)) && rEnd > rStart {
-				res = append(res, chunk[rStart:rEnd]...)
+			if rEnd > rStart {
+				for b := rStart; b < rEnd; b++ {
+					if b < int64(len(chunk)) {
+						res = append(res, chunk[b])
+					} else {
+						res = append(res, 0)
+					}
+				}
 			}
 		}
 		return res, true
@@ -273,6 +291,9 @@ func (c *NodeCache) WriteAt(path string, offset int64, data []byte, modTime time
 
 	oldLen := int64(len(entry.Data))
 	newNeeded := offset + int64(len(data))
+	if newNeeded < entry.Size {
+		newNeeded = entry.Size
+	}
 
 	if newNeeded > oldLen {
 		c.evictIfNeededLocked(newNeeded - oldLen)

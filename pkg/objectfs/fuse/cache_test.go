@@ -143,3 +143,25 @@ func TestNodeCacheChunkOperations(t *testing.T) {
 		t.Fatalf("Expected cache miss for range requiring missing chunk 1")
 	}
 }
+
+func TestNodeCacheSparseGetRangeAndWriteAt(t *testing.T) {
+	cache := NewNodeCache(1024 * 1024)
+
+	// Write at offset 10 with length 5 on an empty file -> creates hole of 10 zeroes
+	cache.WriteAt("/sparse.txt", 10, []byte("world"), time.Now())
+	data, ok := cache.GetRange("/sparse.txt", 0, 15)
+	if !ok {
+		t.Fatalf("GetRange failed on sparse write")
+	}
+	if len(data) != 15 {
+		t.Fatalf("Expected length 15, got %d", len(data))
+	}
+	for i := 0; i < 10; i++ {
+		if data[i] != 0 {
+			t.Fatalf("Expected zero byte at %d, got %d", i, data[i])
+		}
+	}
+	if string(data[10:]) != "world" {
+		t.Fatalf("Expected 'world' at offset 10, got %q", string(data[10:]))
+	}
+}

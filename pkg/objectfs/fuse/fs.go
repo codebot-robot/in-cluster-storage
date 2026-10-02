@@ -267,6 +267,9 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	}
 
 	if input.Valid&fuse.FATTR_SIZE != 0 {
+		if err := fs.syncFileToService(ctx, p); err != nil {
+			return grpcErrorToStatus(err)
+		}
 		fs.cache.Truncate(p, int64(input.Size), time.Now())
 		resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
 			VolumeId: fs.volumeID,
@@ -631,14 +634,15 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 		return 0, fuse.ENOENT
 	}
 
-	// If not in cache and offset > 0, load existing content into cache first
-	if _, exists := fs.cache.Get(p); !exists && input.Offset > 0 {
+	// If not in cache (or clean with no data) and offset > 0, load existing content into cache first
+	cached, exists := fs.cache.Get(p)
+	if (!exists || (cached != nil && !cached.IsDirty && len(cached.Data) == 0)) && input.Offset > 0 {
 		ctx, cancelFunc := makeContext(cancel)
 		resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
 			VolumeId: fs.volumeID,
 			Path:     p,
 			Offset:   0,
-			Size:     int64(input.Offset),
+			Size:     0,
 		})
 		cancelFunc()
 		if err == nil && resp.GetError() == 0 && len(resp.GetData()) > 0 {
