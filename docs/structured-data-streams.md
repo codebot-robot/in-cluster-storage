@@ -1,12 +1,12 @@
 # Structured Data Streams: SQL, OLTP and OLAP as Snapshots over a Stream of Proto Records
 
-> **Status:** design proposal. Nothing in this document is implemented yet. It builds on the existing Streams service ([`docs/streams.md`](streams.md)) and borrows the log-plus-snapshot pattern that ObjectFS already uses ([`docs/objectfs.md`](objectfs.md)).
+> **Status:** Architecture and design rationale document. For the normative wire format specification, see [`docs/sds-spec.md`](sds-spec.md). It builds on the existing Streams service ([`docs/streams.md`](streams.md)) and borrows the log-plus-snapshot pattern that ObjectFS already uses ([`docs/objectfs.md`](objectfs.md)).
 
 ---
 
 ## Overview
 
-A Streams stream is an ordered, durable sequence of opaque payloads. This document proposes a **structured** payload format on top of it, so that a stream becomes a **logical change log for a relational dataset**: typed records describing row inserts, updates and deletes, optionally grouped into transactions, with the schema carried in-band.
+A Streams stream is an ordered, durable sequence of opaque payloads. This design proposes a **structured** payload format on top of it, so that a stream becomes a **logical change log for a relational dataset**: typed records describing row inserts, updates and deletes, optionally grouped into transactions, with the schema carried in-band.
 
 Once the log is the source of truth, every other representation is a **projection** of it, materialized at a known stream position:
 
@@ -61,8 +61,9 @@ payload := varint(type_id) body
 | `2` | **TxCommit**: closes a multi-record transaction. | `TxCommit` |
 | `3` | **SnapshotPointer**: announces that a snapshot covering up to a position exists. | `SnapshotPointer` |
 | `4` | **Padding**: no-op. | Arbitrary bytes |
-| `5`–`15` | Reserved for the framework. | — |
-| `16`+ | Application types, defined by a preceding `TypeDefinition`. | `RowChange` wrapping the registered message (see Layer 2) |
+| `5` | **OpRecord**: relational row change (CREATE, UPDATE, DELETE). | `OpRecord` |
+| `6`–`15` | Reserved for the framework. | — |
+| `16`+ | Application types, defined by a preceding `TypeDefinition`. | Bare registered message (keyless event) |
 
 Type ids `16`–`127` cost one byte per record; ids up to `16383` cost two.
 
@@ -76,15 +77,15 @@ message TypeDefinition {
 }
 ```
 
-### Rules
+### Key Principles
 
 1. **Define before use.** A type's `TypeDefinition` precedes its first use in the same stream. This is inherent to any in-band scheme.
-2. **Ids are never reused, and redefinitions must be compatible.** A `TypeDefinition` for an id that already exists is allowed only if the new descriptors are a *compatible* evolution of the previous ones: existing field numbers keep their wire type and label, fields may be added, and fields may be removed only by reserving their numbers. Renaming a field is allowed (proto identifies fields by number). Changing a field's type, its `repeated`-ness, or its number, or changing `key_fields`, is incompatible and is rejected by writers and readers alike. Because every version of an id is wire-compatible with every other, a record encoded under any version decodes correctly under any other, which is what makes replay deterministic regardless of which definition a reader happens to hold; the reader simply adopts the latest definition it has seen as the current schema.
+2. **Ids are never reused, and redefinitions must be compatible.** A `TypeDefinition` for an id that already exists is allowed only if the new descriptors are a compatible evolution of the previous ones: existing field numbers keep their wire type and label, fields may be added, and fields may be removed only by reserving their numbers. Renaming a field is allowed (proto identifies fields by number). Changing a field's type, its `repeated`-ness, or its number, or changing `key_fields`, is incompatible and is rejected by writers and readers alike.
 3. **Ids are scoped to a stream and allocated by its single writer.** Streams already have exactly one writer per `stream_id`, so no coordination is needed. Types are shared *across* streams by `fingerprint` or `name`, never by id.
-4. **Definitions are idempotent by fingerprint.** A repeated definition with a matching fingerprint is a no-op; a compatible one with a new fingerprint is an evolution; an incompatible one is a hard error. This lets a restarting writer simply re-emit its definitions instead of persisting which ids it has already announced (its local segments are trimmed after the `Permanent` ack, so it cannot always re-derive them).
+4. **Definitions are idempotent by fingerprint.** A repeated definition with a matching fingerprint is a no-op; a compatible one with a new fingerprint is an evolution; an incompatible one is a hard error. This lets a restarting writer simply re-emit its definitions instead of persisting which ids it has already announced.
 5. **The registry travels with snapshots and cursors, not with periodic keyframes in the log.** See [Layer 3](#layer-3-projections-as-snapshots). A reader that starts from a snapshot at `P` has every definition in force at `P`; anything newer is in the log after `P`. A tailing consumer persists the handful of definitions it has seen alongside its position. The log therefore carries each definition once per version.
 
-The accepted cost of rule 5 is that a lone segment pulled out of object storage is not decodable without the snapshot before it. Tooling that inspects segments takes a snapshot or registry as input.
+The accepted cost of principle 5 is that a lone segment pulled out of object storage is not decodable without the snapshot before it. Tooling that inspects segments takes a snapshot or registry as input.
 
 ### Why proto
 
@@ -94,7 +95,7 @@ Bodies are protobuf, with no alternative encodings, for reasons that matter spec
 - **Misparse fails loudly.** Decoding an Avro record with the wrong writer schema yields plausible garbage; a proto decoded against the wrong type yields unknown fields or a wire-type error.
 - **One IDL, one toolchain.** The Streams and ObjectFS APIs, and `MutationRecord`, are already proto with first-party Go support. A log record can flow through `AppendRecord` and out of `Tail` as the same bytes, and applications register the message types they already have.
 - **Sparse records are smaller.** Unset fields cost nothing; a change log is sparse (deletes carry only key fields, most updates touch two columns).
-- **Unknown fields are preserved**, so a relay or compactor built against an older schema forwards newer fields intact, and compatible schema evolution (rule 2) needs no coordination between writer and readers.
+- **Unknown fields are preserved**, so a relay or compactor built against an older schema forwards newer fields intact, and compatible schema evolution needs no coordination between writer and readers.
 
 Avro wins on dense tiny rows and on its logical-type vocabulary (`decimal`, `date`, `uuid`); the first is recovered by segment compression and the second is handled by annotations (Layer 2). Consumers that need Avro, e.g. Kafka sinks, convert at the edge from the descriptors in the registry.
 
@@ -140,9 +141,9 @@ message OpRecord {
 
 A row change on the wire carries the table type ID, the operation, the transaction ID (`0` for autocommit), the canonically encoded proto key bytes, and the non-key proto value bytes. There is no column unpacking or per-table wrapper; key data and value data remain native protobuf bytes.
 
-**Columns are derived from the descriptor.** Scalar fields map to columns; `key_fields` become the primary key. How nested messages and `repeated` fields map (flattened, JSON, or stored only in the raw proto and not queryable) is an open question below, and projections may legitimately differ on it.
+**Columns are derived from the descriptor.** Scalar fields map to columns; `key_fields` become the primary key.
 
-**Schema evolution is in place.** Adding a field to `Order` is a new `TypeDefinition` for id 16 with the new descriptors (rule 2). Records written before it decode under the new descriptor with the field unset; records written after it decode under an older descriptor with an unknown field. Projections add the column when they see the definition. Incompatible changes are a new message and a new table.
+**Schema evolution is in place.** Adding a field to `Order` is a new `TypeDefinition` for id 16 with the new descriptors. Records written before it decode under the new descriptor with the field unset; records written after it decode under an older descriptor with an unknown field. Projections add the column when they see the definition. Incompatible changes are a new message and a new table.
 
 ### Value types
 
@@ -159,11 +160,11 @@ Column types are derived from proto field types, restricted to what the projecti
 | `google.protobuf.Timestamp` | `INTEGER` (micros) | `INT64` (TIMESTAMP_MICROS) |
 | proto3 `optional`, message fields | `NULL` when unset | definition level |
 
-Richer semantics (`decimal`, `date`, `uuid`) are field annotations carried in the descriptors (custom options), stored over one of the above. Large values (file contents, images) are **not** stored inline: they are written to the content-addressed blob store and referenced by SHA-256, the same rule ObjectFS is adopting for large file content.
+Richer semantics (`decimal`, `date`, `uuid`) are field annotations carried in the descriptors (custom options), stored over one of the above. Large values (file contents, images) are not stored inline: they are written to the content-addressed blob store and referenced by SHA-256, the same rule ObjectFS is adopting for large file content.
 
 ### Transactions
 
-Most changes are single rows. A `RowChange` with `tx_id = 0` is its own transaction and is applied immediately; no `TxCommit` is written. A multi-row transaction sets the same non-zero `tx_id` on each of its records and closes with:
+Most changes are single rows. An `OpRecord` with `tx_id = 0` is its own autocommit transaction and is applied immediately; no `TxCommit` is written. A multi-row transaction sets the same non-zero `tx_id` on each of its records and closes with:
 
 ```proto
 message TxCommit {
@@ -172,7 +173,7 @@ message TxCommit {
 }
 ```
 
-A reader holds records with a non-zero `tx_id` as pending until the matching `TxCommit` arrives; on recovery, pending groups with no commit are discarded. Snapshots are only taken at points where nothing is pending. A filesystem rename, which touches two directory rows and one inode row, is one transaction; a single `mkdir` is not.
+A reader holds records with a non-zero `tx_id` as pending until the matching `TxCommit` arrives; on recovery, pending groups with no commit are discarded. Snapshots are only taken at points where nothing is pending (safe positions). A filesystem rename, which touches two directory rows and one inode row, is one transaction; a single `mkdir` is not.
 
 `tx_id` values are allocated by the stream's writer and need only be unique among transactions that are open at the same time. Cross-stream transactions are out of scope: a stream is the unit of atomicity and ordering, as it is today.
 
@@ -195,10 +196,10 @@ Snapshots are also the **retention anchor**. Segments older than the oldest snap
 
 ### SQLite (OLTP)
 
-- One database file per stream (or per shard if a stream is sharded; see open questions).
+- One database file per stream (or per shard if a stream is sharded).
 - Tables are created from the registry. Each scalar field is a column; `key_fields` become the `PRIMARY KEY`; indexes are a property of the projection, not the log, and may differ between two SQLite snapshots of the same stream.
 - Two bookkeeping tables: `_stream_types` (`id`, `name`, `fingerprint`, `descriptors BLOB`, `key_fields`) and `_stream_position` (`stream_id`, `position`, `snapshot_time`).
-- Apply rules: `INSERT` → `INSERT OR REPLACE`; `UPDATE` → `UPDATE ... WHERE key`, falling back to insert of `after` if the row is missing (idempotent replay); `DELETE` → `DELETE WHERE key`. An autocommit `RowChange` is its own SQLite transaction; a `TxCommit` closes one covering its pending rows.
+- Apply rules: `CREATE` → `INSERT OR REPLACE`; `UPDATE` → `UPDATE ... WHERE key` (or replace); `DELETE` → `DELETE WHERE key`. An autocommit `OpRecord` is its own SQLite transaction; a `TxCommit` closes one covering its pending rows.
 - Writing: build in a temp file, `PRAGMA journal_mode=OFF` during load, fsync, then upload. Serving: download or stream to local disk, open read-only, and keep applying the live tail into it from `Tail`.
 - SQLite is the initial OLTP shape because a single file is trivially snapshotted, has real indexes and a page cache, and is readable everywhere. Its WAL and page format are *not* used as the log format: the log is logical, the file is a projection.
 
@@ -213,7 +214,7 @@ Snapshots are also the **retention anchor**. Segments older than the oldest snap
 
 ### EROFS (filesystem, case study)
 
-ObjectFS today stores its metadata mutations as a proto `MutationRecord` in a stream and periodically compiles an EROFS image. Recast in this design, the filesystem is two registered messages, an inode and a directory entry; a `mkdir` is one transaction touching both; and the EROFS image is a third kind of projection alongside SQLite and Parquet, with `user.digest` xattrs carrying the blob SHA exactly as now. This unification is **deliberately tabled**: it would change the on-disk WAL format for a working system and belongs behind stream-format versioning rather than in this proposal. It is listed here because it demonstrates that the layering is general, and because it would let a directory tree be queried with SQL from the SQLite projection.
+ObjectFS today stores its metadata mutations as a proto `MutationRecord` in a stream and periodically compiles an EROFS image. Recast in this design, the filesystem is two registered messages, an inode and a directory entry; a `mkdir` is one transaction touching both; and the EROFS image is a third kind of projection alongside SQLite and Parquet, with `user.digest` xattrs carrying the blob SHA exactly as now. This unification is deliberately tabled: it would change the on-disk WAL format for a working system and belongs behind stream-format versioning rather than in this proposal. It is listed here because it demonstrates that the layering is general, and because it would let a directory tree be queried with SQL from the SQLite projection.
 
 ### SnapshotPointer
 
@@ -263,7 +264,7 @@ The client-side encryption proposed for Streams (per-record AEAD, [issue #87](ht
 | Avro | No structural decode without the writer schema; silent misparse on schema mismatch; second IDL and third-party Go tooling. |
 | Arrow IPC record batches as the log | Excellent for bulk ingestion and maps straight to Parquet, but hundreds of bytes of overhead per single-row change. |
 | New type id per schema change | Simpler invariants on paper, but every projection then has to merge several ids into one table. Requiring compatible in-place evolution keeps one id per table and leans on proto's own compatibility rules. |
-| SQLite session changesets | Almost exactly a `RowChange`, and worth reading, but engine-specific binary with no versioning; unsuitable as an archive format. |
+| SQLite session changesets | Almost exactly a row-change log, and worth reading, but engine-specific binary with no versioning; unsuitable as an archive format. |
 | SQLite WAL / physical page log | Ties the log to one engine's page layout; cannot be projected into Parquet. |
 | Riegeli | Solves the *file* problem well (descriptors in the header, chunk checksums, resync, transposition) and validates the in-band-schema approach, but is one type per file, has no streaming or append semantics, and has no Go implementation. Its role would be a sealed-segment format, which zstd on segments already covers. |
 | Periodic type keyframes in the log | Redundant once snapshots carry the registry and consumers persist it with their cursor. Dropped. |
@@ -272,8 +273,8 @@ The client-side encryption proposed for Streams (per-record AEAD, [issue #87](ht
 
 ## Open Questions
 
-- **Column mapping for nested and repeated fields.** For now, Layer 2 column derivation (`Columns`) excludes nested messages (other than `google.protobuf.Timestamp`) and repeated fields, keeping them only in the raw row proto. Whether future projections flatten with a naming convention, store as JSON text, or treat them as non-queryable remains open. The raw-proto-plus-index SQLite layout (see the TODO above) sidesteps this for OLTP; Parquet has native nested types.
-- **Precise compatibility rules.** Rule 2 gives the intent; the exact checker (labels, `oneof` membership changes, enum value additions, message-typed fields) needs a specification and a test suite, and should match `buf breaking` where possible.
+- **Column mapping for nested and repeated fields.** Column derivation for relational projections excludes nested messages (other than `google.protobuf.Timestamp`) and repeated fields, keeping them only in the raw row proto. Whether future projections flatten with a naming convention, store as JSON text, or treat them as non-queryable remains open. The raw-proto-plus-index SQLite layout (see the TODO above) sidesteps this for OLTP; Parquet has native nested types.
+- **Precise compatibility rules.** Fully specified in the normative specification ([`docs/sds-spec.md#4-precise-schema-compatibility-rules`](sds-spec.md)).
 - **Snapshot production.** Who takes snapshots: the writer (has the state in memory), a buffer-side compactor (has all streams, no application code), or a dedicated projector reading `Tail`? The projector is the most general and keeps the buffer schema-free; the writer is simplest for a single-tenant stream.
 - **Cadence and cost.** Snapshot on a size threshold of log since last snapshot, on a timer, or on demand. Interaction with `Permanent` durability: a snapshot must not cover positions beyond the `s3Seq` watermark.
 - **Sharding.** A stream is the unit of ordering; a large table may need many streams. How keys map to streams, and whether a Parquet projection can span streams, is undecided.
@@ -286,8 +287,8 @@ The client-side encryption proposed for Streams (per-record AEAD, [issue #87](ht
 
 ## Roadmap
 
-- [ ] Layer 1 in `pkg/wal`: `TypeDefinition` / `RowChange` / `TxCommit` / `SnapshotPointer` / `Padding` protos, a typed `Append`/`Read` wrapper over `client.Stream` that maintains the registry and enforces compatibility, and `streams cat`.
-- [ ] Layer 2: column derivation from message descriptors, `dynamicpb` decoding, transaction grouping on read.
+- [x] Layer 1 in `pkg/sds`: `TypeDefinition` / `OpRecord` / `TxCommit` / `SnapshotPointer` / `Padding` protos, typed `Append`/`Read` framing that maintains the registry and enforces compatibility.
+- [x] Layer 2: `OpRecord` row operations (CREATE, UPDATE, DELETE), canonical primary key splitting/merging, transaction grouping on read, safe snapshot positions, and in-memory memtable projection.
 - [ ] SQLite projector: build, publish, restore, live tail apply.
 - [ ] Parquet projector: append-only tables first.
 - [ ] Conformance suite: random logs replayed into both projections must agree, from any snapshot position and across compatible schema changes.
