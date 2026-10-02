@@ -12,9 +12,9 @@
       </p>
 
       <div class="hero-actions">
-        <a class="btn primary" href="{{ "/idea/" | relURL }}">Explore The Idea</a>
-        <a class="btn ghost" href="{{ "/format/" | relURL }}">The Wire Format</a>
-        <a class="btn ghost" href="{{ "/projections/" | relURL }}">Projections</a>
+        <a class="btn primary" href="{{ "idea/" | relURL }}">Explore The Idea</a>
+        <a class="btn ghost" href="{{ "format/" | relURL }}">The Wire Format</a>
+        <a class="btn ghost" href="{{ "projections/" | relURL }}">Projections</a>
         <a class="btn ghost" href="{{ site.Params.repo }}" target="_blank" rel="noopener">GitHub</a>
       </div>
     </div>
@@ -100,42 +100,42 @@
       </div>
 
       <div class="grid cards-grid">
-        <a class="card feature-card" href="{{ "/idea/" | relURL }}">
+        <a class="card feature-card" href="{{ "idea/" | relURL }}">
           <div class="card-icon">⚡</div>
           <h3>No Dual-Write Problem</h3>
           <p>Writes hit exactly one place: the append-only stream. SQLite databases, Parquet tables, and caches update deterministically by tailing the log.</p>
           <span class="card-arrow">Learn more →</span>
         </a>
 
-        <a class="card feature-card" href="{{ "/idea/" | relURL }}#restore-and-time-travel">
+        <a class="card feature-card" href="{{ "idea/#restore-and-time-travel" | relURL }}">
           <div class="card-icon">⏱</div>
           <h3>Time Travel &amp; Instant Restore</h3>
           <p>To restore state at any position <code>Q</code>, pick the latest snapshot at <code>P ≤ Q</code> and replay forward. Snapshots also act as the retention anchor to trim old log segments.</p>
           <span class="card-arrow">Learn more →</span>
         </a>
 
-        <a class="card feature-card" href="{{ "/format/" | relURL }}">
+        <a class="card feature-card" href="{{ "format/" | relURL }}">
           <div class="card-icon">📦</div>
           <h3>Efficient, Self-Describing Wire Format</h3>
           <p>1–2 byte type prefixes. Protobuf descriptors sent once in-band. Unknown fields are preserved, schema migrations happen in place, and ten-year-old segments remain decodable.</p>
           <span class="card-arrow">Inspect wire format →</span>
         </a>
 
-        <a class="card feature-card" href="{{ "/projections/" | relURL }}">
+        <a class="card feature-card" href="{{ "projections/" | relURL }}">
           <div class="card-icon">🗄</div>
           <h3>OLTP &amp; OLAP from One Stream</h3>
           <p>Serve indexed point lookups from SQLite with sub-millisecond local reads, while DuckDB and Spark query columnar Parquet snapshots generated from the exact same stream.</p>
           <span class="card-arrow">Explore projections →</span>
         </a>
 
-        <a class="card feature-card" href="{{ "/case-study/" | relURL }}">
+        <a class="card feature-card" href="{{ "case-study/" | relURL }}">
           <div class="card-icon">📁</div>
           <h3>Filesystems as Tables: ObjectFS</h3>
           <p>ObjectFS expresses directory trees and inodes as proto messages over an SDS stream, projecting high-performance read-only EROFS images for containers.</p>
           <span class="card-arrow">Read case study →</span>
         </a>
 
-        <a class="card feature-card" href="{{ "/faq/" | relURL }}">
+        <a class="card feature-card" href="{{ "faq/" | relURL }}">
           <div class="card-icon">💡</div>
           <h3>Design Trade-offs &amp; FAQ</h3>
           <p>Why Protobuf over Avro? Why not <code>google.protobuf.Any</code> or <code>oneof</code>? How SDS complements Iceberg and Delta Lake rather than competing with them.</p>
@@ -204,7 +204,7 @@
           We make no premature performance or production-readiness claims. Specifications, conformance suites, and reference implementations are evolving.
         </p>
         <div class="status-links">
-          <a class="btn primary" href="{{ "/implementations/" | relURL }}">View Implementation Status</a>
+          <a class="btn primary" href="{{ "implementations/" | relURL }}">View Implementation Status</a>
           <a class="btn ghost" href="{{ site.Params.repo }}/issues/97" target="_blank" rel="noopener">Tracking Issue #97</a>
         </div>
       </div>

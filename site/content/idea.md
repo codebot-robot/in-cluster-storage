@@ -3,7 +3,7 @@ title: "The Idea"
 kicker: "Architecture & Fundamentals"
 summary: "The log is the single source of truth. Databases, analytics tables, and filesystem images are snapshots of the stream materialized at a position."
 status_note: "Design proposal with an experimental implementation."
-next_url: "/format/"
+next_url: "format/"
 next_title: "The Wire Format"
 ---
 

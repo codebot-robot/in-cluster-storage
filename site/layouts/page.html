@@ -20,9 +20,9 @@
     <div class="page-nav">
       <hr class="nav-divider">
       <div class="nav-links">
-        <a href="{{ "/" | relURL }}" class="nav-link-item">← Overview</a>
+        <a href="{{ "" | relURL }}" class="nav-link-item">← Overview</a>
         {{ with .Params.next_url }}
-        <a href="{{ . | relURL }}" class="nav-link-item next">{{ $.Params.next_title | default "Next Section" }} →</a>
+        <a href="{{ strings.TrimPrefix "/" . | relURL }}" class="nav-link-item next">{{ $.Params.next_title | default "Next Section" }} →</a>
         {{ end }}
       </div>
     </div>

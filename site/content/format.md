@@ -3,7 +3,7 @@ title: "The Wire Format"
 kicker: "Framing & Encodings"
 summary: "Layer 1 record typing and Layer 2 logical change log framing, with a byte-by-byte wire example."
 status_note: "Draft specification. See the normative specification in docs/sds-spec.md."
-next_url: "/projections/"
+next_url: "projections/"
 next_title: "Projections"
 ---
 

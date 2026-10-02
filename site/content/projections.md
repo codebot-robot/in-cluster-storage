@@ -3,7 +3,7 @@ title: "Projections"
 kicker: "Snapshots & Materializations"
 summary: "Deriving specialized read representations—SQLite for OLTP, Parquet for OLAP, Iceberg for lakehouses, and EROFS for filesystems—from one authoritative stream."
 status_note: "Design proposal with experimental Go projectors."
-next_url: "/case-study/"
+next_url: "case-study/"
 next_title: "Case Study: ObjectFS"
 ---
 

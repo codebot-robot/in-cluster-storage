@@ -51,12 +51,36 @@ jobs:
         id: pages
         if: github.event_name != 'pull_request'
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # ratchet:actions/configure-pages@v5.0.0
-        with:
-          enablement: true
       - name: Build
         env:
-          BASE_URL: ${{ steps.pages.outputs.base_url && format('{0}/', steps.pages.outputs.base_url) || 'https://structured-data-streams.com/' }}
+          BASE_URL: ${{ steps.pages.outputs.base_url && format('{0}/', steps.pages.outputs.base_url) || 'https://example.github.io/preview/' }}
         run: hugo -s site --minify --baseURL "$BASE_URL"
+      - name: Check internal links
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url && format('{0}/', steps.pages.outputs.base_url) || 'https://example.github.io/preview/' }}
+        run: |
+          BASE_PATH="$(echo "$BASE_URL" | sed -E 's|^https?://[^/]+||')"
+          if [ -n "$BASE_PATH" ] && [ "$BASE_PATH" != "/" ]; then
+            BASE_PATH="/${BASE_PATH#/}"
+            BASE_PATH="${BASE_PATH%/}/"
+            echo "Checking internal links against base path: $BASE_PATH"
+
+            FAILED=0
+            for file in $(find site/public -name "*.html"); do
+              for link in $(grep -oE '(href|src)=["'\''/]?[^ "'\''<>]+' "$file" | sed -E 's/^(href|src)=["'\'']?//' | grep '^/' | grep -v '^//' || true); do
+                if [[ "$link" != "$BASE_PATH"* && "$link" != "${BASE_PATH%/}" ]]; then
+                  echo "::error file=${file}::Internal link '${link}' does not start with '${BASE_PATH}'"
+                  FAILED=1
+                fi
+              done
+            done
+
+            if [ "$FAILED" -ne 0 ]; then
+              echo "Check failed: Found internal links missing base path prefix"
+              exit 1
+            fi
+            echo "All internal links correctly match base path: $BASE_PATH"
+          fi
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # ratchet:actions/upload-pages-artifact@v3.0.1
         with:
           path: site/public

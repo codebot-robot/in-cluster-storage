@@ -3,7 +3,7 @@ title: "Case Study: ObjectFS"
 kicker: "Real-World Application"
 summary: "Expressing a POSIX filesystem as relational tables over a stream, projecting read-only EROFS images for high-performance Kubernetes workloads."
 status_note: "In progress. Tracked under Issue #97 and sub-issues #94, #107, #108, #109."
-next_url: "/implementations/"
+next_url: "implementations/"
 next_title: "Implementations & Roadmap"
 ---
 

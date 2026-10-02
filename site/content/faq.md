@@ -3,7 +3,7 @@ title: "Why / FAQ"
 kicker: "Design Decisions & Alternatives"
 summary: "Detailed rationale behind design trade-offs: Protobuf vs Avro, Any vs oneof, Delta/Iceberg relationships, Kafka, and Riegeli."
 status_note: "Derived from the SDS Design Proposal (docs/structured-data-streams.md)."
-next_url: "/case-study/"
+next_url: "case-study/"
 next_title: "Case Study: ObjectFS"
 ---
 
