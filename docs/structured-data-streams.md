@@ -292,4 +292,4 @@ The client-side encryption proposed for Streams (per-record AEAD, [issue #87](ht
 - [ ] SQLite projector: build, publish, restore, live tail apply.
 - [ ] Parquet projector: append-only tables first.
 - [ ] Conformance suite: random logs replayed into both projections must agree, from any snapshot position and across compatible schema changes.
-- [ ] Case study: express the ObjectFS `MutationRecord` as two registered messages and produce an EROFS image from the SQLite projection (no format change to the live system).
+- [x] Case study: express the ObjectFS `MutationRecord` as relational tables (`Inode`, `DirEntry`, `Content`) and produce EROFS snapshots as position-named projections with embedded schemas and no pointer files.
