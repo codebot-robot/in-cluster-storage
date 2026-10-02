@@ -389,3 +389,120 @@ func TestBlobStoreOperations(t *testing.T) {
 		}
 	}
 }
+
+func TestManifestEncodeDecodeAndChunkBlobs(t *testing.T) {
+	// 1. Create a 100KB stream and chunk it into 16KB chunks
+	data := make([]byte, 100*1024)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+
+	src := NewByteStreamFromBytes(data)
+
+	// Test chunkSize 0 error
+	if _, _, _, err := ChunkBlobs(src, 0, true); err == nil {
+		t.Fatalf("expected error for chunkSize 0, got nil")
+	}
+
+	chunkSize := uint32(16 * 1024)
+
+	chunkBlobs, manifest, manifestBlob, err := ChunkBlobs(src, chunkSize, true)
+	if err != nil {
+		t.Fatalf("ChunkBlobs failed: %v", err)
+	}
+
+	expectedChunks := (len(data) + int(chunkSize) - 1) / int(chunkSize)
+	if len(chunkBlobs) != expectedChunks {
+		t.Fatalf("expected %d chunks, got %d", expectedChunks, len(chunkBlobs))
+	}
+	if manifest.ChunkSize != chunkSize {
+		t.Fatalf("expected manifest chunkSize %d, got %d", chunkSize, manifest.ChunkSize)
+	}
+	if manifest.TotalLength != uint64(len(data)) {
+		t.Fatalf("expected manifest total length %d, got %d", len(data), manifest.TotalLength)
+	}
+	if manifestBlob.Encoding != EncodingChunked {
+		t.Fatalf("expected manifest blob encoding %d, got %d", EncodingChunked, manifestBlob.Encoding)
+	}
+
+	// 2. Decode manifest from manifestBlob stream
+	if err := manifestBlob.Stream.Rewind(); err != nil {
+		t.Fatalf("rewind manifest stream failed: %v", err)
+	}
+	decodedManifest, err := DecodeManifest(manifestBlob.Stream)
+	if err != nil {
+		t.Fatalf("DecodeManifest failed: %v", err)
+	}
+	if decodedManifest.ChunkSize != manifest.ChunkSize {
+		t.Fatalf("decoded chunkSize mismatch: %d vs %d", decodedManifest.ChunkSize, manifest.ChunkSize)
+	}
+	if decodedManifest.TotalLength != manifest.TotalLength {
+		t.Fatalf("decoded total length mismatch: %d vs %d", decodedManifest.TotalLength, manifest.TotalLength)
+	}
+	if len(decodedManifest.Chunks) != len(manifest.Chunks) {
+		t.Fatalf("decoded chunks count mismatch: %d vs %d", len(decodedManifest.Chunks), len(manifest.Chunks))
+	}
+	for i := range manifest.Chunks {
+		if decodedManifest.Chunks[i] != manifest.Chunks[i] {
+			t.Fatalf("chunk SHA mismatch at index %d", i)
+		}
+	}
+}
+
+func TestStoreChunkedManifestInPacks(t *testing.T) {
+	ctx := t.Context()
+	backend := newTestMemoryBackend()
+	store := NewStore(backend, 0)
+
+	// Create 3 chunks and 1 manifest
+	c1Data := []byte("chunk-1-content-hello")
+	c2Data := []byte("chunk-2-content-world")
+	c1Sha := sha256.Sum256(c1Data)
+	c2Sha := sha256.Sum256(c2Data)
+
+	manifest := &Manifest{
+		ChunkSize:   16384,
+		TotalLength: uint64(len(c1Data) + len(c2Data)),
+		Chunks:      [][32]byte{c1Sha, c2Sha},
+	}
+	manifestBlob, err := EncodeManifest(manifest)
+	if err != nil {
+		t.Fatalf("EncodeManifest failed: %v", err)
+	}
+
+	blobsMap := map[string]ByteStream{
+		fmt.Sprintf("%x", c1Sha): NewByteStreamFromBytes(c1Data),
+		fmt.Sprintf("%x", c2Sha): NewByteStreamFromBytes(c2Data),
+		manifestBlob.SHA256Hex(): manifestBlob.Stream,
+	}
+
+	if err := store.PutBlobs(ctx, blobsMap); err != nil {
+		t.Fatalf("PutBlobs failed: %v", err)
+	}
+
+	// Read back manifest blob from store
+	mStream, err := store.GetBlob(ctx, manifestBlob.SHA256Hex())
+	if err != nil {
+		t.Fatalf("GetBlob on manifest failed: %v", err)
+	}
+	defer mStream.Close()
+
+	decM, err := DecodeManifest(mStream)
+	if err != nil {
+		t.Fatalf("DecodeManifest from store blob failed: %v", err)
+	}
+	if decM.TotalLength != manifest.TotalLength {
+		t.Fatalf("manifest totalLength mismatch: %d vs %d", decM.TotalLength, manifest.TotalLength)
+	}
+
+	// Read back chunks
+	c1Stream, err := store.GetBlob(ctx, fmt.Sprintf("%x", c1Sha))
+	if err != nil {
+		t.Fatalf("GetBlob on c1 failed: %v", err)
+	}
+	defer c1Stream.Close()
+	c1Read, _ := io.ReadAll(c1Stream)
+	if !bytes.Equal(c1Read, c1Data) {
+		t.Fatalf("c1 content mismatch: %q vs %q", string(c1Read), string(c1Data))
+	}
+}

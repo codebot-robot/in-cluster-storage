@@ -48,6 +48,9 @@ const (
 	// FileHeaderSize is the fixed size of the base file header (8 bytes).
 	FileHeaderSize = 8
 
+	// ManifestHeaderSize is the fixed size of the Manifest payload header (24 bytes).
+	ManifestHeaderSize = 24
+
 	// SingleBlobHeaderSize is the total size of the loose blob header (64 bytes).
 	SingleBlobHeaderSize = 64
 
@@ -454,7 +457,7 @@ func decodePayloadToByteStream(r io.Reader, encoding uint32, finalLen int64) (By
 		}
 		defer zr.Close()
 		src = zr
-	} else if encoding != EncodingRaw {
+	} else if encoding != EncodingRaw && encoding != EncodingChunked {
 		return nil, fmt.Errorf("unsupported encoding: %d", encoding)
 	}
 
@@ -688,4 +691,122 @@ func DecodeBlobFromPayload(r io.Reader, entry BlobEntry) (ByteStream, error) {
 
 	limited := io.LimitReader(r, payloadStoredLen)
 	return decodePayloadToByteStream(limited, encoding, finalLen)
+}
+
+// Manifest describes a chunked file consisting of fixed-size chunk blobs.
+type Manifest struct {
+	ChunkSize   uint32
+	TotalLength uint64
+	Chunks      [][32]byte
+}
+
+// ChunkHexSHAs returns the hex string representations of the chunk SHA256 hashes.
+func (m *Manifest) ChunkHexSHAs() []string {
+	res := make([]string, len(m.Chunks))
+	for i, c := range m.Chunks {
+		res[i] = hex.EncodeToString(c[:])
+	}
+	return res
+}
+
+// EncodeManifest encodes a Manifest into its binary representation and returns an EncodedBlob.
+func EncodeManifest(m *Manifest) (*EncodedBlob, error) {
+	n := len(m.Chunks)
+	buf := make([]byte, ManifestHeaderSize+n*32)
+	binary.BigEndian.PutUint32(buf[0:4], m.ChunkSize)
+	binary.BigEndian.PutUint32(buf[4:8], 0) // Reserved
+	binary.BigEndian.PutUint64(buf[8:16], m.TotalLength)
+	binary.BigEndian.PutUint32(buf[16:20], uint32(n))
+	binary.BigEndian.PutUint32(buf[20:24], 0) // Reserved2
+
+	for i, c := range m.Chunks {
+		copy(buf[ManifestHeaderSize+i*32:ManifestHeaderSize+(i+1)*32], c[:])
+	}
+
+	h := sha256.Sum256(buf)
+	return &EncodedBlob{
+		Stream:       NewByteStreamFromBytes(buf),
+		StoredLength: uint64(len(buf)),
+		FinalLength:  uint64(len(buf)),
+		SHA256:       h,
+		Encoding:     EncodingChunked,
+	}, nil
+}
+
+// DecodeManifest parses a Manifest binary representation from r.
+func DecodeManifest(r io.Reader) (*Manifest, error) {
+	hdr := make([]byte, ManifestHeaderSize)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return nil, fmt.Errorf("failed to read manifest header: %w", err)
+	}
+
+	chunkSize := binary.BigEndian.Uint32(hdr[0:4])
+	totalLength := binary.BigEndian.Uint64(hdr[8:16])
+	count := int(binary.BigEndian.Uint32(hdr[16:20]))
+
+	chunksBuf := make([]byte, count*32)
+	if _, err := io.ReadFull(r, chunksBuf); err != nil {
+		return nil, fmt.Errorf("failed to read chunk SHAs: %w", err)
+	}
+
+	chunks := make([][32]byte, count)
+	for i := 0; i < count; i++ {
+		copy(chunks[i][:], chunksBuf[i*32:(i+1)*32])
+	}
+
+	return &Manifest{
+		ChunkSize:   chunkSize,
+		TotalLength: totalLength,
+		Chunks:      chunks,
+	}, nil
+}
+
+// ChunkBlobs splits a ByteStream into fixed-size chunk blobs and produces a Manifest.
+func ChunkBlobs(src ByteStream, chunkSize uint32, compress bool) ([]*EncodedBlob, *Manifest, *EncodedBlob, error) {
+	if chunkSize == 0 {
+		return nil, nil, nil, fmt.Errorf("chunkSize must be greater than 0")
+	}
+
+	if err := src.Rewind(); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to rewind input stream: %w", err)
+	}
+
+	var chunkBlobs []*EncodedBlob
+	var chunkSHAs [][32]byte
+	var totalLen uint64
+
+	buf := make([]byte, chunkSize)
+	for {
+		n, err := io.ReadFull(src, buf)
+		if n > 0 {
+			totalLen += uint64(n)
+			chunkData := make([]byte, n)
+			copy(chunkData, buf[:n])
+			chunkBlob, encodeErr := EncodeBlob(NewByteStreamFromBytes(chunkData), compress)
+			if encodeErr != nil {
+				return nil, nil, nil, fmt.Errorf("failed encoding chunk: %w", encodeErr)
+			}
+			chunkBlobs = append(chunkBlobs, chunkBlob)
+			chunkSHAs = append(chunkSHAs, chunkBlob.SHA256)
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed reading chunk data: %w", err)
+		}
+	}
+
+	manifest := &Manifest{
+		ChunkSize:   chunkSize,
+		TotalLength: totalLen,
+		Chunks:      chunkSHAs,
+	}
+
+	manifestBlob, err := EncodeManifest(manifest)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed encoding manifest: %w", err)
+	}
+
+	return chunkBlobs, manifest, manifestBlob, nil
 }
