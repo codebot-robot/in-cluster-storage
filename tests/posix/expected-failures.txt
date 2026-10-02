@@ -1,0 +1,134 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Expected failing tests for pjdfstest against objectfs.
+# As POSIX features are implemented in objectfs (e.g. chmod, chown, utimes, symlinks,
+# hard links, xattrs), tests that begin passing must be removed from this list.
+chmod/00.t
+chmod/01.t
+chmod/02.t
+chmod/03.t
+chmod/04.t
+chmod/05.t
+chmod/06.t
+chmod/07.t
+chmod/11.t
+chmod/12.t
+chown/00.t
+chown/01.t
+chown/02.t
+chown/03.t
+chown/04.t
+chown/05.t
+chown/06.t
+chown/07.t
+ftruncate/00.t
+ftruncate/02.t
+ftruncate/05.t
+ftruncate/07.t
+ftruncate/12.t
+link/00.t
+link/01.t
+link/02.t
+link/03.t
+link/06.t
+link/07.t
+link/08.t
+link/09.t
+link/10.t
+link/11.t
+mkdir/00.t
+mkdir/01.t
+mkdir/02.t
+mkdir/05.t
+mkdir/06.t
+mkdir/07.t
+mkdir/10.t
+mkfifo/00.t
+mkfifo/01.t
+mkfifo/02.t
+mkfifo/03.t
+mkfifo/05.t
+mkfifo/06.t
+mkfifo/07.t
+mkfifo/09.t
+mknod/00.t
+mknod/01.t
+mknod/02.t
+mknod/03.t
+mknod/05.t
+mknod/06.t
+mknod/07.t
+mknod/08.t
+mknod/11.t
+open/00.t
+open/01.t
+open/02.t
+open/05.t
+open/06.t
+open/07.t
+open/12.t
+open/16.t
+open/17.t
+open/22.t
+open/25.t
+rename/00.t
+rename/01.t
+rename/04.t
+rename/05.t
+rename/09.t
+rename/10.t
+rename/11.t
+rename/12.t
+rename/13.t
+rename/14.t
+rename/20.t
+rename/21.t
+rename/23.t
+rename/24.t
+rmdir/01.t
+rmdir/02.t
+rmdir/05.t
+rmdir/06.t
+rmdir/07.t
+rmdir/08.t
+rmdir/11.t
+symlink/00.t
+symlink/02.t
+symlink/03.t
+symlink/05.t
+symlink/06.t
+symlink/07.t
+symlink/08.t
+truncate/02.t
+truncate/05.t
+truncate/07.t
+truncate/12.t
+unlink/00.t
+unlink/02.t
+unlink/05.t
+unlink/06.t
+unlink/07.t
+unlink/08.t
+unlink/11.t
+unlink/14.t
+utimensat/00.t
+utimensat/01.t
+utimensat/02.t
+utimensat/04.t
+utimensat/05.t
+utimensat/06.t
+utimensat/07.t
+utimensat/08.t
+utimensat/09.t

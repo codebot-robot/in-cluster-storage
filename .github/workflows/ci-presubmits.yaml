@@ -92,6 +92,25 @@ jobs:
 
       - name: Run ap-lint
         run: ./dev/ci/presubmits/ap-lint
+  ap-posix:
+    runs-on: ubuntu-latest
+    env:
+      ARTIFACTS: /tmp/artifacts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # ratchet:actions/setup-go@v7.0.0
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run ap-posix
+        run: ./dev/ci/presubmits/ap-posix
   ap-test:
     runs-on: ubuntu-latest
     env:

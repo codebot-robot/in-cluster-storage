@@ -1,0 +1,221 @@
+#!/bin/bash
+
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
+
+# pjdfstest requires root privileges to test syscalls with setuid/setgid (-u / -g).
+if [[ "${EUID}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+  exec sudo -E env "PATH=${PATH}" "HOME=${HOME}" "$0" "$@"
+fi
+
+# Install fuse3 in CI if missing.
+if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+  echo "Installing fuse3 dependencies..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y -qq fuse3 libfuse3-dev
+  fi
+fi
+
+WORK_DIR="$(mktemp -d /tmp/posix-gate.XXXXXX)"
+cleanup() {
+  rm -rf "${WORK_DIR}"
+}
+trap cleanup EXIT
+
+PJDFSTEST_DIR="${WORK_DIR}/pjdfstest"
+PJDFSTEST_COMMIT="85a8aea9e685999ef0540392fd80535f873d7ff7"
+echo "Fetching pjdfstest at commit ${PJDFSTEST_COMMIT}..."
+git clone --quiet https://github.com/pjd/pjdfstest.git "${PJDFSTEST_DIR}"
+(
+  cd "${PJDFSTEST_DIR}"
+  git checkout --quiet "${PJDFSTEST_COMMIT}"
+  cat << 'EOF' > config.h
+#define _GNU_SOURCE 1
+#define HAVE_SYS_SYSMACROS_H 1
+#define HAVE_FACCESSAT 1
+#define HAVE_FCHMODAT 1
+#define HAVE_FCHOWNAT 1
+#define HAVE_FSTATAT 1
+#define HAVE_LINKAT 1
+#define HAVE_MKDIRAT 1
+#define HAVE_MKFIFOAT 1
+#define HAVE_MKNODAT 1
+#define HAVE_OPENAT 1
+#define HAVE_POSIX_FALLOCATE 1
+#define HAVE_READLINKAT 1
+#define HAVE_RENAMEAT 1
+#define HAVE_SYMLINKAT 1
+#define HAVE_UTIMENSAT 1
+#define HAVE_STRUCT_STAT_ST_ATIM 1
+#define HAVE_STRUCT_STAT_ST_CTIM 1
+#define HAVE_STRUCT_STAT_ST_MTIM 1
+EOF
+  gcc -Wall -O2 -I. -o pjdfstest pjdfstest.c
+)
+
+XFSTESTS_DIR="${WORK_DIR}/xfstests"
+XFSTESTS_COMMIT="3e1ee800e52a0f53d7d9a7809be1ffc80ec1788f"
+echo "Fetching fsx from xfstests at commit ${XFSTESTS_COMMIT}..."
+if ! git clone --quiet --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "${XFSTESTS_DIR}" 2>/dev/null; then
+  git clone --quiet https://github.com/kdave/xfstests.git "${XFSTESTS_DIR}"
+fi
+(
+  cd "${XFSTESTS_DIR}"
+  git checkout --quiet "${XFSTESTS_COMMIT}" 2>/dev/null || true
+  cat << 'EOF' > config.h
+#define _GNU_SOURCE 1
+#define HAVE_SYS_PARAM_H 1
+#define HAVE_SYS_TYPES_H 1
+#define HAVE_SYS_STAT_H 1
+#define HAVE_SYS_TIME_H 1
+#define HAVE_SYS_MMAN_H 1
+#define HAVE_MALLOC_H 1
+#define HAVE_DIRENT_H 1
+#define HAVE_STDLIB_H 1
+#define HAVE_UNISTD_H 1
+#define HAVE_ERRNO_H 1
+#define HAVE_STRING_H 1
+#define HAVE_SYS_FCNTL_H 1
+#define HAVE_ASSERT_H 1
+#define STDC_HEADERS 1
+#define HAVE_LINUX_FALLOC_H 1
+#define HAVE_FALLOCATE 1
+#include <getopt.h>
+EOF
+  gcc -Wall -O2 -I. -Isrc -Iinclude -o fsx ltp/fsx.c
+)
+
+RUNNER_SCRIPT="${WORK_DIR}/run-tests.sh"
+EXPECTED_FAILURES_FILE="${REPO_ROOT}/tests/posix/expected-failures.txt"
+
+cat << EOF > "${RUNNER_SCRIPT}"
+#!/bin/bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+echo "==> Running fsx data-integrity test..."
+# Note: max file size is set to 1MB (-l 1048576) to avoid files >= 4MB blocked by issue #81.
+# Mapped writes are disabled (-W) pending kernel page cache writeback coherency.
+"${XFSTESTS_DIR}/fsx" -N 1000 -S 42 -l 1048576 -o 65536 -p 200 -W fsx-test.bin
+echo "fsx passed successfully!"
+echo
+
+echo "==> Running pjdfstest POSIX conformance test suite..."
+PJDFSTEST_TESTS_DIR="${PJDFSTEST_DIR}/tests"
+EXPECTED_FAILURES="${EXPECTED_FAILURES_FILE}"
+
+expected_failures_map=""
+while IFS= read -r line || [[ -n "\${line}" ]]; do
+  # Strip comments and whitespace
+  line="\$(echo "\${line}" | sed 's/#.*//' | xargs)"
+  if [[ -n "\${line}" ]]; then
+    expected_failures_map="\${expected_failures_map} \${line} "
+  fi
+done < "\${EXPECTED_FAILURES}"
+
+total_count=0
+expected_pass_count=0
+expected_fail_count=0
+unexpected_pass_list=()
+unexpected_fail_list=()
+
+for test_file in \$(find "\${PJDFSTEST_TESTS_DIR}" -name "*.t" | sort); do
+  t_rel="\${test_file#\${PJDFSTEST_TESTS_DIR}/}"
+  total_count=\$((total_count + 1))
+
+  set +o errexit
+  output=\$(/bin/sh "\${test_file}" 2>&1)
+  exit_code=\$?
+  set -o errexit
+
+  passed=0
+  if [[ \${exit_code} -eq 0 ]]; then
+    if printf '%s\n' "\${output}" | grep "^not ok" >/dev/null 2>&1; then
+      passed=0
+    elif printf '%s\n' "\${output}" | grep "^ok" >/dev/null 2>&1; then
+      passed=1
+    fi
+  fi
+
+  is_expected_fail=0
+  if [[ "\${expected_failures_map}" =~ " \${t_rel} " ]]; then
+    is_expected_fail=1
+  fi
+
+  if [[ \${passed} -eq 1 ]]; then
+    if [[ \${is_expected_fail} -eq 1 ]]; then
+      unexpected_pass_list+=("\${t_rel}")
+    else
+      expected_pass_count=\$((expected_pass_count + 1))
+    fi
+  else
+    if [[ \${is_expected_fail} -eq 1 ]]; then
+      expected_fail_count=\$((expected_fail_count + 1))
+    else
+      unexpected_fail_list+=("\${t_rel}")
+    fi
+  fi
+done
+
+echo
+echo "============================================================"
+echo "POSIX & Data-Integrity Conformance Summary:"
+echo "------------------------------------------------------------"
+echo "  fsx data-integrity test: PASS (1000 ops, seed=42, max_len=1MB)"
+echo "------------------------------------------------------------"
+echo "  pjdfstest POSIX test suite:"
+echo "    Total tests executed:  \${total_count}"
+echo "    Passed (expected):     \${expected_pass_count}"
+echo "    Failed (expected):     \${expected_fail_count}"
+echo "    Unexpected passes:     \${#unexpected_pass_list[@]}"
+echo "    Unexpected failures:   \${#unexpected_fail_list[@]}"
+echo "============================================================"
+
+if [[ \${#unexpected_pass_list[@]} -gt 0 ]]; then
+  echo
+  echo "ERROR: The following tests passed but are listed in \${EXPECTED_FAILURES}."
+  echo "Please remove them from expected-failures.txt to shrink the expected failures list:"
+  for t in "\${unexpected_pass_list[@]}"; do
+    echo "  - \${t}"
+  done
+fi
+
+if [[ \${#unexpected_fail_list[@]} -gt 0 ]]; then
+  echo
+  echo "ERROR: The following tests failed unexpectedly (regression):"
+  for t in "\${unexpected_fail_list[@]}"; do
+    echo "  - \${t}"
+  done
+fi
+
+if [[ \${#unexpected_pass_list[@]} -gt 0 || \${#unexpected_fail_list[@]} -gt 0 ]]; then
+  exit 1
+fi
+
+echo "POSIX and data-integrity tests passed all expectations!"
+EOF
+
+chmod +x "${RUNNER_SCRIPT}"
+
+# Execute tests against native FUSE mount
+GOTOOLCHAIN=auto ./dev/tasks/fuse-start -- "${RUNNER_SCRIPT}"
