@@ -541,6 +541,10 @@ func Fsck(r io.ReaderAt) error {
 		return err
 	}
 
+	if sb.XattrBlkaddr > 0 && sb.XattrBlkaddr >= sb.Blocks {
+		return &ErofsError{Code: ErrInvalidSuperblock, Message: fmt.Sprintf("invalid xattr_blkaddr %d >= blocks %d", sb.XattrBlkaddr, sb.Blocks)}
+	}
+
 	visited := make(map[uint64]bool)
 	activeStack := make(map[uint64]bool)
 	maxDepth := 100
@@ -578,6 +582,12 @@ func Fsck(r io.ReaderAt) error {
 		}
 		if inode.DataLayout != DatalayoutFlatPlain && inode.DataLayout != DatalayoutFlatInline {
 			return &ErofsError{Code: ErrInvalidInode, Message: fmt.Sprintf("unsupported data layout %d for NID %d", inode.DataLayout, nid)}
+		}
+
+		if inode.XattrICount > 0 {
+			if _, err := ReadXattrs(r, sb, inode); err != nil {
+				return &ErofsError{Code: ErrInvalidInode, Message: fmt.Sprintf("corrupt xattrs for NID %d", nid), Err: err}
+			}
 		}
 
 		if (inode.Mode & S_IFMT) == S_IFDIR {
@@ -762,6 +772,70 @@ func (reader *Reader) ListDirectory(nid uint64) ([]Dirent, error) {
 	return allDirents, nil
 }
 
+// encodeXattrEntry encodes a single xattr entry according to the standard EROFS on-disk format:
+// struct erofs_xattr_entry (4 bytes) + name suffix + value + 4-byte alignment padding.
+func encodeXattrEntry(k, val string) ([]byte, error) {
+	prefix := uint8(0)
+	suffix := k
+
+	if strings.HasPrefix(k, "user.") {
+		prefix = 1
+		suffix = strings.TrimPrefix(k, "user.")
+	} else if strings.HasPrefix(k, "system.posix_acl_access") {
+		prefix = 2
+		suffix = strings.TrimPrefix(k, "system.posix_acl_access")
+	} else if strings.HasPrefix(k, "system.posix_acl_default") {
+		prefix = 3
+		suffix = strings.TrimPrefix(k, "system.posix_acl_default")
+	} else if strings.HasPrefix(k, "trusted.") {
+		prefix = 4
+		suffix = strings.TrimPrefix(k, "trusted.")
+	} else if strings.HasPrefix(k, "security.") {
+		prefix = 5
+		suffix = strings.TrimPrefix(k, "security.")
+	}
+
+	nameBytes := []byte(suffix)
+	valBytes := []byte(val)
+
+	if len(nameBytes) > 255 {
+		return nil, fmt.Errorf("xattr name suffix %q exceeds 255 bytes limit", suffix)
+	}
+	if len(valBytes) > 65535 {
+		return nil, fmt.Errorf("xattr value for %q exceeds 65535 bytes limit", k)
+	}
+
+	rawLen := 4 + len(nameBytes) + len(valBytes)
+	padLen := (4 - (rawLen % 4)) % 4
+	totalLen := rawLen + padLen
+
+	buf := make([]byte, totalLen)
+	buf[0] = uint8(len(nameBytes))
+	buf[1] = prefix
+	binary.LittleEndian.PutUint16(buf[2:4], uint16(len(valBytes)))
+	copy(buf[4:4+len(nameBytes)], nameBytes)
+	copy(buf[4+len(nameBytes):4+len(nameBytes)+len(valBytes)], valBytes)
+
+	return buf, nil
+}
+
+func formatXattrName(prefix uint8, suffix string) string {
+	switch prefix {
+	case 1:
+		return "user." + suffix
+	case 2:
+		return "system.posix_acl_access" + suffix
+	case 3:
+		return "system.posix_acl_default" + suffix
+	case 4:
+		return "trusted." + suffix
+	case 5:
+		return "security." + suffix
+	default:
+		return suffix
+	}
+}
+
 // BuildInlineXattrs constructs an EROFS inline xattr body buffer and computes xattr_icount.
 func BuildInlineXattrs(xattrs Xattrs) ([]byte, uint16, error) {
 	if xattrs.IsEmpty() {
@@ -775,62 +849,25 @@ func BuildInlineXattrs(xattrs Xattrs) ([]byte, uint16, error) {
 	}
 	sort.Strings(keys)
 
-	var buf []byte
-	// 1. struct erofs_xattr_ibody_header (4 bytes)
-	// h_shared_count = 0, h_reserved2[3] = 0
-	buf = append(buf, 0, 0, 0, 0)
-
-	// 2. Entries
+	var entriesBuf []byte
 	for _, k := range keys {
-		val := []byte(attrMap[k])
-		prefix := uint8(0)
-		suffix := k
-
-		if strings.HasPrefix(k, "user.") {
-			prefix = 1
-			suffix = strings.TrimPrefix(k, "user.")
-		} else if strings.HasPrefix(k, "system.posix_acl_access") {
-			prefix = 2
-			suffix = strings.TrimPrefix(k, "system.posix_acl_access")
-		} else if strings.HasPrefix(k, "system.posix_acl_default") {
-			prefix = 3
-			suffix = strings.TrimPrefix(k, "system.posix_acl_default")
-		} else if strings.HasPrefix(k, "trusted.") {
-			prefix = 4
-			suffix = strings.TrimPrefix(k, "trusted.")
-		} else if strings.HasPrefix(k, "security.") {
-			prefix = 5
-			suffix = strings.TrimPrefix(k, "security.")
+		enc, err := encodeXattrEntry(k, attrMap[k])
+		if err != nil {
+			return nil, 0, err
 		}
-
-		nameBytes := []byte(suffix)
-		nameLen := len(nameBytes)
-		valLen := len(val)
-
-		entryHdr := make([]byte, 4)
-		entryHdr[0] = uint8(nameLen)
-		entryHdr[1] = prefix
-		binary.LittleEndian.PutUint16(entryHdr[2:4], uint16(valLen))
-		buf = append(buf, entryHdr...)
-
-		buf = append(buf, nameBytes...)
-		namePad := (4 - (nameLen % 4)) % 4
-		for i := 0; i < namePad; i++ {
-			buf = append(buf, 0)
-		}
-
-		buf = append(buf, val...)
-		valPad := (4 - (valLen % 4)) % 4
-		for i := 0; i < valPad; i++ {
-			buf = append(buf, 0)
-		}
+		entriesBuf = append(entriesBuf, enc...)
 	}
 
-	xattrICount := uint16((len(buf) + 3) / 4)
+	buf := make([]byte, 12+len(entriesBuf))
+	// 1. struct erofs_xattr_ibody_header (12 bytes)
+	// h_name_filter = 0, h_shared_count = 0, h_reserved2[7] = 0
+	copy(buf[12:], entriesBuf)
+
+	xattrICount := uint16((len(buf) - 8) / 4)
 	return buf, xattrICount, nil
 }
 
-// ReadXattrs reads inline extended attributes for an inode.
+// ReadXattrs reads extended attributes (both shared and inline) for an inode.
 func ReadXattrs(r io.ReaderAt, sb *Superblock, inode *Inode) (Xattrs, error) {
 	if inode.XattrICount == 0 {
 		return Xattrs{}, nil
@@ -842,24 +879,60 @@ func ReadXattrs(r io.ReaderAt, sb *Superblock, inode *Inode) (Xattrs, error) {
 	}
 
 	offset := sb.InodeOffset(inode.NID) + headerSize
-	totalBytes := int(inode.XattrICount) * 4
+	totalBytes := 8 + int(inode.XattrICount)*4
 
 	buf := make([]byte, totalBytes)
 	n, err := r.ReadAt(buf, offset)
 	if err != nil && err != io.EOF {
-		return Xattrs{}, fmt.Errorf("failed to read inline xattrs: %w", err)
+		return Xattrs{}, fmt.Errorf("failed to read inline xattrs for NID %d: %w", inode.NID, err)
 	}
-	if n < 4 {
-		return Xattrs{}, fmt.Errorf("truncated xattr header")
+	if n < 12 {
+		return Xattrs{}, fmt.Errorf("truncated xattr header for NID %d", inode.NID)
 	}
 
-	sharedCount := int(buf[0])
-	pos := 4 + sharedCount*4
-	if pos > n {
-		return Xattrs{}, fmt.Errorf("shared xattr count exceeds buffer")
+	sharedCount := int(buf[4])
+	sharedEnd := 12 + sharedCount*4
+	if sharedEnd > n {
+		return Xattrs{}, fmt.Errorf("shared xattr count %d exceeds inline buffer %d for NID %d", sharedCount, n, inode.NID)
 	}
 
 	res := make(map[string]string)
+
+	// 1. Read shared xattrs
+	if sharedCount > 0 {
+		if sb.XattrBlkaddr == 0 {
+			return Xattrs{}, fmt.Errorf("inode %d references %d shared xattrs but superblock XattrBlkaddr is 0", inode.NID, sharedCount)
+		}
+		sharedBaseOffset := int64(sb.XattrBlkaddr) * int64(sb.BlockSize())
+
+		for i := 0; i < sharedCount; i++ {
+			xattrID := binary.LittleEndian.Uint32(buf[12+i*4 : 16+i*4])
+			entryOffset := sharedBaseOffset + int64(xattrID)*4
+
+			hdrBuf := make([]byte, 4)
+			if _, err := r.ReadAt(hdrBuf, entryOffset); err != nil {
+				return Xattrs{}, fmt.Errorf("failed to read shared xattr entry header at offset %d (id %d): %w", entryOffset, xattrID, err)
+			}
+
+			nameLen := int(hdrBuf[0])
+			namePrefix := hdrBuf[1]
+			valLen := int(binary.LittleEndian.Uint16(hdrBuf[2:4]))
+
+			bodyBuf := make([]byte, nameLen+valLen)
+			if _, err := r.ReadAt(bodyBuf, entryOffset+4); err != nil {
+				return Xattrs{}, fmt.Errorf("failed to read shared xattr body at offset %d (id %d): %w", entryOffset+4, xattrID, err)
+			}
+
+			nameSuffix := string(bodyBuf[:nameLen])
+			val := string(bodyBuf[nameLen : nameLen+valLen])
+
+			fullName := formatXattrName(namePrefix, nameSuffix)
+			res[fullName] = val
+		}
+	}
+
+	// 2. Read inline xattrs
+	pos := sharedEnd
 	for pos < n {
 		if pos+4 > n {
 			break
@@ -867,40 +940,26 @@ func ReadXattrs(r io.ReaderAt, sb *Superblock, inode *Inode) (Xattrs, error) {
 		nameLen := int(buf[pos])
 		namePrefix := buf[pos+1]
 		valLen := int(binary.LittleEndian.Uint16(buf[pos+2 : pos+4]))
-		pos += 4
 
 		if nameLen == 0 && valLen == 0 {
 			break
 		}
 
-		namePad := (4 - (nameLen % 4)) % 4
-		valPad := (4 - (valLen % 4)) % 4
+		rawLen := 4 + nameLen + valLen
+		padLen := (4 - (rawLen % 4)) % 4
+		entrySize := rawLen + padLen
 
-		if pos+nameLen+namePad+valLen+valPad > n {
+		if pos+rawLen > n {
 			break
 		}
 
-		nameSuffix := string(buf[pos : pos+nameLen])
-		pos += nameLen + namePad
+		nameSuffix := string(buf[pos+4 : pos+4+nameLen])
+		val := string(buf[pos+4+nameLen : pos+4+nameLen+valLen])
 
-		val := string(buf[pos : pos+valLen])
-		pos += valLen + valPad
-
-		fullName := nameSuffix
-		switch namePrefix {
-		case 1:
-			fullName = "user." + nameSuffix
-		case 2:
-			fullName = "system.posix_acl_access" + nameSuffix
-		case 3:
-			fullName = "system.posix_acl_default" + nameSuffix
-		case 4:
-			fullName = "trusted." + nameSuffix
-		case 5:
-			fullName = "security." + nameSuffix
-		}
-
+		fullName := formatXattrName(namePrefix, nameSuffix)
 		res[fullName] = val
+
+		pos += entrySize
 	}
 
 	return XattrsFromMap(res), nil
@@ -1331,12 +1390,20 @@ func splitPath(p string) []string {
 	return parts
 }
 
+type rawXattrEntry struct {
+	key     string
+	val     string
+	encoded []byte
+	size    int
+}
+
 // nodeInfo represents the lightweight layout metadata collected during Pass 1.
 type nodeInfo struct {
 	node           Node
 	nid            uint64
 	parentNID      uint64
 	name           string
+	fullPath       string
 	isDir          bool
 	isExtended     bool
 	mode           uint16
@@ -1347,6 +1414,9 @@ type nodeInfo struct {
 	dataLen        uint64
 	dataOffset     int64
 	dirData        []byte
+	inlineEntries  []rawXattrEntry
+	sharedEntries  []rawXattrEntry
+	sharedIDs      []uint32
 	xattrData      []byte
 	xattrICount    uint16
 	slotCount      uint64
@@ -1431,8 +1501,8 @@ func WriteImage(w io.WriterAt, root Node) error {
 	var autoNID uint64 = 0
 
 	// Recursively collect metadata of the nodes
-	var visit func(n Node, parentNID uint64, name string) (*nodeInfo, error)
-	visit = func(n Node, parentNID uint64, name string) (*nodeInfo, error) {
+	var visit func(n Node, parentNID uint64, name string, parentPath string) (*nodeInfo, error)
+	visit = func(n Node, parentNID uint64, name string, parentPath string) (*nodeInfo, error) {
 		var nid uint64
 		if n.Ino() != 0 || (n == root && len(nodes) == 0) {
 			nid = n.Ino()
@@ -1441,6 +1511,15 @@ func WriteImage(w io.WriterAt, root Node) error {
 		}
 		if nid+DefaultInodeStride > autoNID {
 			autoNID = nid + DefaultInodeStride
+		}
+
+		fullPath := "/"
+		if name != "" {
+			if parentPath == "/" {
+				fullPath = "/" + name
+			} else {
+				fullPath = parentPath + "/" + name
+			}
 		}
 
 		isExtended := n.Size() >= (1<<32) || n.UID() > 0xFFFF || n.GID() > 0xFFFF
@@ -1454,6 +1533,7 @@ func WriteImage(w io.WriterAt, root Node) error {
 			nid:        nid,
 			parentNID:  parentNID,
 			name:       name,
+			fullPath:   fullPath,
 			isDir:      n.IsDir(),
 			isExtended: isExtended,
 			mode:       n.Mode(),
@@ -1471,20 +1551,80 @@ func WriteImage(w io.WriterAt, root Node) error {
 		if xNode, ok := n.(XattrNode); ok {
 			xattrs := xNode.Xattrs()
 			if !xattrs.IsEmpty() {
-				xData, xICount, err := BuildInlineXattrs(xattrs)
-				if err != nil {
-					return nil, err
+				attrMap := xattrs.ToMap()
+				var keys []string
+				for k := range attrMap {
+					keys = append(keys, k)
 				}
-				info.xattrData = xData
-				info.xattrICount = xICount
-			}
-		}
+				sort.Strings(keys)
 
-		usedBytes := headerSize + 4*int(info.xattrICount)
-		slots := (usedBytes + SlotSize - 1) / SlotSize
-		info.slotCount = uint64(slots)
-		if info.slotCount > DefaultInodeStride {
-			return nil, fmt.Errorf("inode %d (name %q) footprint (%d slots, %d bytes) exceeds stride limit (%d slots)", nid, name, info.slotCount, usedBytes, DefaultInodeStride)
+				var rawEntries []rawXattrEntry
+				totalRawBytes := 0
+				for _, k := range keys {
+					enc, err := encodeXattrEntry(k, attrMap[k])
+					if err != nil {
+						return nil, fmt.Errorf("inode %d (path %q) invalid xattr %q: %w", nid, fullPath, k, err)
+					}
+					entry := rawXattrEntry{
+						key:     k,
+						val:     attrMap[k],
+						encoded: enc,
+						size:    len(enc),
+					}
+					rawEntries = append(rawEntries, entry)
+					totalRawBytes += entry.size
+				}
+
+				maxInlineSpace := DefaultInodeStride*SlotSize - headerSize
+				if 12+totalRawBytes <= maxInlineSpace {
+					// Everything fits inline
+					info.inlineEntries = rawEntries
+				} else {
+					// Spill to shared xattr area, largest first
+					type candidate struct {
+						idx  int
+						size int
+						key  string
+					}
+					candidates := make([]candidate, len(rawEntries))
+					for i, e := range rawEntries {
+						candidates[i] = candidate{idx: i, size: e.size, key: e.key}
+					}
+					sort.Slice(candidates, func(i, j int) bool {
+						if candidates[i].size != candidates[j].size {
+							return candidates[i].size > candidates[j].size
+						}
+						return candidates[i].key < candidates[j].key
+					})
+
+					spilled := make([]bool, len(rawEntries))
+					numSpilled := 0
+					inlineBytes := totalRawBytes
+
+					for _, c := range candidates {
+						spilled[c.idx] = true
+						numSpilled++
+						inlineBytes -= c.size
+						currentFootprint := 12 + 4*numSpilled + inlineBytes
+						if currentFootprint <= maxInlineSpace {
+							break
+						}
+					}
+
+					if 12+4*numSpilled+inlineBytes > maxInlineSpace {
+						maxCapacity := (maxInlineSpace - 12) / 4
+						return nil, fmt.Errorf("inode %d (path %q) xattrs count (%d) exceeds max capacity (%d) for stride limit (%d slots)", nid, fullPath, len(rawEntries), maxCapacity, DefaultInodeStride)
+					}
+
+					for i, e := range rawEntries {
+						if spilled[i] {
+							info.sharedEntries = append(info.sharedEntries, e)
+						} else {
+							info.inlineEntries = append(info.inlineEntries, e)
+						}
+					}
+				}
+			}
 		}
 
 		if metaNode, ok := n.(MetadataOnlyNode); ok && metaNode.IsMetadataOnly() {
@@ -1500,7 +1640,7 @@ func WriteImage(w io.WriterAt, root Node) error {
 			}
 
 			for _, child := range children {
-				_, err := visit(child, nid, child.Name())
+				_, err := visit(child, nid, child.Name(), fullPath)
 				if err != nil {
 					return nil, err
 				}
@@ -1509,7 +1649,7 @@ func WriteImage(w io.WriterAt, root Node) error {
 		return info, nil
 	}
 
-	_, err := visit(root, 0, "")
+	_, err := visit(root, 0, "", "")
 	if err != nil {
 		return err
 	}
@@ -1527,9 +1667,70 @@ func WriteImage(w io.WriterAt, root Node) error {
 			if prev.nid == curr.nid {
 				return fmt.Errorf("duplicate inode number / NID %d for nodes %q and %q", curr.nid, curr.name, prev.name)
 			}
-			if prev.nid+prev.slotCount > curr.nid {
-				return fmt.Errorf("overlapping inode slot allocation: node %q (nid %d, %d slots) overlaps with node %q (nid %d, %d slots)", prev.name, prev.nid, prev.slotCount, curr.name, curr.nid, curr.slotCount)
+		}
+	}
+
+	// Global shared xattr table deduplication
+	sharedPool := make(map[string]uint32)
+	var sharedData []byte
+	for _, n := range nodes {
+		for _, se := range n.sharedEntries {
+			dedupKey := string(se.encoded)
+			if id, ok := sharedPool[dedupKey]; ok {
+				n.sharedIDs = append(n.sharedIDs, id)
+			} else {
+				id := uint32(len(sharedData) / 4)
+				sharedPool[dedupKey] = id
+				sharedData = append(sharedData, se.encoded...)
+				n.sharedIDs = append(n.sharedIDs, id)
 			}
+		}
+	}
+
+	// Build inline xattr buffer and verify stride slot limits
+	for _, n := range nodes {
+		headerSize := 32
+		if n.isExtended {
+			headerSize = 64
+		}
+
+		if len(n.sharedIDs) == 0 && len(n.inlineEntries) == 0 {
+			n.xattrData = nil
+			n.xattrICount = 0
+			n.slotCount = uint64((headerSize + SlotSize - 1) / SlotSize)
+		} else {
+			inlineBufLen := 12 + 4*len(n.sharedIDs)
+			for _, ie := range n.inlineEntries {
+				inlineBufLen += len(ie.encoded)
+			}
+
+			buf := make([]byte, inlineBufLen)
+			buf[4] = uint8(len(n.sharedIDs))
+			for i, id := range n.sharedIDs {
+				binary.LittleEndian.PutUint32(buf[12+i*4:16+i*4], id)
+			}
+			pos := 12 + 4*len(n.sharedIDs)
+			for _, ie := range n.inlineEntries {
+				copy(buf[pos:], ie.encoded)
+				pos += len(ie.encoded)
+			}
+
+			n.xattrData = buf
+			n.xattrICount = uint16((inlineBufLen - 8) / 4)
+			usedBytes := headerSize + len(n.xattrData)
+			n.slotCount = uint64((usedBytes + SlotSize - 1) / SlotSize)
+			if n.slotCount > DefaultInodeStride {
+				return fmt.Errorf("inode %d (path %q) footprint (%d slots, %d bytes) exceeds stride limit (%d slots)", n.nid, n.fullPath, n.slotCount, usedBytes, DefaultInodeStride)
+			}
+		}
+	}
+
+	// Re-verify overlapping after calculating exact slot counts
+	for i := 1; i < len(sortedNodes); i++ {
+		prev := sortedNodes[i-1]
+		curr := sortedNodes[i]
+		if prev.nid+prev.slotCount > curr.nid {
+			return fmt.Errorf("overlapping inode slot allocation: node %q (nid %d, %d slots) overlaps with node %q (nid %d, %d slots)", prev.name, prev.nid, prev.slotCount, curr.name, curr.nid, curr.slotCount)
 		}
 	}
 
@@ -1596,6 +1797,13 @@ func WriteImage(w io.WriterAt, root Node) error {
 	metaBlkaddr := int64(1)
 	currentBlock := metaBlkaddr + inodesBlocks
 
+	var xattrBlkaddr int64 = 0
+	if len(sharedData) > 0 {
+		xattrBlkaddr = currentBlock
+		sharedBlocks := (int64(len(sharedData)) + blockSize - 1) / blockSize
+		currentBlock += sharedBlocks
+	}
+
 	for _, n := range nodes {
 		if n.isDir && n.dataLen > 0 {
 			n.dataOffset = currentBlock * blockSize
@@ -1613,12 +1821,13 @@ func WriteImage(w io.WriterAt, root Node) error {
 	totalBlocks := uint32(currentBlock)
 
 	sb := &Superblock{
-		Magic:       SuperMagic,
-		Blkszbits:   12,
-		RootNID:     uint16(nodes[0].nid),
-		Inodes:      uint64(len(nodes)),
-		Blocks:      totalBlocks,
-		MetaBlkaddr: uint32(metaBlkaddr),
+		Magic:        SuperMagic,
+		Blkszbits:    12,
+		RootNID:      uint16(nodes[0].nid),
+		Inodes:       uint64(len(nodes)),
+		Blocks:       totalBlocks,
+		MetaBlkaddr:  uint32(metaBlkaddr),
+		XattrBlkaddr: uint32(xattrBlkaddr),
 	}
 	if nodes[0].nid > 0xFFFF {
 		sb.RootNID8b = nodes[0].nid
@@ -1632,6 +1841,7 @@ func WriteImage(w io.WriterAt, root Node) error {
 	binary.LittleEndian.PutUint64(sbBuf[16:24], sb.Inodes)
 	binary.LittleEndian.PutUint32(sbBuf[36:40], sb.Blocks)
 	binary.LittleEndian.PutUint32(sbBuf[40:44], sb.MetaBlkaddr)
+	binary.LittleEndian.PutUint32(sbBuf[44:48], sb.XattrBlkaddr)
 	if sb.RootNID8b != 0 {
 		binary.LittleEndian.PutUint64(sbBuf[110:118], sb.RootNID8b)
 	}
@@ -1668,6 +1878,20 @@ func WriteImage(w io.WriterAt, root Node) error {
 			pad := make([]byte, totalAllocated-usedBytes)
 			if _, err := w.WriteAt(pad, inodeOffset+int64(usedBytes)); err != nil {
 				return fmt.Errorf("failed to write xattr padding for NID %d: %w", n.nid, err)
+			}
+		}
+	}
+
+	if len(sharedData) > 0 {
+		sharedOffset := xattrBlkaddr * blockSize
+		if _, err := w.WriteAt(sharedData, sharedOffset); err != nil {
+			return fmt.Errorf("failed to write shared xattr table: %w", err)
+		}
+		sharedTail := int64(len(sharedData)) % blockSize
+		if sharedTail > 0 {
+			pad := make([]byte, blockSize-sharedTail)
+			if _, err := w.WriteAt(pad, sharedOffset+int64(len(sharedData))); err != nil {
+				return fmt.Errorf("failed to write shared xattr padding: %w", err)
 			}
 		}
 	}
