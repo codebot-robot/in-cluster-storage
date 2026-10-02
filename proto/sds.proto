@@ -1,0 +1,46 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package sds.v1;
+
+option go_package = "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1;v1";
+
+import "google/protobuf/descriptor.proto";
+import "google/protobuf/timestamp.proto";
+
+message TypeDefinition {
+  uint32 id = 1;
+  string name = 2;
+  bytes fingerprint = 3;
+  google.protobuf.FileDescriptorSet descriptors = 4;
+  repeated int32 key_fields = 5;
+}
+
+message TxCommit {
+  uint64 tx_id = 1;
+  google.protobuf.Timestamp commit_time = 2;
+}
+
+message SnapshotPointer {
+  uint64 position = 1;
+  string format = 2;
+  string location = 3;
+  bytes registry_fingerprint = 4;
+}
+
+message Registry {
+  repeated TypeDefinition types = 1;
+}
