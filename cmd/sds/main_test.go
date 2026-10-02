@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -24,7 +25,9 @@ import (
 	"testing"
 	"time"
 
+	objectfspb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -310,5 +313,48 @@ func TestSdsCatValidationErrors(t *testing.T) {
 	_, err = executeCommand(t.Context(), "cat", "--server", "localhost:50051", "--stream", uuid.NewString(), "--segment", "foo.wal")
 	if err == nil || !strings.Contains(err.Error(), "cannot specify both") {
 		t.Errorf("expected cannot specify both error, got %v", err)
+	}
+}
+
+func TestSdsCatObjectFSStream(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := controller.NewMemoryBackend()
+	volumeID := "cat-test-vol"
+
+	server := controller.NewServer(backend, controller.WithServerWAL(walDir, "", walclient.Local))
+	defer func() { _ = server.Close() }()
+
+	_, err := server.Mkdir(ctx, &objectfspb.MkdirRequest{VolumeId: volumeID, Path: "/cats", Mode: 0755})
+	if err != nil {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+
+	vol := server.GetVolume(volumeID)
+	if vol == nil || vol.Stream() == nil {
+		t.Fatalf("Expected active volume stream")
+	}
+
+	files, err := filepath.Glob(filepath.Join(walDir, fmt.Sprintf("stream-%s-*.wal", vol.StreamID())))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("No segment file found: %v", err)
+	}
+
+	out, err := executeCommand(ctx, "cat", "--segment", files[0])
+	if err != nil {
+		t.Fatalf("sds cat failed: %v", err)
+	}
+
+	if !strings.Contains(out, "objectfs.v1alpha1.Inode") {
+		t.Errorf("expected Inode type definition in sds cat output, got: %s", out)
+	}
+	if !strings.Contains(out, "objectfs.v1alpha1.DirEntry") {
+		t.Errorf("expected DirEntry type definition in sds cat output, got: %s", out)
+	}
+	if !strings.Contains(out, "sds.v1.OpRecord") {
+		t.Errorf("expected OpRecord in sds cat output, got: %s", out)
+	}
+	if !strings.Contains(out, "sds.v1.TxCommit") {
+		t.Errorf("expected TxCommit in sds cat output, got: %s", out)
 	}
 }

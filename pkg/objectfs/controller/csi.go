@@ -87,7 +87,9 @@ func (c *CSIController) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 	}
 
 	// Initialize the volume in the server
-	_ = c.server.getOrCreateVolume(volumeID)
+	if _, err := c.server.getOrCreateVolume(volumeID); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
+	}
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
