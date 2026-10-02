@@ -3,7 +3,7 @@ title: "Implementations & Roadmap"
 kicker: "Software & Specifications"
 summary: "Reference Go implementation, architecture decisions, and active roadmap under Issue #97."
 status_note: "Experimental development in the gke-labs/in-cluster-storage repository."
-next_url: "/idea/"
+next_url: "idea/"
 next_title: "Back to The Idea"
 ---
 

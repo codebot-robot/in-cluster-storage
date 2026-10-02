@@ -23,6 +23,8 @@ make build          # builds the site into public/
 
 ## Domains & Deployment
 
-- Base URL defaults to `https://structured-data-streams.com/`.
-- The GitHub Actions workflow (`.github/workflows/site.yml`) overrides `baseURL` with the GitHub Pages URL in CI/CD, enabling preview deployments on forks and branches.
-- Once a custom domain is configured in Pages, a `CNAME` can be added to `static/CNAME`.
+- Base URL defaults to `https://structured-data-streams.com/` in `hugo.toml`.
+- GitHub Pages must be configured with the **GitHub Actions** build and deployment source in repository settings (**Settings → Pages → Build and deployment → Source: GitHub Actions**).
+- A custom domain is configured directly in repository settings under **Settings → Pages → Custom domain**, plus DNS records at the registrar. When publishing via a GitHub Actions workflow, GitHub manages custom domain routing through repository settings and ignores any `CNAME` file.
+- The site deploys automatically on any push to `main` touching `site/**` or `.github/workflows/site.yml`, or can be triggered manually via `gh workflow run site.yml --ref main`.
+- Pull request builds compile against a subpath base URL and run an automated link check to ensure all internal navigation links preserve subpaths.
