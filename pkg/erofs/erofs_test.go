@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -643,23 +644,35 @@ func TestErofsStridedPlacementAndExtendedInodes(t *testing.T) {
 		}
 	})
 
-	t.Run("Over-stride footprint rejected", func(t *testing.T) {
-		// Create many xattrs that exceed 8 slots (256 bytes)
+	t.Run("Over-stride footprint rejected when exceeding shared budget", func(t *testing.T) {
+		// Create > 45 xattrs on an extended inode so that even with all xattrs shared,
+		// the inline header + shared ID references exceed 8 slots (256 bytes).
 		manyXattrs := Xattrs{
-			UserDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-			Others: map[string]string{
-				"user.attr1": strings.Repeat("a", 100),
-				"user.attr2": strings.Repeat("b", 100),
-				"user.attr3": strings.Repeat("c", 100),
-			},
+			Others: make(map[string]string),
 		}
-		fileTooBig := NewMemoryNode("huge_xattrs.txt", false, 0644, []byte("data"), nil, WithIno(8), WithXattrs(manyXattrs))
+		for i := 0; i < 50; i++ {
+			manyXattrs.Others[fmt.Sprintf("user.attr_%02d", i)] = fmt.Sprintf("val_%d", i)
+		}
+		fileTooBig := NewMemoryNode(
+			"huge_xattrs.txt",
+			false,
+			0644,
+			nil,
+			nil,
+			WithIno(8),
+			WithMetadataOnly(true),
+			WithSize(5*1024*1024*1024), // Extended inode
+			WithXattrs(manyXattrs),
+		)
 		root := NewMemoryNode("", true, 0755, nil, []Node{fileTooBig}, WithIno(0))
 
 		mw := &memoryWriterAt{}
 		err := WriteImage(mw, root)
 		if err == nil {
-			t.Fatalf("expected WriteImage to fail when xattr footprint exceeds stride")
+			t.Fatalf("expected WriteImage to fail when xattr count exceeds stride capacity")
+		}
+		if !strings.Contains(err.Error(), "huge_xattrs.txt") || !strings.Contains(err.Error(), "8") {
+			t.Fatalf("expected error to name path and inode, got: %v", err)
 		}
 	})
 
@@ -696,4 +709,305 @@ func TestErofsStridedPlacementAndExtendedInodes(t *testing.T) {
 			t.Fatalf("expected 502 dirents, got %d", len(dirents))
 		}
 	})
+}
+
+// verifyWithFsckErofs runs external fsck.erofs if installed on the system.
+func verifyWithFsckErofs(t *testing.T, imgBytes []byte) {
+	fsckPath, err := exec.LookPath("fsck.erofs")
+	if err != nil {
+		t.Logf("fsck.erofs not found in PATH, skipping external fsck validation")
+		return
+	}
+
+	tmpFile, err := os.CreateTemp("", "erofs_test_*.img")
+	if err != nil {
+		t.Fatalf("failed to create temp file for fsck.erofs: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write(imgBytes); err != nil {
+		t.Fatalf("failed to write img to temp file: %v", err)
+	}
+	_ = tmpFile.Close()
+
+	cmd := exec.Command(fsckPath, "-d9", "--xattrs", tmpFile.Name())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("external fsck.erofs failed on generated image: %v\nOutput: %s", err, string(out))
+	}
+}
+
+func TestErofsXattrSpillingTable(t *testing.T) {
+	// Table from Issue #137:
+	// 1. digest only, compact (file1) / extended (file2)
+	// 2. digest + user.objectfs.manifest, extended (file3)
+	// 3. digest + user.objectfs.manifest + one 32-byte user xattr, extended (file4) -> spills
+	// 4. digest + user.objectfs.manifest + SELinux label, compact (file5) / extended (file6) -> spills
+
+	digestVal := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	manifestVal := "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	user32Val := "this_is_a_32_byte_custom_user_xattr"
+	selinuxVal := "system_u:object_r:container_file_t:s0"
+
+	f1Xattrs := Xattrs{UserDigest: digestVal}
+	f2Xattrs := Xattrs{UserDigest: digestVal}
+	f3Xattrs := Xattrs{UserDigest: digestVal, UserManifest: manifestVal}
+	f4Xattrs := Xattrs{
+		UserDigest:   digestVal,
+		UserManifest: manifestVal,
+		Others: map[string]string{
+			"user.custom32": user32Val,
+		},
+	}
+	f5Xattrs := Xattrs{
+		UserDigest:   digestVal,
+		UserManifest: manifestVal,
+		Others: map[string]string{
+			"security.selinux": selinuxVal,
+		},
+	}
+	f6Xattrs := Xattrs{
+		UserDigest:   digestVal,
+		UserManifest: manifestVal,
+		Others: map[string]string{
+			"security.selinux": selinuxVal,
+		},
+	}
+
+	f1 := NewMemoryNode("f1_digest_compact.txt", false, 0644, []byte("f1"), nil, WithIno(8), WithXattrs(f1Xattrs))
+	f2 := NewMemoryNode("f2_digest_extended.txt", false, 0644, nil, nil, WithIno(16), WithMetadataOnly(true), WithSize(5*1024*1024*1024), WithXattrs(f2Xattrs))
+	f3 := NewMemoryNode("f3_manifest_extended.txt", false, 0644, nil, nil, WithIno(24), WithMetadataOnly(true), WithSize(5*1024*1024*1024), WithXattrs(f3Xattrs))
+	f4 := NewMemoryNode("f4_user32_extended.txt", false, 0644, nil, nil, WithIno(32), WithMetadataOnly(true), WithSize(5*1024*1024*1024), WithXattrs(f4Xattrs))
+	f5 := NewMemoryNode("f5_selinux_compact.txt", false, 0644, []byte("f5"), nil, WithIno(40), WithXattrs(f5Xattrs))
+	f6 := NewMemoryNode("f6_selinux_extended.txt", false, 0644, nil, nil, WithIno(48), WithMetadataOnly(true), WithSize(5*1024*1024*1024), WithXattrs(f6Xattrs))
+
+	root := NewMemoryNode("", true, 0755, nil, []Node{f1, f2, f3, f4, f5, f6}, WithIno(0))
+
+	mw := &memoryWriterAt{}
+	if err := WriteImage(mw, root); err != nil {
+		t.Fatalf("WriteImage failed: %v", err)
+	}
+
+	readerAt := bytes.NewReader(mw.buf)
+	if err := Fsck(readerAt); err != nil {
+		t.Fatalf("Fsck failed: %v", err)
+	}
+	verifyWithFsckErofs(t, mw.buf)
+
+	reader, err := NewReader(readerAt)
+	if err != nil {
+		t.Fatalf("NewReader failed: %v", err)
+	}
+
+	tests := []struct {
+		nid      uint64
+		expected Xattrs
+	}{
+		{8, f1Xattrs},
+		{16, f2Xattrs},
+		{24, f3Xattrs},
+		{32, f4Xattrs},
+		{40, f5Xattrs},
+		{48, f6Xattrs},
+	}
+
+	for _, tc := range tests {
+		got, err := reader.GetXattrs(tc.nid)
+		if err != nil {
+			t.Fatalf("GetXattrs(nid=%d) failed: %v", tc.nid, err)
+		}
+		if got.UserDigest != tc.expected.UserDigest {
+			t.Errorf("nid=%d UserDigest mismatch: expected %q, got %q", tc.nid, tc.expected.UserDigest, got.UserDigest)
+		}
+		if got.UserManifest != tc.expected.UserManifest {
+			t.Errorf("nid=%d UserManifest mismatch: expected %q, got %q", tc.nid, tc.expected.UserManifest, got.UserManifest)
+		}
+		for k, expectedVal := range tc.expected.Others {
+			if got.Others[k] != expectedVal {
+				t.Errorf("nid=%d others[%q] mismatch: expected %q, got %q", tc.nid, k, expectedVal, got.Others[k])
+			}
+		}
+	}
+}
+
+func TestErofsXattr16KiBValue(t *testing.T) {
+	largeVal := strings.Repeat("A1b2C3d4E5f6G7h8", 1024) // 16 KiB
+	fileXattrs := Xattrs{
+		UserDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Others: map[string]string{
+			"user.large_payload": largeVal,
+		},
+	}
+
+	file := NewMemoryNode("large_xattr.bin", false, 0644, []byte("file data"), nil, WithIno(8), WithXattrs(fileXattrs))
+	root := NewMemoryNode("", true, 0755, nil, []Node{file}, WithIno(0))
+
+	mw := &memoryWriterAt{}
+	if err := WriteImage(mw, root); err != nil {
+		t.Fatalf("WriteImage failed with 16KiB xattr: %v", err)
+	}
+
+	readerAt := bytes.NewReader(mw.buf)
+	if err := Fsck(readerAt); err != nil {
+		t.Fatalf("Fsck failed on 16KiB xattr image: %v", err)
+	}
+	verifyWithFsckErofs(t, mw.buf)
+
+	reader, err := NewReader(readerAt)
+	if err != nil {
+		t.Fatalf("NewReader failed: %v", err)
+	}
+
+	got, err := reader.GetXattrs(8)
+	if err != nil {
+		t.Fatalf("GetXattrs failed: %v", err)
+	}
+	if got.UserDigest != fileXattrs.UserDigest {
+		t.Errorf("UserDigest mismatch: expected %q, got %q", fileXattrs.UserDigest, got.UserDigest)
+	}
+	if got.Others["user.large_payload"] != largeVal {
+		t.Errorf("user.large_payload mismatch: length got=%d, expected=%d", len(got.Others["user.large_payload"]), len(largeVal))
+	}
+}
+
+func TestErofsSharedXattrDeduplication(t *testing.T) {
+	sharedVal := strings.Repeat("shared-security-context-data-", 50) // ~1500 bytes
+	sharedXattrs := Xattrs{
+		UserDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Others: map[string]string{
+			"security.selinux": "system_u:object_r:container_file_t:s0",
+			"trusted.policy":   sharedVal,
+		},
+	}
+
+	var files []Node
+	for i := 0; i < 10; i++ {
+		ino := uint64((i + 1) * DefaultInodeStride)
+		files = append(files, NewMemoryNode(
+			fmt.Sprintf("shared_file_%d.txt", i),
+			false,
+			0644,
+			[]byte("hello"),
+			nil,
+			WithIno(ino),
+			WithXattrs(sharedXattrs),
+		))
+	}
+	root := NewMemoryNode("", true, 0755, nil, files, WithIno(0))
+
+	mw := &memoryWriterAt{}
+	if err := WriteImage(mw, root); err != nil {
+		t.Fatalf("WriteImage failed: %v", err)
+	}
+
+	readerAt := bytes.NewReader(mw.buf)
+	if err := Fsck(readerAt); err != nil {
+		t.Fatalf("Fsck failed on deduplicated image: %v", err)
+	}
+	verifyWithFsckErofs(t, mw.buf)
+
+	reader, err := NewReader(readerAt)
+	if err != nil {
+		t.Fatalf("NewReader failed: %v", err)
+	}
+
+	// Verify all files can retrieve the identical shared xattr values accurately
+	for i := 0; i < 10; i++ {
+		ino := uint64((i + 1) * DefaultInodeStride)
+		got, err := reader.GetXattrs(ino)
+		if err != nil {
+			t.Fatalf("GetXattrs for file %d failed: %v", i, err)
+		}
+		if got.Others["trusted.policy"] != sharedVal {
+			t.Errorf("File %d trusted.policy mismatch", i)
+		}
+		if got.Others["security.selinux"] != "system_u:object_r:container_file_t:s0" {
+			t.Errorf("File %d security.selinux mismatch", i)
+		}
+	}
+}
+
+func TestErofsRootRegistryMultiKilobyteXattr(t *testing.T) {
+	registryPayload := strings.Repeat("stream-schema-registry-definition-metadata;", 200) // ~8.6 KiB
+	rootXattrs := Xattrs{
+		Others: map[string]string{
+			"trusted.sds.registry": registryPayload,
+		},
+	}
+
+	childXattrs := Xattrs{
+		UserDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}
+	child := NewMemoryNode("data.parquet", false, 0644, []byte("data"), nil, WithIno(8), WithXattrs(childXattrs))
+	root := NewMemoryNode("", true, 0755, nil, []Node{child}, WithIno(0), WithXattrs(rootXattrs))
+
+	mw := &memoryWriterAt{}
+	if err := WriteImage(mw, root); err != nil {
+		t.Fatalf("WriteImage failed with root multi-kilobyte registry: %v", err)
+	}
+
+	readerAt := bytes.NewReader(mw.buf)
+	if err := Fsck(readerAt); err != nil {
+		t.Fatalf("Fsck failed on root registry image: %v", err)
+	}
+	verifyWithFsckErofs(t, mw.buf)
+
+	reader, err := NewReader(readerAt)
+	if err != nil {
+		t.Fatalf("NewReader failed: %v", err)
+	}
+
+	rootGot, err := reader.GetXattrs(0)
+	if err != nil {
+		t.Fatalf("GetXattrs for root failed: %v", err)
+	}
+	if rootGot.Others["trusted.sds.registry"] != registryPayload {
+		t.Fatalf("Root registry payload mismatch: length got=%d, expected=%d", len(rootGot.Others["trusted.sds.registry"]), len(registryPayload))
+	}
+
+	childGot, err := reader.GetXattrs(8)
+	if err != nil {
+		t.Fatalf("GetXattrs for child failed: %v", err)
+	}
+	if childGot.UserDigest != childXattrs.UserDigest {
+		t.Fatalf("Child digest mismatch: expected %q, got %q", childXattrs.UserDigest, childGot.UserDigest)
+	}
+}
+
+func TestErofsPerInodeBudgetEnforcement(t *testing.T) {
+	// 50 xattrs on an extended inode exceeds the maximum 45 references capacity for 8 slots.
+	manyXattrs := Xattrs{
+		Others: make(map[string]string),
+	}
+	for i := 0; i < 50; i++ {
+		manyXattrs.Others[fmt.Sprintf("user.custom_attr_%02d", i)] = fmt.Sprintf("val_%d", i)
+	}
+
+	file := NewMemoryNode(
+		"budget_test.txt",
+		false,
+		0644,
+		nil,
+		nil,
+		WithIno(8),
+		WithMetadataOnly(true),
+		WithSize(5*1024*1024*1024), // Extended inode
+		WithXattrs(manyXattrs),
+	)
+	root := NewMemoryNode("", true, 0755, nil, []Node{file}, WithIno(0))
+
+	mw := &memoryWriterAt{}
+	err := WriteImage(mw, root)
+	if err == nil {
+		t.Fatalf("expected WriteImage to fail due to per-inode budget limit")
+	}
+
+	expectedPath := "/budget_test.txt"
+	expectedInode := "8"
+	if !strings.Contains(err.Error(), expectedPath) {
+		t.Errorf("expected error to contain path %q, got: %v", expectedPath, err)
+	}
+	if !strings.Contains(err.Error(), expectedInode) {
+		t.Errorf("expected error to contain inode %q, got: %v", expectedInode, err)
+	}
 }
