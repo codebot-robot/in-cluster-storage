@@ -1,0 +1,214 @@
+{{ define "main" }}
+<div class="home-container">
+  <section class="hero">
+    <div class="wrap hero-wrap">
+      <div class="status-pill">
+        <span class="status-dot"></span>
+        <span class="status-text">Status: Design Proposal &amp; Experimental Implementation</span>
+      </div>
+      <h1 class="hero-title">The Log is the Source of Truth</h1>
+      <p class="hero-tag">
+        SQL databases, analytics tables, and filesystem images are all <em>snapshots</em> of an authoritative, typed stream of proto records at a position.
+      </p>
+
+      <div class="hero-actions">
+        <a class="btn primary" href="{{ "/idea/" | relURL }}">Explore The Idea</a>
+        <a class="btn ghost" href="{{ "/format/" | relURL }}">The Wire Format</a>
+        <a class="btn ghost" href="{{ "/projections/" | relURL }}">Projections</a>
+        <a class="btn ghost" href="{{ site.Params.repo }}" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section arch-section">
+    <div class="wrap">
+      <div class="section-header">
+        <span class="section-kicker">Architecture</span>
+        <h2>Four Independent Layers</h2>
+        <p>A layered model where the transport is opaque, types are defined in-band, and all databases are derived views.</p>
+      </div>
+
+      <div class="layer-stack">
+        <div class="layer-card l3">
+          <div class="layer-num">Layer 3</div>
+          <div class="layer-body">
+            <h3>Projections (Snapshots at Position <code>P</code>)</h3>
+            <p>Interchangeable, rebuildable snapshots carrying the type registry in force at <code>P</code>.</p>
+            <div class="layer-chips">
+              <span class="chip">SQLite (OLTP &amp; Key-Value)</span>
+              <span class="chip">Parquet (OLAP Scans)</span>
+              <span class="chip">Iceberg (Table Commits)</span>
+              <span class="chip">EROFS (Filesystems)</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="layer-connector">▼</div>
+
+        <div class="layer-card l2">
+          <div class="layer-num">Layer 2</div>
+          <div class="layer-body">
+            <h3>Logical Change Log</h3>
+            <p>Application messages as tables, row-level mutations, multi-record transactions, and compatible in-place schema evolution.</p>
+            <div class="layer-chips">
+              <span class="chip"><code>RowChange { INSERT, UPDATE, DELETE }</code></span>
+              <span class="chip"><code>TxCommit</code></span>
+              <span class="chip">Primary Key Inference</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="layer-connector">▼</div>
+
+        <div class="layer-card l1">
+          <div class="layer-num">Layer 1</div>
+          <div class="layer-body">
+            <h3>Record Typing</h3>
+            <p>Lightweight <code>varint(type_id) body</code> framing. Type 1 registers protobuf descriptors in-band before first use.</p>
+            <div class="layer-chips">
+              <span class="chip"><code>1-2 Byte Type IDs</code></span>
+              <span class="chip"><code>TypeDefinition</code></span>
+              <span class="chip"><code>SnapshotPointer</code></span>
+              <span class="chip">End-to-End Encryption Ready</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="layer-connector">▼</div>
+
+        <div class="layer-card l0">
+          <div class="layer-num">Layer 0</div>
+          <div class="layer-body">
+            <h3>Streams Transport (Opaque &amp; Append-Only)</h3>
+            <p>Sequential stream sequence numbers, CRC32C checksums, segment-based durability, and local / witness / permanent replication.</p>
+            <div class="layer-chips">
+              <span class="chip">Single-Writer per Stream</span>
+              <span class="chip">Total Ordering</span>
+              <span class="chip">Opaque Byte Payloads</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section features-section">
+    <div class="wrap">
+      <div class="section-header">
+        <span class="section-kicker">Core Principles</span>
+        <h2>Why Structured Data Streams?</h2>
+      </div>
+
+      <div class="grid cards-grid">
+        <a class="card feature-card" href="{{ "/idea/" | relURL }}">
+          <div class="card-icon">⚡</div>
+          <h3>No Dual-Write Problem</h3>
+          <p>Writes hit exactly one place: the append-only stream. SQLite databases, Parquet tables, and caches update deterministically by tailing the log.</p>
+          <span class="card-arrow">Learn more →</span>
+        </a>
+
+        <a class="card feature-card" href="{{ "/idea/" | relURL }}#restore-and-time-travel">
+          <div class="card-icon">⏱</div>
+          <h3>Time Travel &amp; Instant Restore</h3>
+          <p>To restore state at any position <code>Q</code>, pick the latest snapshot at <code>P ≤ Q</code> and replay forward. Snapshots also act as the retention anchor to trim old log segments.</p>
+          <span class="card-arrow">Learn more →</span>
+        </a>
+
+        <a class="card feature-card" href="{{ "/format/" | relURL }}">
+          <div class="card-icon">📦</div>
+          <h3>Efficient, Self-Describing Wire Format</h3>
+          <p>1–2 byte type prefixes. Protobuf descriptors sent once in-band. Unknown fields are preserved, schema migrations happen in place, and ten-year-old segments remain decodable.</p>
+          <span class="card-arrow">Inspect wire format →</span>
+        </a>
+
+        <a class="card feature-card" href="{{ "/projections/" | relURL }}">
+          <div class="card-icon">🗄</div>
+          <h3>OLTP &amp; OLAP from One Stream</h3>
+          <p>Serve indexed point lookups from SQLite with sub-millisecond local reads, while DuckDB and Spark query columnar Parquet snapshots generated from the exact same stream.</p>
+          <span class="card-arrow">Explore projections →</span>
+        </a>
+
+        <a class="card feature-card" href="{{ "/case-study/" | relURL }}">
+          <div class="card-icon">📁</div>
+          <h3>Filesystems as Tables: ObjectFS</h3>
+          <p>ObjectFS expresses directory trees and inodes as proto messages over an SDS stream, projecting high-performance read-only EROFS images for containers.</p>
+          <span class="card-arrow">Read case study →</span>
+        </a>
+
+        <a class="card feature-card" href="{{ "/faq/" | relURL }}">
+          <div class="card-icon">💡</div>
+          <h3>Design Trade-offs &amp; FAQ</h3>
+          <p>Why Protobuf over Avro? Why not <code>google.protobuf.Any</code> or <code>oneof</code>? How SDS complements Iceberg and Delta Lake rather than competing with them.</p>
+          <span class="card-arrow">Read the FAQ →</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section matrix-section">
+    <div class="wrap">
+      <div class="section-header">
+        <span class="section-kicker">Projections Matrix</span>
+        <h2>One Stream, Multiple Specialized Views</h2>
+      </div>
+
+      <div class="table-wrap">
+        <table class="matrix-table">
+          <thead>
+            <tr>
+              <th>Projection</th>
+              <th>Format</th>
+              <th>Primary Workload</th>
+              <th>Query Engines</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>OLTP Snapshot</strong></td>
+              <td>SQLite database file</td>
+              <td>Point lookups, single-row edits, index serving</td>
+              <td>SQLite, SQLite WAL read replicas</td>
+            </tr>
+            <tr>
+              <td><strong>OLAP Snapshot</strong></td>
+              <td>Parquet directory / files</td>
+              <td>Analytical scans, bulk aggregations</td>
+              <td>DuckDB, Apache Spark, Polars, Trino</td>
+            </tr>
+            <tr>
+              <td><strong>Table Format</strong></td>
+              <td>Apache Iceberg metadata</td>
+              <td>ACID lakehouse queries, partition pruning</td>
+              <td>Iceberg catalog, Snowflake, BigQuery</td>
+            </tr>
+            <tr>
+              <td><strong>Filesystem Image</strong></td>
+              <td>EROFS image</td>
+              <td>Container rootfs, low-latency FUSE metadata</td>
+              <td>Linux kernel erofs, ObjectFS FUSE daemon</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section status-section">
+    <div class="wrap narrow text-center">
+      <div class="status-box">
+        <h3>Project Status &amp; Roadmap</h3>
+        <p>
+          Structured Data Streams is currently a <strong>design proposal</strong> with an active, experimental Go implementation under development in <a href="{{ site.Params.repo }}">in-cluster-storage</a>.
+        </p>
+        <p class="status-disclaimer">
+          We make no premature performance or production-readiness claims. Specifications, conformance suites, and reference implementations are evolving.
+        </p>
+        <div class="status-links">
+          <a class="btn primary" href="{{ "/implementations/" | relURL }}">View Implementation Status</a>
+          <a class="btn ghost" href="{{ site.Params.repo }}/issues/97" target="_blank" rel="noopener">Tracking Issue #97</a>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+{{ end }}

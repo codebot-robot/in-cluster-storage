@@ -1,1 +1,6 @@
 .build/
+
+# website build outputs
+site/public/
+site/resources/_gen/
+site/.hugo_build.lock

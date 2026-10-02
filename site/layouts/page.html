@@ -1,0 +1,31 @@
+{{ define "main" }}
+<div class="page-container">
+  <article class="wrap narrow post">
+    <header class="page-header">
+      {{ with .Params.kicker }}<div class="crumb">{{ . }}</div>{{ end }}
+      <h1 class="page-title">{{ .Title }}</h1>
+      {{ with .Params.summary }}<p class="page-lead">{{ . }}</p>{{ end }}
+      {{ if .Params.status_note }}
+      <div class="status-callout">
+        <span class="status-dot"></span>
+        <span><strong>Status:</strong> {{ .Params.status_note }}</span>
+      </div>
+      {{ end }}
+    </header>
+
+    <div class="prose">
+      {{ .Content }}
+    </div>
+
+    <div class="page-nav">
+      <hr class="nav-divider">
+      <div class="nav-links">
+        <a href="{{ "/" | relURL }}" class="nav-link-item">← Overview</a>
+        {{ with .Params.next_url }}
+        <a href="{{ . | relURL }}" class="nav-link-item next">{{ $.Params.next_title | default "Next Section" }} →</a>
+        {{ end }}
+      </div>
+    </div>
+  </article>
+</div>
+{{ end }}
