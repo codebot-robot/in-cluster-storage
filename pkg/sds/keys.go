@@ -176,7 +176,6 @@ func (pk *PrimaryKey) Split(msg proto.Message) (keyBytes []byte, valBytes []byte
 	}
 
 	marshalOpts := proto.MarshalOptions{Deterministic: true}
-
 	keyBytes, err = marshalOpts.Marshal(keyMsg.Interface())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to marshal key proto: %w", err)
