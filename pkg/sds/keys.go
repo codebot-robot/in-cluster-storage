@@ -21,10 +21,71 @@ import (
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 // ErrMissingPrimaryKey is returned when a row operation is missing one or more required primary key fields.
 var ErrMissingPrimaryKey = errors.New("missing primary key field")
+
+// ErrInvalidKeyBytes is returned when key bytes do not match the expected primary key definition.
+var ErrInvalidKeyBytes = errors.New("key bytes do not match key_fields")
+
+// ValidateKeyBytes validates that keyBytes represents a valid protobuf message for md where:
+// 1. Every field number in keyFields is present and set.
+// 2. No non-key fields are set.
+// 3. No unknown fields are present.
+func ValidateKeyBytes(md protoreflect.MessageDescriptor, keyFields []int32, keyBytes []byte) error {
+	if md == nil {
+		return errors.New("nil message descriptor")
+	}
+	if len(keyBytes) == 0 {
+		if len(keyFields) == 0 {
+			return nil
+		}
+		return fmt.Errorf("%w: empty key bytes for message %q with key_fields %v", ErrInvalidKeyBytes, md.FullName(), keyFields)
+	}
+
+	keyMsg := dynamicpb.NewMessage(md)
+	if err := proto.Unmarshal(keyBytes, keyMsg); err != nil {
+		return fmt.Errorf("%w: failed to unmarshal key proto bytes: %w", ErrInvalidKeyBytes, err)
+	}
+
+	fields := md.Fields()
+	// Check all required key_fields are present
+	for _, kf := range keyFields {
+		f := fields.ByNumber(protoreflect.FieldNumber(kf))
+		if f == nil {
+			return fmt.Errorf("%w: key field %d not found in %q", ErrInvalidKeyBytes, kf, md.FullName())
+		}
+		if !keyMsg.Has(f) {
+			return fmt.Errorf("%w: missing key field %d (%q) in message %q", ErrInvalidKeyBytes, kf, f.Name(), md.FullName())
+		}
+	}
+
+	// Check that no non-key fields are set
+	keyFieldMap := make(map[int32]bool, len(keyFields))
+	for _, kf := range keyFields {
+		keyFieldMap[kf] = true
+	}
+
+	var extraFields []string
+	for i := 0; i < fields.Len(); i++ {
+		f := fields.Get(i)
+		if keyMsg.Has(f) && !keyFieldMap[int32(f.Number())] {
+			extraFields = append(extraFields, fmt.Sprintf("%d (%q)", f.Number(), f.Name()))
+		}
+	}
+
+	if len(extraFields) > 0 {
+		return fmt.Errorf("%w: key bytes contain non-key fields %v in message %q", ErrInvalidKeyBytes, extraFields, md.FullName())
+	}
+
+	if len(keyMsg.GetUnknown()) > 0 {
+		return fmt.Errorf("%w: key bytes contain unknown fields in message %q", ErrInvalidKeyBytes, md.FullName())
+	}
+
+	return nil
+}
 
 // PrimaryKey encapsulates the primary key field numbers and provides methods
 // for extracting and encoding primary keys as canonical binary protobuf bytes.
@@ -114,12 +175,14 @@ func (pk *PrimaryKey) Split(msg proto.Message) (keyBytes []byte, valBytes []byte
 		}
 	}
 
-	keyBytes, err = proto.Marshal(keyMsg.Interface())
+	marshalOpts := proto.MarshalOptions{Deterministic: true}
+
+	keyBytes, err = marshalOpts.Marshal(keyMsg.Interface())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to marshal key proto: %w", err)
 	}
 
-	valBytes, err = proto.Marshal(valMsg.Interface())
+	valBytes, err = marshalOpts.Marshal(valMsg.Interface())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to marshal value proto: %w", err)
 	}
