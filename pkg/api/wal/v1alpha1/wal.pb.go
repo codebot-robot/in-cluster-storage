@@ -490,6 +490,8 @@ func (x *FlushResponse) GetLastPosition() uint64 {
 type TailRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	FromPosition  uint64                 `protobuf:"varint,1,opt,name=from_position,json=fromPosition,proto3" json:"from_position,omitempty"`
+	StreamId      []byte                 `protobuf:"bytes,2,opt,name=stream_id,json=streamId,proto3" json:"stream_id,omitempty"`                   // optional: only return records of this stream
+	FromStreamSeq uint64                 `protobuf:"varint,3,opt,name=from_stream_seq,json=fromStreamSeq,proto3" json:"from_stream_seq,omitempty"` // with stream_id: return records with stream_seq > from_stream_seq
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -527,6 +529,20 @@ func (*TailRequest) Descriptor() ([]byte, []int) {
 func (x *TailRequest) GetFromPosition() uint64 {
 	if x != nil {
 		return x.FromPosition
+	}
+	return 0
+}
+
+func (x *TailRequest) GetStreamId() []byte {
+	if x != nil {
+		return x.StreamId
+	}
+	return nil
+}
+
+func (x *TailRequest) GetFromStreamSeq() uint64 {
+	if x != nil {
+		return x.FromStreamSeq
 	}
 	return 0
 }
@@ -687,9 +703,11 @@ const file_proto_wal_proto_rawDesc = "" +
 	"\x13s3_acked_stream_seq\x18\x02 \x01(\x04R\x10s3AckedStreamSeq\"\x0e\n" +
 	"\fFlushRequest\"4\n" +
 	"\rFlushResponse\x12#\n" +
-	"\rlast_position\x18\x01 \x01(\x04R\flastPosition\"2\n" +
+	"\rlast_position\x18\x01 \x01(\x04R\flastPosition\"w\n" +
 	"\vTailRequest\x12#\n" +
-	"\rfrom_position\x18\x01 \x01(\x04R\ffromPosition\"\x95\x01\n" +
+	"\rfrom_position\x18\x01 \x01(\x04R\ffromPosition\x12\x1b\n" +
+	"\tstream_id\x18\x02 \x01(\fR\bstreamId\x12&\n" +
+	"\x0ffrom_stream_seq\x18\x03 \x01(\x04R\rfromStreamSeq\"\x95\x01\n" +
 	"\tLogRecord\x12\x1a\n" +
 	"\bposition\x18\x01 \x01(\x04R\bposition\x12\x1b\n" +
 	"\tstream_id\x18\x02 \x01(\fR\bstreamId\x12\x1d\n" +

@@ -854,3 +854,142 @@ func TestTargetlessStreamDurabilityFastFail(t *testing.T) {
 		t.Fatalf("expected ErrDurabilityUnavailable for Flush(), got: %v", err)
 	}
 }
+
+// 13. TailStream helper: tails a specific stream with from_stream_seq across segment boundaries,
+// local/object-storage boundary, and buffer restart with interleaved streams.
+func TestTailStreamHelper(t *testing.T) {
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir())
+
+	clientDir1 := t.TempDir()
+	clientDir2 := t.TempDir()
+	streamID1 := uuid.New()
+	streamID2 := uuid.New()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	stream1, err := Open(ctx, clientDir1, streamID1, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream1 failed: %v", err)
+	}
+	defer stream1.Close()
+
+	stream2, err := Open(ctx, clientDir2, streamID2, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream2 failed: %v", err)
+	}
+	defer stream2.Close()
+
+	// 1. Interleaved appends seq 1..10 on both streams, then flush (segment 1 in object storage)
+	for i := 1; i <= 10; i++ {
+		seq1, _ := stream1.Append(ctx, []byte(fmt.Sprintf("s1-msg-%d", i)))
+		_ = stream1.Wait(ctx, seq1, Witness, false)
+		seq2, _ := stream2.Append(ctx, []byte(fmt.Sprintf("s2-msg-%d", i)))
+		_ = stream2.Wait(ctx, seq2, Witness, false)
+	}
+	if err := stream1.Flush(ctx); err != nil {
+		t.Fatalf("flush 1 failed: %v", err)
+	}
+
+	// 2. Interleaved appends seq 11..15 on both streams, then flush (segment 2 in object storage)
+	for i := 11; i <= 15; i++ {
+		seq1, _ := stream1.Append(ctx, []byte(fmt.Sprintf("s1-msg-%d", i)))
+		_ = stream1.Wait(ctx, seq1, Witness, false)
+		seq2, _ := stream2.Append(ctx, []byte(fmt.Sprintf("s2-msg-%d", i)))
+		_ = stream2.Wait(ctx, seq2, Witness, false)
+	}
+	if err := stream1.Flush(ctx); err != nil {
+		t.Fatalf("flush 2 failed: %v", err)
+	}
+
+	// 3. Interleaved appends seq 16..20 on both streams (unflushed, in local store)
+	for i := 16; i <= 20; i++ {
+		seq1, _ := stream1.Append(ctx, []byte(fmt.Sprintf("s1-msg-%d", i)))
+		_ = stream1.Wait(ctx, seq1, Witness, false)
+		seq2, _ := stream2.Append(ctx, []byte(fmt.Sprintf("s2-msg-%d", i)))
+		_ = stream2.Wait(ctx, seq2, Witness, false)
+	}
+
+	// 4. Use TailStream helper to tail stream 1 starting after seq 7 across segment 1, segment 2, and local store
+	streamIter, err := TailStream(ctx, handle.addr, streamID1, 7)
+	if err != nil {
+		t.Fatalf("TailStream failed: %v", err)
+	}
+
+	var stream1Seqs []uint64
+	var stream1Payloads []string
+
+	for seq, payload := range streamIter {
+		stream1Seqs = append(stream1Seqs, seq)
+		stream1Payloads = append(stream1Payloads, string(payload))
+		if seq == 20 {
+			break // All 13 expected records (8..20) received
+		}
+	}
+
+	expectedSeqs := []uint64{8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+	if len(stream1Seqs) != len(expectedSeqs) {
+		t.Fatalf("expected %d records, got %d: %v", len(expectedSeqs), len(stream1Seqs), stream1Seqs)
+	}
+	for i, seq := range stream1Seqs {
+		if seq != expectedSeqs[i] {
+			t.Errorf("at index %d: expected seq %d, got %d", i, expectedSeqs[i], seq)
+		}
+		expectedPayload := fmt.Sprintf("s1-msg-%d", seq)
+		if stream1Payloads[i] != expectedPayload {
+			t.Errorf("at index %d: expected payload %s, got %s", i, expectedPayload, stream1Payloads[i])
+		}
+	}
+
+	// 5. Append seq 21..25 on stream 1 (unflushed) and simulate ungraceful crash of buffer server
+	for i := 21; i <= 25; i++ {
+		seq1, _ := stream1.Append(ctx, []byte(fmt.Sprintf("s1-msg-%d", i)))
+		_ = stream1.Wait(ctx, seq1, Witness, false)
+	}
+
+	handle.StopWithoutClose()
+
+	// Restart buffer server on new empty dataDir
+	handle2 := startBufferServer(t, backend, t.TempDir())
+	defer handle2.StopGraceful()
+
+	// Reopen client stream 1 to reconnect and replay unflushed records
+	stream1Restarted, err := Open(ctx, clientDir1, streamID1, handle2.addr)
+	if err != nil {
+		t.Fatalf("reopen stream1 failed: %v", err)
+	}
+	defer stream1Restarted.Close()
+
+	if err := stream1Restarted.Wait(ctx, 25, Witness, false); err != nil {
+		t.Fatalf("failed waiting for witness ack after restart: %v", err)
+	}
+
+	// 6. TailStream helper across buffer restart from seq 18
+	restartIter, err := TailStream(ctx, handle2.addr, streamID1, 18)
+	if err != nil {
+		t.Fatalf("TailStream after restart failed: %v", err)
+	}
+
+	var restartedSeqs []uint64
+	for seq, payload := range restartIter {
+		restartedSeqs = append(restartedSeqs, seq)
+		expectedPayload := fmt.Sprintf("s1-msg-%d", seq)
+		if string(payload) != expectedPayload {
+			t.Errorf("expected payload %s, got %s", expectedPayload, string(payload))
+		}
+		if seq == 25 {
+			break
+		}
+	}
+
+	expectedRestartSeqs := []uint64{19, 20, 21, 22, 23, 24, 25}
+	if len(restartedSeqs) != len(expectedRestartSeqs) {
+		t.Fatalf("expected %d records after restart, got %d: %v", len(expectedRestartSeqs), len(restartedSeqs), restartedSeqs)
+	}
+	for i, seq := range restartedSeqs {
+		if seq != expectedRestartSeqs[i] {
+			t.Errorf("after restart index %d: expected seq %d, got %d", i, expectedRestartSeqs[i], seq)
+		}
+	}
+}

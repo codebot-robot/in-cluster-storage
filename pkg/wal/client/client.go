@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -656,4 +657,58 @@ func (s *streamImpl) cleanupS3AckedLocked(s3AckedSeq uint64) {
 	s.retainedMu.Unlock()
 
 	s.retainedBytes = newRetainedBytes
+}
+
+// TailStream tails records belonging to a specific stream starting after fromSeq (stream_seq > fromSeq).
+// It returns an iterator yielding (stream_seq, payload) pairs.
+func TailStream(ctx context.Context, target string, streamID uuid.UUID, fromSeq uint64, opts ...Option) (iter.Seq2[uint64, []byte], error) {
+	var opt options
+	for _, o := range opts {
+		o(&opt)
+	}
+
+	if opt.grpcClient == nil && target == "" {
+		return nil, errors.New("target or WithGRPCClient must be provided")
+	}
+
+	iterator := func(yield func(uint64, []byte) bool) {
+		var localConn *grpc.ClientConn
+		grpcClient := opt.grpcClient
+		if grpcClient == nil {
+			dialOpts := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, opt.dialOpts...)
+			conn, err := grpc.NewClient(target, dialOpts...)
+			if err != nil {
+				klog.Errorf("TailStream failed to dial target %s: %v", target, err)
+				return
+			}
+			localConn = conn
+			defer localConn.Close()
+			grpcClient = pb.NewWalBufferClient(conn)
+		}
+
+		tailStream, err := grpcClient.Tail(ctx, &pb.TailRequest{
+			StreamId:      streamID[:],
+			FromStreamSeq: fromSeq,
+		})
+		if err != nil {
+			klog.V(4).Infof("TailStream RPC failed: %v", err)
+			return
+		}
+
+		for {
+			resp, err := tailStream.Recv()
+			if err != nil {
+				return
+			}
+			rec := resp.GetRecord()
+			if rec == nil {
+				continue
+			}
+			if !yield(rec.StreamSeq, rec.Payload) {
+				return
+			}
+		}
+	}
+
+	return iterator, nil
 }

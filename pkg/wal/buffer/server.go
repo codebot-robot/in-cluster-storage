@@ -762,13 +762,28 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 }
 
 // Tail streams merged records in position order from object storage, local disk, and live incoming commits.
+// When stream_id is set in req, Tail filters records to only return those matching stream_id with
+// stream_seq > from_stream_seq.
 // Positions are strictly increasing within a witness incarnation; positions above the last flushed position
 // are provisional and may be reassigned after a restart.
 // Tail clamps from_position to last_flushed_position + 1 when it exceeds that, returning the effective start
 // in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq) and must
 // tolerate re-delivery from the last flushed position after reconnecting.
+//
+// TODO: Add a per-segment index of per-stream sequence ranges to avoid scanning
+// unneeded segments when filtering by stream_id and from_stream_seq.
 func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
 	ctx := stream.Context()
+
+	var filterStreamID uuid.UUID
+	hasStreamFilter := len(req.StreamId) > 0
+	if hasStreamFilter {
+		if len(req.StreamId) != 16 {
+			return status.Errorf(codes.InvalidArgument, "stream_id must be exactly 16 bytes")
+		}
+		copy(filterStreamID[:], req.StreamId)
+	}
+
 	fromPos := req.FromPosition
 	if fromPos == 0 {
 		fromPos = 1
@@ -787,6 +802,11 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 	firstSent := false
 
 	sendRecord := func(rec *wal.LogRecord) error {
+		if hasStreamFilter {
+			if rec.StreamID != filterStreamID || rec.StreamSeq <= req.FromStreamSeq {
+				return nil
+			}
+		}
 		resp := &pb.TailResponse{Record: rec.ToProto()}
 		if !firstSent {
 			resp.ResumedFrom = fromPos

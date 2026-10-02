@@ -941,3 +941,175 @@ func TestFlushIsolationAcrossStreams(t *testing.T) {
 	}
 	_ = srv
 }
+
+func TestPerStreamTailFiltering(t *testing.T) {
+	backend := inmemorystorage.New()
+	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
+	defer cleanup()
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewWalBufferClient(conn)
+
+	streamA, err := client.Append(t.Context())
+	if err != nil {
+		t.Fatalf("failed to start stream A: %v", err)
+	}
+	streamB, err := client.Append(t.Context())
+	if err != nil {
+		t.Fatalf("failed to start stream B: %v", err)
+	}
+	streamC, err := client.Append(t.Context())
+	if err != nil {
+		t.Fatalf("failed to start stream C: %v", err)
+	}
+
+	streamIDA := uuid.New()
+	streamIDB := uuid.New()
+	streamIDC := uuid.New()
+
+	_ = streamA.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Hello{Hello: &pb.Hello{StreamId: streamIDA[:]}}})
+	_, _ = streamA.Recv()
+	_ = streamB.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Hello{Hello: &pb.Hello{StreamId: streamIDB[:]}}})
+	_, _ = streamB.Recv()
+	_ = streamC.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Hello{Hello: &pb.Hello{StreamId: streamIDC[:]}}})
+	_, _ = streamC.Recv()
+
+	// 1. Interleave appends: stream A 1..5, stream B 1..5, stream C 1..5
+	for i := uint64(1); i <= 5; i++ {
+		_ = streamA.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("A-%d", i))}}})
+		_, _ = streamA.Recv()
+		_ = streamB.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("B-%d", i))}}})
+		_, _ = streamB.Recv()
+		_ = streamC.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("C-%d", i))}}})
+		_, _ = streamC.Recv()
+	}
+
+	// Flush first segment to permanent storage (positions 1..15)
+	if _, err := client.Flush(t.Context(), &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush 1 failed: %v", err)
+	}
+
+	// 2. Interleave more appends: stream A 6..10, stream B 6..10
+	for i := uint64(6); i <= 10; i++ {
+		_ = streamA.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("A-%d", i))}}})
+		_, _ = streamA.Recv()
+		_ = streamB.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("B-%d", i))}}})
+		_, _ = streamB.Recv()
+	}
+
+	// Flush second segment to permanent storage (positions 16..25)
+	if _, err := client.Flush(t.Context(), &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush 2 failed: %v", err)
+	}
+
+	// 3. Interleave unflushed appends: stream A 11..15, stream C 6..10 (in localStore/memory)
+	for i := uint64(11); i <= 15; i++ {
+		_ = streamA.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("A-%d", i))}}})
+		_, _ = streamA.Recv()
+	}
+	for i := uint64(6); i <= 10; i++ {
+		_ = streamC.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("C-%d", i))}}})
+		_, _ = streamC.Recv()
+	}
+
+	// 4. Tail Stream A from from_stream_seq = 3 across flushed segments and local store
+	tailCtx, tailCancel := context.WithCancel(t.Context())
+	defer tailCancel()
+
+	tailStream, err := client.Tail(tailCtx, &pb.TailRequest{
+		StreamId:      streamIDA[:],
+		FromStreamSeq: 3,
+	})
+	if err != nil {
+		t.Fatalf("tail stream A failed: %v", err)
+	}
+
+	var receivedSeqs []uint64
+	var receivedPayloads []string
+	recvErrChan := make(chan error, 1)
+
+	go func() {
+		// Expect seq 4..15 (12 records) + 2 live records (16, 17) = 14 records total
+		for len(receivedSeqs) < 14 {
+			resp, err := tailStream.Recv()
+			if err != nil {
+				recvErrChan <- err
+				return
+			}
+			rec := resp.GetRecord()
+			if rec != nil {
+				receivedSeqs = append(receivedSeqs, rec.StreamSeq)
+				receivedPayloads = append(receivedPayloads, string(rec.Payload))
+			}
+		}
+		recvErrChan <- nil
+	}()
+
+	// Wait a moment for backlog to be processed
+	time.Sleep(50 * time.Millisecond)
+
+	// 5. Append live records: stream A 16, stream B 11, stream A 17
+	_ = streamA.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: 16, Payload: []byte("A-16")}}})
+	_, _ = streamA.Recv()
+	_ = streamB.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: 11, Payload: []byte("B-11")}}})
+	_, _ = streamB.Recv()
+	_ = streamA.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: 17, Payload: []byte("A-17")}}})
+	_, _ = streamA.Recv()
+
+	select {
+	case err := <-recvErrChan:
+		if err != nil {
+			t.Fatalf("error receiving tailed records: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for tail records, received: %v", receivedSeqs)
+	}
+
+	expectedSeqs := []uint64{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
+	if len(receivedSeqs) != len(expectedSeqs) {
+		t.Fatalf("expected %d records, got %d: %v", len(expectedSeqs), len(receivedSeqs), receivedSeqs)
+	}
+
+	for i, seq := range receivedSeqs {
+		if seq != expectedSeqs[i] {
+			t.Errorf("at index %d: expected seq %d, got %d", i, expectedSeqs[i], seq)
+		}
+		expectedPayload := fmt.Sprintf("A-%d", seq)
+		if receivedPayloads[i] != expectedPayload {
+			t.Errorf("at index %d: expected payload %s, got %s", i, expectedPayload, receivedPayloads[i])
+		}
+	}
+	_ = srv
+}
+
+func TestPerStreamTailInvalidStreamID(t *testing.T) {
+	backend := inmemorystorage.New()
+	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
+	defer cleanup()
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewWalBufferClient(conn)
+
+	tailStream, err := client.Tail(t.Context(), &pb.TailRequest{
+		StreamId: []byte("short-id"), // invalid length (!= 16)
+	})
+	if err != nil {
+		t.Fatalf("tail failed: %v", err)
+	}
+
+	_, err = tailStream.Recv()
+	if err == nil {
+		t.Fatalf("expected error for invalid stream_id, got nil")
+	}
+	_ = srv
+}

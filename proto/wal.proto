@@ -74,6 +74,8 @@ message FlushResponse {
 
 message TailRequest {
   uint64 from_position = 1;
+  bytes stream_id = 2;        // optional: only return records of this stream
+  uint64 from_stream_seq = 3;  // with stream_id: return records with stream_seq > from_stream_seq
 }
 
 message LogRecord {
