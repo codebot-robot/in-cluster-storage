@@ -121,19 +121,24 @@ message Order {
 TypeDefinition{ id: 16, name: "shop.Order", descriptors: <shop/order.proto + imports>, key_fields: [1] }
 ```
 
-Every application-typed record is a framework `RowChange` whose `before` and `after` are the registered message, encoded:
+Every row change is an `OpRecord` framework record (type ID 5):
 
 ```proto
-message RowChange {
-  enum Op { INSERT = 0; UPDATE = 1; DELETE = 2; }
+message OpRecord {
+  enum Op {
+    CREATE = 0;
+    UPDATE = 1;
+    DELETE = 2;
+  }
   Op     op = 1;
-  uint64 tx_id = 2;   // 0: this record is its own transaction; otherwise pending until TxCommit{tx_id}
-  bytes  before = 3;  // UPDATE/DELETE: at least the key fields; full image optional (undo, CDC diffs)
-  bytes  after = 4;   // INSERT/UPDATE: the full row
+  uint32 type_id = 2;
+  uint64 tx_id = 3;   // 0: this record is its own transaction; otherwise pending until TxCommit{tx_id}
+  bytes  key = 4;     // canonical binary proto encoding of the key fields
+  bytes  value = 5;   // binary proto encoding of non-key fields (CREATE/UPDATE)
 }
 ```
 
-A row change on the wire is one varint (which message this is) plus one `RowChange` (what happened to it). The two `bytes` fields cost a tag and a length each; there is no table name, no column names, and no per-table generated wrapper. The key is not a separate field: it is read from `after` (or `before` for deletes) using `key_fields`.
+A row change on the wire carries the table type ID, the operation, the transaction ID (`0` for autocommit), the canonically encoded proto key bytes, and the non-key proto value bytes. There is no column unpacking or per-table wrapper; key data and value data remain native protobuf bytes.
 
 **Columns are derived from the descriptor.** Scalar fields map to columns; `key_fields` become the primary key. How nested messages and `repeated` fields map (flattened, JSON, or stored only in the raw proto and not queryable) is an open question below, and projections may legitimately differ on it.
 
@@ -267,7 +272,7 @@ The client-side encryption proposed for Streams (per-record AEAD, [issue #87](ht
 
 ## Open Questions
 
-- **Column mapping for nested and repeated fields.** Flatten with a naming convention, store as JSON text, or keep them only in the raw proto and treat them as non-queryable. The raw-proto-plus-index SQLite layout (see the TODO above) sidesteps this for OLTP; Parquet has native nested types.
+- **Column mapping for nested and repeated fields.** For now, Layer 2 column derivation (`Columns`) excludes nested messages (other than `google.protobuf.Timestamp`) and repeated fields, keeping them only in the raw row proto. Whether future projections flatten with a naming convention, store as JSON text, or treat them as non-queryable remains open. The raw-proto-plus-index SQLite layout (see the TODO above) sidesteps this for OLTP; Parquet has native nested types.
 - **Precise compatibility rules.** Rule 2 gives the intent; the exact checker (labels, `oneof` membership changes, enum value additions, message-typed fields) needs a specification and a test suite, and should match `buf breaking` where possible.
 - **Snapshot production.** Who takes snapshots: the writer (has the state in memory), a buffer-side compactor (has all streams, no application code), or a dedicated projector reading `Tail`? The projector is the most general and keeps the buffer schema-free; the writer is simplest for a single-tenant stream.
 - **Cadence and cost.** Snapshot on a size threshold of log since last snapshot, on a timer, or on demand. Interaction with `Permanent` durability: a snapshot must not cover positions beyond the `s3Seq` watermark.
