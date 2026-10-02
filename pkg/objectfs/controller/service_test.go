@@ -2758,3 +2758,61 @@ func TestSDSCatOnObjectFSStream(t *testing.T) {
 
 	_ = server.Close()
 }
+
+func TestTruncateUpwardAndSparseRead(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-vol-truncate"
+
+	// Create a file with small initial content
+	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/sparse.bin",
+		Mode:           0644,
+		InitialContent: []byte("hello world"),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create file: %v", err)
+	}
+
+	// Truncate up to 256KB across multiple chunks
+	targetSize := int64(256 * 1024)
+	truncResp, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{
+		VolumeId: volumeID,
+		Path:     "/sparse.bin",
+		Size:     targetSize,
+	})
+	if err != nil {
+		t.Fatalf("Failed to truncate upward: %v", err)
+	}
+	if truncResp.GetError() != 0 {
+		t.Fatalf("TruncateFile returned error: %d", truncResp.GetError())
+	}
+
+	// Read back whole file and verify size and contents
+	readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Path:     "/sparse.bin",
+		Offset:   0,
+		Size:     0,
+	})
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	if readResp.GetTotalSize() != targetSize {
+		t.Fatalf("Expected total size %d, got %d", targetSize, readResp.GetTotalSize())
+	}
+	if int64(len(readResp.GetData())) != targetSize {
+		t.Fatalf("Expected data length %d, got %d", targetSize, len(readResp.GetData()))
+	}
+	if string(readResp.GetData()[:11]) != "hello world" {
+		t.Fatalf("Expected prefix 'hello world', got %q", string(readResp.GetData()[:11]))
+	}
+	// Verify that the extended portion is all zeroes
+	for i, b := range readResp.GetData()[11:] {
+		if b != 0 {
+			t.Fatalf("Expected zero byte at offset %d, got %d", 11+i, b)
+		}
+	}
+}
