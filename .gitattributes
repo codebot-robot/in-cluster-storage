@@ -3,6 +3,7 @@
 # Go
 *.pb.go linguist-generated=true
 *.pb.gw.go linguist-generated=true
+*_grpc.pb.go linguist-generated=true
 
 # Python
 *_pb2.py linguist-generated=true
@@ -53,3 +54,11 @@
 
 # PHP
 *.pb.php linguist-generated=true
+
+# Go module checksum files
+go.sum linguist-generated=true
+*.sum linguist-generated=true
+
+# Generated presubmits and CI workflows
+.github/workflows/ci-presubmits.yaml linguist-generated=true
+dev/ci/presubmits/* linguist-generated=true
