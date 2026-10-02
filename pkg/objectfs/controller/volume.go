@@ -203,8 +203,8 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 			dirtyDirs:   make(map[uint64]LocalOffset),
 		},
 		volumeID:         volumeID,
-		rootInodeID:      1,
-		nextInode:        2,
+		rootInodeID:      0,
+		nextInode:        erofs.DefaultInodeStride,
 		backend:          backend,
 		blobStore:        blobStore,
 		broadcaster:      broadcaster,
@@ -233,14 +233,14 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 
 	// Always initialize an initial base EROFS snapshot with empty root directory
-	rootNode := erofs.NewMemoryNode("", true, 0755, nil, nil, erofs.WithMtime(uint64(time.Now().Unix())))
+	rootNode := erofs.NewMemoryNode("", true, 0755, nil, nil, erofs.WithIno(0), erofs.WithMtime(uint64(time.Now().Unix())))
 	var initialErofsBuf bufferWriterAt
 	if err := erofs.WriteImage(&initialErofsBuf, rootNode); err == nil {
 		v.snapshotRaw = bytes.NewReader(initialErofsBuf.buf)
 		if r, err := erofs.NewReader(v.snapshotRaw); err == nil {
 			v.snapshotReader = r
 			v.rootInodeID = r.GetRootNID()
-			v.nextInode = v.rootInodeID + 100
+			v.nextInode = erofs.DefaultInodeStride
 		}
 	}
 
@@ -518,7 +518,7 @@ func (v *Volume) logMutationLocked(ctx context.Context, record *MutationRecord, 
 }
 
 func (v *Volume) allocInode() uint64 {
-	return atomic.AddUint64(&v.nextInode, 1) - 1
+	return atomic.AddUint64(&v.nextInode, erofs.DefaultInodeStride) - erofs.DefaultInodeStride
 }
 
 func cleanPath(p string) string {
@@ -2318,10 +2318,8 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 			var xattrs erofs.Xattrs
 			if childInode.ContentSha256 != "" {
 				xattrs.UserDigest = childInode.ContentSha256
-				xattrs.UserSHA256 = childInode.ContentSha256
 			} else if childInode.Sha256 != "" {
 				xattrs.UserDigest = childInode.Sha256
-				xattrs.UserSHA256 = childInode.Sha256
 			}
 			if childInode.ManifestSha256 != "" {
 				xattrs.UserManifest = childInode.ManifestSha256
@@ -2333,6 +2331,7 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 				uint16(childInode.Mode),
 				nil,
 				nil,
+				erofs.WithIno(childInode.ID),
 				erofs.WithMetadataOnly(true),
 				erofs.WithSize(uint64(childInode.Size)),
 				erofs.WithMtime(uint64(childInode.ModTime.Unix())),
@@ -2354,6 +2353,7 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 		uint16(dirInode.Mode),
 		nil,
 		children,
+		erofs.WithIno(dirInode.ID),
 		erofs.WithMtime(uint64(dirInode.ModTime.Unix())),
 		erofs.WithUID(dirInode.Uid),
 		erofs.WithGID(dirInode.Gid),
@@ -2494,17 +2494,13 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		}
 	}
 
-	// Reset in-memory clean caches so all directory entries and inode IDs seamlessly rebind to the new EROFS snapshot's NIDs
-	v.inodeCache.Clear()
-	v.dirCache.Clear()
-
 	if v.localStore != nil && cutoffOffset != NoOffset {
 		_ = v.localStore.TrimBefore(cutoffOffset)
 	}
 
 	newMeta := VolumeMetadata{
 		VolumeID:    v.volumeID,
-		Version:     1,
+		Version:     2,
 		LastFlushed: time.Now(),
 		NextInode:   v.nextInode,
 		Entries:     currentEntries,
@@ -2587,7 +2583,7 @@ func (v *Volume) findLatestSnapshotNameLocked(ctx context.Context) (string, erro
 func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 	ctx := context.Background()
 	if record.Inode >= v.nextInode {
-		v.nextInode = record.Inode + 1
+		v.nextInode = ((record.Inode / erofs.DefaultInodeStride) + 1) * erofs.DefaultInodeStride
 	}
 
 	switch record.Type {
@@ -2932,6 +2928,17 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 	defer v.mu.Unlock()
 
 	if v.backend != nil {
+		var meta VolumeMetadata
+		var metaBuf bytes.Buffer
+		if err := v.backend.GetObject(ctx, v.volumeID, MetadataFileName, 0, 0, &metaBuf); err == nil && metaBuf.Len() > 0 {
+			if err := json.Unmarshal(metaBuf.Bytes(), &meta); err == nil {
+				v.lastFlushedMetadata = &meta
+				if meta.NextInode > 0 {
+					v.nextInode = meta.NextInode
+				}
+			}
+		}
+
 		latestSnapshotName, err := v.findLatestSnapshotNameLocked(ctx)
 		if err == nil && latestSnapshotName != "" {
 			snapshotKey := path.Join("volumes", v.volumeID, "meta", latestSnapshotName)
@@ -2945,9 +2952,12 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 					v.snapshotRaw = readerAt
 					v.snapshotReader = reader
 					v.rootInodeID = reader.GetRootNID()
-					maxNID := (uint64(len(snapBytes)))/32 + 1000
+					maxNID := ((uint64(len(snapBytes))/32 + erofs.DefaultInodeStride - 1) / erofs.DefaultInodeStride) * erofs.DefaultInodeStride
 					if v.nextInode < maxNID {
 						v.nextInode = maxNID
+					}
+					if v.nextInode < erofs.DefaultInodeStride {
+						v.nextInode = erofs.DefaultInodeStride
 					}
 					v.inodeCache.Clear()
 					v.dirCache.Clear()
@@ -3030,9 +3040,12 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 	v.snapshotRaw = readerAt
 	v.snapshotReader = reader
 	v.rootInodeID = reader.GetRootNID()
-	maxNID := (uint64(len(snapBytes)))/32 + 1000
+	maxNID := ((uint64(len(snapBytes))/32 + erofs.DefaultInodeStride - 1) / erofs.DefaultInodeStride) * erofs.DefaultInodeStride
 	if v.nextInode < maxNID {
 		v.nextInode = maxNID
+	}
+	if v.nextInode < erofs.DefaultInodeStride {
+		v.nextInode = erofs.DefaultInodeStride
 	}
 
 	v.inodeCache.Clear()

@@ -37,6 +37,8 @@ const (
 	SuperSize = 128
 	// SlotSize is the unit slot size used to align and address inodes (32 bytes).
 	SlotSize = 32
+	// DefaultInodeStride is the default stride in slots between consecutive inodes in strided EROFS images (8 slots = 256 bytes).
+	DefaultInodeStride = 8
 	// BlockSize4K is the default filesystem page and block alignment size (4096 bytes).
 	BlockSize4K = 4096
 )
@@ -946,6 +948,61 @@ func BuildDirectoryBlock(dirents []Dirent, size int) ([]byte, error) {
 	return buf, nil
 }
 
+// BuildDirectoryData packs directory entries into one or more EROFS block buffers.
+func BuildDirectoryData(dirents []Dirent, blockSize int) ([]byte, error) {
+	if len(dirents) == 0 {
+		return make([]byte, blockSize), nil
+	}
+
+	var allBlocks []byte
+	var currentBlockDirents []Dirent
+	namesLen := 0
+
+	for _, de := range dirents {
+		if strings.Contains(de.Name, "\x00") {
+			return nil, fmt.Errorf("invalid filename contains null byte: %q", de.Name)
+		}
+		if strings.Contains(de.Name, "/") {
+			return nil, fmt.Errorf("invalid filename contains path separator: %q", de.Name)
+		}
+		if de.Name == "" {
+			return nil, fmt.Errorf("invalid filename is empty")
+		}
+		if !utf8.ValidString(de.Name) {
+			return nil, fmt.Errorf("invalid filename is not valid UTF-8: %q", de.Name)
+		}
+
+		nameLen := len([]byte(de.Name))
+		nextEntryCount := len(currentBlockDirents) + 1
+		nextNamesLen := namesLen + nameLen
+		if nextEntryCount*12+nextNamesLen > blockSize {
+			if len(currentBlockDirents) == 0 {
+				return nil, fmt.Errorf("single directory entry %q exceeds block size %d", de.Name, blockSize)
+			}
+			block, err := BuildDirectoryBlock(currentBlockDirents, blockSize)
+			if err != nil {
+				return nil, err
+			}
+			allBlocks = append(allBlocks, block...)
+			currentBlockDirents = nil
+			namesLen = 0
+		}
+
+		currentBlockDirents = append(currentBlockDirents, de)
+		namesLen += nameLen
+	}
+
+	if len(currentBlockDirents) > 0 {
+		block, err := BuildDirectoryBlock(currentBlockDirents, blockSize)
+		if err != nil {
+			return nil, err
+		}
+		allBlocks = append(allBlocks, block...)
+	}
+
+	return allBlocks, nil
+}
+
 // Node represents a node in the virtual filesystem to be written.
 type Node interface {
 	Name() string
@@ -955,6 +1012,7 @@ type Node interface {
 	GID() uint32
 	Mtime() uint64
 	Size() uint64
+	Ino() uint64
 	// Open returns an io.ReadCloser to read the file/symlink content.
 	// For directories, it is not used.
 	Open() (io.ReadCloser, error)
@@ -984,6 +1042,7 @@ type memoryNode struct {
 	gid            uint32
 	mtime          uint64
 	size           uint64
+	ino            uint64
 	content        []byte
 	children       []Node
 	xattrs         Xattrs
@@ -1002,6 +1061,7 @@ func (m *memoryNode) Size() uint64 {
 	}
 	return uint64(len(m.content))
 }
+func (m *memoryNode) Ino() uint64          { return m.ino }
 func (m *memoryNode) Xattrs() Xattrs       { return m.xattrs }
 func (m *memoryNode) IsMetadataOnly() bool { return m.isMetadataOnly }
 func (m *memoryNode) Children() ([]Node, error) {
@@ -1035,6 +1095,12 @@ func WithMetadataOnly(metadataOnly bool) MemoryNodeOption {
 func WithSize(size uint64) MemoryNodeOption {
 	return func(m *memoryNode) {
 		m.size = size
+	}
+}
+
+func WithIno(ino uint64) MemoryNodeOption {
+	return func(m *memoryNode) {
+		m.ino = ino
 	}
 }
 
@@ -1078,6 +1144,7 @@ type fileSystemNode struct {
 	mode   uint16
 	mtime  uint64
 	size   uint64
+	ino    uint64
 	target string
 }
 
@@ -1135,6 +1202,7 @@ func (f *fileSystemNode) UID() uint32   { return 0 }
 func (f *fileSystemNode) GID() uint32   { return 0 }
 func (f *fileSystemNode) Mtime() uint64 { return f.mtime }
 func (f *fileSystemNode) Size() uint64  { return f.size }
+func (f *fileSystemNode) Ino() uint64   { return f.ino }
 
 func (f *fileSystemNode) Open() (io.ReadCloser, error) {
 	if (f.mode & S_IFMT) == S_IFLNK {
@@ -1175,6 +1243,7 @@ type treeBuilderNode struct {
 	uid      uint32
 	gid      uint32
 	mtime    uint64
+	ino      uint64
 	content  []byte
 	children map[string]*treeBuilderNode
 }
@@ -1187,6 +1256,7 @@ func convertToMemoryNode(b *treeBuilderNode) *memoryNode {
 		uid:     b.uid,
 		gid:     b.gid,
 		mtime:   b.mtime,
+		ino:     b.ino,
 		content: b.content,
 	}
 	if b.isDir {
@@ -1268,6 +1338,7 @@ type nodeInfo struct {
 	parentNID      uint64
 	name           string
 	isDir          bool
+	isExtended     bool
 	mode           uint16
 	uid            uint32
 	gid            uint32
@@ -1322,27 +1393,74 @@ func marshalCompactNode(n *nodeInfo) []byte {
 	return buf
 }
 
+// marshalExtendedNode constructs the 64-byte extended inode layout.
+func marshalExtendedNode(n *nodeInfo) []byte {
+	buf := make([]byte, 64)
+
+	var format uint16 = 1 // version = 1 (extended), dataLayout = 0 (FLAT_PLAIN)
+	binary.LittleEndian.PutUint16(buf[0:2], format)
+	binary.LittleEndian.PutUint16(buf[2:4], n.xattrICount) // xattr_icount
+	binary.LittleEndian.PutUint16(buf[4:6], n.mode)
+	binary.LittleEndian.PutUint16(buf[6:8], 0) // reserved
+
+	binary.LittleEndian.PutUint64(buf[8:16], n.size)
+	if n.dataLen > 0 {
+		binary.LittleEndian.PutUint32(buf[16:20], uint32(n.dataOffset/BlockSize4K))
+	} else {
+		binary.LittleEndian.PutUint32(buf[16:20], 0)
+	}
+	binary.LittleEndian.PutUint32(buf[20:24], uint32(n.nid))
+	binary.LittleEndian.PutUint32(buf[24:28], n.uid)
+	binary.LittleEndian.PutUint32(buf[28:32], n.gid)
+	binary.LittleEndian.PutUint64(buf[32:40], n.mtime)
+	binary.LittleEndian.PutUint32(buf[40:44], 0) // mtime_nsec
+	var nlink uint32 = 1
+	if n.isDir {
+		nlink = 2
+	}
+	binary.LittleEndian.PutUint32(buf[44:48], nlink)
+	// buf[48:64] reserved
+
+	return buf
+}
+
 // WriteImage compiles a Node hierarchy into a valid, block-aligned EROFS filesystem image.
 // Writes directly to w at exact offsets, avoiding any full disk image or file buffering in memory.
 func WriteImage(w io.WriterAt, root Node) error {
 	var nodes []*nodeInfo
-	var nextNID uint64 = 0
+	var autoNID uint64 = 0
 
 	// Recursively collect metadata of the nodes
 	var visit func(n Node, parentNID uint64, name string) (*nodeInfo, error)
 	visit = func(n Node, parentNID uint64, name string) (*nodeInfo, error) {
-		nid := nextNID
+		var nid uint64
+		if n.Ino() != 0 || (n == root && len(nodes) == 0) {
+			nid = n.Ino()
+		} else {
+			nid = autoNID
+		}
+		if nid+DefaultInodeStride > autoNID {
+			autoNID = nid + DefaultInodeStride
+		}
+
+		isExtended := n.Size() >= (1<<32) || n.UID() > 0xFFFF || n.GID() > 0xFFFF
+		headerSize := 32
+		if isExtended {
+			headerSize = 64
+		}
+
 		info := &nodeInfo{
-			node:      n,
-			nid:       nid,
-			parentNID: parentNID,
-			name:      name,
-			isDir:     n.IsDir(),
-			mode:      n.Mode(),
-			uid:       n.UID(),
-			gid:       n.GID(),
-			mtime:     n.Mtime(),
-			size:      n.Size(),
+			node:       n,
+			nid:        nid,
+			parentNID:  parentNID,
+			name:       name,
+			isDir:      n.IsDir(),
+			isExtended: isExtended,
+			mode:       n.Mode(),
+			uid:        n.UID(),
+			gid:        n.GID(),
+			mtime:      n.Mtime(),
+			size:       n.Size(),
 		}
 		if info.isDir {
 			info.mode |= S_IFDIR
@@ -1362,9 +1480,12 @@ func WriteImage(w io.WriterAt, root Node) error {
 			}
 		}
 
-		slots := (int(SlotSize) + 4*int(info.xattrICount) + int(SlotSize) - 1) / int(SlotSize)
+		usedBytes := headerSize + 4*int(info.xattrICount)
+		slots := (usedBytes + SlotSize - 1) / SlotSize
 		info.slotCount = uint64(slots)
-		nextNID += uint64(slots)
+		if info.slotCount > DefaultInodeStride {
+			return nil, fmt.Errorf("inode %d (name %q) footprint (%d slots, %d bytes) exceeds stride limit (%d slots)", nid, name, info.slotCount, usedBytes, DefaultInodeStride)
+		}
 
 		if metaNode, ok := n.(MetadataOnlyNode); ok && metaNode.IsMetadataOnly() {
 			info.isMetadataOnly = true
@@ -1391,6 +1512,25 @@ func WriteImage(w io.WriterAt, root Node) error {
 	_, err := visit(root, 0, "")
 	if err != nil {
 		return err
+	}
+
+	// Validate that no two nodes claim duplicate or overlapping slot ranges
+	sortedNodes := make([]*nodeInfo, len(nodes))
+	copy(sortedNodes, nodes)
+	sort.Slice(sortedNodes, func(i, j int) bool {
+		return sortedNodes[i].nid < sortedNodes[j].nid
+	})
+	for i := 0; i < len(sortedNodes); i++ {
+		if i > 0 {
+			prev := sortedNodes[i-1]
+			curr := sortedNodes[i]
+			if prev.nid == curr.nid {
+				return fmt.Errorf("duplicate inode number / NID %d for nodes %q and %q", curr.nid, curr.name, prev.name)
+			}
+			if prev.nid+prev.slotCount > curr.nid {
+				return fmt.Errorf("overlapping inode slot allocation: node %q (nid %d, %d slots) overlaps with node %q (nid %d, %d slots)", prev.name, prev.nid, prev.slotCount, curr.name, curr.nid, curr.slotCount)
+			}
+		}
 	}
 
 	blockSize := int64(BlockSize4K)
@@ -1427,7 +1567,7 @@ func WriteImage(w io.WriterAt, root Node) error {
 				dirents = append(dirents, Dirent{NID: childInfo.nid, Name: childInfo.name, FileType: ft})
 			}
 
-			dirBlock, err := BuildDirectoryBlock(dirents, int(blockSize))
+			dirBlock, err := BuildDirectoryData(dirents, int(blockSize))
 			if err != nil {
 				return err
 			}
@@ -1443,7 +1583,14 @@ func WriteImage(w io.WriterAt, root Node) error {
 		}
 	}
 
-	inodesBytes := int64(nextNID * SlotSize)
+	maxSlot := uint64(0)
+	for _, n := range nodes {
+		if n.nid+n.slotCount > maxSlot {
+			maxSlot = n.nid + n.slotCount
+		}
+	}
+
+	inodesBytes := int64(maxSlot * SlotSize)
 	inodesBlocks := (inodesBytes + blockSize - 1) / blockSize
 
 	metaBlkaddr := int64(1)
@@ -1473,6 +1620,9 @@ func WriteImage(w io.WriterAt, root Node) error {
 		Blocks:      totalBlocks,
 		MetaBlkaddr: uint32(metaBlkaddr),
 	}
+	if nodes[0].nid > 0xFFFF {
+		sb.RootNID8b = nodes[0].nid
+	}
 
 	sbBuf := make([]byte, SuperSize)
 	binary.LittleEndian.PutUint32(sbBuf[0:4], sb.Magic)
@@ -1482,6 +1632,9 @@ func WriteImage(w io.WriterAt, root Node) error {
 	binary.LittleEndian.PutUint64(sbBuf[16:24], sb.Inodes)
 	binary.LittleEndian.PutUint32(sbBuf[36:40], sb.Blocks)
 	binary.LittleEndian.PutUint32(sbBuf[40:44], sb.MetaBlkaddr)
+	if sb.RootNID8b != 0 {
+		binary.LittleEndian.PutUint64(sbBuf[110:118], sb.RootNID8b)
+	}
 
 	// Compute superblock checksum
 	sb.Checksum = crc32.ChecksumIEEE(sbBuf)
@@ -1493,21 +1646,28 @@ func WriteImage(w io.WriterAt, root Node) error {
 
 	for _, n := range nodes {
 		inodeOffset := sb.InodeOffset(n.nid)
-		inodeBuf := marshalCompactNode(n)
+		var inodeBuf []byte
+		headerSize := 32
+		if n.isExtended {
+			inodeBuf = marshalExtendedNode(n)
+			headerSize = 64
+		} else {
+			inodeBuf = marshalCompactNode(n)
+		}
 		if _, err := w.WriteAt(inodeBuf, inodeOffset); err != nil {
 			return fmt.Errorf("failed to write inode for NID %d: %w", n.nid, err)
 		}
 		if len(n.xattrData) > 0 {
-			if _, err := w.WriteAt(n.xattrData, inodeOffset+SlotSize); err != nil {
+			if _, err := w.WriteAt(n.xattrData, inodeOffset+int64(headerSize)); err != nil {
 				return fmt.Errorf("failed to write xattr for NID %d: %w", n.nid, err)
 			}
-			usedBytes := int(SlotSize) + len(n.xattrData)
-			totalAllocated := int(n.slotCount * SlotSize)
-			if totalAllocated > usedBytes {
-				pad := make([]byte, totalAllocated-usedBytes)
-				if _, err := w.WriteAt(pad, inodeOffset+int64(usedBytes)); err != nil {
-					return fmt.Errorf("failed to write xattr padding for NID %d: %w", n.nid, err)
-				}
+		}
+		usedBytes := headerSize + len(n.xattrData)
+		totalAllocated := int(n.slotCount * SlotSize)
+		if totalAllocated > usedBytes {
+			pad := make([]byte, totalAllocated-usedBytes)
+			if _, err := w.WriteAt(pad, inodeOffset+int64(usedBytes)); err != nil {
+				return fmt.Errorf("failed to write xattr padding for NID %d: %w", n.nid, err)
 			}
 		}
 	}

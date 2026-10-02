@@ -498,3 +498,120 @@ func TestFUSEAttributesOwnerAndNlink(t *testing.T) {
 		t.Fatalf("ReadDirPlus failed: %v", status)
 	}
 }
+
+func TestFUSEStableInodesAcrossSnapshots(t *testing.T) {
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	backend := controller.NewMemoryBackend()
+	server := controller.NewServer(backend)
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+	defer func() {
+		grpcServer.Stop()
+		_ = lis.Close()
+	}()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("Failed to dial bufnet: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	volumeID := "fuse-stable-ino-vol"
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Mkdir /subdir
+	var mkdirOut fuse.EntryOut
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "subdir", &mkdirOut); status != fuse.OK {
+		t.Fatalf("Mkdir failed: %v", status)
+	}
+	dirID := mkdirOut.NodeId
+
+	// 2. Create /file.txt
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, "file.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Verify initial getattr
+	var fileAttrOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &fileAttrOut); status != fuse.OK {
+		t.Fatalf("GetAttr on fileID failed: %v", status)
+	}
+	if fileAttrOut.Attr.Ino != fileID {
+		t.Fatalf("Expected st_ino %d, got %d", fileID, fileAttrOut.Attr.Ino)
+	}
+
+	// 3. Trigger controller snapshot 1
+	ctx := t.Context()
+	if _, err := client.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("Failed to create snapshot 1: %v", err)
+	}
+
+	// 4. Query GetAttr using the existing fileID after snapshot 1
+	var fileAttrAfterSnap1 fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &fileAttrAfterSnap1); status != fuse.OK {
+		t.Fatalf("GetAttr on fileID after snap 1 failed: %v", status)
+	}
+	if fileAttrAfterSnap1.Attr.Ino != fileID {
+		t.Fatalf("st_ino changed after snap 1: expected %d, got %d", fileID, fileAttrAfterSnap1.Attr.Ino)
+	}
+
+	// Also verify lookup returns the same stable Inode / NodeId
+	var lookupOut fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "file.txt", &lookupOut); status != fuse.OK {
+		t.Fatalf("Lookup file.txt after snap 1 failed: %v", status)
+	}
+	if lookupOut.NodeId != fileID || lookupOut.Attr.Ino != fileID {
+		t.Fatalf("Lookup returned different inode: expected %d, got NodeId=%d Ino=%d", fileID, lookupOut.NodeId, lookupOut.Attr.Ino)
+	}
+
+	// 5. Create a new file before snapshot 2
+	var createOut2 fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: dirID}, Mode: 0644}, "nested.txt", &createOut2); status != fuse.OK {
+		t.Fatalf("Create nested failed: %v", status)
+	}
+	nestedID := createOut2.EntryOut.NodeId
+
+	// Trigger snapshot 2
+	if _, err := client.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("Failed to create snapshot 2: %v", err)
+	}
+
+	// Verify all inode numbers remain unchanged across snapshot 2
+	var fileAttrAfterSnap2 fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &fileAttrAfterSnap2); status != fuse.OK {
+		t.Fatalf("GetAttr on fileID after snap 2 failed: %v", status)
+	}
+	if fileAttrAfterSnap2.Attr.Ino != fileID {
+		t.Fatalf("file st_ino changed after snap 2: expected %d, got %d", fileID, fileAttrAfterSnap2.Attr.Ino)
+	}
+
+	var dirAttrAfterSnap2 fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: dirID}}, &dirAttrAfterSnap2); status != fuse.OK {
+		t.Fatalf("GetAttr on dirID after snap 2 failed: %v", status)
+	}
+	if dirAttrAfterSnap2.Attr.Ino != dirID {
+		t.Fatalf("dir st_ino changed after snap 2: expected %d, got %d", dirID, dirAttrAfterSnap2.Attr.Ino)
+	}
+
+	var nestedAttrAfterSnap2 fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: nestedID}}, &nestedAttrAfterSnap2); status != fuse.OK {
+		t.Fatalf("GetAttr on nestedID after snap 2 failed: %v", status)
+	}
+	if nestedAttrAfterSnap2.Attr.Ino != nestedID {
+		t.Fatalf("nested st_ino changed after snap 2: expected %d, got %d", nestedID, nestedAttrAfterSnap2.Attr.Ino)
+	}
+}

@@ -16,9 +16,11 @@ package erofs
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -346,16 +348,37 @@ func TestErofsFsckFailures(t *testing.T) {
 			t.Fatalf("failed to read superblock: %v", err)
 		}
 
-		// Find the directory's inode. NID 0 is root, NID 1 is dir1.
-		inode, err := ReadInode(readerAt, sb, 1)
+		reader, err := NewReader(readerAt)
 		if err != nil {
-			t.Fatalf("failed to read inode 1: %v", err)
+			t.Fatalf("failed to create reader: %v", err)
+		}
+
+		rootDirents, err := reader.ListDirectory(sb.GetRootNID())
+		if err != nil {
+			t.Fatalf("failed to list root directory: %v", err)
+		}
+
+		var dir1NID uint64
+		for _, de := range rootDirents {
+			if de.Name == "dir1" {
+				dir1NID = de.NID
+				break
+			}
+		}
+		if dir1NID == 0 {
+			t.Fatalf("failed to find dir1 in root dirents")
+		}
+
+		// Find the directory's inode.
+		inode, err := ReadInode(readerAt, sb, dir1NID)
+		if err != nil {
+			t.Fatalf("failed to read inode for dir1 (%d): %v", dir1NID, err)
 		}
 
 		dirents := []Dirent{
-			{NID: 1, Name: ".", FileType: FTDir},
+			{NID: dir1NID, Name: ".", FileType: FTDir},
 			{NID: 0, Name: "..", FileType: FTDir},
-			{NID: 1, Name: "loop", FileType: FTDir},
+			{NID: dir1NID, Name: "loop", FileType: FTDir},
 		}
 
 		block, err := BuildDirectoryBlock(dirents, BlockSize4K)
@@ -545,4 +568,132 @@ func TestErofsXattrsAndComposeFS(t *testing.T) {
 	if !foundFile1 || !foundFile2 {
 		t.Fatalf("expected both files to be found in directory listing")
 	}
+}
+
+func TestErofsStridedPlacementAndExtendedInodes(t *testing.T) {
+	t.Run("5 GiB Extended Inode with Digest fits in stride", func(t *testing.T) {
+		fileXattrs := Xattrs{
+			UserDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		}
+		file5GB := NewMemoryNode(
+			"bigfile.iso",
+			false,
+			0644,
+			nil,
+			nil,
+			WithIno(8),
+			WithMetadataOnly(true),
+			WithSize(5*1024*1024*1024), // 5 GiB (requires extended inode > 4GB)
+			WithXattrs(fileXattrs),
+		)
+		root := NewMemoryNode(
+			"",
+			true,
+			0755,
+			nil,
+			[]Node{file5GB},
+			WithIno(0),
+		)
+
+		mw := &memoryWriterAt{}
+		err := WriteImage(mw, root)
+		if err != nil {
+			t.Fatalf("failed to write image with 5GiB file: %v", err)
+		}
+
+		readerAt := bytes.NewReader(mw.buf)
+		if err := Fsck(readerAt); err != nil {
+			t.Fatalf("Fsck failed on 5GiB extended inode image: %v", err)
+		}
+
+		reader, err := NewReader(readerAt)
+		if err != nil {
+			t.Fatalf("failed to create reader: %v", err)
+		}
+
+		inode, err := ReadInode(readerAt, reader.sb, 8)
+		if err != nil {
+			t.Fatalf("failed to read inode at NID 8: %v", err)
+		}
+		if inode.Version != 1 {
+			t.Fatalf("expected extended inode (version 1), got %d", inode.Version)
+		}
+		if inode.Size != 5*1024*1024*1024 {
+			t.Fatalf("expected size 5GiB, got %d", inode.Size)
+		}
+
+		xattrs, err := reader.GetXattrs(8)
+		if err != nil {
+			t.Fatalf("failed to get xattrs: %v", err)
+		}
+		if xattrs.UserDigest != fileXattrs.UserDigest {
+			t.Fatalf("expected user.digest %q, got %q", fileXattrs.UserDigest, xattrs.UserDigest)
+		}
+	})
+
+	t.Run("Overlapping placement rejected", func(t *testing.T) {
+		file1 := NewMemoryNode("file1.txt", false, 0644, []byte("data"), nil, WithIno(8))
+		file2 := NewMemoryNode("file2.txt", false, 0644, []byte("data"), nil, WithIno(8)) // same NID
+		root := NewMemoryNode("", true, 0755, nil, []Node{file1, file2}, WithIno(0))
+
+		mw := &memoryWriterAt{}
+		err := WriteImage(mw, root)
+		if err == nil {
+			t.Fatalf("expected WriteImage to fail with duplicate/overlapping NID")
+		}
+	})
+
+	t.Run("Over-stride footprint rejected", func(t *testing.T) {
+		// Create many xattrs that exceed 8 slots (256 bytes)
+		manyXattrs := Xattrs{
+			UserDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			Others: map[string]string{
+				"user.attr1": strings.Repeat("a", 100),
+				"user.attr2": strings.Repeat("b", 100),
+				"user.attr3": strings.Repeat("c", 100),
+			},
+		}
+		fileTooBig := NewMemoryNode("huge_xattrs.txt", false, 0644, []byte("data"), nil, WithIno(8), WithXattrs(manyXattrs))
+		root := NewMemoryNode("", true, 0755, nil, []Node{fileTooBig}, WithIno(0))
+
+		mw := &memoryWriterAt{}
+		err := WriteImage(mw, root)
+		if err == nil {
+			t.Fatalf("expected WriteImage to fail when xattr footprint exceeds stride")
+		}
+	})
+
+	t.Run("Large directory places inode in stride and entries in blocks", func(t *testing.T) {
+		var children []Node
+		for i := 0; i < 500; i++ {
+			ino := uint64((i + 1) * DefaultInodeStride)
+			children = append(children, NewMemoryNode(fmt.Sprintf("entry_%04d.txt", i), false, 0644, []byte("test"), nil, WithIno(ino)))
+		}
+		root := NewMemoryNode("", true, 0755, nil, children, WithIno(0))
+
+		mw := &memoryWriterAt{}
+		err := WriteImage(mw, root)
+		if err != nil {
+			t.Fatalf("failed to write image with large directory: %v", err)
+		}
+
+		readerAt := bytes.NewReader(mw.buf)
+		if err := Fsck(readerAt); err != nil {
+			t.Fatalf("Fsck failed on large directory image: %v", err)
+		}
+
+		reader, err := NewReader(readerAt)
+		if err != nil {
+			t.Fatalf("failed to create reader: %v", err)
+		}
+
+		dirents, err := reader.ListDirectory(0)
+		if err != nil {
+			t.Fatalf("failed to list large directory: %v", err)
+		}
+		// 500 children + "." + ".." = 502
+		if len(dirents) != 502 {
+			t.Fatalf("expected 502 dirents, got %d", len(dirents))
+		}
+	})
 }
