@@ -59,12 +59,17 @@ func TestControllerServiceOperations(t *testing.T) {
 		VolumeId: volumeID,
 		Path:     "/subdir",
 		Mode:     0755,
+		Uid:      1001,
+		Gid:      1002,
 	})
 	if err != nil {
 		t.Fatalf("Failed to mkdir /subdir: %v", err)
 	}
 	if !mkdirResp.Attr.IsDir || mkdirResp.Attr.Name != "subdir" {
 		t.Fatalf("Unexpected mkdir attr: %v", mkdirResp.Attr)
+	}
+	if mkdirResp.Attr.Uid != 1001 || mkdirResp.Attr.Gid != 1002 {
+		t.Fatalf("Unexpected mkdir owner: uid=%d, gid=%d", mkdirResp.Attr.Uid, mkdirResp.Attr.Gid)
 	}
 
 	// 3. Create file
@@ -73,12 +78,17 @@ func TestControllerServiceOperations(t *testing.T) {
 		Path:           "/subdir/hello.txt",
 		Mode:           0644,
 		InitialContent: []byte("initial content"),
+		Uid:            5001,
+		Gid:            5002,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create file: %v", err)
 	}
 	if createResp.Attr.Size != int64(len("initial content")) {
 		t.Fatalf("Unexpected file size: %d", createResp.Attr.Size)
+	}
+	if createResp.Attr.Uid != 5001 || createResp.Attr.Gid != 5002 {
+		t.Fatalf("Unexpected file owner: uid=%d, gid=%d", createResp.Attr.Uid, createResp.Attr.Gid)
 	}
 
 	// 4. Lookup
@@ -92,6 +102,9 @@ func TestControllerServiceOperations(t *testing.T) {
 	}
 	if lookupResp.Attr.Path != "/subdir/hello.txt" {
 		t.Fatalf("Unexpected path in lookup: %s", lookupResp.Attr.Path)
+	}
+	if lookupResp.Attr.Uid != 5001 || lookupResp.Attr.Gid != 5002 {
+		t.Fatalf("Unexpected owner in lookup: uid=%d, gid=%d", lookupResp.Attr.Uid, lookupResp.Attr.Gid)
 	}
 
 	// 5. Read file

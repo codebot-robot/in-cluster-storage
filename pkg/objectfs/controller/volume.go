@@ -61,6 +61,8 @@ type FileMetadata struct {
 	ModTime time.Time `json:"mod_time"`
 	Sha256  string    `json:"sha256,omitempty"`
 	ETag    string    `json:"etag,omitempty"`
+	Uid     uint32    `json:"uid,omitempty"`
+	Gid     uint32    `json:"gid,omitempty"`
 }
 
 // metadataResolver provides unified read methods for resolving inodes and directories
@@ -257,6 +259,8 @@ func (v *Volume) persistInode(ctx context.Context, node *CachedInode) error {
 			IsDir:   node.IsDir,
 			Sha256:  node.Sha256,
 			ETag:    node.ETag,
+			Uid:     node.Uid,
+			Gid:     node.Gid,
 		}
 		payload, err := EncodeInodeRecord(rec)
 		if err != nil {
@@ -442,6 +446,8 @@ func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, pop
 					IsDir:   rec.IsDir,
 					Sha256:  rec.Sha256,
 					ETag:    rec.ETag,
+					Uid:     rec.Uid,
+					Gid:     rec.Gid,
 					IsDirty: populateCache,
 				}
 				if populateCache && r.inodeCache != nil {
@@ -486,6 +492,8 @@ func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, pop
 				ModTime: mtime,
 				IsDir:   isDir,
 				Sha256:  shaStr,
+				Uid:     erofsInode.UID,
+				Gid:     erofsInode.GID,
 				IsDirty: false,
 			}
 			if populateCache && r.inodeCache != nil {
@@ -740,6 +748,8 @@ func (v *Volume) toEntryAttrLocked(ctx context.Context, inodeID uint64, fullPath
 		ModTime:     timestamppb.New(node.ModTime),
 		Sha256:      node.Sha256,
 		RedirectUrl: node.RedirectURL,
+		Uid:         node.Uid,
+		Gid:         node.Gid,
 	}, nil
 }
 
@@ -817,7 +827,7 @@ func (v *Volume) ReadDir(ctx context.Context, p string) ([]*pb.EntryAttr, error)
 	return entries, nil
 }
 
-func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAttr, error) {
+func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint32) (*pb.EntryAttr, error) {
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
@@ -878,6 +888,8 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAtt
 			Mode:    mode,
 			ModTime: now,
 			IsDir:   true,
+			Uid:     uid,
+			Gid:     gid,
 			IsDirty: true,
 		}
 		v.inodeCache.Put(childInodeID, childInode)
@@ -899,6 +911,8 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAtt
 			Mode:     mode,
 			ModTime:  timestamppb.New(now),
 			Inode:    childInodeID,
+			Uid:      uid,
+			Gid:      gid,
 		}
 		waitFn, err := v.logMutationLocked(ctx, rec, nil)
 		if err != nil {
@@ -915,6 +929,8 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAtt
 			Size:    0,
 			Mode:    mode,
 			ModTime: timestamppb.New(now),
+			Uid:     uid,
+			Gid:     gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_CREATED,
@@ -936,7 +952,7 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAtt
 	return attr, nil
 }
 
-func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialContent []byte) (*pb.EntryAttr, error) {
+func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialContent []byte, uid, gid uint32) (*pb.EntryAttr, error) {
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
@@ -1004,6 +1020,8 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			childInode.Data = stream
 			childInode.ModTime = now
 			childInode.Sha256 = hashStr
+			childInode.Uid = uid
+			childInode.Gid = gid
 			childInode.IsDirty = true
 
 			rec := &MutationRecord{
@@ -1016,6 +1034,8 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 				Sha256:   hashStr,
 				Inode:    childInode.ID,
 				Data:     dataCopy,
+				Uid:      uid,
+				Gid:      gid,
 			}
 			waitFn, err := v.logMutationLocked(ctx, rec, nil)
 			if err != nil {
@@ -1031,6 +1051,8 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 				Mode:    childInode.Mode,
 				ModTime: timestamppb.New(now),
 				Sha256:  hashStr,
+				Uid:     uid,
+				Gid:     gid,
 			}
 			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 				EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -1063,6 +1085,8 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			Data:    stream,
 			Sha256:  hashStr,
 			IsDir:   false,
+			Uid:     uid,
+			Gid:     gid,
 			IsDirty: true,
 		}
 		v.inodeCache.Put(childInodeID, childInode)
@@ -1077,6 +1101,8 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			Sha256:   hashStr,
 			Inode:    childInodeID,
 			Data:     dataCopy,
+			Uid:      uid,
+			Gid:      gid,
 		}
 		waitFn, err := v.logMutationLocked(ctx, rec, nil)
 		if err != nil {
@@ -1094,6 +1120,8 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			Mode:    mode,
 			ModTime: timestamppb.New(now),
 			Sha256:  hashStr,
+			Uid:     uid,
+			Gid:     gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_CREATED,
@@ -1270,6 +1298,8 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 			Mode:    node.Mode,
 			ModTime: timestamppb.New(now),
 			Sha256:  node.Sha256,
+			Uid:     node.Uid,
+			Gid:     node.Gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -1371,6 +1401,8 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 			Mode:    node.Mode,
 			ModTime: timestamppb.New(now),
 			Sha256:  node.Sha256,
+			Uid:     node.Uid,
+			Gid:     node.Gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -1657,6 +1689,8 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 			Mode:    childInode.Mode,
 			ModTime: timestamppb.New(now),
 			Sha256:  childInode.Sha256,
+			Uid:     childInode.Uid,
+			Gid:     childInode.Gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_RENAMED,
@@ -1744,6 +1778,8 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 		Mode:    dirInode.Mode,
 		Size:    dirInode.Size,
 		ModTime: dirInode.ModTime,
+		Uid:     dirInode.Uid,
+		Gid:     dirInode.Gid,
 	}
 
 	var childNames []string
@@ -1778,6 +1814,8 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 				ModTime: childInode.ModTime,
 				Sha256:  childInode.Sha256,
 				ETag:    childInode.ETag,
+				Uid:     childInode.Uid,
+				Gid:     childInode.Gid,
 			}
 
 			needsUpload := childInode.ETag == ""
@@ -1816,6 +1854,8 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 				erofs.WithMetadataOnly(true),
 				erofs.WithSize(uint64(childInode.Size)),
 				erofs.WithMtime(uint64(childInode.ModTime.Unix())),
+				erofs.WithUID(childInode.Uid),
+				erofs.WithGID(childInode.Gid),
 				erofs.WithXattrs(xattrs),
 			)
 			children = append(children, leafNode)
@@ -1833,6 +1873,8 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 		nil,
 		children,
 		erofs.WithMtime(uint64(dirInode.ModTime.Unix())),
+		erofs.WithUID(dirInode.Uid),
+		erofs.WithGID(dirInode.Gid),
 	), nil
 }
 
@@ -2109,6 +2151,8 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 			Mode:    mode,
 			ModTime: modTime,
 			IsDir:   true,
+			Uid:     record.Uid,
+			Gid:     record.Gid,
 			IsDirty: false,
 		}
 		v.inodeCache.Put(inodeID, childInode)
@@ -2182,6 +2226,8 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 			Data:    stream,
 			Sha256:  record.Sha256,
 			IsDir:   false,
+			Uid:     record.Uid,
+			Gid:     record.Gid,
 			IsDirty: false,
 		}
 		v.inodeCache.Put(inodeID, childInode)

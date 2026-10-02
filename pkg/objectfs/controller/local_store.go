@@ -72,6 +72,8 @@ type InodeRecord struct {
 	IsDir   bool
 	Sha256  string
 	ETag    string
+	Uid     uint32
+	Gid     uint32
 }
 
 // DirEntry represents a single directory entry.
@@ -131,13 +133,21 @@ func EncodeInodeRecord(rec *InodeRecord) ([]byte, error) {
 	buf.Write(b2[:])
 	buf.Write(etagBytes)
 
+	// Uid (4)
+	binary.BigEndian.PutUint32(b4[:], rec.Uid)
+	buf.Write(b4[:])
+
+	// Gid (4)
+	binary.BigEndian.PutUint32(b4[:], rec.Gid)
+	buf.Write(b4[:])
+
 	return buf.Bytes(), nil
 }
 
 // DecodeInodeRecord decodes an InodeRecord from binary representation.
 // TODO: optimize encoding/decoding by parsing slice offsets directly instead of allocating bytes.NewReader wrapper.
 func DecodeInodeRecord(data []byte) (*InodeRecord, error) {
-	if len(data) < 29 {
+	if len(data) < 37 {
 		return nil, fmt.Errorf("data too short for InodeRecord: %d bytes", len(data))
 	}
 	r := bytes.NewReader(data)
@@ -190,6 +200,16 @@ func DecodeInodeRecord(data []byte) (*InodeRecord, error) {
 		return nil, err
 	}
 
+	if _, err := io.ReadFull(r, b4[:]); err != nil {
+		return nil, err
+	}
+	uid := binary.BigEndian.Uint32(b4[:])
+
+	if _, err := io.ReadFull(r, b4[:]); err != nil {
+		return nil, err
+	}
+	gid := binary.BigEndian.Uint32(b4[:])
+
 	return &InodeRecord{
 		InodeID: inodeID,
 		Mode:    mode,
@@ -198,6 +218,8 @@ func DecodeInodeRecord(data []byte) (*InodeRecord, error) {
 		IsDir:   isDir,
 		Sha256:  string(shaBytes),
 		ETag:    string(etagBytes),
+		Uid:     uid,
+		Gid:     gid,
 	}, nil
 }
 

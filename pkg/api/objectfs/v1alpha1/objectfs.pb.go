@@ -218,6 +218,8 @@ type EntryAttr struct {
 	ModTime       *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
 	Sha256        string                 `protobuf:"bytes,8,opt,name=sha256,proto3" json:"sha256,omitempty"`
 	RedirectUrl   string                 `protobuf:"bytes,9,opt,name=redirect_url,json=redirectUrl,proto3" json:"redirect_url,omitempty"`
+	Uid           uint32                 `protobuf:"varint,10,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid           uint32                 `protobuf:"varint,11,opt,name=gid,proto3" json:"gid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -313,6 +315,20 @@ func (x *EntryAttr) GetRedirectUrl() string {
 		return x.RedirectUrl
 	}
 	return ""
+}
+
+func (x *EntryAttr) GetUid() uint32 {
+	if x != nil {
+		return x.Uid
+	}
+	return 0
+}
+
+func (x *EntryAttr) GetGid() uint32 {
+	if x != nil {
+		return x.Gid
+	}
+	return 0
 }
 
 type GetAttrRequest struct {
@@ -640,6 +656,8 @@ type MkdirRequest struct {
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
 	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	Mode          uint32                 `protobuf:"varint,3,opt,name=mode,proto3" json:"mode,omitempty"`
+	Uid           uint32                 `protobuf:"varint,4,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid           uint32                 `protobuf:"varint,5,opt,name=gid,proto3" json:"gid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -691,6 +709,20 @@ func (x *MkdirRequest) GetPath() string {
 func (x *MkdirRequest) GetMode() uint32 {
 	if x != nil {
 		return x.Mode
+	}
+	return 0
+}
+
+func (x *MkdirRequest) GetUid() uint32 {
+	if x != nil {
+		return x.Uid
+	}
+	return 0
+}
+
+func (x *MkdirRequest) GetGid() uint32 {
+	if x != nil {
+		return x.Gid
 	}
 	return 0
 }
@@ -753,6 +785,8 @@ type CreateFileRequest struct {
 	Path           string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	Mode           uint32                 `protobuf:"varint,3,opt,name=mode,proto3" json:"mode,omitempty"`
 	InitialContent []byte                 `protobuf:"bytes,4,opt,name=initial_content,json=initialContent,proto3" json:"initial_content,omitempty"`
+	Uid            uint32                 `protobuf:"varint,5,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid            uint32                 `protobuf:"varint,6,opt,name=gid,proto3" json:"gid,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -813,6 +847,20 @@ func (x *CreateFileRequest) GetInitialContent() []byte {
 		return x.InitialContent
 	}
 	return nil
+}
+
+func (x *CreateFileRequest) GetUid() uint32 {
+	if x != nil {
+		return x.Uid
+	}
+	return 0
+}
+
+func (x *CreateFileRequest) GetGid() uint32 {
+	if x != nil {
+		return x.Gid
+	}
+	return 0
 }
 
 type CreateFileResponse struct {
@@ -2473,6 +2521,8 @@ type MutationRecord struct {
 	Inode         uint64                 `protobuf:"varint,10,opt,name=inode,proto3" json:"inode,omitempty"`
 	Data          []byte                 `protobuf:"bytes,11,opt,name=data,proto3" json:"data,omitempty"`
 	StreamSeq     uint64                 `protobuf:"varint,12,opt,name=stream_seq,json=streamSeq,proto3" json:"stream_seq,omitempty"`
+	Uid           uint32                 `protobuf:"varint,13,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid           uint32                 `protobuf:"varint,14,opt,name=gid,proto3" json:"gid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2591,11 +2641,25 @@ func (x *MutationRecord) GetStreamSeq() uint64 {
 	return 0
 }
 
+func (x *MutationRecord) GetUid() uint32 {
+	if x != nil {
+		return x.Uid
+	}
+	return 0
+}
+
+func (x *MutationRecord) GetGid() uint32 {
+	if x != nil {
+		return x.Gid
+	}
+	return 0
+}
+
 var File_objectfs_proto protoreflect.FileDescriptor
 
 const file_objectfs_proto_rawDesc = "" +
 	"\n" +
-	"\x0eobjectfs.proto\x12\x11objectfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xfa\x01\n" +
+	"\x0eobjectfs.proto\x12\x11objectfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x9e\x02\n" +
 	"\tEntryAttr\x12\x14\n" +
 	"\x05inode\x18\x01 \x01(\x04R\x05inode\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
@@ -2605,7 +2669,10 @@ const file_objectfs_proto_rawDesc = "" +
 	"\x04mode\x18\x06 \x01(\rR\x04mode\x125\n" +
 	"\bmod_time\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\amodTime\x12\x16\n" +
 	"\x06sha256\x18\b \x01(\tR\x06sha256\x12!\n" +
-	"\fredirect_url\x18\t \x01(\tR\vredirectUrl\"A\n" +
+	"\fredirect_url\x18\t \x01(\tR\vredirectUrl\x12\x10\n" +
+	"\x03uid\x18\n" +
+	" \x01(\rR\x03uid\x12\x10\n" +
+	"\x03gid\x18\v \x01(\rR\x03gid\"A\n" +
 	"\x0eGetAttrRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\"Y\n" +
@@ -2625,19 +2692,23 @@ const file_objectfs_proto_rawDesc = "" +
 	"\x04path\x18\x02 \x01(\tR\x04path\"_\n" +
 	"\x0fReadDirResponse\x126\n" +
 	"\aentries\x18\x01 \x03(\v2\x1c.objectfs.v1alpha1.EntryAttrR\aentries\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"S\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"w\n" +
 	"\fMkdirRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
-	"\x04mode\x18\x03 \x01(\rR\x04mode\"W\n" +
+	"\x04mode\x18\x03 \x01(\rR\x04mode\x12\x10\n" +
+	"\x03uid\x18\x04 \x01(\rR\x03uid\x12\x10\n" +
+	"\x03gid\x18\x05 \x01(\rR\x03gid\"W\n" +
 	"\rMkdirResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"\x81\x01\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"\xa5\x01\n" +
 	"\x11CreateFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
 	"\x04mode\x18\x03 \x01(\rR\x04mode\x12'\n" +
-	"\x0finitial_content\x18\x04 \x01(\fR\x0einitialContent\"\\\n" +
+	"\x0finitial_content\x18\x04 \x01(\fR\x0einitialContent\x12\x10\n" +
+	"\x03uid\x18\x05 \x01(\rR\x03uid\x12\x10\n" +
+	"\x03gid\x18\x06 \x01(\rR\x03gid\"\\\n" +
 	"\x12CreateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\"n\n" +
@@ -2747,7 +2818,7 @@ const file_objectfs_proto_rawDesc = "" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"z\n" +
 	"\x16CreateSnapshotResponse\x12#\n" +
 	"\rsnapshot_name\x18\x01 \x01(\tR\fsnapshotName\x12;\n" +
-	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\xe9\x02\n" +
+	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\x8d\x03\n" +
 	"\x0eMutationRecord\x123\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x1f.objectfs.v1alpha1.MutationTypeR\x04type\x12\x1b\n" +
 	"\tvolume_id\x18\x02 \x01(\tR\bvolumeId\x12\x12\n" +
@@ -2762,7 +2833,9 @@ const file_objectfs_proto_rawDesc = "" +
 	" \x01(\x04R\x05inode\x12\x12\n" +
 	"\x04data\x18\v \x01(\fR\x04data\x12\x1d\n" +
 	"\n" +
-	"stream_seq\x18\f \x01(\x04R\tstreamSeq*g\n" +
+	"stream_seq\x18\f \x01(\x04R\tstreamSeq\x12\x10\n" +
+	"\x03uid\x18\r \x01(\rR\x03uid\x12\x10\n" +
+	"\x03gid\x18\x0e \x01(\rR\x03gid*g\n" +
 	"\tWriteMode\x12\x1a\n" +
 	"\x16WRITE_MODE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13WRITE_THROUGH_FSYNC\x10\x01\x12\x0e\n" +

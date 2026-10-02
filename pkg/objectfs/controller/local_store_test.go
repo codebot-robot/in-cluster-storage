@@ -243,7 +243,7 @@ func TestTieredMetadataLRUEvictionAndReload(t *testing.T) {
 	// Create 10 files across 3 subdirectories
 	for d := 1; d <= 3; d++ {
 		dirPath := fmt.Sprintf("/dir%d", d)
-		_, err := vol.Mkdir(ctx, dirPath, 0755)
+		_, err := vol.Mkdir(ctx, dirPath, 0755, 0, 0)
 		if err != nil {
 			t.Fatalf("Mkdir %s failed: %v", dirPath, err)
 		}
@@ -251,7 +251,7 @@ func TestTieredMetadataLRUEvictionAndReload(t *testing.T) {
 		for f := 1; f <= 4; f++ {
 			filePath := fmt.Sprintf("%s/file%d.txt", dirPath, f)
 			content := []byte(fmt.Sprintf("content of dir%d file%d", d, f))
-			_, err := vol.CreateFile(ctx, filePath, 0644, content)
+			_, err := vol.CreateFile(ctx, filePath, 0644, content, 0, 0)
 			if err != nil {
 				t.Fatalf("CreateFile %s failed: %v", filePath, err)
 			}
@@ -356,21 +356,21 @@ func TestLargeDirectoryDeltaEviction(t *testing.T) {
 	defer vol.Close()
 
 	// 1. Create directory /bigdir with 50 files
-	_, err := vol.Mkdir(ctx, "/bigdir", 0755)
+	_, err := vol.Mkdir(ctx, "/bigdir", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Mkdir /bigdir failed: %v", err)
 	}
 
 	for i := 0; i < 50; i++ {
 		filePath := fmt.Sprintf("/bigdir/file_%03d.txt", i)
-		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("data-%d", i)))
+		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("data-%d", i)), 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile %s failed: %v", filePath, err)
 		}
 	}
 
 	// Force eviction of /bigdir by accessing root and another directory
-	_, _ = vol.Mkdir(ctx, "/otherdir", 0755)
+	_, _ = vol.Mkdir(ctx, "/otherdir", 0755, 0, 0)
 	_, _ = vol.GetAttr(ctx, "/")
 
 	// Verify /bigdir is recorded in dirtyDirs
@@ -382,13 +382,13 @@ func TestLargeDirectoryDeltaEviction(t *testing.T) {
 	if err := vol.Unlink(ctx, "/bigdir/file_005.txt"); err != nil {
 		t.Fatalf("Unlink file_005 failed: %v", err)
 	}
-	_, err = vol.CreateFile(ctx, "/bigdir/new_file.txt", 0644, []byte("new file content"))
+	_, err = vol.CreateFile(ctx, "/bigdir/new_file.txt", 0644, []byte("new file content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile new_file.txt failed: %v", err)
 	}
 
 	// Force eviction of /bigdir again
-	_, _ = vol.Mkdir(ctx, "/third_dir", 0755)
+	_, _ = vol.Mkdir(ctx, "/third_dir", 0755, 0, 0)
 
 	// 3. ReadDir /bigdir: should replay deltas correctly
 	entries, err := vol.ReadDir(ctx, "/bigdir")
@@ -433,7 +433,7 @@ func TestAutoSnapshotTriggerOnThreshold(t *testing.T) {
 	// Create 10 files which evicts and reaches threshold of 5 dirty records
 	for i := 0; i < 10; i++ {
 		filePath := fmt.Sprintf("/auto_file_%d.txt", i)
-		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("data-%d", i)))
+		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("data-%d", i)), 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile %s failed: %v", filePath, err)
 		}
@@ -559,7 +559,7 @@ func TestSnapshotCircularBufferTrimmingAndCap(t *testing.T) {
 	for i := 1; i <= 15; i++ {
 		filePath := fmt.Sprintf("/file_%02d.txt", i)
 		content := []byte(fmt.Sprintf("content-data-for-file-%02d", i))
-		_, err := vol.CreateFile(ctx, filePath, 0644, content)
+		_, err := vol.CreateFile(ctx, filePath, 0644, content, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile %s failed: %v", filePath, err)
 		}
@@ -597,7 +597,7 @@ func TestSnapshotCircularBufferTrimmingAndCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
-	_, err = vol.CreateFile(ctx, "/file_new.txt", 0644, []byte("new file content"))
+	_, err = vol.CreateFile(ctx, "/file_new.txt", 0644, []byte("new file content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile file_new failed: %v", err)
 	}
@@ -638,7 +638,7 @@ func TestAutoSnapshotTriggerOnMaxBufferFiles(t *testing.T) {
 	// Create files causing multiple file rotations
 	for i := 0; i < 25; i++ {
 		filePath := fmt.Sprintf("/capped_file_%d.txt", i)
-		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("some-data-payload-%d", i)))
+		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("some-data-payload-%d", i)), 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile %s failed: %v", filePath, err)
 		}
@@ -672,7 +672,7 @@ func TestTwoPhaseSnapshotConcurrentOperations(t *testing.T) {
 
 	// Seed initial files
 	for i := 0; i < 5; i++ {
-		_, err := vol.CreateFile(ctx, fmt.Sprintf("/init_%d.txt", i), 0644, []byte(fmt.Sprintf("initial-%d", i)))
+		_, err := vol.CreateFile(ctx, fmt.Sprintf("/init_%d.txt", i), 0644, []byte(fmt.Sprintf("initial-%d", i)), 0, 0)
 		if err != nil {
 			t.Fatalf("Initial CreateFile failed: %v", err)
 		}
@@ -688,7 +688,7 @@ func TestTwoPhaseSnapshotConcurrentOperations(t *testing.T) {
 		<-start
 		for i := 0; i < 20; i++ {
 			filePath := fmt.Sprintf("/concurrent_file_%d.txt", i)
-			_, _ = vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("concurrent-payload-%d", i)))
+			_, _ = vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("concurrent-payload-%d", i)), 0, 0)
 			_, _, _, _ = vol.WriteFile(ctx, filePath, 0, []byte(fmt.Sprintf("updated-payload-%d", i)), pb.WriteMode_LAZY_WRITE)
 			time.Sleep(1 * time.Millisecond)
 		}
