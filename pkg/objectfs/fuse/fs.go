@@ -583,8 +583,11 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		return nil, fuse.ENOENT
 	}
 
-	// Check local cache first (dirty or clean)
-	if cached, ok := fs.cache.Get(p); ok {
+	// Check local cache first (dirty or clean range)
+	if data, ok := fs.cache.GetRange(p, int64(input.Offset), int64(input.Size)); ok {
+		return fuse.ReadResultData(data), fuse.OK
+	}
+	if cached, ok := fs.cache.Get(p); ok && len(cached.Data) > 0 {
 		if input.Offset >= uint64(cached.Size) {
 			return fuse.ReadResultData([]byte{}), fuse.OK
 		}
@@ -613,6 +616,10 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 
 	if input.Offset == 0 && resp.GetEof() && len(resp.GetData()) > 0 {
 		fs.cache.Put(p, resp.GetData(), time.Now(), "")
+	} else if len(resp.GetData()) > 0 {
+		chunkSize := uint32(32 * 1024)
+		chunkIdx := int(input.Offset / uint64(chunkSize))
+		fs.cache.PutChunk(p, chunkIdx, chunkSize, resp.GetTotalSize(), resp.GetData(), time.Now())
 	}
 
 	return fuse.ReadResultData(resp.GetData()), fuse.OK

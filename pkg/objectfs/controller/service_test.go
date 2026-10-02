@@ -19,7 +19,9 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -2184,4 +2186,127 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 			t.Errorf("Expected directory to be removed in memory during Rmdir durability wait")
 		}
 	})
+}
+
+func TestVolumeFixedBoundaryChunking(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	chunkSize := uint32(16 * 1024) // 16 KiB chunk size for testing
+	vol := NewVolume("chunk-test-vol", backend, NewEventBroadcaster(), WithChunkSize(chunkSize))
+
+	// 1. Small file <= 1 chunk (e.g. 100 bytes)
+	smallData := []byte("small file content unchunked")
+	smallAttr, err := vol.CreateFile(ctx, "/small.txt", 0644, smallData, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile /small.txt failed: %v", err)
+	}
+	smallSha := fmt.Sprintf("%x", sha256.Sum256(smallData))
+	if smallAttr.ManifestSha256 != "" {
+		t.Fatalf("expected empty ManifestSha256 for small file, got %s", smallAttr.ManifestSha256)
+	}
+	if smallAttr.ContentSha256 != smallSha {
+		t.Fatalf("expected ContentSha256 %s, got %s", smallSha, smallAttr.ContentSha256)
+	}
+
+	// 2. Large file > 1 chunk (e.g. 40 KiB = 2.5 chunks)
+	largeData := make([]byte, 40*1024)
+	for i := range largeData {
+		largeData[i] = byte(i % 251)
+	}
+	largeSha := fmt.Sprintf("%x", sha256.Sum256(largeData))
+
+	largeAttr, err := vol.CreateFile(ctx, "/large.bin", 0644, largeData, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile /large.bin failed: %v", err)
+	}
+	if largeAttr.ManifestSha256 == "" {
+		t.Fatalf("expected non-empty ManifestSha256 for chunked file")
+	}
+	if largeAttr.ContentSha256 != largeSha {
+		t.Fatalf("expected ContentSha256 %s, got %s", largeSha, largeAttr.ContentSha256)
+	}
+
+	// 3. Read partial ranges spanning chunk boundaries
+	// Read 20 KiB starting at offset 10 KiB (spans chunk 0 and chunk 1)
+	partData, total, _, err := vol.ReadFile(ctx, "/large.bin", 10*1024, 20*1024)
+	if err != nil {
+		t.Fatalf("ReadFile partial spanning chunks failed: %v", err)
+	}
+	if total != int64(len(largeData)) {
+		t.Fatalf("expected total %d, got %d", len(largeData), total)
+	}
+	if !bytes.Equal(partData, largeData[10*1024:30*1024]) {
+		t.Fatalf("partial data mismatch spanning chunks")
+	}
+
+	// 4. Random write touching chunk 1 (offset 20 KiB, length 4 KiB)
+	patch := []byte("random patch in chunk 1")
+	copy(largeData[20*1024:], patch)
+	_, newSize, _, err := vol.WriteFile(ctx, "/large.bin", 20*1024, patch, pb.WriteMode_LAZY_WRITE)
+	if err != nil {
+		t.Fatalf("WriteFile random write failed: %v", err)
+	}
+	if newSize != int64(len(largeData)) {
+		t.Fatalf("expected size %d, got %d", len(largeData), newSize)
+	}
+
+	updatedAttr, err := vol.GetAttr(ctx, "/large.bin")
+	if err != nil {
+		t.Fatalf("GetAttr after random write failed: %v", err)
+	}
+	// ContentSha256 should be cleared (marked unknown) after random write
+	if updatedAttr.ContentSha256 != "" {
+		t.Fatalf("expected ContentSha256 to be unknown (\"\") after random write, got %s", updatedAttr.ContentSha256)
+	}
+
+	// Read back modified range
+	readBack, _, _, err := vol.ReadFile(ctx, "/large.bin", 20*1024, int64(len(patch)))
+	if err != nil || !bytes.Equal(readBack, patch) {
+		t.Fatalf("read back patch mismatch: %q vs %q", string(readBack), string(patch))
+	}
+
+	// 5. Test snapshot compilation: lazy ContentSha256 recomputation and EROFS xattrs
+	if err := vol.FlushToBackend(ctx); err != nil {
+		t.Fatalf("FlushToBackend failed: %v", err)
+	}
+
+	newLargeSha := fmt.Sprintf("%x", sha256.Sum256(largeData))
+	postSnapAttr, err := vol.GetAttr(ctx, "/large.bin")
+	if err != nil {
+		t.Fatalf("GetAttr post-snapshot failed: %v", err)
+	}
+	if postSnapAttr.ContentSha256 != newLargeSha {
+		t.Fatalf("expected recomputed ContentSha256 %s post-snapshot, got %s", newLargeSha, postSnapAttr.ContentSha256)
+	}
+
+	// 6. Test migration: writing to an unchunked file that grows > chunkSize turns into chunked
+	growData := make([]byte, 20*1024)
+	for i := range growData {
+		growData[i] = 'G'
+	}
+	_, _, _, err = vol.WriteFile(ctx, "/small.txt", 100, growData, pb.WriteMode_LAZY_WRITE)
+	if err != nil {
+		t.Fatalf("WriteFile growing small file failed: %v", err)
+	}
+
+	growAttr, err := vol.GetAttr(ctx, "/small.txt")
+	if err != nil {
+		t.Fatalf("GetAttr for grown file failed: %v", err)
+	}
+	if growAttr.ManifestSha256 == "" {
+		t.Fatalf("expected grown file to have ManifestSha256 populated")
+	}
+
+	// 7. Test truncation across chunks
+	truncAttr, err := vol.TruncateFile(ctx, "/large.bin", 18*1024)
+	if err != nil {
+		t.Fatalf("TruncateFile failed: %v", err)
+	}
+	if truncAttr.Size != 18*1024 {
+		t.Fatalf("expected size %d after truncation, got %d", 18*1024, truncAttr.Size)
+	}
+	truncData, total, _, err := vol.ReadFile(ctx, "/large.bin", 0, 20*1024)
+	if err != nil || total != 18*1024 || len(truncData) != 18*1024 {
+		t.Fatalf("ReadFile after truncation failed: total=%d, len=%d, err=%v", total, len(truncData), err)
+	}
 }

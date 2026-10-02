@@ -60,6 +60,8 @@ message EntryAttr {
   string redirect_url = 9;
   uint32 uid = 10;
   uint32 gid = 11;
+  string manifest_sha256 = 12;
+  string content_sha256 = 13;
 }
 
 message GetAttrRequest {
@@ -311,6 +313,8 @@ message MutationRecord {
   uint64 stream_seq = 12;
   uint32 uid = 13;
   uint32 gid = 14;
+  string manifest_sha256 = 15;
+  string content_sha256 = 16;
 }
 
 

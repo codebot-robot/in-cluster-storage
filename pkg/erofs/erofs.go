@@ -648,14 +648,15 @@ func NewReader(r io.ReaderAt) (*Reader, error) {
 
 // Xattrs represents extended attributes for an EROFS inode.
 type Xattrs struct {
-	UserDigest string
-	UserSHA256 string
-	Others     map[string]string
+	UserDigest   string
+	UserSHA256   string
+	UserManifest string
+	Others       map[string]string
 }
 
 // IsEmpty returns true if no extended attributes are set.
 func (x Xattrs) IsEmpty() bool {
-	return x.UserDigest == "" && x.UserSHA256 == "" && len(x.Others) == 0
+	return x.UserDigest == "" && x.UserSHA256 == "" && x.UserManifest == "" && len(x.Others) == 0
 }
 
 // ToMap converts Xattrs to a map of key-value pairs.
@@ -666,6 +667,9 @@ func (x Xattrs) ToMap() map[string]string {
 	}
 	if x.UserSHA256 != "" {
 		m["user.sha256"] = x.UserSHA256
+	}
+	if x.UserManifest != "" {
+		m["user.objectfs.manifest"] = x.UserManifest
 	}
 	for k, v := range x.Others {
 		m[k] = v
@@ -682,6 +686,8 @@ func XattrsFromMap(m map[string]string) Xattrs {
 			x.UserDigest = v
 		case "user.sha256":
 			x.UserSHA256 = v
+		case "user.objectfs.manifest":
+			x.UserManifest = v
 		default:
 			if x.Others == nil {
 				x.Others = make(map[string]string)

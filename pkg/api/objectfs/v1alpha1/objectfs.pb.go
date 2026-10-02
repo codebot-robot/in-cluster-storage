@@ -208,20 +208,22 @@ func (MutationType) EnumDescriptor() ([]byte, []int) {
 }
 
 type EntryAttr struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Inode         uint64                 `protobuf:"varint,1,opt,name=inode,proto3" json:"inode,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
-	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
-	IsDir         bool                   `protobuf:"varint,4,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
-	Size          int64                  `protobuf:"varint,5,opt,name=size,proto3" json:"size,omitempty"`
-	Mode          uint32                 `protobuf:"varint,6,opt,name=mode,proto3" json:"mode,omitempty"`
-	ModTime       *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
-	Sha256        string                 `protobuf:"bytes,8,opt,name=sha256,proto3" json:"sha256,omitempty"`
-	RedirectUrl   string                 `protobuf:"bytes,9,opt,name=redirect_url,json=redirectUrl,proto3" json:"redirect_url,omitempty"`
-	Uid           uint32                 `protobuf:"varint,10,opt,name=uid,proto3" json:"uid,omitempty"`
-	Gid           uint32                 `protobuf:"varint,11,opt,name=gid,proto3" json:"gid,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Inode          uint64                 `protobuf:"varint,1,opt,name=inode,proto3" json:"inode,omitempty"`
+	Path           string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	Name           string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	IsDir          bool                   `protobuf:"varint,4,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
+	Size           int64                  `protobuf:"varint,5,opt,name=size,proto3" json:"size,omitempty"`
+	Mode           uint32                 `protobuf:"varint,6,opt,name=mode,proto3" json:"mode,omitempty"`
+	ModTime        *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
+	Sha256         string                 `protobuf:"bytes,8,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	RedirectUrl    string                 `protobuf:"bytes,9,opt,name=redirect_url,json=redirectUrl,proto3" json:"redirect_url,omitempty"`
+	Uid            uint32                 `protobuf:"varint,10,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid            uint32                 `protobuf:"varint,11,opt,name=gid,proto3" json:"gid,omitempty"`
+	ManifestSha256 string                 `protobuf:"bytes,12,opt,name=manifest_sha256,json=manifestSha256,proto3" json:"manifest_sha256,omitempty"`
+	ContentSha256  string                 `protobuf:"bytes,13,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *EntryAttr) Reset() {
@@ -329,6 +331,20 @@ func (x *EntryAttr) GetGid() uint32 {
 		return x.Gid
 	}
 	return 0
+}
+
+func (x *EntryAttr) GetManifestSha256() string {
+	if x != nil {
+		return x.ManifestSha256
+	}
+	return ""
+}
+
+func (x *EntryAttr) GetContentSha256() string {
+	if x != nil {
+		return x.ContentSha256
+	}
+	return ""
 }
 
 type GetAttrRequest struct {
@@ -2508,23 +2524,25 @@ func (x *CreateSnapshotResponse) GetSnapshot() *SnapshotInfo {
 }
 
 type MutationRecord struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Type          MutationType           `protobuf:"varint,1,opt,name=type,proto3,enum=objectfs.v1alpha1.MutationType" json:"type,omitempty"`
-	VolumeId      string                 `protobuf:"bytes,2,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,3,opt,name=path,proto3" json:"path,omitempty"`
-	OldPath       string                 `protobuf:"bytes,4,opt,name=old_path,json=oldPath,proto3" json:"old_path,omitempty"`
-	Mode          uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
-	Size          int64                  `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
-	Offset        int64                  `protobuf:"varint,7,opt,name=offset,proto3" json:"offset,omitempty"`
-	ModTime       *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
-	Sha256        string                 `protobuf:"bytes,9,opt,name=sha256,proto3" json:"sha256,omitempty"`
-	Inode         uint64                 `protobuf:"varint,10,opt,name=inode,proto3" json:"inode,omitempty"`
-	Data          []byte                 `protobuf:"bytes,11,opt,name=data,proto3" json:"data,omitempty"`
-	StreamSeq     uint64                 `protobuf:"varint,12,opt,name=stream_seq,json=streamSeq,proto3" json:"stream_seq,omitempty"`
-	Uid           uint32                 `protobuf:"varint,13,opt,name=uid,proto3" json:"uid,omitempty"`
-	Gid           uint32                 `protobuf:"varint,14,opt,name=gid,proto3" json:"gid,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Type           MutationType           `protobuf:"varint,1,opt,name=type,proto3,enum=objectfs.v1alpha1.MutationType" json:"type,omitempty"`
+	VolumeId       string                 `protobuf:"bytes,2,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	Path           string                 `protobuf:"bytes,3,opt,name=path,proto3" json:"path,omitempty"`
+	OldPath        string                 `protobuf:"bytes,4,opt,name=old_path,json=oldPath,proto3" json:"old_path,omitempty"`
+	Mode           uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
+	Size           int64                  `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
+	Offset         int64                  `protobuf:"varint,7,opt,name=offset,proto3" json:"offset,omitempty"`
+	ModTime        *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
+	Sha256         string                 `protobuf:"bytes,9,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	Inode          uint64                 `protobuf:"varint,10,opt,name=inode,proto3" json:"inode,omitempty"`
+	Data           []byte                 `protobuf:"bytes,11,opt,name=data,proto3" json:"data,omitempty"`
+	StreamSeq      uint64                 `protobuf:"varint,12,opt,name=stream_seq,json=streamSeq,proto3" json:"stream_seq,omitempty"`
+	Uid            uint32                 `protobuf:"varint,13,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid            uint32                 `protobuf:"varint,14,opt,name=gid,proto3" json:"gid,omitempty"`
+	ManifestSha256 string                 `protobuf:"bytes,15,opt,name=manifest_sha256,json=manifestSha256,proto3" json:"manifest_sha256,omitempty"`
+	ContentSha256  string                 `protobuf:"bytes,16,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *MutationRecord) Reset() {
@@ -2653,6 +2671,20 @@ func (x *MutationRecord) GetGid() uint32 {
 		return x.Gid
 	}
 	return 0
+}
+
+func (x *MutationRecord) GetManifestSha256() string {
+	if x != nil {
+		return x.ManifestSha256
+	}
+	return ""
+}
+
+func (x *MutationRecord) GetContentSha256() string {
+	if x != nil {
+		return x.ContentSha256
+	}
+	return ""
 }
 
 var File_objectfs_proto protoreflect.FileDescriptor

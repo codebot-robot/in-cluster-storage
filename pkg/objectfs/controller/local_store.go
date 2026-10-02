@@ -65,15 +65,17 @@ func UnpackOffset(off LocalOffset) (int, int64) {
 
 // InodeRecord stores serialized metadata for an evicted inode.
 type InodeRecord struct {
-	InodeID uint64
-	Mode    uint32
-	Size    int64
-	ModTime time.Time
-	IsDir   bool
-	Sha256  string
-	ETag    string
-	Uid     uint32
-	Gid     uint32
+	InodeID        uint64
+	Mode           uint32
+	Size           int64
+	ModTime        time.Time
+	IsDir          bool
+	Sha256         string
+	ETag           string
+	Uid            uint32
+	Gid            uint32
+	ManifestSha256 string
+	ContentSha256  string
 }
 
 // DirEntry represents a single directory entry.
@@ -140,6 +142,18 @@ func EncodeInodeRecord(rec *InodeRecord) ([]byte, error) {
 	// Gid (4)
 	binary.BigEndian.PutUint32(b4[:], rec.Gid)
 	buf.Write(b4[:])
+
+	// ManifestSha256 length (2) + bytes
+	manifestShaBytes := []byte(rec.ManifestSha256)
+	binary.BigEndian.PutUint16(b2[:], uint16(len(manifestShaBytes)))
+	buf.Write(b2[:])
+	buf.Write(manifestShaBytes)
+
+	// ContentSha256 length (2) + bytes
+	contentShaBytes := []byte(rec.ContentSha256)
+	binary.BigEndian.PutUint16(b2[:], uint16(len(contentShaBytes)))
+	buf.Write(b2[:])
+	buf.Write(contentShaBytes)
 
 	return buf.Bytes(), nil
 }
@@ -210,16 +224,43 @@ func DecodeInodeRecord(data []byte) (*InodeRecord, error) {
 	}
 	gid := binary.BigEndian.Uint32(b4[:])
 
+	if _, err := io.ReadFull(r, b2[:]); err != nil {
+		return nil, err
+	}
+	mLen := int(binary.BigEndian.Uint16(b2[:]))
+	mBytes := make([]byte, mLen)
+	if _, err := io.ReadFull(r, mBytes); err != nil {
+		return nil, err
+	}
+	manifestSha := string(mBytes)
+
+	if _, err := io.ReadFull(r, b2[:]); err != nil {
+		return nil, err
+	}
+	cLen := int(binary.BigEndian.Uint16(b2[:]))
+	cBytes := make([]byte, cLen)
+	if _, err := io.ReadFull(r, cBytes); err != nil {
+		return nil, err
+	}
+	contentSha := string(cBytes)
+
+	shaStr := string(shaBytes)
+	if manifestSha == "" && contentSha == "" {
+		contentSha = shaStr
+	}
+
 	return &InodeRecord{
-		InodeID: inodeID,
-		Mode:    mode,
-		Size:    size,
-		ModTime: modTime,
-		IsDir:   isDir,
-		Sha256:  string(shaBytes),
-		ETag:    string(etagBytes),
-		Uid:     uid,
-		Gid:     gid,
+		InodeID:        inodeID,
+		Mode:           mode,
+		Size:           size,
+		ModTime:        modTime,
+		IsDir:          isDir,
+		Sha256:         shaStr,
+		ETag:           string(etagBytes),
+		Uid:            uid,
+		Gid:            gid,
+		ManifestSha256: manifestSha,
+		ContentSha256:  contentSha,
 	}, nil
 }
 
