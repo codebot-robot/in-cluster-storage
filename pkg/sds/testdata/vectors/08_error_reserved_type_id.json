@@ -1,0 +1,10 @@
+{
+  "name": "08_error_reserved_type_id",
+  "description": "Error case: decoding frame with reserved framework Type ID (6..15)",
+  "payloads_hex": [
+    "07010203"
+  ],
+  "expected_safe_position": 0,
+  "expected_error": "reserved type ID",
+  "error_at_seq": 1
+}

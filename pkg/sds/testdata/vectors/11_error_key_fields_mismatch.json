@@ -1,0 +1,63 @@
+{
+  "name": "11_error_key_fields_mismatch",
+  "description": "Error case: OpRecord whose key bytes do not match declared key_fields",
+  "payloads_hex": [
+    "010810120e74657374706b672e456e746974791a205abb8a4c6568c715619a9520db26df00b30b23831fcd09378c3049626cf9904b22450a430a0c456e746974792e70726f746f120774657374706b6722220a06456e74697479120a0a026964180120012803120c0a0464617461180220012809620670726f746f332a0101",
+    "05101022051203626164"
+  ],
+  "expected_records": [
+    {
+      "seq": 1,
+      "type_id": 1,
+      "type_name": "sds.v1.TypeDefinition",
+      "protojson": {
+        "id": 16,
+        "name": "testpkg.Entity",
+        "fingerprint": "WruKTGVoxxVhmpUg2ybfALMLI4MfzQk3jDBJYmz5kEs=",
+        "descriptors": {
+          "file": [
+            {
+              "name": "Entity.proto",
+              "package": "testpkg",
+              "messageType": [
+                {
+                  "name": "Entity",
+                  "field": [
+                    {
+                      "name": "id",
+                      "number": 1,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_INT64"
+                    },
+                    {
+                      "name": "data",
+                      "number": 2,
+                      "label": "LABEL_OPTIONAL",
+                      "type": "TYPE_STRING"
+                    }
+                  ]
+                }
+              ],
+              "syntax": "proto3"
+            }
+          ]
+        },
+        "keyFields": [
+          1
+        ]
+      }
+    },
+    {
+      "seq": 2,
+      "type_id": 5,
+      "type_name": "sds.v1.OpRecord",
+      "protojson": {
+        "typeId": 16,
+        "key": "EgNiYWQ="
+      }
+    }
+  ],
+  "expected_safe_position": 0,
+  "expected_error": "key bytes do not match key_fields",
+  "error_at_seq": 2
+}
