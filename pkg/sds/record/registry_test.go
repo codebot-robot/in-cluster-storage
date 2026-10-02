@@ -164,6 +164,24 @@ func TestRegistryValidationErrors(t *testing.T) {
 	if err := reg.Register(defMismatchedFP); err == nil {
 		t.Errorf("expected error on fingerprint mismatch, got nil")
 	}
+
+	// Repeated key field
+	defRepeatedKey := makeTestTypeDef("OrderRepeatedKey", []*descriptorpb.FieldDescriptorProto{
+		field("ids", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_REPEATED),
+	}, nil, nil, []int32{1}, nil)
+	defRepeatedKey.Id = 18
+	if err := reg.Register(defRepeatedKey); err == nil {
+		t.Errorf("expected error on repeated key field, got nil")
+	}
+
+	// Message (non-scalar) key field
+	defMsgKey := makeTestTypeDef("OrderMsgKey", []*descriptorpb.FieldDescriptorProto{
+		field("sub", 1, descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	}, nil, nil, []int32{1}, nil)
+	defMsgKey.Id = 19
+	if err := reg.Register(defMsgKey); err == nil {
+		t.Errorf("expected error on message-typed key field, got nil")
+	}
 }
 
 func TestRegistryGoTypeResolution(t *testing.T) {

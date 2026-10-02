@@ -115,79 +115,37 @@ func (w *Writer) ensureAnnounced(ctx context.Context, typeID uint32) error {
 	return nil
 }
 
-// Append writes an application message to the stream.
-// If the message type has not been announced (or if its schema evolved),
-// a TypeDefinition frame is automatically emitted before the record.
-func (w *Writer) Append(ctx context.Context, msg proto.Message) (uint64, error) {
-	if msg == nil {
-		return 0, fmt.Errorf("nil message")
-	}
-
+// EnsureAnnounced ensures that the TypeDefinition for typeID is emitted to the stream
+// before any record of this type is written.
+func (w *Writer) EnsureAnnounced(ctx context.Context, typeID uint32) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	name := string(msg.ProtoReflect().Descriptor().FullName())
-	def, _, exists := w.registry.LookupByName(name)
-	if !exists {
-		var err error
-		def, err = w.registry.RegisterMessage(msg)
-		if err != nil {
-			return 0, err
-		}
-	} else {
-		// Check if descriptor evolved.
-		currentFP, _, err := ComputeMessageFingerprint(msg.ProtoReflect().Descriptor())
-		if err != nil {
-			return 0, err
-		}
-		if !bytes.Equal(currentFP, def.GetFingerprint()) {
-			def, err = w.registry.RegisterMessage(msg, def.GetKeyFields()...)
-			if err != nil {
-				return 0, err
-			}
-		}
-	}
-
-	if err := w.ensureAnnounced(ctx, def.GetId()); err != nil {
-		return 0, err
-	}
-
-	body, err := proto.Marshal(msg)
-	if err != nil {
-		return 0, fmt.Errorf("failed to marshal record body: %w", err)
-	}
-
-	payload, err := EncodeFrame(def.GetId(), body)
-	if err != nil {
-		return 0, err
-	}
-
-	return w.appender.Append(ctx, payload)
+	return w.ensureAnnounced(ctx, typeID)
 }
 
-// AppendTyped writes an application message using an explicitly assigned type ID.
-func (w *Writer) AppendTyped(ctx context.Context, typeID uint32, msg proto.Message) (uint64, error) {
-	if msg == nil {
-		return 0, fmt.Errorf("nil message")
+// AppendOp writes an OpRecord framework record (TypeID = 5).
+// It ensures that the referenced table type ID is announced before writing.
+func (w *Writer) AppendOp(ctx context.Context, op *sdsv1.OpRecord) (uint64, error) {
+	if op == nil {
+		return 0, fmt.Errorf("nil OpRecord")
 	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if err := w.ensureAnnounced(ctx, typeID); err != nil {
+	if err := w.ensureAnnounced(ctx, op.GetTypeId()); err != nil {
 		return 0, err
 	}
 
-	body, err := proto.Marshal(msg)
+	body, err := proto.Marshal(op)
 	if err != nil {
-		return 0, fmt.Errorf("failed to marshal record body: %w", err)
+		return 0, fmt.Errorf("failed to marshal OpRecord: %w", err)
 	}
 
-	payload, err := EncodeFrame(typeID, body)
+	payload, err := EncodeFrame(TypeIDOpRecord, body)
 	if err != nil {
 		return 0, err
 	}
-
 	return w.appender.Append(ctx, payload)
 }
 

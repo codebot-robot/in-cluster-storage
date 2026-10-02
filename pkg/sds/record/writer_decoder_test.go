@@ -142,6 +142,19 @@ func TestWriterAndDecoderEndToEnd(t *testing.T) {
 	}
 }
 
+func appendOp(ctx context.Context, w *Writer, op sdsv1.OpRecord_Op, tableTypeID uint32, txID uint64, keyMsg proto.Message) (uint64, error) {
+	keyBytes, err := proto.Marshal(keyMsg)
+	if err != nil {
+		return 0, err
+	}
+	return w.AppendOp(ctx, &sdsv1.OpRecord{
+		Op:     op,
+		TypeId: tableTypeID,
+		TxId:   txID,
+		Key:    keyBytes,
+	})
+}
+
 func TestWriterAutomaticTypeAnnouncementAndRestart(t *testing.T) {
 	ctx := t.Context()
 	appender := &memoryAppender{}
@@ -175,8 +188,8 @@ func TestWriterAutomaticTypeAnnouncementAndRestart(t *testing.T) {
 	order1.Set(orderDescV1.Fields().ByName("id"), protoreflect.ValueOfInt64(101))
 	order1.Set(orderDescV1.Fields().ByName("customer"), protoreflect.ValueOfString("Alice"))
 
-	// Append first record: should emit TypeDefinition (payload 0) + record (payload 1)
-	if _, err := writer1.Append(ctx, order1); err != nil {
+	// Append first record (OpCreate): should emit TypeDefinition (payload 0) + record (payload 1)
+	if _, err := appendOp(ctx, writer1, sdsv1.OpRecord_CREATE, 16, 0, order1); err != nil {
 		t.Fatalf("Append order1 error: %v", err)
 	}
 
@@ -189,7 +202,7 @@ func TestWriterAutomaticTypeAnnouncementAndRestart(t *testing.T) {
 	order2.Set(orderDescV1.Fields().ByName("id"), protoreflect.ValueOfInt64(102))
 	order2.Set(orderDescV1.Fields().ByName("customer"), protoreflect.ValueOfString("Bob"))
 
-	if _, err := writer1.Append(ctx, order2); err != nil {
+	if _, err := appendOp(ctx, writer1, sdsv1.OpRecord_CREATE, 16, 0, order2); err != nil {
 		t.Fatalf("Append order2 error: %v", err)
 	}
 
@@ -209,7 +222,7 @@ func TestWriterAutomaticTypeAnnouncementAndRestart(t *testing.T) {
 	order3.Set(orderDescV1.Fields().ByName("customer"), protoreflect.ValueOfString("Charlie"))
 
 	// writer2 emits TypeDefinition again + record
-	if _, err := writer2.Append(ctx, order3); err != nil {
+	if _, err := appendOp(ctx, writer2, sdsv1.OpRecord_CREATE, 16, 0, order3); err != nil {
 		t.Fatalf("writer2 Append order3 error: %v", err)
 	}
 
@@ -226,10 +239,10 @@ func TestWriterAutomaticTypeAnnouncementAndRestart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decoder failed on payload %d: %v", i, err)
 		}
-		if rec.TypeID == 16 {
-			dynMsg, ok := rec.Message.(*dynamicpb.Message)
-			if !ok {
-				t.Fatalf("expected *dynamicpb.Message, got %T", rec.Message)
+		if rec.TypeID == TypeIDOpRecord {
+			dynMsg := dynamicpb.NewMessage(orderDescV1)
+			if err := proto.Unmarshal(rec.OpRecord.GetKey(), dynMsg); err != nil {
+				t.Fatalf("Unmarshal op key error: %v", err)
 			}
 			cust := dynMsg.Get(dynMsg.Descriptor().Fields().ByName("customer")).String()
 			decodedOrders = append(decodedOrders, cust)
@@ -283,7 +296,7 @@ func TestCrossSchemaEvolutionAndUnknownFieldsPreservation(t *testing.T) {
 	orderV1.Set(descV1.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	orderV1.Set(descV1.Fields().ByName("customer"), protoreflect.ValueOfString("Alice"))
 
-	if _, err := writer.Append(ctx, orderV1); err != nil {
+	if _, err := appendOp(ctx, writer, sdsv1.OpRecord_CREATE, 16, 0, orderV1); err != nil {
 		t.Fatalf("Append orderV1 error: %v", err)
 	}
 
@@ -295,7 +308,7 @@ func TestCrossSchemaEvolutionAndUnknownFieldsPreservation(t *testing.T) {
 	orderV2.Set(descV2.Fields().ByName("total"), protoreflect.ValueOfFloat64(99.50))
 	orderV2.Set(descV2.Fields().ByName("notes"), protoreflect.ValueOfString("Rush order"))
 
-	if _, err := writer.Append(ctx, orderV2); err != nil {
+	if _, err := appendOp(ctx, writer, sdsv1.OpRecord_CREATE, 16, 0, orderV2); err != nil {
 		t.Fatalf("Append orderV2 error: %v", err)
 	}
 
@@ -308,8 +321,16 @@ func TestCrossSchemaEvolutionAndUnknownFieldsPreservation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Decode error: %v", err)
 		}
-		if rec.TypeID == 16 {
-			decodedRecords = append(decodedRecords, rec.Message.(*dynamicpb.Message))
+		if rec.TypeID == TypeIDOpRecord {
+			msgType, err := decoder.Registry().ResolveMessageType(rec.OpRecord.GetTypeId())
+			if err != nil {
+				t.Fatalf("ResolveMessageType error: %v", err)
+			}
+			dynMsg := msgType.New().Interface().(*dynamicpb.Message)
+			if err := proto.Unmarshal(rec.OpRecord.GetKey(), dynMsg); err != nil {
+				t.Fatalf("Unmarshal key error: %v", err)
+			}
+			decodedRecords = append(decodedRecords, dynMsg)
 		}
 	}
 

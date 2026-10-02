@@ -37,6 +37,55 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type OpRecord_Op int32
+
+const (
+	OpRecord_CREATE OpRecord_Op = 0
+	OpRecord_UPDATE OpRecord_Op = 1
+	OpRecord_DELETE OpRecord_Op = 2
+)
+
+// Enum value maps for OpRecord_Op.
+var (
+	OpRecord_Op_name = map[int32]string{
+		0: "CREATE",
+		1: "UPDATE",
+		2: "DELETE",
+	}
+	OpRecord_Op_value = map[string]int32{
+		"CREATE": 0,
+		"UPDATE": 1,
+		"DELETE": 2,
+	}
+)
+
+func (x OpRecord_Op) Enum() *OpRecord_Op {
+	p := new(OpRecord_Op)
+	*p = x
+	return p
+}
+
+func (x OpRecord_Op) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (OpRecord_Op) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_sds_proto_enumTypes[0].Descriptor()
+}
+
+func (OpRecord_Op) Type() protoreflect.EnumType {
+	return &file_proto_sds_proto_enumTypes[0]
+}
+
+func (x OpRecord_Op) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use OpRecord_Op.Descriptor instead.
+func (OpRecord_Op) EnumDescriptor() ([]byte, []int) {
+	return file_proto_sds_proto_rawDescGZIP(), []int{1, 0}
+}
+
 type TypeDefinition struct {
 	state         protoimpl.MessageState          `protogen:"open.v1"`
 	Id            uint32                          `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -113,6 +162,82 @@ func (x *TypeDefinition) GetKeyFields() []int32 {
 	return nil
 }
 
+type OpRecord struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Op            OpRecord_Op            `protobuf:"varint,1,opt,name=op,proto3,enum=sds.v1.OpRecord_Op" json:"op,omitempty"`
+	TypeId        uint32                 `protobuf:"varint,2,opt,name=type_id,json=typeId,proto3" json:"type_id,omitempty"`
+	TxId          uint64                 `protobuf:"varint,3,opt,name=tx_id,json=txId,proto3" json:"tx_id,omitempty"` // 0 = autocommit
+	Key           []byte                 `protobuf:"bytes,4,opt,name=key,proto3" json:"key,omitempty"`
+	Value         []byte                 `protobuf:"bytes,5,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OpRecord) Reset() {
+	*x = OpRecord{}
+	mi := &file_proto_sds_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OpRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OpRecord) ProtoMessage() {}
+
+func (x *OpRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_sds_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OpRecord.ProtoReflect.Descriptor instead.
+func (*OpRecord) Descriptor() ([]byte, []int) {
+	return file_proto_sds_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *OpRecord) GetOp() OpRecord_Op {
+	if x != nil {
+		return x.Op
+	}
+	return OpRecord_CREATE
+}
+
+func (x *OpRecord) GetTypeId() uint32 {
+	if x != nil {
+		return x.TypeId
+	}
+	return 0
+}
+
+func (x *OpRecord) GetTxId() uint64 {
+	if x != nil {
+		return x.TxId
+	}
+	return 0
+}
+
+func (x *OpRecord) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *OpRecord) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
 type TxCommit struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TxId          uint64                 `protobuf:"varint,1,opt,name=tx_id,json=txId,proto3" json:"tx_id,omitempty"`
@@ -123,7 +248,7 @@ type TxCommit struct {
 
 func (x *TxCommit) Reset() {
 	*x = TxCommit{}
-	mi := &file_proto_sds_proto_msgTypes[1]
+	mi := &file_proto_sds_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -135,7 +260,7 @@ func (x *TxCommit) String() string {
 func (*TxCommit) ProtoMessage() {}
 
 func (x *TxCommit) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sds_proto_msgTypes[1]
+	mi := &file_proto_sds_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -148,7 +273,7 @@ func (x *TxCommit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TxCommit.ProtoReflect.Descriptor instead.
 func (*TxCommit) Descriptor() ([]byte, []int) {
-	return file_proto_sds_proto_rawDescGZIP(), []int{1}
+	return file_proto_sds_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *TxCommit) GetTxId() uint64 {
@@ -177,7 +302,7 @@ type SnapshotPointer struct {
 
 func (x *SnapshotPointer) Reset() {
 	*x = SnapshotPointer{}
-	mi := &file_proto_sds_proto_msgTypes[2]
+	mi := &file_proto_sds_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -189,7 +314,7 @@ func (x *SnapshotPointer) String() string {
 func (*SnapshotPointer) ProtoMessage() {}
 
 func (x *SnapshotPointer) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sds_proto_msgTypes[2]
+	mi := &file_proto_sds_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -202,7 +327,7 @@ func (x *SnapshotPointer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotPointer.ProtoReflect.Descriptor instead.
 func (*SnapshotPointer) Descriptor() ([]byte, []int) {
-	return file_proto_sds_proto_rawDescGZIP(), []int{2}
+	return file_proto_sds_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *SnapshotPointer) GetPosition() uint64 {
@@ -242,7 +367,7 @@ type Registry struct {
 
 func (x *Registry) Reset() {
 	*x = Registry{}
-	mi := &file_proto_sds_proto_msgTypes[3]
+	mi := &file_proto_sds_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -254,7 +379,7 @@ func (x *Registry) String() string {
 func (*Registry) ProtoMessage() {}
 
 func (x *Registry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sds_proto_msgTypes[3]
+	mi := &file_proto_sds_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -267,7 +392,7 @@ func (x *Registry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Registry.ProtoReflect.Descriptor instead.
 func (*Registry) Descriptor() ([]byte, []int) {
-	return file_proto_sds_proto_rawDescGZIP(), []int{3}
+	return file_proto_sds_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Registry) GetTypes() []*TypeDefinition {
@@ -288,7 +413,20 @@ const file_proto_sds_proto_rawDesc = "" +
 	"\vfingerprint\x18\x03 \x01(\fR\vfingerprint\x12D\n" +
 	"\vdescriptors\x18\x04 \x01(\v2\".google.protobuf.FileDescriptorSetR\vdescriptors\x12\x1d\n" +
 	"\n" +
-	"key_fields\x18\x05 \x03(\x05R\tkeyFields\"\\\n" +
+	"key_fields\x18\x05 \x03(\x05R\tkeyFields\"\xaf\x01\n" +
+	"\bOpRecord\x12#\n" +
+	"\x02op\x18\x01 \x01(\x0e2\x13.sds.v1.OpRecord.OpR\x02op\x12\x17\n" +
+	"\atype_id\x18\x02 \x01(\rR\x06typeId\x12\x13\n" +
+	"\x05tx_id\x18\x03 \x01(\x04R\x04txId\x12\x10\n" +
+	"\x03key\x18\x04 \x01(\fR\x03key\x12\x14\n" +
+	"\x05value\x18\x05 \x01(\fR\x05value\"(\n" +
+	"\x02Op\x12\n" +
+	"\n" +
+	"\x06CREATE\x10\x00\x12\n" +
+	"\n" +
+	"\x06UPDATE\x10\x01\x12\n" +
+	"\n" +
+	"\x06DELETE\x10\x02\"\\\n" +
 	"\bTxCommit\x12\x13\n" +
 	"\x05tx_id\x18\x01 \x01(\x04R\x04txId\x12;\n" +
 	"\vcommit_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
@@ -313,24 +451,28 @@ func file_proto_sds_proto_rawDescGZIP() []byte {
 	return file_proto_sds_proto_rawDescData
 }
 
-var file_proto_sds_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_proto_sds_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_proto_sds_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_proto_sds_proto_goTypes = []any{
-	(*TypeDefinition)(nil),                 // 0: sds.v1.TypeDefinition
-	(*TxCommit)(nil),                       // 1: sds.v1.TxCommit
-	(*SnapshotPointer)(nil),                // 2: sds.v1.SnapshotPointer
-	(*Registry)(nil),                       // 3: sds.v1.Registry
-	(*descriptorpb.FileDescriptorSet)(nil), // 4: google.protobuf.FileDescriptorSet
-	(*timestamppb.Timestamp)(nil),          // 5: google.protobuf.Timestamp
+	(OpRecord_Op)(0),                       // 0: sds.v1.OpRecord.Op
+	(*TypeDefinition)(nil),                 // 1: sds.v1.TypeDefinition
+	(*OpRecord)(nil),                       // 2: sds.v1.OpRecord
+	(*TxCommit)(nil),                       // 3: sds.v1.TxCommit
+	(*SnapshotPointer)(nil),                // 4: sds.v1.SnapshotPointer
+	(*Registry)(nil),                       // 5: sds.v1.Registry
+	(*descriptorpb.FileDescriptorSet)(nil), // 6: google.protobuf.FileDescriptorSet
+	(*timestamppb.Timestamp)(nil),          // 7: google.protobuf.Timestamp
 }
 var file_proto_sds_proto_depIdxs = []int32{
-	4, // 0: sds.v1.TypeDefinition.descriptors:type_name -> google.protobuf.FileDescriptorSet
-	5, // 1: sds.v1.TxCommit.commit_time:type_name -> google.protobuf.Timestamp
-	0, // 2: sds.v1.Registry.types:type_name -> sds.v1.TypeDefinition
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	6, // 0: sds.v1.TypeDefinition.descriptors:type_name -> google.protobuf.FileDescriptorSet
+	0, // 1: sds.v1.OpRecord.op:type_name -> sds.v1.OpRecord.Op
+	7, // 2: sds.v1.TxCommit.commit_time:type_name -> google.protobuf.Timestamp
+	1, // 3: sds.v1.Registry.types:type_name -> sds.v1.TypeDefinition
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_proto_sds_proto_init() }
@@ -343,13 +485,14 @@ func file_proto_sds_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_sds_proto_rawDesc), len(file_proto_sds_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   4,
+			NumEnums:      1,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_proto_sds_proto_goTypes,
 		DependencyIndexes: file_proto_sds_proto_depIdxs,
+		EnumInfos:         file_proto_sds_proto_enumTypes,
 		MessageInfos:      file_proto_sds_proto_msgTypes,
 	}.Build()
 	File_proto_sds_proto = out.File
