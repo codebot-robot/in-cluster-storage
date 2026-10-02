@@ -173,18 +173,23 @@ func (c *LRUCache[K, V]) evictOldest() {
 
 // CachedInode represents an inode metadata entry held in memory.
 type CachedInode struct {
-	ID          uint64
-	Mode        uint32
-	Size        int64
-	ModTime     time.Time
-	IsDir       bool
-	Sha256      string
-	ETag        string
-	RedirectURL string
-	Data        blob.ByteStream
-	Uid         uint32
-	Gid         uint32
-	IsDirty     bool
+	ID             uint64
+	Mode           uint32
+	Size           int64
+	ModTime        time.Time
+	IsDir          bool
+	Sha256         string
+	ManifestSha256 string
+	ContentSha256  string
+	ChunkSize      uint32
+	Chunks         []string
+	DirtyChunks    map[int][]byte
+	ETag           string
+	RedirectURL    string
+	Data           blob.ByteStream
+	Uid            uint32
+	Gid            uint32
+	IsDirty        bool
 }
 
 // CachedDir represents a directory metadata entry held in memory.

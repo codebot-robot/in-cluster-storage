@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -52,17 +53,19 @@ type VolumeMetadata struct {
 }
 
 type FileMetadata struct {
-	Inode   uint64    `json:"inode"`
-	Path    string    `json:"path"`
-	Name    string    `json:"name"`
-	IsDir   bool      `json:"is_dir"`
-	Mode    uint32    `json:"mode"`
-	Size    int64     `json:"size"`
-	ModTime time.Time `json:"mod_time"`
-	Sha256  string    `json:"sha256,omitempty"`
-	ETag    string    `json:"etag,omitempty"`
-	Uid     uint32    `json:"uid,omitempty"`
-	Gid     uint32    `json:"gid,omitempty"`
+	Inode          uint64    `json:"inode"`
+	Path           string    `json:"path"`
+	Name           string    `json:"name"`
+	IsDir          bool      `json:"is_dir"`
+	Mode           uint32    `json:"mode"`
+	Size           int64     `json:"size"`
+	ModTime        time.Time `json:"mod_time"`
+	Sha256         string    `json:"sha256,omitempty"`
+	ManifestSha256 string    `json:"manifest_sha256,omitempty"`
+	ContentSha256  string    `json:"content_sha256,omitempty"`
+	ETag           string    `json:"etag,omitempty"`
+	Uid            uint32    `json:"uid,omitempty"`
+	Gid            uint32    `json:"gid,omitempty"`
 }
 
 // metadataResolver provides unified read methods for resolving inodes and directories
@@ -96,6 +99,7 @@ type Volume struct {
 	blobStore    *blob.Store
 	broadcaster  *EventBroadcaster
 	maxInlineLen int64
+	chunkSize    uint32
 
 	stream     walclient.Stream
 	durability walclient.Level
@@ -136,6 +140,15 @@ func WithDurability(level walclient.Level) VolumeOption {
 func WithStreamID(id uuid.UUID) VolumeOption {
 	return func(v *Volume) {
 		v.streamID = id
+	}
+}
+
+// WithChunkSize sets the fixed chunk size for large files on this volume.
+func WithChunkSize(chunkSize uint32) VolumeOption {
+	return func(v *Volume) {
+		if chunkSize > 0 {
+			v.chunkSize = chunkSize
+		}
 	}
 }
 
@@ -195,7 +208,8 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		backend:          backend,
 		blobStore:        blobStore,
 		broadcaster:      broadcaster,
-		maxInlineLen:     4 * 1024 * 1024, // 4MB default inline threshold
+		maxInlineLen:     32 * 1024, // 32KB default inline threshold
+		chunkSize:        32 * 1024, // 32KB default chunk size
 		durability:       walclient.Local,
 		streamID:         StreamIDForVolume(volumeID),
 		maxBufferFiles:   4,
@@ -233,13 +247,107 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	return v
 }
 
+func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *CachedInode) error {
+	if node.ManifestSha256 == "" {
+		return nil
+	}
+	if node.ChunkSize > 0 && len(node.Chunks) > 0 {
+		return nil
+	}
+	if v.blobStore != nil {
+		mStream, err := v.blobStore.GetBlob(ctx, node.ManifestSha256)
+		if err == nil {
+			defer mStream.Close()
+			manifest, err := blob.DecodeManifest(mStream)
+			if err == nil {
+				node.Chunks = manifest.ChunkHexSHAs()
+				node.ChunkSize = manifest.ChunkSize
+				if node.Size == 0 {
+					node.Size = int64(manifest.TotalLength)
+				}
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkIdx int) ([]byte, error) {
+	if node.DirtyChunks != nil {
+		if data, ok := node.DirtyChunks[chunkIdx]; ok {
+			res := make([]byte, len(data))
+			copy(res, data)
+			return res, nil
+		}
+	}
+
+	_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+
+	if chunkIdx < len(node.Chunks) && node.Chunks[chunkIdx] != "" && v.blobStore != nil {
+		stream, err := v.blobStore.GetBlob(ctx, node.Chunks[chunkIdx])
+		if err == nil {
+			defer stream.Close()
+			return io.ReadAll(stream)
+		}
+	}
+
+	if node.Data != nil && node.ChunkSize > 0 {
+		off := int64(chunkIdx) * int64(node.ChunkSize)
+		if off < node.Size {
+			readLen := int64(node.ChunkSize)
+			if off+readLen > node.Size {
+				readLen = node.Size - off
+			}
+			buf := make([]byte, readLen)
+			_ = node.Data.Rewind()
+			if _, err := node.Data.Seek(off, io.SeekStart); err == nil {
+				n, _ := io.ReadFull(node.Data, buf)
+				return buf[:n], nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("chunk %d not found", chunkIdx)
+}
+
 // persistInode uploads the inode's blob payload if dirty and writes the inode metadata record to local eviction storage.
 func (v *Volume) persistInode(ctx context.Context, node *CachedInode) error {
 	if !node.IsDirty {
 		return nil
 	}
 
-	if node.Data != nil && node.Sha256 != "" && v.blobStore != nil {
+	if node.ChunkSize > 0 && v.blobStore != nil {
+		dirtyBlobs := make(map[string]blob.ByteStream)
+		for idx, chunkBytes := range node.DirtyChunks {
+			if idx < len(node.Chunks) && node.Chunks[idx] != "" {
+				dirtyBlobs[node.Chunks[idx]] = blob.NewByteStreamFromBytes(chunkBytes)
+			}
+		}
+		if node.ManifestSha256 != "" {
+			manifestChunks := make([][32]byte, len(node.Chunks))
+			for i, c := range node.Chunks {
+				raw, _ := hex.DecodeString(c)
+				if len(raw) == 32 {
+					copy(manifestChunks[i][:], raw)
+				}
+			}
+			manifest := &blob.Manifest{
+				ChunkSize:   node.ChunkSize,
+				TotalLength: uint64(node.Size),
+				Chunks:      manifestChunks,
+			}
+			manifestBlob, err := blob.EncodeManifest(manifest)
+			if err == nil {
+				dirtyBlobs[manifestBlob.SHA256Hex()] = manifestBlob.Stream
+			}
+		}
+		if len(dirtyBlobs) > 0 {
+			if err := v.blobStore.PutBlobs(ctx, dirtyBlobs); err != nil {
+				return fmt.Errorf("failed to persist chunk blobs for inode %d: %w", node.ID, err)
+			}
+		}
+		node.DirtyChunks = nil
+	} else if node.Data != nil && node.Sha256 != "" && v.blobStore != nil {
 		if err := node.Data.Rewind(); err != nil {
 			return fmt.Errorf("failed to rewind node data: %w", err)
 		}
@@ -252,15 +360,17 @@ func (v *Volume) persistInode(ctx context.Context, node *CachedInode) error {
 
 	if v.localStore != nil {
 		rec := &InodeRecord{
-			InodeID: node.ID,
-			Mode:    node.Mode,
-			Size:    node.Size,
-			ModTime: node.ModTime,
-			IsDir:   node.IsDir,
-			Sha256:  node.Sha256,
-			ETag:    node.ETag,
-			Uid:     node.Uid,
-			Gid:     node.Gid,
+			InodeID:        node.ID,
+			Mode:           node.Mode,
+			Size:           node.Size,
+			ModTime:        node.ModTime,
+			IsDir:          node.IsDir,
+			Sha256:         node.Sha256,
+			ETag:           node.ETag,
+			Uid:            node.Uid,
+			Gid:            node.Gid,
+			ManifestSha256: node.ManifestSha256,
+			ContentSha256:  node.ContentSha256,
 		}
 		payload, err := EncodeInodeRecord(rec)
 		if err != nil {
@@ -439,16 +549,18 @@ func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, pop
 			rec, err := DecodeInodeRecord(payload)
 			if err == nil {
 				node := &CachedInode{
-					ID:      rec.InodeID,
-					Mode:    rec.Mode,
-					Size:    rec.Size,
-					ModTime: rec.ModTime,
-					IsDir:   rec.IsDir,
-					Sha256:  rec.Sha256,
-					ETag:    rec.ETag,
-					Uid:     rec.Uid,
-					Gid:     rec.Gid,
-					IsDirty: populateCache,
+					ID:             rec.InodeID,
+					Mode:           rec.Mode,
+					Size:           rec.Size,
+					ModTime:        rec.ModTime,
+					IsDir:          rec.IsDir,
+					Sha256:         rec.Sha256,
+					ManifestSha256: rec.ManifestSha256,
+					ContentSha256:  rec.ContentSha256,
+					ETag:           rec.ETag,
+					Uid:            rec.Uid,
+					Gid:            rec.Gid,
+					IsDirty:        populateCache,
 				}
 				if populateCache && r.inodeCache != nil {
 					r.inodeCache.Put(inodeID, node)
@@ -462,14 +574,23 @@ func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, pop
 	if r.snapshotReader != nil && r.snapshotRaw != nil {
 		erofsInode, err := erofs.ReadInode(r.snapshotRaw, r.snapshotReader.Superblock(), inodeID)
 		if err == nil {
-			var shaStr string
+			var shaStr, manifestSha, contentSha string
 			xattrs, xErr := r.snapshotReader.GetXattrs(inodeID)
 			if xErr == nil && !xattrs.IsEmpty() {
 				if xattrs.UserDigest != "" {
 					shaStr = xattrs.UserDigest
+					contentSha = xattrs.UserDigest
 				} else if xattrs.UserSHA256 != "" {
 					shaStr = xattrs.UserSHA256
+					contentSha = xattrs.UserSHA256
 				}
+				if xattrs.UserManifest != "" {
+					manifestSha = xattrs.UserManifest
+					shaStr = manifestSha
+				}
+			}
+			if manifestSha == "" && contentSha == "" {
+				contentSha = shaStr
 			}
 
 			isDir := (erofsInode.Mode & erofs.S_IFMT) == erofs.S_IFDIR
@@ -486,15 +607,17 @@ func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, pop
 			}
 
 			node := &CachedInode{
-				ID:      inodeID,
-				Mode:    mode,
-				Size:    int64(erofsInode.Size),
-				ModTime: mtime,
-				IsDir:   isDir,
-				Sha256:  shaStr,
-				Uid:     erofsInode.UID,
-				Gid:     erofsInode.GID,
-				IsDirty: false,
+				ID:             inodeID,
+				Mode:           mode,
+				Size:           int64(erofsInode.Size),
+				ModTime:        mtime,
+				IsDir:          isDir,
+				Sha256:         shaStr,
+				ManifestSha256: manifestSha,
+				ContentSha256:  contentSha,
+				Uid:            erofsInode.UID,
+				Gid:            erofsInode.GID,
+				IsDirty:        false,
 			}
 			if populateCache && r.inodeCache != nil {
 				r.inodeCache.Put(inodeID, node)
@@ -738,18 +861,27 @@ func (v *Volume) toEntryAttrLocked(ctx context.Context, inodeID uint64, fullPath
 	if err != nil {
 		return nil, err
 	}
+	mSha := node.ManifestSha256
+	cSha := node.ContentSha256
+	if node.ChunkSize == 0 && mSha == "" {
+		cSha = node.Sha256
+	} else if mSha == "" {
+		mSha = node.Sha256
+	}
 	return &pb.EntryAttr{
-		Inode:       node.ID,
-		Path:        fullPath,
-		Name:        name,
-		IsDir:       node.IsDir,
-		Size:        node.Size,
-		Mode:        node.Mode,
-		ModTime:     timestamppb.New(node.ModTime),
-		Sha256:      node.Sha256,
-		RedirectUrl: node.RedirectURL,
-		Uid:         node.Uid,
-		Gid:         node.Gid,
+		Inode:          node.ID,
+		Path:           fullPath,
+		Name:           name,
+		IsDir:          node.IsDir,
+		Size:           node.Size,
+		Mode:           node.Mode,
+		ModTime:        timestamppb.New(node.ModTime),
+		Sha256:         node.Sha256,
+		ManifestSha256: mSha,
+		ContentSha256:  cSha,
+		RedirectUrl:    node.RedirectURL,
+		Uid:            node.Uid,
+		Gid:            node.Gid,
 	}, nil
 }
 
@@ -1014,28 +1146,57 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			}
 			if childInode.Data != nil {
 				_ = childInode.Data.Close()
+				childInode.Data = nil
 			}
 			childInode.Mode = mode
 			childInode.Size = int64(len(dataCopy))
-			childInode.Data = stream
 			childInode.ModTime = now
-			childInode.Sha256 = hashStr
 			childInode.Uid = uid
 			childInode.Gid = gid
 			childInode.IsDirty = true
 
+			if len(dataCopy) > int(v.chunkSize) && v.chunkSize > 0 {
+				_, manifest, manifestBlob, _ := blob.ChunkBlobs(stream, v.chunkSize, true)
+				childInode.ChunkSize = v.chunkSize
+				childInode.Chunks = manifest.ChunkHexSHAs()
+				childInode.ManifestSha256 = manifestBlob.SHA256Hex()
+				childInode.ContentSha256 = hashStr
+				childInode.Sha256 = childInode.ManifestSha256
+				childInode.DirtyChunks = make(map[int][]byte)
+				for i := 0; i < len(childInode.Chunks); i++ {
+					start := i * int(v.chunkSize)
+					end := len(dataCopy)
+					if (i+1)*int(v.chunkSize) < end {
+						end = (i + 1) * int(v.chunkSize)
+					}
+					cSlice := make([]byte, end-start)
+					copy(cSlice, dataCopy[start:end])
+					childInode.DirtyChunks[i] = cSlice
+				}
+			} else {
+				childInode.Data = stream
+				childInode.Sha256 = hashStr
+				childInode.ContentSha256 = hashStr
+				childInode.ManifestSha256 = ""
+				childInode.ChunkSize = 0
+				childInode.Chunks = nil
+				childInode.DirtyChunks = nil
+			}
+
 			rec := &MutationRecord{
-				Type:     MutationCreateFile,
-				VolumeId: v.volumeID,
-				Path:     p,
-				Mode:     mode,
-				Size:     int64(len(dataCopy)),
-				ModTime:  timestamppb.New(now),
-				Sha256:   hashStr,
-				Inode:    childInode.ID,
-				Data:     dataCopy,
-				Uid:      uid,
-				Gid:      gid,
+				Type:           MutationCreateFile,
+				VolumeId:       v.volumeID,
+				Path:           p,
+				Mode:           mode,
+				Size:           int64(len(dataCopy)),
+				ModTime:        timestamppb.New(now),
+				Sha256:         childInode.Sha256,
+				ManifestSha256: childInode.ManifestSha256,
+				ContentSha256:  childInode.ContentSha256,
+				Inode:          childInode.ID,
+				Data:           dataCopy,
+				Uid:            uid,
+				Gid:            gid,
 			}
 			waitFn, err := v.logMutationLocked(ctx, rec, nil)
 			if err != nil {
@@ -1043,16 +1204,18 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			}
 
 			attr := &pb.EntryAttr{
-				Inode:   childInode.ID,
-				Path:    p,
-				Name:    baseName,
-				IsDir:   false,
-				Size:    childInode.Size,
-				Mode:    childInode.Mode,
-				ModTime: timestamppb.New(now),
-				Sha256:  hashStr,
-				Uid:     uid,
-				Gid:     gid,
+				Inode:          childInode.ID,
+				Path:           p,
+				Name:           baseName,
+				IsDir:          false,
+				Size:           childInode.Size,
+				Mode:           childInode.Mode,
+				ModTime:        timestamppb.New(now),
+				Sha256:         childInode.Sha256,
+				ManifestSha256: childInode.ManifestSha256,
+				ContentSha256:  childInode.ContentSha256,
+				Uid:            uid,
+				Gid:            gid,
 			}
 			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 				EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -1082,27 +1245,53 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			Mode:    mode,
 			Size:    int64(len(dataCopy)),
 			ModTime: now,
-			Data:    stream,
-			Sha256:  hashStr,
 			IsDir:   false,
 			Uid:     uid,
 			Gid:     gid,
 			IsDirty: true,
 		}
+
+		if len(dataCopy) > int(v.chunkSize) && v.chunkSize > 0 {
+			_, manifest, manifestBlob, _ := blob.ChunkBlobs(stream, v.chunkSize, true)
+			childInode.ChunkSize = v.chunkSize
+			childInode.Chunks = manifest.ChunkHexSHAs()
+			childInode.ManifestSha256 = manifestBlob.SHA256Hex()
+			childInode.ContentSha256 = hashStr
+			childInode.Sha256 = childInode.ManifestSha256
+			childInode.DirtyChunks = make(map[int][]byte)
+			for i := 0; i < len(childInode.Chunks); i++ {
+				start := i * int(v.chunkSize)
+				end := len(dataCopy)
+				if (i+1)*int(v.chunkSize) < end {
+					end = (i + 1) * int(v.chunkSize)
+				}
+				cSlice := make([]byte, end-start)
+				copy(cSlice, dataCopy[start:end])
+				childInode.DirtyChunks[i] = cSlice
+			}
+		} else {
+			childInode.Data = stream
+			childInode.Sha256 = hashStr
+			childInode.ContentSha256 = hashStr
+			childInode.ManifestSha256 = ""
+			childInode.ChunkSize = 0
+		}
 		v.inodeCache.Put(childInodeID, childInode)
 
 		rec := &MutationRecord{
-			Type:     MutationCreateFile,
-			VolumeId: v.volumeID,
-			Path:     p,
-			Mode:     mode,
-			Size:     int64(len(dataCopy)),
-			ModTime:  timestamppb.New(now),
-			Sha256:   hashStr,
-			Inode:    childInodeID,
-			Data:     dataCopy,
-			Uid:      uid,
-			Gid:      gid,
+			Type:           MutationCreateFile,
+			VolumeId:       v.volumeID,
+			Path:           p,
+			Mode:           mode,
+			Size:           int64(len(dataCopy)),
+			ModTime:        timestamppb.New(now),
+			Sha256:         childInode.Sha256,
+			ManifestSha256: childInode.ManifestSha256,
+			ContentSha256:  childInode.ContentSha256,
+			Inode:          childInodeID,
+			Data:           dataCopy,
+			Uid:            uid,
+			Gid:            gid,
 		}
 		waitFn, err := v.logMutationLocked(ctx, rec, nil)
 		if err != nil {
@@ -1112,16 +1301,18 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 		}
 
 		attr := &pb.EntryAttr{
-			Inode:   childInodeID,
-			Path:    p,
-			Name:    baseName,
-			IsDir:   false,
-			Size:    int64(len(dataCopy)),
-			Mode:    mode,
-			ModTime: timestamppb.New(now),
-			Sha256:  hashStr,
-			Uid:     uid,
-			Gid:     gid,
+			Inode:          childInodeID,
+			Path:           p,
+			Name:           baseName,
+			IsDir:          false,
+			Size:           int64(len(dataCopy)),
+			Mode:           mode,
+			ModTime:        timestamppb.New(now),
+			Sha256:         childInode.Sha256,
+			ManifestSha256: childInode.ManifestSha256,
+			ContentSha256:  childInode.ContentSha256,
+			Uid:            uid,
+			Gid:            gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_CREATED,
@@ -1162,6 +1353,58 @@ func (v *Volume) ReadFile(ctx context.Context, p string, offset, length int64) (
 		return nil, 0, "", fmt.Errorf("cannot read directory as file: %w", syscall.EISDIR)
 	}
 
+	total := node.Size
+	if node.RedirectURL != "" && length > v.maxInlineLen {
+		return nil, total, node.RedirectURL, nil
+	}
+
+	if offset >= total {
+		return []byte{}, total, "", nil
+	}
+
+	end := offset + length
+	if length <= 0 || end > total {
+		end = total
+	}
+	readLen := end - offset
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if node.ManifestSha256 != "" || node.ChunkSize > 0 {
+		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+		cs := int64(node.ChunkSize)
+		if cs == 0 {
+			cs = int64(v.chunkSize)
+			if cs == 0 {
+				cs = 32 * 1024
+			}
+		}
+		startChunk := int(offset / cs)
+		endChunk := int((end - 1) / cs)
+
+		var res bytes.Buffer
+		for i := startChunk; i <= endChunk; i++ {
+			chunkData, err := v.readChunkLocked(ctx, node, i)
+			if err != nil {
+				return nil, 0, "", fmt.Errorf("failed to read chunk %d: %w", i, err)
+			}
+			chunkStart := int64(i) * cs
+			rStart := offset - chunkStart
+			if rStart < 0 {
+				rStart = 0
+			}
+			rEnd := end - chunkStart
+			if rEnd > int64(len(chunkData)) {
+				rEnd = int64(len(chunkData))
+			}
+			if rStart < int64(len(chunkData)) && rEnd > rStart {
+				res.Write(chunkData[rStart:rEnd])
+			}
+		}
+		return res.Bytes(), total, "", nil
+	}
+
 	// Lazy load data from blob store / backend if not currently in memory
 	if node.Data == nil && node.Size > 0 {
 		if node.Sha256 != "" && v.blobStore != nil {
@@ -1179,20 +1422,9 @@ func (v *Volume) ReadFile(ctx context.Context, p string, offset, length int64) (
 		}
 	}
 
-	total := node.Size
-	if node.RedirectURL != "" && length > v.maxInlineLen {
-		return nil, total, node.RedirectURL, nil
-	}
-
-	if offset >= total || node.Data == nil {
+	if node.Data == nil {
 		return []byte{}, total, "", nil
 	}
-
-	end := offset + length
-	if length <= 0 || end > total {
-		end = total
-	}
-	readLen := end - offset
 
 	if _, err := node.Data.Seek(offset, io.SeekStart); err != nil {
 		return nil, 0, "", fmt.Errorf("failed to seek node data: %w", err)
@@ -1226,38 +1458,170 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 			return 0, 0, time.Time{}, nil, fmt.Errorf("cannot write to directory: %w", syscall.EISDIR)
 		}
 
-		var currentData []byte
-		if node.Data != nil {
-			_ = node.Data.Rewind()
-			currentData, _ = io.ReadAll(node.Data)
-			_ = node.Data.Close()
+		effectiveChunkSize := v.chunkSize
+		if effectiveChunkSize == 0 {
+			effectiveChunkSize = 32 * 1024
+		}
+		if node.ManifestSha256 != "" && node.ChunkSize == 0 {
+			_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+		}
+		if node.ChunkSize > 0 {
+			effectiveChunkSize = node.ChunkSize
 		}
 
 		neededLen := offset + int64(len(data))
-		if neededLen > int64(len(currentData)) {
-			newBuf := make([]byte, neededLen)
-			copy(newBuf, currentData)
-			currentData = newBuf
+		calculatedSize := neededLen
+		if calculatedSize < node.Size {
+			calculatedSize = node.Size
 		}
-		copy(currentData[offset:], data)
-		node.Size = int64(len(currentData))
+
 		now := time.Now()
 		node.ModTime = now
 		node.IsDirty = true
 
-		h := sha256.Sum256(currentData)
-		node.Sha256 = fmt.Sprintf("%x", h)
-
-		if node.Size <= blob.MemoryThreshold {
-			node.Data = blob.NewByteStreamFromBytes(currentData)
-		} else {
-			tf, err := os.CreateTemp("", "objectfs-node-*")
-			if err == nil {
-				_, _ = tf.Write(currentData)
-				_, _ = tf.Seek(0, io.SeekStart)
-				node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
+		if calculatedSize > int64(effectiveChunkSize) || node.ManifestSha256 != "" || node.ChunkSize > 0 {
+			if node.ChunkSize == 0 {
+				var currentData []byte
+				if node.Data != nil {
+					_ = node.Data.Rewind()
+					currentData, _ = io.ReadAll(node.Data)
+					_ = node.Data.Close()
+					node.Data = nil
+				} else if node.Sha256 != "" && v.blobStore != nil {
+					stream, err := v.blobStore.GetBlob(ctx, node.Sha256)
+					if err == nil {
+						currentData, _ = io.ReadAll(stream)
+						_ = stream.Close()
+					}
+				}
+				node.ChunkSize = effectiveChunkSize
+				node.Chunks = nil
+				if node.DirtyChunks == nil {
+					node.DirtyChunks = make(map[int][]byte)
+				}
+				rem := int64(len(currentData))
+				chunkIdx := 0
+				for rem > 0 {
+					take := int64(effectiveChunkSize)
+					if rem < take {
+						take = rem
+					}
+					cSlice := make([]byte, take)
+					copy(cSlice, currentData[int64(chunkIdx)*int64(effectiveChunkSize):int64(chunkIdx)*int64(effectiveChunkSize)+take])
+					node.DirtyChunks[chunkIdx] = cSlice
+					cSha := fmt.Sprintf("%x", sha256.Sum256(cSlice))
+					node.Chunks = append(node.Chunks, cSha)
+					rem -= take
+					chunkIdx++
+				}
 			} else {
+				_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+				if node.DirtyChunks == nil {
+					node.DirtyChunks = make(map[int][]byte)
+				}
+			}
+
+			cs := int64(effectiveChunkSize)
+			startChunk := int(offset / cs)
+			endChunk := int((offset + int64(len(data)) - 1) / cs)
+
+			for len(node.Chunks) <= endChunk {
+				node.Chunks = append(node.Chunks, "")
+			}
+
+			for i := startChunk; i <= endChunk; i++ {
+				chunkStart := int64(i) * cs
+				chunkEnd := chunkStart + cs
+				wStart := offset - chunkStart
+				if wStart < 0 {
+					wStart = 0
+				}
+				wEnd := offset + int64(len(data)) - chunkStart
+				if wEnd > cs {
+					wEnd = cs
+				}
+				dataStart := chunkStart - offset
+				if dataStart < 0 {
+					dataStart = 0
+				}
+				dataEnd := chunkEnd - offset
+				if dataEnd > int64(len(data)) {
+					dataEnd = int64(len(data))
+				}
+
+				chunkData, _ := v.readChunkLocked(ctx, node, i)
+				if int64(len(chunkData)) < wEnd {
+					newBuf := make([]byte, wEnd)
+					copy(newBuf, chunkData)
+					chunkData = newBuf
+				}
+				copy(chunkData[wStart:wEnd], data[dataStart:dataEnd])
+				chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
+				node.Chunks[i] = chunkSha
+				node.DirtyChunks[i] = chunkData
+			}
+
+			node.Size = calculatedSize
+
+			manifestChunks := make([][32]byte, len(node.Chunks))
+			for i, c := range node.Chunks {
+				raw, _ := hex.DecodeString(c)
+				if len(raw) == 32 {
+					copy(manifestChunks[i][:], raw)
+				}
+			}
+			manifest := &blob.Manifest{
+				ChunkSize:   effectiveChunkSize,
+				TotalLength: uint64(node.Size),
+				Chunks:      manifestChunks,
+			}
+			manifestBlob, err := blob.EncodeManifest(manifest)
+			if err == nil {
+				node.ManifestSha256 = manifestBlob.SHA256Hex()
+				node.Sha256 = node.ManifestSha256
+			}
+
+			if offset == 0 && int64(len(data)) == node.Size {
+				h := sha256.Sum256(data)
+				node.ContentSha256 = fmt.Sprintf("%x", h)
+			} else {
+				node.ContentSha256 = ""
+			}
+		} else {
+			var currentData []byte
+			if node.Data != nil {
+				_ = node.Data.Rewind()
+				currentData, _ = io.ReadAll(node.Data)
+				_ = node.Data.Close()
+			}
+
+			if neededLen > int64(len(currentData)) {
+				newBuf := make([]byte, neededLen)
+				copy(newBuf, currentData)
+				currentData = newBuf
+			}
+			copy(currentData[offset:], data)
+			node.Size = int64(len(currentData))
+
+			h := sha256.Sum256(currentData)
+			node.Sha256 = fmt.Sprintf("%x", h)
+			node.ContentSha256 = node.Sha256
+			node.ManifestSha256 = ""
+			node.ChunkSize = 0
+			node.Chunks = nil
+			node.DirtyChunks = nil
+
+			if node.Size <= blob.MemoryThreshold {
 				node.Data = blob.NewByteStreamFromBytes(currentData)
+			} else {
+				tf, err := os.CreateTemp("", "objectfs-node-*")
+				if err == nil {
+					_, _ = tf.Write(currentData)
+					_, _ = tf.Seek(0, io.SeekStart)
+					node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
+				} else {
+					node.Data = blob.NewByteStreamFromBytes(currentData)
+				}
 			}
 		}
 
@@ -1275,14 +1639,16 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 		}
 
 		rec := &MutationRecord{
-			Type:     MutationWriteFile,
-			VolumeId: v.volumeID,
-			Path:     p,
-			Offset:   offset,
-			Size:     node.Size,
-			ModTime:  timestamppb.New(now),
-			Sha256:   node.Sha256,
-			Data:     data,
+			Type:           MutationWriteFile,
+			VolumeId:       v.volumeID,
+			Path:           p,
+			Offset:         offset,
+			Size:           node.Size,
+			ModTime:        timestamppb.New(now),
+			Sha256:         node.Sha256,
+			ManifestSha256: node.ManifestSha256,
+			ContentSha256:  node.ContentSha256,
+			Data:           data,
 		}
 		waitFn, err := v.logMutationLocked(ctx, rec, reqLevel)
 		if err != nil {
@@ -1290,16 +1656,18 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 		}
 
 		attr := &pb.EntryAttr{
-			Inode:   node.ID,
-			Path:    p,
-			Name:    baseName,
-			IsDir:   false,
-			Size:    node.Size,
-			Mode:    node.Mode,
-			ModTime: timestamppb.New(now),
-			Sha256:  node.Sha256,
-			Uid:     node.Uid,
-			Gid:     node.Gid,
+			Inode:          node.ID,
+			Path:           p,
+			Name:           baseName,
+			IsDir:          false,
+			Size:           node.Size,
+			Mode:           node.Mode,
+			ModTime:        timestamppb.New(now),
+			Sha256:         node.Sha256,
+			ManifestSha256: node.ManifestSha256,
+			ContentSha256:  node.ContentSha256,
+			Uid:            node.Uid,
+			Gid:            node.Gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -1345,47 +1713,121 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 			return nil, nil, fmt.Errorf("invalid size %d: %w", size, syscall.EINVAL)
 		}
 
-		var currentData []byte
-		if node.Data != nil {
-			_ = node.Data.Rewind()
-			currentData, _ = io.ReadAll(node.Data)
-			_ = node.Data.Close()
-		}
-
-		if size < int64(len(currentData)) {
-			currentData = currentData[:size]
-		} else if size > int64(len(currentData)) {
-			newBuf := make([]byte, size)
-			copy(newBuf, currentData)
-			currentData = newBuf
-		}
-		node.Size = size
 		now := time.Now()
 		node.ModTime = now
 		node.IsDirty = true
-		h := sha256.Sum256(currentData)
-		node.Sha256 = fmt.Sprintf("%x", h)
 
-		if node.Size <= blob.MemoryThreshold {
-			node.Data = blob.NewByteStreamFromBytes(currentData)
-		} else {
-			tf, err := os.CreateTemp("", "objectfs-node-*")
-			if err == nil {
-				_, _ = tf.Write(currentData)
-				_, _ = tf.Seek(0, io.SeekStart)
-				node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
+		if node.ManifestSha256 != "" || node.ChunkSize > 0 {
+			_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+			if node.DirtyChunks == nil {
+				node.DirtyChunks = make(map[int][]byte)
+			}
+
+			if size == 0 {
+				node.Size = 0
+				node.Chunks = nil
+				node.DirtyChunks = nil
+				node.ChunkSize = 0
+				node.ManifestSha256 = ""
+				node.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256([]byte{}))
+				node.Sha256 = node.ContentSha256
+				if node.Data != nil {
+					_ = node.Data.Close()
+					node.Data = nil
+				}
 			} else {
+				cs := int64(node.ChunkSize)
+				numChunks := int((size + cs - 1) / cs)
+				if numChunks < len(node.Chunks) {
+					for k := range node.DirtyChunks {
+						if k >= numChunks {
+							delete(node.DirtyChunks, k)
+						}
+					}
+					node.Chunks = node.Chunks[:numChunks]
+				}
+				if numChunks > 0 {
+					lastIdx := numChunks - 1
+					lastChunkLen := size - int64(lastIdx)*cs
+					chunkData, _ := v.readChunkLocked(ctx, node, lastIdx)
+					if int64(len(chunkData)) > lastChunkLen {
+						chunkData = chunkData[:lastChunkLen]
+					} else if int64(len(chunkData)) < lastChunkLen {
+						newBuf := make([]byte, lastChunkLen)
+						copy(newBuf, chunkData)
+						chunkData = newBuf
+					}
+					chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
+					node.Chunks[lastIdx] = chunkSha
+					node.DirtyChunks[lastIdx] = chunkData
+				}
+
+				node.Size = size
+
+				manifestChunks := make([][32]byte, len(node.Chunks))
+				for i, c := range node.Chunks {
+					raw, _ := hex.DecodeString(c)
+					if len(raw) == 32 {
+						copy(manifestChunks[i][:], raw)
+					}
+				}
+				manifest := &blob.Manifest{
+					ChunkSize:   node.ChunkSize,
+					TotalLength: uint64(node.Size),
+					Chunks:      manifestChunks,
+				}
+				manifestBlob, err := blob.EncodeManifest(manifest)
+				if err == nil {
+					node.ManifestSha256 = manifestBlob.SHA256Hex()
+					node.Sha256 = node.ManifestSha256
+				}
+				node.ContentSha256 = ""
+			}
+		} else {
+			var currentData []byte
+			if node.Data != nil {
+				_ = node.Data.Rewind()
+				currentData, _ = io.ReadAll(node.Data)
+				_ = node.Data.Close()
+			}
+
+			if size < int64(len(currentData)) {
+				currentData = currentData[:size]
+			} else if size > int64(len(currentData)) {
+				newBuf := make([]byte, size)
+				copy(newBuf, currentData)
+				currentData = newBuf
+			}
+			node.Size = size
+			h := sha256.Sum256(currentData)
+			node.Sha256 = fmt.Sprintf("%x", h)
+			node.ContentSha256 = node.Sha256
+			node.ManifestSha256 = ""
+			node.ChunkSize = 0
+
+			if node.Size <= blob.MemoryThreshold {
 				node.Data = blob.NewByteStreamFromBytes(currentData)
+			} else {
+				tf, err := os.CreateTemp("", "objectfs-node-*")
+				if err == nil {
+					_, _ = tf.Write(currentData)
+					_, _ = tf.Seek(0, io.SeekStart)
+					node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
+				} else {
+					node.Data = blob.NewByteStreamFromBytes(currentData)
+				}
 			}
 		}
 
 		rec := &MutationRecord{
-			Type:     MutationTruncateFile,
-			VolumeId: v.volumeID,
-			Path:     p,
-			Size:     size,
-			ModTime:  timestamppb.New(now),
-			Sha256:   node.Sha256,
+			Type:           MutationTruncateFile,
+			VolumeId:       v.volumeID,
+			Path:           p,
+			Size:           size,
+			ModTime:        timestamppb.New(now),
+			Sha256:         node.Sha256,
+			ManifestSha256: node.ManifestSha256,
+			ContentSha256:  node.ContentSha256,
 		}
 		waitFn, err := v.logMutationLocked(ctx, rec, nil)
 		if err != nil {
@@ -1393,16 +1835,18 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 		}
 
 		attr := &pb.EntryAttr{
-			Inode:   node.ID,
-			Path:    p,
-			Name:    baseName,
-			IsDir:   false,
-			Size:    node.Size,
-			Mode:    node.Mode,
-			ModTime: timestamppb.New(now),
-			Sha256:  node.Sha256,
-			Uid:     node.Uid,
-			Gid:     node.Gid,
+			Inode:          node.ID,
+			Path:           p,
+			Name:           baseName,
+			IsDir:          false,
+			Size:           node.Size,
+			Mode:           node.Mode,
+			ModTime:        timestamppb.New(now),
+			Sha256:         node.Sha256,
+			ManifestSha256: node.ManifestSha256,
+			ContentSha256:  node.ContentSha256,
+			Uid:            node.Uid,
+			Gid:            node.Gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -1804,18 +2248,46 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 				return nil, err
 			}
 
+			if childInode.ContentSha256 == "" && childInode.Size > 0 {
+				hasher := sha256.New()
+				if childInode.ManifestSha256 != "" || childInode.ChunkSize > 0 {
+					_ = r.vol.ensureInodeChunksLoadedLocked(ctx, childInode)
+					for i := 0; i < len(childInode.Chunks); i++ {
+						chunkBytes, err := r.vol.readChunkLocked(ctx, childInode, i)
+						if err == nil {
+							hasher.Write(chunkBytes)
+						}
+					}
+				} else if childInode.Data != nil {
+					_ = childInode.Data.Rewind()
+					_, _ = io.Copy(hasher, childInode.Data)
+				} else if childInode.Sha256 != "" && r.vol.blobStore != nil {
+					stream, err := r.vol.blobStore.GetBlob(ctx, childInode.Sha256)
+					if err == nil {
+						_, _ = io.Copy(hasher, stream)
+						_ = stream.Close()
+					}
+				}
+				childInode.ContentSha256 = fmt.Sprintf("%x", hasher.Sum(nil))
+				if inMemNode, ok := r.vol.inodeCache.Peek(childInode.ID); ok {
+					inMemNode.ContentSha256 = childInode.ContentSha256
+				}
+			}
+
 			meta := FileMetadata{
-				Inode:   childInode.ID,
-				Path:    childPath,
-				Name:    name,
-				IsDir:   false,
-				Mode:    childInode.Mode,
-				Size:    childInode.Size,
-				ModTime: childInode.ModTime,
-				Sha256:  childInode.Sha256,
-				ETag:    childInode.ETag,
-				Uid:     childInode.Uid,
-				Gid:     childInode.Gid,
+				Inode:          childInode.ID,
+				Path:           childPath,
+				Name:           name,
+				IsDir:          false,
+				Mode:           childInode.Mode,
+				Size:           childInode.Size,
+				ModTime:        childInode.ModTime,
+				Sha256:         childInode.Sha256,
+				ManifestSha256: childInode.ManifestSha256,
+				ContentSha256:  childInode.ContentSha256,
+				ETag:           childInode.ETag,
+				Uid:            childInode.Uid,
+				Gid:            childInode.Gid,
 			}
 
 			needsUpload := childInode.ETag == ""
@@ -1824,9 +2296,13 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 					needsUpload = true
 				}
 			}
-			if needsUpload && childInode.Sha256 != "" && r.vol.blobStore != nil && r.vol.backend != nil {
+			fetchSha := childInode.Sha256
+			if childInode.ManifestSha256 != "" {
+				fetchSha = childInode.ManifestSha256
+			}
+			if needsUpload && fetchSha != "" && r.vol.blobStore != nil && r.vol.backend != nil {
 				key := strings.TrimPrefix(childPath, "/")
-				blobReader, bErr := r.vol.blobStore.GetBlob(ctx, childInode.Sha256)
+				blobReader, bErr := r.vol.blobStore.GetBlob(ctx, fetchSha)
 				if bErr == nil && blobReader != nil {
 					etag, err := r.vol.backend.PutObject(ctx, r.vol.volumeID, key, blobReader)
 					if err == nil {
@@ -1840,9 +2316,15 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 			currentEntries[childPath] = meta
 
 			var xattrs erofs.Xattrs
-			if childInode.Sha256 != "" {
+			if childInode.ContentSha256 != "" {
+				xattrs.UserDigest = childInode.ContentSha256
+				xattrs.UserSHA256 = childInode.ContentSha256
+			} else if childInode.Sha256 != "" {
 				xattrs.UserDigest = childInode.Sha256
 				xattrs.UserSHA256 = childInode.Sha256
+			}
+			if childInode.ManifestSha256 != "" {
+				xattrs.UserManifest = childInode.ManifestSha256
 			}
 
 			leafNode := erofs.NewMemoryNode(
@@ -2219,16 +2701,18 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		}
 
 		childInode := &CachedInode{
-			ID:      inodeID,
-			Mode:    mode,
-			Size:    record.Size,
-			ModTime: modTime,
-			Data:    stream,
-			Sha256:  record.Sha256,
-			IsDir:   false,
-			Uid:     record.Uid,
-			Gid:     record.Gid,
-			IsDirty: false,
+			ID:             inodeID,
+			Mode:           mode,
+			Size:           record.Size,
+			ModTime:        modTime,
+			Data:           stream,
+			Sha256:         record.Sha256,
+			ManifestSha256: record.ManifestSha256,
+			ContentSha256:  record.ContentSha256,
+			IsDir:          false,
+			Uid:            record.Uid,
+			Gid:            record.Gid,
+			IsDirty:        false,
 		}
 		v.inodeCache.Put(inodeID, childInode)
 
@@ -2277,6 +2761,12 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		if record.Sha256 != "" {
 			node.Sha256 = record.Sha256
 		}
+		if record.ManifestSha256 != "" {
+			node.ManifestSha256 = record.ManifestSha256
+		}
+		if record.ContentSha256 != "" {
+			node.ContentSha256 = record.ContentSha256
+		}
 		if record.ModTime != nil {
 			node.ModTime = record.ModTime.AsTime()
 		}
@@ -2295,6 +2785,12 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		node.Size = record.Size
 		if record.Sha256 != "" {
 			node.Sha256 = record.Sha256
+		}
+		if record.ManifestSha256 != "" {
+			node.ManifestSha256 = record.ManifestSha256
+		}
+		if record.ContentSha256 != "" {
+			node.ContentSha256 = record.ContentSha256
 		}
 		if record.ModTime != nil {
 			node.ModTime = record.ModTime.AsTime()
