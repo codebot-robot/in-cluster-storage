@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"path"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -32,6 +33,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -2308,5 +2310,192 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	truncData, total, _, err := vol.ReadFile(ctx, "/large.bin", 0, 20*1024)
 	if err != nil || total != 18*1024 || len(truncData) != 18*1024 {
 		t.Fatalf("ReadFile after truncation failed: total=%d, len=%d, err=%v", total, len(truncData), err)
+	}
+}
+
+func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "stable-ino-vol"
+
+	// 1. Create a directory /dir1 and file /file1.txt and /dir1/file2.txt
+	_, err := server.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId: volumeID,
+		Path:     "/dir1",
+		Mode:     0755,
+	})
+	if err != nil {
+		t.Fatalf("Failed to mkdir /dir1: %v", err)
+	}
+
+	create1, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file1.txt",
+		Mode:           0644,
+		InitialContent: []byte("content of file 1"),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create /file1.txt: %v", err)
+	}
+
+	create2, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/dir1/file2.txt",
+		Mode:           0644,
+		InitialContent: []byte("content of file 2"),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create /dir1/file2.txt: %v", err)
+	}
+
+	dir1Attr, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1"})
+	if err != nil {
+		t.Fatalf("Failed to get /dir1 attr: %v", err)
+	}
+
+	file1InoInitial := create1.Attr.Inode
+	dir1InoInitial := dir1Attr.Attr.Inode
+	file2InoInitial := create2.Attr.Inode
+
+	if file1InoInitial == 0 || dir1InoInitial == 0 || file2InoInitial == 0 {
+		t.Fatalf("Expected non-zero inode IDs, got file1=%d, dir1=%d, file2=%d", file1InoInitial, dir1InoInitial, file2InoInitial)
+	}
+
+	// 2. Take first snapshot
+	snap1Resp, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("Failed to create first snapshot: %v", err)
+	}
+	snap1Name := snap1Resp.SnapshotName
+
+	// Verify attributes after snapshot 1
+	file1AttrAfterSnap1, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/file1.txt"})
+	if err != nil {
+		t.Fatalf("Failed to get /file1.txt after snap 1: %v", err)
+	}
+	if file1AttrAfterSnap1.Attr.Inode != file1InoInitial {
+		t.Fatalf("Inode changed after snap 1: expected %d, got %d", file1InoInitial, file1AttrAfterSnap1.Attr.Inode)
+	}
+
+	dir1AttrAfterSnap1, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1"})
+	if err != nil {
+		t.Fatalf("Failed to get /dir1 after snap 1: %v", err)
+	}
+	if dir1AttrAfterSnap1.Attr.Inode != dir1InoInitial {
+		t.Fatalf("Dir inode changed after snap 1: expected %d, got %d", dir1InoInitial, dir1AttrAfterSnap1.Attr.Inode)
+	}
+
+	file2AttrAfterSnap1, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1/file2.txt"})
+	if err != nil {
+		t.Fatalf("Failed to get /dir1/file2.txt after snap 1: %v", err)
+	}
+	if file2AttrAfterSnap1.Attr.Inode != file2InoInitial {
+		t.Fatalf("File2 inode changed after snap 1: expected %d, got %d", file2InoInitial, file2AttrAfterSnap1.Attr.Inode)
+	}
+
+	// Read and verify EROFS snapshot 1 image directly
+	var img1Buf bytes.Buffer
+	snap1Key := path.Join("volumes", volumeID, "meta", snap1Name)
+	if err := backend.GetObject(ctx, "", snap1Key, 0, 0, &img1Buf); err != nil {
+		t.Fatalf("Failed to fetch snap 1 bytes: %v", err)
+	}
+	reader1, err := erofs.NewReader(bytes.NewReader(img1Buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Failed to parse snap 1 image: %v", err)
+	}
+
+	// Verify root dirents in snapshot 1
+	rootDirents1, err := reader1.ListDirectory(reader1.GetRootNID())
+	if err != nil {
+		t.Fatalf("Failed to list root in snap 1: %v", err)
+	}
+	for _, de := range rootDirents1 {
+		if de.Name == "file1.txt" && de.NID != file1InoInitial {
+			t.Fatalf("Snap 1 file1.txt NID mismatch: expected %d, got %d", file1InoInitial, de.NID)
+		}
+		if de.Name == "dir1" && de.NID != dir1InoInitial {
+			t.Fatalf("Snap 1 dir1 NID mismatch: expected %d, got %d", dir1InoInitial, de.NID)
+		}
+	}
+
+	// 3. Create a new file before taking second snapshot
+	create3, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file3.txt",
+		Mode:           0644,
+		InitialContent: []byte("content of file 3"),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create /file3.txt: %v", err)
+	}
+	file3InoInitial := create3.Attr.Inode
+
+	// 4. Take second snapshot
+	snap2Resp, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("Failed to create second snapshot: %v", err)
+	}
+	snap2Name := snap2Resp.SnapshotName
+
+	// Verify all attributes after snapshot 2: previous files MUST have identical Inode IDs
+	file1AttrAfterSnap2, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/file1.txt"})
+	if err != nil {
+		t.Fatalf("Failed to get /file1.txt after snap 2: %v", err)
+	}
+	if file1AttrAfterSnap2.Attr.Inode != file1InoInitial {
+		t.Fatalf("Inode changed after snap 2: expected %d, got %d", file1InoInitial, file1AttrAfterSnap2.Attr.Inode)
+	}
+
+	dir1AttrAfterSnap2, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1"})
+	if err != nil {
+		t.Fatalf("Failed to get /dir1 after snap 2: %v", err)
+	}
+	if dir1AttrAfterSnap2.Attr.Inode != dir1InoInitial {
+		t.Fatalf("Dir inode changed after snap 2: expected %d, got %d", dir1InoInitial, dir1AttrAfterSnap2.Attr.Inode)
+	}
+
+	file2AttrAfterSnap2, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1/file2.txt"})
+	if err != nil {
+		t.Fatalf("Failed to get /dir1/file2.txt after snap 2: %v", err)
+	}
+	if file2AttrAfterSnap2.Attr.Inode != file2InoInitial {
+		t.Fatalf("File2 inode changed after snap 2: expected %d, got %d", file2InoInitial, file2AttrAfterSnap2.Attr.Inode)
+	}
+
+	file3AttrAfterSnap2, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/file3.txt"})
+	if err != nil {
+		t.Fatalf("Failed to get /file3.txt after snap 2: %v", err)
+	}
+	if file3AttrAfterSnap2.Attr.Inode != file3InoInitial {
+		t.Fatalf("File3 inode changed after snap 2: expected %d, got %d", file3InoInitial, file3AttrAfterSnap2.Attr.Inode)
+	}
+
+	// Read and verify EROFS snapshot 2 image directly
+	var img2Buf bytes.Buffer
+	snap2Key := path.Join("volumes", volumeID, "meta", snap2Name)
+	if err := backend.GetObject(ctx, "", snap2Key, 0, 0, &img2Buf); err != nil {
+		t.Fatalf("Failed to fetch snap 2 bytes: %v", err)
+	}
+	reader2, err := erofs.NewReader(bytes.NewReader(img2Buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Failed to parse snap 2 image: %v", err)
+	}
+
+	// Verify root dirents in snapshot 2
+	rootDirents2, err := reader2.ListDirectory(reader2.GetRootNID())
+	if err != nil {
+		t.Fatalf("Failed to list root in snap 2: %v", err)
+	}
+	for _, de := range rootDirents2 {
+		if de.Name == "file1.txt" && de.NID != file1InoInitial {
+			t.Fatalf("Snap 2 file1.txt NID mismatch: expected %d, got %d", file1InoInitial, de.NID)
+		}
+		if de.Name == "dir1" && de.NID != dir1InoInitial {
+			t.Fatalf("Snap 2 dir1 NID mismatch: expected %d, got %d", dir1InoInitial, de.NID)
+		}
+		if de.Name == "file3.txt" && de.NID != file3InoInitial {
+			t.Fatalf("Snap 2 file3.txt NID mismatch: expected %d, got %d", file3InoInitial, de.NID)
+		}
 	}
 }
