@@ -63,3 +63,10 @@ The E2E suite will:
 - **YAML Manifest Errors**: Ensure that modifications to the CSI driver arguments in `tests/e2e/e2e_test.go` or `k8s/manifest.yaml` are clean, properly indented, and have correctly matched quotes.
 - **Interception Deadlocks**: If testing on kernels `< 6.5` with fanotify, do not monitor the underlying physical directory (`/var/lib/agentfs`) directly. Instead, mark the active OverlayFS virtual mount points (`targetPath`) to ensure events are captured reliably across all host kernel distributions.
 - **Inspecting Node Daemon Logs**: If a test pod hangs, read the node driver logs via `kubectl logs daemonset/agentfs-node-daemon -n default -c agentfs-node-daemon` to see if events are triggering and being allowed cleanly.
+
+---
+
+## 4. Error Handling Mandate
+
+**Never ignore errors silently.** If an error cannot be proven safe to discard or recover from, it must be returned to the caller or explicitly logged with technical context. Silently discarding errors hides corrupted state, data loss, and race conditions.
+
