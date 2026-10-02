@@ -22,13 +22,16 @@ import (
 )
 
 type CachedEntry struct {
-	Path     string
-	Data     []byte
-	Size     int64
-	ModTime  time.Time
-	LastRead time.Time
-	IsDirty  bool
-	Sha256   string
+	Path        string
+	Data        []byte
+	Size        int64
+	ModTime     time.Time
+	LastRead    time.Time
+	IsDirty     bool
+	Sha256      string
+	ChunkSize   uint32
+	Chunks      map[int][]byte
+	DirtyChunks map[int]bool
 }
 
 type NodeCache struct {
@@ -60,6 +63,117 @@ func (c *NodeCache) Get(path string) (*CachedEntry, bool) {
 	// Return shallow copy
 	copyEntry := *entry
 	return &copyEntry, true
+}
+
+func (c *NodeCache) GetRange(path string, offset, length int64) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.entries[path]
+	if !ok {
+		return nil, false
+	}
+	entry.LastRead = time.Now()
+
+	if offset >= entry.Size {
+		return []byte{}, true
+	}
+
+	end := offset + length
+	if length <= 0 || end > entry.Size {
+		end = entry.Size
+	}
+
+	if len(entry.Data) > 0 && int64(len(entry.Data)) >= end {
+		res := make([]byte, end-offset)
+		copy(res, entry.Data[offset:end])
+		return res, true
+	}
+
+	if entry.Chunks != nil && entry.ChunkSize > 0 {
+		cs := int64(entry.ChunkSize)
+		startChunk := int(offset / cs)
+		endChunk := int((end - 1) / cs)
+
+		var res []byte
+		for i := startChunk; i <= endChunk; i++ {
+			chunk, ok := entry.Chunks[i]
+			if !ok {
+				return nil, false
+			}
+			chunkStart := int64(i) * cs
+			rStart := offset - chunkStart
+			if rStart < 0 {
+				rStart = 0
+			}
+			rEnd := end - chunkStart
+			if rEnd > int64(len(chunk)) {
+				rEnd = int64(len(chunk))
+			}
+			if rStart < int64(len(chunk)) && rEnd > rStart {
+				res = append(res, chunk[rStart:rEnd]...)
+			}
+		}
+		return res, true
+	}
+
+	return nil, false
+}
+
+func (c *NodeCache) PutChunk(path string, chunkIdx int, chunkSize uint32, totalSize int64, data []byte, modTime time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.entries[path]
+	if !ok {
+		entry = &CachedEntry{
+			Path:      path,
+			Size:      totalSize,
+			ModTime:   modTime,
+			LastRead:  time.Now(),
+			ChunkSize: chunkSize,
+			Chunks:    make(map[int][]byte),
+		}
+		c.entries[path] = entry
+	}
+	if entry.Chunks == nil {
+		entry.Chunks = make(map[int][]byte)
+	}
+	if oldChunk, exists := entry.Chunks[chunkIdx]; exists {
+		c.curBytes -= int64(len(oldChunk))
+	}
+
+	dataLen := int64(len(data))
+	c.evictIfNeededLocked(dataLen)
+
+	buf := make([]byte, len(data))
+	copy(buf, data)
+	entry.Chunks[chunkIdx] = buf
+	c.curBytes += dataLen
+	if totalSize > entry.Size {
+		entry.Size = totalSize
+	}
+	entry.ChunkSize = chunkSize
+	entry.ModTime = modTime
+	entry.LastRead = time.Now()
+}
+
+func (c *NodeCache) GetChunk(path string, chunkIdx int) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.entries[path]
+	if !ok || entry.Chunks == nil {
+		return nil, false
+	}
+	chunk, ok := entry.Chunks[chunkIdx]
+	if !ok {
+		return nil, false
+	}
+	entry.LastRead = time.Now()
+	res := make([]byte, len(chunk))
+	copy(res, chunk)
+	return res, true
 }
 
 func (c *NodeCache) GetDirty(path string) (*CachedEntry, bool) {
@@ -98,6 +212,17 @@ func (c *NodeCache) MarkClean(path string) {
 	}
 }
 
+func entryBytes(e *CachedEntry) int64 {
+	if e == nil {
+		return 0
+	}
+	total := int64(len(e.Data))
+	for _, chunk := range e.Chunks {
+		total += int64(len(chunk))
+	}
+	return total
+}
+
 func (c *NodeCache) Put(path string, data []byte, modTime time.Time, sha256 string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -107,7 +232,7 @@ func (c *NodeCache) Put(path string, data []byte, modTime time.Time, sha256 stri
 		if old.IsDirty {
 			return
 		}
-		c.curBytes -= int64(len(old.Data))
+		c.curBytes -= entryBytes(old)
 		delete(c.entries, path)
 	}
 
@@ -225,7 +350,7 @@ func (c *NodeCache) evictIfNeededLocked(neededBytes int64) {
 		}
 
 		if oldestPath != "" {
-			c.curBytes -= int64(len(c.entries[oldestPath].Data))
+			c.curBytes -= entryBytes(c.entries[oldestPath])
 			delete(c.entries, oldestPath)
 		} else {
 			break
@@ -238,7 +363,7 @@ func (c *NodeCache) Invalidate(path string) {
 	defer c.mu.Unlock()
 
 	if old, ok := c.entries[path]; ok {
-		c.curBytes -= int64(len(old.Data))
+		c.curBytes -= entryBytes(old)
 		delete(c.entries, path)
 	}
 }
@@ -248,7 +373,7 @@ func (c *NodeCache) InvalidateIfNotDirty(path string) {
 	defer c.mu.Unlock()
 
 	if old, ok := c.entries[path]; ok && !old.IsDirty {
-		c.curBytes -= int64(len(old.Data))
+		c.curBytes -= entryBytes(old)
 		delete(c.entries, path)
 	}
 }

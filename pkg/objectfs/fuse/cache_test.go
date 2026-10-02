@@ -107,3 +107,39 @@ func TestNodeCacheWriteAndDirtyTracking(t *testing.T) {
 		t.Fatalf("Expected dirty truncated entry 'hello', got %q (dirty=%v)", string(entryTrunc.Data), entryTrunc.IsDirty)
 	}
 }
+
+func TestNodeCacheChunkOperations(t *testing.T) {
+	cache := NewNodeCache(1024)
+
+	chunkSize := uint32(16)
+	totalSize := int64(48)
+	c0 := []byte("0123456789abcdef")
+	c1 := []byte("ghijklmnopqrstuv")
+	c2 := []byte("wxyz0123456789AB")
+
+	cache.PutChunk("/chunked.bin", 0, chunkSize, totalSize, c0, time.Now())
+	cache.PutChunk("/chunked.bin", 1, chunkSize, totalSize, c1, time.Now())
+	cache.PutChunk("/chunked.bin", 2, chunkSize, totalSize, c2, time.Now())
+
+	// Get individual chunk
+	readC1, ok := cache.GetChunk("/chunked.bin", 1)
+	if !ok || string(readC1) != string(c1) {
+		t.Fatalf("GetChunk 1 failed: ok=%v, data=%q", ok, string(readC1))
+	}
+
+	// Get range spanning across chunk 0 and chunk 1 (offset 10, length 10)
+	// c0[10:16] = "abcdef" (6 bytes) + c1[0:4] = "ghij" (4 bytes) -> "abcdefghij"
+	rangeData, ok := cache.GetRange("/chunked.bin", 10, 10)
+	if !ok || string(rangeData) != "abcdefghij" {
+		t.Fatalf("GetRange failed: ok=%v, data=%q", ok, string(rangeData))
+	}
+
+	// Range with missing chunk should return false (cache miss)
+	cache.Invalidate("/chunked.bin")
+	cache.PutChunk("/chunked.bin", 0, chunkSize, totalSize, c0, time.Now())
+	// Chunk 1 is missing
+	_, ok = cache.GetRange("/chunked.bin", 10, 10)
+	if ok {
+		t.Fatalf("Expected cache miss for range requiring missing chunk 1")
+	}
+}
