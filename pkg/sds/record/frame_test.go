@@ -31,7 +31,8 @@ func TestValidateTypeID(t *testing.T) {
 		{name: "TxCommit (2)", typeID: 2, wantErr: nil},
 		{name: "SnapshotPointer (3)", typeID: 3, wantErr: nil},
 		{name: "Padding (4)", typeID: 4, wantErr: nil},
-		{name: "reserved 5", typeID: 5, wantErr: ErrReservedTypeID},
+		{name: "OpRecord (5)", typeID: 5, wantErr: nil},
+		{name: "reserved 6", typeID: 6, wantErr: ErrReservedTypeID},
 		{name: "reserved 10", typeID: 10, wantErr: ErrReservedTypeID},
 		{name: "reserved 15", typeID: 15, wantErr: ErrReservedTypeID},
 		{name: "app type min (16)", typeID: 16, wantErr: nil},
@@ -65,6 +66,7 @@ func TestEncodeAndSplitFrame(t *testing.T) {
 		{name: "TxCommit empty body", typeID: TypeIDTxCommit, body: []byte{}},
 		{name: "SnapshotPointer", typeID: TypeIDSnapshotPointer, body: []byte("snapshot-pointer")},
 		{name: "Padding", typeID: TypeIDPadding, body: bytes.Repeat([]byte{0x00}, 64)},
+		{name: "OpRecord (5)", typeID: TypeIDOpRecord, body: []byte("op-record-body")},
 		{name: "App type 16", typeID: 16, body: []byte("row-change-data")},
 		{name: "App type 128", typeID: 128, body: []byte("multi-byte-varint-data")},
 		{name: "App type 16384", typeID: 16384, body: []byte("large-varint-data")},
@@ -97,8 +99,8 @@ func TestFrameRejections(t *testing.T) {
 		t.Errorf("EncodeFrame(0) got error %v, want ErrInvalidTypeID", err)
 	}
 
-	// Encode reserved IDs 5..15
-	for id := uint32(5); id <= 15; id++ {
+	// Encode reserved IDs 6..15
+	for id := uint32(6); id <= 15; id++ {
 		if _, err := EncodeFrame(id, []byte("body")); !errors.Is(err, ErrReservedTypeID) {
 			t.Errorf("EncodeFrame(%d) got error %v, want ErrReservedTypeID", id, err)
 		}
@@ -115,10 +117,10 @@ func TestFrameRejections(t *testing.T) {
 		t.Errorf("SplitFrame([0]) got error %v, want ErrInvalidTypeID", err)
 	}
 
-	// SplitFrame on reserved type_id 5 wire
-	reservedFrame := []byte{0x05, 0x01, 0x02}
+	// SplitFrame on reserved type_id 6 wire
+	reservedFrame := []byte{0x06, 0x01, 0x02}
 	if _, _, err := SplitFrame(reservedFrame); !errors.Is(err, ErrReservedTypeID) {
-		t.Errorf("SplitFrame([5]) got error %v, want ErrReservedTypeID", err)
+		t.Errorf("SplitFrame([6]) got error %v, want ErrReservedTypeID", err)
 	}
 
 	// SplitFrame on malformed varint (overflowing varint)

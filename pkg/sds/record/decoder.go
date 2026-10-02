@@ -23,9 +23,10 @@ import (
 
 // Record represents a decoded record from a structured data stream.
 type Record struct {
-	TypeID  uint32
-	Message proto.Message // nil for TypeIDPadding
-	Raw     []byte        // The raw payload body bytes (excluding the varint type ID header)
+	TypeID   uint32          // Frame type ID (e.g. TypeIDTypeDefinition, TypeIDOpRecord, etc., or >= 16)
+	Message  proto.Message   // Decoded proto.Message (nil for Padding)
+	OpRecord *sdsv1.OpRecord // Present for TypeIDOpRecord
+	Raw      []byte          // The raw payload body bytes (excluding the varint type ID header)
 }
 
 // DecoderOption configures a Decoder.
@@ -61,8 +62,6 @@ func (d *Decoder) Registry() *Registry {
 
 // Decode parses a framed stream payload, updates the in-band type registry when TypeDefinition
 // frames are encountered, and returns the decoded Record.
-// Application records are instantiated using the compiled Go type from protoregistry when the
-// registered fingerprint matches the compiled descriptor, or dynamicpb otherwise.
 func (d *Decoder) Decode(payload []byte) (Record, error) {
 	typeID, body, err := SplitFrame(payload)
 	if err != nil {
@@ -97,8 +96,26 @@ func (d *Decoder) Decode(payload []byte) (Record, error) {
 	case TypeIDPadding:
 		return Record{TypeID: TypeIDPadding, Message: nil, Raw: body}, nil
 
+	case TypeIDOpRecord:
+		opRec := &sdsv1.OpRecord{}
+		if err := proto.Unmarshal(body, opRec); err != nil {
+			return Record{}, fmt.Errorf("failed to unmarshal OpRecord: %w", err)
+		}
+
+		// Ensure the referenced table type ID is registered
+		if _, _, ok := d.registry.LookupByID(opRec.GetTypeId()); !ok {
+			return Record{}, fmt.Errorf("%w: table type ID %d", ErrTypeNotRegistered, opRec.GetTypeId())
+		}
+
+		return Record{
+			TypeID:   TypeIDOpRecord,
+			Message:  opRec,
+			OpRecord: opRec,
+			Raw:      body,
+		}, nil
+
 	default:
-		// Application type (typeID >= 16)
+		// Raw application-typed record (typeID >= 16)
 		msgType, err := d.registry.ResolveMessageType(typeID)
 		if err != nil {
 			return Record{}, err

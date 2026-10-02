@@ -29,6 +29,19 @@ message TypeDefinition {
   repeated int32 key_fields = 5;
 }
 
+message OpRecord {
+  enum Op {
+    CREATE = 0;
+    UPDATE = 1;
+    DELETE = 2;
+  }
+  Op     op = 1;
+  uint32 type_id = 2;
+  uint64 tx_id = 3; // 0 = autocommit
+  bytes  key = 4;
+  bytes  value = 5;
+}
+
 message TxCommit {
   uint64 tx_id = 1;
   google.protobuf.Timestamp commit_time = 2;

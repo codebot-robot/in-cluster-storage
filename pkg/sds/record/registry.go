@@ -140,8 +140,18 @@ func (r *Registry) Register(def *sdsv1.TypeDefinition) error {
 	// Validate key fields.
 	fields := md.Fields()
 	for _, kf := range def.GetKeyFields() {
-		if f := fields.ByNumber(protoreflect.FieldNumber(kf)); f == nil {
+		f := fields.ByNumber(protoreflect.FieldNumber(kf))
+		if f == nil {
 			return fmt.Errorf("key_field %d not found in message %q", kf, def.GetName())
+		}
+		if f.IsList() {
+			return fmt.Errorf("key_field %d (%q) in message %q cannot be repeated", kf, f.Name(), def.GetName())
+		}
+		if f.IsMap() {
+			return fmt.Errorf("key_field %d (%q) in message %q cannot be a map", kf, f.Name(), def.GetName())
+		}
+		if f.Kind() == protoreflect.MessageKind || f.Kind() == protoreflect.GroupKind {
+			return fmt.Errorf("key_field %d (%q) in message %q must be a scalar, got %s", kf, f.Name(), def.GetName(), f.Kind())
 		}
 	}
 
