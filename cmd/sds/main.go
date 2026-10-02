@@ -51,7 +51,11 @@ func formatRecord(seq uint64, payload []byte, reg *record.Registry) (string, err
 		if err := proto.Unmarshal(body, def); err != nil {
 			return "", fmt.Errorf("failed to unmarshal TypeDefinition: %w", err)
 		}
-		_ = reg.Register(def)
+		if reg != nil {
+			if err := reg.Register(def); err != nil {
+				return "", fmt.Errorf("failed to register TypeDefinition: %w", err)
+			}
+		}
 		b, err := protojson.Marshal(def)
 		if err != nil {
 			return "", err
@@ -186,6 +190,11 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 			return fmt.Errorf("failed to seek segment file: %w", err)
 		}
 
+		// Segment files can come from two sources:
+		// 1. Permanent/sealed WAL segments flushed by the WAL buffer server to object storage,
+		//    which use the LogRecord format (magic "WALL", 44-byte header including global position).
+		// 2. Local client WAL segments written directly to disk by client writers before/during buffer ingestion,
+		//    which use the ClientRecord format (magic "WALC", 36-byte header with stream-level fields).
 		if magic == wal.LogMagicBytes {
 			for {
 				rec, err := wal.DecodeLogRecord(f)
