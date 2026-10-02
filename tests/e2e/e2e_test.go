@@ -419,6 +419,7 @@ metadata:
   name: %s
 spec:
   restartPolicy: Never
+  terminationGracePeriodSeconds: 1
   containers:
     - name: app
       image: alpine
@@ -440,16 +441,13 @@ spec:
 		t.Fatalf("Test Pod 1 failed to start: %v", err)
 	}
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(2 * time.Second)
 	t.Logf("Deleting Pod 1 to trigger layer 1 upload")
 	h.DeletePodWithTimeout(t, pod1Name, "default", 1*time.Minute)
 
 	// Verify snapshot has exactly 1 layer
-	snap1 := getLatestSnapshot(t, h, volumeID)
+	snap1 := waitForSnapshotLayers(t, h, volumeID, 1, 30*time.Second)
 	t.Logf("Snapshot 1: %v", snap1)
-	if len(snap1.ErofsLayers) != 1 {
-		t.Fatalf("Expected exactly 1 EROFS layer in Snapshot 1, got %d", len(snap1.ErofsLayers))
-	}
 
 	// Step 2: Create second layer with file2.txt, also read file1.txt to verify layer stacking
 	pod2Name := "layers-pod-2"
@@ -460,6 +458,7 @@ metadata:
   name: %s
 spec:
   restartPolicy: Never
+  terminationGracePeriodSeconds: 1
   containers:
     - name: app
       image: alpine
@@ -481,7 +480,7 @@ spec:
 		t.Fatalf("Test Pod 2 failed to start: %v", err)
 	}
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(2 * time.Second)
 	logs2 := h.GetPodLogsByName(pod2Name, "default")
 	if !strings.Contains(logs2, "layer1-content") {
 		t.Fatalf("Pod 2 did not successfully read stacked layer1: %s", logs2)
@@ -491,11 +490,8 @@ spec:
 	h.DeletePodWithTimeout(t, pod2Name, "default", 1*time.Minute)
 
 	// Verify snapshot now has exactly 2 layers
-	snap2 := getLatestSnapshot(t, h, volumeID)
+	snap2 := waitForSnapshotLayers(t, h, volumeID, 2, 30*time.Second)
 	t.Logf("Snapshot 2: %v", snap2)
-	if len(snap2.ErofsLayers) != 2 {
-		t.Fatalf("Expected exactly 2 EROFS layers in Snapshot 2, got %d", len(snap2.ErofsLayers))
-	}
 
 	// Step 3: Create third layer with file3.txt, which should trigger flattening/combining
 	pod3Name := "layers-pod-3"
@@ -506,6 +502,7 @@ metadata:
   name: %s
 spec:
   restartPolicy: Never
+  terminationGracePeriodSeconds: 1
   containers:
     - name: app
       image: alpine
@@ -527,7 +524,7 @@ spec:
 		t.Fatalf("Test Pod 3 failed to start: %v", err)
 	}
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(2 * time.Second)
 	logs3 := h.GetPodLogsByName(pod3Name, "default")
 	if !strings.Contains(logs3, "layer1-content") || !strings.Contains(logs3, "layer2-content") {
 		t.Fatalf("Pod 3 did not successfully read stacked layers: %s", logs3)
@@ -537,11 +534,8 @@ spec:
 	h.DeletePodWithTimeout(t, pod3Name, "default", 1*time.Minute)
 
 	// Verify snapshot is now combined back to exactly 1 layer!
-	snap3 := getLatestSnapshot(t, h, volumeID)
+	snap3 := waitForSnapshotLayers(t, h, volumeID, 1, 30*time.Second)
 	t.Logf("Snapshot 3 (Combined): %v", snap3)
-	if len(snap3.ErofsLayers) != 1 {
-		t.Fatalf("Expected EROFS layers to be combined/flattened back to exactly 1 layer, got %d", len(snap3.ErofsLayers))
-	}
 
 	// Step 4: Verify the flattened layer has all three files
 	pod4Name := "layers-pod-4"
@@ -551,6 +545,7 @@ kind: Pod
 metadata:
   name: %s
 spec:
+  terminationGracePeriodSeconds: 1
   containers:
     - name: app
       image: alpine
@@ -584,19 +579,43 @@ spec:
 	t.Logf("Successfully verified EROFS layers stacking, client-side dynamic flattening, and full correctness!")
 }
 
-func getLatestSnapshot(t *testing.T, h *Harness, volumeID string) *pb.SnapshotMetadata {
+func tryGetLatestSnapshot(h *Harness, volumeID string) (*pb.SnapshotMetadata, error) {
 	out, err := h.RunInPod("agentfs-controller-0", "default", "base64", filepath.Join("/data/snapshots", volumeID, "latest.pb"))
 	if err != nil {
-		t.Fatalf("Failed to get snapshot from controller: %v", err)
+		return nil, err
 	}
 	cleanOut := strings.Join(strings.Fields(out), "")
 	data, err := base64.StdEncoding.DecodeString(cleanOut)
 	if err != nil {
-		t.Fatalf("Failed to base64 decode snapshot output: %v\nRaw output:\n%s", err, out)
+		return nil, err
 	}
 	snapshot := &pb.SnapshotMetadata{}
 	if err := proto.Unmarshal(data, snapshot); err != nil {
-		t.Fatalf("Failed to unmarshal snapshot: %v", err)
+		return nil, err
 	}
-	return snapshot
+	return snapshot, nil
+}
+
+func waitForSnapshotLayers(t *testing.T, h *Harness, volumeID string, expectedCount int, timeout time.Duration) *pb.SnapshotMetadata {
+	t.Helper()
+	start := time.Now()
+	for {
+		snap, err := tryGetLatestSnapshot(h, volumeID)
+		if err == nil && snap != nil && len(snap.ErofsLayers) == expectedCount {
+			return snap
+		}
+		if time.Since(start) > timeout {
+			h.DumpDiagnosticLogs(t)
+			t.Fatalf("Timed out waiting for snapshot of %s to have %d layers after %v (last: %v, err: %v)", volumeID, expectedCount, timeout, snap, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func getLatestSnapshot(t *testing.T, h *Harness, volumeID string) *pb.SnapshotMetadata {
+	snap, err := tryGetLatestSnapshot(h, volumeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot from controller: %v", err)
+	}
+	return snap
 }

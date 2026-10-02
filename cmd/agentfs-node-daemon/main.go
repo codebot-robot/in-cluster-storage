@@ -304,9 +304,15 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		return nil, fmt.Errorf("failed to create work path %s: %v", workPath, err)
 	}
 
+	// Persist logical volume ID to volume directory so it survives daemon restarts
+	volumeIDFile := filepath.Join(volumeDir, "volume_id")
+	if err := os.WriteFile(volumeIDFile, []byte(logicalVolumeID), 0644); err != nil {
+		klog.Warningf("failed to write volume_id file at %s: %v", volumeIDFile, err)
+	}
+
 	// Pull snapshot from controller to lower directory
 	if err := d.pullSnapshot(ctx, logicalVolumeID, lowerPath); err != nil {
-		klog.Errorf("failed to pull snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
+		return nil, fmt.Errorf("failed to pull snapshot for volume %s (logical: %s): %w", k8sVolumeID, logicalVolumeID, err)
 	}
 
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
@@ -434,8 +440,13 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 	logicalVolumeID := k8sVolumeID
 	if v, ok := d.volumeMappings.Load(k8sVolumeID); ok {
 		logicalVolumeID = v.(string)
+	} else {
+		// Try reading from persisted volume_id file on disk in case daemon restarted
+		volumeDir := filepath.Join(*storagePath, k8sVolumeID)
+		if data, err := os.ReadFile(filepath.Join(volumeDir, "volume_id")); err == nil && len(data) > 0 {
+			logicalVolumeID = strings.TrimSpace(string(data))
+		}
 	}
-	d.volumeMappings.Delete(k8sVolumeID)
 
 	targetPath := req.GetTargetPath()
 	klog.Infof("Unpublishing volume %s (logical: %s) from %s", k8sVolumeID, logicalVolumeID, targetPath)
@@ -460,17 +471,25 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 
 	// Try to unmount the target path. Ignore if not a mount point.
 	if err := syscall.Unmount(targetPath, 0); err != nil {
-		if err != syscall.EINVAL {
+		if err == syscall.EBUSY {
+			klog.Warningf("Target path %s busy, attempting lazy unmount (MNT_DETACH)", targetPath)
+			if detachErr := syscall.Unmount(targetPath, syscall.MNT_DETACH); detachErr != nil && detachErr != syscall.EINVAL {
+				return nil, fmt.Errorf("failed to lazy unmount target path %s: %v", targetPath, detachErr)
+			}
+		} else if err != syscall.EINVAL {
 			return nil, fmt.Errorf("failed to unmount target path %s: %v", targetPath, err)
+		} else {
+			klog.Infof("Volume %s not mounted at %s (or already unmounted)", k8sVolumeID, targetPath)
 		}
-		klog.Infof("Volume %s not mounted at %s (or already unmounted)", k8sVolumeID, targetPath)
 	}
 
 	// Try to unmount the lower path if we are in EROFS mode
 	if d.enableEROFS {
 		lowerPath := filepath.Join(*storagePath, k8sVolumeID, "lower")
 		if err := syscall.Unmount(lowerPath, 0); err != nil {
-			if err != syscall.EINVAL {
+			if err == syscall.EBUSY {
+				_ = syscall.Unmount(lowerPath, syscall.MNT_DETACH)
+			} else if err != syscall.EINVAL {
 				return nil, fmt.Errorf("failed to unmount lower EROFS mount %s: %v", lowerPath, err)
 			}
 		}
@@ -481,7 +500,11 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 		layerDirs, _ := filepath.Glob(filepath.Join(volumeDir, "layer-*"))
 		for _, ld := range layerDirs {
 			if err := syscall.Unmount(ld, 0); err != nil {
-				klog.Warningf("failed to unmount EROFS layer mount %s: %v", ld, err)
+				if err == syscall.EBUSY {
+					_ = syscall.Unmount(ld, syscall.MNT_DETACH)
+				} else if err != syscall.EINVAL {
+					klog.Warningf("failed to unmount EROFS layer mount %s: %v", ld, err)
+				}
 			}
 		}
 	}
@@ -495,6 +518,9 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 	} else {
 		d.cleanupVolumeDir(volumeDir)
 	}
+
+	// Only delete the volume mapping after unpublish and cleanup have succeeded
+	d.volumeMappings.Delete(k8sVolumeID)
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
@@ -721,53 +747,21 @@ func (d *agentFSDriver) pushErofsLayersSnapshot(ctx context.Context, volumeID, v
 
 	client := pb.NewAgentFSControllerClient(conn)
 
-	// Load the volume snapshot information from the local snapshot.pb file on disk
+	// Load the volume snapshot information from the local snapshot.pb file on disk if available
 	snapshotPBPath := filepath.Join(volumeDir, "snapshot.pb")
-	data, err := os.ReadFile(snapshotPBPath)
-	if err != nil {
-		return fmt.Errorf("failed to read local snapshot metadata from %s: %w", snapshotPBPath, err)
-	}
 	var localSnapshot pb.SnapshotMetadata
-	if err := proto.Unmarshal(data, &localSnapshot); err != nil {
-		return fmt.Errorf("failed to unmarshal local snapshot metadata from %s: %w", snapshotPBPath, err)
+	if data, err := os.ReadFile(snapshotPBPath); err == nil {
+		if err := proto.Unmarshal(data, &localSnapshot); err != nil {
+			klog.Warningf("failed to unmarshal local snapshot metadata from %s: %v", snapshotPBPath, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read local snapshot metadata from %s: %w", snapshotPBPath, err)
 	}
 
 	var existingLayers []string
 	existingLayers = localSnapshot.ErofsLayers
 	if len(existingLayers) == 0 && localSnapshot.ErofsSha256 != "" {
 		existingLayers = []string{localSnapshot.ErofsSha256}
-	}
-
-	// Fetch the latest snapshot from the controller to check for optimistic concurrency / state conflict
-	resp, err := client.GetLatestSnapshot(ctx, &pb.GetLatestSnapshotRequest{VolumeId: volumeID})
-	if err != nil {
-		return fmt.Errorf("failed to check latest snapshot from controller: %v", err)
-	}
-
-	if resp != nil && resp.Snapshot != nil {
-		var serverLayers []string
-		serverLayers = resp.Snapshot.ErofsLayers
-		if len(serverLayers) == 0 && resp.Snapshot.ErofsSha256 != "" {
-			serverLayers = []string{resp.Snapshot.ErofsSha256}
-		}
-
-		// Detect optimistic concurrency conflict: if local EROFS layers list does not match
-		// the server's latest EROFS layers list, then another client has updated the snapshot.
-		conflict := false
-		if len(serverLayers) != len(existingLayers) {
-			conflict = true
-		} else {
-			for idx, layer := range existingLayers {
-				if serverLayers[idx] != layer {
-					conflict = true
-					break
-				}
-			}
-		}
-
-		if conflict {
-			return fmt.Errorf("optimistic concurrency conflict: local EROFS layers list %v does not match the controller's latest EROFS layers list %v", existingLayers, serverLayers)
-		}
 	}
 
 	upperPath := filepath.Join(volumeDir, "upper")
@@ -830,6 +824,40 @@ func (d *agentFSDriver) pushErofsLayersSnapshot(ctx context.Context, volumeID, v
 		return fmt.Errorf("failed to calculate EROFS image SHA256: %v", err)
 	}
 
+	var newLayers []string
+	if shouldCombine {
+		newLayers = []string{sha}
+	} else {
+		newLayers = append(existingLayers, sha)
+	}
+
+	// Fetch latest snapshot from the controller to check for optimistic concurrency / idempotency
+	resp, err := client.GetLatestSnapshot(ctx, &pb.GetLatestSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		return fmt.Errorf("failed to check latest snapshot from controller: %v", err)
+	}
+
+	if resp != nil && resp.Snapshot != nil {
+		var serverLayers []string
+		serverLayers = resp.Snapshot.ErofsLayers
+		if len(serverLayers) == 0 && resp.Snapshot.ErofsSha256 != "" {
+			serverLayers = []string{resp.Snapshot.ErofsSha256}
+		}
+
+		// If the server snapshot already has the exact target layers (e.g. from a prior unpublish attempt that succeeded before unmount error),
+		// treat this as an idempotent success.
+		if slices.Equal(serverLayers, newLayers) {
+			klog.Infof("Controller snapshot for volume %s already contains target layers %v; skipping upload", volumeID, newLayers)
+			return nil
+		}
+
+		// Detect optimistic concurrency conflict: if local EROFS layers list does not match
+		// the server's latest EROFS layers list, then another client has updated the snapshot.
+		if !slices.Equal(serverLayers, existingLayers) {
+			return fmt.Errorf("optimistic concurrency conflict: local EROFS layers list %v does not match the controller's latest EROFS layers list %v", existingLayers, serverLayers)
+		}
+	}
+
 	// Check if controller already has the blob
 	hasResp, err := client.HasBlob(ctx, &pb.HasBlobRequest{Sha256: sha})
 	if err != nil {
@@ -841,13 +869,6 @@ func (d *agentFSDriver) pushErofsLayersSnapshot(ctx context.Context, volumeID, v
 		if err := d.uploadBlob(ctx, client, sha, tempImgPath); err != nil {
 			return fmt.Errorf("failed to upload EROFS layer blob %s: %v", sha, err)
 		}
-	}
-
-	var newLayers []string
-	if shouldCombine {
-		newLayers = []string{sha}
-	} else {
-		newLayers = append(existingLayers, sha)
 	}
 
 	klog.Infof("Uploading updated snapshot with EROFS layers: %v", newLayers)
@@ -862,6 +883,11 @@ func (d *agentFSDriver) pushErofsLayersSnapshot(ctx context.Context, volumeID, v
 	})
 	if err != nil {
 		return fmt.Errorf("failed to upload EROFS layers snapshot: %v", err)
+	}
+
+	// Update local snapshot.pb on disk so retries are aware of the uploaded snapshot state
+	if snapshotData, err := proto.Marshal(snapshot); err == nil {
+		_ = os.WriteFile(snapshotPBPath, snapshotData, 0644)
 	}
 
 	return nil

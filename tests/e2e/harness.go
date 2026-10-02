@@ -15,6 +15,8 @@
 package e2e
 
 import (
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,11 +33,85 @@ func NewHarness(t *testing.T, clusterName string) *Harness {
 	}
 }
 
+func (h *Harness) getPodNames(selector, namespace string) []string {
+	args := []string{"get", "pods", "-n", namespace}
+	if selector != "" {
+		args = append(args, "-l", selector)
+	}
+	args = append(args, "-o", "jsonpath={.items[*].metadata.name}")
+	out, err := exec.Command("kubectl", args...).Output()
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(string(out))
+}
+
+func (h *Harness) getContainerLogs(pod, container, namespace string, previous bool) string {
+	args := []string{"logs", pod, "-n", namespace}
+	if container != "" {
+		args = append(args, "-c", container)
+	}
+	if previous {
+		args = append(args, "--previous")
+	}
+	out, err := exec.Command("kubectl", args...).CombinedOutput()
+	if err != nil {
+		return strings.TrimSpace(string(out))
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 	t.Log("======= DUMPING DIAGNOSTIC LOGS =======")
+
+	// Pod overview
+	if out, err := exec.Command("kubectl", "get", "pods", "-n", "default", "-o", "wide").CombinedOutput(); err == nil {
+		t.Logf("Pods in default namespace:\n%s\n", strings.TrimSpace(string(out)))
+	}
+
+	// Events
 	t.Logf("Events:\n%s\n", h.GetEvents("default"))
-	t.Logf("AgentFS Controller Logs:\n%s\n", h.GetPodLogsByName("agentfs-controller-0", "default"))
-	t.Logf("AgentFS Node Daemon Logs:\n%s\n", h.GetPodLogs("app=agentfs-node-daemon", "default"))
+
+	// Controller Logs (current & previous)
+	if logs := h.getContainerLogs("agentfs-controller-0", "agentfs-controller", "default", false); logs != "" {
+		t.Logf("AgentFS Controller Logs:\n%s\n", logs)
+	}
+	if prevLogs := h.getContainerLogs("agentfs-controller-0", "agentfs-controller", "default", true); prevLogs != "" {
+		t.Logf("AgentFS Controller Previous Logs:\n%s\n", prevLogs)
+	}
+
+	// Node Daemon Logs (current & previous, both agentfs-node-daemon & node-driver-registrar containers)
+	daemonPods := h.getPodNames("app=agentfs-node-daemon", "default")
+	if len(daemonPods) == 0 {
+		daemonPods = h.getPodNames("", "default")
+	}
+	for _, pod := range daemonPods {
+		if strings.Contains(pod, "node-daemon") || strings.Contains(pod, "agentfs") {
+			if logs := h.getContainerLogs(pod, "agentfs-node-daemon", "default", false); logs != "" {
+				t.Logf("AgentFS Node Daemon (%s / agentfs-node-daemon) Logs:\n%s\n", pod, logs)
+			}
+			if prev := h.getContainerLogs(pod, "agentfs-node-daemon", "default", true); prev != "" {
+				t.Logf("AgentFS Node Daemon (%s / agentfs-node-daemon) Previous Logs:\n%s\n", pod, prev)
+			}
+			if regLogs := h.getContainerLogs(pod, "node-driver-registrar", "default", false); regLogs != "" {
+				t.Logf("AgentFS Node Daemon (%s / node-driver-registrar) Logs:\n%s\n", pod, regLogs)
+			}
+		}
+	}
+
+	// Any test pods: describe & logs
+	allPods := h.getPodNames("", "default")
+	for _, pod := range allPods {
+		if strings.HasPrefix(pod, "layers-pod-") || strings.HasPrefix(pod, "test-pod-") {
+			if desc, err := exec.Command("kubectl", "describe", "pod", pod, "-n", "default").CombinedOutput(); err == nil {
+				t.Logf("Pod %s Description:\n%s\n", pod, strings.TrimSpace(string(desc)))
+			}
+			if logs := h.getContainerLogs(pod, "", "default", false); logs != "" {
+				t.Logf("Pod %s Logs:\n%s\n", pod, logs)
+			}
+		}
+	}
+
 	t.Log("=========================================")
 }
 
