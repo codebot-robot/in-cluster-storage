@@ -54,19 +54,33 @@ func (m *memoryAppender) Payloads() [][]byte {
 }
 
 func field(name string, number int32, typeKind descriptorpb.FieldDescriptorProto_Type, label descriptorpb.FieldDescriptorProto_Label) *descriptorpb.FieldDescriptorProto {
-	return &descriptorpb.FieldDescriptorProto{
+	f := &descriptorpb.FieldDescriptorProto{
 		Name:   proto.String(name),
 		Number: proto.Int32(number),
 		Type:   typeKind.Enum(),
 		Label:  label.Enum(),
 	}
+	if label == descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL {
+		f.Proto3Optional = proto.Bool(true)
+	}
+	return f
 }
 
 func buildDynamicMessageDescriptor(t *testing.T, name string, fields []*descriptorpb.FieldDescriptorProto, extraFiles ...*descriptorpb.FileDescriptorProto) protoreflect.MessageDescriptor {
 	t.Helper()
+	var oneofs []*descriptorpb.OneofDescriptorProto
+	for _, f := range fields {
+		if f.GetProto3Optional() {
+			f.OneofIndex = proto.Int32(int32(len(oneofs)))
+			oneofs = append(oneofs, &descriptorpb.OneofDescriptorProto{
+				Name: proto.String("_" + f.GetName()),
+			})
+		}
+	}
 	msgProto := &descriptorpb.DescriptorProto{
-		Name:  proto.String(name),
-		Field: fields,
+		Name:      proto.String(name),
+		Field:     fields,
+		OneofDecl: oneofs,
 	}
 
 	mainFile := &descriptorpb.FileDescriptorProto{

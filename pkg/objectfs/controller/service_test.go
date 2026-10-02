@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"net"
 	"path"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -32,8 +34,11 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -2498,4 +2503,258 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 			t.Fatalf("Snap 2 file3.txt NID mismatch: expected %d, got %d", file3InoInitial, de.NID)
 		}
 	}
+}
+
+func TestSDSStepReplayScratch(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "sds-replay-vol"
+
+	server := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+
+	// 1. Create hierarchy of directories and files
+	_, err := server.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, Path: "/docs", Mode: 0755})
+	if err != nil {
+		t.Fatalf("Mkdir /docs failed: %v", err)
+	}
+	_, err = server.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, Path: "/docs/sub", Mode: 0755})
+	if err != nil {
+		t.Fatalf("Mkdir /docs/sub failed: %v", err)
+	}
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/hello.txt",
+		Mode:           0644,
+		InitialContent: []byte("initial hello"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile /hello.txt failed: %v", err)
+	}
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/docs/doc1.txt",
+		Mode:           0644,
+		InitialContent: []byte("doc1 content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile /docs/doc1.txt failed: %v", err)
+	}
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/docs/sub/doc2.txt",
+		Mode:           0644,
+		InitialContent: []byte("doc2 content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile /docs/sub/doc2.txt failed: %v", err)
+	}
+
+	// 2. Write, Truncate, Rename, Unlink
+	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Path:     "/hello.txt",
+		Offset:   8,
+		Data:     []byte("world!"),
+	})
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	_, err = server.TruncateFile(ctx, &pb.TruncateFileRequest{
+		VolumeId: volumeID,
+		Path:     "/docs/doc1.txt",
+		Size:     4,
+	})
+	if err != nil {
+		t.Fatalf("TruncateFile failed: %v", err)
+	}
+	_, err = server.Rename(ctx, &pb.RenameRequest{
+		VolumeId: volumeID,
+		OldPath:  "/docs/sub/doc2.txt",
+		NewPath:  "/docs/doc2_renamed.txt",
+	})
+	if err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+	_, err = server.Unlink(ctx, &pb.UnlinkRequest{
+		VolumeId: volumeID,
+		Path:     "/docs/doc1.txt",
+	})
+	if err != nil {
+		t.Fatalf("Unlink failed: %v", err)
+	}
+	_, err = server.Rmdir(ctx, &pb.RmdirRequest{
+		VolumeId: volumeID,
+		Path:     "/docs/sub",
+	})
+	if err != nil {
+		t.Fatalf("Rmdir failed: %v", err)
+	}
+
+	liveVol := server.GetVolume(volumeID)
+	if liveVol == nil || liveVol.Stream() == nil {
+		t.Fatalf("Expected live volume with active stream")
+	}
+
+	// Read all states from live volume
+	liveHelloAttr, err := liveVol.GetAttr(ctx, "/hello.txt")
+	if err != nil {
+		t.Fatalf("live GetAttr /hello.txt failed: %v", err)
+	}
+	liveHelloData, _, _, err := liveVol.ReadFile(ctx, "/hello.txt", 0, 100)
+	if err != nil {
+		t.Fatalf("live ReadFile /hello.txt failed: %v", err)
+	}
+
+	liveRenamedAttr, err := liveVol.GetAttr(ctx, "/docs/doc2_renamed.txt")
+	if err != nil {
+		t.Fatalf("live GetAttr /docs/doc2_renamed.txt failed: %v", err)
+	}
+	liveRenamedData, _, _, err := liveVol.ReadFile(ctx, "/docs/doc2_renamed.txt", 0, 100)
+	if err != nil {
+		t.Fatalf("live ReadFile /docs/doc2_renamed.txt failed: %v", err)
+	}
+
+	// 3. Create fresh volume and replay SDS stream from scratch
+	streamID := StreamIDForVolume(volumeID)
+	replayedVol := NewVolume(volumeID, backend, NewEventBroadcaster())
+	legStream, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("Failed to open WAL stream for replay: %v", err)
+	}
+	defer func() { _ = legStream.Close() }()
+
+	recovered := legStream.RecoveredRecords()
+	sr := sds.NewStreamReader("", streamID, sds.WithRecoveredRecords(recovered))
+	changes, err := sr.FeedRecovered(0)
+	if err != nil {
+		t.Fatalf("FeedRecovered failed: %v", err)
+	}
+
+	for _, c := range changes {
+		if err := replayedVol.ApplySDSChangeLocked(ctx, c); err != nil {
+			t.Fatalf("ApplySDSChangeLocked failed: %v", err)
+		}
+	}
+
+	// 4. Verify replayed volume matches live volume
+	repHelloAttr, err := replayedVol.GetAttr(ctx, "/hello.txt")
+	if err != nil {
+		t.Fatalf("replayed GetAttr /hello.txt failed: %v", err)
+	}
+	if repHelloAttr.Inode != liveHelloAttr.Inode || repHelloAttr.Size != liveHelloAttr.Size {
+		t.Fatalf("Replayed /hello.txt attr mismatch: %+v vs %+v", repHelloAttr, liveHelloAttr)
+	}
+	repHelloData, _, _, err := replayedVol.ReadFile(ctx, "/hello.txt", 0, 100)
+	if err != nil || string(repHelloData) != string(liveHelloData) {
+		t.Fatalf("Replayed /hello.txt data mismatch: %q vs %q", string(repHelloData), string(liveHelloData))
+	}
+
+	repRenamedAttr, err := replayedVol.GetAttr(ctx, "/docs/doc2_renamed.txt")
+	if err != nil {
+		t.Fatalf("replayed GetAttr /docs/doc2_renamed.txt failed: %v", err)
+	}
+	if repRenamedAttr.Inode != liveRenamedAttr.Inode || repRenamedAttr.Size != liveRenamedAttr.Size {
+		t.Fatalf("Replayed doc2_renamed attr mismatch: %+v vs %+v", repRenamedAttr, liveRenamedAttr)
+	}
+	repRenamedData, _, _, err := replayedVol.ReadFile(ctx, "/docs/doc2_renamed.txt", 0, 100)
+	if err != nil || string(repRenamedData) != string(liveRenamedData) {
+		t.Fatalf("Replayed doc2_renamed data mismatch: %q vs %q", string(repRenamedData), string(liveRenamedData))
+	}
+
+	// Verify unlinked file and rmdir'd dir do not exist
+	_, err = replayedVol.GetAttr(ctx, "/docs/doc1.txt")
+	if err == nil {
+		t.Fatalf("Expected /docs/doc1.txt to not exist in replayed volume")
+	}
+	_, err = replayedVol.GetAttr(ctx, "/docs/sub")
+	if err == nil {
+		t.Fatalf("Expected /docs/sub to not exist in replayed volume")
+	}
+
+	_ = server.Close()
+}
+
+func TestSDSCatOnObjectFSStream(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "sds-cat-vol"
+
+	server := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+
+	// Perform changes that register Inode, DirEntry, Content
+	_, err := server.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, Path: "/cats", Mode: 0755})
+	if err != nil {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/cats/fluffy.txt",
+		Mode:           0644,
+		InitialContent: []byte("meow meow"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	vol := server.GetVolume(volumeID)
+	if vol == nil || vol.Stream() == nil {
+		t.Fatalf("Expected active volume stream")
+	}
+
+	// Find the segment file
+	files, err := filepath.Glob(filepath.Join(walDir, fmt.Sprintf("stream-%s-*.wal", vol.StreamID())))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("No WAL segment file found in %s: %v", walDir, err)
+	}
+
+	// Read segment file with Decoder
+	clientRecs, _, err := wal.ScanClientSegmentFile(files[0])
+	if err != nil {
+		t.Fatalf("Failed to scan segment file: %v", err)
+	}
+
+	reg := record.NewRegistry()
+	dec := record.NewDecoder(record.WithDecoderRegistry(reg))
+
+	var seenTypeDefs []string
+	var seenOps int
+	var seenCommits int
+
+	for _, clientRec := range clientRecs {
+		item, err := dec.Decode(clientRec.Payload)
+		if err != nil {
+			t.Fatalf("Decode error: %v", err)
+		}
+		if item.TypeID == record.TypeIDTypeDefinition {
+			if def, ok := item.Message.(*sdsv1.TypeDefinition); ok {
+				seenTypeDefs = append(seenTypeDefs, def.GetName())
+			}
+		}
+		if item.TypeID == record.TypeIDOpRecord {
+			seenOps++
+		}
+		if item.TypeID == record.TypeIDTxCommit {
+			seenCommits++
+		}
+	}
+
+	// Verify that TypeDefinitions for Inode, DirEntry, Content were announced in-band
+	hasInodeDef := slices.Contains(seenTypeDefs, "objectfs.v1alpha1.Inode")
+	hasDirDef := slices.Contains(seenTypeDefs, "objectfs.v1alpha1.DirEntry")
+	hasContentDef := slices.Contains(seenTypeDefs, "objectfs.v1alpha1.Content")
+
+	if !hasInodeDef || !hasDirDef || !hasContentDef {
+		t.Fatalf("Expected Inode, DirEntry, and Content TypeDefinitions announced in stream, got %v", seenTypeDefs)
+	}
+
+	if seenOps < 3 {
+		t.Fatalf("Expected at least 3 OpRecords in stream, got %d", seenOps)
+	}
+	if seenCommits < 2 {
+		t.Fatalf("Expected at least 2 TxCommits in stream, got %d", seenCommits)
+	}
+
+	_ = server.Close()
 }

@@ -21,7 +21,6 @@ import (
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
-	"google.golang.org/protobuf/proto"
 )
 
 // ChangeReader decodes stream payloads in order, groups multi-record transactions,
@@ -151,12 +150,9 @@ func (r *ChangeReader) Feed(seq uint64, payload []byte) ([]Change, error) {
 
 		key := NewKeyFromBytes(opRec.GetKey())
 
-		var rowMsg proto.Message
-		if opRec.GetOp() != sdsv1.OpRecord_DELETE {
-			rowMsg = msgType.New().Interface()
-			if err := MergeKeyAndNonKey(rowMsg, opRec.GetKey(), opRec.GetValue()); err != nil {
-				return nil, fmt.Errorf("failed to merge row msg: %w", err)
-			}
+		rowMsg := msgType.New().Interface()
+		if err := MergeKeyAndNonKey(rowMsg, opRec.GetKey(), opRec.GetValue()); err != nil {
+			return nil, fmt.Errorf("failed to merge row msg: %w", err)
 		}
 
 		change := Change{

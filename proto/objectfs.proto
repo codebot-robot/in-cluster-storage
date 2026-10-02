@@ -317,4 +317,31 @@ message MutationRecord {
   string content_sha256 = 16;
 }
 
+message Inode {
+  optional uint64 ino = 1;
+  uint32 mode = 2;
+  int64 size = 3;
+  google.protobuf.Timestamp mtime = 4;
+  bool is_dir = 5;
+  string sha256 = 6;
+  string etag = 7;
+  string manifest_sha256 = 8;
+  string content_sha256 = 9;
+  uint32 chunk_size = 10;
+}
+
+message DirEntry {
+  optional uint64 parent_ino = 1;
+  optional string name = 2;
+  uint64 ino = 3;
+  bool is_dir = 4;
+  uint32 mode = 5;
+}
+
+message Content {
+  optional string sha256 = 1;
+  bytes data = 2;
+}
+
+
 

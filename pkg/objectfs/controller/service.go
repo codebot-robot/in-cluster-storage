@@ -143,7 +143,7 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	return s
 }
 
-func (s *Server) getOrCreateVolume(volumeID string) *Volume {
+func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -152,23 +152,27 @@ func (s *Server) getOrCreateVolume(volumeID string) *Volume {
 		var volOpts []VolumeOption
 		if s.streamFactory != nil {
 			stream, err := s.streamFactory(volumeID)
-			if err == nil && stream != nil {
-				volOpts = append(volOpts, WithStream(stream))
+			if err != nil {
+				return nil, fmt.Errorf("failed to create stream for volume %s: %w", volumeID, err)
 			}
+			volOpts = append(volOpts, WithStream(stream))
 		} else if s.walDir != "" {
 			streamID := StreamIDForVolume(volumeID)
 			stream, err := walclient.Open(context.Background(), s.walDir, streamID, s.walTarget)
-			if err == nil {
-				volOpts = append(volOpts, WithStream(stream))
+			if err != nil {
+				return nil, fmt.Errorf("failed to open stream for volume %s: %w", volumeID, err)
 			}
+			volOpts = append(volOpts, WithStream(stream))
 		}
 		volOpts = append(volOpts, WithDurability(s.defaultDurability))
 
 		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
-		_ = vol.LoadFromBackend(context.Background())
+		if err := vol.LoadFromBackend(context.Background()); err != nil {
+			return nil, fmt.Errorf("failed to load volume %s from backend: %w", volumeID, err)
+		}
 		s.volumes[volumeID] = vol
 	}
-	return vol
+	return vol, nil
 }
 
 // Close stops periodic flushing and closes all active volumes and streams.
@@ -248,14 +252,18 @@ func (s *Server) StopPeriodicFlush() {
 	s.flushWg.Wait()
 }
 
-// GetVolume returns the Volume instance for the given volumeID.
+// GetVolume returns the Volume instance for the given volumeID, or nil if creation fails.
 func (s *Server) GetVolume(volumeID string) *Volume {
-	return s.getOrCreateVolume(volumeID)
+	vol, _ := s.getOrCreateVolume(volumeID)
+	return vol
 }
 
 // RestoreSnapshot restores the volume filesystem state to a specific EROFS snapshot.
 func (s *Server) RestoreSnapshot(ctx context.Context, volumeID, snapshotName string) error {
-	vol := s.getOrCreateVolume(volumeID)
+	vol, err := s.getOrCreateVolume(volumeID)
+	if err != nil {
+		return err
+	}
 	return vol.RestoreSnapshot(ctx, snapshotName)
 }
 
@@ -263,7 +271,10 @@ func (s *Server) GetAttr(ctx context.Context, req *pb.GetAttrRequest) (*pb.GetAt
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	attr, err := vol.GetAttr(ctx, req.GetPath())
 	if err != nil {
 		return &pb.GetAttrResponse{Error: volErrToSyscall(err)}, nil
@@ -275,7 +286,10 @@ func (s *Server) Lookup(ctx context.Context, req *pb.LookupRequest) (*pb.LookupR
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	attr, err := vol.Lookup(ctx, req.GetParentPath(), req.GetName())
 	if err != nil {
 		return &pb.LookupResponse{Error: volErrToSyscall(err)}, nil
@@ -287,7 +301,10 @@ func (s *Server) ReadDir(ctx context.Context, req *pb.ReadDirRequest) (*pb.ReadD
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	entries, err := vol.ReadDir(ctx, req.GetPath())
 	if err != nil {
 		return &pb.ReadDirResponse{Error: volErrToSyscall(err)}, nil
@@ -299,7 +316,10 @@ func (s *Server) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MkdirResp
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	attr, err := vol.Mkdir(ctx, req.GetPath(), req.GetMode(), req.GetUid(), req.GetGid())
 	if err != nil {
 		return &pb.MkdirResponse{Error: volErrToSyscall(err)}, nil
@@ -311,7 +331,10 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	attr, err := vol.CreateFile(ctx, req.GetPath(), req.GetMode(), req.GetInitialContent(), req.GetUid(), req.GetGid())
 	if err != nil {
 		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
@@ -323,7 +346,10 @@ func (s *Server) ReadFile(ctx context.Context, req *pb.ReadFileRequest) (*pb.Rea
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	data, totalSize, redirectURL, err := vol.ReadFile(ctx, req.GetPath(), req.GetOffset(), req.GetSize())
 	if err != nil {
 		return &pb.ReadFileResponse{Error: volErrToSyscall(err)}, nil
@@ -342,7 +368,10 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	bytesWritten, newSize, modTime, err := vol.WriteFile(ctx, req.GetPath(), req.GetOffset(), req.GetData(), req.GetWriteMode())
 	if err != nil {
 		return &pb.WriteFileResponse{Error: volErrToSyscall(err)}, nil
@@ -358,7 +387,10 @@ func (s *Server) TruncateFile(ctx context.Context, req *pb.TruncateFileRequest) 
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	attr, err := vol.TruncateFile(ctx, req.GetPath(), req.GetSize())
 	if err != nil {
 		return &pb.TruncateFileResponse{Error: volErrToSyscall(err)}, nil
@@ -370,7 +402,10 @@ func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkR
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	if err := vol.Unlink(ctx, req.GetPath()); err != nil {
 		return &pb.UnlinkResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
@@ -381,7 +416,10 @@ func (s *Server) Rmdir(ctx context.Context, req *pb.RmdirRequest) (*pb.RmdirResp
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	if err := vol.Rmdir(ctx, req.GetPath()); err != nil {
 		return &pb.RmdirResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
@@ -392,7 +430,10 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	attr, err := vol.Rename(ctx, req.GetOldPath(), req.GetNewPath())
 	if err != nil {
 		return &pb.RenameResponse{Error: volErrToSyscall(err)}, nil
@@ -404,7 +445,10 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	if err := vol.Fsync(ctx, req.GetPath()); err != nil {
 		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
@@ -589,7 +633,10 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	allSnapshots, err := vol.ListSnapshots(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list snapshots: %v", err)
@@ -648,7 +695,10 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	vol := s.getOrCreateVolume(req.GetVolumeId())
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	snapName, err := vol.CreateSnapshot(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create snapshot: %v", err)
