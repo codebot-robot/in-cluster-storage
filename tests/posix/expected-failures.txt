@@ -37,7 +37,6 @@ ftruncate/00.t
 ftruncate/02.t
 ftruncate/05.t
 ftruncate/07.t
-ftruncate/12.t
 link/00.t
 link/01.t
 link/02.t
@@ -113,7 +112,6 @@ symlink/08.t
 truncate/02.t
 truncate/05.t
 truncate/07.t
-truncate/12.t
 unlink/00.t
 unlink/02.t
 unlink/05.t

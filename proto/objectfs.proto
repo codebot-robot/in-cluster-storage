@@ -353,3 +353,11 @@ message Content {
   optional string sha256 = 1;
   bytes data = 2;
 }
+
+message FileChunk {
+  optional uint64 ino = 1;
+  optional uint32 index = 2;
+  string sha256 = 3;
+  bytes inline_data = 4;
+}
+

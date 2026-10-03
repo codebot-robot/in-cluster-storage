@@ -19,6 +19,7 @@ package fuse
 import (
 	"context"
 	"fmt"
+	"sort"
 	"syscall"
 	"time"
 
@@ -485,39 +486,73 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 	}
 
 	data := resp.GetData()
-	if offset == 0 && resp.GetTotalSize() <= int64(len(data)) {
+	if offset == 0 && resp.GetEof() && len(data) > 0 {
 		fs.cache.Put(input.NodeId, data, time.Now(), "")
+	} else if len(data) > 0 {
+		chunkSize := DefaultChunkSize
+		chunkIdx := int(offset / int64(chunkSize))
+		fs.cache.PutChunk(input.NodeId, chunkIdx, chunkSize, resp.GetTotalSize(), data, time.Now())
 	}
 
 	return fuse.ReadResultData(data), fuse.OK
 }
 
 func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
+	// If partial chunk write at offset > 0 and chunk not in cache, load existing chunk content into cache first
+	cs := int64(DefaultChunkSize)
+	startChunk := int64(input.Offset) / cs
+	if int64(input.Offset)%cs != 0 {
+		if _, ok := fs.cache.GetChunk(input.NodeId, int(startChunk)); !ok {
+			ctx, cancelFunc := makeContext(cancel)
+			resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
+				VolumeId: fs.volumeID,
+				Inode:    input.NodeId,
+				Offset:   startChunk * cs,
+				Size:     cs,
+			})
+			cancelFunc()
+			if err == nil && resp.GetError() == 0 && len(resp.GetData()) > 0 {
+				fs.cache.PutChunk(input.NodeId, int(startChunk), DefaultChunkSize, resp.GetTotalSize(), resp.GetData(), time.Now())
+			}
+		}
+	}
+
+	// Buffer write locally and mark dirty per chunk
 	fs.cache.WriteAt(input.NodeId, int64(input.Offset), data, time.Now())
 	return uint32(len(data)), fuse.OK
 }
 
 func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
-	entry, isDirty := fs.cache.GetDirty(inode)
-	if !isDirty {
+	dirtyChunks, chunkSize, _, isDirty := fs.cache.GetDirtyChunks(inode)
+	if !isDirty || len(dirtyChunks) == 0 {
 		return nil
 	}
 
-	resp, err := fs.client.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  fs.volumeID,
-		Inode:     inode,
-		Offset:    0,
-		Data:      entry.Data,
-		WriteMode: fs.writeMode,
-	})
-	if err != nil {
-		return err
+	indices := make([]int, 0, len(dirtyChunks))
+	for idx := range dirtyChunks {
+		indices = append(indices, idx)
 	}
-	if resp.GetError() != 0 {
-		return syscall.Errno(resp.GetError())
+	sort.Ints(indices)
+
+	for _, idx := range indices {
+		chunkData := dirtyChunks[idx]
+		chunkOffset := int64(idx) * int64(chunkSize)
+		resp, err := fs.client.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId:  fs.volumeID,
+			Inode:     inode,
+			Offset:    chunkOffset,
+			Data:      chunkData,
+			WriteMode: fs.writeMode,
+		})
+		if err != nil {
+			return err
+		}
+		if resp.GetError() != 0 {
+			return syscall.Errno(resp.GetError())
+		}
+		fs.cache.MarkChunkClean(inode, idx)
 	}
 
-	fs.cache.MarkClean(inode)
 	return nil
 }
 
@@ -553,10 +588,7 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 }
 
 func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
-	ctx, cancelFunc := makeContext(cancel)
-	defer cancelFunc()
-
-	_ = fs.syncFileToService(ctx, input.NodeId)
+	// Release only cleans up file handles; data synchronization is performed in Flush.
 }
 
 func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {

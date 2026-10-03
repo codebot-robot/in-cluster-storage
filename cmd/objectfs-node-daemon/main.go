@@ -274,6 +274,25 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 	d.mu.Unlock()
 
 	if ok && mountInfo != nil {
+		client, err := d.getClient()
+		if err != nil {
+			klog.Warningf("Failed to get ObjectFS client to fsync volume %s: %v", mountInfo.volumeID, err)
+			return nil, fmt.Errorf("failed to get ObjectFS client to fsync volume: %w", err)
+		}
+		if client != nil {
+			resp, err := client.Fsync(ctx, &pb.FsyncRequest{
+				VolumeId: mountInfo.volumeID,
+				Inode:    1,
+			})
+			if err != nil {
+				klog.Warningf("Failed to fsync ObjectFS volume %s during unpublish: %v", mountInfo.volumeID, err)
+				return nil, fmt.Errorf("failed to fsync ObjectFS volume %s: %w", mountInfo.volumeID, err)
+			}
+			if resp.GetError() != 0 {
+				klog.Warningf("Fsync ObjectFS volume %s returned error code %d during unpublish", mountInfo.volumeID, resp.GetError())
+				return nil, fmt.Errorf("fsync ObjectFS volume %s returned error: %d", mountInfo.volumeID, resp.GetError())
+			}
+		}
 		mountInfo.cancelFunc()
 		if err := mountInfo.server.Unmount(); err != nil {
 			klog.Warningf("FUSE server unmount returned error: %v, attempting system unmount", err)
