@@ -18,6 +18,7 @@ package fuse
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"syscall"
 	"testing"
@@ -311,7 +312,7 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 	}
 
 	// Verify local cache has it and marks it dirty
-	entry, isDirty := cache.GetDirty("/buffered.txt")
+	entry, isDirty := cache.GetDirty(fileID)
 	if !isDirty || string(entry.Data) != string(localData) {
 		t.Fatalf("Expected dirty cache entry with local data")
 	}
@@ -320,7 +321,7 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 	ctx := t.Context()
 	ctrlResp, err := client.ReadFile(ctx, &pb.ReadFileRequest{
 		VolumeId: "vol-buffering",
-		Path:     "/buffered.txt",
+		Inode:    fileID,
 		Offset:   0,
 		Size:     1024,
 	})
@@ -339,7 +340,7 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 	// Controller should now have the synced data
 	ctrlResp2, err := client.ReadFile(ctx, &pb.ReadFileRequest{
 		VolumeId: "vol-buffering",
-		Path:     "/buffered.txt",
+		Inode:    fileID,
 		Offset:   0,
 		Size:     1024,
 	})
@@ -351,7 +352,7 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 	}
 
 	// Cache entry should no longer be dirty
-	if _, isDirty := cache.GetDirty("/buffered.txt"); isDirty {
+	if _, isDirty := cache.GetDirty(fileID); isDirty {
 		t.Fatalf("Expected cache entry to be marked clean after flush")
 	}
 }
@@ -613,5 +614,225 @@ func TestFUSEStableInodesAcrossSnapshots(t *testing.T) {
 	}
 	if nestedAttrAfterSnap2.Attr.Ino != nestedID {
 		t.Fatalf("nested st_ino changed after snap 2: expected %d, got %d", nestedID, nestedAttrAfterSnap2.Attr.Ino)
+	}
+}
+
+func TestRenameDescendantOpenHandleAndDirtyFlush(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-rename-bug"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Create directory 'a'
+	var mkdirOut fuse.EntryOut
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "a", &mkdirOut); status != fuse.OK {
+		t.Fatalf("Mkdir a failed: %v", status)
+	}
+	dirAID := mkdirOut.NodeId
+
+	// 2. Open / Create 'a/x'
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: dirAID}, Mode: 0644}, "x", &createOut); status != fuse.OK {
+		t.Fatalf("Create a/x failed: %v", status)
+	}
+	fileXID := createOut.EntryOut.NodeId
+
+	// 3. Write initial content through open descriptor (fileXID) without flushing yet (dirty buffer in cache)
+	initData := []byte("initial ")
+	written, status := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileXID}, Offset: 0}, initData)
+	if status != fuse.OK || int(written) != len(initData) {
+		t.Fatalf("Write to a/x failed: %v", status)
+	}
+
+	// 4. Rename 'a' -> 'b' while file descriptor on 'x' is open and dirty
+	renameIn := &fuse.RenameIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Newdir:   fuse.FUSE_ROOT_ID,
+	}
+	if status := rawFS.Rename(nil, renameIn, "a", "b"); status != fuse.OK {
+		t.Fatalf("Rename a -> b failed: %v", status)
+	}
+
+	// 5. Write more content through the open descriptor on 'x' (fileXID) after parent rename
+	appendData := []byte("appended data")
+	written, status = rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileXID}, Offset: uint64(len(initData))}, appendData)
+	if status != fuse.OK || int(written) != len(appendData) {
+		t.Fatalf("Write through open handle after rename failed: %v", status)
+	}
+
+	// 6. Flush / close the open descriptor
+	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileXID}}); status != fuse.OK {
+		t.Fatalf("Flush on open handle after rename failed: %v", status)
+	}
+
+	// 7. fstat (GetAttr) on the open handle (fileXID)
+	var statOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileXID}}, &statOut); status != fuse.OK {
+		t.Fatalf("fstat on open handle failed: %v", status)
+	}
+	expectedTotalSize := uint64(len(initData) + len(appendData))
+	if statOut.Attr.Size != expectedTotalSize {
+		t.Fatalf("Expected size %d, got %d", expectedTotalSize, statOut.Attr.Size)
+	}
+
+	// 8. Read through open descriptor (fileXID)
+	readBuf := make([]byte, 100)
+	readRes, status := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileXID}, Size: 100, Offset: 0}, readBuf)
+	if status != fuse.OK {
+		t.Fatalf("Read through open handle failed: %v", status)
+	}
+	readBytes, readStatus := readRes.Bytes(readBuf)
+	if readStatus != fuse.OK {
+		t.Fatalf("Read result status failed: %v", readStatus)
+	}
+	if string(readBytes) != "initial appended data" {
+		t.Fatalf("Expected 'initial appended data', got %q", string(readBytes))
+	}
+
+	// 9. Lookup 'b/x' under new parent 'b'
+	var lookupB fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "b", &lookupB); status != fuse.OK {
+		t.Fatalf("Lookup b failed: %v", status)
+	}
+	dirBID := lookupB.NodeId
+	if dirBID != dirAID {
+		t.Fatalf("Expected directory b to have same inode as a (%d), got %d", dirAID, dirBID)
+	}
+
+	var lookupX fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: dirBID}, "x", &lookupX); status != fuse.OK {
+		t.Fatalf("Lookup b/x failed: %v", status)
+	}
+	if lookupX.NodeId != fileXID {
+		t.Fatalf("Expected b/x to have inode %d, got %d", fileXID, lookupX.NodeId)
+	}
+}
+
+func TestDotAndDotDotLookup(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-dot-dot"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Root '.' and '..' lookup
+	var rootDotOut, rootDotDotOut fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, ".", &rootDotOut); status != fuse.OK {
+		t.Fatalf("Lookup '.' on root failed: %v", status)
+	}
+	if rootDotOut.NodeId != fuse.FUSE_ROOT_ID {
+		t.Fatalf("Expected root '.' to have NodeId %d, got %d", fuse.FUSE_ROOT_ID, rootDotOut.NodeId)
+	}
+
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "..", &rootDotDotOut); status != fuse.OK {
+		t.Fatalf("Lookup '..' on root failed: %v", status)
+	}
+	if rootDotDotOut.NodeId != fuse.FUSE_ROOT_ID {
+		t.Fatalf("Expected root '..' to have NodeId %d, got %d", fuse.FUSE_ROOT_ID, rootDotDotOut.NodeId)
+	}
+
+	// 2. Mkdir dir1
+	var dir1Out fuse.EntryOut
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "dir1", &dir1Out); status != fuse.OK {
+		t.Fatalf("Mkdir dir1 failed: %v", status)
+	}
+	dir1ID := dir1Out.NodeId
+
+	// Lookup '.' and '..' on dir1
+	var d1Dot, d1DotDot fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: dir1ID}, ".", &d1Dot); status != fuse.OK {
+		t.Fatalf("Lookup '.' on dir1 failed: %v", status)
+	}
+	if d1Dot.NodeId != dir1ID {
+		t.Fatalf("Expected dir1 '.' to have NodeId %d, got %d", dir1ID, d1Dot.NodeId)
+	}
+
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: dir1ID}, "..", &d1DotDot); status != fuse.OK {
+		t.Fatalf("Lookup '..' on dir1 failed: %v", status)
+	}
+	if d1DotDot.NodeId != fuse.FUSE_ROOT_ID {
+		t.Fatalf("Expected dir1 '..' to have root NodeId %d, got %d", fuse.FUSE_ROOT_ID, d1DotDot.NodeId)
+	}
+
+	// 3. Mkdir dir2 inside dir1
+	var dir2Out fuse.EntryOut
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: dir1ID}, Mode: 0755}, "dir2", &dir2Out); status != fuse.OK {
+		t.Fatalf("Mkdir dir2 failed: %v", status)
+	}
+	dir2ID := dir2Out.NodeId
+
+	var d2DotDot fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: dir2ID}, "..", &d2DotDot); status != fuse.OK {
+		t.Fatalf("Lookup '..' on dir2 failed: %v", status)
+	}
+	if d2DotDot.NodeId != dir1ID {
+		t.Fatalf("Expected dir2 '..' to have dir1 NodeId %d, got %d", dir1ID, d2DotDot.NodeId)
+	}
+
+	// 4. Move dir2 from dir1 to root
+	renameIn := &fuse.RenameIn{
+		InHeader: fuse.InHeader{NodeId: dir1ID},
+		Newdir:   fuse.FUSE_ROOT_ID,
+	}
+	if status := rawFS.Rename(nil, renameIn, "dir2", "dir2_moved"); status != fuse.OK {
+		t.Fatalf("Rename dir2 failed: %v", status)
+	}
+
+	// Verify '..' on dir2 now points to root
+	var d2MovedDotDot fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: dir2ID}, "..", &d2MovedDotDot); status != fuse.OK {
+		t.Fatalf("Lookup '..' on dir2 after move failed: %v", status)
+	}
+	if d2MovedDotDot.NodeId != fuse.FUSE_ROOT_ID {
+		t.Fatalf("Expected moved dir2 '..' to have root NodeId %d, got %d", fuse.FUSE_ROOT_ID, d2MovedDotDot.NodeId)
+	}
+}
+
+func TestDeepPathLookupEfficiency(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-deep-path"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Create 50 nested directories
+	parentID := uint64(fuse.FUSE_ROOT_ID)
+	for i := 0; i < 50; i++ {
+		var dOut fuse.EntryOut
+		name := fmt.Sprintf("d%d", i)
+		if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parentID}, Mode: 0755}, name, &dOut); status != fuse.OK {
+			t.Fatalf("Mkdir level %d failed: %v", i, status)
+		}
+		parentID = dOut.NodeId
+	}
+
+	// Create a leaf file inside the 50th directory
+	var leafOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: parentID}, Mode: 0644}, "leaf.txt", &leafOut); status != fuse.OK {
+		t.Fatalf("Create leaf file failed: %v", status)
+	}
+	leafID := leafOut.EntryOut.NodeId
+
+	// Operating on the leaf file uses its inode number directly without traversing 50 levels
+	data := []byte("hello deep leaf")
+	written, status := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: leafID}, Offset: 0}, data)
+	if status != fuse.OK || int(written) != len(data) {
+		t.Fatalf("Write to leaf failed: %v", status)
+	}
+
+	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: leafID}}); status != fuse.OK {
+		t.Fatalf("Flush leaf failed: %v", status)
+	}
+
+	var statOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: leafID}}, &statOut); status != fuse.OK {
+		t.Fatalf("GetAttr on leaf failed: %v", status)
+	}
+	if statOut.Attr.Size != uint64(len(data)) {
+		t.Fatalf("Expected leaf size %d, got %d", len(data), statOut.Attr.Size)
 	}
 }

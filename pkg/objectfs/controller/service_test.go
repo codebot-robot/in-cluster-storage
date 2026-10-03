@@ -45,6 +45,159 @@ import (
 	"google.golang.org/grpc"
 )
 
+func resolvePath(ctx context.Context, server *Server, volumeID, p string) (uint64, error) {
+	vol, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		return 0, err
+	}
+	return vol.ResolvePath(ctx, p)
+}
+
+func testGetAttr(ctx context.Context, server *Server, volumeID, p string) (*pb.GetAttrResponse, error) {
+	ino, err := resolvePath(ctx, server, volumeID, p)
+	if err != nil {
+		return &pb.GetAttrResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Inode: ino})
+}
+
+func testReadFile(ctx context.Context, server *Server, volumeID, p string, offset, size int64) (*pb.ReadFileResponse, error) {
+	ino, err := resolvePath(ctx, server, volumeID, p)
+	if err != nil {
+		return &pb.ReadFileResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino, Offset: offset, Size: size})
+}
+
+func testWriteFile(ctx context.Context, server *Server, volumeID, p string, offset int64, data []byte, mode pb.WriteMode) (*pb.WriteFileResponse, error) {
+	ino, err := resolvePath(ctx, server, volumeID, p)
+	if err != nil {
+		return &pb.WriteFileResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return server.WriteFile(ctx, &pb.WriteFileRequest{VolumeId: volumeID, Inode: ino, Offset: offset, Data: data, WriteMode: mode})
+}
+
+func testTruncateFile(ctx context.Context, server *Server, volumeID, p string, size int64) (*pb.TruncateFileResponse, error) {
+	ino, err := resolvePath(ctx, server, volumeID, p)
+	if err != nil {
+		return &pb.TruncateFileResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return server.TruncateFile(ctx, &pb.TruncateFileRequest{VolumeId: volumeID, Inode: ino, Size: size})
+}
+
+func testReadDir(ctx context.Context, server *Server, volumeID, p string) (*pb.ReadDirResponse, error) {
+	ino, err := resolvePath(ctx, server, volumeID, p)
+	if err != nil {
+		return &pb.ReadDirResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return server.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: ino})
+}
+
+func testMkdir(ctx context.Context, server *Server, volumeID, p string, mode uint32, uid, gid uint32) (*pb.MkdirResponse, error) {
+	p = cleanPath(p)
+	parentPath := path.Dir(p)
+	name := path.Base(p)
+	parentIno, err := resolvePath(ctx, server, volumeID, parentPath)
+	if err != nil {
+		return &pb.MkdirResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return server.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, ParentInode: parentIno, Name: name, Mode: mode, Uid: uid, Gid: gid})
+}
+
+func testCreateFile(ctx context.Context, server *Server, volumeID, p string, mode uint32, initialContent []byte, uid, gid uint32) (*pb.CreateFileResponse, error) {
+	p = cleanPath(p)
+	parentPath := path.Dir(p)
+	name := path.Base(p)
+	parentIno, err := resolvePath(ctx, server, volumeID, parentPath)
+	if err != nil {
+		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return server.CreateFile(ctx, &pb.CreateFileRequest{VolumeId: volumeID, ParentInode: parentIno, Name: name, Mode: mode, InitialContent: initialContent, Uid: uid, Gid: gid})
+}
+
+func testUnlink(ctx context.Context, server *Server, volumeID, p string) (*pb.UnlinkResponse, error) {
+	p = cleanPath(p)
+	parentPath := path.Dir(p)
+	name := path.Base(p)
+	parentIno, err := resolvePath(ctx, server, volumeID, parentPath)
+	if err != nil {
+		return &pb.UnlinkResponse{Success: false, Error: volErrToSyscall(err)}, nil
+	}
+	return server.Unlink(ctx, &pb.UnlinkRequest{VolumeId: volumeID, ParentInode: parentIno, Name: name})
+}
+
+func testRmdir(ctx context.Context, server *Server, volumeID, p string) (*pb.RmdirResponse, error) {
+	p = cleanPath(p)
+	parentPath := path.Dir(p)
+	name := path.Base(p)
+	parentIno, err := resolvePath(ctx, server, volumeID, parentPath)
+	if err != nil {
+		return &pb.RmdirResponse{Success: false, Error: volErrToSyscall(err)}, nil
+	}
+	return server.Rmdir(ctx, &pb.RmdirRequest{VolumeId: volumeID, ParentInode: parentIno, Name: name})
+}
+
+func testRename(ctx context.Context, server *Server, volumeID, oldP, newP string) (*pb.RenameResponse, error) {
+	oldP = cleanPath(oldP)
+	newP = cleanPath(newP)
+	oldParentIno, err := resolvePath(ctx, server, volumeID, path.Dir(oldP))
+	if err != nil {
+		return &pb.RenameResponse{Error: volErrToSyscall(err)}, nil
+	}
+	newParentIno, err := resolvePath(ctx, server, volumeID, path.Dir(newP))
+	if err != nil {
+		return &pb.RenameResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return server.Rename(ctx, &pb.RenameRequest{
+		VolumeId:       volumeID,
+		OldParentInode: oldParentIno,
+		OldName:        path.Base(oldP),
+		NewParentInode: newParentIno,
+		NewName:        path.Base(newP),
+	})
+}
+
+func volGetAttr(ctx context.Context, vol *Volume, p string) (*pb.EntryAttr, error) {
+	ino, err := vol.ResolvePath(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	return vol.GetAttr(ctx, ino)
+}
+
+func volReadFile(ctx context.Context, vol *Volume, p string, offset, length int64) ([]byte, int64, string, error) {
+	ino, err := vol.ResolvePath(ctx, p)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	return vol.ReadFile(ctx, ino, offset, length)
+}
+
+func volWriteFile(ctx context.Context, vol *Volume, p string, offset int64, data []byte, mode pb.WriteMode) (int64, int64, time.Time, error) {
+	ino, err := vol.ResolvePath(ctx, p)
+	if err != nil {
+		return 0, 0, time.Time{}, err
+	}
+	return vol.WriteFile(ctx, ino, offset, data, mode)
+}
+
+func volTruncateFile(ctx context.Context, vol *Volume, p string, size int64) (*pb.EntryAttr, error) {
+	ino, err := vol.ResolvePath(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	return vol.TruncateFile(ctx, ino, size)
+}
+
+func volCreateFile(ctx context.Context, vol *Volume, p string, mode uint32, initialContent []byte, uid, gid uint32) (*pb.EntryAttr, error) {
+	p = cleanPath(p)
+	parentIno, err := vol.ResolvePath(ctx, path.Dir(p))
+	if err != nil {
+		return nil, err
+	}
+	return vol.CreateFile(ctx, parentIno, path.Base(p), mode, initialContent, uid, gid)
+}
+
 func TestControllerServiceOperations(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
@@ -54,7 +207,7 @@ func TestControllerServiceOperations(t *testing.T) {
 	// 1. Root attribute
 	rootAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
 		VolumeId: volumeID,
-		Path:     "/",
+		Inode:    1,
 	})
 	if err != nil {
 		t.Fatalf("Failed to get root attr: %v", err)
@@ -65,11 +218,12 @@ func TestControllerServiceOperations(t *testing.T) {
 
 	// 2. Mkdir
 	mkdirResp, err := server.Mkdir(ctx, &pb.MkdirRequest{
-		VolumeId: volumeID,
-		Path:     "/subdir",
-		Mode:     0755,
-		Uid:      1001,
-		Gid:      1002,
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "subdir",
+		Mode:        0755,
+		Uid:         1001,
+		Gid:         1002,
 	})
 	if err != nil {
 		t.Fatalf("Failed to mkdir /subdir: %v", err)
@@ -80,11 +234,13 @@ func TestControllerServiceOperations(t *testing.T) {
 	if mkdirResp.Attr.Uid != 1001 || mkdirResp.Attr.Gid != 1002 {
 		t.Fatalf("Unexpected mkdir owner: uid=%d, gid=%d", mkdirResp.Attr.Uid, mkdirResp.Attr.Gid)
 	}
+	subdirIno := mkdirResp.Attr.Inode
 
 	// 3. Create file
 	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       volumeID,
-		Path:           "/subdir/hello.txt",
+		ParentInode:    subdirIno,
+		Name:           "hello.txt",
 		Mode:           0644,
 		InitialContent: []byte("initial content"),
 		Uid:            5001,
@@ -99,18 +255,19 @@ func TestControllerServiceOperations(t *testing.T) {
 	if createResp.Attr.Uid != 5001 || createResp.Attr.Gid != 5002 {
 		t.Fatalf("Unexpected file owner: uid=%d, gid=%d", createResp.Attr.Uid, createResp.Attr.Gid)
 	}
+	fileIno := createResp.Attr.Inode
 
 	// 4. Lookup
 	lookupResp, err := server.Lookup(ctx, &pb.LookupRequest{
-		VolumeId:   volumeID,
-		ParentPath: "/subdir",
-		Name:       "hello.txt",
+		VolumeId:    volumeID,
+		ParentInode: subdirIno,
+		Name:        "hello.txt",
 	})
 	if err != nil {
 		t.Fatalf("Failed to lookup: %v", err)
 	}
-	if lookupResp.Attr.Path != "/subdir/hello.txt" {
-		t.Fatalf("Unexpected path in lookup: %s", lookupResp.Attr.Path)
+	if lookupResp.Attr.Name != "hello.txt" || lookupResp.Attr.Inode != fileIno {
+		t.Fatalf("Unexpected attr in lookup: %v", lookupResp.Attr)
 	}
 	if lookupResp.Attr.Uid != 5001 || lookupResp.Attr.Gid != 5002 {
 		t.Fatalf("Unexpected owner in lookup: uid=%d, gid=%d", lookupResp.Attr.Uid, lookupResp.Attr.Gid)
@@ -119,7 +276,7 @@ func TestControllerServiceOperations(t *testing.T) {
 	// 5. Read file
 	readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
 		VolumeId: volumeID,
-		Path:     "/subdir/hello.txt",
+		Inode:    fileIno,
 		Offset:   0,
 		Size:     1024,
 	})
@@ -133,7 +290,7 @@ func TestControllerServiceOperations(t *testing.T) {
 	// 6. Write file
 	writeResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
 		VolumeId:  volumeID,
-		Path:      "/subdir/hello.txt",
+		Inode:     fileIno,
 		Offset:    int64(len("initial ")),
 		Data:      []byte("objectfs!"),
 		WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
@@ -148,7 +305,7 @@ func TestControllerServiceOperations(t *testing.T) {
 	// Read back modified
 	readResp2, err := server.ReadFile(ctx, &pb.ReadFileRequest{
 		VolumeId: volumeID,
-		Path:     "/subdir/hello.txt",
+		Inode:    fileIno,
 		Offset:   0,
 		Size:     1024,
 	})
@@ -162,7 +319,7 @@ func TestControllerServiceOperations(t *testing.T) {
 	// 7. ReadDir
 	readdirResp, err := server.ReadDir(ctx, &pb.ReadDirRequest{
 		VolumeId: volumeID,
-		Path:     "/subdir",
+		Inode:    subdirIno,
 	})
 	if err != nil {
 		t.Fatalf("Failed to readdir: %v", err)
@@ -173,9 +330,11 @@ func TestControllerServiceOperations(t *testing.T) {
 
 	// 8. Rename
 	renameResp, err := server.Rename(ctx, &pb.RenameRequest{
-		VolumeId: volumeID,
-		OldPath:  "/subdir/hello.txt",
-		NewPath:  "/subdir/renamed.txt",
+		VolumeId:       volumeID,
+		OldParentInode: subdirIno,
+		OldName:        "hello.txt",
+		NewParentInode: subdirIno,
+		NewName:        "renamed.txt",
 	})
 	if err != nil {
 		t.Fatalf("Failed to rename: %v", err)
@@ -184,22 +343,23 @@ func TestControllerServiceOperations(t *testing.T) {
 		t.Fatalf("Unexpected rename attr: %v", renameResp.Attr)
 	}
 
-	// Verify old path not found
-	oldResp, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-		VolumeId: volumeID,
-		Path:     "/subdir/hello.txt",
+	// Verify old name not found in lookup
+	oldResp, err := server.Lookup(ctx, &pb.LookupRequest{
+		VolumeId:    volumeID,
+		ParentInode: subdirIno,
+		Name:        "hello.txt",
 	})
 	if err != nil {
-		t.Fatalf("GetAttr failed: %v", err)
+		t.Fatalf("Lookup failed: %v", err)
 	}
 	if oldResp.GetError() != int32(syscall.ENOENT) {
-		t.Fatalf("Expected old path to not exist after rename, got error %d", oldResp.GetError())
+		t.Fatalf("Expected old name to not exist after rename, got error %d", oldResp.GetError())
 	}
 
 	// 9. Truncate
 	truncResp, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{
 		VolumeId: volumeID,
-		Path:     "/subdir/renamed.txt",
+		Inode:    fileIno,
 		Size:     7,
 	})
 	if err != nil {
@@ -211,28 +371,31 @@ func TestControllerServiceOperations(t *testing.T) {
 
 	// 10. Unlink & Rmdir
 	_, err = server.Unlink(ctx, &pb.UnlinkRequest{
-		VolumeId: volumeID,
-		Path:     "/subdir/renamed.txt",
+		VolumeId:    volumeID,
+		ParentInode: subdirIno,
+		Name:        "renamed.txt",
 	})
 	if err != nil {
 		t.Fatalf("Failed to unlink: %v", err)
 	}
 
 	_, err = server.Rmdir(ctx, &pb.RmdirRequest{
-		VolumeId: volumeID,
-		Path:     "/subdir",
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "subdir",
 	})
 	if err != nil {
 		t.Fatalf("Failed to rmdir: %v", err)
 	}
 
 	// Verify subdir gone
-	goneResp, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-		VolumeId: volumeID,
-		Path:     "/subdir",
+	goneResp, err := server.Lookup(ctx, &pb.LookupRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "subdir",
 	})
 	if err != nil {
-		t.Fatalf("GetAttr failed: %v", err)
+		t.Fatalf("Lookup failed: %v", err)
 	}
 	if goneResp.GetError() != int32(syscall.ENOENT) {
 		t.Fatalf("Expected subdir to not exist after rmdir, got error %d", goneResp.GetError())
@@ -246,29 +409,18 @@ func TestServerRmdirAndUnlinkErrorCodes(t *testing.T) {
 	volumeID := "test-error-codes-vol"
 
 	// Create /parent/child.txt
-	mkdirResp, err := server.Mkdir(ctx, &pb.MkdirRequest{
-		VolumeId: volumeID,
-		Path:     "/parent",
-		Mode:     0755,
-	})
+	mkdirResp, err := testMkdir(ctx, server, volumeID, "/parent", 0755, 0, 0)
 	if err != nil || mkdirResp.GetError() != 0 {
 		t.Fatalf("Mkdir failed: err=%v, resp=%v", err, mkdirResp)
 	}
 
-	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId: volumeID,
-		Path:     "/parent/child.txt",
-		Mode:     0644,
-	})
+	createResp, err := testCreateFile(ctx, server, volumeID, "/parent/child.txt", 0644, nil, 0, 0)
 	if err != nil || createResp.GetError() != 0 {
 		t.Fatalf("CreateFile failed: err=%v, resp=%v", err, createResp)
 	}
 
 	// 1. Rmdir non-empty directory -> returns non-error gRPC response with error = ENOTEMPTY
-	rmdirResp, err := server.Rmdir(ctx, &pb.RmdirRequest{
-		VolumeId: volumeID,
-		Path:     "/parent",
-	})
+	rmdirResp, err := testRmdir(ctx, server, volumeID, "/parent")
 	if err != nil {
 		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
 	}
@@ -280,10 +432,7 @@ func TestServerRmdirAndUnlinkErrorCodes(t *testing.T) {
 	}
 
 	// 2. Unlink directory -> returns non-error gRPC response with error = EISDIR
-	unlinkResp, err := server.Unlink(ctx, &pb.UnlinkRequest{
-		VolumeId: volumeID,
-		Path:     "/parent",
-	})
+	unlinkResp, err := testUnlink(ctx, server, volumeID, "/parent")
 	if err != nil {
 		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
 	}
@@ -295,10 +444,7 @@ func TestServerRmdirAndUnlinkErrorCodes(t *testing.T) {
 	}
 
 	// 3. Rmdir regular file -> returns non-error gRPC response with error = ENOTDIR
-	rmdirFileResp, err := server.Rmdir(ctx, &pb.RmdirRequest{
-		VolumeId: volumeID,
-		Path:     "/parent/child.txt",
-	})
+	rmdirFileResp, err := testRmdir(ctx, server, volumeID, "/parent/child.txt")
 	if err != nil {
 		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
 	}
@@ -307,10 +453,7 @@ func TestServerRmdirAndUnlinkErrorCodes(t *testing.T) {
 	}
 
 	// 4. Rmdir nonexistent -> returns non-error gRPC response with error = ENOENT
-	rmdirNoneResp, err := server.Rmdir(ctx, &pb.RmdirRequest{
-		VolumeId: volumeID,
-		Path:     "/nonexistent",
-	})
+	rmdirNoneResp, err := testRmdir(ctx, server, volumeID, "/nonexistent")
 	if err != nil {
 		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
 	}
@@ -319,11 +462,7 @@ func TestServerRmdirAndUnlinkErrorCodes(t *testing.T) {
 	}
 
 	// 5. Mkdir already exists -> returns non-error gRPC response with error = EEXIST
-	mkdirExistResp, err := server.Mkdir(ctx, &pb.MkdirRequest{
-		VolumeId: volumeID,
-		Path:     "/parent",
-		Mode:     0755,
-	})
+	mkdirExistResp, err := testMkdir(ctx, server, volumeID, "/parent", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Expected non-error gRPC response, got err: %v", err)
 	}
@@ -339,22 +478,12 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 	volumeID := "test-flush-vol"
 
 	// Create files
-	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/file1.txt",
-		Mode:           0644,
-		InitialContent: []byte("file 1 initial data"),
-	})
+	_, err := testCreateFile(ctx, server, volumeID, "/file1.txt", 0644, []byte("file 1 initial data"), 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create file1: %v", err)
 	}
 
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/file2.txt",
-		Mode:           0644,
-		InitialContent: []byte("file 2 initial data"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/file2.txt", 0644, []byte("file 2 initial data"), 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create file2: %v", err)
 	}
@@ -397,21 +526,13 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 	}
 
 	// Incremental write: modify only file2
-	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId: volumeID,
-		Path:     "/file2.txt",
-		Offset:   0,
-		Data:     []byte("file 2 updated content!"),
-	})
+	_, err = testWriteFile(ctx, server, volumeID, "/file2.txt", 0, []byte("file 2 updated content!"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("Failed to update file2: %v", err)
 	}
 
 	// Unlink file1
-	_, err = server.Unlink(ctx, &pb.UnlinkRequest{
-		VolumeId: volumeID,
-		Path:     "/file1.txt",
-	})
+	_, err = testUnlink(ctx, server, volumeID, "/file1.txt")
 	if err != nil {
 		t.Fatalf("Failed to unlink file1: %v", err)
 	}
@@ -437,12 +558,7 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 	// Test Recovery / LoadFromBackend
 	// Create a new server pointing to the same backend
 	newServer := NewServer(backend)
-	readResp, err := newServer.ReadFile(ctx, &pb.ReadFileRequest{
-		VolumeId: volumeID,
-		Path:     "/file2.txt",
-		Offset:   0,
-		Size:     100,
-	})
+	readResp, err := testReadFile(ctx, newServer, volumeID, "/file2.txt", 0, 100)
 	if err != nil {
 		t.Fatalf("Failed to read file2 from recovered server: %v", err)
 	}
@@ -459,12 +575,7 @@ func TestPeriodicFlusherLifecycle(t *testing.T) {
 
 	server.StartPeriodicFlush(ctx, 10*time.Millisecond)
 
-	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/auto-flushed.txt",
-		Mode:           0644,
-		InitialContent: []byte("auto flushed data"),
-	})
+	_, err := testCreateFile(ctx, server, volumeID, "/auto-flushed.txt", 0644, []byte("auto flushed data"), 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create file: %v", err)
 	}
@@ -492,19 +603,14 @@ func TestControllerPushNotifications(t *testing.T) {
 	defer server.broadcaster.Unsubscribe(volumeID, ch)
 
 	// Trigger create
-	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/event-test.txt",
-		Mode:           0644,
-		InitialContent: []byte("event data"),
-	})
+	_, err := testCreateFile(ctx, server, volumeID, "/event-test.txt", 0644, []byte("event data"), 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create file: %v", err)
 	}
 
 	select {
 	case ev := <-ch:
-		if ev.EventType != pb.WatchEventType_EVENT_CREATED || ev.Path != "/event-test.txt" {
+		if ev.EventType != pb.WatchEventType_EVENT_CREATED || ev.GetInode() == 0 {
 			t.Fatalf("Unexpected event received: %v", ev)
 		}
 	case <-time.After(1 * time.Second):
@@ -512,19 +618,14 @@ func TestControllerPushNotifications(t *testing.T) {
 	}
 
 	// Trigger modify
-	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId: volumeID,
-		Path:     "/event-test.txt",
-		Offset:   0,
-		Data:     []byte("more data"),
-	})
+	_, err = testWriteFile(ctx, server, volumeID, "/event-test.txt", 0, []byte("more data"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("Failed to write file: %v", err)
 	}
 
 	select {
 	case ev := <-ch:
-		if ev.EventType != pb.WatchEventType_EVENT_MODIFIED || ev.Path != "/event-test.txt" {
+		if ev.EventType != pb.WatchEventType_EVENT_MODIFIED || ev.GetInode() == 0 {
 			t.Fatalf("Unexpected modify event: %v", ev)
 		}
 	case <-time.After(1 * time.Second):
@@ -543,14 +644,16 @@ func TestEventBroadcasterSlowSubscriber(t *testing.T) {
 	for i := 0; i < 128; i++ {
 		eb.Broadcast(volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
-			Path:      "/file.txt",
+			Inode:     uint64(i + 1),
+			Name:      "file.txt",
 		})
 	}
 
 	// Next broadcast should detect full channel and unsubscribe/close it asynchronously
 	eb.Broadcast(volumeID, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_MODIFIED,
-		Path:      "/overflow.txt",
+		Inode:     999,
+		Name:      "overflow.txt",
 	})
 
 	// Drain items from ch until closed
@@ -575,30 +678,17 @@ func TestErofsSnapshotCreationAndRecovery(t *testing.T) {
 	volumeID := "test-erofs-snap-vol"
 
 	// Create a nested directory hierarchy and files
-	_, err := server.Mkdir(ctx, &pb.MkdirRequest{
-		VolumeId: volumeID,
-		Path:     "/data",
-	})
+	_, err := testMkdir(ctx, server, volumeID, "/data", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Mkdir /data failed: %v", err)
 	}
 
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/data/file1.txt",
-		Mode:           0644,
-		InitialContent: []byte("file 1 content for snapshot"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/data/file1.txt", 0644, []byte("file 1 content for snapshot"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/root-file.txt",
-		Mode:           0644,
-		InitialContent: []byte("root file content"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/root-file.txt", 0644, []byte("root file content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -646,10 +736,7 @@ func TestErofsSnapshotCreationAndRecovery(t *testing.T) {
 	newServer := NewServer(backend)
 
 	// Verify directory structure on recovered server
-	dirResp, err := newServer.ReadDir(ctx, &pb.ReadDirRequest{
-		VolumeId: volumeID,
-		Path:     "/data",
-	})
+	dirResp, err := testReadDir(ctx, newServer, volumeID, "/data")
 	if err != nil {
 		t.Fatalf("Recovered server ReadDir /data failed: %v", err)
 	}
@@ -658,12 +745,7 @@ func TestErofsSnapshotCreationAndRecovery(t *testing.T) {
 	}
 
 	// Read content from recovered server (verifying lazy blob download)
-	readResp, err := newServer.ReadFile(ctx, &pb.ReadFileRequest{
-		VolumeId: volumeID,
-		Path:     "/data/file1.txt",
-		Offset:   0,
-		Size:     1024,
-	})
+	readResp, err := testReadFile(ctx, newServer, volumeID, "/data/file1.txt", 0, 1024)
 	if err != nil {
 		t.Fatalf("Recovered server ReadFile failed: %v", err)
 	}
@@ -671,12 +753,7 @@ func TestErofsSnapshotCreationAndRecovery(t *testing.T) {
 		t.Fatalf("Recovered data mismatch: got %q", string(readResp.Data))
 	}
 
-	readRootResp, err := newServer.ReadFile(ctx, &pb.ReadFileRequest{
-		VolumeId: volumeID,
-		Path:     "/root-file.txt",
-		Offset:   0,
-		Size:     1024,
-	})
+	readRootResp, err := testReadFile(ctx, newServer, volumeID, "/root-file.txt", 0, 1024)
 	if err != nil {
 		t.Fatalf("Recovered server ReadFile root-file failed: %v", err)
 	}
@@ -692,12 +769,7 @@ func TestErofsSnapshotRollback(t *testing.T) {
 	volumeID := "test-rollback-vol"
 
 	// State 1: create v1
-	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/doc.txt",
-		Mode:           0644,
-		InitialContent: []byte("version 1 data"),
-	})
+	_, err := testCreateFile(ctx, server, volumeID, "/doc.txt", 0644, []byte("version 1 data"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -713,22 +785,12 @@ func TestErofsSnapshotRollback(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	// State 2: modify doc.txt and add doc2.txt
-	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId: volumeID,
-		Path:     "/doc.txt",
-		Offset:   0,
-		Data:     []byte("version 2 data overwritten"),
-	})
+	_, err = testWriteFile(ctx, server, volumeID, "/doc.txt", 0, []byte("version 2 data overwritten"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/doc2.txt",
-		Mode:           0644,
-		InitialContent: []byte("version 2 second document"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/doc2.txt", 0644, []byte("version 2 second document"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile doc2 failed: %v", err)
 	}
@@ -758,12 +820,7 @@ func TestErofsSnapshotRollback(t *testing.T) {
 	}
 
 	// Read /doc.txt -> should be version 1 data
-	readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
-		VolumeId: volumeID,
-		Path:     "/doc.txt",
-		Offset:   0,
-		Size:     1024,
-	})
+	readResp, err := testReadFile(ctx, server, volumeID, "/doc.txt", 0, 1024)
 	if err != nil {
 		t.Fatalf("ReadFile after rollback failed: %v", err)
 	}
@@ -772,10 +829,7 @@ func TestErofsSnapshotRollback(t *testing.T) {
 	}
 
 	// /doc2.txt should not exist
-	doc2Resp, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-		VolumeId: volumeID,
-		Path:     "/doc2.txt",
-	})
+	doc2Resp, err := testGetAttr(ctx, server, volumeID, "/doc2.txt")
 	if err != nil {
 		t.Fatalf("GetAttr failed: %v", err)
 	}
@@ -788,12 +842,7 @@ func TestErofsSnapshotRollback(t *testing.T) {
 		t.Fatalf("RestoreSnapshot to %s failed: %v", snap2, err)
 	}
 
-	readResp2, err := server.ReadFile(ctx, &pb.ReadFileRequest{
-		VolumeId: volumeID,
-		Path:     "/doc.txt",
-		Offset:   0,
-		Size:     1024,
-	})
+	readResp2, err := testReadFile(ctx, server, volumeID, "/doc.txt", 0, 1024)
 	if err != nil {
 		t.Fatalf("ReadFile after restore to snap2 failed: %v", err)
 	}
@@ -924,22 +973,12 @@ func TestControllerListBlobsAndGetBlob(t *testing.T) {
 	content1 := []byte("blob data content number 1")
 	content2 := []byte("blob data content number 2 - slightly longer test blob")
 
-	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/file1.txt",
-		Mode:           0644,
-		InitialContent: content1,
-	})
+	_, err := testCreateFile(ctx, server, volumeID, "/file1.txt", 0644, content1, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile file1 failed: %v", err)
 	}
 
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/file2.txt",
-		Mode:           0644,
-		InitialContent: content2,
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/file2.txt", 0644, content2, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile file2 failed: %v", err)
 	}
@@ -1047,11 +1086,7 @@ func TestListVolumes(t *testing.T) {
 	// 2. Create files in 3 volumes
 	volNames := []string{"vol-c", "vol-a", "vol-b"}
 	for _, v := range volNames {
-		_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-			VolumeId:       v,
-			Path:           "/hello.txt",
-			InitialContent: []byte("content for " + v),
-		})
+		_, err := testCreateFile(ctx, server, v, "/hello.txt", 0644, []byte("content for "+v), 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile for %s failed: %v", v, err)
 		}
@@ -1120,11 +1155,7 @@ func TestSnapshotsServicePagination(t *testing.T) {
 	volumeID := "test-snap-pag"
 
 	// 2. Create snapshot 1
-	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/file1.txt",
-		InitialContent: []byte("snap 1 content"),
-	})
+	_, err := testCreateFile(ctx, server, volumeID, "/file1.txt", 0644, []byte("snap 1 content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile 1 failed: %v", err)
 	}
@@ -1141,11 +1172,7 @@ func TestSnapshotsServicePagination(t *testing.T) {
 	time.Sleep(15 * time.Millisecond)
 
 	// Create snapshot 2
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/file2.txt",
-		InitialContent: []byte("snap 2 content"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/file2.txt", 0644, []byte("snap 2 content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile 2 failed: %v", err)
 	}
@@ -1159,11 +1186,7 @@ func TestSnapshotsServicePagination(t *testing.T) {
 	time.Sleep(15 * time.Millisecond)
 
 	// Create snapshot 3
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/file3.txt",
-		InitialContent: []byte("snap 3 content"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/file3.txt", 0644, []byte("snap 3 content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile 3 failed: %v", err)
 	}
@@ -1278,11 +1301,7 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	volumeID := "wal-vol-test"
 
 	// 1. Mkdir should append a mutation record
-	mkdirResp, err := server.Mkdir(ctx, &pb.MkdirRequest{
-		VolumeId: volumeID,
-		Path:     "/testdir",
-		Mode:     0755,
-	})
+	mkdirResp, err := testMkdir(ctx, server, volumeID, "/testdir", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
@@ -1301,12 +1320,7 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	}
 
 	// 2. CreateFile should log to stream
-	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/testdir/data.txt",
-		Mode:           0644,
-		InitialContent: []byte("hello streams"),
-	})
+	createResp, err := testCreateFile(ctx, server, volumeID, "/testdir/data.txt", 0644, []byte("hello streams"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -1320,12 +1334,7 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	}
 
 	// 3. WriteFile should log to stream
-	writeResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId: volumeID,
-		Path:     "/testdir/data.txt",
-		Offset:   5,
-		Data:     []byte(" world!"),
-	})
+	writeResp, err := testWriteFile(ctx, server, volumeID, "/testdir/data.txt", 5, []byte(" world!"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
@@ -1334,11 +1343,7 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	}
 
 	// 4. TruncateFile should log to stream
-	truncResp, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{
-		VolumeId: volumeID,
-		Path:     "/testdir/data.txt",
-		Size:     5,
-	})
+	truncResp, err := testTruncateFile(ctx, server, volumeID, "/testdir/data.txt", 5)
 	if err != nil {
 		t.Fatalf("TruncateFile failed: %v", err)
 	}
@@ -1347,11 +1352,7 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	}
 
 	// 5. Rename should log to stream
-	renameResp, err := server.Rename(ctx, &pb.RenameRequest{
-		VolumeId: volumeID,
-		OldPath:  "/testdir/data.txt",
-		NewPath:  "/testdir/renamed.txt",
-	})
+	renameResp, err := testRename(ctx, server, volumeID, "/testdir/data.txt", "/testdir/renamed.txt")
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
@@ -1360,19 +1361,13 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	}
 
 	// 6. Unlink should log to stream
-	_, err = server.Unlink(ctx, &pb.UnlinkRequest{
-		VolumeId: volumeID,
-		Path:     "/testdir/renamed.txt",
-	})
+	_, err = testUnlink(ctx, server, volumeID, "/testdir/renamed.txt")
 	if err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
 
 	// 7. Rmdir should log to stream
-	_, err = server.Rmdir(ctx, &pb.RmdirRequest{
-		VolumeId: volumeID,
-		Path:     "/testdir",
-	})
+	_, err = testRmdir(ctx, server, volumeID, "/testdir")
 	if err != nil {
 		t.Fatalf("Rmdir failed: %v", err)
 	}
@@ -1392,20 +1387,11 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 
 	// Step 1: Initialize server 1 and perform initial changes
 	server1 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
-	_, err := server1.Mkdir(ctx, &pb.MkdirRequest{
-		VolumeId: volumeID,
-		Path:     "/base",
-		Mode:     0755,
-	})
+	_, err := testMkdir(ctx, server1, volumeID, "/base", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("server1 Mkdir failed: %v", err)
 	}
-	_, err = server1.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/base/initial.txt",
-		Mode:           0644,
-		InitialContent: []byte("initial snapshot content"),
-	})
+	_, err = testCreateFile(ctx, server1, volumeID, "/base/initial.txt", 0644, []byte("initial snapshot content"), 0, 0)
 	if err != nil {
 		t.Fatalf("server1 CreateFile failed: %v", err)
 	}
@@ -1421,21 +1407,12 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	}
 
 	// Step 3: Perform mutations AFTER snapshot (these are in the WAL change-log, not in snapshot)
-	_, err = server1.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/base/post_snapshot.txt",
-		Mode:           0644,
-		InitialContent: []byte("post snapshot content"),
-	})
+	_, err = testCreateFile(ctx, server1, volumeID, "/base/post_snapshot.txt", 0644, []byte("post snapshot content"), 0, 0)
 	if err != nil {
 		t.Fatalf("server1 CreateFile post snapshot failed: %v", err)
 	}
 
-	_, err = server1.Rename(ctx, &pb.RenameRequest{
-		VolumeId: volumeID,
-		OldPath:  "/base/initial.txt",
-		NewPath:  "/base/renamed_initial.txt",
-	})
+	_, err = testRename(ctx, server1, volumeID, "/base/initial.txt", "/base/renamed_initial.txt")
 	if err != nil {
 		t.Fatalf("server1 Rename failed: %v", err)
 	}
@@ -1454,13 +1431,13 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 
 	// Verify that state reflects both the snapshot AND replayed WAL mutations:
 	// - /base should exist
-	baseAttr, err := server2.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/base"})
+	baseAttr, err := testGetAttr(ctx, server2, volumeID, "/base")
 	if err != nil || !baseAttr.Attr.IsDir {
 		t.Fatalf("Recovered base directory missing or not dir: %v", err)
 	}
 
 	// - /base/initial.txt should have been renamed to /base/renamed_initial.txt
-	initResp, err := server2.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/base/initial.txt"})
+	initResp, err := testGetAttr(ctx, server2, volumeID, "/base/initial.txt")
 	if err != nil {
 		t.Fatalf("GetAttr failed: %v", err)
 	}
@@ -1468,7 +1445,7 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 		t.Fatalf("Expected /base/initial.txt to not exist after rename replay, got error %d", initResp.GetError())
 	}
 
-	renamedAttr, err := server2.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/base/renamed_initial.txt"})
+	renamedAttr, err := testGetAttr(ctx, server2, volumeID, "/base/renamed_initial.txt")
 	if err != nil {
 		t.Fatalf("Expected /base/renamed_initial.txt to exist: %v", err)
 	}
@@ -1477,12 +1454,7 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	}
 
 	// - /base/post_snapshot.txt should exist and have correct size and content
-	readResp, err := server2.ReadFile(ctx, &pb.ReadFileRequest{
-		VolumeId: volumeID,
-		Path:     "/base/post_snapshot.txt",
-		Offset:   0,
-		Size:     1024,
-	})
+	readResp, err := testReadFile(ctx, server2, volumeID, "/base/post_snapshot.txt", 0, 1024)
 	if err != nil {
 		t.Fatalf("ReadFile on replayed post-snapshot file failed: %v", err)
 	}
@@ -1507,11 +1479,7 @@ func TestStreamsDurabilityModes(t *testing.T) {
 	ctx := t.Context()
 
 	// 1. Mkdir with default durability (Witness)
-	_, err := server.Mkdir(ctx, &pb.MkdirRequest{
-		VolumeId: volumeID,
-		Path:     "/witness_dir",
-		Mode:     0755,
-	})
+	_, err := testMkdir(ctx, server, volumeID, "/witness_dir", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Mkdir with Witness durability failed: %v", err)
 	}
@@ -1523,23 +1491,12 @@ func TestStreamsDurabilityModes(t *testing.T) {
 	}
 
 	// 2. WriteFile with WRITE_THROUGH_FSYNC (Permanent)
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/witness_dir/file.bin",
-		Mode:           0644,
-		InitialContent: []byte("data"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/witness_dir/file.bin", 0644, []byte("data"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 
-	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  volumeID,
-		Path:      "/witness_dir/file.bin",
-		Offset:    4,
-		Data:      []byte("more"),
-		WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
-	})
+	_, err = testWriteFile(ctx, server, volumeID, "/witness_dir/file.bin", 4, []byte("more"), pb.WriteMode_WRITE_THROUGH_FSYNC)
 	if err != nil {
 		t.Fatalf("WriteFile with WRITE_THROUGH_FSYNC failed: %v", err)
 	}
@@ -1550,9 +1507,10 @@ func TestStreamsDurabilityModes(t *testing.T) {
 	}
 
 	// 3. Fsync RPC flushes stream
+	ino, _ := resolvePath(ctx, server, volumeID, "/witness_dir/file.bin")
 	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{
 		VolumeId: volumeID,
-		Path:     "/witness_dir/file.bin",
+		Inode:    ino,
 	})
 	if err != nil || !fsyncResp.GetSuccess() {
 		t.Fatalf("Fsync failed: %v", err)
@@ -1566,36 +1524,38 @@ func TestApplyRecordDirect(t *testing.T) {
 
 	// Apply Mkdir
 	err := vol.ApplyRecordLocked(&MutationRecord{
-		Type:     MutationMkdir,
-		VolumeId: "apply-test",
-		Path:     "/a/b/c",
-		Mode:     0755,
-		Inode:    10,
+		Type:        MutationMkdir,
+		VolumeId:    "apply-test",
+		ParentInode: 1,
+		Name:        "c",
+		Mode:        0755,
+		Inode:       10,
 	})
 	if err != nil {
 		t.Fatalf("Apply Mkdir failed: %v", err)
 	}
 
-	attr, err := vol.GetAttr(ctx, "/a/b/c")
+	attr, err := vol.GetAttr(ctx, 10)
 	if err != nil || !attr.IsDir {
-		t.Fatalf("Expected directory /a/b/c: %v", err)
+		t.Fatalf("Expected directory inode 10: %v", err)
 	}
 
 	// Apply CreateFile
 	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:     MutationCreateFile,
-		VolumeId: "apply-test",
-		Path:     "/a/b/c/foo.txt",
-		Mode:     0644,
-		Size:     4,
-		Inode:    11,
-		Data:     []byte("test"),
+		Type:        MutationCreateFile,
+		VolumeId:    "apply-test",
+		ParentInode: 10,
+		Name:        "foo.txt",
+		Mode:        0644,
+		Size:        4,
+		Inode:       11,
+		Data:        []byte("test"),
 	})
 	if err != nil {
 		t.Fatalf("Apply CreateFile failed: %v", err)
 	}
 
-	data, total, _, err := vol.ReadFile(ctx, "/a/b/c/foo.txt", 0, 100)
+	data, total, _, err := vol.ReadFile(ctx, 11, 0, 100)
 	if err != nil || total != 4 || string(data) != "test" {
 		t.Fatalf("Unexpected file content: %s (err: %v)", string(data), err)
 	}
@@ -1604,62 +1564,66 @@ func TestApplyRecordDirect(t *testing.T) {
 	err = vol.ApplyRecordLocked(&MutationRecord{
 		Type:     MutationTruncateFile,
 		VolumeId: "apply-test",
-		Path:     "/a/b/c/foo.txt",
+		Inode:    11,
 		Size:     2,
 	})
 	if err != nil {
 		t.Fatalf("Apply TruncateFile failed: %v", err)
 	}
-	data, total, _, err = vol.ReadFile(ctx, "/a/b/c/foo.txt", 0, 100)
+	data, total, _, err = vol.ReadFile(ctx, 11, 0, 100)
 	if err != nil || total != 2 || string(data) != "te" {
 		t.Fatalf("Unexpected truncated content: %s (err: %v)", string(data), err)
 	}
 
 	// Apply Rename
 	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:     MutationRename,
-		VolumeId: "apply-test",
-		OldPath:  "/a/b/c/foo.txt",
-		Path:     "/a/b/c/bar.txt",
+		Type:           MutationRename,
+		VolumeId:       "apply-test",
+		OldParentInode: 10,
+		OldName:        "foo.txt",
+		ParentInode:    10,
+		Name:           "bar.txt",
 	})
 	if err != nil {
 		t.Fatalf("Apply Rename failed: %v", err)
 	}
-	_, err = vol.GetAttr(ctx, "/a/b/c/foo.txt")
+	_, err = vol.Lookup(ctx, 10, "foo.txt")
 	if err == nil {
-		t.Fatalf("Expected /a/b/c/foo.txt to be removed after rename")
+		t.Fatalf("Expected foo.txt to be removed after rename")
 	}
-	barAttr, err := vol.GetAttr(ctx, "/a/b/c/bar.txt")
+	barAttr, err := vol.Lookup(ctx, 10, "bar.txt")
 	if err != nil || barAttr.Name != "bar.txt" {
-		t.Fatalf("Expected /a/b/c/bar.txt to exist: %v", err)
+		t.Fatalf("Expected bar.txt to exist: %v", err)
 	}
 
 	// Apply Unlink
 	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:     MutationUnlink,
-		VolumeId: "apply-test",
-		Path:     "/a/b/c/bar.txt",
+		Type:        MutationUnlink,
+		VolumeId:    "apply-test",
+		ParentInode: 10,
+		Name:        "bar.txt",
 	})
 	if err != nil {
 		t.Fatalf("Apply Unlink failed: %v", err)
 	}
-	_, err = vol.GetAttr(ctx, "/a/b/c/bar.txt")
+	_, err = vol.Lookup(ctx, 10, "bar.txt")
 	if err == nil {
-		t.Fatalf("Expected /a/b/c/bar.txt to be unlinked")
+		t.Fatalf("Expected bar.txt to be unlinked")
 	}
 
 	// Apply Rmdir
 	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:     MutationRmdir,
-		VolumeId: "apply-test",
-		Path:     "/a/b/c",
+		Type:        MutationRmdir,
+		VolumeId:    "apply-test",
+		ParentInode: 1,
+		Name:        "c",
 	})
 	if err != nil {
 		t.Fatalf("Apply Rmdir failed: %v", err)
 	}
-	_, err = vol.GetAttr(ctx, "/a/b/c")
+	_, err = vol.Lookup(ctx, 1, "c")
 	if err == nil {
-		t.Fatalf("Expected /a/b/c to be deleted")
+		t.Fatalf("Expected c to be deleted")
 	}
 }
 
@@ -1675,19 +1639,14 @@ func TestTargetlessWALDurabilityFastFail(t *testing.T) {
 	volumeID := "test-vol-targetless-wal"
 
 	// Create file should succeed under default Local durability
-	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/test.txt",
-		Mode:           0644,
-		InitialContent: []byte("initial"),
-	})
+	createResp, err := testCreateFile(ctx, server, volumeID, "/test.txt", 0644, []byte("initial"), 0, 0)
 	if err != nil || createResp.GetError() != 0 {
 		t.Fatalf("CreateFile failed: err=%v, resp.Error=%d", err, createResp.GetError())
 	}
 
 	// Direct Volume.WriteFile with WRITE_THROUGH_FSYNC (Permanent) should fail promptly with typed error
 	vol := server.GetVolume(volumeID)
-	_, _, _, err = vol.WriteFile(ctx, "/test.txt", 0, []byte("data-permanent"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	_, _, _, err = volWriteFile(ctx, vol, "/test.txt", 0, []byte("data-permanent"), pb.WriteMode_WRITE_THROUGH_FSYNC)
 	if err == nil {
 		t.Fatalf("expected vol.WriteFile(WRITE_THROUGH_FSYNC) to fail on target-less WAL, got nil")
 	}
@@ -1696,13 +1655,7 @@ func TestTargetlessWALDurabilityFastFail(t *testing.T) {
 	}
 
 	// Server.WriteFile with WRITE_THROUGH_FSYNC (Permanent) should return error in response
-	writeResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  volumeID,
-		Path:      "/test.txt",
-		Offset:    0,
-		Data:      []byte("data-permanent"),
-		WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
-	})
+	writeResp, err := testWriteFile(ctx, server, volumeID, "/test.txt", 0, []byte("data-permanent"), pb.WriteMode_WRITE_THROUGH_FSYNC)
 	if err != nil {
 		t.Fatalf("unexpected gRPC error: %v", err)
 	}
@@ -1711,7 +1664,7 @@ func TestTargetlessWALDurabilityFastFail(t *testing.T) {
 	}
 
 	// Direct Volume.WriteFile with EAGER_REPLICATION (Witness) should fail promptly with typed error
-	_, _, _, err = vol.WriteFile(ctx, "/test.txt", 0, []byte("data-witness"), pb.WriteMode_EAGER_REPLICATION)
+	_, _, _, err = volWriteFile(ctx, vol, "/test.txt", 0, []byte("data-witness"), pb.WriteMode_EAGER_REPLICATION)
 	if err == nil {
 		t.Fatalf("expected vol.WriteFile(EAGER_REPLICATION) to fail on target-less WAL, got nil")
 	}
@@ -1720,13 +1673,7 @@ func TestTargetlessWALDurabilityFastFail(t *testing.T) {
 	}
 
 	// Server.WriteFile with EAGER_REPLICATION (Witness) should return error in response
-	writeResp, err = server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  volumeID,
-		Path:      "/test.txt",
-		Offset:    0,
-		Data:      []byte("data-witness"),
-		WriteMode: pb.WriteMode_EAGER_REPLICATION,
-	})
+	writeResp, err = testWriteFile(ctx, server, volumeID, "/test.txt", 0, []byte("data-witness"), pb.WriteMode_EAGER_REPLICATION)
 	if err != nil {
 		t.Fatalf("unexpected gRPC error: %v", err)
 	}
@@ -1735,13 +1682,7 @@ func TestTargetlessWALDurabilityFastFail(t *testing.T) {
 	}
 
 	// WriteFile with LAZY_WRITE (Local) should succeed
-	writeResp, err = server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  volumeID,
-		Path:      "/test.txt",
-		Offset:    0,
-		Data:      []byte("data-local"),
-		WriteMode: pb.WriteMode_LAZY_WRITE,
-	})
+	writeResp, err = testWriteFile(ctx, server, volumeID, "/test.txt", 0, []byte("data-local"), pb.WriteMode_LAZY_WRITE)
 	if err != nil || writeResp.GetError() != 0 {
 		t.Fatalf("WriteFile(LAZY_WRITE) failed: err=%v, resp.Error=%d", err, writeResp.GetError())
 	}
@@ -1750,7 +1691,8 @@ func TestTargetlessWALDurabilityFastFail(t *testing.T) {
 	}
 
 	// Direct Volume.Fsync should fail fast on target-less WAL because it flushes to permanent storage
-	err = vol.Fsync(ctx, "/test.txt")
+	testIno, _ := vol.ResolvePath(ctx, "/test.txt")
+	err = vol.Fsync(ctx, testIno)
 	if err == nil {
 		t.Fatalf("expected vol.Fsync to fail on target-less WAL with unflushed records, got nil")
 	}
@@ -1761,7 +1703,7 @@ func TestTargetlessWALDurabilityFastFail(t *testing.T) {
 	// Server.Fsync should return error in response
 	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{
 		VolumeId: volumeID,
-		Path:     "/test.txt",
+		Inode:    testIno,
 	})
 	if err != nil {
 		t.Fatalf("unexpected gRPC error: %v", err)
@@ -1847,12 +1789,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 	createCh := make(chan createResult, 1)
 
 	go func() {
-		resp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-			VolumeId:       volumeID,
-			Path:           "/blocking_file.txt",
-			Mode:           0644,
-			InitialContent: []byte("initial-data"),
-		})
+		resp, err := testCreateFile(ctx, server, volumeID, "/blocking_file.txt", 0644, []byte("initial-data"), 0, 0)
 		createCh <- createResult{resp: resp, err: err}
 	}()
 
@@ -1869,10 +1806,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 		defer close(readDone)
 
 		// Root GetAttr
-		rootAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-			VolumeId: volumeID,
-			Path:     "/",
-		})
+		rootAttr, err := testGetAttr(ctx, server, volumeID, "/")
 		if err != nil || !rootAttr.Attr.IsDir {
 			t.Errorf("GetAttr root failed while write is waiting for durability: %v", err)
 			return
@@ -1880,9 +1814,9 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 
 		// Lookup the new file (in-memory state is already updated)
 		lookupResp, err := server.Lookup(ctx, &pb.LookupRequest{
-			VolumeId:   volumeID,
-			ParentPath: "/",
-			Name:       "blocking_file.txt",
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        "blocking_file.txt",
 		})
 		if err != nil || lookupResp.Attr.Name != "blocking_file.txt" {
 			t.Errorf("Lookup new file failed while write is waiting for durability: %v", err)
@@ -1890,22 +1824,14 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 		}
 
 		// GetAttr on the new file
-		fileAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-			VolumeId: volumeID,
-			Path:     "/blocking_file.txt",
-		})
+		fileAttr, err := testGetAttr(ctx, server, volumeID, "/blocking_file.txt")
 		if err != nil || fileAttr.Attr.Size != int64(len("initial-data")) {
 			t.Errorf("GetAttr new file failed while write is waiting for durability: %v", err)
 			return
 		}
 
 		// ReadFile on the new file
-		readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
-			VolumeId: volumeID,
-			Path:     "/blocking_file.txt",
-			Offset:   0,
-			Size:     1024,
-		})
+		readResp, err := testReadFile(ctx, server, volumeID, "/blocking_file.txt", 0, 1024)
 		if err != nil || string(readResp.Data) != "initial-data" {
 			t.Errorf("ReadFile failed while write is waiting for durability: %v", err)
 			return
@@ -1956,12 +1882,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 	}
 	writeCh := make(chan createFailResult, 1)
 	go func() {
-		resp, err := server2.CreateFile(writeCtx, &pb.CreateFileRequest{
-			VolumeId:       vol2,
-			Path:           "/fail_durability.txt",
-			Mode:           0644,
-			InitialContent: []byte("persisted-in-mem"),
-		})
+		resp, err := testCreateFile(writeCtx, server2, vol2, "/fail_durability.txt", 0644, []byte("persisted-in-mem"), 0, 0)
 		writeCh <- createFailResult{resp: resp, err: err}
 	}()
 
@@ -1984,11 +1905,8 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 	}
 
 	// Verify in-memory state is still visible (not rolled back)
-	attr, err := server2.GetAttr(ctx, &pb.GetAttrRequest{
-		VolumeId: vol2,
-		Path:     "/fail_durability.txt",
-	})
-	if err != nil || attr.GetError() != 0 || attr.Attr.Name != "fail_durability.txt" {
+	attr, err := testGetAttr(ctx, server2, vol2, "/fail_durability.txt")
+	if err != nil || attr.GetError() != 0 || attr.Attr.Inode == 0 {
 		t.Fatalf("Expected in-memory state to remain intact after durability wait failure: %v (attr: %v)", err, attr)
 	}
 }
@@ -2051,20 +1969,12 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 
 	// 1. CreateFile
 	runMutationTest("CreateFile", func() {
-		_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-			VolumeId:       volumeID,
-			Path:           "/test_file.txt",
-			Mode:           0644,
-			InitialContent: []byte("initial"),
-		})
+		_, err := testCreateFile(ctx, server, volumeID, "/test_file.txt", 0644, []byte("initial"), 0, 0)
 		if err != nil {
 			t.Errorf("CreateFile failed: %v", err)
 		}
 	}, func() {
-		attr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-			VolumeId: volumeID,
-			Path:     "/test_file.txt",
-		})
+		attr, err := testGetAttr(ctx, server, volumeID, "/test_file.txt")
 		if err != nil || attr.Attr.Size != 7 {
 			t.Errorf("GetAttr during CreateFile failed: %v", err)
 		}
@@ -2072,23 +1982,12 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 
 	// 2. WriteFile
 	runMutationTest("WriteFile", func() {
-		_, err := server.WriteFile(ctx, &pb.WriteFileRequest{
-			VolumeId:  volumeID,
-			Path:      "/test_file.txt",
-			Offset:    7,
-			Data:      []byte("-appended"),
-			WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
-		})
+		_, err := testWriteFile(ctx, server, volumeID, "/test_file.txt", 7, []byte("-appended"), pb.WriteMode_WRITE_THROUGH_FSYNC)
 		if err != nil {
 			t.Errorf("WriteFile failed: %v", err)
 		}
 	}, func() {
-		resp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
-			VolumeId: volumeID,
-			Path:     "/test_file.txt",
-			Offset:   0,
-			Size:     1024,
-		})
+		resp, err := testReadFile(ctx, server, volumeID, "/test_file.txt", 0, 1024)
 		if err != nil || string(resp.Data) != "initial-appended" {
 			t.Errorf("ReadFile during WriteFile durability wait failed: %v, data=%q", err, string(resp.Data))
 		}
@@ -2096,19 +1995,12 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 
 	// 3. Mkdir
 	runMutationTest("Mkdir", func() {
-		_, err := server.Mkdir(ctx, &pb.MkdirRequest{
-			VolumeId: volumeID,
-			Path:     "/newdir",
-			Mode:     0755,
-		})
+		_, err := testMkdir(ctx, server, volumeID, "/newdir", 0755, 0, 0)
 		if err != nil {
 			t.Errorf("Mkdir failed: %v", err)
 		}
 	}, func() {
-		dirAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-			VolumeId: volumeID,
-			Path:     "/newdir",
-		})
+		dirAttr, err := testGetAttr(ctx, server, volumeID, "/newdir")
 		if err != nil || !dirAttr.Attr.IsDir {
 			t.Errorf("GetAttr during Mkdir durability wait failed: %v", err)
 		}
@@ -2116,41 +2008,25 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 
 	// 4. Rename
 	runMutationTest("Rename", func() {
-		_, err := server.Rename(ctx, &pb.RenameRequest{
-			VolumeId: volumeID,
-			OldPath:  "/test_file.txt",
-			NewPath:  "/renamed_file.txt",
-		})
+		_, err := testRename(ctx, server, volumeID, "/test_file.txt", "/renamed_file.txt")
 		if err != nil {
 			t.Errorf("Rename failed: %v", err)
 		}
 	}, func() {
-		renamedAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-			VolumeId: volumeID,
-			Path:     "/renamed_file.txt",
-		})
-		if err != nil || renamedAttr.Attr.Name != "renamed_file.txt" {
+		renamedAttr, err := testGetAttr(ctx, server, volumeID, "/renamed_file.txt")
+		if err != nil || renamedAttr.GetError() != 0 || renamedAttr.Attr == nil || renamedAttr.Attr.Inode == 0 {
 			t.Errorf("GetAttr during Rename durability wait failed: %v", err)
 		}
 	})
 
 	// 5. TruncateFile
 	runMutationTest("TruncateFile", func() {
-		_, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{
-			VolumeId: volumeID,
-			Path:     "/renamed_file.txt",
-			Size:     7,
-		})
+		_, err := testTruncateFile(ctx, server, volumeID, "/renamed_file.txt", 7)
 		if err != nil {
 			t.Errorf("TruncateFile failed: %v", err)
 		}
 	}, func() {
-		truncRead, err := server.ReadFile(ctx, &pb.ReadFileRequest{
-			VolumeId: volumeID,
-			Path:     "/renamed_file.txt",
-			Offset:   0,
-			Size:     1024,
-		})
+		truncRead, err := testReadFile(ctx, server, volumeID, "/renamed_file.txt", 0, 1024)
 		if err != nil || string(truncRead.Data) != "initial" {
 			t.Errorf("ReadFile during TruncateFile durability wait failed: %v, data=%q", err, string(truncRead.Data))
 		}
@@ -2158,18 +2034,12 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 
 	// 6. Unlink
 	runMutationTest("Unlink", func() {
-		_, err := server.Unlink(ctx, &pb.UnlinkRequest{
-			VolumeId: volumeID,
-			Path:     "/renamed_file.txt",
-		})
+		_, err := testUnlink(ctx, server, volumeID, "/renamed_file.txt")
 		if err != nil {
 			t.Errorf("Unlink failed: %v", err)
 		}
 	}, func() {
-		resp, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-			VolumeId: volumeID,
-			Path:     "/renamed_file.txt",
-		})
+		resp, err := testGetAttr(ctx, server, volumeID, "/renamed_file.txt")
 		if err == nil && resp.GetError() == 0 {
 			t.Errorf("Expected file to be unlinked in memory during Unlink durability wait")
 		}
@@ -2177,18 +2047,12 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 
 	// 7. Rmdir
 	runMutationTest("Rmdir", func() {
-		_, err := server.Rmdir(ctx, &pb.RmdirRequest{
-			VolumeId: volumeID,
-			Path:     "/newdir",
-		})
+		_, err := testRmdir(ctx, server, volumeID, "/newdir")
 		if err != nil {
 			t.Errorf("Rmdir failed: %v", err)
 		}
 	}, func() {
-		resp, err := server.GetAttr(ctx, &pb.GetAttrRequest{
-			VolumeId: volumeID,
-			Path:     "/newdir",
-		})
+		resp, err := testGetAttr(ctx, server, volumeID, "/newdir")
 		if err == nil && resp.GetError() == 0 {
 			t.Errorf("Expected directory to be removed in memory during Rmdir durability wait")
 		}
@@ -2203,7 +2067,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 
 	// 1. Small file <= 1 chunk (e.g. 100 bytes)
 	smallData := []byte("small file content unchunked")
-	smallAttr, err := vol.CreateFile(ctx, "/small.txt", 0644, smallData, 0, 0)
+	smallAttr, err := volCreateFile(ctx, vol, "/small.txt", 0644, smallData, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile /small.txt failed: %v", err)
 	}
@@ -2222,7 +2086,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	}
 	largeSha := fmt.Sprintf("%x", sha256.Sum256(largeData))
 
-	largeAttr, err := vol.CreateFile(ctx, "/large.bin", 0644, largeData, 0, 0)
+	largeAttr, err := volCreateFile(ctx, vol, "/large.bin", 0644, largeData, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile /large.bin failed: %v", err)
 	}
@@ -2235,7 +2099,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 
 	// 3. Read partial ranges spanning chunk boundaries
 	// Read 20 KiB starting at offset 10 KiB (spans chunk 0 and chunk 1)
-	partData, total, _, err := vol.ReadFile(ctx, "/large.bin", 10*1024, 20*1024)
+	partData, total, _, err := volReadFile(ctx, vol, "/large.bin", 10*1024, 20*1024)
 	if err != nil {
 		t.Fatalf("ReadFile partial spanning chunks failed: %v", err)
 	}
@@ -2249,7 +2113,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	// 4. Random write touching chunk 1 (offset 20 KiB, length 4 KiB)
 	patch := []byte("random patch in chunk 1")
 	copy(largeData[20*1024:], patch)
-	_, newSize, _, err := vol.WriteFile(ctx, "/large.bin", 20*1024, patch, pb.WriteMode_LAZY_WRITE)
+	_, newSize, _, err := volWriteFile(ctx, vol, "/large.bin", 20*1024, patch, pb.WriteMode_LAZY_WRITE)
 	if err != nil {
 		t.Fatalf("WriteFile random write failed: %v", err)
 	}
@@ -2257,7 +2121,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 		t.Fatalf("expected size %d, got %d", len(largeData), newSize)
 	}
 
-	updatedAttr, err := vol.GetAttr(ctx, "/large.bin")
+	updatedAttr, err := volGetAttr(ctx, vol, "/large.bin")
 	if err != nil {
 		t.Fatalf("GetAttr after random write failed: %v", err)
 	}
@@ -2267,7 +2131,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	}
 
 	// Read back modified range
-	readBack, _, _, err := vol.ReadFile(ctx, "/large.bin", 20*1024, int64(len(patch)))
+	readBack, _, _, err := volReadFile(ctx, vol, "/large.bin", 20*1024, int64(len(patch)))
 	if err != nil || !bytes.Equal(readBack, patch) {
 		t.Fatalf("read back patch mismatch: %q vs %q", string(readBack), string(patch))
 	}
@@ -2278,7 +2142,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	}
 
 	newLargeSha := fmt.Sprintf("%x", sha256.Sum256(largeData))
-	postSnapAttr, err := vol.GetAttr(ctx, "/large.bin")
+	postSnapAttr, err := volGetAttr(ctx, vol, "/large.bin")
 	if err != nil {
 		t.Fatalf("GetAttr post-snapshot failed: %v", err)
 	}
@@ -2291,12 +2155,12 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	for i := range growData {
 		growData[i] = 'G'
 	}
-	_, _, _, err = vol.WriteFile(ctx, "/small.txt", 100, growData, pb.WriteMode_LAZY_WRITE)
+	_, _, _, err = volWriteFile(ctx, vol, "/small.txt", 100, growData, pb.WriteMode_LAZY_WRITE)
 	if err != nil {
 		t.Fatalf("WriteFile growing small file failed: %v", err)
 	}
 
-	growAttr, err := vol.GetAttr(ctx, "/small.txt")
+	growAttr, err := volGetAttr(ctx, vol, "/small.txt")
 	if err != nil {
 		t.Fatalf("GetAttr for grown file failed: %v", err)
 	}
@@ -2305,14 +2169,14 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	}
 
 	// 7. Test truncation across chunks
-	truncAttr, err := vol.TruncateFile(ctx, "/large.bin", 18*1024)
+	truncAttr, err := volTruncateFile(ctx, vol, "/large.bin", 18*1024)
 	if err != nil {
 		t.Fatalf("TruncateFile failed: %v", err)
 	}
 	if truncAttr.Size != 18*1024 {
 		t.Fatalf("expected size %d after truncation, got %d", 18*1024, truncAttr.Size)
 	}
-	truncData, total, _, err := vol.ReadFile(ctx, "/large.bin", 0, 20*1024)
+	truncData, total, _, err := volReadFile(ctx, vol, "/large.bin", 0, 20*1024)
 	if err != nil || total != 18*1024 || len(truncData) != 18*1024 {
 		t.Fatalf("ReadFile after truncation failed: total=%d, len=%d, err=%v", total, len(truncData), err)
 	}
@@ -2325,36 +2189,22 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 	volumeID := "stable-ino-vol"
 
 	// 1. Create a directory /dir1 and file /file1.txt and /dir1/file2.txt
-	_, err := server.Mkdir(ctx, &pb.MkdirRequest{
-		VolumeId: volumeID,
-		Path:     "/dir1",
-		Mode:     0755,
-	})
+	_, err := testMkdir(ctx, server, volumeID, "/dir1", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to mkdir /dir1: %v", err)
 	}
 
-	create1, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/file1.txt",
-		Mode:           0644,
-		InitialContent: []byte("content of file 1"),
-	})
+	create1, err := testCreateFile(ctx, server, volumeID, "/file1.txt", 0644, []byte("content of file 1"), 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create /file1.txt: %v", err)
 	}
 
-	create2, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/dir1/file2.txt",
-		Mode:           0644,
-		InitialContent: []byte("content of file 2"),
-	})
+	create2, err := testCreateFile(ctx, server, volumeID, "/dir1/file2.txt", 0644, []byte("content of file 2"), 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create /dir1/file2.txt: %v", err)
 	}
 
-	dir1Attr, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1"})
+	dir1Attr, err := testGetAttr(ctx, server, volumeID, "/dir1")
 	if err != nil {
 		t.Fatalf("Failed to get /dir1 attr: %v", err)
 	}
@@ -2375,7 +2225,7 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 	snap1Name := snap1Resp.SnapshotName
 
 	// Verify attributes after snapshot 1
-	file1AttrAfterSnap1, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/file1.txt"})
+	file1AttrAfterSnap1, err := testGetAttr(ctx, server, volumeID, "/file1.txt")
 	if err != nil {
 		t.Fatalf("Failed to get /file1.txt after snap 1: %v", err)
 	}
@@ -2383,7 +2233,7 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 		t.Fatalf("Inode changed after snap 1: expected %d, got %d", file1InoInitial, file1AttrAfterSnap1.Attr.Inode)
 	}
 
-	dir1AttrAfterSnap1, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1"})
+	dir1AttrAfterSnap1, err := testGetAttr(ctx, server, volumeID, "/dir1")
 	if err != nil {
 		t.Fatalf("Failed to get /dir1 after snap 1: %v", err)
 	}
@@ -2391,7 +2241,7 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 		t.Fatalf("Dir inode changed after snap 1: expected %d, got %d", dir1InoInitial, dir1AttrAfterSnap1.Attr.Inode)
 	}
 
-	file2AttrAfterSnap1, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1/file2.txt"})
+	file2AttrAfterSnap1, err := testGetAttr(ctx, server, volumeID, "/dir1/file2.txt")
 	if err != nil {
 		t.Fatalf("Failed to get /dir1/file2.txt after snap 1: %v", err)
 	}
@@ -2425,12 +2275,7 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 	}
 
 	// 3. Create a new file before taking second snapshot
-	create3, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/file3.txt",
-		Mode:           0644,
-		InitialContent: []byte("content of file 3"),
-	})
+	create3, err := testCreateFile(ctx, server, volumeID, "/file3.txt", 0644, []byte("content of file 3"), 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create /file3.txt: %v", err)
 	}
@@ -2444,7 +2289,7 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 	snap2Name := snap2Resp.SnapshotName
 
 	// Verify all attributes after snapshot 2: previous files MUST have identical Inode IDs
-	file1AttrAfterSnap2, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/file1.txt"})
+	file1AttrAfterSnap2, err := testGetAttr(ctx, server, volumeID, "/file1.txt")
 	if err != nil {
 		t.Fatalf("Failed to get /file1.txt after snap 2: %v", err)
 	}
@@ -2452,7 +2297,7 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 		t.Fatalf("Inode changed after snap 2: expected %d, got %d", file1InoInitial, file1AttrAfterSnap2.Attr.Inode)
 	}
 
-	dir1AttrAfterSnap2, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1"})
+	dir1AttrAfterSnap2, err := testGetAttr(ctx, server, volumeID, "/dir1")
 	if err != nil {
 		t.Fatalf("Failed to get /dir1 after snap 2: %v", err)
 	}
@@ -2460,7 +2305,7 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 		t.Fatalf("Dir inode changed after snap 2: expected %d, got %d", dir1InoInitial, dir1AttrAfterSnap2.Attr.Inode)
 	}
 
-	file2AttrAfterSnap2, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/dir1/file2.txt"})
+	file2AttrAfterSnap2, err := testGetAttr(ctx, server, volumeID, "/dir1/file2.txt")
 	if err != nil {
 		t.Fatalf("Failed to get /dir1/file2.txt after snap 2: %v", err)
 	}
@@ -2468,7 +2313,7 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 		t.Fatalf("File2 inode changed after snap 2: expected %d, got %d", file2InoInitial, file2AttrAfterSnap2.Attr.Inode)
 	}
 
-	file3AttrAfterSnap2, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Path: "/file3.txt"})
+	file3AttrAfterSnap2, err := testGetAttr(ctx, server, volumeID, "/file3.txt")
 	if err != nil {
 		t.Fatalf("Failed to get /file3.txt after snap 2: %v", err)
 	}
@@ -2514,79 +2359,45 @@ func TestSDSStepReplayScratch(t *testing.T) {
 	server := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
 
 	// 1. Create hierarchy of directories and files
-	_, err := server.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, Path: "/docs", Mode: 0755})
+	_, err := testMkdir(ctx, server, volumeID, "/docs", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Mkdir /docs failed: %v", err)
 	}
-	_, err = server.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, Path: "/docs/sub", Mode: 0755})
+	_, err = testMkdir(ctx, server, volumeID, "/docs/sub", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Mkdir /docs/sub failed: %v", err)
 	}
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/hello.txt",
-		Mode:           0644,
-		InitialContent: []byte("initial hello"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/hello.txt", 0644, []byte("initial hello"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile /hello.txt failed: %v", err)
 	}
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/docs/doc1.txt",
-		Mode:           0644,
-		InitialContent: []byte("doc1 content"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/docs/doc1.txt", 0644, []byte("doc1 content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile /docs/doc1.txt failed: %v", err)
 	}
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/docs/sub/doc2.txt",
-		Mode:           0644,
-		InitialContent: []byte("doc2 content"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/docs/sub/doc2.txt", 0644, []byte("doc2 content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile /docs/sub/doc2.txt failed: %v", err)
 	}
 
 	// 2. Write, Truncate, Rename, Unlink
-	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId: volumeID,
-		Path:     "/hello.txt",
-		Offset:   8,
-		Data:     []byte("world!"),
-	})
+	_, err = testWriteFile(ctx, server, volumeID, "/hello.txt", 8, []byte("world!"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
-	_, err = server.TruncateFile(ctx, &pb.TruncateFileRequest{
-		VolumeId: volumeID,
-		Path:     "/docs/doc1.txt",
-		Size:     4,
-	})
+	_, err = testTruncateFile(ctx, server, volumeID, "/docs/doc1.txt", 4)
 	if err != nil {
 		t.Fatalf("TruncateFile failed: %v", err)
 	}
-	_, err = server.Rename(ctx, &pb.RenameRequest{
-		VolumeId: volumeID,
-		OldPath:  "/docs/sub/doc2.txt",
-		NewPath:  "/docs/doc2_renamed.txt",
-	})
+	_, err = testRename(ctx, server, volumeID, "/docs/sub/doc2.txt", "/docs/doc2_renamed.txt")
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
-	_, err = server.Unlink(ctx, &pb.UnlinkRequest{
-		VolumeId: volumeID,
-		Path:     "/docs/doc1.txt",
-	})
+	_, err = testUnlink(ctx, server, volumeID, "/docs/doc1.txt")
 	if err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
-	_, err = server.Rmdir(ctx, &pb.RmdirRequest{
-		VolumeId: volumeID,
-		Path:     "/docs/sub",
-	})
+	_, err = testRmdir(ctx, server, volumeID, "/docs/sub")
 	if err != nil {
 		t.Fatalf("Rmdir failed: %v", err)
 	}
@@ -2597,20 +2408,20 @@ func TestSDSStepReplayScratch(t *testing.T) {
 	}
 
 	// Read all states from live volume
-	liveHelloAttr, err := liveVol.GetAttr(ctx, "/hello.txt")
+	liveHelloAttr, err := volGetAttr(ctx, liveVol, "/hello.txt")
 	if err != nil {
 		t.Fatalf("live GetAttr /hello.txt failed: %v", err)
 	}
-	liveHelloData, _, _, err := liveVol.ReadFile(ctx, "/hello.txt", 0, 100)
+	liveHelloData, _, _, err := volReadFile(ctx, liveVol, "/hello.txt", 0, 100)
 	if err != nil {
 		t.Fatalf("live ReadFile /hello.txt failed: %v", err)
 	}
 
-	liveRenamedAttr, err := liveVol.GetAttr(ctx, "/docs/doc2_renamed.txt")
+	liveRenamedAttr, err := volGetAttr(ctx, liveVol, "/docs/doc2_renamed.txt")
 	if err != nil {
 		t.Fatalf("live GetAttr /docs/doc2_renamed.txt failed: %v", err)
 	}
-	liveRenamedData, _, _, err := liveVol.ReadFile(ctx, "/docs/doc2_renamed.txt", 0, 100)
+	liveRenamedData, _, _, err := volReadFile(ctx, liveVol, "/docs/doc2_renamed.txt", 0, 100)
 	if err != nil {
 		t.Fatalf("live ReadFile /docs/doc2_renamed.txt failed: %v", err)
 	}
@@ -2638,36 +2449,36 @@ func TestSDSStepReplayScratch(t *testing.T) {
 	}
 
 	// 4. Verify replayed volume matches live volume
-	repHelloAttr, err := replayedVol.GetAttr(ctx, "/hello.txt")
+	repHelloAttr, err := volGetAttr(ctx, replayedVol, "/hello.txt")
 	if err != nil {
 		t.Fatalf("replayed GetAttr /hello.txt failed: %v", err)
 	}
 	if repHelloAttr.Inode != liveHelloAttr.Inode || repHelloAttr.Size != liveHelloAttr.Size {
 		t.Fatalf("Replayed /hello.txt attr mismatch: %+v vs %+v", repHelloAttr, liveHelloAttr)
 	}
-	repHelloData, _, _, err := replayedVol.ReadFile(ctx, "/hello.txt", 0, 100)
+	repHelloData, _, _, err := volReadFile(ctx, replayedVol, "/hello.txt", 0, 100)
 	if err != nil || string(repHelloData) != string(liveHelloData) {
 		t.Fatalf("Replayed /hello.txt data mismatch: %q vs %q", string(repHelloData), string(liveHelloData))
 	}
 
-	repRenamedAttr, err := replayedVol.GetAttr(ctx, "/docs/doc2_renamed.txt")
+	repRenamedAttr, err := volGetAttr(ctx, replayedVol, "/docs/doc2_renamed.txt")
 	if err != nil {
 		t.Fatalf("replayed GetAttr /docs/doc2_renamed.txt failed: %v", err)
 	}
 	if repRenamedAttr.Inode != liveRenamedAttr.Inode || repRenamedAttr.Size != liveRenamedAttr.Size {
 		t.Fatalf("Replayed doc2_renamed attr mismatch: %+v vs %+v", repRenamedAttr, liveRenamedAttr)
 	}
-	repRenamedData, _, _, err := replayedVol.ReadFile(ctx, "/docs/doc2_renamed.txt", 0, 100)
+	repRenamedData, _, _, err := volReadFile(ctx, replayedVol, "/docs/doc2_renamed.txt", 0, 100)
 	if err != nil || string(repRenamedData) != string(liveRenamedData) {
 		t.Fatalf("Replayed doc2_renamed data mismatch: %q vs %q", string(repRenamedData), string(liveRenamedData))
 	}
 
 	// Verify unlinked file and rmdir'd dir do not exist
-	_, err = replayedVol.GetAttr(ctx, "/docs/doc1.txt")
+	_, err = volGetAttr(ctx, replayedVol, "/docs/doc1.txt")
 	if err == nil {
 		t.Fatalf("Expected /docs/doc1.txt to not exist in replayed volume")
 	}
-	_, err = replayedVol.GetAttr(ctx, "/docs/sub")
+	_, err = volGetAttr(ctx, replayedVol, "/docs/sub")
 	if err == nil {
 		t.Fatalf("Expected /docs/sub to not exist in replayed volume")
 	}
@@ -2684,16 +2495,11 @@ func TestSDSCatOnObjectFSStream(t *testing.T) {
 	server := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
 
 	// Perform changes that register Inode, DirEntry, Content
-	_, err := server.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, Path: "/cats", Mode: 0755})
+	_, err := testMkdir(ctx, server, volumeID, "/cats", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
-	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/cats/fluffy.txt",
-		Mode:           0644,
-		InitialContent: []byte("meow meow"),
-	})
+	_, err = testCreateFile(ctx, server, volumeID, "/cats/fluffy.txt", 0644, []byte("meow meow"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -2766,23 +2572,14 @@ func TestTruncateUpwardAndSparseRead(t *testing.T) {
 	volumeID := "test-vol-truncate"
 
 	// Create a file with small initial content
-	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       volumeID,
-		Path:           "/sparse.bin",
-		Mode:           0644,
-		InitialContent: []byte("hello world"),
-	})
+	_, err := testCreateFile(ctx, server, volumeID, "/sparse.bin", 0644, []byte("hello world"), 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create file: %v", err)
 	}
 
 	// Truncate up to 256KB across multiple chunks
 	targetSize := int64(256 * 1024)
-	truncResp, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{
-		VolumeId: volumeID,
-		Path:     "/sparse.bin",
-		Size:     targetSize,
-	})
+	truncResp, err := testTruncateFile(ctx, server, volumeID, "/sparse.bin", targetSize)
 	if err != nil {
 		t.Fatalf("Failed to truncate upward: %v", err)
 	}
@@ -2791,12 +2588,7 @@ func TestTruncateUpwardAndSparseRead(t *testing.T) {
 	}
 
 	// Read back whole file and verify size and contents
-	readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
-		VolumeId: volumeID,
-		Path:     "/sparse.bin",
-		Offset:   0,
-		Size:     0,
-	})
+	readResp, err := testReadFile(ctx, server, volumeID, "/sparse.bin", 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to read file: %v", err)
 	}

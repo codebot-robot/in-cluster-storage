@@ -124,6 +124,7 @@ type Volume struct {
 
 	lastFlushedMetadata    *VolumeMetadata
 	deletedPathsSinceFlush []string
+	dirParents             map[uint64]uint64
 }
 
 // VolumeOption configures a Volume instance.
@@ -226,6 +227,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		maxDirtyRecords:  100000,
 		maxLocalFileSize: 250 * 1024 * 1024,
 		recoveredContent: make(map[string][]byte),
+		dirParents:       make(map[uint64]uint64),
 	}
 
 	v.inodeCache = NewLRUCache[uint64, *CachedInode](10000, v.onEvictInode)
@@ -248,16 +250,23 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 
 	// Always initialize an initial base EROFS snapshot with empty root directory
-	rootNode := erofs.NewMemoryNode("", true, 0755, nil, nil, erofs.WithIno(0), erofs.WithMtime(uint64(time.Now().Unix())))
+	rootNode := erofs.NewMemoryNode("", true, 0755, nil, nil, erofs.WithIno(1), erofs.WithMtime(uint64(time.Now().Unix())))
 	var initialErofsBuf bufferWriterAt
 	if err := erofs.WriteImage(&initialErofsBuf, rootNode); err == nil {
 		v.snapshotRaw = bytes.NewReader(initialErofsBuf.buf)
 		if r, err := erofs.NewReader(v.snapshotRaw); err == nil {
 			v.snapshotReader = r
 			v.rootInodeID = r.GetRootNID()
+			if v.rootInodeID == 0 {
+				v.rootInodeID = 1
+			}
 			v.nextInode = erofs.DefaultInodeStride
 		}
 	}
+	if v.rootInodeID == 0 {
+		v.rootInodeID = 1
+	}
+	v.dirParents[v.rootInodeID] = v.rootInodeID
 
 	return v
 }
@@ -632,10 +641,14 @@ func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, pop
 
 	// 2. Fetch from base snapshot
 	if r.snapshotReader != nil && r.snapshotRaw != nil {
-		erofsInode, err := erofs.ReadInode(r.snapshotRaw, r.snapshotReader.Superblock(), inodeID)
+		lookupNID := inodeID
+		if lookupNID == 1 && r.snapshotReader.GetRootNID() == 0 {
+			lookupNID = 0
+		}
+		erofsInode, err := erofs.ReadInode(r.snapshotRaw, r.snapshotReader.Superblock(), lookupNID)
 		if err == nil {
 			var shaStr, manifestSha, contentSha string
-			xattrs, xErr := r.snapshotReader.GetXattrs(inodeID)
+			xattrs, xErr := r.snapshotReader.GetXattrs(lookupNID)
 			if xErr == nil && !xattrs.IsEmpty() {
 				if xattrs.UserDigest != "" {
 					shaStr = xattrs.UserDigest
@@ -784,7 +797,11 @@ func (r *metadataResolver) resolveDir(ctx context.Context, inodeID uint64, popul
 
 	// 2. Fetch clean directory from snapshot
 	if r.snapshotReader != nil {
-		dirents, err := r.snapshotReader.ListDirectory(inodeID)
+		lookupNID := inodeID
+		if lookupNID == 1 && r.snapshotReader.GetRootNID() == 0 {
+			lookupNID = 0
+		}
+		dirents, err := r.snapshotReader.ListDirectory(lookupNID)
 		if err == nil {
 			for _, de := range dirents {
 				if de.Name == "." || de.Name == ".." {
@@ -795,9 +812,13 @@ func (r *metadataResolver) resolveDir(ctx context.Context, inodeID uint64, popul
 				if isDir {
 					mode = uint32(0755 | syscall.S_IFDIR)
 				}
+				childIno := de.NID
+				if childIno == 0 {
+					childIno = 1
+				}
 				entries[de.Name] = DirEntry{
 					Name:    de.Name,
-					InodeID: de.NID,
+					InodeID: childIno,
 					IsDir:   isDir,
 					Mode:    mode,
 				}
@@ -859,64 +880,7 @@ func (v *Volume) resolvePathLocked(ctx context.Context, p string) (uint64, uint6
 	return currInodeID, parentInodeID, baseName, nil
 }
 
-func (v *Volume) findOrCreateDirParentsLocked(ctx context.Context, p string) (uint64, error) {
-	p = cleanPath(p)
-	if p == "/" {
-		return v.rootInodeID, nil
-	}
-	parts := strings.Split(strings.Trim(p, "/"), "/")
-	currInodeID := v.rootInodeID
-	for _, part := range parts {
-		dir, err := v.getOrLoadDirLocked(ctx, currInodeID)
-		if err != nil {
-			return 0, err
-		}
-		entry, exists := dir.Entries[part]
-		if !exists {
-			childInodeID := v.allocInode()
-			now := time.Now()
-			childInode := &CachedInode{
-				ID:      childInodeID,
-				Mode:    0755 | syscall.S_IFDIR,
-				ModTime: now,
-				IsDir:   true,
-				IsDirty: true,
-			}
-
-			newEntry := DirEntry{
-				Name:    part,
-				InodeID: childInodeID,
-				IsDir:   true,
-				Mode:    0755 | syscall.S_IFDIR,
-			}
-			dir.Entries[part] = newEntry
-			dir.Added[part] = true
-			delete(dir.Deleted, part)
-			dir.IsDirty = true
-
-			v.inodeCache.Put(childInodeID, childInode)
-
-			childDir := &CachedDir{
-				ID:         childInodeID,
-				Entries:    make(map[string]DirEntry),
-				Added:      make(map[string]bool),
-				Deleted:    make(map[string]bool),
-				PrevOffset: NoOffset,
-				IsDirty:    true,
-			}
-			v.dirCache.Put(childInodeID, childDir)
-			currInodeID = childInodeID
-		} else {
-			if !entry.IsDir {
-				return 0, fmt.Errorf("path component %s is not a directory: %w", part, syscall.ENOTDIR)
-			}
-			currInodeID = entry.InodeID
-		}
-	}
-	return currInodeID, nil
-}
-
-func (v *Volume) toEntryAttrLocked(ctx context.Context, inodeID uint64, fullPath, name string) (*pb.EntryAttr, error) {
+func (v *Volume) toEntryAttrLocked(ctx context.Context, inodeID uint64, name string) (*pb.EntryAttr, error) {
 	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
 	if err != nil {
 		return nil, err
@@ -928,9 +892,11 @@ func (v *Volume) toEntryAttrLocked(ctx context.Context, inodeID uint64, fullPath
 	} else if mSha == "" {
 		mSha = node.Sha256
 	}
+	if name == "" && inodeID == v.rootInodeID {
+		name = "/"
+	}
 	return &pb.EntryAttr{
 		Inode:          node.ID,
-		Path:           fullPath,
 		Name:           name,
 		IsDir:          node.IsDir,
 		Size:           node.Size,
@@ -945,30 +911,43 @@ func (v *Volume) toEntryAttrLocked(ctx context.Context, inodeID uint64, fullPath
 	}, nil
 }
 
-func (v *Volume) GetAttr(ctx context.Context, p string) (*pb.EntryAttr, error) {
+func (v *Volume) GetAttr(ctx context.Context, inodeID uint64) (*pb.EntryAttr, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	p = cleanPath(p)
-	inodeID, _, baseName, err := v.resolvePathLocked(ctx, p)
-	if err != nil {
-		return nil, err
+	if inodeID == 0 {
+		inodeID = v.rootInodeID
 	}
-	if p == "/" {
-		baseName = "/"
-	}
-
-	return v.toEntryAttrLocked(ctx, inodeID, p, baseName)
+	return v.toEntryAttrLocked(ctx, inodeID, "")
 }
 
-func (v *Volume) Lookup(ctx context.Context, parentPath, name string) (*pb.EntryAttr, error) {
+func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) (*pb.EntryAttr, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	parentPath = cleanPath(parentPath)
-	parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
-	if err != nil {
-		return nil, err
+	if parentInodeID == 0 {
+		parentInodeID = v.rootInodeID
+	}
+
+	if name == "." {
+		return v.toEntryAttrLocked(ctx, parentInodeID, ".")
+	}
+	if name == ".." {
+		if parentInodeID == v.rootInodeID {
+			return v.toEntryAttrLocked(ctx, v.rootInodeID, "..")
+		}
+		parentNode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		if err != nil {
+			return nil, err
+		}
+		if !parentNode.IsDir {
+			return nil, syscall.ENOTDIR
+		}
+		pIno, ok := v.dirParents[parentInodeID]
+		if !ok || pIno == 0 {
+			pIno = v.rootInodeID
+		}
+		return v.toEntryAttrLocked(ctx, pIno, "..")
 	}
 
 	parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
@@ -978,21 +957,18 @@ func (v *Volume) Lookup(ctx context.Context, parentPath, name string) (*pb.Entry
 
 	entry, ok := parentDir.Entries[name]
 	if !ok {
-		return nil, fmt.Errorf("child %s not found in %s: %w", name, parentPath, syscall.ENOENT)
+		return nil, fmt.Errorf("child %s not found in inode %d: %w", name, parentInodeID, syscall.ENOENT)
 	}
 
-	fullPath := path.Join(parentPath, name)
-	return v.toEntryAttrLocked(ctx, entry.InodeID, fullPath, name)
+	return v.toEntryAttrLocked(ctx, entry.InodeID, name)
 }
 
-func (v *Volume) ReadDir(ctx context.Context, p string) ([]*pb.EntryAttr, error) {
+func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAttr, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	p = cleanPath(p)
-	dirInodeID, _, _, err := v.resolvePathLocked(ctx, p)
-	if err != nil {
-		return nil, err
+	if dirInodeID == 0 {
+		dirInodeID = v.rootInodeID
 	}
 
 	dirNode, err := v.getOrLoadInodeLocked(ctx, dirInodeID)
@@ -1000,7 +976,7 @@ func (v *Volume) ReadDir(ctx context.Context, p string) ([]*pb.EntryAttr, error)
 		return nil, err
 	}
 	if !dirNode.IsDir {
-		return nil, fmt.Errorf("path %s is not a directory: %w", p, syscall.ENOTDIR)
+		return nil, fmt.Errorf("inode %d is not a directory: %w", dirInodeID, syscall.ENOTDIR)
 	}
 
 	dir, err := v.getOrLoadDirLocked(ctx, dirInodeID)
@@ -1008,10 +984,16 @@ func (v *Volume) ReadDir(ctx context.Context, p string) ([]*pb.EntryAttr, error)
 		return nil, err
 	}
 
+	names := make([]string, 0, len(dir.Entries))
+	for name := range dir.Entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	var entries []*pb.EntryAttr
-	for name, entry := range dir.Entries {
-		childPath := path.Join(p, name)
-		attr, err := v.toEntryAttrLocked(ctx, entry.InodeID, childPath, name)
+	for _, name := range names {
+		entry := dir.Entries[name]
+		attr, err := v.toEntryAttrLocked(ctx, entry.InodeID, name)
 		if err == nil {
 			entries = append(entries, attr)
 		}
@@ -1019,22 +1001,16 @@ func (v *Volume) ReadDir(ctx context.Context, p string) ([]*pb.EntryAttr, error)
 	return entries, nil
 }
 
-func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint32) (*pb.EntryAttr, error) {
+func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, mode uint32, uid, gid uint32) (*pb.EntryAttr, error) {
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		p = cleanPath(p)
-		if p == "/" {
-			return nil, nil, fmt.Errorf("cannot recreate root directory: %w", syscall.EEXIST)
+		if parentInodeID == 0 {
+			parentInodeID = v.rootInodeID
 		}
-
-		parentPath := path.Dir(p)
-		baseName := path.Base(p)
-
-		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parent directory not found: %w", err)
+		if name == "" || name == "." || name == ".." {
+			return nil, nil, fmt.Errorf("invalid directory name %q: %w", name, syscall.EINVAL)
 		}
 
 		parentInode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
@@ -1042,7 +1018,7 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint
 			return nil, nil, err
 		}
 		if !parentInode.IsDir {
-			return nil, nil, fmt.Errorf("parent %s is not a directory: %w", parentPath, syscall.ENOTDIR)
+			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
 		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
@@ -1050,8 +1026,8 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint
 			return nil, nil, err
 		}
 
-		if _, exists := parentDir.Entries[baseName]; exists {
-			return nil, nil, fmt.Errorf("directory %s already exists: %w", p, syscall.EEXIST)
+		if _, exists := parentDir.Entries[name]; exists {
+			return nil, nil, fmt.Errorf("directory %s already exists under inode %d: %w", name, parentInodeID, syscall.EEXIST)
 		}
 
 		if mode == 0 {
@@ -1063,17 +1039,22 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint
 		childInodeID := v.allocInode()
 
 		newEntry := DirEntry{
-			Name:    baseName,
+			Name:    name,
 			InodeID: childInodeID,
 			IsDir:   true,
 			Mode:    mode,
 		}
-		parentDir.Entries[baseName] = newEntry
-		parentDir.Added[baseName] = true
-		delete(parentDir.Deleted, baseName)
+		parentDir.Entries[name] = newEntry
+		parentDir.Added[name] = true
+		delete(parentDir.Deleted, name)
 		parentDir.IsDirty = true
 		parentInode.ModTime = now
 		parentInode.IsDirty = true
+
+		if v.dirParents == nil {
+			v.dirParents = make(map[uint64]uint64)
+		}
+		v.dirParents[childInodeID] = parentInodeID
 
 		childInode := &CachedInode{
 			ID:      childInodeID,
@@ -1106,21 +1087,23 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint
 			IsDir: true,
 		}
 		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
-			delete(parentDir.Entries, baseName)
-			delete(parentDir.Added, baseName)
+			delete(parentDir.Entries, name)
+			delete(parentDir.Added, name)
+			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log child inode creation: %w", err)
 		}
 
 		dirEntryMsg := &pb.DirEntry{
 			ParentIno: proto.Uint64(parentInodeID),
-			Name:      proto.String(baseName),
+			Name:      proto.String(name),
 			Ino:       childInodeID,
 			IsDir:     true,
 			Mode:      mode,
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
-			delete(parentDir.Entries, baseName)
-			delete(parentDir.Added, baseName)
+			delete(parentDir.Entries, name)
+			delete(parentDir.Added, name)
+			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
@@ -1137,15 +1120,17 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint
 			ChunkSize:      parentInode.ChunkSize,
 		}
 		if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
-			delete(parentDir.Entries, baseName)
-			delete(parentDir.Added, baseName)
+			delete(parentDir.Entries, name)
+			delete(parentDir.Added, name)
+			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 
 		commitSeq, err = tx.Commit(ctx)
 		if err != nil {
-			delete(parentDir.Entries, baseName)
-			delete(parentDir.Added, baseName)
+			delete(parentDir.Entries, name)
+			delete(parentDir.Added, name)
+			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to commit mkdir transaction: %w", err)
 		}
 
@@ -1153,8 +1138,7 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint
 
 		attr := &pb.EntryAttr{
 			Inode:   childInodeID,
-			Path:    p,
-			Name:    baseName,
+			Name:    name,
 			IsDir:   true,
 			Size:    0,
 			Mode:    mode,
@@ -1163,9 +1147,11 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint
 			Gid:     gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_CREATED,
-			Path:      p,
-			Attr:      attr,
+			EventType:   pb.WatchEventType_EVENT_CREATED,
+			Attr:        attr,
+			Inode:       childInodeID,
+			ParentInode: parentInodeID,
+			Name:        name,
 		})
 
 		v.checkAutoSnapshotTriggerLocked(ctx)
@@ -1182,22 +1168,16 @@ func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32, uid, gid uint
 	return attr, nil
 }
 
-func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialContent []byte, uid, gid uint32) (*pb.EntryAttr, error) {
+func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name string, mode uint32, initialContent []byte, uid, gid uint32) (*pb.EntryAttr, error) {
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		p = cleanPath(p)
-		if p == "/" {
-			return nil, nil, fmt.Errorf("cannot create file at root: %w", syscall.EISDIR)
+		if parentInodeID == 0 {
+			parentInodeID = v.rootInodeID
 		}
-
-		parentPath := path.Dir(p)
-		baseName := path.Base(p)
-
-		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parent directory not found: %w", err)
+		if name == "" || name == "." || name == ".." {
+			return nil, nil, fmt.Errorf("invalid file name %q: %w", name, syscall.EINVAL)
 		}
 
 		parentInode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
@@ -1205,7 +1185,7 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			return nil, nil, err
 		}
 		if !parentInode.IsDir {
-			return nil, nil, fmt.Errorf("parent %s is not a directory: %w", parentPath, syscall.ENOTDIR)
+			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
 		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
@@ -1233,7 +1213,7 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			stream = blob.NewByteStreamFromBytes(dataCopy)
 		}
 
-		entry, exists := parentDir.Entries[baseName]
+		entry, exists := parentDir.Entries[name]
 		if exists {
 			childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
 			if err != nil {
@@ -1366,8 +1346,7 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 
 			attr := &pb.EntryAttr{
 				Inode:          childInode.ID,
-				Path:           p,
-				Name:           baseName,
+				Name:           name,
 				IsDir:          false,
 				Size:           childInode.Size,
 				Mode:           childInode.Mode,
@@ -1379,9 +1358,11 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 				Gid:            gid,
 			}
 			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-				EventType: pb.WatchEventType_EVENT_MODIFIED,
-				Path:      p,
-				Attr:      attr,
+				EventType:   pb.WatchEventType_EVENT_MODIFIED,
+				Attr:        attr,
+				Inode:       childInode.ID,
+				ParentInode: parentInodeID,
+				Name:        name,
 			})
 			v.checkAutoSnapshotTriggerLocked(ctx)
 			return attr, waitFn, nil
@@ -1389,14 +1370,14 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 
 		childInodeID := v.allocInode()
 		newEntry := DirEntry{
-			Name:    baseName,
+			Name:    name,
 			InodeID: childInodeID,
 			IsDir:   false,
 			Mode:    mode,
 		}
-		parentDir.Entries[baseName] = newEntry
-		parentDir.Added[baseName] = true
-		delete(parentDir.Deleted, baseName)
+		parentDir.Entries[name] = newEntry
+		parentDir.Added[name] = true
+		delete(parentDir.Deleted, name)
 		parentDir.IsDirty = true
 		parentInode.ModTime = now
 		parentInode.IsDirty = true
@@ -1445,8 +1426,8 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			for idx, chunkBytes := range childInode.DirtyChunks {
 				if idx < len(childInode.Chunks) && childInode.Chunks[idx] != "" {
 					if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(childInode.Chunks[idx]), Data: chunkBytes}); err != nil {
-						delete(parentDir.Entries, baseName)
-						delete(parentDir.Added, baseName)
+						delete(parentDir.Entries, name)
+						delete(parentDir.Added, name)
 						return nil, nil, fmt.Errorf("failed to log chunk content: %w", err)
 					}
 				}
@@ -1466,31 +1447,31 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 				}
 				manifestBlob, err := blob.EncodeManifest(manifest)
 				if err != nil {
-					delete(parentDir.Entries, baseName)
-					delete(parentDir.Added, baseName)
+					delete(parentDir.Entries, name)
+					delete(parentDir.Added, name)
 					return nil, nil, fmt.Errorf("failed to encode manifest: %w", err)
 				}
 				if err := manifestBlob.Stream.Rewind(); err != nil {
-					delete(parentDir.Entries, baseName)
-					delete(parentDir.Added, baseName)
+					delete(parentDir.Entries, name)
+					delete(parentDir.Added, name)
 					return nil, nil, fmt.Errorf("failed to rewind manifest stream: %w", err)
 				}
 				mBytes, err := io.ReadAll(manifestBlob.Stream)
 				if err != nil {
-					delete(parentDir.Entries, baseName)
-					delete(parentDir.Added, baseName)
+					delete(parentDir.Entries, name)
+					delete(parentDir.Added, name)
 					return nil, nil, fmt.Errorf("failed to read manifest stream: %w", err)
 				}
 				if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(manifestBlob.SHA256Hex()), Data: mBytes}); err != nil {
-					delete(parentDir.Entries, baseName)
-					delete(parentDir.Added, baseName)
+					delete(parentDir.Entries, name)
+					delete(parentDir.Added, name)
 					return nil, nil, fmt.Errorf("failed to log manifest content: %w", err)
 				}
 			}
 		} else if len(dataCopy) > 0 {
 			if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(childInode.Sha256), Data: dataCopy}); err != nil {
-				delete(parentDir.Entries, baseName)
-				delete(parentDir.Added, baseName)
+				delete(parentDir.Entries, name)
+				delete(parentDir.Added, name)
 				return nil, nil, fmt.Errorf("failed to log file content: %w", err)
 			}
 		}
@@ -1508,21 +1489,21 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			ChunkSize:      childInode.ChunkSize,
 		}
 		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
-			delete(parentDir.Entries, baseName)
-			delete(parentDir.Added, baseName)
+			delete(parentDir.Entries, name)
+			delete(parentDir.Added, name)
 			return nil, nil, fmt.Errorf("failed to log child inode creation: %w", err)
 		}
 
 		dirEntryMsg := &pb.DirEntry{
 			ParentIno: proto.Uint64(parentInodeID),
-			Name:      proto.String(baseName),
+			Name:      proto.String(name),
 			Ino:       childInodeID,
 			IsDir:     false,
 			Mode:      mode,
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
-			delete(parentDir.Entries, baseName)
-			delete(parentDir.Added, baseName)
+			delete(parentDir.Entries, name)
+			delete(parentDir.Added, name)
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
@@ -1539,14 +1520,14 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			ChunkSize:      parentInode.ChunkSize,
 		}
 		if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
-			delete(parentDir.Entries, baseName)
-			delete(parentDir.Added, baseName)
+			delete(parentDir.Entries, name)
+			delete(parentDir.Added, name)
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 		commitSeq, err = tx.Commit(ctx)
 		if err != nil {
-			delete(parentDir.Entries, baseName)
-			delete(parentDir.Added, baseName)
+			delete(parentDir.Entries, name)
+			delete(parentDir.Added, name)
 			return nil, nil, fmt.Errorf("failed to commit create file transaction: %w", err)
 		}
 
@@ -1554,8 +1535,7 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 
 		attr := &pb.EntryAttr{
 			Inode:          childInodeID,
-			Path:           p,
-			Name:           baseName,
+			Name:           name,
 			IsDir:          false,
 			Size:           int64(len(dataCopy)),
 			Mode:           mode,
@@ -1567,9 +1547,11 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			Gid:            gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_CREATED,
-			Path:      p,
-			Attr:      attr,
+			EventType:   pb.WatchEventType_EVENT_CREATED,
+			Attr:        attr,
+			Inode:       childInodeID,
+			ParentInode: parentInodeID,
+			Name:        name,
 		})
 
 		v.checkAutoSnapshotTriggerLocked(ctx)
@@ -1586,13 +1568,10 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 	return attr, nil
 }
 
-func (v *Volume) ReadFile(ctx context.Context, p string, offset, length int64) ([]byte, int64, string, error) {
+func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length int64) ([]byte, int64, string, error) {
 	v.mu.RLock()
-	p = cleanPath(p)
-	inodeID, _, _, err := v.resolvePathLocked(ctx, p)
-	if err != nil {
-		v.mu.RUnlock()
-		return nil, 0, "", err
+	if inodeID == 0 {
+		inodeID = v.rootInodeID
 	}
 
 	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
@@ -1667,19 +1646,12 @@ func (v *Volume) ReadFile(ctx context.Context, p string, offset, length int64) (
 		return res.Bytes(), total, "", nil
 	}
 
-	// Lazy load data from blob store / backend if not currently in memory
+	// Lazy load data from blob store if not currently in memory
 	if node.Data == nil && node.Size > 0 {
 		if node.Sha256 != "" && v.blobStore != nil {
 			stream, err := v.blobStore.GetBlob(ctx, node.Sha256)
 			if err == nil {
 				node.Data = stream
-			}
-		}
-		if node.Data == nil && v.backend != nil {
-			var legacyBuf bytes.Buffer
-			err := v.backend.GetObject(ctx, v.volumeID, strings.TrimPrefix(p, "/"), 0, node.Size, &legacyBuf)
-			if err == nil {
-				node.Data = blob.NewByteStreamFromBytes(legacyBuf.Bytes())
 			}
 		}
 	}
@@ -1700,15 +1672,13 @@ func (v *Volume) ReadFile(ctx context.Context, p string, offset, length int64) (
 	return res[:n], total, "", nil
 }
 
-func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []byte, writeMode pb.WriteMode) (int64, int64, time.Time, error) {
+func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, data []byte, writeMode pb.WriteMode) (int64, int64, time.Time, error) {
 	nWritten, newSize, modTime, waitFn, err := func() (int64, int64, time.Time, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		p = cleanPath(p)
-		inodeID, _, baseName, err := v.resolvePathLocked(ctx, p)
-		if err != nil {
-			return 0, 0, time.Time{}, nil, err
+		if inodeID == 0 {
+			inodeID = v.rootInodeID
 		}
 
 		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
@@ -1983,8 +1953,6 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 
 		attr := &pb.EntryAttr{
 			Inode:          node.ID,
-			Path:           p,
-			Name:           baseName,
 			IsDir:          false,
 			Size:           node.Size,
 			Mode:           node.Mode,
@@ -1997,8 +1965,8 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
-			Path:      p,
 			Attr:      attr,
+			Inode:     node.ID,
 		})
 
 		v.checkAutoSnapshotTriggerLocked(ctx)
@@ -2015,15 +1983,13 @@ func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []b
 	return nWritten, newSize, modTime, nil
 }
 
-func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.EntryAttr, error) {
+func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (*pb.EntryAttr, error) {
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		p = cleanPath(p)
-		inodeID, _, baseName, err := v.resolvePathLocked(ctx, p)
-		if err != nil {
-			return nil, nil, err
+		if inodeID == 0 {
+			inodeID = v.rootInodeID
 		}
 
 		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
@@ -2230,8 +2196,6 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 
 		attr := &pb.EntryAttr{
 			Inode:          node.ID,
-			Path:           p,
-			Name:           baseName,
 			IsDir:          false,
 			Size:           node.Size,
 			Mode:           node.Mode,
@@ -2244,8 +2208,8 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
-			Path:      p,
 			Attr:      attr,
+			Inode:     node.ID,
 		})
 		v.checkAutoSnapshotTriggerLocked(ctx)
 		return attr, waitFn, nil
@@ -2261,22 +2225,13 @@ func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.En
 	return attr, nil
 }
 
-func (v *Volume) Unlink(ctx context.Context, p string) error {
+func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) error {
 	waitFn, err := func() (func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		p = cleanPath(p)
-		if p == "/" {
-			return nil, fmt.Errorf("cannot unlink root: %w", syscall.EBUSY)
-		}
-
-		parentPath := path.Dir(p)
-		baseName := path.Base(p)
-
-		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
-		if err != nil {
-			return nil, err
+		if parentInodeID == 0 {
+			parentInodeID = v.rootInodeID
 		}
 
 		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
@@ -2284,9 +2239,9 @@ func (v *Volume) Unlink(ctx context.Context, p string) error {
 			return nil, err
 		}
 
-		entry, ok := parentDir.Entries[baseName]
+		entry, ok := parentDir.Entries[name]
 		if !ok {
-			return nil, fmt.Errorf("file %s not found: %w", p, syscall.ENOENT)
+			return nil, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 		}
 
 		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
@@ -2294,16 +2249,16 @@ func (v *Volume) Unlink(ctx context.Context, p string) error {
 			return nil, err
 		}
 		if childInode.IsDir {
-			return nil, fmt.Errorf("cannot unlink directory %s: %w", p, syscall.EISDIR)
+			return nil, fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
 		}
 
 		if childInode.Data != nil {
 			_ = childInode.Data.Close()
 		}
 
-		delete(parentDir.Entries, baseName)
-		delete(parentDir.Added, baseName)
-		parentDir.Deleted[baseName] = true
+		delete(parentDir.Entries, name)
+		delete(parentDir.Added, name)
+		parentDir.Deleted[name] = true
 		parentDir.IsDirty = true
 
 		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
@@ -2312,11 +2267,9 @@ func (v *Volume) Unlink(ctx context.Context, p string) error {
 			parentInode.IsDirty = true
 		}
 
-		v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, p)
-
 		var commitSeq uint64
 		tx := v.metadataStream.Begin()
-		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(baseName)}); err != nil {
+		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
 		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInode.ID)}); err != nil {
@@ -2347,8 +2300,10 @@ func (v *Volume) Unlink(ctx context.Context, p string) error {
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_DELETED,
-			Path:      p,
+			EventType:   pb.WatchEventType_EVENT_DELETED,
+			Inode:       childInode.ID,
+			ParentInode: parentInodeID,
+			Name:        name,
 		})
 
 		v.checkAutoSnapshotTriggerLocked(ctx)
@@ -2365,22 +2320,13 @@ func (v *Volume) Unlink(ctx context.Context, p string) error {
 	return nil
 }
 
-func (v *Volume) Rmdir(ctx context.Context, p string) error {
+func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) error {
 	waitFn, err := func() (func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		p = cleanPath(p)
-		if p == "/" {
-			return nil, fmt.Errorf("cannot rmdir root: %w", syscall.EBUSY)
-		}
-
-		parentPath := path.Dir(p)
-		baseName := path.Base(p)
-
-		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
-		if err != nil {
-			return nil, err
+		if parentInodeID == 0 {
+			parentInodeID = v.rootInodeID
 		}
 
 		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
@@ -2388,9 +2334,9 @@ func (v *Volume) Rmdir(ctx context.Context, p string) error {
 			return nil, err
 		}
 
-		entry, ok := parentDir.Entries[baseName]
+		entry, ok := parentDir.Entries[name]
 		if !ok {
-			return nil, fmt.Errorf("directory %s not found: %w", p, syscall.ENOENT)
+			return nil, fmt.Errorf("directory %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 		}
 
 		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
@@ -2398,7 +2344,7 @@ func (v *Volume) Rmdir(ctx context.Context, p string) error {
 			return nil, err
 		}
 		if !childInode.IsDir {
-			return nil, fmt.Errorf("cannot rmdir non-directory %s: %w", p, syscall.ENOTDIR)
+			return nil, fmt.Errorf("cannot rmdir non-directory %s: %w", name, syscall.ENOTDIR)
 		}
 
 		childDir, err := v.getOrLoadDirLocked(ctx, entry.InodeID)
@@ -2406,13 +2352,14 @@ func (v *Volume) Rmdir(ctx context.Context, p string) error {
 			return nil, err
 		}
 		if len(childDir.Entries) > 0 {
-			return nil, fmt.Errorf("directory %s not empty: %w", p, syscall.ENOTEMPTY)
+			return nil, fmt.Errorf("directory %s not empty: %w", name, syscall.ENOTEMPTY)
 		}
 
-		delete(parentDir.Entries, baseName)
-		delete(parentDir.Added, baseName)
-		parentDir.Deleted[baseName] = true
+		delete(parentDir.Entries, name)
+		delete(parentDir.Added, name)
+		parentDir.Deleted[name] = true
 		parentDir.IsDirty = true
+		delete(v.dirParents, childInode.ID)
 
 		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
 		if parentInode != nil {
@@ -2422,7 +2369,7 @@ func (v *Volume) Rmdir(ctx context.Context, p string) error {
 
 		var commitSeq uint64
 		tx := v.metadataStream.Begin()
-		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(baseName)}); err != nil {
+		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
 		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInode.ID)}); err != nil {
@@ -2453,8 +2400,10 @@ func (v *Volume) Rmdir(ctx context.Context, p string) error {
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_DELETED,
-			Path:      p,
+			EventType:   pb.WatchEventType_EVENT_DELETED,
+			Inode:       childInode.ID,
+			ParentInode: parentInodeID,
+			Name:        name,
 		})
 
 		v.checkAutoSnapshotTriggerLocked(ctx)
@@ -2471,26 +2420,20 @@ func (v *Volume) Rmdir(ctx context.Context, p string) error {
 	return nil
 }
 
-func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.EntryAttr, error) {
+func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName string, newParentInodeID uint64, newName string) (*pb.EntryAttr, error) {
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		oldPath = cleanPath(oldPath)
-		newPath = cleanPath(newPath)
-
-		if oldPath == "/" || newPath == "/" {
-			return nil, nil, fmt.Errorf("cannot rename root: %w", syscall.EBUSY)
+		if oldParentInodeID == 0 {
+			oldParentInodeID = v.rootInodeID
+		}
+		if newParentInodeID == 0 {
+			newParentInodeID = v.rootInodeID
 		}
 
-		oldParentPath := path.Dir(oldPath)
-		oldBaseName := path.Base(oldPath)
-		newParentPath := path.Dir(newPath)
-		newBaseName := path.Base(newPath)
-
-		oldParentInodeID, _, _, err := v.resolvePathLocked(ctx, oldParentPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("old parent not found: %w", err)
+		if oldName == "" || oldName == "." || oldName == ".." || newName == "" || newName == "." || newName == ".." {
+			return nil, nil, fmt.Errorf("invalid name for rename: %w", syscall.EINVAL)
 		}
 
 		oldParentDir, err := v.getOrLoadDirLocked(ctx, oldParentInodeID)
@@ -2498,14 +2441,9 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 			return nil, nil, fmt.Errorf("old parent directory not loaded: %w", err)
 		}
 
-		entry, ok := oldParentDir.Entries[oldBaseName]
+		entry, ok := oldParentDir.Entries[oldName]
 		if !ok {
-			return nil, nil, fmt.Errorf("source %s not found: %w", oldPath, syscall.ENOENT)
-		}
-
-		newParentInodeID, _, _, err := v.resolvePathLocked(ctx, newParentPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("new parent not found: %w", err)
+			return nil, nil, fmt.Errorf("source %s not found in parent %d: %w", oldName, oldParentInodeID, syscall.ENOENT)
 		}
 
 		newParentInode, err := v.getOrLoadInodeLocked(ctx, newParentInodeID)
@@ -2513,7 +2451,7 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 			return nil, nil, err
 		}
 		if !newParentInode.IsDir {
-			return nil, nil, fmt.Errorf("target parent %s is not a directory: %w", newParentPath, syscall.ENOTDIR)
+			return nil, nil, fmt.Errorf("target parent %d is not a directory: %w", newParentInodeID, syscall.ENOTDIR)
 		}
 
 		newParentDir, err := v.getOrLoadDirLocked(ctx, newParentInodeID)
@@ -2521,7 +2459,30 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 			return nil, nil, err
 		}
 
-		targetEntry, targetExists := newParentDir.Entries[newBaseName]
+		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if childInode.IsDir && newParentInodeID != oldParentInodeID {
+			currCheck := newParentInodeID
+			for currCheck != 0 && currCheck != v.rootInodeID {
+				if currCheck == childInode.ID {
+					return nil, nil, fmt.Errorf("cannot move directory into its own subdirectory: %w", syscall.EINVAL)
+				}
+				pIno, ok := v.dirParents[currCheck]
+				if !ok || pIno == currCheck {
+					break
+				}
+				currCheck = pIno
+			}
+			if v.dirParents == nil {
+				v.dirParents = make(map[uint64]uint64)
+			}
+			v.dirParents[childInode.ID] = newParentInodeID
+		}
+
+		targetEntry, targetExists := newParentDir.Entries[newName]
 		if targetExists {
 			targetInode, _ := v.getOrLoadInodeLocked(ctx, targetEntry.InodeID)
 			if targetInode != nil && targetInode.Data != nil {
@@ -2530,23 +2491,20 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 		}
 
 		// Move entry
-		delete(oldParentDir.Entries, oldBaseName)
-		delete(oldParentDir.Added, oldBaseName)
-		oldParentDir.Deleted[oldBaseName] = true
+		delete(oldParentDir.Entries, oldName)
+		delete(oldParentDir.Added, oldName)
+		oldParentDir.Deleted[oldName] = true
 		oldParentDir.IsDirty = true
 
-		entry.Name = newBaseName
-		newParentDir.Entries[newBaseName] = entry
-		newParentDir.Added[newBaseName] = true
-		delete(newParentDir.Deleted, newBaseName)
+		entry.Name = newName
+		newParentDir.Entries[newName] = entry
+		newParentDir.Added[newName] = true
+		delete(newParentDir.Deleted, newName)
 		newParentDir.IsDirty = true
 
 		now := time.Now()
-		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
-		if err == nil {
-			childInode.ModTime = now
-			childInode.IsDirty = true
-		}
+		childInode.ModTime = now
+		childInode.IsDirty = true
 
 		oldParentInode, _ := v.getOrLoadInodeLocked(ctx, oldParentInodeID)
 		if oldParentInode != nil {
@@ -2556,15 +2514,13 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 		newParentInode.ModTime = now
 		newParentInode.IsDirty = true
 
-		v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, oldPath)
-
 		var commitSeq uint64
 		tx := v.metadataStream.Begin()
-		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(oldParentInodeID), Name: proto.String(oldBaseName)}); err != nil {
+		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(oldParentInodeID), Name: proto.String(oldName)}); err != nil {
 			return nil, nil, fmt.Errorf("failed to log old dir entry deletion: %w", err)
 		}
 		if targetExists {
-			if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(newParentInodeID), Name: proto.String(newBaseName)}); err != nil {
+			if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(newParentInodeID), Name: proto.String(newName)}); err != nil {
 				return nil, nil, fmt.Errorf("failed to log target dir entry deletion: %w", err)
 			}
 			if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(targetEntry.InodeID)}); err != nil {
@@ -2573,7 +2529,7 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 		}
 		if _, err := tx.Insert(ctx, &pb.DirEntry{
 			ParentIno: proto.Uint64(newParentInodeID),
-			Name:      proto.String(newBaseName),
+			Name:      proto.String(newName),
 			Ino:       entry.InodeID,
 			IsDir:     entry.IsDir,
 			Mode:      entry.Mode,
@@ -2640,8 +2596,7 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 
 		attr := &pb.EntryAttr{
 			Inode:   entry.InodeID,
-			Path:    newPath,
-			Name:    newBaseName,
+			Name:    newName,
 			IsDir:   entry.IsDir,
 			Size:    childInode.Size,
 			Mode:    childInode.Mode,
@@ -2651,10 +2606,13 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 			Gid:     childInode.Gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_RENAMED,
-			Path:      newPath,
-			OldPath:   oldPath,
-			Attr:      attr,
+			EventType:      pb.WatchEventType_EVENT_RENAMED,
+			Attr:           attr,
+			Inode:          entry.InodeID,
+			OldParentInode: oldParentInodeID,
+			OldName:        oldName,
+			ParentInode:    newParentInodeID,
+			Name:           newName,
 		})
 
 		v.checkAutoSnapshotTriggerLocked(ctx)
@@ -2671,9 +2629,12 @@ func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.Entry
 	return attr, nil
 }
 
-func (v *Volume) Fsync(ctx context.Context, p string) error {
+func (v *Volume) Fsync(ctx context.Context, inodeID uint64) error {
 	v.mu.RLock()
-	_, _, _, err := v.resolvePathLocked(ctx, p)
+	if inodeID == 0 {
+		inodeID = v.rootInodeID
+	}
+	_, err := v.getOrLoadInodeLocked(ctx, inodeID)
 	v.mu.RUnlock()
 	if err != nil {
 		return err
@@ -2684,6 +2645,13 @@ func (v *Volume) Fsync(ctx context.Context, p string) error {
 		}
 	}
 	return nil
+}
+
+func (v *Volume) ResolvePath(ctx context.Context, p string) (uint64, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	inodeID, _, _, err := v.resolvePathLocked(ctx, p)
+	return inodeID, err
 }
 
 type bufferWriterAt struct {
@@ -2945,6 +2913,15 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 			return fmt.Errorf("failed to build hierarchy for snapshot: %w", err)
 		}
 
+		if v.lastFlushedMetadata != nil {
+			for oldPath := range v.lastFlushedMetadata.Entries {
+				if _, stillExists := currentEntries[oldPath]; !stillExists {
+					key := strings.TrimPrefix(oldPath, "/")
+					_ = v.backend.DeleteObject(ctx, v.volumeID, key)
+				}
+			}
+		}
+
 		if len(dirtyBlobs) > 0 && v.blobStore != nil {
 			if err := v.blobStore.PutBlobs(ctx, dirtyBlobs); err != nil {
 				return fmt.Errorf("failed to persist blobs: %w", err)
@@ -3102,16 +3079,13 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 
 	switch record.Type {
 	case MutationMkdir:
-		p := cleanPath(record.Path)
-		if p == "/" {
-			return nil
+		parentInodeID := record.ParentInode
+		if parentInodeID == 0 {
+			parentInodeID = v.rootInodeID
 		}
-		parentPath := path.Dir(p)
-		baseName := path.Base(p)
-
-		parentInodeID, err := v.findOrCreateDirParentsLocked(ctx, parentPath)
-		if err != nil {
-			return err
+		baseName := record.Name
+		if baseName == "" {
+			return nil
 		}
 
 		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
@@ -3166,19 +3140,20 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 			Mode:    mode,
 		}
 		parentDir.Entries[baseName] = newEntry
+		if v.dirParents == nil {
+			v.dirParents = make(map[uint64]uint64)
+		}
+		v.dirParents[inodeID] = parentInodeID
 		return nil
 
 	case MutationCreateFile:
-		p := cleanPath(record.Path)
-		if p == "/" {
-			return fmt.Errorf("cannot create file at root: %w", syscall.EISDIR)
+		parentInodeID := record.ParentInode
+		if parentInodeID == 0 {
+			parentInodeID = v.rootInodeID
 		}
-		parentPath := path.Dir(p)
-		baseName := path.Base(p)
-
-		parentInodeID, err := v.findOrCreateDirParentsLocked(ctx, parentPath)
-		if err != nil {
-			return err
+		baseName := record.Name
+		if baseName == "" {
+			return nil
 		}
 
 		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
@@ -3236,10 +3211,9 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		return nil
 
 	case MutationWriteFile:
-		p := cleanPath(record.Path)
-		inodeID, _, _, err := v.resolvePathLocked(ctx, p)
-		if err != nil {
-			return err
+		inodeID := record.Inode
+		if inodeID == 0 {
+			return nil
 		}
 		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
 		if err != nil {
@@ -3283,10 +3257,9 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		return nil
 
 	case MutationTruncateFile:
-		p := cleanPath(record.Path)
-		inodeID, _, _, err := v.resolvePathLocked(ctx, p)
-		if err != nil {
-			return err
+		inodeID := record.Inode
+		if inodeID == 0 {
+			return nil
 		}
 		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
 		if err != nil {
@@ -3321,14 +3294,11 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		return nil
 
 	case MutationUnlink:
-		p := cleanPath(record.Path)
-		parentPath := path.Dir(p)
-		baseName := path.Base(p)
-
-		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
-		if err != nil {
-			return nil
+		parentInodeID := record.ParentInode
+		if parentInodeID == 0 {
+			parentInodeID = v.rootInodeID
 		}
+		baseName := record.Name
 		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
 		if err != nil {
 			return nil
@@ -3337,33 +3307,33 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		return nil
 
 	case MutationRmdir:
-		p := cleanPath(record.Path)
-		parentPath := path.Dir(p)
-		baseName := path.Base(p)
-
-		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
-		if err != nil {
-			return nil
+		parentInodeID := record.ParentInode
+		if parentInodeID == 0 {
+			parentInodeID = v.rootInodeID
 		}
+		baseName := record.Name
 		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
 		if err != nil {
 			return nil
+		}
+		if entry, ok := parentDir.Entries[baseName]; ok {
+			delete(v.dirParents, entry.InodeID)
 		}
 		delete(parentDir.Entries, baseName)
 		return nil
 
 	case MutationRename:
-		oldP := cleanPath(record.OldPath)
-		newP := cleanPath(record.Path)
-		oldParentPath := path.Dir(oldP)
-		oldBase := path.Base(oldP)
-		newParentPath := path.Dir(newP)
-		newBase := path.Base(newP)
-
-		oldParentInodeID, _, _, err := v.resolvePathLocked(ctx, oldParentPath)
-		if err != nil {
-			return err
+		oldParentInodeID := record.OldParentInode
+		if oldParentInodeID == 0 {
+			oldParentInodeID = v.rootInodeID
 		}
+		oldBase := record.OldName
+		newParentInodeID := record.ParentInode
+		if newParentInodeID == 0 {
+			newParentInodeID = v.rootInodeID
+		}
+		newBase := record.Name
+
 		oldParentDir, err := v.getOrLoadDirLocked(ctx, oldParentInodeID)
 		if err != nil {
 			return err
@@ -3371,13 +3341,9 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 
 		entry, ok := oldParentDir.Entries[oldBase]
 		if !ok {
-			return fmt.Errorf("rename source not found: %s", oldP)
+			return fmt.Errorf("rename source not found: %s in inode %d", oldBase, oldParentInodeID)
 		}
 
-		newParentInodeID, err := v.findOrCreateDirParentsLocked(ctx, newParentPath)
-		if err != nil {
-			return err
-		}
 		newParentDir, err := v.getOrLoadDirLocked(ctx, newParentInodeID)
 		if err != nil {
 			return err
@@ -3386,6 +3352,12 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		delete(oldParentDir.Entries, oldBase)
 		entry.Name = newBase
 		newParentDir.Entries[newBase] = entry
+		if entry.IsDir {
+			if v.dirParents == nil {
+				v.dirParents = make(map[uint64]uint64)
+			}
+			v.dirParents[entry.InodeID] = newParentInodeID
+		}
 
 		if record.ModTime != nil {
 			childInode, _ := v.getOrLoadInodeLocked(ctx, entry.InodeID)
@@ -3536,6 +3508,10 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 			v.dirCache.Put(parentIno, parentDir)
 		}
 
+		if v.dirParents == nil {
+			v.dirParents = make(map[uint64]uint64)
+		}
+
 		switch change.Op {
 		case sdsv1.OpRecord_CREATE, sdsv1.OpRecord_UPDATE:
 			parentDir.Entries[name] = DirEntry{
@@ -3545,8 +3521,12 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 				Mode:    row.GetMode(),
 			}
 			delete(parentDir.Deleted, name)
+			if row.GetIsDir() {
+				v.dirParents[row.GetIno()] = parentIno
+			}
 		case sdsv1.OpRecord_DELETE:
 			delete(parentDir.Entries, name)
+			delete(v.dirParents, row.GetIno())
 		}
 
 	default:

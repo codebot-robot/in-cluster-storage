@@ -131,7 +131,8 @@ func TestBlobsListAndGet(t *testing.T) {
 
 	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       volumeID,
-		Path:           "/test1.txt",
+		ParentInode:    1,
+		Name:           "test1.txt",
 		InitialContent: content1,
 	})
 	if err != nil {
@@ -140,7 +141,8 @@ func TestBlobsListAndGet(t *testing.T) {
 
 	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       volumeID,
-		Path:           "/test2.txt",
+		ParentInode:    1,
+		Name:           "test2.txt",
 		InitialContent: content2,
 	})
 	if err != nil {
@@ -258,7 +260,8 @@ func TestBlobsOverUnixSocket(t *testing.T) {
 
 	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       volumeID,
-		Path:           "/unix_file.txt",
+		ParentInode:    1,
+		Name:           "unix_file.txt",
 		InitialContent: content,
 	})
 	if err != nil {
@@ -313,7 +316,8 @@ func TestVolumesList(t *testing.T) {
 	for _, v := range volNames {
 		_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
 			VolumeId:       v,
-			Path:           "/test.txt",
+			ParentInode:    1,
+			Name:           "test.txt",
 			InitialContent: []byte("sample content for " + v),
 		})
 		if err != nil {
@@ -399,7 +403,8 @@ func TestSnapshotsListAndCreate(t *testing.T) {
 	// 3. Create file in volume
 	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       volumeID,
-		Path:           "/doc1.txt",
+		ParentInode:    1,
+		Name:           "doc1.txt",
 		InitialContent: []byte("doc 1 content"),
 	})
 	if err != nil {
@@ -421,7 +426,8 @@ func TestSnapshotsListAndCreate(t *testing.T) {
 	// Modify and create snapshot 2 via CLI
 	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       volumeID,
-		Path:           "/doc2.txt",
+		ParentInode:    1,
+		Name:           "doc2.txt",
 		InitialContent: []byte("doc 2 content"),
 	})
 	if err != nil {
@@ -442,7 +448,8 @@ func TestSnapshotsListAndCreate(t *testing.T) {
 	// Modify and create snapshot 3 via CLI
 	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       volumeID,
-		Path:           "/doc3.txt",
+		ParentInode:    1,
+		Name:           "doc3.txt",
 		InitialContent: []byte("doc 3 content"),
 	})
 	if err != nil {
@@ -506,7 +513,8 @@ func TestVolumesAndSnapshotsOverUnixSocket(t *testing.T) {
 	volumeID := "unix-snap-vol"
 	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       volumeID,
-		Path:           "/file.txt",
+		ParentInode:    1,
+		Name:           "file.txt",
 		InitialContent: []byte("content on unix socket"),
 	})
 	if err != nil {

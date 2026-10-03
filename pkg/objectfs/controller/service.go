@@ -275,7 +275,7 @@ func (s *Server) GetAttr(ctx context.Context, req *pb.GetAttrRequest) (*pb.GetAt
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	attr, err := vol.GetAttr(ctx, req.GetPath())
+	attr, err := vol.GetAttr(ctx, req.GetInode())
 	if err != nil {
 		return &pb.GetAttrResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -290,7 +290,7 @@ func (s *Server) Lookup(ctx context.Context, req *pb.LookupRequest) (*pb.LookupR
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	attr, err := vol.Lookup(ctx, req.GetParentPath(), req.GetName())
+	attr, err := vol.Lookup(ctx, req.GetParentInode(), req.GetName())
 	if err != nil {
 		return &pb.LookupResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -305,7 +305,7 @@ func (s *Server) ReadDir(ctx context.Context, req *pb.ReadDirRequest) (*pb.ReadD
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	entries, err := vol.ReadDir(ctx, req.GetPath())
+	entries, err := vol.ReadDir(ctx, req.GetInode())
 	if err != nil {
 		return &pb.ReadDirResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -320,7 +320,7 @@ func (s *Server) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MkdirResp
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	attr, err := vol.Mkdir(ctx, req.GetPath(), req.GetMode(), req.GetUid(), req.GetGid())
+	attr, err := vol.Mkdir(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetUid(), req.GetGid())
 	if err != nil {
 		return &pb.MkdirResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -335,7 +335,7 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	attr, err := vol.CreateFile(ctx, req.GetPath(), req.GetMode(), req.GetInitialContent(), req.GetUid(), req.GetGid())
+	attr, err := vol.CreateFile(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetInitialContent(), req.GetUid(), req.GetGid())
 	if err != nil {
 		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -350,7 +350,7 @@ func (s *Server) ReadFile(ctx context.Context, req *pb.ReadFileRequest) (*pb.Rea
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	data, totalSize, redirectURL, err := vol.ReadFile(ctx, req.GetPath(), req.GetOffset(), req.GetSize())
+	data, totalSize, redirectURL, err := vol.ReadFile(ctx, req.GetInode(), req.GetOffset(), req.GetSize())
 	if err != nil {
 		return &pb.ReadFileResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -372,7 +372,7 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	bytesWritten, newSize, modTime, err := vol.WriteFile(ctx, req.GetPath(), req.GetOffset(), req.GetData(), req.GetWriteMode())
+	bytesWritten, newSize, modTime, err := vol.WriteFile(ctx, req.GetInode(), req.GetOffset(), req.GetData(), req.GetWriteMode())
 	if err != nil {
 		return &pb.WriteFileResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -391,7 +391,7 @@ func (s *Server) TruncateFile(ctx context.Context, req *pb.TruncateFileRequest) 
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	attr, err := vol.TruncateFile(ctx, req.GetPath(), req.GetSize())
+	attr, err := vol.TruncateFile(ctx, req.GetInode(), req.GetSize())
 	if err != nil {
 		return &pb.TruncateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -406,7 +406,7 @@ func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkR
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	if err := vol.Unlink(ctx, req.GetPath()); err != nil {
+	if err := vol.Unlink(ctx, req.GetParentInode(), req.GetName()); err != nil {
 		return &pb.UnlinkResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.UnlinkResponse{Success: true}, nil
@@ -420,7 +420,7 @@ func (s *Server) Rmdir(ctx context.Context, req *pb.RmdirRequest) (*pb.RmdirResp
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	if err := vol.Rmdir(ctx, req.GetPath()); err != nil {
+	if err := vol.Rmdir(ctx, req.GetParentInode(), req.GetName()); err != nil {
 		return &pb.RmdirResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.RmdirResponse{Success: true}, nil
@@ -434,7 +434,7 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	attr, err := vol.Rename(ctx, req.GetOldPath(), req.GetNewPath())
+	attr, err := vol.Rename(ctx, req.GetOldParentInode(), req.GetOldName(), req.GetNewParentInode(), req.GetNewName())
 	if err != nil {
 		return &pb.RenameResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -449,7 +449,7 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	if err := vol.Fsync(ctx, req.GetPath()); err != nil {
+	if err := vol.Fsync(ctx, req.GetInode()); err != nil {
 		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.FsyncResponse{Success: true}, nil
