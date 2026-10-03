@@ -17,6 +17,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -55,8 +56,10 @@ type Option func(*options)
 
 type options struct {
 	streamID    string
+	lockingMode string
 	journalMode string
 	synchronous string
+	busyTimeout int
 	decoderOpts []record.DecoderOption
 }
 
@@ -64,6 +67,13 @@ type options struct {
 func WithStreamID(streamID string) Option {
 	return func(o *options) {
 		o.streamID = streamID
+	}
+}
+
+// WithLockingMode sets the SQLite PRAGMA locking_mode (e.g. "NORMAL", "EXCLUSIVE").
+func WithLockingMode(mode string) Option {
+	return func(o *options) {
+		o.lockingMode = mode
 	}
 }
 
@@ -81,11 +91,59 @@ func WithSynchronous(syncMode string) Option {
 	}
 }
 
+// WithBusyTimeout sets the SQLite busy_timeout in milliseconds.
+func WithBusyTimeout(ms int) Option {
+	return func(o *options) {
+		o.busyTimeout = ms
+	}
+}
+
 // WithDecoderOptions passes record decoder options to the underlying ChangeReader.
 func WithDecoderOptions(opts ...record.DecoderOption) Option {
 	return func(o *options) {
 		o.decoderOpts = append(o.decoderOpts, opts...)
 	}
+}
+
+// withoutCancel returns a context that is not cancelled when ctx is cancelled.
+// In modernc.org/sqlite, every query or exec call on a cancellable context spawns
+// an interruptOnDone background goroutine that listens on ctx.Done(). Since these
+// operations take single-digit microseconds on our local, exclusive-locked SQLite
+// database, stripping cancellation on the internal hot path avoids substantial
+// goroutine creation and channel synchronization overhead.
+func withoutCancel(ctx context.Context) context.Context {
+	return context.WithoutCancel(ctx)
+}
+
+type tableStmts struct {
+	get           *sql.Stmt
+	upsert        *sql.Stmt
+	del           *sql.Stmt
+	scanPrefix    *sql.Stmt
+	scanPrefixLim *sql.Stmt
+	scanGe        *sql.Stmt
+	scanGeLim     *sql.Stmt
+	scanAll       *sql.Stmt
+	scanAllLim    *sql.Stmt
+	count         *sql.Stmt
+}
+
+func (ts *tableStmts) Close() error {
+	var firstErr error
+	for _, s := range []*sql.Stmt{
+		ts.get, ts.upsert, ts.del,
+		ts.scanPrefix, ts.scanPrefixLim,
+		ts.scanGe, ts.scanGeLim,
+		ts.scanAll, ts.scanAllLim,
+		ts.count,
+	} {
+		if s != nil {
+			if err := s.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // DB represents a SQLite projection database for a structured data stream.
@@ -97,6 +155,7 @@ type DB struct {
 	position     uint64
 	changeReader *sds.ChangeReader
 	knownTables  map[string]bool // tableName -> table created
+	stmts        map[string]*tableStmts
 }
 
 // Open opens an existing SQLite projection database or creates a new one if it does not exist.
@@ -106,23 +165,36 @@ func Open(ctx context.Context, path string, opts ...Option) (*DB, error) {
 		o(&opt)
 	}
 
-	sqlDB, err := sql.Open("sqlite", path)
+	dsn := path
+	var pragmas []string
+	if opt.lockingMode != "" {
+		pragmas = append(pragmas, fmt.Sprintf("_pragma=locking_mode(%s)", opt.lockingMode))
+	}
+	if opt.journalMode != "" {
+		pragmas = append(pragmas, fmt.Sprintf("_pragma=journal_mode(%s)", opt.journalMode))
+	}
+	if opt.synchronous != "" {
+		pragmas = append(pragmas, fmt.Sprintf("_pragma=synchronous(%s)", opt.synchronous))
+	}
+	if opt.busyTimeout > 0 {
+		pragmas = append(pragmas, fmt.Sprintf("_pragma=busy_timeout(%d)", opt.busyTimeout))
+	} else if len(pragmas) > 0 {
+		pragmas = append(pragmas, "_pragma=busy_timeout(5000)")
+	}
+
+	if len(pragmas) > 0 {
+		sep := "?"
+		if strings.Contains(dsn, "?") {
+			sep = "&"
+		}
+		dsn += sep + strings.Join(pragmas, "&")
+	}
+
+	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database at %q: %w", path, err)
 	}
-
-	if opt.journalMode != "" {
-		if _, err := sqlDB.ExecContext(ctx, fmt.Sprintf("PRAGMA journal_mode = %s;", opt.journalMode)); err != nil {
-			_ = sqlDB.Close()
-			return nil, fmt.Errorf("failed to set journal_mode: %w", err)
-		}
-	}
-	if opt.synchronous != "" {
-		if _, err := sqlDB.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %s;", opt.synchronous)); err != nil {
-			_ = sqlDB.Close()
-			return nil, fmt.Errorf("failed to set synchronous: %w", err)
-		}
-	}
+	sqlDB.SetMaxOpenConns(1)
 
 	db := &DB{
 		sqlDB:        sqlDB,
@@ -130,6 +202,7 @@ func Open(ctx context.Context, path string, opts ...Option) (*DB, error) {
 		streamID:     opt.streamID,
 		changeReader: sds.NewChangeReader(opt.decoderOpts...),
 		knownTables:  make(map[string]bool),
+		stmts:        make(map[string]*tableStmts),
 	}
 
 	if err := db.initBookkeeping(ctx); err != nil {
@@ -183,10 +256,67 @@ func (d *DB) ChangeReader() *sds.ChangeReader {
 func (d *DB) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	for _, ts := range d.stmts {
+		_ = ts.Close()
+	}
+	d.stmts = make(map[string]*tableStmts)
 	if d.sqlDB != nil {
 		return d.sqlDB.Close()
 	}
 	return nil
+}
+
+func (d *DB) ensureTableStmtsLocked(ctx context.Context, tableName string) (*tableStmts, error) {
+	if ts, ok := d.stmts[tableName]; ok && ts != nil {
+		return ts, nil
+	}
+
+	cctx := withoutCancel(ctx)
+	ts := &tableStmts{}
+	var err error
+	defer func() {
+		if err != nil {
+			_ = ts.Close()
+		}
+	}()
+
+	prepare := func(query string) (*sql.Stmt, error) {
+		return d.sqlDB.PrepareContext(cctx, fmt.Sprintf(query, tableName))
+	}
+
+	if ts.get, err = prepare("SELECT valuedata FROM %q WHERE keydata = ?;"); err != nil {
+		return nil, err
+	}
+	if ts.upsert, err = prepare("INSERT OR REPLACE INTO %q (keydata, valuedata) VALUES (?, ?);"); err != nil {
+		return nil, err
+	}
+	if ts.del, err = prepare("DELETE FROM %q WHERE keydata = ?;"); err != nil {
+		return nil, err
+	}
+	if ts.scanPrefix, err = prepare("SELECT keydata, valuedata FROM %q WHERE keydata >= ? AND keydata < ? ORDER BY keydata ASC;"); err != nil {
+		return nil, err
+	}
+	if ts.scanPrefixLim, err = prepare("SELECT keydata, valuedata FROM %q WHERE keydata >= ? AND keydata < ? ORDER BY keydata ASC LIMIT ?;"); err != nil {
+		return nil, err
+	}
+	if ts.scanGe, err = prepare("SELECT keydata, valuedata FROM %q WHERE keydata >= ? ORDER BY keydata ASC;"); err != nil {
+		return nil, err
+	}
+	if ts.scanGeLim, err = prepare("SELECT keydata, valuedata FROM %q WHERE keydata >= ? ORDER BY keydata ASC LIMIT ?;"); err != nil {
+		return nil, err
+	}
+	if ts.scanAll, err = prepare("SELECT keydata, valuedata FROM %q ORDER BY keydata ASC;"); err != nil {
+		return nil, err
+	}
+	if ts.scanAllLim, err = prepare("SELECT keydata, valuedata FROM %q ORDER BY keydata ASC LIMIT ?;"); err != nil {
+		return nil, err
+	}
+	if ts.count, err = prepare("SELECT COUNT(*) FROM %q;"); err != nil {
+		return nil, err
+	}
+
+	d.stmts[tableName] = ts
+	return ts, nil
 }
 
 func (d *DB) initBookkeeping(ctx context.Context) error {
@@ -215,14 +345,14 @@ CREATE TABLE IF NOT EXISTS _stream_position (
 	return nil
 }
 
-func (d *DB) loadState(ctx context.Context) error {
-	// 1. Load registry types
+func (d *DB) loadTypes(ctx context.Context) ([]*sdsv1.TypeDefinition, error) {
 	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, fingerprint, descriptors, key_fields FROM _stream_types ORDER BY id ASC")
 	if err != nil {
-		return fmt.Errorf("failed to query _stream_types: %w", err)
+		return nil, fmt.Errorf("failed to query _stream_types: %w", err)
 	}
 	defer rows.Close()
 
+	var defs []*sdsv1.TypeDefinition
 	for rows.Next() {
 		var id uint32
 		var name string
@@ -231,57 +361,80 @@ func (d *DB) loadState(ctx context.Context) error {
 		var keyFieldsJSON string
 
 		if err := rows.Scan(&id, &name, &fingerprint, &descBytes, &keyFieldsJSON); err != nil {
-			return fmt.Errorf("failed to scan _stream_types row: %w", err)
+			return nil, fmt.Errorf("failed to scan _stream_types row: %w", err)
 		}
 
 		var keyFields []int32
 		if err := json.Unmarshal([]byte(keyFieldsJSON), &keyFields); err != nil {
-			return fmt.Errorf("failed to parse key_fields for type ID %d: %w", id, err)
+			return nil, fmt.Errorf("failed to parse key_fields for type ID %d: %w", id, err)
 		}
 
 		var fds *descriptorpb.FileDescriptorSet
 		if len(descBytes) > 0 {
 			fds = &descriptorpb.FileDescriptorSet{}
 			if err := proto.Unmarshal(descBytes, fds); err != nil {
-				return fmt.Errorf("failed to unmarshal descriptors for type ID %d: %w", id, err)
+				return nil, fmt.Errorf("failed to unmarshal descriptors for type ID %d: %w", id, err)
 			}
 		}
 
-		def := &sdsv1.TypeDefinition{
+		defs = append(defs, &sdsv1.TypeDefinition{
 			Id:          id,
 			Name:        name,
 			Fingerprint: fingerprint,
 			Descriptors: fds,
 			KeyFields:   keyFields,
-		}
-
-		if err := d.changeReader.Registry().Register(def); err != nil {
-			return fmt.Errorf("failed to register restored type %d (%s): %w", id, name, err)
-		}
+		})
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error reading _stream_types: %w", err)
+		return nil, fmt.Errorf("error reading _stream_types: %w", err)
 	}
+	return defs, nil
+}
 
-	// 2. Load stream position
-	posRows, err := d.sqlDB.QueryContext(ctx, "SELECT stream_id, position FROM _stream_position LIMIT 1")
+func (d *DB) loadPosition(ctx context.Context) (string, uint64, bool, error) {
+	rows, err := d.sqlDB.QueryContext(ctx, "SELECT stream_id, position FROM _stream_position LIMIT 1")
 	if err != nil {
-		return fmt.Errorf("failed to query _stream_position: %w", err)
+		return "", 0, false, fmt.Errorf("failed to query _stream_position: %w", err)
 	}
-	defer posRows.Close()
+	defer rows.Close()
 
-	if posRows.Next() {
+	if rows.Next() {
 		var sID string
 		var pos uint64
-		if err := posRows.Scan(&sID, &pos); err != nil {
-			return fmt.Errorf("failed to scan _stream_position: %w", err)
+		if err := rows.Scan(&sID, &pos); err != nil {
+			return "", 0, false, fmt.Errorf("failed to scan _stream_position: %w", err)
 		}
+		return sID, pos, true, nil
+	}
+	return "", 0, false, nil
+}
+
+func (d *DB) loadState(ctx context.Context) error {
+	defs, err := d.loadTypes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, def := range defs {
+		if err := d.changeReader.Registry().Register(def); err != nil {
+			return fmt.Errorf("failed to register restored type %d (%s): %w", def.GetId(), def.GetName(), err)
+		}
+		tableName := TableName(def.GetName())
+		d.knownTables[tableName] = true
+		if _, err := d.ensureTableStmtsLocked(ctx, tableName); err != nil {
+			return fmt.Errorf("failed to prepare statements for %s: %w", tableName, err)
+		}
+	}
+
+	sID, pos, found, err := d.loadPosition(ctx)
+	if err != nil {
+		return err
+	}
+	if found {
 		if d.streamID == "" {
 			d.streamID = sID
 		}
 		d.position = pos
 	}
-
 	return nil
 }
 
@@ -351,7 +504,22 @@ func (d *DB) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	cctx := context.WithoutCancel(ctx)
+
+	// Ensure schemas and prepared statements exist BEFORE opening transaction on the single connection
+	for _, ch := range changes {
+		def, _, ok := d.changeReader.Registry().LookupByID(ch.TypeID)
+		if !ok && ch.TypeName != "" {
+			def, _, ok = d.changeReader.Registry().LookupByName(ch.TypeName)
+		}
+		if ok {
+			if err := d.ensureTableSchema(cctx, nil, def); err != nil {
+				return err
+			}
+		}
+	}
+
+	tx, err := d.sqlDB.BeginTx(cctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -361,7 +529,7 @@ func (d *DB) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 
 	var maxSeq uint64 = d.position
 	for _, ch := range changes {
-		if err := d.applyChangeInTx(ctx, tx, ch); err != nil {
+		if err := d.applyChangeInTx(cctx, tx, ch); err != nil {
 			return err
 		}
 		if ch.Seq > maxSeq {
@@ -370,7 +538,7 @@ func (d *DB) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 	}
 
 	if maxSeq > d.position {
-		if err := d.updatePositionInTx(ctx, tx, maxSeq); err != nil {
+		if err := d.updatePositionInTx(cctx, tx, maxSeq); err != nil {
 			return err
 		}
 	}
@@ -386,28 +554,45 @@ func (d *DB) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 }
 
 func (d *DB) applyChangeInTx(ctx context.Context, tx *sql.Tx, ch sds.Change) error {
+	cctx := context.WithoutCancel(ctx)
 	def, _, ok := d.changeReader.Registry().LookupByID(ch.TypeID)
+	if !ok && ch.TypeName != "" {
+		def, _, ok = d.changeReader.Registry().LookupByName(ch.TypeName)
+	}
 	if !ok {
 		return fmt.Errorf("%w: type ID %d (%s)", ErrTypeNotRegistered, ch.TypeID, ch.TypeName)
 	}
 
-	if err := d.ensureTableSchema(ctx, tx, def); err != nil {
+	if err := d.ensureTableSchema(cctx, tx, def); err != nil {
 		return err
 	}
 
 	tableName := TableName(def.GetName())
+	ts := d.stmts[tableName]
 
 	switch ch.Op {
 	case sds.OpCreate, sds.OpUpdate:
-		query := fmt.Sprintf("INSERT OR REPLACE INTO %q (keydata, valuedata) VALUES (?, ?);", tableName)
-		if _, err := tx.ExecContext(ctx, query, ch.RawKey, ch.RawVal); err != nil {
-			return fmt.Errorf("failed to upsert row in %q: %w", tableName, err)
+		if ts != nil && ts.upsert != nil {
+			if _, err := tx.StmtContext(cctx, ts.upsert).ExecContext(cctx, ch.RawKey, ch.RawVal); err != nil {
+				return fmt.Errorf("failed to upsert row in %q: %w", tableName, err)
+			}
+		} else {
+			query := fmt.Sprintf("INSERT OR REPLACE INTO %q (keydata, valuedata) VALUES (?, ?);", tableName)
+			if _, err := tx.ExecContext(cctx, query, ch.RawKey, ch.RawVal); err != nil {
+				return fmt.Errorf("failed to upsert row in %q: %w", tableName, err)
+			}
 		}
 
 	case sds.OpDelete:
-		query := fmt.Sprintf("DELETE FROM %q WHERE keydata = ?;", tableName)
-		if _, err := tx.ExecContext(ctx, query, ch.RawKey); err != nil {
-			return fmt.Errorf("failed to delete row in %q: %w", tableName, err)
+		if ts != nil && ts.del != nil {
+			if _, err := tx.StmtContext(cctx, ts.del).ExecContext(cctx, ch.RawKey); err != nil {
+				return fmt.Errorf("failed to delete row in %q: %w", tableName, err)
+			}
+		} else {
+			query := fmt.Sprintf("DELETE FROM %q WHERE keydata = ?;", tableName)
+			if _, err := tx.ExecContext(cctx, query, ch.RawKey); err != nil {
+				return fmt.Errorf("failed to delete row in %q: %w", tableName, err)
+			}
 		}
 
 	default:
@@ -418,6 +603,7 @@ func (d *DB) applyChangeInTx(ctx context.Context, tx *sql.Tx, ch sds.Change) err
 }
 
 func (d *DB) ensureTableSchema(ctx context.Context, tx *sql.Tx, def *sdsv1.TypeDefinition) error {
+	cctx := context.WithoutCancel(ctx)
 	tableName := TableName(def.GetName())
 
 	var execer interface {
@@ -440,7 +626,7 @@ func (d *DB) ensureTableSchema(ctx context.Context, tx *sql.Tx, def *sdsv1.TypeD
 	}
 
 	upsertTypeSQL := `INSERT OR REPLACE INTO _stream_types (id, name, fingerprint, descriptors, key_fields) VALUES (?, ?, ?, ?, ?);`
-	if _, err := execer.ExecContext(ctx, upsertTypeSQL, def.GetId(), def.GetName(), def.GetFingerprint(), descBytes, string(kfBytes)); err != nil {
+	if _, err := execer.ExecContext(cctx, upsertTypeSQL, def.GetId(), def.GetName(), def.GetFingerprint(), descBytes, string(kfBytes)); err != nil {
 		return fmt.Errorf("failed to upsert _stream_types for %d: %w", def.GetId(), err)
 	}
 
@@ -450,43 +636,71 @@ func (d *DB) ensureTableSchema(ctx context.Context, tx *sql.Tx, def *sdsv1.TypeD
     keydata BLOB PRIMARY KEY,
     valuedata BLOB
 );`, tableName)
-		if _, err := execer.ExecContext(ctx, createSQL); err != nil {
+		if _, err := execer.ExecContext(cctx, createSQL); err != nil {
 			return fmt.Errorf("failed to create table %q: %w", tableName, err)
 		}
 		d.knownTables[tableName] = true
+	}
+
+	if tx == nil {
+		if _, err := d.ensureTableStmtsLocked(cctx, tableName); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 func (d *DB) updatePositionInTx(ctx context.Context, tx *sql.Tx, seq uint64) error {
+	cctx := context.WithoutCancel(ctx)
 	nowMicros := time.Now().UnixMicro()
 	sqlStr := `INSERT OR REPLACE INTO _stream_position (stream_id, position, snapshot_time) VALUES (?, ?, ?);`
-	if _, err := tx.ExecContext(ctx, sqlStr, d.streamID, seq, nowMicros); err != nil {
+	if _, err := tx.ExecContext(cctx, sqlStr, d.streamID, seq, nowMicros); err != nil {
 		return fmt.Errorf("failed to update _stream_position to %d: %w", seq, err)
 	}
 	return nil
 }
 
-// Get retrieves a merged proto row from a table by primary key.
-func (d *DB) Get(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
+func (d *DB) getTable(ctx context.Context, typeName string) (*sdsv1.TypeDefinition, *tableStmts, error) {
 	def, _, ok := d.changeReader.Registry().LookupByName(typeName)
 	if !ok {
-		return nil, false, fmt.Errorf("%w: type %q", ErrTypeNotRegistered, typeName)
+		return nil, nil, fmt.Errorf("%w: type %q", ErrTypeNotRegistered, typeName)
 	}
 
 	tableName := TableName(typeName)
+
+	d.mu.RLock()
+	ts := d.stmts[tableName]
+	d.mu.RUnlock()
+
+	if ts == nil {
+		cctx := withoutCancel(ctx)
+		d.mu.Lock()
+		var err error
+		ts, err = d.ensureTableStmtsLocked(cctx, tableName)
+		d.mu.Unlock()
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to prepare stmts for %q: %w", tableName, err)
+		}
+	}
+	return def, ts, nil
+}
+
+// Get retrieves a merged proto row from a table by primary key.
+func (d *DB) Get(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
+	def, ts, err := d.getTable(ctx, typeName)
+	if err != nil {
+		return nil, false, err
+	}
+
+	cctx := withoutCancel(ctx)
 	var valuedata []byte
-	query := fmt.Sprintf("SELECT valuedata FROM %q WHERE keydata = ?;", tableName)
-	err := d.sqlDB.QueryRowContext(ctx, query, key.Bytes()).Scan(&valuedata)
+	err = ts.get.QueryRowContext(cctx, key.Bytes()).Scan(&valuedata)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to query row from %q: %w", tableName, err)
+		return nil, false, fmt.Errorf("failed to query row from %q: %w", typeName, err)
 	}
 
 	msgType, err := d.changeReader.Registry().ResolveMessageType(def.GetId())
@@ -504,14 +718,15 @@ func (d *DB) Get(ctx context.Context, typeName string, key sds.Key) (proto.Messa
 
 // Count returns the number of rows in the specified table.
 func (d *DB) Count(ctx context.Context, typeName string) (int, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	_, ts, err := d.getTable(ctx, typeName)
+	if err != nil {
+		return 0, err
+	}
 
-	tableName := TableName(typeName)
+	cctx := withoutCancel(ctx)
 	var count int
-	query := fmt.Sprintf("SELECT COUNT(*) FROM %q;", tableName)
-	if err := d.sqlDB.QueryRowContext(ctx, query).Scan(&count); err != nil {
-		return 0, fmt.Errorf("failed to count rows in %q: %w", tableName, err)
+	if err := ts.count.QueryRowContext(cctx).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count rows in %q: %w", typeName, err)
 	}
 	return count, nil
 }
@@ -532,14 +747,63 @@ func (d *DB) Tables() []string {
 	return tables
 }
 
-// Rows returns all merged proto rows from the specified table.
-func (d *DB) Rows(ctx context.Context, typeName string) ([]proto.Message, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+// SyncRegistry imports types from reg into the DB's registry and ensures their schemas exist in SQLite.
+func (d *DB) SyncRegistry(ctx context.Context, reg *record.Registry) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
-	def, _, ok := d.changeReader.Registry().LookupByName(typeName)
-	if !ok {
-		return nil, fmt.Errorf("%w: type %q", ErrTypeNotRegistered, typeName)
+	if reg == nil {
+		return nil
+	}
+	exported := reg.Export()
+	if err := d.changeReader.Registry().Import(exported); err != nil {
+		return err
+	}
+	cctx := withoutCancel(ctx)
+	for _, def := range exported.GetTypes() {
+		if err := d.ensureTableSchema(cctx, nil, def); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RegisterType registers a Go proto.Message type with optional primary key field numbers
+// and creates its table schema in SQLite.
+func (d *DB) RegisterType(ctx context.Context, msg proto.Message, keyFields ...int32) (*sdsv1.TypeDefinition, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	def, err := d.changeReader.Registry().RegisterMessage(msg, keyFields...)
+	if err != nil {
+		return nil, err
+	}
+	cctx := withoutCancel(ctx)
+	if err := d.ensureTableSchema(cctx, nil, def); err != nil {
+		return nil, err
+	}
+	return def, nil
+}
+
+func prefixLimit(prefix []byte) []byte {
+	limit := make([]byte, len(prefix))
+	copy(limit, prefix)
+	for i := len(limit) - 1; i >= 0; i-- {
+		if limit[i] < 0xff {
+			limit[i]++
+			return limit[:i+1]
+		}
+	}
+	return nil
+}
+
+// ScanLimit retrieves up to limit merged proto rows from a table matching a canonical key prefix,
+// ordered by keydata ASC. If limit <= 0, all matching rows are returned.
+// If keyPrefix is empty, all rows in the table (up to limit) are returned.
+func (d *DB) ScanLimit(ctx context.Context, typeName string, keyPrefix []byte, limit int) ([]proto.Message, error) {
+	def, ts, err := d.getTable(ctx, typeName)
+	if err != nil {
+		return nil, err
 	}
 
 	msgType, err := d.changeReader.Registry().ResolveMessageType(def.GetId())
@@ -547,11 +811,32 @@ func (d *DB) Rows(ctx context.Context, typeName string) ([]proto.Message, error)
 		return nil, fmt.Errorf("failed to resolve message type for %q: %w", typeName, err)
 	}
 
-	tableName := TableName(typeName)
-	query := fmt.Sprintf("SELECT keydata, valuedata FROM %q;", tableName)
-	rows, err := d.sqlDB.QueryContext(ctx, query)
+	cctx := withoutCancel(ctx)
+	var rows *sql.Rows
+	if len(keyPrefix) == 0 {
+		if limit > 0 {
+			rows, err = ts.scanAllLim.QueryContext(cctx, limit)
+		} else {
+			rows, err = ts.scanAll.QueryContext(cctx)
+		}
+	} else {
+		limitBytes := prefixLimit(keyPrefix)
+		if limitBytes != nil {
+			if limit > 0 {
+				rows, err = ts.scanPrefixLim.QueryContext(cctx, keyPrefix, limitBytes, limit)
+			} else {
+				rows, err = ts.scanPrefix.QueryContext(cctx, keyPrefix, limitBytes)
+			}
+		} else {
+			if limit > 0 {
+				rows, err = ts.scanGeLim.QueryContext(cctx, keyPrefix, limit)
+			} else {
+				rows, err = ts.scanGe.QueryContext(cctx, keyPrefix)
+			}
+		}
+	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to query rows from %q: %w", tableName, err)
+		return nil, fmt.Errorf("failed to scan rows from %q: %w", typeName, err)
 	}
 	defer rows.Close()
 
@@ -562,15 +847,33 @@ func (d *DB) Rows(ctx context.Context, typeName string) ([]proto.Message, error)
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
+		if len(keyPrefix) > 0 && !bytes.HasPrefix(keydata, keyPrefix) {
+			continue
+		}
+
 		target := msgType.New().Interface()
 		if err := sds.MergeKeyAndNonKey(target, keydata, valuedata); err != nil {
 			return nil, fmt.Errorf("failed to merge proto key and value: %w", err)
 		}
 		result = append(result, target)
+		if limit > 0 && len(result) >= limit {
+			break
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
 	return result, nil
+}
+
+// Scan retrieves merged proto rows from a table matching a canonical key prefix,
+// ordered by keydata ASC. If keyPrefix is empty, it returns all rows in the table.
+func (d *DB) Scan(ctx context.Context, typeName string, keyPrefix []byte) ([]proto.Message, error) {
+	return d.ScanLimit(ctx, typeName, keyPrefix, 0)
+}
+
+// Rows returns all merged proto rows from the specified table.
+func (d *DB) Rows(ctx context.Context, typeName string) ([]proto.Message, error) {
+	return d.ScanLimit(ctx, typeName, nil, 0)
 }
