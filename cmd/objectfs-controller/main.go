@@ -44,7 +44,7 @@ var (
 	walTarget            = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer:50051)")
 	walDurability        = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
 	metadataStore        = flag.String("metadata-store", "legacy", "Metadata store type (legacy or sqlite)")
-	metadataCacheEntries = flag.Int("metadata-cache-entries", 65536, "Maximum number of entries in metadata read cache")
+	metadataCacheEntries = flag.Int("metadata-cache-entries", 0, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
 	metadataCacheBytes   = flag.Int64("metadata-cache-bytes", 64*1024*1024, "Maximum byte size of metadata read cache")
 )
 

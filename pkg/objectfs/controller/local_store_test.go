@@ -263,19 +263,27 @@ func TestLRUCacheByteLimitsAndStats(t *testing.T) {
 		t.Fatalf("expected nonexistent not found")
 	}
 
-	if lru.Hits() != 1 {
-		t.Fatalf("expected 1 hit, got %d", lru.Hits())
+	stats := lru.Stats()
+	if stats.Hits != 1 {
+		t.Fatalf("expected 1 hit, got %d", stats.Hits)
 	}
-	if lru.Misses() != 1 {
-		t.Fatalf("expected 1 miss, got %d", lru.Misses())
+	if stats.Misses != 1 {
+		t.Fatalf("expected 1 miss, got %d", stats.Misses)
 	}
-	if lru.HitRate() != 0.5 {
-		t.Fatalf("expected hit rate 0.5, got %f", lru.HitRate())
+	if stats.HitRate != 0.5 {
+		t.Fatalf("expected hit rate 0.5, got %f", stats.HitRate)
+	}
+	if stats.Entries != 1 {
+		t.Fatalf("expected 1 entry, got %d", stats.Entries)
+	}
+	if stats.Bytes != 6 {
+		t.Fatalf("expected 6 bytes, got %d", stats.Bytes)
 	}
 
 	lru.ResetStats()
-	if lru.Hits() != 0 || lru.Misses() != 0 || lru.HitRate() != 0.0 {
-		t.Fatalf("expected reset stats, got hits=%d misses=%d hitRate=%f", lru.Hits(), lru.Misses(), lru.HitRate())
+	stats = lru.Stats()
+	if stats.Hits != 0 || stats.Misses != 0 || stats.HitRate != 0.0 {
+		t.Fatalf("expected reset stats, got hits=%d misses=%d hitRate=%f", stats.Hits, stats.Misses, stats.HitRate)
 	}
 
 	// Peek should not alter hit/miss stats or LRU order
@@ -283,7 +291,7 @@ func TestLRUCacheByteLimitsAndStats(t *testing.T) {
 	if !ok || val != "5678" {
 		t.Fatalf("expected peek k2 found, got %v", ok)
 	}
-	if lru.Hits() != 0 {
+	if lru.Stats().Hits != 0 {
 		t.Fatalf("peek should not increment hits")
 	}
 
@@ -296,6 +304,27 @@ func TestLRUCacheByteLimitsAndStats(t *testing.T) {
 	if lru.Bytes() != 12 {
 		t.Fatalf("expected 12 bytes, got %d", lru.Bytes())
 	}
+}
+
+func TestLRUCacheConcurrent(t *testing.T) {
+	lru := NewLRUCache[int, int](100, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				key := (workerID*500 + j) % 150
+				if j%2 == 0 {
+					lru.Put(key, key*10)
+				} else {
+					_, _ = lru.Get(key)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	_ = lru.Stats()
 }
 
 func TestTieredMetadataLRUEvictionAndReload(t *testing.T) {

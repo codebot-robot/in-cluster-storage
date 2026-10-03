@@ -298,7 +298,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	v.inodeCache = NewLRUCache[uint64, *CachedInode](10000, v.onEvictInode)
 	v.dirCache = NewLRUCache[uint64, *CachedDir](2000, v.onEvictDir)
 	v.sqliteCache = NewLRUCacheWithLimits[SQLiteCacheKey, *SQLiteCachedRow](
-		65536,
+		0,
 		64*1024*1024,
 		SQLiteCacheSizeFn,
 		nil,
@@ -1179,13 +1179,13 @@ var (
 )
 
 // SQLiteCacheStats returns cache hit/miss and memory usage statistics.
-func (v *Volume) SQLiteCacheStats() (hits, misses uint64, hitRate float64, currentEntries int, currentBytes, maxBytes int64) {
+func (v *Volume) SQLiteCacheStats() LRUCacheStats {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	if v.sqliteCache == nil {
-		return 0, 0, 0, 0, 0, 0
+		return LRUCacheStats{}
 	}
-	return v.sqliteCache.Hits(), v.sqliteCache.Misses(), v.sqliteCache.HitRate(), v.sqliteCache.Len(), v.sqliteCache.Bytes(), v.sqliteCache.MaxBytes()
+	return v.sqliteCache.Stats()
 }
 
 // SQLiteCacheResetStats resets the cache hits and misses counters.
@@ -1208,7 +1208,7 @@ func (v *Volume) SetSQLiteCacheLimits(maxEntries int, maxBytes int64) {
 
 func (v *Volume) getSQLiteRowLocked(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
 	if v.sqliteCache != nil && !v.sqliteCacheDisabled {
-		ck := SQLiteCacheKey{Table: typeName, Key: string(key.Bytes())}
+		ck := SQLiteCacheKey{Table: typeName, Key: key}
 		if row, ok := v.sqliteCache.Get(ck); ok {
 			if !row.Exists {
 				return nil, false, nil
@@ -1227,7 +1227,7 @@ func (v *Volume) getSQLiteRowLocked(ctx context.Context, typeName string, key sd
 	}
 
 	if v.sqliteCache != nil && !v.sqliteCacheDisabled {
-		ck := SQLiteCacheKey{Table: typeName, Key: string(key.Bytes())}
+		ck := SQLiteCacheKey{Table: typeName, Key: key}
 		if !ok {
 			v.sqliteCache.Put(ck, &SQLiteCachedRow{Exists: false})
 		} else {
@@ -1257,7 +1257,11 @@ func (v *Volume) applyChangesToSQLiteCacheLocked(changes []sds.Change) {
 		if typeName == "" {
 			continue
 		}
-		ck := SQLiteCacheKey{Table: typeName, Key: string(ch.RawKey)}
+		key := ch.Key
+		if key.IsZero() && len(ch.RawKey) > 0 {
+			key = sds.NewKeyFromBytes(ch.RawKey)
+		}
+		ck := SQLiteCacheKey{Table: typeName, Key: key}
 		switch ch.Op {
 		case sds.OpCreate, sds.OpUpdate:
 			if ch.Row != nil {
@@ -1363,8 +1367,8 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 				if k, kErr := pkDirEntry.Extract(&pb.DirEntry{
 					ParentIno: proto.Uint64(inodeID),
 					Name:      proto.String(name),
-				}); kErr == nil && len(k.Bytes()) > 0 {
-					ck := SQLiteCacheKey{Table: "objectfs.v1alpha1.DirEntry", Key: string(k.Bytes())}
+				}); kErr == nil && !k.IsZero() {
+					ck := SQLiteCacheKey{Table: "objectfs.v1alpha1.DirEntry", Key: k}
 					v.sqliteCache.Put(ck, &SQLiteCachedRow{Exists: true, Msg: de})
 				}
 			}

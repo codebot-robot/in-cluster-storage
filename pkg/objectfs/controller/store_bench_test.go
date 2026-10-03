@@ -19,6 +19,7 @@ package controller
 import (
 	"fmt"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -89,6 +90,34 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				}
 			})
 
+			b.Run("StatParallel", func(b *testing.B) {
+				ctx := b.Context()
+				backend := inmemorystorage.New()
+				broadcaster := NewEventBroadcaster()
+				vol := NewVolume("bench-stat-par-"+cfg.name, backend, broadcaster,
+					WithMetadataStore(cfg.store),
+					WithSQLiteCacheDisabled(cfg.cacheDisable),
+					WithLocalStorageDir(b.TempDir()),
+				)
+				_ = vol.LoadFromBackend(ctx)
+				defer vol.Close()
+
+				attr, err := vol.CreateFile(ctx, 1, "target.txt", 0644, []byte("data"), 0, 0)
+				if err != nil {
+					b.Fatalf("CreateFile failed: %v", err)
+				}
+
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						_, err := vol.GetAttr(ctx, attr.Inode)
+						if err != nil {
+							b.Fatalf("GetAttr failed: %v", err)
+						}
+					}
+				})
+			})
+
 			b.Run("Lookup", func(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
@@ -113,6 +142,34 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 						b.Fatalf("Lookup failed: %v", err)
 					}
 				}
+			})
+
+			b.Run("LookupParallel", func(b *testing.B) {
+				ctx := b.Context()
+				backend := inmemorystorage.New()
+				broadcaster := NewEventBroadcaster()
+				vol := NewVolume("bench-lookup-par-"+cfg.name, backend, broadcaster,
+					WithMetadataStore(cfg.store),
+					WithSQLiteCacheDisabled(cfg.cacheDisable),
+					WithLocalStorageDir(b.TempDir()),
+				)
+				_ = vol.LoadFromBackend(ctx)
+				defer vol.Close()
+
+				_, err := vol.CreateFile(ctx, 1, "target.txt", 0644, []byte("data"), 0, 0)
+				if err != nil {
+					b.Fatalf("CreateFile failed: %v", err)
+				}
+
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						_, err := vol.Lookup(ctx, 1, "target.txt")
+						if err != nil {
+							b.Fatalf("Lookup failed: %v", err)
+						}
+					}
+				})
 			})
 
 			b.Run("ReadDir", func(b *testing.B) {
@@ -161,11 +218,13 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					b.Fatalf("CreateFile failed: %v", err)
 				}
 
+				var cnt uint64
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
+					c := atomic.AddUint64(&cnt, 1)
 					from := "name_a.txt"
 					to := "name_b.txt"
-					if i%2 == 1 {
+					if c%2 == 0 {
 						from = "name_b.txt"
 						to = "name_a.txt"
 					}
@@ -296,21 +355,21 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		}
 		lookupDur := time.Since(start)
 
-		hits, misses, hitRate, curEntries, curBytes, _ := vol.SQLiteCacheStats()
+		stats := vol.SQLiteCacheStats()
 		t.Logf("[%s] Stat 1,000 inodes: %v (avg %v/op) | Lookup 10 dirs: %v (avg %v/op) | Cache: hits=%d misses=%d hitRate=%.2f%% entries=%d bytes=%d KB",
-			cfg.name, statDur, statDur/1000, lookupDur, lookupDur/10, hits, misses, hitRate*100, curEntries, curBytes/1024)
+			cfg.name, statDur, statDur/1000, lookupDur, lookupDur/10, stats.Hits, stats.Misses, stats.HitRate*100, stats.Entries, stats.Bytes/1024)
 		_ = vol.Close()
 	}
 
 	// 3. SQLite Read Cache Scale & Hit Rate Analysis (10,000 and 50,000 files)
-	t.Log("\n--- 3. SQLite Read Cache Scale & Hit Rate Analysis ---")
+	t.Log("\n--- 3. SQLite Read Cache Scale & Hit Rate Analysis (Byte-Bound Governed) ---")
 	for _, numFiles := range []int{10000, 50000} {
 		for _, cacheOn := range []bool{true, false} {
 			backend := inmemorystorage.New()
 			vol := NewVolume(fmt.Sprintf("hitrate-scale-%d", numFiles), backend, NewEventBroadcaster(),
 				WithMetadataStore("sqlite"),
 				WithSQLiteCacheDisabled(!cacheOn),
-				WithMetadataCacheLimits(65536, 64*1024*1024),
+				WithMetadataCacheLimits(0, 64*1024*1024),
 				WithLocalStorageDir(t.TempDir()),
 			)
 			_ = vol.LoadFromBackend(ctx)
@@ -336,20 +395,22 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 			}
 			hotLookupDur := time.Since(start)
 
-			// Measure negative lookups (ENOENT)
+			// Measure negative lookups with repeated misses (100 distinct missing names x 50 repetitions = 5,000 lookups)
 			start = time.Now()
-			for i := 0; i < 1000; i++ {
-				_, _ = vol.Lookup(ctx, 1, fmt.Sprintf("missing_%d.txt", i))
+			for rep := 0; rep < 50; rep++ {
+				for i := 0; i < 100; i++ {
+					_, _ = vol.Lookup(ctx, 1, fmt.Sprintf("missing_%d.txt", i))
+				}
 			}
 			enoentDur := time.Since(start)
 
-			hits, misses, hitRate, curEntries, curBytes, maxBytes := vol.SQLiteCacheStats()
+			stats := vol.SQLiteCacheStats()
 			cacheStatus := "cache ON"
 			if !cacheOn {
 				cacheStatus = "cache OFF"
 			}
-			t.Logf("[%s @ %d files] Stat 5k: %v (%v/op) | Lookup 5k: %v (%v/op) | ENOENT 1k: %v (%v/op) | Hits=%d Misses=%d HitRate=%.2f%% | Mem=%d KB / %d KB (entries=%d)",
-				cacheStatus, numFiles, hotStatDur, hotStatDur/5000, hotLookupDur, hotLookupDur/5000, enoentDur, enoentDur/1000, hits, misses, hitRate*100, curBytes/1024, maxBytes/1024, curEntries)
+			t.Logf("[%s @ %d files] Stat 5k: %v (%v/op) | Lookup 5k: %v (%v/op) | ENOENT 5k (100x50): %v (%v/op) | Hits=%d Misses=%d HitRate=%.2f%% | Mem=%d KB / %d KB (entries=%d)",
+				cacheStatus, numFiles, hotStatDur, hotStatDur/5000, hotLookupDur, hotLookupDur/5000, enoentDur, enoentDur/5000, stats.Hits, stats.Misses, stats.HitRate*100, stats.Bytes/1024, stats.MaxBytes/1024, stats.Entries)
 			_ = vol.Close()
 		}
 	}
