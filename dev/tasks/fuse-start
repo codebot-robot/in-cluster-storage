@@ -143,6 +143,7 @@ if [[ -z "${OBJECTFS_DEV_DIR:-}" ]]; then
   OBJECTFS_DEV_DIR="$(mktemp -d -t objectfs-dev.XXXXXX)"
 fi
 mkdir -p "${OBJECTFS_DEV_DIR}"
+chmod 755 "${OBJECTFS_DEV_DIR}"
 DEV_DIR="$(cd "${OBJECTFS_DEV_DIR}" && pwd)"
 
 STORE_DIR="${DEV_DIR}/objectstore"

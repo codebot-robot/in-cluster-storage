@@ -27,6 +27,8 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // MaxNameLength is the maximum allowed byte length for a path component name
@@ -133,6 +135,16 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 		out.Ctime = out.Mtime
 		out.Ctimensec = out.Mtimensec
 	}
+	if attr.GetAtime() != nil {
+		t := attr.GetAtime().AsTime()
+		out.Atime = uint64(t.Unix())
+		out.Atimensec = uint32(t.Nanosecond())
+	}
+	if attr.GetCtime() != nil {
+		t := attr.GetCtime().AsTime()
+		out.Ctime = uint64(t.Unix())
+		out.Ctimensec = uint32(t.Nanosecond())
+	}
 	out.Owner = fuse.Owner{
 		Uid: attr.GetUid(),
 		Gid: attr.GetGid(),
@@ -206,6 +218,8 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
+	var finalAttr *pb.EntryAttr
+
 	if input.Valid&fuse.FATTR_SIZE != 0 {
 		_ = fs.syncFileToService(ctx, input.NodeId)
 		fs.cache.Truncate(input.NodeId, int64(input.Size), time.Now())
@@ -220,28 +234,70 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
 		}
-		if resp.GetAttr() != nil {
-			fs.fillAttrOut(resp.GetAttr(), &out.Attr)
-			out.Attr.Size = input.Size
-			out.SetTimeout(1 * time.Second)
-			return fuse.OK
-		}
+		finalAttr = resp.GetAttr()
 	}
 
-	resp, err := fs.client.GetAttr(ctx, &pb.GetAttrRequest{
-		VolumeId: fs.volumeID,
-		Inode:    input.NodeId,
-	})
-	if err != nil {
-		return grpcErrorToStatus(err)
+	hasOtherAttrs := input.Valid&(fuse.FATTR_MODE|fuse.FATTR_UID|fuse.FATTR_GID|fuse.FATTR_ATIME|fuse.FATTR_ATIME_NOW|fuse.FATTR_MTIME|fuse.FATTR_MTIME_NOW|fuse.FATTR_CTIME) != 0
+
+	if hasOtherAttrs {
+		req := &pb.SetAttrRequest{
+			VolumeId: fs.volumeID,
+			Inode:    input.NodeId,
+		}
+		if input.Valid&fuse.FATTR_MODE != 0 {
+			req.Mode = proto.Uint32(input.Mode)
+		}
+		if input.Valid&fuse.FATTR_UID != 0 {
+			req.Uid = proto.Uint32(input.Uid)
+		}
+		if input.Valid&fuse.FATTR_GID != 0 {
+			req.Gid = proto.Uint32(input.Gid)
+		}
+		if input.Valid&fuse.FATTR_ATIME_NOW != 0 {
+			req.AtimeNow = true
+		} else if input.Valid&fuse.FATTR_ATIME != 0 {
+			req.Atime = timestamppb.New(time.Unix(int64(input.Atime), int64(input.Atimensec)))
+		}
+		if input.Valid&fuse.FATTR_MTIME_NOW != 0 {
+			req.MtimeNow = true
+		} else if input.Valid&fuse.FATTR_MTIME != 0 {
+			req.Mtime = timestamppb.New(time.Unix(int64(input.Mtime), int64(input.Mtimensec)))
+		}
+		if input.Valid&fuse.FATTR_CTIME != 0 {
+			req.Ctime = timestamppb.New(time.Unix(int64(input.Ctime), int64(input.Ctimensec)))
+		}
+
+		resp, err := fs.client.SetAttr(ctx, req)
+		if err != nil {
+			return grpcErrorToStatus(err)
+		}
+		if resp.GetError() != 0 {
+			return fuse.Status(resp.GetError())
+		}
+		finalAttr = resp.GetAttr()
 	}
-	if resp.GetError() != 0 {
-		return fuse.Status(resp.GetError())
+
+	if finalAttr == nil {
+		resp, err := fs.client.GetAttr(ctx, &pb.GetAttrRequest{
+			VolumeId: fs.volumeID,
+			Inode:    input.NodeId,
+		})
+		if err != nil {
+			return grpcErrorToStatus(err)
+		}
+		if resp.GetError() != 0 {
+			return fuse.Status(resp.GetError())
+		}
+		if resp.GetAttr() == nil {
+			return fuse.ENOENT
+		}
+		finalAttr = resp.GetAttr()
 	}
-	if resp.GetAttr() == nil {
-		return fuse.ENOENT
+
+	fs.fillAttrOut(finalAttr, &out.Attr)
+	if input.Valid&fuse.FATTR_SIZE != 0 {
+		out.Attr.Size = input.Size
 	}
-	fs.fillAttrOut(resp.GetAttr(), &out.Attr)
 	if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
 		out.Attr.Size = uint64(entry.Size)
 		out.Attr.Mtime = uint64(entry.ModTime.Unix())

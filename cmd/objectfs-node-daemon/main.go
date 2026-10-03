@@ -230,6 +230,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		AllowOther: true,
 		FsName:     "objectfs",
 		Name:       "objectfs",
+		Options:    []string{"default_permissions", "allow_other"},
 	}
 
 	server, err := gofuse.NewServer(rawFS, targetPath, mountOpts)

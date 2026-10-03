@@ -116,11 +116,9 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 	fuseOpts := &gofuse.MountOptions{
 		FsName:     "objectfs",
 		Name:       "objectfs",
-		AllowOther: opts.allowOther,
+		AllowOther: true,
 		Debug:      opts.debug,
-		// When running as root (e.g. inside a container), mount via the mount
-		// syscall so that the fusermount helper is not required.
-		DirectMount: os.Geteuid() == 0,
+		Options:    []string{"default_permissions", "allow_other"},
 	}
 
 	server, err := gofuse.NewServer(rawFS, mountpoint, fuseOpts)
