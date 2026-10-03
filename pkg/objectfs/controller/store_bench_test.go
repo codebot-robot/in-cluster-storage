@@ -18,6 +18,8 @@ package controller
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -277,6 +279,9 @@ func Benchmark64KiBFsyncedWrite(b *testing.B) {
 }
 
 func TestBenchmarkMetricsReport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow benchmark report in short mode")
+	}
 	ctx := t.Context()
 
 	t.Log("================ METADATA STORE COMPARISON REPORT ================")
@@ -513,6 +518,106 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 		diffHeap := int64(m2.HeapAlloc) - int64(m1.HeapAlloc)
 		t.Logf("[%s] HeapAlloc after 15,000 files: %d KB", mode, diffHeap/1024)
+		_ = vol.Close()
+	}
+
+	// 6. Async SQLite Overlay & Batch Applier Scaling & Disk/WAL Footprint
+	t.Log("\n--- 6. Async SQLite Overlay & Batch Applier Scaling & Disk/WAL Footprint ---")
+	getDiskFootprint := func(dir string) (dbBytes int64, walBytes int64) {
+		if fi, err := os.Stat(filepath.Join(dir, "metadata.sqlite")); err == nil {
+			dbBytes = fi.Size()
+		}
+		if fi, err := os.Stat(filepath.Join(dir, "metadata.sqlite-wal")); err == nil {
+			walBytes = fi.Size()
+		}
+		return
+	}
+
+	for _, batchSize := range []int{1, 10, 100} {
+		localDir := t.TempDir()
+		vol := NewVolume("batch-bench", inmemorystorage.New(), NewEventBroadcaster(),
+			WithMetadataStore("sqlite"),
+			WithLocalStorageDir(localDir),
+			WithApplierBatchSize(batchSize),
+		)
+		_ = vol.LoadFromBackend(ctx)
+
+		// Measure 100 creates in single hot directory
+		dirAttr, _ := vol.Mkdir(ctx, 1, "hot_dir", 0755, 0, 0)
+		startCreate := time.Now()
+		for i := 0; i < 100; i++ {
+			_, _ = vol.CreateFile(ctx, dirAttr.Inode, fmt.Sprintf("f_%d.txt", i), 0644, []byte("val"), 0, 0)
+		}
+		createDur := time.Since(startCreate)
+		_ = vol.FlushOverlay(ctx)
+		dbBytes, walBytes := getDiskFootprint(localDir)
+
+		// Measure 100 64 KiB writes to single file
+		fAttr, _ := vol.CreateFile(ctx, 1, "large_write.bin", 0644, nil, 0, 0)
+		data64K := make([]byte, 64*1024)
+		startWrite := time.Now()
+		for i := 0; i < 100; i++ {
+			_, _, _, _ = vol.WriteFile(ctx, fAttr.Inode, 0, data64K, 0)
+		}
+		writeDur := time.Since(startWrite)
+		_ = vol.FlushOverlay(ctx)
+		dbBytesW, walBytesW := getDiskFootprint(localDir)
+
+		// Measure 100 renames
+		rAttr, _ := vol.CreateFile(ctx, 1, "r_a.txt", 0644, []byte("x"), 0, 0)
+		startRename := time.Now()
+		for i := 0; i < 100; i++ {
+			from, to := "r_a.txt", "r_b.txt"
+			if i%2 == 1 {
+				from, to = "r_b.txt", "r_a.txt"
+			}
+			_, _ = vol.Rename(ctx, 1, from, 1, to)
+		}
+		renameDur := time.Since(startRename)
+		_ = vol.FlushOverlay(ctx)
+		dbBytesR, walBytesR := getDiskFootprint(localDir)
+
+		_ = vol.Close()
+
+		t.Logf("[batch_size=%3d] 100 Creates: %v (avg %v/op) | WAL: %d KB, DB: %d KB (pages ~%d)",
+			batchSize, createDur, createDur/100, walBytes/1024, dbBytes/1024, (dbBytes+walBytes)/4096)
+		t.Logf("[batch_size=%3d] 100 64KiB Writes: %v (avg %v/op) | WAL delta: %d KB",
+			batchSize, writeDur, writeDur/100, (walBytesW-walBytes)/1024)
+		t.Logf("[batch_size=%3d] 100 Renames: %v (avg %v/op) | WAL delta: %d KB",
+			batchSize, renameDur, renameDur/100, (walBytesR-walBytesW)/1024)
+		_ = dbBytesW
+		_ = dbBytesR
+		_ = rAttr
+	}
+
+	// 7. Overlay read latency comparison
+	t.Log("\n--- 7. Overlay vs Cache Read Performance ---")
+	{
+		localDir := t.TempDir()
+		vol := NewVolume("overlay-read", inmemorystorage.New(), NewEventBroadcaster(),
+			WithMetadataStore("sqlite"),
+			WithLocalStorageDir(localDir),
+		)
+		_ = vol.LoadFromBackend(ctx)
+		fAttr, _ := vol.CreateFile(ctx, 1, "target.txt", 0644, []byte("data"), 0, 0)
+
+		// Read from overlay (before flush)
+		startOverlay := time.Now()
+		for i := 0; i < 1000; i++ {
+			_, _ = vol.GetAttr(ctx, fAttr.Inode)
+		}
+		overlayDur := time.Since(startOverlay)
+
+		// Flush and read from clean read cache
+		_ = vol.FlushOverlay(ctx)
+		startCache := time.Now()
+		for i := 0; i < 1000; i++ {
+			_, _ = vol.GetAttr(ctx, fAttr.Inode)
+		}
+		cacheDur := time.Since(startCache)
+
+		t.Logf("Overlay Read 1,000 ops: %v (avg %v/op) | Clean Cache Read 1,000 ops: %v (avg %v/op)",
+			overlayDur, overlayDur/1000, cacheDur, cacheDur/1000)
 		_ = vol.Close()
 	}
 
