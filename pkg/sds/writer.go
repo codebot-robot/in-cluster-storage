@@ -163,6 +163,7 @@ type Tx struct {
 	writer   *Writer
 	txID     uint64
 	finished bool
+	changes  []Change
 }
 
 // TxID returns the transaction ID.
@@ -170,12 +171,41 @@ func (tx *Tx) TxID() uint64 {
 	return tx.txID
 }
 
+func (tx *Tx) recordChange(seq uint64, op sdsv1.OpRecord_Op, msg proto.Message) error {
+	def, err := tx.writer.resolveOrRegister(msg)
+	if err != nil {
+		return err
+	}
+	keyBytes, valBytes, err := SplitKeyAndNonKey(msg, def.GetKeyFields())
+	if err != nil {
+		return err
+	}
+	ch := Change{
+		Seq:      seq,
+		TypeID:   def.GetId(),
+		TypeName: def.GetName(),
+		Op:       op,
+		TxID:     tx.txID,
+		Key:      NewKeyFromBytes(keyBytes),
+		RawKey:   keyBytes,
+		RawVal:   valBytes,
+		Row:      msg,
+	}
+	tx.changes = append(tx.changes, ch)
+	return nil
+}
+
 // Insert writes an OpRecord_CREATE row change belonging to this transaction.
 func (tx *Tx) Insert(ctx context.Context, msg proto.Message) (uint64, error) {
 	if tx.finished {
 		return 0, fmt.Errorf("transaction %d already closed", tx.txID)
 	}
-	return tx.writer.writeOp(ctx, sdsv1.OpRecord_CREATE, tx.txID, msg)
+	seq, err := tx.writer.writeOp(ctx, sdsv1.OpRecord_CREATE, tx.txID, msg)
+	if err != nil {
+		return 0, err
+	}
+	_ = tx.recordChange(seq, sdsv1.OpRecord_CREATE, msg)
+	return seq, nil
 }
 
 // Create writes an OpRecord_CREATE row change belonging to this transaction.
@@ -183,7 +213,12 @@ func (tx *Tx) Create(ctx context.Context, msg proto.Message) (uint64, error) {
 	if tx.finished {
 		return 0, fmt.Errorf("transaction %d already closed", tx.txID)
 	}
-	return tx.writer.writeOp(ctx, sdsv1.OpRecord_CREATE, tx.txID, msg)
+	seq, err := tx.writer.writeOp(ctx, sdsv1.OpRecord_CREATE, tx.txID, msg)
+	if err != nil {
+		return 0, err
+	}
+	_ = tx.recordChange(seq, sdsv1.OpRecord_CREATE, msg)
+	return seq, nil
 }
 
 // Update writes an OpRecord_UPDATE row change belonging to this transaction.
@@ -191,7 +226,12 @@ func (tx *Tx) Update(ctx context.Context, msg proto.Message) (uint64, error) {
 	if tx.finished {
 		return 0, fmt.Errorf("transaction %d already closed", tx.txID)
 	}
-	return tx.writer.writeOp(ctx, sdsv1.OpRecord_UPDATE, tx.txID, msg)
+	seq, err := tx.writer.writeOp(ctx, sdsv1.OpRecord_UPDATE, tx.txID, msg)
+	if err != nil {
+		return 0, err
+	}
+	_ = tx.recordChange(seq, sdsv1.OpRecord_UPDATE, msg)
+	return seq, nil
 }
 
 // Delete writes an OpRecord_DELETE row change belonging to this transaction.
@@ -199,7 +239,12 @@ func (tx *Tx) Delete(ctx context.Context, msg proto.Message) (uint64, error) {
 	if tx.finished {
 		return 0, fmt.Errorf("transaction %d already closed", tx.txID)
 	}
-	return tx.writer.writeOp(ctx, sdsv1.OpRecord_DELETE, tx.txID, msg)
+	seq, err := tx.writer.writeOp(ctx, sdsv1.OpRecord_DELETE, tx.txID, msg)
+	if err != nil {
+		return 0, err
+	}
+	_ = tx.recordChange(seq, sdsv1.OpRecord_DELETE, msg)
+	return seq, nil
 }
 
 // Commit commits this transaction by writing a TxCommit framework record.
@@ -212,5 +257,17 @@ func (tx *Tx) Commit(ctx context.Context) (uint64, error) {
 		TxId:       tx.txID,
 		CommitTime: timestamppb.Now(),
 	}
-	return tx.writer.recordWriter.AppendTxCommit(ctx, commit)
+	commitSeq, err := tx.writer.recordWriter.AppendTxCommit(ctx, commit)
+	if err != nil {
+		return 0, err
+	}
+	for i := range tx.changes {
+		tx.changes[i].Seq = commitSeq
+	}
+	return commitSeq, nil
+}
+
+// Changes returns all row changes made during this transaction with updated commit sequence numbers.
+func (tx *Tx) Changes() []Change {
+	return tx.changes
 }

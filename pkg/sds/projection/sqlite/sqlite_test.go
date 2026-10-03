@@ -665,3 +665,176 @@ func TestRandomLogReplayConformance(t *testing.T) {
 		verifySQLiteMatchesMemStore(t, ctx, restoredDB, memStore)
 	}
 }
+
+func TestKeyPrefixScan(t *testing.T) {
+	ctx := t.Context()
+	appender := &memoryAppender{}
+	writer := sds.NewWriter(appender)
+
+	dirEntryMD := buildMD(t, "DirEntry", []*descriptorpb.FieldDescriptorProto{
+		field("parent_id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("name", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("ino", 3, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("is_dir", 4, descriptorpb.FieldDescriptorProto_TYPE_BOOL, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+	writer.RegisterDescriptor(dirEntryMD, 1, 2)
+
+	// Insert parent 1 entries
+	p1Names := []string{"alpha", "beta", "gamma"}
+	for i, name := range p1Names {
+		de := dynamicpb.NewMessage(dirEntryMD)
+		de.Set(dirEntryMD.Fields().ByName("parent_id"), protoreflect.ValueOfInt64(1))
+		de.Set(dirEntryMD.Fields().ByName("name"), protoreflect.ValueOfString(name))
+		de.Set(dirEntryMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(int64(10+i)))
+		de.Set(dirEntryMD.Fields().ByName("is_dir"), protoreflect.ValueOfBool(false))
+		writer.Insert(ctx, de)
+	}
+
+	// Insert parent 2 entries
+	p2Names := []string{"alpha", "delta"}
+	for i, name := range p2Names {
+		de := dynamicpb.NewMessage(dirEntryMD)
+		de.Set(dirEntryMD.Fields().ByName("parent_id"), protoreflect.ValueOfInt64(2))
+		de.Set(dirEntryMD.Fields().ByName("name"), protoreflect.ValueOfString(name))
+		de.Set(dirEntryMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(int64(20+i)))
+		de.Set(dirEntryMD.Fields().ByName("is_dir"), protoreflect.ValueOfBool(true))
+		writer.Insert(ctx, de)
+	}
+
+	// Insert parent 100 entry
+	de100 := dynamicpb.NewMessage(dirEntryMD)
+	de100.Set(dirEntryMD.Fields().ByName("parent_id"), protoreflect.ValueOfInt64(100))
+	de100.Set(dirEntryMD.Fields().ByName("name"), protoreflect.ValueOfString("zeta"))
+	de100.Set(dirEntryMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(1000))
+	de100.Set(dirEntryMD.Fields().ByName("is_dir"), protoreflect.ValueOfBool(false))
+	writer.Insert(ctx, de100)
+
+	dbPath := filepath.Join(t.TempDir(), "scan_test.sqlite")
+	db, err := sqlite.Open(ctx, dbPath, sqlite.WithStreamID("stream-scan"))
+	if err != nil {
+		t.Fatalf("sqlite.Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i, p := range appender.Payloads() {
+		if _, err := db.Feed(ctx, uint64(i+1), p); err != nil {
+			t.Fatalf("Feed failed: %v", err)
+		}
+	}
+
+	// 1. Scan for parent_id = 1
+	p1PrefixMsg := dynamicpb.NewMessage(dirEntryMD)
+	p1PrefixMsg.Set(dirEntryMD.Fields().ByName("parent_id"), protoreflect.ValueOfInt64(1))
+	p1Prefix, err := sds.EncodeKeyPrefix(p1PrefixMsg, 1)
+	if err != nil {
+		t.Fatalf("EncodeKeyPrefix for parent 1 failed: %v", err)
+	}
+
+	p1Rows, err := db.Scan(ctx, "testpkg.DirEntry", p1Prefix)
+	if err != nil {
+		t.Fatalf("db.Scan parent 1 failed: %v", err)
+	}
+	if len(p1Rows) != 3 {
+		t.Fatalf("expected 3 rows for parent 1, got %d", len(p1Rows))
+	}
+	gotP1Names := make(map[string]bool)
+	for _, row := range p1Rows {
+		dyn := row.(*dynamicpb.Message)
+		name := dyn.Get(dyn.Descriptor().Fields().ByName("name")).String()
+		gotP1Names[name] = true
+	}
+	for _, name := range p1Names {
+		if !gotP1Names[name] {
+			t.Errorf("missing expected name %s in parent 1", name)
+		}
+	}
+
+	// 2. Scan for parent_id = 2
+	p2PrefixMsg := dynamicpb.NewMessage(dirEntryMD)
+	p2PrefixMsg.Set(dirEntryMD.Fields().ByName("parent_id"), protoreflect.ValueOfInt64(2))
+	p2Prefix, err := sds.EncodeKeyPrefix(p2PrefixMsg, 1)
+	if err != nil {
+		t.Fatalf("EncodeKeyPrefix for parent 2 failed: %v", err)
+	}
+
+	p2Rows, err := db.Scan(ctx, "testpkg.DirEntry", p2Prefix)
+	if err != nil {
+		t.Fatalf("db.Scan parent 2 failed: %v", err)
+	}
+	if len(p2Rows) != 2 {
+		t.Fatalf("expected 2 rows for parent 2, got %d", len(p2Rows))
+	}
+
+	// 3. Scan all (empty prefix)
+	allRows, err := db.Scan(ctx, "testpkg.DirEntry", nil)
+	if err != nil {
+		t.Fatalf("db.Scan all failed: %v", err)
+	}
+	if len(allRows) != 6 {
+		t.Fatalf("expected 6 total rows, got %d", len(allRows))
+	}
+}
+
+func TestTxChangesAndApplyBatch(t *testing.T) {
+	ctx := t.Context()
+	appender := &memoryAppender{}
+	writer := sds.NewWriter(appender)
+
+	userMD := buildMD(t, "User", []*descriptorpb.FieldDescriptorProto{
+		field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("name", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+	writer.RegisterDescriptor(userMD, 1)
+
+	dbPath := filepath.Join(t.TempDir(), "writethrough.sqlite")
+	db, err := sqlite.Open(ctx, dbPath, sqlite.WithStreamID("stream-wt"))
+	if err != nil {
+		t.Fatalf("sqlite.Open failed: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.SyncRegistry(ctx, writer.Registry()); err != nil {
+		t.Fatalf("SyncRegistry failed: %v", err)
+	}
+
+	tx := writer.Begin()
+	u1 := dynamicpb.NewMessage(userMD)
+	u1.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(10))
+	u1.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString("User 10"))
+	tx.Insert(ctx, u1)
+
+	u2 := dynamicpb.NewMessage(userMD)
+	u2.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(20))
+	u2.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString("User 20"))
+	tx.Insert(ctx, u2)
+
+	commitSeq, err := tx.Commit(ctx)
+	if err != nil {
+		t.Fatalf("tx.Commit failed: %v", err)
+	}
+
+	changes := tx.Changes()
+	if len(changes) != 2 {
+		t.Fatalf("expected 2 changes, got %d", len(changes))
+	}
+	if changes[0].Seq != commitSeq || changes[1].Seq != commitSeq {
+		t.Fatalf("changes seq mismatch: %d, %d vs %d", changes[0].Seq, changes[1].Seq, commitSeq)
+	}
+
+	// Apply write-through
+	if err := db.ApplyBatch(ctx, changes); err != nil {
+		t.Fatalf("db.ApplyBatch failed: %v", err)
+	}
+
+	if db.Position() != commitSeq {
+		t.Errorf("db.Position = %d, want %d", db.Position(), commitSeq)
+	}
+
+	count, err := db.Count(ctx, "testpkg.User")
+	if err != nil {
+		t.Fatalf("db.Count failed: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 users in db, got %d", count)
+	}
+}

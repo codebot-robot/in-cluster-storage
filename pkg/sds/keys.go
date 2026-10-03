@@ -226,3 +226,31 @@ func MergeKeyAndNonKey(target proto.Message, keyBytes, valBytes []byte) error {
 	}
 	return nil
 }
+
+// EncodeKeyPrefix extracts and marshals only the specified prefixKeyFields in sorted order
+// deterministically to form a canonical binary key prefix for range queries.
+// If prefixKeyFields is empty, all set fields in msg are marshaled deterministically.
+func EncodeKeyPrefix(msg proto.Message, prefixKeyFields ...int32) ([]byte, error) {
+	if msg == nil {
+		return nil, errors.New("nil message")
+	}
+	m := msg.ProtoReflect()
+	fields := m.Descriptor().Fields()
+
+	if len(prefixKeyFields) == 0 {
+		return proto.MarshalOptions{Deterministic: true}.Marshal(msg)
+	}
+
+	sorted := make([]int32, len(prefixKeyFields))
+	copy(sorted, prefixKeyFields)
+	slices.Sort(sorted)
+
+	prefixMsg := m.Type().New()
+	for _, fn := range sorted {
+		f := fields.ByNumber(protoreflect.FieldNumber(fn))
+		if f != nil && m.Has(f) {
+			prefixMsg.Set(f, m.Get(f))
+		}
+	}
+	return proto.MarshalOptions{Deterministic: true}.Marshal(prefixMsg.Interface())
+}

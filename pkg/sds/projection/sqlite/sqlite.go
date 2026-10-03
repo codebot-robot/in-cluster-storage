@@ -17,6 +17,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -387,6 +388,9 @@ func (d *DB) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 
 func (d *DB) applyChangeInTx(ctx context.Context, tx *sql.Tx, ch sds.Change) error {
 	def, _, ok := d.changeReader.Registry().LookupByID(ch.TypeID)
+	if !ok && ch.TypeName != "" {
+		def, _, ok = d.changeReader.Registry().LookupByName(ch.TypeName)
+	}
 	if !ok {
 		return fmt.Errorf("%w: type ID %d (%s)", ErrTypeNotRegistered, ch.TypeID, ch.TypeName)
 	}
@@ -530,6 +534,114 @@ func (d *DB) Tables() []string {
 	}
 	sort.Strings(tables)
 	return tables
+}
+
+// SyncRegistry imports types from reg into the DB's registry and ensures their schemas exist in SQLite.
+func (d *DB) SyncRegistry(ctx context.Context, reg *record.Registry) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if reg == nil {
+		return nil
+	}
+	exported := reg.Export()
+	if err := d.changeReader.Registry().Import(exported); err != nil {
+		return err
+	}
+	for _, def := range exported.GetTypes() {
+		if err := d.ensureTableSchema(ctx, nil, def); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RegisterType registers a Go proto.Message type with optional primary key field numbers
+// and creates its table schema in SQLite.
+func (d *DB) RegisterType(ctx context.Context, msg proto.Message, keyFields ...int32) (*sdsv1.TypeDefinition, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	def, err := d.changeReader.Registry().RegisterMessage(msg, keyFields...)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.ensureTableSchema(ctx, nil, def); err != nil {
+		return nil, err
+	}
+	return def, nil
+}
+
+func prefixLimit(prefix []byte) []byte {
+	limit := make([]byte, len(prefix))
+	copy(limit, prefix)
+	for i := len(limit) - 1; i >= 0; i-- {
+		if limit[i] < 0xff {
+			limit[i]++
+			return limit[:i+1]
+		}
+	}
+	return nil
+}
+
+// Scan retrieves merged proto rows from a table matching a canonical key prefix,
+// ordered by keydata ASC. If keyPrefix is empty, it returns all rows in the table.
+func (d *DB) Scan(ctx context.Context, typeName string, keyPrefix []byte) ([]proto.Message, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	def, _, ok := d.changeReader.Registry().LookupByName(typeName)
+	if !ok {
+		return nil, fmt.Errorf("%w: type %q", ErrTypeNotRegistered, typeName)
+	}
+
+	msgType, err := d.changeReader.Registry().ResolveMessageType(def.GetId())
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve message type for %q: %w", typeName, err)
+	}
+
+	tableName := TableName(typeName)
+	var rows *sql.Rows
+	if len(keyPrefix) == 0 {
+		query := fmt.Sprintf("SELECT keydata, valuedata FROM %q ORDER BY keydata ASC;", tableName)
+		rows, err = d.sqlDB.QueryContext(ctx, query)
+	} else {
+		limit := prefixLimit(keyPrefix)
+		if limit != nil {
+			query := fmt.Sprintf("SELECT keydata, valuedata FROM %q WHERE keydata >= ? AND keydata < ? ORDER BY keydata ASC;", tableName)
+			rows, err = d.sqlDB.QueryContext(ctx, query, keyPrefix, limit)
+		} else {
+			query := fmt.Sprintf("SELECT keydata, valuedata FROM %q WHERE keydata >= ? ORDER BY keydata ASC;", tableName)
+			rows, err = d.sqlDB.QueryContext(ctx, query, keyPrefix)
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan rows from %q: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	var result []proto.Message
+	for rows.Next() {
+		var keydata, valuedata []byte
+		if err := rows.Scan(&keydata, &valuedata); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		if len(keyPrefix) > 0 && !bytes.HasPrefix(keydata, keyPrefix) {
+			continue
+		}
+
+		target := msgType.New().Interface()
+		if err := sds.MergeKeyAndNonKey(target, keydata, valuedata); err != nil {
+			return nil, fmt.Errorf("failed to merge proto key and value: %w", err)
+		}
+		result = append(result, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 // Rows returns all merged proto rows from the specified table.
