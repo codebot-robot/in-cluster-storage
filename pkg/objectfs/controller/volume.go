@@ -1343,7 +1343,7 @@ func (v *Volume) flushOverlayLocked(ctx context.Context) error {
 	}
 
 	targetSeq := v.lastCommitSeq
-	for (v.sqliteAppliedPos < targetSeq || len(v.sqliteOverlay) > 0) && !v.closed {
+	for v.sqliteAppliedPos < targetSeq && !v.closed {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -1881,6 +1881,10 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
+
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, nil, err
+		}
 
 		inodeID = v.normalizeInodeID(inodeID)
 

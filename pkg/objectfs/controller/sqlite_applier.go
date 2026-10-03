@@ -132,10 +132,24 @@ func (a *sqliteApplier) loop() {
 			return
 		}
 
-		// Determine batch size
-		batchLimit := a.batchSize
-		if batchLimit <= 0 || batchLimit > len(a.queue) {
-			batchLimit = len(a.queue)
+		// Determine batch size: only cut batches at transaction boundaries!
+		// Never split changes that share a Seq. If a single transaction is larger than batchSize,
+		// apply it as one batch anyway.
+		targetSize := a.batchSize
+		if targetSize <= 0 {
+			targetSize = defaultApplierBatchSize
+		}
+		batchLimit := 0
+		for batchLimit < len(a.queue) {
+			currentSeq := a.queue[batchLimit].Seq
+			nextLimit := batchLimit + 1
+			for nextLimit < len(a.queue) && a.queue[nextLimit].Seq == currentSeq {
+				nextLimit++
+			}
+			batchLimit = nextLimit
+			if batchLimit >= targetSize {
+				break
+			}
 		}
 		batch := a.queue[:batchLimit]
 

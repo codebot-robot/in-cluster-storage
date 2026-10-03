@@ -1197,3 +1197,171 @@ func TestSQLiteSnapshotFlushesOverlay(t *testing.T) {
 		t.Fatalf("expected 5 files in restored snapshot, got %d", len(entries))
 	}
 }
+
+func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	walDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-tx-boundary"
+
+	streamID := StreamIDForVolume(volID)
+	stream, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("Open WAL stream failed: %v", err)
+	}
+
+	// 1. Start volume with batchSize = 1 (smaller than a rename's change count)
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+		WithStream(stream),
+		WithApplierBatchSize(1),
+	)
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Create initial file and flush to SQLite
+	fAttr, err := vol.CreateFile(ctx, 1, "before_rename.txt", 0644, []byte("tx-boundary-test"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	posBeforeRename := vol.SQLiteAppliedPosition()
+
+	// 2. Perform a multi-change Rename (delete old DirEntry, insert new DirEntry, update Inode)
+	// while applier is stalled by fault hook
+	var faultActive atomic.Bool
+	faultActive.Store(true)
+	vol.SetApplierFaultHook(func() error {
+		if faultActive.Load() {
+			return errors.New("simulated stall during rename")
+		}
+		return nil
+	})
+
+	_, err = vol.Rename(ctx, 1, "before_rename.txt", 1, "after_rename.txt")
+	if err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+
+	// SQLite position must NOT have advanced partially
+	if pos := vol.SQLiteAppliedPosition(); pos != posBeforeRename {
+		t.Fatalf("SQLiteAppliedPosition advanced unexpectedly before batch apply: %d vs %d", pos, posBeforeRename)
+	}
+
+	// Abruptly simulate crash without draining overlay
+	_ = vol.Close()
+
+	// 3. Restart from the EXISTING SQLite database file (without deleting it) + WAL stream replay
+	newStream, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("Reopen WAL stream failed: %v", err)
+	}
+
+	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+		WithStream(newStream),
+		WithApplierBatchSize(1),
+	)
+	defer vol2.Close()
+
+	if err := vol2.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend on recovered volume failed: %v", err)
+	}
+
+	// 4. Verify rename transaction is fully consistent in recovered SQLite view
+	_, err = vol2.Lookup(ctx, 1, "before_rename.txt")
+	if err == nil {
+		t.Fatalf("expected ENOENT for old name after recovery from existing SQLite file")
+	}
+
+	renamedAttr, err := vol2.Lookup(ctx, 1, "after_rename.txt")
+	if err != nil {
+		t.Fatalf("Lookup after_rename failed after recovery: %v", err)
+	}
+	if renamedAttr.Inode != fAttr.Inode {
+		t.Fatalf("mismatched inode: %d vs %d", renamedAttr.Inode, fAttr.Inode)
+	}
+
+	entries, err := vol2.ReadDir(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReadDir failed after recovery: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "after_rename.txt" {
+		t.Fatalf("unexpected entries after recovery: %+v", entries)
+	}
+}
+
+func TestSQLiteSnapshotFlushNoStarvationUnderContinuousWrites(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-continuous-writes"
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	stopWrites := make(chan struct{})
+	var writeCount atomic.Int64
+	var writeErr atomic.Value
+
+	go func() {
+		idx := 0
+		for {
+			select {
+			case <-stopWrites:
+				return
+			default:
+				_, err := vol.CreateFile(ctx, 1, fmt.Sprintf("continuous_%d.txt", idx), 0644, []byte("data"), 0, 0)
+				if err != nil {
+					writeErr.Store(err)
+					return
+				}
+				writeCount.Add(1)
+				idx++
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Wait until several writes have completed
+	for writeCount.Load() < 10 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Trigger snapshot flush to backend; must complete promptly without starving
+	flushCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- vol.FlushToBackend(flushCtx)
+	}()
+
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatalf("FlushToBackend failed during continuous writes: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("FlushToBackend stalled/starved under continuous writes")
+	}
+
+	close(stopWrites)
+	if errVal := writeErr.Load(); errVal != nil {
+		t.Fatalf("Writer goroutine failed: %v", errVal)
+	}
+}
