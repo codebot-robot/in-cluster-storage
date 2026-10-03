@@ -34,7 +34,6 @@ chown/05.t
 chown/06.t
 chown/07.t
 ftruncate/00.t
-ftruncate/02.t
 ftruncate/05.t
 ftruncate/07.t
 link/00.t
@@ -49,7 +48,6 @@ link/10.t
 link/11.t
 mkdir/00.t
 mkdir/01.t
-mkdir/02.t
 mkdir/05.t
 mkdir/06.t
 mkdir/07.t
@@ -73,7 +71,6 @@ mknod/08.t
 mknod/11.t
 open/00.t
 open/01.t
-open/02.t
 open/05.t
 open/06.t
 open/07.t
@@ -82,7 +79,6 @@ open/16.t
 open/17.t
 open/22.t
 rename/00.t
-rename/01.t
 rename/04.t
 rename/05.t
 rename/09.t
@@ -96,7 +92,6 @@ rename/21.t
 rename/23.t
 rename/24.t
 rmdir/01.t
-rmdir/02.t
 rmdir/05.t
 rmdir/06.t
 rmdir/07.t
@@ -109,11 +104,9 @@ symlink/05.t
 symlink/06.t
 symlink/07.t
 symlink/08.t
-truncate/02.t
 truncate/05.t
 truncate/07.t
 unlink/00.t
-unlink/02.t
 unlink/05.t
 unlink/06.t
 unlink/07.t

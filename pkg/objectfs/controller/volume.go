@@ -56,7 +56,12 @@ const (
 	MetadataStoreSQLite MetadataStore = "sqlite"
 )
 
-const MetadataFileName = ".objectfs-metadata.json"
+const (
+	MetadataFileName = ".objectfs-metadata.json"
+	// MaxNameLength is the maximum allowed byte length for a path component name
+	// (matching the POSIX NAME_MAX limit of 255 bytes advertised by statfs).
+	MaxNameLength = 255
+)
 
 type VolumeMetadata struct {
 	VolumeID    string                  `json:"volume_id"`
@@ -1263,6 +1268,9 @@ func (v *Volume) resolvePathLocked(ctx context.Context, p string) (uint64, uint6
 	var parentInodeID uint64
 	var baseName string
 	for i, part := range parts {
+		if len(part) > MaxNameLength {
+			return 0, 0, "", fmt.Errorf("path component %q exceeds maximum length: %w", part, syscall.ENAMETOOLONG)
+		}
 		var entryInodeID uint64
 		var isDir bool
 		if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
@@ -1342,6 +1350,10 @@ func (v *Volume) GetAttr(ctx context.Context, inodeID uint64) (*pb.EntryAttr, er
 }
 
 func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) (*pb.EntryAttr, error) {
+	if len(name) > MaxNameLength {
+		return nil, fmt.Errorf("name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+	}
+
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
@@ -1475,6 +1487,10 @@ func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) error {
 }
 
 func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, mode uint32, uid, gid uint32) (*pb.EntryAttr, error) {
+	if len(name) > MaxNameLength {
+		return nil, fmt.Errorf("directory name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+	}
+
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
@@ -1673,6 +1689,10 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 }
 
 func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name string, mode uint32, initialContent []byte, uid, gid uint32) (*pb.EntryAttr, error) {
+	if len(name) > MaxNameLength {
+		return nil, fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+	}
+
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
@@ -2749,6 +2769,10 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 }
 
 func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) error {
+	if len(name) > MaxNameLength {
+		return fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+	}
+
 	v.mu.Lock()
 	if parentInodeID == 0 {
 		parentInodeID = v.rootInodeID
@@ -2912,6 +2936,10 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 }
 
 func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) error {
+	if len(name) > MaxNameLength {
+		return fmt.Errorf("directory name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+	}
+
 	waitFn, err := func() (func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
@@ -3050,6 +3078,10 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 }
 
 func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName string, newParentInodeID uint64, newName string) (*pb.EntryAttr, error) {
+	if len(oldName) > MaxNameLength || len(newName) > MaxNameLength {
+		return nil, fmt.Errorf("name exceeds maximum length: %w", syscall.ENAMETOOLONG)
+	}
+
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()

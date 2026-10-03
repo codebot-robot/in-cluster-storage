@@ -29,6 +29,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// MaxNameLength is the maximum allowed byte length for a path component name
+// (matching the POSIX NAME_MAX limit of 255 bytes advertised by statfs).
+const MaxNameLength = 255
+
 type ObjectFS struct {
 	fuse.RawFileSystem
 
@@ -144,6 +148,9 @@ func (fs *ObjectFS) fillEntryOut(attr *pb.EntryAttr, out *fuse.EntryOut) {
 }
 
 func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
+	if len(name) > MaxNameLength {
+		return fuse.Status(syscall.ENAMETOOLONG)
+	}
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
@@ -245,6 +252,9 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 }
 
 func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
+	if len(name) > MaxNameLength {
+		return fuse.Status(syscall.ENAMETOOLONG)
+	}
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
@@ -271,6 +281,9 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 }
 
 func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
+	if len(name) > MaxNameLength {
+		return fuse.Status(syscall.ENAMETOOLONG)
+	}
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
@@ -300,6 +313,9 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 }
 
 func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name string, out *fuse.EntryOut) fuse.Status {
+	if len(name) > MaxNameLength {
+		return fuse.Status(syscall.ENAMETOOLONG)
+	}
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
@@ -326,6 +342,9 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 }
 
 func (fs *ObjectFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
+	if len(name) > MaxNameLength {
+		return fuse.Status(syscall.ENAMETOOLONG)
+	}
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
@@ -344,6 +363,9 @@ func (fs *ObjectFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name s
 }
 
 func (fs *ObjectFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
+	if len(name) > MaxNameLength {
+		return fuse.Status(syscall.ENAMETOOLONG)
+	}
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
@@ -362,6 +384,9 @@ func (fs *ObjectFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name st
 }
 
 func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName string, newName string) fuse.Status {
+	if len(oldName) > MaxNameLength || len(newName) > MaxNameLength {
+		return fuse.Status(syscall.ENAMETOOLONG)
+	}
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
@@ -599,7 +624,7 @@ func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fu
 	out.Frsize = 4096
 	out.Files = 1000000
 	out.Ffree = 1000000
-	out.NameLen = 255
+	out.NameLen = MaxNameLength
 	return fuse.OK
 }
 

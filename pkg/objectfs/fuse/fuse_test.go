@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -834,5 +835,132 @@ func TestDeepPathLookupEfficiency(t *testing.T) {
 	}
 	if statOut.Attr.Size != uint64(len(data)) {
 		t.Fatalf("Expected leaf size %d, got %d", len(data), statOut.Attr.Size)
+	}
+}
+
+func TestFUSENameLengthLimit(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-name-limit"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	validNames := map[string]string{
+		"ascii_255":   strings.Repeat("a", 255),
+		"utf8_3b_255": strings.Repeat("日", 85),
+		"utf8_2b_255": strings.Repeat("é", 127) + "x",
+		"utf8_4b_255": strings.Repeat("🎉", 63) + "xyz",
+	}
+
+	tooLongNames := map[string]string{
+		"ascii_256":   strings.Repeat("a", 256),
+		"utf8_3b_256": strings.Repeat("日", 85) + "x",
+		"utf8_2b_256": strings.Repeat("é", 128),
+		"utf8_4b_256": strings.Repeat("🎉", 64),
+	}
+
+	for desc, name := range validNames {
+		if len(name) != 255 {
+			t.Fatalf("%s length is %d, expected 255", desc, len(name))
+		}
+
+		// 1. Lookup non-existent 255-byte name -> returns ENOENT, not ENAMETOOLONG
+		var lOut fuse.EntryOut
+		if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, name, &lOut); st != fuse.ENOENT {
+			t.Fatalf("[%s] Lookup non-existent: expected ENOENT, got %v", desc, st)
+		}
+
+		// 2. Mkdir 255-byte name -> OK
+		var dOut fuse.EntryOut
+		if st := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, name, &dOut); st != fuse.OK {
+			t.Fatalf("[%s] Mkdir 255-byte name failed: %v", desc, st)
+		}
+
+		// 3. Lookup existing 255-byte name -> OK
+		if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, name, &lOut); st != fuse.OK {
+			t.Fatalf("[%s] Lookup existing 255-byte name failed: %v", desc, st)
+		}
+
+		// 4. Rmdir 255-byte name -> OK
+		if st := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, name); st != fuse.OK {
+			t.Fatalf("[%s] Rmdir 255-byte name failed: %v", desc, st)
+		}
+
+		// 5. Create 255-byte name -> OK
+		var cOut fuse.CreateOut
+		if st := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, name, &cOut); st != fuse.OK {
+			t.Fatalf("[%s] Create 255-byte name failed: %v", desc, st)
+		}
+
+		// 6. Rename 255-byte name -> another 255-byte name -> OK
+		renamedName := strings.Repeat("b", 255)
+		if st := rawFS.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}, name, renamedName); st != fuse.OK {
+			t.Fatalf("[%s] Rename 255-byte name failed: %v", desc, st)
+		}
+
+		// 7. Unlink 255-byte name -> OK
+		if st := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, renamedName); st != fuse.OK {
+			t.Fatalf("[%s] Unlink 255-byte name failed: %v", desc, st)
+		}
+
+		// 8. Mknod 255-byte name -> OK
+		var mOut fuse.EntryOut
+		if st := rawFS.Mknod(nil, &fuse.MknodIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, name, &mOut); st != fuse.OK {
+			t.Fatalf("[%s] Mknod 255-byte name failed: %v", desc, st)
+		}
+		if st := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, name); st != fuse.OK {
+			t.Fatalf("[%s] Unlink after Mknod failed: %v", desc, st)
+		}
+	}
+
+	for desc, name := range tooLongNames {
+		if len(name) < 256 {
+			t.Fatalf("%s length is %d, expected >= 256", desc, len(name))
+		}
+
+		// 1. Lookup 256-byte name -> ENAMETOOLONG
+		var lOut fuse.EntryOut
+		if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, name, &lOut); st != fuse.Status(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Lookup 256-byte: expected ENAMETOOLONG (%d), got %v", desc, syscall.ENAMETOOLONG, st)
+		}
+
+		// 2. Mkdir 256-byte name -> ENAMETOOLONG
+		var dOut fuse.EntryOut
+		if st := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, name, &dOut); st != fuse.Status(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Mkdir 256-byte: expected ENAMETOOLONG (%d), got %v", desc, syscall.ENAMETOOLONG, st)
+		}
+
+		// 3. Create 256-byte name -> ENAMETOOLONG
+		var cOut fuse.CreateOut
+		if st := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, name, &cOut); st != fuse.Status(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Create 256-byte: expected ENAMETOOLONG (%d), got %v", desc, syscall.ENAMETOOLONG, st)
+		}
+
+		// 4. Mknod 256-byte name -> ENAMETOOLONG
+		var mOut fuse.EntryOut
+		if st := rawFS.Mknod(nil, &fuse.MknodIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, name, &mOut); st != fuse.Status(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Mknod 256-byte: expected ENAMETOOLONG (%d), got %v", desc, syscall.ENAMETOOLONG, mOut)
+		}
+
+		// 5. Unlink 256-byte name -> ENAMETOOLONG
+		if st := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, name); st != fuse.Status(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Unlink 256-byte: expected ENAMETOOLONG (%d), got %v", desc, syscall.ENAMETOOLONG, st)
+		}
+
+		// 6. Rmdir 256-byte name -> ENAMETOOLONG
+		if st := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, name); st != fuse.Status(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Rmdir 256-byte: expected ENAMETOOLONG (%d), got %v", desc, syscall.ENAMETOOLONG, st)
+		}
+
+		// 7. Rename 256-byte oldName -> ENAMETOOLONG
+		if st := rawFS.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}, name, "valid.txt"); st != fuse.Status(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Rename 256-byte oldName: expected ENAMETOOLONG (%d), got %v", desc, syscall.ENAMETOOLONG, st)
+		}
+
+		// 8. Rename 256-byte newName -> ENAMETOOLONG
+		if st := rawFS.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}, "valid.txt", name); st != fuse.Status(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Rename 256-byte newName: expected ENAMETOOLONG (%d), got %v", desc, syscall.ENAMETOOLONG, st)
+		}
 	}
 }
