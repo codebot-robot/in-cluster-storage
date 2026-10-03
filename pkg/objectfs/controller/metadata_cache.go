@@ -182,7 +182,7 @@ type CachedInode struct {
 	ManifestSha256 string
 	ContentSha256  string
 	ChunkSize      uint32
-	Chunks         []string
+	Chunks         map[uint32]string
 	InlineData     []byte
 	StagedChunks   map[int][]byte
 	DirtyChunks    map[int][]byte

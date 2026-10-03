@@ -25,6 +25,7 @@ import (
 	"net"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -2782,5 +2783,66 @@ func TestTinyFileInlineLogging(t *testing.T) {
 	readResp, err := testReadFile(ctx, server, volumeID, "/tiny.txt", 0, 100)
 	if err != nil || !bytes.Equal(readResp.GetData(), tinyData) {
 		t.Fatalf("ReadFile tiny mismatch: %q vs %q (err=%v)", string(readResp.GetData()), string(tinyData), err)
+	}
+}
+
+func TestHugeSparseTruncateAndUnlink(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "huge-vol"
+	defer server.Close()
+
+	// Create file
+	createResp, err := testCreateFile(ctx, server, volumeID, "/huge.bin", 0644, []byte("initial chunk data"), 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v (err=%d)", err, createResp.GetError())
+	}
+
+	// Grow file to 999,999,999,999,999 bytes (~1 PB, as in pjdfstest 12.t)
+	hugeSize := int64(999999999999999)
+	var mBefore runtime.MemStats
+	runtime.ReadMemStats(&mBefore)
+
+	truncResp, err := testTruncateFile(ctx, server, volumeID, "/huge.bin", hugeSize)
+	if err != nil || truncResp.GetError() != 0 {
+		t.Fatalf("TruncateFile to hugeSize failed: %v (err=%d)", err, truncResp.GetError())
+	}
+
+	var mAfter runtime.MemStats
+	runtime.ReadMemStats(&mAfter)
+
+	// Heap growth must remain tiny (under 10 MB), never allocating billions of chunk entries
+	if mAfter.HeapAlloc > mBefore.HeapAlloc && (mAfter.HeapAlloc-mBefore.HeapAlloc) > 10*1024*1024 {
+		t.Fatalf("Excessive heap growth on sparse truncate: allocated %d bytes", mAfter.HeapAlloc-mBefore.HeapAlloc)
+	}
+
+	// Stat to confirm size
+	attrResp, err := testGetAttr(ctx, server, volumeID, "/huge.bin")
+	if err != nil || attrResp.GetError() != 0 {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if attrResp.GetAttr().GetSize() != hugeSize {
+		t.Fatalf("Expected size %d, got %d", hugeSize, attrResp.GetAttr().GetSize())
+	}
+
+	// Read a few bytes from the end (sparse hole reads as zeros)
+	readResp, err := testReadFile(ctx, server, volumeID, "/huge.bin", hugeSize-1024, 1024)
+	if err != nil || readResp.GetError() != 0 {
+		t.Fatalf("ReadFile near EOF failed: %v (err=%d)", err, readResp.GetError())
+	}
+	if len(readResp.GetData()) != 1024 {
+		t.Fatalf("Expected 1024 bytes, got %d", len(readResp.GetData()))
+	}
+	for i, b := range readResp.GetData() {
+		if b != 0 {
+			t.Fatalf("Expected zero byte at %d, got %d", i, b)
+		}
+	}
+
+	// Unlink should be instantaneous and bounded without iterating billions of chunk indices
+	unResp, err := testUnlink(ctx, server, volumeID, "/huge.bin")
+	if err != nil || unResp.GetError() != 0 {
+		t.Fatalf("Unlink failed: %v (err=%d)", err, unResp.GetError())
 	}
 }
