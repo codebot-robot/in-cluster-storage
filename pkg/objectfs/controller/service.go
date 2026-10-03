@@ -93,6 +93,7 @@ type Server struct {
 	walDir            string
 	walTarget         string
 	defaultDurability walclient.Level
+	metadataStore     string
 	streamFactory     func(volumeID string) (walclient.Stream, error)
 
 	flushTicker *time.Ticker
@@ -102,6 +103,13 @@ type Server struct {
 
 // ServerOption configures the controller Server.
 type ServerOption func(*Server)
+
+// WithServerMetadataStore configures the metadata store (legacy or sqlite).
+func WithServerMetadataStore(store string) ServerOption {
+	return func(s *Server) {
+		s.metadataStore = store
+	}
+}
 
 // WithServerWAL configures the WAL directory, buffer target, and default durability level.
 func WithServerWAL(walDir, walTarget string, durability walclient.Level) ServerOption {
@@ -165,6 +173,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 			volOpts = append(volOpts, WithStream(stream))
 		}
 		volOpts = append(volOpts, WithDurability(s.defaultDurability))
+		if s.metadataStore != "" {
+			volOpts = append(volOpts, WithMetadataStore(s.metadataStore))
+		}
 
 		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
 		if err := vol.LoadFromBackend(context.Background()); err != nil {

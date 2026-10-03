@@ -242,5 +242,10 @@ EOF
 
 chmod +x "${RUNNER_SCRIPT}"
 
-# Execute tests against native FUSE mount
-GOTOOLCHAIN=auto ./dev/tasks/fuse-start -- "${RUNNER_SCRIPT}"
+# Execute tests against native FUSE mount in legacy mode
+echo "=== Running POSIX gate (legacy metadata store) ==="
+GOTOOLCHAIN=auto OBJECTFS_METADATA_STORE=legacy ./dev/tasks/fuse-start -- "${RUNNER_SCRIPT}"
+
+# Execute tests against native FUSE mount in sqlite mode
+echo "=== Running POSIX gate (sqlite metadata store) ==="
+GOTOOLCHAIN=auto OBJECTFS_METADATA_STORE=sqlite ./dev/tasks/fuse-start -- "${RUNNER_SCRIPT}"

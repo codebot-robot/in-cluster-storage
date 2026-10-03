@@ -43,6 +43,7 @@ var (
 	walDir        = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
 	walTarget     = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer:50051)")
 	walDurability = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
+	metadataStore = flag.String("metadata-store", "legacy", "Metadata store type (legacy or sqlite)")
 )
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -73,6 +74,9 @@ func main() {
 	}
 
 	var serverOpts []controller.ServerOption
+	if *metadataStore != "" {
+		serverOpts = append(serverOpts, controller.WithServerMetadataStore(*metadataStore))
+	}
 	// TODO: We always want to assume a WAL, and maybe it would be nice to have a wal-client mode that was local-only e.g. for testing.
 	if *walDir != "" {
 		durability := walclient.Local
