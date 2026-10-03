@@ -89,34 +89,12 @@ type FileMetadata struct {
 	Gid            uint32    `json:"gid,omitempty"`
 }
 
-// metadataResolver provides unified read methods for resolving inodes and directories
-// across active in-memory state/caches, local eviction storage, and immutable base EROFS snapshots.
-type metadataResolver struct {
-	localStore     *LocalStorage
-	snapshotReader *erofs.Reader
-	snapshotRaw    io.ReaderAt
-	inodeCache     *LRUCache[uint64, *CachedInode]
-	dirCache       *LRUCache[uint64, *CachedDir]
-
-	// dirtyInodes maps inode IDs to their latest eviction offset in LocalStorage for inodes
-	// that have changed since the last EROFS snapshot. Additional unflushed modifications
-	// may also reside in inodeCache.
-	dirtyInodes map[uint64]LocalOffset
-
-	// dirtyDirs maps directory inode IDs to their latest delta eviction offset in LocalStorage
-	// for directories that have changed since the last EROFS snapshot. Additional unflushed
-	// delta modifications may also reside in dirCache.
-	dirtyDirs map[uint64]LocalOffset
-}
-
 type InodeUpload struct {
 	wg  sync.WaitGroup
 	err error
 }
 
 type Volume struct {
-	metadataResolver
-
 	mu           sync.RWMutex
 	volumeID     string
 	rootInodeID  uint64
@@ -140,8 +118,9 @@ type Volume struct {
 	recoveredContent map[string][]byte
 
 	localStorageDir string
-	metadataStore   MetadataStore
 	sqliteDB        *sqlite.DB
+	snapshotRaw     io.ReaderAt
+	snapshotReader  *erofs.Reader
 
 	sqliteCache         *LRUCache[SQLiteCacheKey, *SQLiteCachedRow]
 	sqliteCacheDisabled bool
@@ -157,13 +136,7 @@ type Volume struct {
 	closed              bool
 	closedCh            chan struct{}
 
-	snapshotCutoff LocalOffset
-	snapshotMu     sync.Mutex
-
-	// Snapshot trigger limits
-	maxBufferFiles   int
-	maxDirtyRecords  int
-	maxLocalFileSize int64
+	snapshotMu sync.Mutex
 
 	lastFlushedMetadata    *VolumeMetadata
 	deletedPathsSinceFlush []string
@@ -173,14 +146,10 @@ type Volume struct {
 // VolumeOption configures a Volume instance.
 type VolumeOption func(*Volume)
 
-// WithMetadataStore sets the metadata storage engine ("legacy" or "sqlite").
+// WithMetadataStore sets the metadata storage engine (deprecated: sqlite is the only engine).
 func WithMetadataStore(store string) VolumeOption {
 	return func(v *Volume) {
-		if strings.ToLower(store) == "sqlite" {
-			v.metadataStore = MetadataStoreSQLite
-		} else {
-			v.metadataStore = MetadataStoreLegacy
-		}
+		// SQLite is the sole metadata storage engine.
 	}
 }
 
@@ -220,12 +189,6 @@ func WithChunkSize(chunkSize uint32) VolumeOption {
 // WithMaxRAMEntries sets the maximum number of inodes and directories kept in RAM.
 func WithMaxRAMEntries(maxInodes, maxDirs int) VolumeOption {
 	return func(v *Volume) {
-		if maxInodes > 0 && v.inodeCache != nil {
-			v.inodeCache.capacity = maxInodes
-		}
-		if maxDirs > 0 && v.dirCache != nil {
-			v.dirCache.capacity = maxDirs
-		}
 		if v.sqliteCache != nil && (maxInodes > 0 || maxDirs > 0) {
 			entries := maxInodes + maxDirs
 			if entries <= 0 {
@@ -273,26 +236,21 @@ func WithApplierFaultHook(hook func() error) VolumeOption {
 	}
 }
 
-// WithLocalStorageDir sets the local directory for evicted metadata storage.
+// WithLocalStorageDir sets the local directory for metadata storage.
 func WithLocalStorageDir(dir string) VolumeOption {
 	return func(v *Volume) {
 		v.localStorageDir = dir
 	}
 }
 
-// WithMaxBufferFiles sets the maximum number of buffer files before auto-triggering a snapshot.
+// WithMaxBufferFiles is deprecated and kept for backwards compatibility.
 func WithMaxBufferFiles(count int) VolumeOption {
-	return func(v *Volume) {
-		v.maxBufferFiles = count
-	}
+	return func(v *Volume) {}
 }
 
-// WithSnapshotThreshold sets limits before auto-triggering a snapshot.
+// WithSnapshotThreshold is deprecated and kept for backwards compatibility.
 func WithSnapshotThreshold(maxDirtyRecords int, maxFileSize int64) VolumeOption {
-	return func(v *Volume) {
-		v.maxDirtyRecords = maxDirtyRecords
-		v.maxLocalFileSize = maxFileSize
-	}
+	return func(v *Volume) {}
 }
 
 // StreamIDForVolume generates a deterministic UUID for an SDS structured stream for the volume.
@@ -307,12 +265,8 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 
 	v := &Volume{
-		metadataResolver: metadataResolver{
-			dirtyInodes: make(map[uint64]LocalOffset),
-			dirtyDirs:   make(map[uint64]LocalOffset),
-		},
 		volumeID:          volumeID,
-		rootInodeID:       0,
+		rootInodeID:       1,
 		nextInode:         erofs.DefaultInodeStride,
 		backend:           backend,
 		blobStore:         blobStore,
@@ -321,9 +275,6 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		chunkSize:         64 * 1024, // 64KB default chunk size
 		durability:        walclient.Local,
 		streamID:          StreamIDForVolume(volumeID),
-		maxBufferFiles:    4,
-		maxDirtyRecords:   100000,
-		maxLocalFileSize:  250 * 1024 * 1024,
 		maxUnappliedBytes: 64 * 1024 * 1024,
 		applierBatchSize:  defaultApplierBatchSize,
 		sqliteOverlay:     make(map[SQLiteCacheKey]SQLiteOverlayEntry),
@@ -335,8 +286,6 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	v.backpressureCond = sync.NewCond(&v.mu)
 	v.flushCond = sync.NewCond(&v.mu)
 
-	v.inodeCache = NewLRUCache[uint64, *CachedInode](10000, v.onEvictInode)
-	v.dirCache = NewLRUCache[uint64, *CachedDir](2000, v.onEvictDir)
 	v.sqliteCache = NewLRUCacheWithLimits[SQLiteCacheKey, *SQLiteCachedRow](
 		0,
 		64*1024*1024,
@@ -356,77 +305,52 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		v.localStorageDir = path.Join(os.TempDir(), fmt.Sprintf("objectfs-local-%s-%d", volumeID, time.Now().UnixNano()))
 	}
 
-	if v.metadataStore == MetadataStoreSQLite {
-		_ = os.MkdirAll(v.localStorageDir, 0755)
-		dbPath := filepath.Join(v.localStorageDir, "metadata.sqlite")
-		db, err := sqlite.Open(context.Background(), dbPath,
-			sqlite.WithStreamID(v.streamID.String()),
-			sqlite.WithLockingMode("EXCLUSIVE"),
-			sqlite.WithJournalMode("WAL"),
-			sqlite.WithSynchronous("NORMAL"),
-		)
-		if err == nil {
-			v.sqliteDB = db
-			if v.metadataStream != nil {
-				_ = v.sqliteDB.SyncRegistry(context.Background(), v.metadataStream.Registry())
-			}
-			count, _ := v.sqliteDB.Count(context.Background(), "objectfs.v1alpha1.Inode")
-			if count == 0 {
-				rootInodeMsg := &pb.Inode{
-					Ino:   proto.Uint64(1),
-					Mode:  0755 | syscall.S_IFDIR,
-					Mtime: timestamppb.Now(),
-					IsDir: true,
-				}
-				keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
-				initChanges := []sds.Change{
-					{
-						Seq:      0,
-						TypeID:   16,
-						TypeName: "objectfs.v1alpha1.Inode",
-						Op:       sds.OpCreate,
-						Key:      sds.NewKeyFromBytes(keyBytes),
-						RawKey:   keyBytes,
-						RawVal:   valBytes,
-						Row:      rootInodeMsg,
-					},
-				}
-				_ = v.sqliteDB.ApplyBatch(context.Background(), initChanges)
-				v.applyChangesToSQLiteCacheLocked(initChanges)
-			}
+	_ = os.MkdirAll(v.localStorageDir, 0755)
+	dbPath := filepath.Join(v.localStorageDir, "metadata.sqlite")
+	db, err := sqlite.Open(context.Background(), dbPath,
+		sqlite.WithStreamID(v.streamID.String()),
+		sqlite.WithLockingMode("EXCLUSIVE"),
+		sqlite.WithJournalMode("WAL"),
+		sqlite.WithSynchronous("NORMAL"),
+	)
+	if err == nil {
+		v.sqliteDB = db
+		if v.metadataStream != nil {
+			_ = v.sqliteDB.SyncRegistry(context.Background(), v.metadataStream.Registry())
 		}
-		if v.sqliteDB != nil {
-			v.sqliteAppliedPos = v.sqliteDB.Position()
-		}
-		v.sqliteApplier = newSQLiteApplier(v, v.applierBatchSize, v.applierFaultHook)
-		v.sqliteApplier.start()
-		v.rootInodeID = 1
-		v.nextInode = erofs.DefaultInodeStride
-	} else {
-		ls, err := NewLocalStorage(v.localStorageDir, WithMaxLocalFileSize(v.maxLocalFileSize))
-		if err == nil {
-			v.localStore = ls
+		count, _ := v.sqliteDB.Count(context.Background(), "objectfs.v1alpha1.Inode")
+		if count == 0 {
+			rootInodeMsg := &pb.Inode{
+				Ino:   proto.Uint64(1),
+				Mode:  0755 | syscall.S_IFDIR,
+				Mtime: timestamppb.Now(),
+				IsDir: true,
+			}
+			keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+			initChanges := []sds.Change{
+				{
+					Seq:      0,
+					TypeID:   16,
+					TypeName: "objectfs.v1alpha1.Inode",
+					Op:       sds.OpCreate,
+					Key:      sds.NewKeyFromBytes(keyBytes),
+					RawKey:   keyBytes,
+					RawVal:   valBytes,
+					Row:      rootInodeMsg,
+				},
+			}
+			_ = v.sqliteDB.ApplyBatch(context.Background(), initChanges)
+			v.applyChangesToSQLiteCacheLocked(initChanges)
 		}
 	}
-
-	// Always initialize an initial base EROFS snapshot with empty root directory
-	rootNode := erofs.NewMemoryNode("", true, 0755, nil, nil, erofs.WithIno(1), erofs.WithMtime(uint64(time.Now().Unix())))
-	var initialErofsBuf bufferWriterAt
-	if err := erofs.WriteImage(&initialErofsBuf, rootNode); err == nil {
-		v.snapshotRaw = bytes.NewReader(initialErofsBuf.buf)
-		if r, err := erofs.NewReader(v.snapshotRaw); err == nil {
-			v.snapshotReader = r
-			v.rootInodeID = r.GetRootNID()
-			if v.rootInodeID == 0 {
-				v.rootInodeID = 1
-			}
-			v.nextInode = erofs.DefaultInodeStride
-		}
+	if v.sqliteDB != nil {
+		v.sqliteAppliedPos = v.sqliteDB.Position()
 	}
-	if v.rootInodeID == 0 {
-		v.rootInodeID = 1
-	}
-	v.dirParents[v.rootInodeID] = v.rootInodeID
+	v.sqliteApplier = newSQLiteApplier(v, v.applierBatchSize, v.applierFaultHook)
+	v.sqliteApplier.start()
+	v.rootInodeID = 1
+	v.nextInode = erofs.DefaultInodeStride
+	v.dirParents[1] = 1
 
 	return v
 }
@@ -555,7 +479,7 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 	if node.ChunkSize > 0 && len(node.Chunks) > 0 {
 		return nil
 	}
-	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
+	if v.sqliteDB != nil {
 		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(node.ID)}, 1)
 		if pErr == nil {
 			chunkMsgs, sErr := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
@@ -574,50 +498,6 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 			}
 		}
 		return nil
-	}
-	if node.ManifestSha256 == "" {
-		return nil
-	}
-	if node.ChunkSize > 0 && len(node.Chunks) > 0 {
-		return nil
-	}
-	if v.recoveredContent != nil {
-		if mData, ok := v.recoveredContent[node.ManifestSha256]; ok {
-			manifest, err := blob.DecodeManifest(bytes.NewReader(mData))
-			if err == nil {
-				node.Chunks = make(map[uint32]string, len(manifest.Chunks))
-				for idx, hexSha := range manifest.ChunkHexSHAs() {
-					if hexSha != "" {
-						node.Chunks[uint32(idx)] = hexSha
-					}
-				}
-				node.ChunkSize = manifest.ChunkSize
-				if node.Size == 0 {
-					node.Size = int64(manifest.TotalLength)
-				}
-				return nil
-			}
-		}
-	}
-	if v.blobStore != nil {
-		mStream, err := v.blobStore.GetBlob(ctx, node.ManifestSha256)
-		if err == nil {
-			defer mStream.Close()
-			manifest, err := blob.DecodeManifest(mStream)
-			if err == nil {
-				node.Chunks = make(map[uint32]string, len(manifest.Chunks))
-				for idx, hexSha := range manifest.ChunkHexSHAs() {
-					if hexSha != "" {
-						node.Chunks[uint32(idx)] = hexSha
-					}
-				}
-				node.ChunkSize = manifest.ChunkSize
-				if node.Size == 0 {
-					node.Size = int64(manifest.TotalLength)
-				}
-				return nil
-			}
-		}
 	}
 	return nil
 }
@@ -704,150 +584,6 @@ func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkId
 	return nil, nil
 }
 
-// persistInode uploads the inode's blob payload if dirty and writes the inode metadata record to local eviction storage.
-func (v *Volume) persistInode(ctx context.Context, node *CachedInode) error {
-	if !node.IsDirty {
-		return nil
-	}
-
-	if v.blobStore != nil {
-		dirtyBlobs := make(map[string]blob.ByteStream)
-		if len(node.InlineData) > 0 {
-			sha := fmt.Sprintf("%x", sha256.Sum256(node.InlineData))
-			node.Sha256 = sha
-			node.ContentSha256 = sha
-			dirtyBlobs[sha] = blob.NewByteStreamFromBytes(node.InlineData)
-		}
-		for idx, chunkBytes := range node.DirtyChunks {
-			if sha, ok := node.Chunks[uint32(idx)]; ok && sha != "" {
-				dirtyBlobs[sha] = blob.NewByteStreamFromBytes(chunkBytes)
-			}
-		}
-		for idx, chunkBytes := range node.StagedChunks {
-			if sha, ok := node.Chunks[uint32(idx)]; ok && sha != "" {
-				dirtyBlobs[sha] = blob.NewByteStreamFromBytes(chunkBytes)
-			}
-		}
-		if node.ManifestSha256 != "" {
-			cs := int64(node.ChunkSize)
-			if cs == 0 {
-				cs = 64 * 1024
-			}
-			numChunks := int((node.Size + cs - 1) / cs)
-			manifestChunks := make([][32]byte, numChunks)
-			for i := 0; i < numChunks; i++ {
-				if c, ok := node.Chunks[uint32(i)]; ok && c != "" {
-					raw, _ := hex.DecodeString(c)
-					if len(raw) == 32 {
-						copy(manifestChunks[i][:], raw)
-					}
-				}
-			}
-			manifest := &blob.Manifest{
-				ChunkSize:   node.ChunkSize,
-				TotalLength: uint64(node.Size),
-				Chunks:      manifestChunks,
-			}
-			manifestBlob, err := blob.EncodeManifest(manifest)
-			if err == nil {
-				dirtyBlobs[manifestBlob.SHA256Hex()] = manifestBlob.Stream
-			}
-		}
-		if len(dirtyBlobs) > 0 {
-			if err := v.blobStore.PutBlobs(ctx, dirtyBlobs); err != nil {
-				return fmt.Errorf("failed to persist chunk blobs for inode %d: %w", node.ID, err)
-			}
-		}
-		node.DirtyChunks = nil
-	} else if node.Data != nil && node.Sha256 != "" && v.blobStore != nil {
-		if err := node.Data.Rewind(); err != nil {
-			return fmt.Errorf("failed to rewind node data: %w", err)
-		}
-		if err := v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{node.Sha256: node.Data}); err != nil {
-			return fmt.Errorf("failed to persist inode %d blob to blobStore: %w", node.ID, err)
-		}
-		_ = node.Data.Close()
-		node.Data = nil
-	}
-
-	if v.localStore != nil {
-		rec := &InodeRecord{
-			InodeID:        node.ID,
-			Mode:           node.Mode,
-			Size:           node.Size,
-			ModTime:        node.ModTime,
-			IsDir:          node.IsDir,
-			Sha256:         node.Sha256,
-			ETag:           node.ETag,
-			Uid:            node.Uid,
-			Gid:            node.Gid,
-			ManifestSha256: node.ManifestSha256,
-			ContentSha256:  node.ContentSha256,
-			Atime:          node.Atime,
-			Ctime:          node.Ctime,
-		}
-		payload, err := EncodeInodeRecord(rec)
-		if err != nil {
-			return fmt.Errorf("failed to encode inode record %d: %w", node.ID, err)
-		}
-		off, err := v.localStore.WriteRecord(RecordTypeInode, payload)
-		if err != nil {
-			return fmt.Errorf("failed to write inode record %d to local storage: %w", node.ID, err)
-		}
-		v.dirtyInodes[node.ID] = off
-	}
-
-	node.IsDirty = false
-	return nil
-}
-
-func (v *Volume) onEvictInode(inodeID uint64, node *CachedInode) {
-	if v.metadataStore == MetadataStoreSQLite {
-		return
-	}
-	_ = v.persistInode(context.Background(), node)
-}
-
-func (v *Volume) onEvictDir(dirID uint64, dir *CachedDir) {
-	if v.metadataStore == MetadataStoreSQLite {
-		return
-	}
-	if !dir.IsDirty || v.localStore == nil {
-		return
-	}
-	if len(dir.Added) == 0 && len(dir.Deleted) == 0 && dir.PrevOffset != NoOffset {
-		return
-	}
-	deletedList := make([]string, 0, len(dir.Deleted))
-	for del := range dir.Deleted {
-		deletedList = append(deletedList, del)
-	}
-	addedList := make([]DirEntry, 0, len(dir.Added))
-	for name := range dir.Added {
-		if entry, ok := dir.Entries[name]; ok {
-			addedList = append(addedList, entry)
-		}
-	}
-	rec := &DirDeltaRecord{
-		InodeID:    dir.ID,
-		PrevOffset: dir.PrevOffset,
-		Deleted:    deletedList,
-		Added:      addedList,
-	}
-	payload, err := EncodeDirDeltaRecord(rec)
-	if err != nil {
-		return
-	}
-	off, err := v.localStore.WriteRecord(RecordTypeDirDelta, payload)
-	if err == nil {
-		v.dirtyDirs[dir.ID] = off
-		dir.PrevOffset = off
-		dir.Added = make(map[string]bool)
-		dir.Deleted = make(map[string]bool)
-		dir.IsDirty = false
-	}
-}
-
 // VolumeID returns the volume identifier.
 func (v *Volume) VolumeID() string {
 	return v.volumeID
@@ -906,14 +642,6 @@ func (v *Volume) Close() error {
 	if v.sqliteDB != nil {
 		if err := v.sqliteDB.Close(); err != nil && firstErr == nil {
 			firstErr = err
-		}
-	}
-	if v.localStore != nil {
-		if err := v.localStore.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if v.metadataStore != MetadataStoreSQLite {
-			_ = os.RemoveAll(v.localStorageDir)
 		}
 	}
 	if v.stream != nil {
@@ -996,253 +724,6 @@ func cleanPath(p string) string {
 		cleaned = "/" + cleaned
 	}
 	return cleaned
-}
-
-func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, populateCache bool) (*CachedInode, error) {
-	if r.inodeCache != nil {
-		if populateCache {
-			if node, ok := r.inodeCache.Get(inodeID); ok {
-				return node, nil
-			}
-		} else {
-			if node, ok := r.inodeCache.Peek(inodeID); ok {
-				return node, nil
-			}
-		}
-	}
-
-	// 1. Check if evicted to local storage
-	if off, isDirty := r.dirtyInodes[inodeID]; isDirty && off != NoOffset && r.localStore != nil {
-		_, payload, err := r.localStore.ReadRecord(off)
-		if err == nil {
-			rec, err := DecodeInodeRecord(payload)
-			if err == nil {
-				node := &CachedInode{
-					ID:             rec.InodeID,
-					Mode:           rec.Mode,
-					Size:           rec.Size,
-					ModTime:        rec.ModTime,
-					Atime:          rec.Atime,
-					Ctime:          rec.Ctime,
-					IsDir:          rec.IsDir,
-					Sha256:         rec.Sha256,
-					ManifestSha256: rec.ManifestSha256,
-					ContentSha256:  rec.ContentSha256,
-					ETag:           rec.ETag,
-					Uid:            rec.Uid,
-					Gid:            rec.Gid,
-					IsDirty:        populateCache,
-				}
-				if populateCache && r.inodeCache != nil {
-					r.inodeCache.Put(inodeID, node)
-				}
-				return node, nil
-			}
-		}
-	}
-
-	// 2. Fetch from base snapshot
-	if r.snapshotReader != nil && r.snapshotRaw != nil {
-		lookupNID := inodeID
-		if lookupNID == 1 && r.snapshotReader.GetRootNID() == 0 {
-			lookupNID = 0
-		}
-		erofsInode, err := erofs.ReadInode(r.snapshotRaw, r.snapshotReader.Superblock(), lookupNID)
-		if err == nil {
-			var shaStr, manifestSha, contentSha string
-			xattrs, xErr := r.snapshotReader.GetXattrs(lookupNID)
-			if xErr == nil && !xattrs.IsEmpty() {
-				if xattrs.UserDigest != "" {
-					shaStr = xattrs.UserDigest
-					contentSha = xattrs.UserDigest
-				} else if xattrs.UserSHA256 != "" {
-					shaStr = xattrs.UserSHA256
-					contentSha = xattrs.UserSHA256
-				}
-				if xattrs.UserManifest != "" {
-					manifestSha = xattrs.UserManifest
-					shaStr = manifestSha
-				}
-			}
-			if manifestSha == "" && contentSha == "" {
-				contentSha = shaStr
-			}
-
-			isDir := (erofsInode.Mode & erofs.S_IFMT) == erofs.S_IFDIR
-			mode := uint32(erofsInode.Mode)
-			if isDir {
-				mode |= syscall.S_IFDIR
-			} else {
-				mode |= syscall.S_IFREG
-			}
-
-			mtime := time.Unix(int64(erofsInode.Mtime), int64(erofsInode.MtimeNsec))
-			if erofsInode.Mtime == 0 {
-				mtime = time.Now()
-			}
-
-			node := &CachedInode{
-				ID:             inodeID,
-				Mode:           mode,
-				Size:           int64(erofsInode.Size),
-				ModTime:        mtime,
-				Atime:          mtime,
-				Ctime:          mtime,
-				IsDir:          isDir,
-				Sha256:         shaStr,
-				ManifestSha256: manifestSha,
-				ContentSha256:  contentSha,
-				Uid:            erofsInode.UID,
-				Gid:            erofsInode.GID,
-				IsDirty:        false,
-			}
-			if populateCache && r.inodeCache != nil {
-				r.inodeCache.Put(inodeID, node)
-			}
-			return node, nil
-		}
-	}
-
-	return nil, fmt.Errorf("inode %d not found: %w", inodeID, syscall.ENOENT)
-}
-
-func (r *metadataResolver) resolveDir(ctx context.Context, inodeID uint64, populateCache bool) (*CachedDir, error) {
-	if r.dirCache != nil {
-		if populateCache {
-			if dir, ok := r.dirCache.Get(inodeID); ok {
-				return dir, nil
-			}
-		} else {
-			if cached, ok := r.dirCache.Peek(inodeID); ok {
-				entriesCopy := make(map[string]DirEntry, len(cached.Entries))
-				for k, v := range cached.Entries {
-					entriesCopy[k] = v
-				}
-				return &CachedDir{
-					ID:         cached.ID,
-					Entries:    entriesCopy,
-					Added:      make(map[string]bool),
-					Deleted:    make(map[string]bool),
-					PrevOffset: cached.PrevOffset,
-					IsDirty:    false,
-				}, nil
-			}
-		}
-	}
-
-	entries := make(map[string]DirEntry)
-
-	// 1. Check if dirty delta exists in local storage
-	if off, isDirty := r.dirtyDirs[inodeID]; isDirty && off != NoOffset && r.localStore != nil {
-		var deltas []*DirDeltaRecord
-		currOff := off
-		visited := make(map[LocalOffset]bool)
-		for currOff != NoOffset && !visited[currOff] {
-			visited[currOff] = true
-			_, payload, err := r.localStore.ReadRecord(currOff)
-			if err != nil {
-				break
-			}
-			rec, err := DecodeDirDeltaRecord(payload)
-			if err != nil {
-				break
-			}
-			deltas = append(deltas, rec)
-			currOff = rec.PrevOffset
-		}
-
-		// Read base from base snapshot if present
-		if r.snapshotReader != nil {
-			dirents, err := r.snapshotReader.ListDirectory(inodeID)
-			if err == nil {
-				for _, de := range dirents {
-					if de.Name == "." || de.Name == ".." {
-						continue
-					}
-					isDir := de.FileType == erofs.FTDir
-					mode := uint32(0644 | syscall.S_IFREG)
-					if isDir {
-						mode = uint32(0755 | syscall.S_IFDIR)
-					}
-					entries[de.Name] = DirEntry{
-						Name:    de.Name,
-						InodeID: de.NID,
-						IsDir:   isDir,
-						Mode:    mode,
-					}
-				}
-			}
-		}
-
-		// Replay deltas in chronological order (oldest to newest)
-		for i := len(deltas) - 1; i >= 0; i-- {
-			d := deltas[i]
-			for _, del := range d.Deleted {
-				delete(entries, del)
-			}
-			for _, add := range d.Added {
-				entries[add.Name] = add
-			}
-		}
-
-		dir := &CachedDir{
-			ID:         inodeID,
-			Entries:    entries,
-			Added:      make(map[string]bool),
-			Deleted:    make(map[string]bool),
-			PrevOffset: off,
-			IsDirty:    false,
-		}
-		if populateCache && r.dirCache != nil {
-			r.dirCache.Put(inodeID, dir)
-		}
-		return dir, nil
-	}
-
-	// 2. Fetch clean directory from snapshot
-	if r.snapshotReader != nil {
-		lookupNID := inodeID
-		if lookupNID == 1 && r.snapshotReader.GetRootNID() == 0 {
-			lookupNID = 0
-		}
-		dirents, err := r.snapshotReader.ListDirectory(lookupNID)
-		if err == nil {
-			for _, de := range dirents {
-				if de.Name == "." || de.Name == ".." {
-					continue
-				}
-				isDir := de.FileType == erofs.FTDir
-				mode := uint32(0644 | syscall.S_IFREG)
-				if isDir {
-					mode = uint32(0755 | syscall.S_IFDIR)
-				}
-				childIno := de.NID
-				if childIno == 0 {
-					childIno = 1
-				}
-				entries[de.Name] = DirEntry{
-					Name:    de.Name,
-					InodeID: childIno,
-					IsDir:   isDir,
-					Mode:    mode,
-				}
-			}
-			dir := &CachedDir{
-				ID:         inodeID,
-				Entries:    entries,
-				Added:      make(map[string]bool),
-				Deleted:    make(map[string]bool),
-				PrevOffset: NoOffset,
-				IsDirty:    false,
-			}
-			if populateCache && r.dirCache != nil {
-				r.dirCache.Put(inodeID, dir)
-			}
-			return dir, nil
-		}
-	}
-
-	return nil, fmt.Errorf("directory inode %d not found: %w", inodeID, syscall.ENOENT)
 }
 
 var (
@@ -1338,7 +819,7 @@ func (v *Volume) FlushOverlay(ctx context.Context) error {
 }
 
 func (v *Volume) flushOverlayLocked(ctx context.Context) error {
-	if v.metadataStore != MetadataStoreSQLite || v.sqliteApplier == nil {
+	if v.sqliteApplier == nil {
 		return nil
 	}
 
@@ -1357,7 +838,7 @@ func (v *Volume) flushOverlayLocked(ctx context.Context) error {
 }
 
 func (v *Volume) checkBackpressureLocked(ctx context.Context) error {
-	if v.maxUnappliedBytes <= 0 || v.metadataStore != MetadataStoreSQLite {
+	if v.maxUnappliedBytes <= 0 {
 		return nil
 	}
 	if v.unappliedBytes < v.maxUnappliedBytes {
@@ -1398,7 +879,7 @@ func (v *Volume) checkBackpressureLocked(ctx context.Context) error {
 }
 
 func (v *Volume) recordOverlayTxChangesLocked(tx *sds.Tx) {
-	if tx == nil || v.metadataStore != MetadataStoreSQLite {
+	if tx == nil {
 		return
 	}
 	changes := tx.Changes()
@@ -1625,7 +1106,7 @@ func (v *Volume) applyChangesToSQLiteCacheLocked(changes []sds.Change) {
 }
 
 func (v *Volume) normalizeInodeID(id uint64) uint64 {
-	if id == 0 || (v.metadataStore != MetadataStoreSQLite && id == 1) {
+	if id == 0 {
 		if v.rootInodeID != 0 {
 			return v.rootInodeID
 		}
@@ -1637,116 +1118,108 @@ func (v *Volume) normalizeInodeID(id uint64) uint64 {
 func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
 	inodeID = v.normalizeInodeID(inodeID)
 
-	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-		key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(inodeID)})
-		if err != nil {
-			return nil, err
-		}
-		msg, ok, err := v.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.Inode", key)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, fmt.Errorf("inode %d: %w", inodeID, syscall.ENOENT)
-		}
-		inode := msg.(*pb.Inode)
-		chunkSize := inode.GetChunkSize()
-		if chunkSize == 0 && v.chunkSize > 0 {
-			chunkSize = v.chunkSize
-		}
-		node := &CachedInode{
-			ID:             inode.GetIno(),
-			Mode:           inode.GetMode(),
-			Size:           inode.GetSize(),
-			IsDir:          inode.GetIsDir(),
-			Sha256:         inode.GetSha256(),
-			ETag:           inode.GetEtag(),
-			ManifestSha256: inode.GetManifestSha256(),
-			ContentSha256:  inode.GetContentSha256(),
-			ChunkSize:      chunkSize,
-			Uid:            inode.GetUid(),
-			Gid:            inode.GetGid(),
-		}
-		if inode.GetMtime() != nil {
-			node.ModTime = inode.GetMtime().AsTime()
-		}
-		if inode.GetAtime() != nil {
-			node.Atime = inode.GetAtime().AsTime()
-		} else {
-			node.Atime = node.ModTime
-		}
-		if inode.GetCtime() != nil {
-			node.Ctime = inode.GetCtime().AsTime()
-		} else {
-			node.Ctime = node.ModTime
-		}
-
-		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
-
-		return node, nil
+	key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(inodeID)})
+	if err != nil {
+		return nil, err
+	}
+	msg, ok, err := v.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.Inode", key)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("inode %d: %w", inodeID, syscall.ENOENT)
+	}
+	inode := msg.(*pb.Inode)
+	chunkSize := inode.GetChunkSize()
+	if chunkSize == 0 && v.chunkSize > 0 {
+		chunkSize = v.chunkSize
+	}
+	node := &CachedInode{
+		ID:             inode.GetIno(),
+		Mode:           inode.GetMode(),
+		Size:           inode.GetSize(),
+		IsDir:          inode.GetIsDir(),
+		Sha256:         inode.GetSha256(),
+		ETag:           inode.GetEtag(),
+		ManifestSha256: inode.GetManifestSha256(),
+		ContentSha256:  inode.GetContentSha256(),
+		ChunkSize:      chunkSize,
+		Uid:            inode.GetUid(),
+		Gid:            inode.GetGid(),
+	}
+	if inode.GetMtime() != nil {
+		node.ModTime = inode.GetMtime().AsTime()
+	}
+	if inode.GetAtime() != nil {
+		node.Atime = inode.GetAtime().AsTime()
+	} else {
+		node.Atime = node.ModTime
+	}
+	if inode.GetCtime() != nil {
+		node.Ctime = inode.GetCtime().AsTime()
+	} else {
+		node.Ctime = node.ModTime
 	}
 
-	return v.resolveInode(ctx, inodeID, true)
+	_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+
+	return node, nil
 }
 
 func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*CachedDir, error) {
 	inodeID = v.normalizeInodeID(inodeID)
 
-	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-		dirNode, err := v.getOrLoadInodeLocked(ctx, inodeID)
-		if err != nil {
-			return nil, err
-		}
-		if !dirNode.IsDir {
-			return nil, fmt.Errorf("inode %d: %w", inodeID, syscall.ENOTDIR)
-		}
-
-		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(inodeID)}, 1)
-		if pErr != nil {
-			return nil, pErr
-		}
-		entryMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
-		if err != nil {
-			return nil, err
-		}
-
-		dir := &CachedDir{
-			ID:      inodeID,
-			Entries: make(map[string]DirEntry, len(entryMsgs)),
-			Added:   make(map[string]bool),
-			Deleted: make(map[string]bool),
-		}
-
-		for _, msg := range entryMsgs {
-			de := msg.(*pb.DirEntry)
-			name := de.GetName()
-			dir.Entries[name] = DirEntry{
-				Name:    name,
-				InodeID: de.GetIno(),
-				IsDir:   de.GetIsDir(),
-				Mode:    de.GetMode(),
-			}
-			if de.GetIsDir() {
-				if v.dirParents == nil {
-					v.dirParents = make(map[uint64]uint64)
-				}
-				v.dirParents[de.GetIno()] = inodeID
-			}
-			if v.sqliteCache != nil && !v.sqliteCacheDisabled {
-				if k, kErr := pkDirEntry.Extract(&pb.DirEntry{
-					ParentIno: proto.Uint64(inodeID),
-					Name:      proto.String(name),
-				}); kErr == nil && !k.IsZero() {
-					ck := SQLiteCacheKey{Table: "objectfs.v1alpha1.DirEntry", Key: k}
-					v.sqliteCache.Put(ck, &SQLiteCachedRow{Exists: true, Msg: de})
-				}
-			}
-		}
-
-		return dir, nil
+	dirNode, err := v.getOrLoadInodeLocked(ctx, inodeID)
+	if err != nil {
+		return nil, err
+	}
+	if !dirNode.IsDir {
+		return nil, fmt.Errorf("inode %d: %w", inodeID, syscall.ENOTDIR)
 	}
 
-	return v.resolveDir(ctx, inodeID, true)
+	prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(inodeID)}, 1)
+	if pErr != nil {
+		return nil, pErr
+	}
+	entryMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	dir := &CachedDir{
+		ID:      inodeID,
+		Entries: make(map[string]DirEntry, len(entryMsgs)),
+		Added:   make(map[string]bool),
+		Deleted: make(map[string]bool),
+	}
+
+	for _, msg := range entryMsgs {
+		de := msg.(*pb.DirEntry)
+		name := de.GetName()
+		dir.Entries[name] = DirEntry{
+			Name:    name,
+			InodeID: de.GetIno(),
+			IsDir:   de.GetIsDir(),
+			Mode:    de.GetMode(),
+		}
+		if de.GetIsDir() {
+			if v.dirParents == nil {
+				v.dirParents = make(map[uint64]uint64)
+			}
+			v.dirParents[de.GetIno()] = inodeID
+		}
+		if v.sqliteCache != nil && !v.sqliteCacheDisabled {
+			if k, kErr := pkDirEntry.Extract(&pb.DirEntry{
+				ParentIno: proto.Uint64(inodeID),
+				Name:      proto.String(name),
+			}); kErr == nil && !k.IsZero() {
+				ck := SQLiteCacheKey{Table: "objectfs.v1alpha1.DirEntry", Key: k}
+				v.sqliteCache.Put(ck, &SQLiteCachedRow{Exists: true, Msg: de})
+			}
+		}
+	}
+
+	return dir, nil
 }
 
 type InodeEntry struct {
@@ -1789,30 +1262,16 @@ func (v *Volume) resolvePathLocked(ctx context.Context, p string) (uint64, uint6
 		if len(part) > MaxNameLength {
 			return 0, 0, "", fmt.Errorf("path component %q exceeds maximum length: %w", part, syscall.ENAMETOOLONG)
 		}
-		var entryInodeID uint64
-		var isDir bool
-		if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-			de, ok, err := v.getDirEntrySQLiteLocked(ctx, currInodeID, part)
-			if err != nil {
-				return 0, 0, "", fmt.Errorf("directory for inode %d not found: %w", currInodeID, err)
-			}
-			if !ok {
-				return 0, 0, "", fmt.Errorf("path component %s not found: %w", part, syscall.ENOENT)
-			}
-			entryInodeID = de.GetIno()
-			isDir = de.GetIsDir()
-		} else {
-			dir, err := v.getOrLoadDirLocked(ctx, currInodeID)
-			if err != nil {
-				return 0, 0, "", fmt.Errorf("directory for inode %d not found: %w", currInodeID, syscall.ENOENT)
-			}
-			entry, exists := dir.Entries[part]
-			if !exists {
-				return 0, 0, "", fmt.Errorf("path component %s not found: %w", part, syscall.ENOENT)
-			}
-			entryInodeID = entry.InodeID
-			isDir = entry.IsDir
+		de, ok, err := v.getDirEntrySQLiteLocked(ctx, currInodeID, part)
+		if err != nil {
+			return 0, 0, "", fmt.Errorf("directory for inode %d not found: %w", currInodeID, err)
 		}
+		if !ok {
+			return 0, 0, "", fmt.Errorf("path component %s not found: %w", part, syscall.ENOENT)
+		}
+		entryInodeID := de.GetIno()
+		isDir := de.GetIsDir()
+
 		if i == len(parts)-1 {
 			return entryInodeID, currInodeID, part, nil
 		}
@@ -1941,9 +1400,6 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 			return attr, nil, err
 		}
 
-		node.IsDirty = true
-		v.inodeCache.Put(inodeID, node)
-
 		tx := v.metadataStream.Begin()
 		mAtime := node.Atime
 		if mAtime.IsZero() {
@@ -2006,7 +1462,6 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 			Gid:            node.Gid,
 		}
 
-		v.checkAutoSnapshotTriggerLocked(ctx)
 		return attr, waitFn, nil
 	}()
 	if err != nil {
@@ -2058,28 +1513,14 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 		return v.toEntryAttrLocked(ctx, pIno, "..")
 	}
 
-	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-		de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, fmt.Errorf("child %s not found in inode %d: %w", name, parentInodeID, syscall.ENOENT)
-		}
-		return v.toEntryAttrLocked(ctx, de.GetIno(), name)
-	}
-
-	parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
+	de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
 	if err != nil {
 		return nil, err
 	}
-
-	entry, ok := parentDir.Entries[name]
 	if !ok {
 		return nil, fmt.Errorf("child %s not found in inode %d: %w", name, parentInodeID, syscall.ENOENT)
 	}
-
-	return v.toEntryAttrLocked(ctx, entry.InodeID, name)
+	return v.toEntryAttrLocked(ctx, de.GetIno(), name)
 }
 
 func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAttr, error) {
@@ -2096,51 +1537,28 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 		return nil, fmt.Errorf("inode %d is not a directory: %w", dirInodeID, syscall.ENOTDIR)
 	}
 
-	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(dirInodeID)}, 1)
-		if pErr != nil {
-			return nil, pErr
-		}
-		entryMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
-		if err != nil {
-			return nil, err
-		}
-		names := make([]string, 0, len(entryMsgs))
-		entriesMap := make(map[string]*pb.DirEntry, len(entryMsgs))
-		for _, msg := range entryMsgs {
-			de := msg.(*pb.DirEntry)
-			name := de.GetName()
-			names = append(names, name)
-			entriesMap[name] = de
-		}
-		sort.Strings(names)
-
-		var entries []*pb.EntryAttr
-		for _, name := range names {
-			de := entriesMap[name]
-			attr, err := v.toEntryAttrLocked(ctx, de.GetIno(), name)
-			if err == nil {
-				entries = append(entries, attr)
-			}
-		}
-		return entries, nil
+	prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(dirInodeID)}, 1)
+	if pErr != nil {
+		return nil, pErr
 	}
-
-	dir, err := v.getOrLoadDirLocked(ctx, dirInodeID)
+	entryMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
 	if err != nil {
 		return nil, err
 	}
-
-	names := make([]string, 0, len(dir.Entries))
-	for name := range dir.Entries {
+	names := make([]string, 0, len(entryMsgs))
+	entriesMap := make(map[string]*pb.DirEntry, len(entryMsgs))
+	for _, msg := range entryMsgs {
+		de := msg.(*pb.DirEntry)
+		name := de.GetName()
 		names = append(names, name)
+		entriesMap[name] = de
 	}
 	sort.Strings(names)
 
 	var entries []*pb.EntryAttr
 	for _, name := range names {
-		entry := dir.Entries[name]
-		attr, err := v.toEntryAttrLocked(ctx, entry.InodeID, name)
+		de := entriesMap[name]
+		attr, err := v.toEntryAttrLocked(ctx, de.GetIno(), name)
 		if err == nil {
 			entries = append(entries, attr)
 		}
@@ -2149,7 +1567,7 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 }
 
 func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) error {
-	if v.metadataStore == MetadataStoreSQLite && tx != nil {
+	if tx != nil {
 		v.recordOverlayTxChangesLocked(tx)
 	}
 	return nil
@@ -2181,24 +1599,12 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
-		var parentDir *CachedDir
-		if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-			_, exists, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
-			if err != nil {
-				return nil, nil, err
-			}
-			if exists {
-				return nil, nil, fmt.Errorf("directory %s already exists under inode %d: %w", name, parentInodeID, syscall.EEXIST)
-			}
-		} else {
-			var err error
-			parentDir, err = v.getOrLoadDirLocked(ctx, parentInodeID)
-			if err != nil {
-				return nil, nil, err
-			}
-			if _, exists := parentDir.Entries[name]; exists {
-				return nil, nil, fmt.Errorf("directory %s already exists under inode %d: %w", name, parentInodeID, syscall.EEXIST)
-			}
+		_, exists, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		if exists {
+			return nil, nil, fmt.Errorf("directory %s already exists under inode %d: %w", name, parentInodeID, syscall.EEXIST)
 		}
 
 		if mode == 0 {
@@ -2214,56 +1620,14 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		now := time.Now()
 		childInodeID := v.allocInode()
 
-		if parentDir != nil {
-			newEntry := DirEntry{
-				Name:    name,
-				InodeID: childInodeID,
-				IsDir:   true,
-				Mode:    mode,
-			}
-			parentDir.Entries[name] = newEntry
-			parentDir.Added[name] = true
-			delete(parentDir.Deleted, name)
-			parentDir.IsDirty = true
-		}
 		parentInode.ModTime = now
 		parentInode.Ctime = now
-		parentInode.IsDirty = true
-		if v.inodeCache != nil {
-			v.inodeCache.Put(parentInode.ID, parentInode)
-		}
 
 		if v.dirParents == nil {
 			v.dirParents = make(map[uint64]uint64)
 		}
 		v.dirParents[childInodeID] = parentInodeID
 
-		if v.metadataStore != MetadataStoreSQLite {
-			childInode := &CachedInode{
-				ID:      childInodeID,
-				Mode:    mode,
-				ModTime: now,
-				Atime:   now,
-				Ctime:   now,
-				IsDir:   true,
-				Uid:     uid,
-				Gid:     gid,
-				IsDirty: true,
-			}
-			v.inodeCache.Put(childInodeID, childInode)
-
-			childDir := &CachedDir{
-				ID:         childInodeID,
-				Entries:    make(map[string]DirEntry),
-				Added:      make(map[string]bool),
-				Deleted:    make(map[string]bool),
-				PrevOffset: NoOffset,
-				IsDirty:    true,
-			}
-			v.dirCache.Put(childInodeID, childDir)
-		}
-
-		var commitSeq uint64
 		tx := v.metadataStream.Begin()
 		childInodeMsg := &pb.Inode{
 			Ino:   proto.Uint64(childInodeID),
@@ -2277,10 +1641,6 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			IsDir: true,
 		}
 		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log child inode creation: %w", err)
 		}
@@ -2293,10 +1653,6 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			Mode:      mode,
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
@@ -2322,28 +1678,16 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			ChunkSize:      parentInode.ChunkSize,
 		}
 		if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 
-		commitSeq, err = tx.Commit(ctx)
+		commitSeq, err := tx.Commit(ctx)
 		if err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to commit mkdir transaction: %w", err)
 		}
 		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			delete(v.dirParents, childInodeID)
 			return nil, nil, err
 		}
@@ -2370,7 +1714,6 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			Name:        name,
 		})
 
-		v.checkAutoSnapshotTriggerLocked(ctx)
 		return attr, waitFn, nil
 	}()
 	if err != nil {
@@ -2410,28 +1753,15 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
-		var parentDir *CachedDir
 		var existingChildIno uint64
 		var exists bool
-		if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-			de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
-			if err != nil {
-				return nil, nil, err
-			}
-			if ok {
-				exists = true
-				existingChildIno = de.GetIno()
-			}
-		} else {
-			var err error
-			parentDir, err = v.getOrLoadDirLocked(ctx, parentInodeID)
-			if err != nil {
-				return nil, nil, err
-			}
-			if entry, ok := parentDir.Entries[name]; ok {
-				exists = true
-				existingChildIno = entry.InodeID
-			}
+		de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ok {
+			exists = true
+			existingChildIno = de.GetIno()
 		}
 
 		if mode == 0 {
@@ -2471,14 +1801,9 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			childInode.Ctime = now
 			childInode.Uid = uid
 			childInode.Gid = gid
-			childInode.IsDirty = true
 
 			parentInode.ModTime = now
 			parentInode.Ctime = now
-			parentInode.IsDirty = true
-			if v.inodeCache != nil {
-				v.inodeCache.Put(parentInode.ID, parentInode)
-			}
 
 			effectiveChunkSize := childInode.ChunkSize
 			if effectiveChunkSize == 0 {
@@ -2489,7 +1814,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				childInode.ChunkSize = effectiveChunkSize
 			}
 
-			oldChunks := childInode.Chunks
 			tx := v.metadataStream.Begin()
 
 			if len(dataCopy) <= int(v.maxInlineLen) {
@@ -2500,20 +1824,12 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				childInode.DirtyChunks = nil
 				childInode.ManifestSha256 = ""
 
-				if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-					prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.ID)}, 1)
-					chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
-					for _, msg := range chunkMsgs {
-						c := msg.(*pb.FileChunk)
-						if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(c.GetIndex())}); err != nil {
-							return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
-						}
-					}
-				} else {
-					for i := range oldChunks {
-						if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(i)}); err != nil {
-							return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
-						}
+				prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.ID)}, 1)
+				chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+				for _, msg := range chunkMsgs {
+					c := msg.(*pb.FileChunk)
+					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(c.GetIndex())}); err != nil {
+						return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
 					}
 				}
 				if len(dataCopy) > 0 {
@@ -2551,23 +1867,13 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 					}
 				}
 
-				if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-					prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.ID)}, 1)
-					chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
-					for _, msg := range chunkMsgs {
-						c := msg.(*pb.FileChunk)
-						if _, stillPresent := childInode.Chunks[c.GetIndex()]; !stillPresent {
-							if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(c.GetIndex())}); err != nil {
-								return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
-							}
-						}
-					}
-				} else {
-					for i := range oldChunks {
-						if _, stillPresent := childInode.Chunks[i]; !stillPresent {
-							if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(i)}); err != nil {
-								return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
-							}
+				prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.ID)}, 1)
+				chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+				for _, msg := range chunkMsgs {
+					c := msg.(*pb.FileChunk)
+					if _, stillPresent := childInode.Chunks[c.GetIndex()]; !stillPresent {
+						if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(c.GetIndex())}); err != nil {
+							return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
 						}
 					}
 				}
@@ -2655,29 +1961,12 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				ParentInode: parentInodeID,
 				Name:        name,
 			})
-			v.checkAutoSnapshotTriggerLocked(ctx)
 			return attr, waitFn, nil
 		}
 
 		childInodeID := v.allocInode()
-		if parentDir != nil {
-			newEntry := DirEntry{
-				Name:    name,
-				InodeID: childInodeID,
-				IsDir:   false,
-				Mode:    mode,
-			}
-			parentDir.Entries[name] = newEntry
-			parentDir.Added[name] = true
-			delete(parentDir.Deleted, name)
-			parentDir.IsDirty = true
-		}
 		parentInode.ModTime = now
 		parentInode.Ctime = now
-		parentInode.IsDirty = true
-		if v.inodeCache != nil {
-			v.inodeCache.Put(parentInode.ID, parentInode)
-		}
 
 		effectiveChunkSize := v.chunkSize
 		if effectiveChunkSize == 0 {
@@ -2695,7 +1984,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			Uid:       uid,
 			Gid:       gid,
 			ChunkSize: effectiveChunkSize,
-			IsDirty:   true,
 		}
 
 		tx := v.metadataStream.Begin()
@@ -2706,10 +1994,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 			if len(dataCopy) > 0 {
 				if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
-					if parentDir != nil {
-						delete(parentDir.Entries, name)
-						delete(parentDir.Added, name)
-					}
 					return nil, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 				}
 			}
@@ -2737,27 +2021,15 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 			if v.blobStore != nil && len(blobsMap) > 0 {
 				if err := v.blobStore.PutBlobs(ctx, blobsMap); err != nil {
-					if parentDir != nil {
-						delete(parentDir.Entries, name)
-						delete(parentDir.Added, name)
-					}
 					return nil, nil, fmt.Errorf("failed to upload blobs: %w", err)
 				}
 			}
 
 			for i, sha := range childInode.Chunks {
 				if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(i), Sha256: sha}); err != nil {
-					if parentDir != nil {
-						delete(parentDir.Entries, name)
-						delete(parentDir.Added, name)
-					}
 					return nil, nil, fmt.Errorf("failed to log FileChunk: %w", err)
 				}
 			}
-		}
-
-		if v.metadataStore != MetadataStoreSQLite {
-			v.inodeCache.Put(childInodeID, childInode)
 		}
 
 		childInodeMsg := &pb.Inode{
@@ -2774,10 +2046,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			ChunkSize:     childInode.ChunkSize,
 		}
 		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			return nil, nil, fmt.Errorf("failed to log child inode creation: %w", err)
 		}
 
@@ -2789,10 +2057,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			Mode:      mode,
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
@@ -2817,25 +2081,13 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			ChunkSize:      parentInode.ChunkSize,
 		}
 		if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 		commitSeq, err := tx.Commit(ctx)
 		if err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			return nil, nil, fmt.Errorf("failed to commit create file transaction: %w", err)
 		}
 		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			if parentDir != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-			}
 			return nil, nil, err
 		}
 
@@ -2864,7 +2116,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			Name:        name,
 		})
 
-		v.checkAutoSnapshotTriggerLocked(ctx)
 		return attr, waitFn, nil
 	}()
 	if err != nil {
@@ -3137,7 +2388,6 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 				Attr:      attr,
 				Inode:     node.ID,
 			})
-			v.checkAutoSnapshotTriggerLocked(ctx)
 			return int64(len(data)), node.Size, now, waitFn, nil
 		}
 
@@ -3212,11 +2462,78 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 
 		node.Size = calculatedSize
 		node.ContentSha256 = ""
+		node.ModTime = now
+		node.Ctime = now
+
+		numChunks := int((calculatedSize + cs - 1) / cs)
+		manifestChunks := make([][32]byte, numChunks)
+		for i := 0; i < numChunks; i++ {
+			if cSha, ok := node.Chunks[uint32(i)]; ok && cSha != "" {
+				raw, _ := hex.DecodeString(cSha)
+				if len(raw) == 32 {
+					copy(manifestChunks[i][:], raw)
+				}
+			}
+		}
+		manifest := &blob.Manifest{
+			ChunkSize:   uint32(cs),
+			TotalLength: uint64(calculatedSize),
+			Chunks:      manifestChunks,
+		}
+		manifestBlob, mErr := blob.EncodeManifest(manifest)
+		if mErr == nil {
+			node.ManifestSha256 = manifestBlob.SHA256Hex()
+		}
+
+		tx := v.metadataStream.Begin()
+		for _, idx := range touchedIndices {
+			cSize := int64(node.ChunkSize)
+			if cSize == 0 {
+				cSize = int64(effectiveChunkSize)
+			}
+			if int64(idx)*cSize < node.Size {
+				if _, err := tx.Insert(ctx, &pb.FileChunk{
+					Ino:    proto.Uint64(node.ID),
+					Index:  proto.Uint32(uint32(idx)),
+					Sha256: chunkShas[idx],
+				}); err != nil {
+					return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log FileChunk: %w", err)
+				}
+			}
+		}
+
+		nAtime := node.Atime
+		if nAtime.IsZero() {
+			nAtime = now
+		}
+		nodeInodeMsg := &pb.Inode{
+			Ino:            proto.Uint64(node.ID),
+			Mode:           node.Mode,
+			Size:           node.Size,
+			Mtime:          timestamppb.New(now),
+			Atime:          timestamppb.New(nAtime),
+			Ctime:          timestamppb.New(now),
+			Uid:            node.Uid,
+			Gid:            node.Gid,
+			IsDir:          false,
+			ChunkSize:      node.ChunkSize,
+			ManifestSha256: node.ManifestSha256,
+		}
+		if _, err := tx.Update(ctx, nodeInodeMsg); err != nil {
+			return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inode update: %w", err)
+		}
+
+		commitSeq, err := tx.Commit(ctx)
+		if err != nil {
+			return 0, 0, time.Time{}, nil, fmt.Errorf("failed to commit chunked write transaction: %w", err)
+		}
+		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
+			return 0, 0, time.Time{}, nil, err
+		}
+
+		waitFn := v.makeWaitFn(commitSeq, reqLevel)
 
 		done := v.registerPendingUpload(node.ID)
-		ino := node.ID
-		mode := node.Mode
-
 		go func() {
 			var uploadErr error
 			defer func() { done(uploadErr) }()
@@ -3231,72 +2548,9 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 					return
 				}
 			}
-
-			v.mu.Lock()
-			defer v.mu.Unlock()
-
-			currNode, _ := v.getOrLoadInodeLocked(context.Background(), ino)
-			if currNode == nil {
-				return
-			}
-			if currNode.Size < calculatedSize {
-				currNode.Size = calculatedSize
-			}
-			if currNode.ChunkSize == 0 {
-				currNode.ChunkSize = uint32(effectiveChunkSize)
-			}
-
-			tx := v.metadataStream.Begin()
-			for _, idx := range touchedIndices {
-				cSize := int64(currNode.ChunkSize)
-				if cSize == 0 {
-					cSize = int64(effectiveChunkSize)
-				}
-				if int64(idx)*cSize < currNode.Size {
-					if _, err := tx.Insert(context.Background(), &pb.FileChunk{
-						Ino:    proto.Uint64(ino),
-						Index:  proto.Uint32(uint32(idx)),
-						Sha256: chunkShas[idx],
-					}); err != nil {
-						uploadErr = err
-						return
-					}
-				}
-			}
-
-			curAtime := currNode.Atime
-			if curAtime.IsZero() {
-				curAtime = currNode.ModTime
-			}
-			curCtime := currNode.Ctime
-			if curCtime.IsZero() {
-				curCtime = currNode.ModTime
-			}
-			nodeInodeMsg := &pb.Inode{
-				Ino:       proto.Uint64(ino),
-				Mode:      mode,
-				Size:      currNode.Size,
-				Mtime:     timestamppb.New(currNode.ModTime),
-				Atime:     timestamppb.New(curAtime),
-				Ctime:     timestamppb.New(curCtime),
-				Uid:       currNode.Uid,
-				Gid:       currNode.Gid,
-				IsDir:     false,
-				ChunkSize: currNode.ChunkSize,
-			}
-			if _, err := tx.Update(context.Background(), nodeInodeMsg); err != nil {
-				uploadErr = err
-				return
-			}
-
-			if _, err := tx.Commit(context.Background()); err != nil {
-				uploadErr = err
-				return
-			}
-			_ = v.applyTxChangesLocked(context.Background(), tx)
 		}()
 
-		nAtime := node.Atime
+		nAtime = node.Atime
 		if nAtime.IsZero() {
 			nAtime = now
 		}
@@ -3317,8 +2571,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			Inode:     node.ID,
 		})
 
-		v.checkAutoSnapshotTriggerLocked(ctx)
-		return int64(len(data)), node.Size, now, nil, nil
+		return int64(len(data)), node.Size, now, waitFn, nil
 	}()
 	if err != nil {
 		return 0, 0, time.Time{}, err
@@ -3546,7 +2799,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			Attr:      attr,
 			Inode:     node.ID,
 		})
-		v.checkAutoSnapshotTriggerLocked(ctx)
 		return attr, waitFn, nil
 	}()
 	if err != nil {
@@ -3569,51 +2821,25 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	parentInodeID = v.normalizeInodeID(parentInodeID)
 
 	var childInodeID uint64
-	var oldChunks map[uint32]string
-	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-		de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
-		if err != nil {
-			v.mu.Unlock()
-			return err
-		}
-		if !ok {
-			v.mu.Unlock()
-			return fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
-		}
-		childInode, err := v.getOrLoadInodeLocked(ctx, de.GetIno())
-		if err != nil {
-			v.mu.Unlock()
-			return err
-		}
-		if childInode.IsDir {
-			v.mu.Unlock()
-			return fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
-		}
-		childInodeID = childInode.ID
-		oldChunks = childInode.Chunks
-	} else {
-		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-		if err != nil {
-			v.mu.Unlock()
-			return err
-		}
-		entry, ok := parentDir.Entries[name]
-		if !ok {
-			v.mu.Unlock()
-			return fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
-		}
-		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
-		if err != nil {
-			v.mu.Unlock()
-			return err
-		}
-		if childInode.IsDir {
-			v.mu.Unlock()
-			return fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
-		}
-		childInodeID = childInode.ID
-		oldChunks = childInode.Chunks
+	de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+	if err != nil {
+		v.mu.Unlock()
+		return err
 	}
+	if !ok {
+		v.mu.Unlock()
+		return fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
+	}
+	childInode, err := v.getOrLoadInodeLocked(ctx, de.GetIno())
+	if err != nil {
+		v.mu.Unlock()
+		return err
+	}
+	if childInode.IsDir {
+		v.mu.Unlock()
+		return fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
+	}
+	childInodeID = childInode.ID
 	v.mu.Unlock()
 
 	if err := v.waitForInodeUploads(ctx, childInodeID); err != nil {
@@ -3637,26 +2863,11 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			_ = childInode.Data.Close()
 		}
 
-		if v.metadataStore != MetadataStoreSQLite {
-			parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-			if err != nil {
-				return nil, err
-			}
-			delete(parentDir.Entries, name)
-			delete(parentDir.Added, name)
-			parentDir.Deleted[name] = true
-			parentDir.IsDirty = true
-		}
-
 		now := time.Now()
 		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
 		if parentInode != nil {
 			parentInode.ModTime = now
 			parentInode.Ctime = now
-			parentInode.IsDirty = true
-			if v.inodeCache != nil {
-				v.inodeCache.Put(parentInode.ID, parentInode)
-			}
 		}
 
 		var commitSeq uint64
@@ -3664,23 +2875,12 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
-		if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-			prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInodeID)}, 1)
-			chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
-			for _, msg := range chunkMsgs {
-				c := msg.(*pb.FileChunk)
-				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
-					return nil, fmt.Errorf("failed to log FileChunk deletion: %w", err)
-				}
-			}
-		} else {
-			for i := range oldChunks {
-				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(i)}); err != nil {
-					return nil, fmt.Errorf("failed to log FileChunk deletion: %w", err)
-				}
-			}
-			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(0)}); err != nil {
-				// delete inline chunk 0 if existed
+		prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInodeID)}, 1)
+		chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+		for _, msg := range chunkMsgs {
+			c := msg.(*pb.FileChunk)
+			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
+				return nil, fmt.Errorf("failed to log FileChunk deletion: %w", err)
 			}
 		}
 		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInodeID)}); err != nil {
@@ -3728,7 +2928,6 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			Name:        name,
 		})
 
-		v.checkAutoSnapshotTriggerLocked(ctx)
 		return waitFn, nil
 	}()
 	if err != nil {
@@ -3758,67 +2957,33 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		parentInodeID = v.normalizeInodeID(parentInodeID)
 
 		var childInodeID uint64
-		if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-			de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				return nil, fmt.Errorf("directory %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
-			}
-			childInodeID = de.GetIno()
-			childInode, err := v.getOrLoadInodeLocked(ctx, childInodeID)
-			if err != nil {
-				return nil, err
-			}
-			if !childInode.IsDir {
-				return nil, fmt.Errorf("cannot rmdir non-directory %s: %w", name, syscall.ENOTDIR)
-			}
+		de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("directory %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
+		}
+		childInodeID = de.GetIno()
+		childInode, err := v.getOrLoadInodeLocked(ctx, childInodeID)
+		if err != nil {
+			return nil, err
+		}
+		if !childInode.IsDir {
+			return nil, fmt.Errorf("cannot rmdir non-directory %s: %w", name, syscall.ENOTDIR)
+		}
 
-			// Emptiness check: scan child directory with limit 1
-			prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(childInodeID)}, 1)
-			if pErr != nil {
-				return nil, pErr
-			}
-			subEntries, err := v.scanLimitSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes, 1)
-			if err != nil {
-				return nil, err
-			}
-			if len(subEntries) > 0 {
-				return nil, fmt.Errorf("directory %s not empty: %w", name, syscall.ENOTEMPTY)
-			}
-		} else {
-			parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-			if err != nil {
-				return nil, err
-			}
-
-			entry, ok := parentDir.Entries[name]
-			if !ok {
-				return nil, fmt.Errorf("directory %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
-			}
-
-			childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
-			if err != nil {
-				return nil, err
-			}
-			if !childInode.IsDir {
-				return nil, fmt.Errorf("cannot rmdir non-directory %s: %w", name, syscall.ENOTDIR)
-			}
-
-			childDir, err := v.getOrLoadDirLocked(ctx, entry.InodeID)
-			if err != nil {
-				return nil, err
-			}
-			if len(childDir.Entries) > 0 {
-				return nil, fmt.Errorf("directory %s not empty: %w", name, syscall.ENOTEMPTY)
-			}
-
-			delete(parentDir.Entries, name)
-			delete(parentDir.Added, name)
-			parentDir.Deleted[name] = true
-			parentDir.IsDirty = true
-			childInodeID = childInode.ID
+		// Emptiness check: scan child directory with limit 1
+		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(childInodeID)}, 1)
+		if pErr != nil {
+			return nil, pErr
+		}
+		subEntries, err := v.scanLimitSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes, 1)
+		if err != nil {
+			return nil, err
+		}
+		if len(subEntries) > 0 {
+			return nil, fmt.Errorf("directory %s not empty: %w", name, syscall.ENOTEMPTY)
 		}
 
 		delete(v.dirParents, childInodeID)
@@ -3828,14 +2993,9 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		if parentInode != nil {
 			parentInode.ModTime = now
 			parentInode.Ctime = now
-			parentInode.IsDirty = true
-			if v.inodeCache != nil {
-				v.inodeCache.Put(parentInode.ID, parentInode)
-			}
 		}
 
 		var commitSeq uint64
-		var err error
 		tx := v.metadataStream.Begin()
 		if _, err = tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
@@ -3885,7 +3045,6 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 			Name:        name,
 		})
 
-		v.checkAutoSnapshotTriggerLocked(ctx)
 		return waitFn, nil
 	}()
 	if err != nil {
@@ -3920,74 +3079,37 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		}
 
 		var entry InodeEntry
-		var oldParentDir, newParentDir *CachedDir
 		var targetExists bool
 		var targetInodeID uint64
 
-		if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-			oldDe, ok, err := v.getDirEntrySQLiteLocked(ctx, oldParentInodeID, oldName)
-			if err != nil {
-				return nil, nil, err
-			}
-			if !ok {
-				return nil, nil, fmt.Errorf("source %s not found in parent %d: %w", oldName, oldParentInodeID, syscall.ENOENT)
-			}
-			entry = InodeEntry{
-				InodeID: oldDe.GetIno(),
-				IsDir:   oldDe.GetIsDir(),
-				Mode:    oldDe.GetMode(),
-			}
+		oldDe, ok, err := v.getDirEntrySQLiteLocked(ctx, oldParentInodeID, oldName)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !ok {
+			return nil, nil, fmt.Errorf("source %s not found in parent %d: %w", oldName, oldParentInodeID, syscall.ENOENT)
+		}
+		entry = InodeEntry{
+			InodeID: oldDe.GetIno(),
+			IsDir:   oldDe.GetIsDir(),
+			Mode:    oldDe.GetMode(),
+		}
 
-			newParentInode, err := v.getOrLoadInodeLocked(ctx, newParentInodeID)
-			if err != nil {
-				return nil, nil, err
-			}
-			if !newParentInode.IsDir {
-				return nil, nil, fmt.Errorf("target parent %d is not a directory: %w", newParentInodeID, syscall.ENOTDIR)
-			}
+		newParentInode, err := v.getOrLoadInodeLocked(ctx, newParentInodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !newParentInode.IsDir {
+			return nil, nil, fmt.Errorf("target parent %d is not a directory: %w", newParentInodeID, syscall.ENOTDIR)
+		}
 
-			targetDe, ok, err := v.getDirEntrySQLiteLocked(ctx, newParentInodeID, newName)
-			if err != nil {
-				return nil, nil, err
-			}
-			if ok {
-				targetExists = true
-				targetInodeID = targetDe.GetIno()
-			}
-		} else {
-			var err error
-			oldParentDir, err = v.getOrLoadDirLocked(ctx, oldParentInodeID)
-			if err != nil {
-				return nil, nil, fmt.Errorf("old parent directory not loaded: %w", err)
-			}
-
-			e, ok := oldParentDir.Entries[oldName]
-			if !ok {
-				return nil, nil, fmt.Errorf("source %s not found in parent %d: %w", oldName, oldParentInodeID, syscall.ENOENT)
-			}
-			entry = InodeEntry{
-				InodeID: e.InodeID,
-				IsDir:   e.IsDir,
-				Mode:    e.Mode,
-			}
-
-			newParentInode, err := v.getOrLoadInodeLocked(ctx, newParentInodeID)
-			if err != nil {
-				return nil, nil, err
-			}
-			if !newParentInode.IsDir {
-				return nil, nil, fmt.Errorf("target parent %d is not a directory: %w", newParentInodeID, syscall.ENOTDIR)
-			}
-
-			newParentDir, err = v.getOrLoadDirLocked(ctx, newParentInodeID)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			if targetEntry, ok := newParentDir.Entries[newName]; ok {
-				targetExists = true
-				targetInodeID = targetEntry.InodeID
-			}
+		targetDe, ok, err := v.getDirEntrySQLiteLocked(ctx, newParentInodeID, newName)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ok {
+			targetExists = true
+			targetInodeID = targetDe.GetIno()
 		}
 
 		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
@@ -4020,44 +3142,18 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			}
 		}
 
-		if oldParentDir != nil && newParentDir != nil {
-			delete(oldParentDir.Entries, oldName)
-			delete(oldParentDir.Added, oldName)
-			oldParentDir.Deleted[oldName] = true
-			oldParentDir.IsDirty = true
-
-			newParentDir.Entries[newName] = DirEntry{
-				Name:    newName,
-				InodeID: entry.InodeID,
-				IsDir:   entry.IsDir,
-				Mode:    entry.Mode,
-			}
-			newParentDir.Added[newName] = true
-			delete(newParentDir.Deleted, newName)
-			newParentDir.IsDirty = true
-		}
-
 		now := time.Now()
 		childInode.Ctime = now
-		childInode.IsDirty = true
 
 		oldParentInode, _ := v.getOrLoadInodeLocked(ctx, oldParentInodeID)
 		if oldParentInode != nil {
 			oldParentInode.ModTime = now
 			oldParentInode.Ctime = now
-			oldParentInode.IsDirty = true
-			if v.inodeCache != nil {
-				v.inodeCache.Put(oldParentInode.ID, oldParentInode)
-			}
 		}
-		newParentInode, _ := v.getOrLoadInodeLocked(ctx, newParentInodeID)
+		newParentInode, _ = v.getOrLoadInodeLocked(ctx, newParentInodeID)
 		if newParentInode != nil {
 			newParentInode.ModTime = now
 			newParentInode.Ctime = now
-			newParentInode.IsDirty = true
-			if v.inodeCache != nil {
-				v.inodeCache.Put(newParentInode.ID, newParentInode)
-			}
 		}
 
 		var commitSeq uint64
@@ -4194,7 +3290,6 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			Name:           newName,
 		})
 
-		v.checkAutoSnapshotTriggerLocked(ctx)
 		return attr, waitFn, nil
 	}()
 	if err != nil {
@@ -4261,36 +3356,26 @@ func (b *bufferWriterAt) WriteAt(p []byte, off int64) (int, error) {
 }
 
 type snapshotResolver struct {
-	metadataResolver
 	vol        *Volume
 	rootXattrs *erofs.Xattrs
 }
 
 func (r *snapshotResolver) getOrLoadInode(ctx context.Context, inodeID uint64) (*CachedInode, error) {
-	if r.vol != nil && r.vol.metadataStore == MetadataStoreSQLite {
+	if r.vol != nil {
 		return r.vol.getOrLoadInodeLocked(ctx, inodeID)
 	}
-	if r.vol != nil && r.vol.inodeCache != nil {
-		if node, ok := r.vol.inodeCache.Peek(inodeID); ok {
-			return node, nil
-		}
-	}
-	return r.resolveInode(ctx, inodeID, false)
+	return nil, fmt.Errorf("no volume attached")
 }
 
 func (r *snapshotResolver) getOrLoadDir(ctx context.Context, inodeID uint64) (map[string]DirEntry, error) {
-	if r.vol != nil && r.vol.metadataStore == MetadataStoreSQLite {
+	if r.vol != nil {
 		dir, err := r.vol.getOrLoadDirLocked(ctx, inodeID)
 		if err != nil {
 			return nil, err
 		}
 		return dir.Entries, nil
 	}
-	dir, err := r.resolveDir(ctx, inodeID, false)
-	if err != nil {
-		return nil, err
-	}
-	return dir.Entries, nil
+	return nil, fmt.Errorf("no volume attached")
 }
 
 func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64, dirName, currentPath string, dirtyBlobs map[string]blob.ByteStream, currentEntries map[string]FileMetadata) (erofs.Node, error) {
@@ -4398,12 +3483,52 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 					}
 				}
 				childInode.ContentSha256 = fmt.Sprintf("%x", hasher.Sum(nil))
-				if inMemNode, ok := r.vol.inodeCache.Peek(childInode.ID); ok {
-					inMemNode.ContentSha256 = childInode.ContentSha256
+				if r.vol != nil {
+					r.vol.mu.Lock()
+					if r.vol.sqliteDB != nil {
+						nodeMsg := &pb.Inode{
+							Ino:            proto.Uint64(childInode.ID),
+							Mode:           childInode.Mode,
+							Size:           childInode.Size,
+							Mtime:          timestamppb.New(childInode.ModTime),
+							Atime:          timestamppb.New(childInode.Atime),
+							Ctime:          timestamppb.New(childInode.Ctime),
+							Uid:            childInode.Uid,
+							Gid:            childInode.Gid,
+							IsDir:          false,
+							Sha256:         childInode.Sha256,
+							Etag:           childInode.ETag,
+							ManifestSha256: childInode.ManifestSha256,
+							ContentSha256:  childInode.ContentSha256,
+							ChunkSize:      childInode.ChunkSize,
+						}
+						kBytes, vBytes, _ := sds.SplitKeyAndNonKey(nodeMsg, []int32{1})
+						ch := sds.Change{
+							TypeID:   16,
+							TypeName: "objectfs.v1alpha1.Inode",
+							Op:       sds.OpUpdate,
+							Key:      sds.NewKeyFromBytes(kBytes),
+							RawKey:   kBytes,
+							RawVal:   vBytes,
+							Row:      nodeMsg,
+						}
+						_ = r.vol.sqliteDB.ApplyBatch(ctx, []sds.Change{ch})
+						r.vol.applyChangesToSQLiteCacheLocked([]sds.Change{ch})
+					}
+					r.vol.mu.Unlock()
 				}
 			}
 
 			// Collect dirty / unpersisted blobs for flush
+			if len(childInode.InlineData) > 0 {
+				if childInode.ContentSha256 == "" {
+					childInode.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256(childInode.InlineData))
+				}
+				if childInode.Sha256 == "" {
+					childInode.Sha256 = childInode.ContentSha256
+				}
+				dirtyBlobs[childInode.Sha256] = blob.NewByteStreamFromBytes(childInode.InlineData)
+			}
 			if childInode.Sha256 != "" {
 				if cData, ok := r.vol.recoveredContent[childInode.Sha256]; ok {
 					dirtyBlobs[childInode.Sha256] = blob.NewByteStreamFromBytes(cData)
@@ -4422,6 +3547,16 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 			for _, chunkSha := range childInode.Chunks {
 				if chunkData, ok := r.vol.recoveredContent[chunkSha]; ok {
 					dirtyBlobs[chunkSha] = blob.NewByteStreamFromBytes(chunkData)
+				}
+			}
+			for i, cBytes := range childInode.StagedChunks {
+				if sha, ok := childInode.Chunks[uint32(i)]; ok && sha != "" {
+					dirtyBlobs[sha] = blob.NewByteStreamFromBytes(cBytes)
+				}
+			}
+			for i, cBytes := range childInode.DirtyChunks {
+				if sha, ok := childInode.Chunks[uint32(i)]; ok && sha != "" {
+					dirtyBlobs[sha] = blob.NewByteStreamFromBytes(cBytes)
 				}
 			}
 
@@ -4453,16 +3588,28 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 			if childInode.ManifestSha256 != "" {
 				fetchSha = childInode.ManifestSha256
 			}
-			if needsUpload && fetchSha != "" && r.vol.blobStore != nil && r.vol.backend != nil {
+			if fetchSha == "" {
+				fetchSha = childInode.ContentSha256
+			}
+			if needsUpload && fetchSha != "" && r.vol.backend != nil {
 				key := strings.TrimPrefix(childPath, "/")
-				blobReader, bErr := r.vol.blobStore.GetBlob(ctx, fetchSha)
-				if bErr == nil && blobReader != nil {
+				var blobReader blob.ByteStream
+				if dbStream, ok := dirtyBlobs[fetchSha]; ok {
+					_ = dbStream.Rewind()
+					blobReader = dbStream
+				} else if r.vol.blobStore != nil {
+					bs, bErr := r.vol.blobStore.GetBlob(ctx, fetchSha)
+					if bErr == nil {
+						blobReader = bs
+					}
+				}
+				if blobReader != nil {
 					etag, err := r.vol.backend.PutObject(ctx, r.vol.volumeID, key, blobReader)
 					if err == nil {
 						childInode.ETag = etag
 						meta.ETag = etag
 					}
-					_ = blobReader.Close()
+					_ = blobReader.Rewind()
 				}
 			}
 
@@ -4478,20 +3625,37 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 				xattrs.UserManifest = childInode.ManifestSha256
 			}
 
-			leafNode := erofs.NewMemoryNode(
-				name,
-				false,
-				uint16(childInode.Mode),
-				nil,
-				nil,
-				erofs.WithIno(childInode.ID),
-				erofs.WithMetadataOnly(true),
-				erofs.WithSize(uint64(childInode.Size)),
-				erofs.WithMtime(uint64(childInode.ModTime.Unix())),
-				erofs.WithUID(childInode.Uid),
-				erofs.WithGID(childInode.Gid),
-				erofs.WithXattrs(xattrs),
-			)
+			var leafNode erofs.Node
+			if len(childInode.InlineData) > 0 {
+				leafNode = erofs.NewMemoryNode(
+					name,
+					false,
+					uint16(childInode.Mode),
+					childInode.InlineData,
+					nil,
+					erofs.WithIno(childInode.ID),
+					erofs.WithSize(uint64(childInode.Size)),
+					erofs.WithMtime(uint64(childInode.ModTime.Unix())),
+					erofs.WithUID(childInode.Uid),
+					erofs.WithGID(childInode.Gid),
+					erofs.WithXattrs(xattrs),
+				)
+			} else {
+				leafNode = erofs.NewMemoryNode(
+					name,
+					false,
+					uint16(childInode.Mode),
+					nil,
+					nil,
+					erofs.WithIno(childInode.ID),
+					erofs.WithMetadataOnly(true),
+					erofs.WithSize(uint64(childInode.Size)),
+					erofs.WithMtime(uint64(childInode.ModTime.Unix())),
+					erofs.WithUID(childInode.Uid),
+					erofs.WithGID(childInode.Gid),
+					erofs.WithXattrs(xattrs),
+				)
+			}
 			children = append(children, leafNode)
 		}
 	}
@@ -4533,7 +3697,7 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 
 	snapPos := v.safeSnapshotPositionLocked()
 
-	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil && v.backend != nil {
+	if v.sqliteDB != nil && v.backend != nil {
 		if err := v.flushOverlayLocked(ctx); err != nil {
 			return err
 		}
@@ -4548,37 +3712,6 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		}
 	}
 
-	// 1. Phase 1: Persist all in-memory dirty cache entries to local storage / blob store.
-	v.inodeCache.ForEach(func(id uint64, node *CachedInode) {
-		if node.IsDirty {
-			_ = v.persistInode(ctx, node)
-		}
-	})
-	v.dirCache.ForEach(func(id uint64, dir *CachedDir) {
-		if dir.IsDirty {
-			v.onEvictDir(id, dir)
-		}
-	})
-
-	// 2. Phase 2: Capture point-in-time metadata pointers.
-	var cutoffOffset LocalOffset
-	if v.localStore != nil {
-		cutoffOffset = v.localStore.CurrentOffset()
-	}
-
-	snapDirtyInodes := make(map[uint64]LocalOffset, len(v.dirtyInodes))
-	for k, off := range v.dirtyInodes {
-		snapDirtyInodes[k] = off
-	}
-
-	snapDirtyDirs := make(map[uint64]LocalOffset, len(v.dirtyDirs))
-	for k, off := range v.dirtyDirs {
-		snapDirtyDirs[k] = off
-	}
-
-	baseReader := v.snapshotReader
-	baseRaw := v.snapshotRaw
-	rootID := v.rootInodeID
 	delPaths := make([]string, len(v.deletedPathsSinceFlush))
 	copy(delPaths, v.deletedPathsSinceFlush)
 	v.deletedPathsSinceFlush = nil
@@ -4621,16 +3754,9 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		resolver := &snapshotResolver{
 			vol:        v,
 			rootXattrs: &rootXattrs,
-			metadataResolver: metadataResolver{
-				localStore:     v.localStore,
-				snapshotReader: baseReader,
-				snapshotRaw:    baseRaw,
-				dirtyInodes:    snapDirtyInodes,
-				dirtyDirs:      snapDirtyDirs,
-			},
 		}
 
-		erofsTree, err := resolver.buildErofsTree(ctx, rootID, "/", "/", dirtyBlobs, currentEntries)
+		erofsTree, err := resolver.buildErofsTree(ctx, v.rootInodeID, "/", "/", dirtyBlobs, currentEntries)
 		if err != nil {
 			return fmt.Errorf("failed to build hierarchy for snapshot: %w", err)
 		}
@@ -4682,37 +3808,19 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		return nil
 	}()
 
-	// Re-acquire v.mu.Lock() for Phase 4
+	// Re-acquire v.mu.Lock()
 	v.mu.Lock()
 
 	if snapErr != nil {
 		return snapErr
 	}
 
-	// 4. Phase 4: Update base snapshot reader, prune committed dirty maps, and trim circular buffer
 	v.snapshotRaw = bytes.NewReader(erofsBuf.buf)
 	if r, err := erofs.NewReader(v.snapshotRaw); err == nil {
 		v.snapshotReader = r
 		v.rootInodeID = r.GetRootNID()
 	}
-	v.snapshotCutoff = cutoffOffset
 	v.recoveredContent = make(map[string][]byte)
-
-	for inodeID, snapOff := range snapDirtyInodes {
-		if currOff, ok := v.dirtyInodes[inodeID]; ok && currOff == snapOff {
-			delete(v.dirtyInodes, inodeID)
-		}
-	}
-
-	for dirID, snapOff := range snapDirtyDirs {
-		if currOff, ok := v.dirtyDirs[dirID]; ok && currOff == snapOff {
-			delete(v.dirtyDirs, dirID)
-		}
-	}
-
-	if v.localStore != nil && cutoffOffset != NoOffset {
-		_ = v.localStore.TrimBefore(cutoffOffset)
-	}
 
 	newMeta := VolumeMetadata{
 		VolumeID:    v.volumeID,
@@ -4731,31 +3839,6 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 	v.lastFlushedMetadata = &newMeta
 
 	return nil
-}
-
-func (v *Volume) checkAutoSnapshotTriggerLocked(ctx context.Context) {
-	if v.backend == nil {
-		return
-	}
-	shouldSnapshot := false
-	if v.maxDirtyRecords > 0 && (len(v.dirtyInodes)+len(v.dirtyDirs)) >= v.maxDirtyRecords {
-		shouldSnapshot = true
-	}
-	if v.localStore != nil {
-		if v.maxLocalFileSize > 0 && v.localStore.ActiveFileSize() >= v.maxLocalFileSize {
-			shouldSnapshot = true
-		}
-		if v.maxBufferFiles > 0 && v.localStore.FileCount() >= v.maxBufferFiles {
-			shouldSnapshot = true
-		}
-	}
-	if shouldSnapshot {
-		if !v.snapshotMu.TryLock() {
-			return
-		}
-		defer v.snapshotMu.Unlock()
-		_ = v.flushToBackendLocked(ctx)
-	}
 }
 
 func (v *Volume) FlushToBackend(ctx context.Context) error {
@@ -4801,11 +3884,17 @@ func (v *Volume) findLatestSnapshotNameLocked(ctx context.Context) (string, erro
 	return snapshots[len(snapshots)-1].name, nil
 }
 
-// ApplyRecordLocked applies a single mutation record to the filesystem tables.
+// ApplyRecordLocked applies a single mutation record to the filesystem tables in SQLite.
 func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 	ctx := context.Background()
 	if record.Inode >= v.nextInode {
 		v.nextInode = ((record.Inode / erofs.DefaultInodeStride) + 1) * erofs.DefaultInodeStride
+	}
+
+	var changes []sds.Change
+	now := time.Now()
+	if record.ModTime != nil {
+		now = record.ModTime.AsTime()
 	}
 
 	switch record.Type {
@@ -4814,16 +3903,6 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		if parentInodeID == 0 {
 			parentInodeID = v.rootInodeID
 		}
-		baseName := record.Name
-		if baseName == "" {
-			return nil
-		}
-
-		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-		if err != nil {
-			return err
-		}
-
 		mode := record.Mode
 		if mode == 0 {
 			mode = 0755
@@ -4835,63 +3914,58 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 			inodeID = v.allocInode()
 		}
 
-		var modTime time.Time
-		if record.ModTime != nil {
-			modTime = record.ModTime.AsTime()
+		childInodeMsg := &pb.Inode{
+			Ino:   proto.Uint64(inodeID),
+			Mode:  mode,
+			Size:  0,
+			Mtime: timestamppb.New(now),
+			Atime: timestamppb.New(now),
+			Ctime: timestamppb.New(now),
+			Uid:   record.Uid,
+			Gid:   record.Gid,
+			IsDir: true,
 		}
-		if modTime.IsZero() {
-			modTime = time.Now()
-		}
+		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(childInodeMsg, []int32{1})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   16,
+			TypeName: "objectfs.v1alpha1.Inode",
+			Op:       sds.OpCreate,
+			Key:      sds.NewKeyFromBytes(kBytes),
+			RawKey:   kBytes,
+			RawVal:   vBytes,
+			Row:      childInodeMsg,
+		})
 
-		childInode := &CachedInode{
-			ID:      inodeID,
-			Mode:    mode,
-			ModTime: modTime,
-			IsDir:   true,
-			Uid:     record.Uid,
-			Gid:     record.Gid,
-			IsDirty: false,
+		dirEntryMsg := &pb.DirEntry{
+			ParentIno: proto.Uint64(parentInodeID),
+			Name:      proto.String(record.Name),
+			Ino:       inodeID,
+			IsDir:     true,
+			Mode:      mode,
 		}
-		v.inodeCache.Put(inodeID, childInode)
+		dkBytes, dvBytes, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   17,
+			TypeName: "objectfs.v1alpha1.DirEntry",
+			Op:       sds.OpCreate,
+			Key:      sds.NewKeyFromBytes(dkBytes),
+			RawKey:   dkBytes,
+			RawVal:   dvBytes,
+			Row:      dirEntryMsg,
+		})
 
-		childDir := &CachedDir{
-			ID:         inodeID,
-			Entries:    make(map[string]DirEntry),
-			Added:      make(map[string]bool),
-			Deleted:    make(map[string]bool),
-			PrevOffset: NoOffset,
-			IsDirty:    false,
-		}
-		v.dirCache.Put(inodeID, childDir)
-
-		newEntry := DirEntry{
-			Name:    baseName,
-			InodeID: inodeID,
-			IsDir:   true,
-			Mode:    mode,
-		}
-		parentDir.Entries[baseName] = newEntry
 		if v.dirParents == nil {
 			v.dirParents = make(map[uint64]uint64)
 		}
 		v.dirParents[inodeID] = parentInodeID
-		return nil
 
 	case MutationCreateFile:
 		parentInodeID := record.ParentInode
 		if parentInodeID == 0 {
 			parentInodeID = v.rootInodeID
 		}
-		baseName := record.Name
-		if baseName == "" {
-			return nil
-		}
-
-		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-		if err != nil {
-			return err
-		}
-
 		mode := record.Mode
 		if mode == 0 {
 			mode = 0644
@@ -4903,239 +3977,387 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 			inodeID = v.allocInode()
 		}
 
-		var modTime time.Time
-		if record.ModTime != nil {
-			modTime = record.ModTime.AsTime()
+		childInodeMsg := &pb.Inode{
+			Ino:           proto.Uint64(inodeID),
+			Mode:          mode,
+			Size:          record.Size,
+			Mtime:         timestamppb.New(now),
+			Atime:         timestamppb.New(now),
+			Ctime:         timestamppb.New(now),
+			Uid:           record.Uid,
+			Gid:           record.Gid,
+			IsDir:         false,
+			ContentSha256: record.ContentSha256,
 		}
-		if modTime.IsZero() {
-			modTime = time.Now()
-		}
+		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(childInodeMsg, []int32{1})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   16,
+			TypeName: "objectfs.v1alpha1.Inode",
+			Op:       sds.OpCreate,
+			Key:      sds.NewKeyFromBytes(kBytes),
+			RawKey:   kBytes,
+			RawVal:   vBytes,
+			Row:      childInodeMsg,
+		})
 
-		var stream blob.ByteStream
+		dirEntryMsg := &pb.DirEntry{
+			ParentIno: proto.Uint64(parentInodeID),
+			Name:      proto.String(record.Name),
+			Ino:       inodeID,
+			IsDir:     false,
+			Mode:      mode,
+		}
+		dkBytes, dvBytes, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   17,
+			TypeName: "objectfs.v1alpha1.DirEntry",
+			Op:       sds.OpCreate,
+			Key:      sds.NewKeyFromBytes(dkBytes),
+			RawKey:   dkBytes,
+			RawVal:   dvBytes,
+			Row:      dirEntryMsg,
+		})
+
 		if len(record.Data) > 0 {
-			stream = blob.NewByteStreamFromBytes(record.Data)
+			chunkMsg := &pb.FileChunk{
+				Ino:        proto.Uint64(inodeID),
+				Index:      proto.Uint32(0),
+				InlineData: record.Data,
+			}
+			ckBytes, cvBytes, _ := sds.SplitKeyAndNonKey(chunkMsg, []int32{1, 2})
+			changes = append(changes, sds.Change{
+				Seq:      record.StreamSeq,
+				TypeID:   18,
+				TypeName: "objectfs.v1alpha1.FileChunk",
+				Op:       sds.OpCreate,
+				Key:      sds.NewKeyFromBytes(ckBytes),
+				RawKey:   ckBytes,
+				RawVal:   cvBytes,
+				Row:      chunkMsg,
+			})
 		}
-
-		childInode := &CachedInode{
-			ID:             inodeID,
-			Mode:           mode,
-			Size:           record.Size,
-			ModTime:        modTime,
-			Data:           stream,
-			Sha256:         record.Sha256,
-			ManifestSha256: record.ManifestSha256,
-			ContentSha256:  record.ContentSha256,
-			IsDir:          false,
-			Uid:            record.Uid,
-			Gid:            record.Gid,
-			IsDirty:        false,
-		}
-		v.inodeCache.Put(inodeID, childInode)
-
-		newEntry := DirEntry{
-			Name:    baseName,
-			InodeID: inodeID,
-			IsDir:   false,
-			Mode:    mode,
-		}
-		parentDir.Entries[baseName] = newEntry
-		return nil
 
 	case MutationWriteFile:
 		inodeID := record.Inode
 		if inodeID == 0 {
 			return nil
 		}
-		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+		existing, err := v.getOrLoadInodeLocked(ctx, inodeID)
 		if err != nil {
 			return err
 		}
+		var currentData []byte
+		if len(existing.InlineData) > 0 {
+			currentData = existing.InlineData
+		}
+		neededLen := record.Offset + int64(len(record.Data))
+		if neededLen > int64(len(currentData)) {
+			newBuf := make([]byte, neededLen)
+			copy(newBuf, currentData)
+			currentData = newBuf
+		}
+		copy(currentData[record.Offset:], record.Data)
+		newSize := int64(len(currentData))
+		if record.Size > newSize {
+			newSize = record.Size
+		}
 
-		if len(record.Data) > 0 {
-			var currentData []byte
-			if node.Data != nil {
-				_ = node.Data.Rewind()
-				currentData, _ = io.ReadAll(node.Data)
-				_ = node.Data.Close()
-			}
-			neededLen := record.Offset + int64(len(record.Data))
-			if neededLen > int64(len(currentData)) {
-				newBuf := make([]byte, neededLen)
-				copy(newBuf, currentData)
-				currentData = newBuf
-			}
-			copy(currentData[record.Offset:], record.Data)
-			if node.Size < int64(len(currentData)) {
-				node.Size = int64(len(currentData))
-			}
-			node.Data = blob.NewByteStreamFromBytes(currentData)
+		inodeMsg := &pb.Inode{
+			Ino:           proto.Uint64(inodeID),
+			Mode:          existing.Mode,
+			Size:          newSize,
+			Mtime:         timestamppb.New(now),
+			Atime:         timestamppb.New(now),
+			Ctime:         timestamppb.New(now),
+			Uid:           existing.Uid,
+			Gid:           existing.Gid,
+			IsDir:         false,
+			ContentSha256: record.ContentSha256,
 		}
-		if record.Size > 0 {
-			node.Size = record.Size
+		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(inodeMsg, []int32{1})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   16,
+			TypeName: "objectfs.v1alpha1.Inode",
+			Op:       sds.OpUpdate,
+			Key:      sds.NewKeyFromBytes(kBytes),
+			RawKey:   kBytes,
+			RawVal:   vBytes,
+			Row:      inodeMsg,
+		})
+
+		chunkMsg := &pb.FileChunk{
+			Ino:        proto.Uint64(inodeID),
+			Index:      proto.Uint32(0),
+			InlineData: currentData,
 		}
-		if record.Sha256 != "" {
-			node.Sha256 = record.Sha256
-		}
-		if record.ManifestSha256 != "" {
-			node.ManifestSha256 = record.ManifestSha256
-		}
-		if record.ContentSha256 != "" {
-			node.ContentSha256 = record.ContentSha256
-		}
-		if record.ModTime != nil {
-			node.ModTime = record.ModTime.AsTime()
-		}
-		return nil
+		ckBytes, cvBytes, _ := sds.SplitKeyAndNonKey(chunkMsg, []int32{1, 2})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   18,
+			TypeName: "objectfs.v1alpha1.FileChunk",
+			Op:       sds.OpCreate,
+			Key:      sds.NewKeyFromBytes(ckBytes),
+			RawKey:   ckBytes,
+			RawVal:   cvBytes,
+			Row:      chunkMsg,
+		})
 
 	case MutationTruncateFile:
 		inodeID := record.Inode
 		if inodeID == 0 {
 			return nil
 		}
-		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+		existing, err := v.getOrLoadInodeLocked(ctx, inodeID)
 		if err != nil {
 			return err
 		}
-		node.Size = record.Size
-		if record.Sha256 != "" {
-			node.Sha256 = record.Sha256
+		var currentData []byte
+		if len(existing.InlineData) > 0 {
+			currentData = existing.InlineData
 		}
-		if record.ManifestSha256 != "" {
-			node.ManifestSha256 = record.ManifestSha256
+		if record.Size < int64(len(currentData)) {
+			currentData = currentData[:record.Size]
+		} else if record.Size > int64(len(currentData)) {
+			newBuf := make([]byte, record.Size)
+			copy(newBuf, currentData)
+			currentData = newBuf
 		}
-		if record.ContentSha256 != "" {
-			node.ContentSha256 = record.ContentSha256
+		inodeMsg := &pb.Inode{
+			Ino:           proto.Uint64(inodeID),
+			Mode:          existing.Mode,
+			Size:          record.Size,
+			Mtime:         timestamppb.New(now),
+			Atime:         timestamppb.New(now),
+			Ctime:         timestamppb.New(now),
+			Uid:           existing.Uid,
+			Gid:           existing.Gid,
+			IsDir:         false,
+			ContentSha256: record.ContentSha256,
 		}
-		if record.ModTime != nil {
-			node.ModTime = record.ModTime.AsTime()
+		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(inodeMsg, []int32{1})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   16,
+			TypeName: "objectfs.v1alpha1.Inode",
+			Op:       sds.OpUpdate,
+			Key:      sds.NewKeyFromBytes(kBytes),
+			RawKey:   kBytes,
+			RawVal:   vBytes,
+			Row:      inodeMsg,
+		})
+
+		chunkMsg := &pb.FileChunk{
+			Ino:        proto.Uint64(inodeID),
+			Index:      proto.Uint32(0),
+			InlineData: currentData,
 		}
-		if node.Data != nil {
-			_ = node.Data.Rewind()
-			currentData, _ := io.ReadAll(node.Data)
-			_ = node.Data.Close()
-			if record.Size < int64(len(currentData)) {
-				currentData = currentData[:record.Size]
-			} else if record.Size > int64(len(currentData)) {
-				newBuf := make([]byte, record.Size)
-				copy(newBuf, currentData)
-				currentData = newBuf
-			}
-			node.Data = blob.NewByteStreamFromBytes(currentData)
-		}
-		return nil
+		ckBytes, cvBytes, _ := sds.SplitKeyAndNonKey(chunkMsg, []int32{1, 2})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   18,
+			TypeName: "objectfs.v1alpha1.FileChunk",
+			Op:       sds.OpCreate,
+			Key:      sds.NewKeyFromBytes(ckBytes),
+			RawKey:   ckBytes,
+			RawVal:   cvBytes,
+			Row:      chunkMsg,
+		})
 
 	case MutationUnlink:
 		parentInodeID := record.ParentInode
 		if parentInodeID == 0 {
 			parentInodeID = v.rootInodeID
 		}
-		baseName := record.Name
-		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-		if err != nil {
-			return nil
+		de, ok, _ := v.getDirEntrySQLiteLocked(ctx, parentInodeID, record.Name)
+		dirEntryMsg := &pb.DirEntry{
+			ParentIno: proto.Uint64(parentInodeID),
+			Name:      proto.String(record.Name),
 		}
-		delete(parentDir.Entries, baseName)
-		return nil
+		dkBytes, _, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   17,
+			TypeName: "objectfs.v1alpha1.DirEntry",
+			Op:       sds.OpDelete,
+			Key:      sds.NewKeyFromBytes(dkBytes),
+			RawKey:   dkBytes,
+			Row:      dirEntryMsg,
+		})
+		if ok && de != nil {
+			inoMsg := &pb.Inode{Ino: proto.Uint64(de.GetIno())}
+			ikBytes, _, _ := sds.SplitKeyAndNonKey(inoMsg, []int32{1})
+			changes = append(changes, sds.Change{
+				Seq:      record.StreamSeq,
+				TypeID:   16,
+				TypeName: "objectfs.v1alpha1.Inode",
+				Op:       sds.OpDelete,
+				Key:      sds.NewKeyFromBytes(ikBytes),
+				RawKey:   ikBytes,
+				Row:      inoMsg,
+			})
+		}
 
 	case MutationRmdir:
 		parentInodeID := record.ParentInode
 		if parentInodeID == 0 {
 			parentInodeID = v.rootInodeID
 		}
-		baseName := record.Name
-		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-		if err != nil {
-			return nil
+		de, ok, _ := v.getDirEntrySQLiteLocked(ctx, parentInodeID, record.Name)
+		dirEntryMsg := &pb.DirEntry{
+			ParentIno: proto.Uint64(parentInodeID),
+			Name:      proto.String(record.Name),
 		}
-		if entry, ok := parentDir.Entries[baseName]; ok {
-			delete(v.dirParents, entry.InodeID)
+		dkBytes, _, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   17,
+			TypeName: "objectfs.v1alpha1.DirEntry",
+			Op:       sds.OpDelete,
+			Key:      sds.NewKeyFromBytes(dkBytes),
+			RawKey:   dkBytes,
+			Row:      dirEntryMsg,
+		})
+		if ok && de != nil {
+			delete(v.dirParents, de.GetIno())
+			inoMsg := &pb.Inode{Ino: proto.Uint64(de.GetIno())}
+			ikBytes, _, _ := sds.SplitKeyAndNonKey(inoMsg, []int32{1})
+			changes = append(changes, sds.Change{
+				Seq:      record.StreamSeq,
+				TypeID:   16,
+				TypeName: "objectfs.v1alpha1.Inode",
+				Op:       sds.OpDelete,
+				Key:      sds.NewKeyFromBytes(ikBytes),
+				RawKey:   ikBytes,
+				Row:      inoMsg,
+			})
 		}
-		delete(parentDir.Entries, baseName)
-		return nil
 
 	case MutationRename:
 		oldParentInodeID := record.OldParentInode
 		if oldParentInodeID == 0 {
 			oldParentInodeID = v.rootInodeID
 		}
-		oldBase := record.OldName
 		newParentInodeID := record.ParentInode
 		if newParentInodeID == 0 {
 			newParentInodeID = v.rootInodeID
 		}
-		newBase := record.Name
-
-		oldParentDir, err := v.getOrLoadDirLocked(ctx, oldParentInodeID)
-		if err != nil {
-			return err
+		oldDe, ok, _ := v.getDirEntrySQLiteLocked(ctx, oldParentInodeID, record.OldName)
+		delMsg := &pb.DirEntry{
+			ParentIno: proto.Uint64(oldParentInodeID),
+			Name:      proto.String(record.OldName),
 		}
-
-		entry, ok := oldParentDir.Entries[oldBase]
-		if !ok {
-			return fmt.Errorf("rename source not found: %s in inode %d", oldBase, oldParentInodeID)
-		}
-
-		newParentDir, err := v.getOrLoadDirLocked(ctx, newParentInodeID)
-		if err != nil {
-			return err
-		}
-
-		delete(oldParentDir.Entries, oldBase)
-		entry.Name = newBase
-		newParentDir.Entries[newBase] = entry
-		if entry.IsDir {
-			if v.dirParents == nil {
-				v.dirParents = make(map[uint64]uint64)
+		dkBytes, _, _ := sds.SplitKeyAndNonKey(delMsg, []int32{1, 2})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   17,
+			TypeName: "objectfs.v1alpha1.DirEntry",
+			Op:       sds.OpDelete,
+			Key:      sds.NewKeyFromBytes(dkBytes),
+			RawKey:   dkBytes,
+			Row:      delMsg,
+		})
+		if ok && oldDe != nil {
+			insMsg := &pb.DirEntry{
+				ParentIno: proto.Uint64(newParentInodeID),
+				Name:      proto.String(record.Name),
+				Ino:       oldDe.GetIno(),
+				IsDir:     oldDe.GetIsDir(),
+				Mode:      oldDe.GetMode(),
 			}
-			v.dirParents[entry.InodeID] = newParentInodeID
-		}
-
-		if record.ModTime != nil {
-			childInode, _ := v.getOrLoadInodeLocked(ctx, entry.InodeID)
-			if childInode != nil {
-				childInode.ModTime = record.ModTime.AsTime()
+			ikBytes, ivBytes, _ := sds.SplitKeyAndNonKey(insMsg, []int32{1, 2})
+			changes = append(changes, sds.Change{
+				Seq:      record.StreamSeq,
+				TypeID:   17,
+				TypeName: "objectfs.v1alpha1.DirEntry",
+				Op:       sds.OpCreate,
+				Key:      sds.NewKeyFromBytes(ikBytes),
+				RawKey:   ikBytes,
+				RawVal:   ivBytes,
+				Row:      insMsg,
+			})
+			if oldDe.GetIsDir() {
+				if v.dirParents == nil {
+					v.dirParents = make(map[uint64]uint64)
+				}
+				v.dirParents[oldDe.GetIno()] = newParentInodeID
 			}
 		}
-		return nil
 
 	case MutationSetAttr:
 		inodeID := record.Inode
 		if inodeID == 0 {
 			inodeID = v.rootInodeID
 		}
-		node, _ := v.inodeCache.Get(inodeID)
-		if node == nil {
-			var err error
-			node, err = v.getOrLoadInodeLocked(ctx, inodeID)
-			if err != nil {
-				return err
-			}
+		existing, err := v.getOrLoadInodeLocked(ctx, inodeID)
+		if err != nil {
+			return err
 		}
+		mode := existing.Mode
 		if record.Mode != 0 {
-			node.Mode = (node.Mode & ^uint32(07777)) | (record.Mode & 07777)
+			mode = (existing.Mode & ^uint32(07777)) | (record.Mode & 07777)
 		}
+		uid := existing.Uid
 		if record.Uid != 0 {
-			node.Uid = record.Uid
+			uid = record.Uid
 		}
+		gid := existing.Gid
 		if record.Gid != 0 {
-			node.Gid = record.Gid
+			gid = record.Gid
 		}
+		mtime := existing.ModTime
 		if record.ModTime != nil {
-			node.ModTime = record.ModTime.AsTime()
+			mtime = record.ModTime.AsTime()
 		}
+		atime := existing.Atime
 		if record.Atime != nil {
-			node.Atime = record.Atime.AsTime()
+			atime = record.Atime.AsTime()
 		}
+		ctime := existing.Ctime
 		if record.Ctime != nil {
-			node.Ctime = record.Ctime.AsTime()
+			ctime = record.Ctime.AsTime()
 		}
-		node.IsDirty = false
-		v.inodeCache.Put(inodeID, node)
-		return nil
+
+		inodeMsg := &pb.Inode{
+			Ino:            proto.Uint64(inodeID),
+			Mode:           mode,
+			Size:           existing.Size,
+			Mtime:          timestamppb.New(mtime),
+			Atime:          timestamppb.New(atime),
+			Ctime:          timestamppb.New(ctime),
+			Uid:            uid,
+			Gid:            gid,
+			IsDir:          existing.IsDir,
+			Sha256:         existing.Sha256,
+			ManifestSha256: existing.ManifestSha256,
+			ContentSha256:  existing.ContentSha256,
+			ChunkSize:      existing.ChunkSize,
+		}
+		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(inodeMsg, []int32{1})
+		changes = append(changes, sds.Change{
+			Seq:      record.StreamSeq,
+			TypeID:   16,
+			TypeName: "objectfs.v1alpha1.Inode",
+			Op:       sds.OpUpdate,
+			Key:      sds.NewKeyFromBytes(kBytes),
+			RawKey:   kBytes,
+			RawVal:   vBytes,
+			Row:      inodeMsg,
+		})
 
 	default:
 		return fmt.Errorf("unknown mutation type: %s", record.Type)
 	}
+
+	if len(changes) > 0 && v.sqliteDB != nil {
+		if err := v.sqliteDB.ApplyBatch(ctx, changes); err != nil {
+			return err
+		}
+		v.applyChangesToSQLiteCacheLocked(changes)
+	}
+	return nil
 }
 
 func (v *Volume) replayRecordsLocked(records []*MutationRecord) error {
@@ -5161,212 +4383,24 @@ func (v *Volume) replayClientRecordsLocked(records []*wal.ClientRecord) error {
 	return nil
 }
 
-// ApplySDSChangeLocked applies a single committed SDS change to the in-memory filesystem caches.
+// ApplySDSChangeLocked applies a single committed SDS change to SQLite.
 func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) error {
-	// TODO: Avoid string comparisons by using RegisteredType structs with type IDs.
-	msg := change.Row
-	if msg == nil {
-		return fmt.Errorf("change at seq %d has nil Row for type %q (op=%v)", change.Seq, change.TypeName, change.Op)
-	}
-
-	switch row := msg.(type) {
-	case *pb.FileChunk:
-		ino := row.GetIno()
-		idx := row.GetIndex()
-		node, _ := v.inodeCache.Get(ino)
-		if node == nil {
-			node = &CachedInode{
-				ID:        ino,
-				ChunkSize: v.chunkSize,
-				IsDirty:   false,
-			}
-			if node.ChunkSize == 0 {
-				node.ChunkSize = 64 * 1024
-			}
-			v.inodeCache.Put(ino, node)
+	if v.sqliteDB != nil {
+		if err := v.sqliteDB.ApplyBatch(ctx, []sds.Change{change}); err != nil {
+			return err
 		}
-		switch change.Op {
-		case sdsv1.OpRecord_CREATE, sdsv1.OpRecord_UPDATE:
-			if len(row.GetInlineData()) > 0 {
-				node.InlineData = row.GetInlineData()
-				node.Chunks = nil
-			} else if row.GetSha256() != "" {
-				node.InlineData = nil
-				if node.Chunks == nil {
-					node.Chunks = make(map[uint32]string)
-				}
-				node.Chunks[idx] = row.GetSha256()
-			}
-		case sdsv1.OpRecord_DELETE:
-			if node.Chunks != nil {
-				delete(node.Chunks, idx)
-			}
-			if idx == 0 && len(node.InlineData) > 0 {
-				node.InlineData = nil
-			}
+		v.applyChangesToSQLiteCacheLocked([]sds.Change{change})
+		if change.Seq > v.lastCommitSeq {
+			v.lastCommitSeq = change.Seq
 		}
-
-	case *pb.Content:
-		switch change.Op {
-		case sdsv1.OpRecord_CREATE, sdsv1.OpRecord_UPDATE:
-			if v.recoveredContent == nil {
-				v.recoveredContent = make(map[string][]byte)
-			}
-			v.recoveredContent[row.GetSha256()] = row.GetData()
-		case sdsv1.OpRecord_DELETE:
-			if v.recoveredContent != nil {
-				delete(v.recoveredContent, row.GetSha256())
-			}
-		}
-
-	case *pb.Inode:
-		ino := row.GetIno()
-		if ino >= v.nextInode {
-			v.nextInode = ((ino / erofs.DefaultInodeStride) + 1) * erofs.DefaultInodeStride
-		}
-		switch change.Op {
-		case sdsv1.OpRecord_CREATE, sdsv1.OpRecord_UPDATE:
-			var modTime time.Time
-			if row.GetMtime() != nil {
-				modTime = row.GetMtime().AsTime()
-			}
-			if modTime.IsZero() {
-				modTime = time.Now()
-			}
-			var atime, ctime time.Time
-			if row.GetAtime() != nil {
-				atime = row.GetAtime().AsTime()
-			}
-			if atime.IsZero() {
-				atime = modTime
-			}
-			if row.GetCtime() != nil {
-				ctime = row.GetCtime().AsTime()
-			}
-			if ctime.IsZero() {
-				ctime = modTime
-			}
-
-			if row.GetIsDir() {
-				node, _ := v.inodeCache.Get(ino)
-				if node == nil {
-					node = &CachedInode{
-						ID:      ino,
-						IsDir:   true,
-						IsDirty: false,
-					}
-					v.inodeCache.Put(ino, node)
-				}
-				node.Mode = row.GetMode()
-				node.ModTime = modTime
-				node.Atime = atime
-				node.Ctime = ctime
-				node.Uid = row.GetUid()
-				node.Gid = row.GetGid()
-				node.IsDir = true
-				if _, ok := v.dirCache.Peek(ino); !ok {
-					v.dirCache.Put(ino, &CachedDir{
-						ID:         ino,
-						Entries:    make(map[string]DirEntry),
-						Added:      make(map[string]bool),
-						Deleted:    make(map[string]bool),
-						PrevOffset: NoOffset,
-						IsDirty:    false,
-					})
-				}
-			} else {
-				node, _ := v.inodeCache.Get(ino)
-				if node == nil {
-					node = &CachedInode{
-						ID:      ino,
-						IsDir:   false,
-						IsDirty: false,
-					}
-					v.inodeCache.Put(ino, node)
-				}
-				node.Mode = row.GetMode()
-				node.Size = row.GetSize()
-				node.ModTime = modTime
-				node.Atime = atime
-				node.Ctime = ctime
-				node.Uid = row.GetUid()
-				node.Gid = row.GetGid()
-				node.Sha256 = row.GetSha256()
-				node.ManifestSha256 = row.GetManifestSha256()
-				node.ContentSha256 = row.GetContentSha256()
-				node.ChunkSize = row.GetChunkSize()
-				node.ETag = row.GetEtag()
-				node.IsDir = false
-
-				if node.ChunkSize > 0 && node.ManifestSha256 != "" {
-					if mData, ok := v.recoveredContent[node.ManifestSha256]; ok {
-						manifest, err := blob.DecodeManifest(bytes.NewReader(mData))
-						if err == nil {
-							node.Chunks = make(map[uint32]string, len(manifest.Chunks))
-							for idx, hexSha := range manifest.ChunkHexSHAs() {
-								if hexSha != "" {
-									node.Chunks[uint32(idx)] = hexSha
-								}
-							}
-							node.ChunkSize = manifest.ChunkSize
-							if node.Size == 0 {
-								node.Size = int64(manifest.TotalLength)
-							}
-						}
-					}
-				} else if node.Sha256 != "" {
-					if cData, ok := v.recoveredContent[node.Sha256]; ok {
-						node.Data = blob.NewByteStreamFromBytes(cData)
-					}
+		if change.TypeName == "objectfs.v1alpha1.Inode" || change.TypeID == 16 {
+			if inode, ok := change.Row.(*pb.Inode); ok {
+				ino := inode.GetIno()
+				if ino >= v.nextInode {
+					v.nextInode = ((ino / erofs.DefaultInodeStride) + 1) * erofs.DefaultInodeStride
 				}
 			}
-
-		case sdsv1.OpRecord_DELETE:
-			v.inodeCache.Remove(ino)
-			v.dirCache.Remove(ino)
-			delete(v.dirtyInodes, ino)
-			delete(v.dirtyDirs, ino)
 		}
-
-	case *pb.DirEntry:
-		parentIno := row.GetParentIno()
-		name := row.GetName()
-		parentDir, _ := v.getOrLoadDirLocked(ctx, parentIno)
-		if parentDir == nil {
-			parentDir = &CachedDir{
-				ID:         parentIno,
-				Entries:    make(map[string]DirEntry),
-				Added:      make(map[string]bool),
-				Deleted:    make(map[string]bool),
-				PrevOffset: NoOffset,
-				IsDirty:    false,
-			}
-			v.dirCache.Put(parentIno, parentDir)
-		}
-
-		if v.dirParents == nil {
-			v.dirParents = make(map[uint64]uint64)
-		}
-
-		switch change.Op {
-		case sdsv1.OpRecord_CREATE, sdsv1.OpRecord_UPDATE:
-			parentDir.Entries[name] = DirEntry{
-				Name:    name,
-				InodeID: row.GetIno(),
-				IsDir:   row.GetIsDir(),
-				Mode:    row.GetMode(),
-			}
-			delete(parentDir.Deleted, name)
-			if row.GetIsDir() {
-				v.dirParents[row.GetIno()] = parentIno
-			}
-		case sdsv1.OpRecord_DELETE:
-			delete(parentDir.Entries, name)
-			delete(v.dirParents, row.GetIno())
-		}
-
-	default:
-		return fmt.Errorf("unrecognized type %T (%s) for SDS change", msg, change.TypeName)
 	}
 	return nil
 }
@@ -5557,26 +4591,33 @@ func (v *Volume) importErofsToSQLiteLocked(ctx context.Context, reader *erofs.Re
 			}
 		} else {
 			if erofsInode.Size <= 4096 && erofsInode.Size > 0 {
+				var data []byte
 				if r, err := reader.ReadFileContent(nid); err == nil {
-					data, err := io.ReadAll(r)
-					if err == nil && len(data) > 0 {
-						chunkMsg := &pb.FileChunk{
-							Ino:        proto.Uint64(ino),
-							Index:      proto.Uint32(0),
-							InlineData: data,
-						}
-						cKeyBytes, cValBytes, _ := sds.SplitKeyAndNonKey(chunkMsg, []int32{1, 2})
-						changes = append(changes, sds.Change{
-							Seq:      snapPos,
-							TypeID:   18,
-							TypeName: "objectfs.v1alpha1.FileChunk",
-							Op:       sds.OpCreate,
-							Key:      sds.NewKeyFromBytes(cKeyBytes),
-							RawKey:   cKeyBytes,
-							RawVal:   cValBytes,
-							Row:      chunkMsg,
-						})
+					data, _ = io.ReadAll(r)
+				}
+				if (len(data) == 0 || bytes.Equal(data, make([]byte, len(data)))) && inoMsg.GetContentSha256() != "" && v.blobStore != nil {
+					if bs, err := v.blobStore.GetBlob(ctx, inoMsg.GetContentSha256()); err == nil {
+						data, _ = io.ReadAll(bs)
+						_ = bs.Close()
 					}
+				}
+				if len(data) > 0 {
+					chunkMsg := &pb.FileChunk{
+						Ino:        proto.Uint64(ino),
+						Index:      proto.Uint32(0),
+						InlineData: data,
+					}
+					cKeyBytes, cValBytes, _ := sds.SplitKeyAndNonKey(chunkMsg, []int32{1, 2})
+					changes = append(changes, sds.Change{
+						Seq:      snapPos,
+						TypeID:   18,
+						TypeName: "objectfs.v1alpha1.FileChunk",
+						Op:       sds.OpCreate,
+						Key:      sds.NewKeyFromBytes(cKeyBytes),
+						RawKey:   cKeyBytes,
+						RawVal:   cValBytes,
+						Row:      chunkMsg,
+					})
 				}
 			}
 		}
@@ -5782,101 +4823,7 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if v.metadataStore == MetadataStoreSQLite {
-		return v.loadFromBackendSQLiteLocked(ctx)
-	}
-
-	var snapPos uint64
-
-	if v.backend != nil {
-		var meta VolumeMetadata
-		var metaBuf bytes.Buffer
-		if err := v.backend.GetObject(ctx, v.volumeID, MetadataFileName, 0, 0, &metaBuf); err == nil && metaBuf.Len() > 0 {
-			if err := json.Unmarshal(metaBuf.Bytes(), &meta); err == nil {
-				v.lastFlushedMetadata = &meta
-				if meta.NextInode > 0 {
-					v.nextInode = meta.NextInode
-				}
-			}
-		}
-
-		latestSnapshotName, err := v.findLatestSnapshotNameLocked(ctx)
-		if err == nil && latestSnapshotName != "" {
-			snapshotKey := path.Join("volumes", v.volumeID, "meta", latestSnapshotName)
-			var imgBuf bytes.Buffer
-			err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0, &imgBuf)
-			if err == nil && imgBuf.Len() > 0 {
-				snapBytes := imgBuf.Bytes()
-				readerAt := bytes.NewReader(snapBytes)
-				reader, err := erofs.NewReader(readerAt)
-				if err == nil {
-					v.snapshotRaw = readerAt
-					v.snapshotReader = reader
-					v.rootInodeID = reader.GetRootNID()
-					maxNID := ((uint64(len(snapBytes))/32 + erofs.DefaultInodeStride - 1) / erofs.DefaultInodeStride) * erofs.DefaultInodeStride
-					if v.nextInode < maxNID {
-						v.nextInode = maxNID
-					}
-					if v.nextInode < erofs.DefaultInodeStride {
-						v.nextInode = erofs.DefaultInodeStride
-					}
-					v.inodeCache.Clear()
-					v.dirCache.Clear()
-					v.dirtyInodes = make(map[uint64]LocalOffset)
-					v.dirtyDirs = make(map[uint64]LocalOffset)
-					v.recoveredContent = make(map[string][]byte)
-
-					// Read root xattrs for position and registry
-					if rootXattrs, xErr := reader.GetXattrs(reader.GetRootNID()); xErr == nil {
-						if posStr, ok := rootXattrs.Others["trusted.sds.position"]; ok && posStr != "" {
-							if p, pErr := strconv.ParseUint(posStr, 10, 64); pErr == nil {
-								snapPos = p
-							}
-						}
-						if regStr, ok := rootXattrs.Others["trusted.sds.registry"]; ok && regStr != "" {
-							var reg sdsv1.Registry
-							if uErr := proto.Unmarshal([]byte(regStr), &reg); uErr == nil {
-								if v.metadataStream != nil {
-									_ = v.metadataStream.Registry().Import(&reg)
-								}
-							}
-						}
-					}
-					if snapPos == 0 {
-						trimmed := strings.TrimSuffix(latestSnapshotName, ".erofs")
-						if p, pErr := strconv.ParseUint(trimmed, 10, 64); pErr == nil {
-							snapPos = p
-						}
-					}
-					v.lastCommitSeq = snapPos
-				}
-			}
-		}
-	}
-
-	// SDS Stream replay from snapPos
-	if v.stream != nil {
-		recovered := v.stream.RecoveredRecords()
-		if len(recovered) > 0 {
-			cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
-			sr := sds.NewStreamReader("", v.streamID, sds.WithChangeReader(cr), sds.WithRecoveredRecords(recovered))
-			changes, err := sr.FeedRecovered(snapPos)
-			if err != nil {
-				return fmt.Errorf("failed to recover SDS stream records: %w", err)
-			}
-			for _, change := range changes {
-				if err := v.ApplySDSChangeLocked(ctx, change); err != nil {
-					return fmt.Errorf("failed to apply recovered SDS change: %w", err)
-				}
-				if change.Seq > v.lastCommitSeq {
-					v.lastCommitSeq = change.Seq
-				}
-			}
-			sr.ChangeReader().DiscardPending()
-		}
-	}
-
-	return nil
+	return v.loadFromBackendSQLiteLocked(ctx)
 }
 
 // CreateSnapshot creates and returns a new EROFS snapshot of the current volume state.
@@ -6003,14 +4950,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 
 	v.snapshotRaw = readerAt
 	v.snapshotReader = reader
-	v.rootInodeID = reader.GetRootNID()
-	maxNID := ((uint64(len(snapBytes))/32 + erofs.DefaultInodeStride - 1) / erofs.DefaultInodeStride) * erofs.DefaultInodeStride
-	if v.nextInode < maxNID {
-		v.nextInode = maxNID
-	}
-	if v.nextInode < erofs.DefaultInodeStride {
-		v.nextInode = erofs.DefaultInodeStride
-	}
+	v.rootInodeID = 1
 
 	var snapPos uint64
 	if rootXattrs, xErr := reader.GetXattrs(reader.GetRootNID()); xErr == nil {
@@ -6036,15 +4976,42 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 	}
 	v.lastCommitSeq = snapPos
 
-	v.inodeCache.Clear()
-	v.dirCache.Clear()
-	v.dirtyInodes = make(map[uint64]LocalOffset)
-	v.dirtyDirs = make(map[uint64]LocalOffset)
-	v.recoveredContent = make(map[string][]byte)
-	v.snapshotCutoff = NoOffset
-	if v.localStore != nil {
-		_ = v.localStore.DeleteAllAndReset()
+	// Reset SQLite database for restored snapshot
+	if v.sqliteDB != nil {
+		_ = v.sqliteDB.Close()
+		v.sqliteDB = nil
 	}
+	dbPath := filepath.Join(v.localStorageDir, "metadata.sqlite")
+	_ = os.Remove(dbPath)
+	db, err := sqlite.Open(ctx, dbPath,
+		sqlite.WithStreamID(v.streamID.String()),
+		sqlite.WithLockingMode("EXCLUSIVE"),
+		sqlite.WithJournalMode("WAL"),
+		sqlite.WithSynchronous("NORMAL"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to open SQLite database during restore: %w", err)
+	}
+	v.sqliteDB = db
+	if v.metadataStream != nil {
+		_ = v.sqliteDB.SyncRegistry(ctx, v.metadataStream.Registry())
+	}
+
+	if err := v.importErofsToSQLiteLocked(ctx, reader, snapPos); err != nil {
+		return fmt.Errorf("failed to import restored EROFS snapshot into SQLite: %w", err)
+	}
+
+	if v.sqliteCache != nil {
+		v.sqliteCache.Clear()
+	}
+	if v.sqliteOverlay != nil {
+		clear(v.sqliteOverlay)
+		v.unappliedBytes = 0
+	}
+	if v.sqliteDB != nil {
+		v.sqliteAppliedPos = v.sqliteDB.Position()
+	}
+	v.updateNextInodeFromSQLiteLocked(ctx)
 
 	return nil
 }

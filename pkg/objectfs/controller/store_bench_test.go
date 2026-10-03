@@ -37,7 +37,6 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 		store        string
 		cacheDisable bool
 	}{
-		{name: "legacy", store: "legacy", cacheDisable: false},
 		{name: "sqlite_cache_on", store: "sqlite", cacheDisable: false},
 		{name: "sqlite_cache_off", store: "sqlite", cacheDisable: true},
 	}
@@ -241,40 +240,35 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 }
 
 func Benchmark64KiBFsyncedWrite(b *testing.B) {
-	modes := []string{"legacy", "sqlite"}
 	data64KiB := make([]byte, 64*1024)
 	for i := range data64KiB {
 		data64KiB[i] = byte(i % 256)
 	}
 
-	for _, mode := range modes {
-		b.Run(fmt.Sprintf("mode=%s", mode), func(b *testing.B) {
-			ctx := b.Context()
-			backend := inmemorystorage.New()
-			broadcaster := NewEventBroadcaster()
-			vol := NewVolume("bench-fsync-"+mode, backend, broadcaster,
-				WithMetadataStore(mode),
-				WithLocalStorageDir(b.TempDir()),
-			)
-			_ = vol.LoadFromBackend(ctx)
-			defer vol.Close()
+	ctx := b.Context()
+	backend := inmemorystorage.New()
+	broadcaster := NewEventBroadcaster()
+	vol := NewVolume("bench-fsync-sqlite", backend, broadcaster,
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(b.TempDir()),
+	)
+	_ = vol.LoadFromBackend(ctx)
+	defer vol.Close()
 
-			fileAttr, err := vol.CreateFile(ctx, 1, "write_test.bin", 0644, nil, 0, 0)
-			if err != nil {
-				b.Fatalf("CreateFile failed: %v", err)
-			}
+	fileAttr, err := vol.CreateFile(ctx, 1, "write_test.bin", 0644, nil, 0, 0)
+	if err != nil {
+		b.Fatalf("CreateFile failed: %v", err)
+	}
 
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				_, _, _, err := vol.WriteFile(ctx, fileAttr.Inode, 0, data64KiB, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
-				if err != nil {
-					b.Fatalf("WriteFile failed: %v", err)
-				}
-				if err := vol.Fsync(ctx, fileAttr.Inode); err != nil {
-					b.Fatalf("Fsync failed: %v", err)
-				}
-			}
-		})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, err := vol.WriteFile(ctx, fileAttr.Inode, 0, data64KiB, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+		if err != nil {
+			b.Fatalf("WriteFile failed: %v", err)
+		}
+		if err := vol.Fsync(ctx, fileAttr.Inode); err != nil {
+			b.Fatalf("Fsync failed: %v", err)
+		}
 	}
 }
 
