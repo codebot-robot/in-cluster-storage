@@ -208,7 +208,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 	t.Log("================ METADATA STORE COMPARISON REPORT ================")
 
-	// 1. Directory Entry Addition Scaling (Empty vs Large Directory)
+	// 1. Directory Entry Addition Scaling (Empty vs 10,000 Entry Directory)
 	t.Log("\n--- 1. Directory Entry Addition Scaling ---")
 	for _, mode := range []string{"legacy", "sqlite"} {
 		backend := inmemorystorage.New()
@@ -239,8 +239,46 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		t.Logf("[%s] Add to empty dir: %v | Add to 10k entry dir: %v", mode, emptyDur, largeDur)
 	}
 
-	// 2. Cold Start Recovery Times
-	t.Log("\n--- 2. Cold Start Time to Serve First Request ---")
+	// 2. Cache-Miss / Scale Latency (Exceeding Legacy 10,000 Inode LRU)
+	t.Log("\n--- 2. Cache-Miss & Scale Latency (15,000 files across 100 dirs) ---")
+	for _, mode := range []string{"legacy", "sqlite"} {
+		backend := inmemorystorage.New()
+		vol := NewVolume("cachemiss-"+mode, backend, NewEventBroadcaster(),
+			WithMetadataStore(mode),
+			WithLocalStorageDir(t.TempDir()),
+		)
+		_ = vol.LoadFromBackend(ctx)
+
+		var fileInos []uint64
+		// Create 15,000 files (exceeds legacy 10,000 cache capacity)
+		for d := 0; d < 150; d++ {
+			dirAttr, _ := vol.Mkdir(ctx, 1, fmt.Sprintf("dir_%d", d), 0755, 0, 0)
+			for f := 0; f < 100; f++ {
+				fAttr, _ := vol.CreateFile(ctx, dirAttr.Inode, fmt.Sprintf("file_%d.txt", f), 0644, []byte("val"), 0, 0)
+				fileInos = append(fileInos, fAttr.Inode)
+			}
+		}
+
+		// Lookup earliest created files (evicted from memory in legacy store)
+		start := time.Now()
+		for i := 0; i < 1000; i++ {
+			_, _ = vol.GetAttr(ctx, fileInos[i])
+		}
+		statDur := time.Since(start)
+
+		start = time.Now()
+		for d := 0; d < 10; d++ {
+			_, _ = vol.Lookup(ctx, 1, fmt.Sprintf("dir_%d", d))
+		}
+		lookupDur := time.Since(start)
+
+		_ = vol.Close()
+		t.Logf("[%s] Stat 1,000 evicted inodes: %v (avg %v/op) | Lookup 10 dirs: %v",
+			mode, statDur, statDur/1000, lookupDur/10)
+	}
+
+	// 3. Cold Start Recovery Times
+	t.Log("\n--- 3. Cold Start Time to Serve First Request ---")
 	{
 		backend := inmemorystorage.New()
 		streamID := uuid.New()
@@ -313,8 +351,8 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		t.Logf("Cold start from EROFS snapshot:            %v", erofsColdStartDur)
 	}
 
-	// 3. Memory Consumption Comparison
-	t.Log("\n--- 3. Memory Consumption Comparison (10,000 files) ---")
+	// 4. Memory Consumption Comparison
+	t.Log("\n--- 4. Memory Consumption Comparison (15,000 files) ---")
 	for _, mode := range []string{"legacy", "sqlite"} {
 		runtime.GC()
 		var m1 runtime.MemStats
@@ -327,7 +365,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		)
 		_ = vol.LoadFromBackend(ctx)
 
-		for i := 0; i < 10000; i++ {
+		for i := 0; i < 15000; i++ {
 			_, _ = vol.CreateFile(ctx, 1, fmt.Sprintf("file_%d.txt", i), 0644, []byte("hello"), 0, 0)
 		}
 
@@ -336,7 +374,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		runtime.ReadMemStats(&m2)
 
 		diffHeap := int64(m2.HeapAlloc) - int64(m1.HeapAlloc)
-		t.Logf("[%s] HeapAlloc after 10,000 files: %d KB", mode, diffHeap/1024)
+		t.Logf("[%s] HeapAlloc after 15,000 files: %d KB", mode, diffHeap/1024)
 		_ = vol.Close()
 	}
 

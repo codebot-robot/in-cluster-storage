@@ -15,26 +15,84 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 type SimulationState struct {
 	Files map[int]string
 }
 
+func runOpsBenchmark(dataDir string, n int) {
+	fmt.Printf("Running FUSE end-to-end ops benchmark in %s (N=%d)\n", dataDir, n)
+
+	testDir := filepath.Join(dataDir, "fuse_bench")
+	_ = os.MkdirAll(testDir, 0755)
+
+	// 1. Create benchmark
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		fname := filepath.Join(testDir, fmt.Sprintf("f%d.txt", i))
+		if err := os.WriteFile(fname, []byte("data"), 0644); err != nil {
+			panic(fmt.Sprintf("create %s failed: %v", fname, err))
+		}
+	}
+	createDur := time.Since(start)
+	createPerOp := createDur / time.Duration(n)
+
+	// 2. Stat benchmark
+	start = time.Now()
+	for i := 0; i < n; i++ {
+		fname := filepath.Join(testDir, fmt.Sprintf("f%d.txt", i))
+		if _, err := os.Stat(fname); err != nil {
+			panic(fmt.Sprintf("stat %s failed: %v", fname, err))
+		}
+	}
+	statDur := time.Since(start)
+	statPerOp := statDur / time.Duration(n)
+
+	// 3. ReadDir benchmark
+	start = time.Now()
+	entries, err := os.ReadDir(testDir)
+	if err != nil {
+		panic(fmt.Sprintf("readdir failed: %v", err))
+	}
+	readdirDur := time.Since(start)
+
+	fmt.Printf("Results (FUSE End-to-End):\n")
+	fmt.Printf("  Create:  %v total (%v/op, %.1f ops/sec)\n", createDur, createPerOp, float64(n)/createDur.Seconds())
+	fmt.Printf("  Stat:    %v total (%v/op, %.1f ops/sec)\n", statDur, statPerOp, float64(n)/statDur.Seconds())
+	fmt.Printf("  ReadDir (%d entries): %v total\n", len(entries), readdirDur)
+}
+
 func main() {
-	if len(os.Args) < 4 {
+	modeFlag := flag.String("mode", "sim", "Benchmark mode: sim or ops")
+	opsNFlag := flag.Int("n", 1000, "Number of operations for ops mode")
+	flag.Parse()
+
+	args := flag.Args()
+	if *modeFlag == "ops" {
+		if len(args) < 1 {
+			fmt.Println("Usage: benchmark -mode=ops [-n=1000] <data_dir>")
+			os.Exit(1)
+		}
+		runOpsBenchmark(args[0], *opsNFlag)
+		return
+	}
+
+	if len(args) < 3 {
 		fmt.Println("Usage: benchmark <data_dir> <seed> <count>")
 		os.Exit(1)
 	}
 
-	dataDir := os.Args[1]
-	seed, _ := strconv.ParseInt(os.Args[2], 10, 64)
-	count, _ := strconv.Atoi(os.Args[3])
+	dataDir := args[0]
+	seed, _ := strconv.ParseInt(args[1], 10, 64)
+	count, _ := strconv.Atoi(args[2])
 
 	fmt.Printf("Starting benchmark. DataDir: %s, Seed: %d, Count: %d\n", dataDir, seed, count)
 
