@@ -325,7 +325,7 @@ func TestSdsCatObjectFSStream(t *testing.T) {
 	server := controller.NewServer(backend, controller.WithServerWAL(walDir, "", walclient.Local))
 	defer func() { _ = server.Close() }()
 
-	_, err := server.Mkdir(ctx, &objectfspb.MkdirRequest{VolumeId: volumeID, Path: "/cats", Mode: 0755})
+	_, err := server.Mkdir(ctx, &objectfspb.MkdirRequest{VolumeId: volumeID, ParentInode: 1, Name: "cats", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}

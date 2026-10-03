@@ -22,6 +22,7 @@ import (
 )
 
 type CachedEntry struct {
+	Inode       uint64
 	Path        string
 	Data        []byte
 	Size        int64
@@ -36,7 +37,7 @@ type CachedEntry struct {
 
 type NodeCache struct {
 	mu       sync.RWMutex
-	entries  map[string]*CachedEntry
+	entries  map[uint64]*CachedEntry
 	maxBytes int64
 	curBytes int64
 }
@@ -46,16 +47,16 @@ func NewNodeCache(maxBytes int64) *NodeCache {
 		maxBytes = 128 * 1024 * 1024 // 128MB default cache
 	}
 	return &NodeCache{
-		entries:  make(map[string]*CachedEntry),
+		entries:  make(map[uint64]*CachedEntry),
 		maxBytes: maxBytes,
 	}
 }
 
-func (c *NodeCache) Get(path string) (*CachedEntry, bool) {
+func (c *NodeCache) Get(inode uint64) (*CachedEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, ok := c.entries[path]
+	entry, ok := c.entries[inode]
 	if !ok {
 		return nil, false
 	}
@@ -65,11 +66,11 @@ func (c *NodeCache) Get(path string) (*CachedEntry, bool) {
 	return &copyEntry, true
 }
 
-func (c *NodeCache) GetRange(path string, offset, length int64) ([]byte, bool) {
+func (c *NodeCache) GetRange(inode uint64, offset, length int64) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, ok := c.entries[path]
+	entry, ok := c.entries[inode]
 	if !ok {
 		return nil, false
 	}
@@ -138,21 +139,21 @@ func (c *NodeCache) GetRange(path string, offset, length int64) ([]byte, bool) {
 	return nil, false
 }
 
-func (c *NodeCache) PutChunk(path string, chunkIdx int, chunkSize uint32, totalSize int64, data []byte, modTime time.Time) {
+func (c *NodeCache) PutChunk(inode uint64, chunkIdx int, chunkSize uint32, totalSize int64, data []byte, modTime time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, ok := c.entries[path]
+	entry, ok := c.entries[inode]
 	if !ok {
 		entry = &CachedEntry{
-			Path:      path,
+			Inode:     inode,
 			Size:      totalSize,
 			ModTime:   modTime,
 			LastRead:  time.Now(),
 			ChunkSize: chunkSize,
 			Chunks:    make(map[int][]byte),
 		}
-		c.entries[path] = entry
+		c.entries[inode] = entry
 	}
 	if entry.Chunks == nil {
 		entry.Chunks = make(map[int][]byte)
@@ -176,11 +177,11 @@ func (c *NodeCache) PutChunk(path string, chunkIdx int, chunkSize uint32, totalS
 	entry.LastRead = time.Now()
 }
 
-func (c *NodeCache) GetChunk(path string, chunkIdx int) ([]byte, bool) {
+func (c *NodeCache) GetChunk(inode uint64, chunkIdx int) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, ok := c.entries[path]
+	entry, ok := c.entries[inode]
 	if !ok || entry.Chunks == nil {
 		return nil, false
 	}
@@ -194,11 +195,11 @@ func (c *NodeCache) GetChunk(path string, chunkIdx int) ([]byte, bool) {
 	return res, true
 }
 
-func (c *NodeCache) GetDirty(path string) (*CachedEntry, bool) {
+func (c *NodeCache) GetDirty(inode uint64) (*CachedEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, ok := c.entries[path]
+	entry, ok := c.entries[inode]
 	if !ok || !entry.IsDirty {
 		return nil, false
 	}
@@ -221,11 +222,11 @@ func (c *NodeCache) GetDirtyEntries() []*CachedEntry {
 	return dirty
 }
 
-func (c *NodeCache) MarkClean(path string) {
+func (c *NodeCache) MarkClean(inode uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if entry, ok := c.entries[path]; ok {
+	if entry, ok := c.entries[inode]; ok {
 		entry.IsDirty = false
 	}
 }
@@ -241,17 +242,17 @@ func entryBytes(e *CachedEntry) int64 {
 	return total
 }
 
-func (c *NodeCache) Put(path string, data []byte, modTime time.Time, sha256 string) {
+func (c *NodeCache) Put(inode uint64, data []byte, modTime time.Time, sha256 string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if old, ok := c.entries[path]; ok {
+	if old, ok := c.entries[inode]; ok {
 		// If existing entry is dirty, don't overwrite dirty uncommitted data with stale data
 		if old.IsDirty {
 			return
 		}
 		c.curBytes -= entryBytes(old)
-		delete(c.entries, path)
+		delete(c.entries, inode)
 	}
 
 	dataLen := int64(len(data))
@@ -260,8 +261,8 @@ func (c *NodeCache) Put(path string, data []byte, modTime time.Time, sha256 stri
 	buf := make([]byte, len(data))
 	copy(buf, data)
 
-	c.entries[path] = &CachedEntry{
-		Path:     path,
+	c.entries[inode] = &CachedEntry{
+		Inode:    inode,
 		Data:     buf,
 		Size:     dataLen,
 		ModTime:  modTime,
@@ -272,21 +273,21 @@ func (c *NodeCache) Put(path string, data []byte, modTime time.Time, sha256 stri
 	c.curBytes += dataLen
 }
 
-func (c *NodeCache) WriteAt(path string, offset int64, data []byte, modTime time.Time) int64 {
+func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime time.Time) int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, ok := c.entries[path]
+	entry, ok := c.entries[inode]
 	if !ok {
 		entry = &CachedEntry{
-			Path:     path,
+			Inode:    inode,
 			Data:     make([]byte, 0),
 			Size:     0,
 			ModTime:  modTime,
 			LastRead: time.Now(),
 			IsDirty:  true,
 		}
-		c.entries[path] = entry
+		c.entries[inode] = entry
 	}
 
 	oldLen := int64(len(entry.Data))
@@ -312,21 +313,21 @@ func (c *NodeCache) WriteAt(path string, offset int64, data []byte, modTime time
 	return entry.Size
 }
 
-func (c *NodeCache) Truncate(path string, size int64, modTime time.Time) {
+func (c *NodeCache) Truncate(inode uint64, size int64, modTime time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, ok := c.entries[path]
+	entry, ok := c.entries[inode]
 	if !ok {
 		entry = &CachedEntry{
-			Path:     path,
+			Inode:    inode,
 			Data:     make([]byte, size),
 			Size:     size,
 			ModTime:  modTime,
 			LastRead: time.Now(),
 			IsDirty:  true,
 		}
-		c.entries[path] = entry
+		c.entries[inode] = entry
 		c.curBytes += size
 		return
 	}
@@ -350,15 +351,15 @@ func (c *NodeCache) Truncate(path string, size int64, modTime time.Time) {
 
 func (c *NodeCache) evictIfNeededLocked(neededBytes int64) {
 	for c.curBytes+neededBytes > c.maxBytes && len(c.entries) > 0 {
-		var oldestPath string
+		var oldestInode uint64
 		var oldestTime time.Time
 		foundClean := false
 
 		// Prefer evicting non-dirty entries first
-		for p, e := range c.entries {
+		for ino, e := range c.entries {
 			if !e.IsDirty {
 				if !foundClean || e.LastRead.Before(oldestTime) {
-					oldestPath = p
+					oldestInode = ino
 					oldestTime = e.LastRead
 					foundClean = true
 				}
@@ -370,32 +371,32 @@ func (c *NodeCache) evictIfNeededLocked(neededBytes int64) {
 			break
 		}
 
-		if oldestPath != "" {
-			c.curBytes -= entryBytes(c.entries[oldestPath])
-			delete(c.entries, oldestPath)
+		if oldestInode != 0 {
+			c.curBytes -= entryBytes(c.entries[oldestInode])
+			delete(c.entries, oldestInode)
 		} else {
 			break
 		}
 	}
 }
 
-func (c *NodeCache) Invalidate(path string) {
+func (c *NodeCache) Invalidate(inode uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if old, ok := c.entries[path]; ok {
+	if old, ok := c.entries[inode]; ok {
 		c.curBytes -= entryBytes(old)
-		delete(c.entries, path)
+		delete(c.entries, inode)
 	}
 }
 
-func (c *NodeCache) InvalidateIfNotDirty(path string) {
+func (c *NodeCache) InvalidateIfNotDirty(inode uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if old, ok := c.entries[path]; ok && !old.IsDirty {
+	if old, ok := c.entries[inode]; ok && !old.IsDirty {
 		c.curBytes -= entryBytes(old)
-		delete(c.entries, path)
+		delete(c.entries, inode)
 	}
 }
 
@@ -403,6 +404,6 @@ func (c *NodeCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.entries = make(map[string]*CachedEntry)
+	c.entries = make(map[uint64]*CachedEntry)
 	c.curBytes = 0
 }

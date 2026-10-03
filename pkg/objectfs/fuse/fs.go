@@ -19,8 +19,6 @@ package fuse
 import (
 	"context"
 	"fmt"
-	"path"
-	"sync"
 	"syscall"
 	"time"
 
@@ -37,11 +35,7 @@ type ObjectFS struct {
 	volumeID  string
 	writeMode pb.WriteMode
 	cache     *NodeCache
-
-	mu          sync.RWMutex
-	inodeToPath map[uint64]string
-	pathToInode map[string]uint64
-	server      *fuse.Server
+	server    *fuse.Server
 }
 
 var _ fuse.RawFileSystem = (*ObjectFS)(nil)
@@ -56,11 +50,7 @@ func NewObjectFS(client pb.ObjectFSControllerClient, volumeID string, writeMode 
 		volumeID:      volumeID,
 		writeMode:     writeMode,
 		cache:         cache,
-		inodeToPath:   make(map[uint64]string),
-		pathToInode:   make(map[string]uint64),
 	}
-	fs.inodeToPath[fuse.FUSE_ROOT_ID] = "/"
-	fs.pathToInode["/"] = fuse.FUSE_ROOT_ID
 	return fs
 }
 
@@ -70,43 +60,6 @@ func (fs *ObjectFS) String() string {
 
 func (fs *ObjectFS) Init(server *fuse.Server) {
 	fs.server = server
-}
-
-func (fs *ObjectFS) getPath(inode uint64) (string, bool) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
-	p, ok := fs.inodeToPath[inode]
-	return p, ok
-}
-
-func (fs *ObjectFS) setInode(inode uint64, p string) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	clean := path.Clean("/" + p)
-	fs.inodeToPath[inode] = clean
-	fs.pathToInode[clean] = inode
-}
-
-func (fs *ObjectFS) removePath(p string) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	clean := path.Clean("/" + p)
-	if inode, ok := fs.pathToInode[clean]; ok {
-		delete(fs.inodeToPath, inode)
-		delete(fs.pathToInode, clean)
-	}
-}
-
-func (fs *ObjectFS) renamePath(oldPath, newPath string) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	oldClean := path.Clean("/" + oldPath)
-	newClean := path.Clean("/" + newPath)
-	if inode, ok := fs.pathToInode[oldClean]; ok {
-		delete(fs.pathToInode, oldClean)
-		fs.inodeToPath[inode] = newClean
-		fs.pathToInode[newClean] = inode
-	}
 }
 
 func makeContext(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
@@ -155,43 +108,34 @@ func grpcErrorToStatus(err error) fuse.Status {
 	}
 }
 
-func (fs *ObjectFS) fillAttr(attr *pb.EntryAttr, out *fuse.Attr) {
+func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 	out.Ino = attr.GetInode()
 	out.Size = uint64(attr.GetSize())
 	out.Mode = attr.GetMode()
 	if attr.GetIsDir() {
 		out.Mode |= syscall.S_IFDIR
-		// In POSIX filesystems, a directory's link count is 2 (from "." and the parent
-		// entry) plus 1 for each child subdirectory (".."). Computing the exact count
-		// on every getattr/lookup would require scanning all directory children from the
-		// controller, which is prohibitively expensive for a remote/object filesystem.
-		// Setting Nlink = 2 satisfies tools like `find` and backup utilities (preventing
-		// leaf-optimization bugs or treating directories as deleted) and is the standard
-		// convention for network and virtual filesystems (e.g. s3fs, 9p, EROFS).
 		out.Nlink = 2
 	} else {
 		out.Mode |= syscall.S_IFREG
-		// ObjectFS does not support hard links, so every regular file has exactly 1 link.
 		out.Nlink = 1
-	}
-	// Use UID and GID persisted on the inode/entry attr.
-	out.Owner = fuse.Owner{
-		Uid: attr.GetUid(),
-		Gid: attr.GetGid(),
 	}
 	if attr.GetModTime() != nil {
 		t := attr.GetModTime().AsTime()
 		out.Mtime = uint64(t.Unix())
 		out.Mtimensec = uint32(t.Nanosecond())
-		out.Ctime = out.Mtime
-		out.Ctimensec = out.Mtimensec
 		out.Atime = out.Mtime
 		out.Atimensec = out.Mtimensec
+		out.Ctime = out.Mtime
+		out.Ctimensec = out.Mtimensec
+	}
+	out.Owner = fuse.Owner{
+		Uid: attr.GetUid(),
+		Gid: attr.GetGid(),
 	}
 }
 
 func (fs *ObjectFS) fillEntryOut(attr *pb.EntryAttr, out *fuse.EntryOut) {
-	fs.fillAttr(attr, &out.Attr)
+	fs.fillAttrOut(attr, &out.Attr)
 	out.NodeId = attr.GetInode()
 	out.Generation = 1
 	out.SetEntryTimeout(1 * time.Second)
@@ -202,15 +146,10 @@ func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	parentPath, ok := fs.getPath(header.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
 	resp, err := fs.client.Lookup(ctx, &pb.LookupRequest{
-		VolumeId:   fs.volumeID,
-		ParentPath: parentPath,
-		Name:       name,
+		VolumeId:    fs.volumeID,
+		ParentInode: header.NodeId,
+		Name:        name,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -218,11 +157,10 @@ func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
-
 	attr := resp.GetAttr()
-	childPath := path.Join(parentPath, name)
-	fs.setInode(attr.GetInode(), childPath)
-
+	if attr == nil {
+		return fuse.ENOENT
+	}
 	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
@@ -231,14 +169,9 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	p, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
 	resp, err := fs.client.GetAttr(ctx, &pb.GetAttrRequest{
 		VolumeId: fs.volumeID,
-		Path:     p,
+		Inode:    input.NodeId,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -246,9 +179,13 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
+	attr := resp.GetAttr()
+	if attr == nil {
+		return fuse.ENOENT
+	}
+	fs.fillAttrOut(attr, &out.Attr)
 
-	fs.fillAttr(resp.GetAttr(), &out.Attr)
-	if entry, isDirty := fs.cache.GetDirty(p); isDirty {
+	if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
 		out.Attr.Size = uint64(entry.Size)
 		out.Attr.Mtime = uint64(entry.ModTime.Unix())
 		out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
@@ -261,19 +198,12 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	p, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
 	if input.Valid&fuse.FATTR_SIZE != 0 {
-		if err := fs.syncFileToService(ctx, p); err != nil {
-			return grpcErrorToStatus(err)
-		}
-		fs.cache.Truncate(p, int64(input.Size), time.Now())
+		_ = fs.syncFileToService(ctx, input.NodeId)
+		fs.cache.Truncate(input.NodeId, int64(input.Size), time.Now())
 		resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
 			VolumeId: fs.volumeID,
-			Path:     p,
+			Inode:    input.NodeId,
 			Size:     int64(input.Size),
 		})
 		if err != nil {
@@ -282,15 +212,17 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
 		}
-		fs.fillAttr(resp.GetAttr(), &out.Attr)
-		out.Attr.Size = input.Size
-		out.SetTimeout(1 * time.Second)
-		return fuse.OK
+		if resp.GetAttr() != nil {
+			fs.fillAttrOut(resp.GetAttr(), &out.Attr)
+			out.Attr.Size = input.Size
+			out.SetTimeout(1 * time.Second)
+			return fuse.OK
+		}
 	}
 
 	resp, err := fs.client.GetAttr(ctx, &pb.GetAttrRequest{
 		VolumeId: fs.volumeID,
-		Path:     p,
+		Inode:    input.NodeId,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -298,8 +230,11 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
-	fs.fillAttr(resp.GetAttr(), &out.Attr)
-	if entry, isDirty := fs.cache.GetDirty(p); isDirty {
+	if resp.GetAttr() == nil {
+		return fuse.ENOENT
+	}
+	fs.fillAttrOut(resp.GetAttr(), &out.Attr)
+	if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
 		out.Attr.Size = uint64(entry.Size)
 		out.Attr.Mtime = uint64(entry.ModTime.Unix())
 		out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
@@ -312,18 +247,13 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	parentPath, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
-	childPath := path.Join(parentPath, name)
 	resp, err := fs.client.Mkdir(ctx, &pb.MkdirRequest{
-		VolumeId: fs.volumeID,
-		Path:     childPath,
-		Mode:     input.Mode,
-		Uid:      input.Uid,
-		Gid:      input.Gid,
+		VolumeId:    fs.volumeID,
+		ParentInode: input.NodeId,
+		Name:        name,
+		Mode:        input.Mode,
+		Uid:         input.Uid,
+		Gid:         input.Gid,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -331,9 +261,10 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
-
 	attr := resp.GetAttr()
-	fs.setInode(attr.GetInode(), childPath)
+	if attr == nil {
+		return fuse.EIO
+	}
 	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
@@ -342,18 +273,13 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	parentPath, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
-	childPath := path.Join(parentPath, name)
 	resp, err := fs.client.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId: fs.volumeID,
-		Path:     childPath,
-		Mode:     input.Mode,
-		Uid:      input.Uid,
-		Gid:      input.Gid,
+		VolumeId:    fs.volumeID,
+		ParentInode: input.NodeId,
+		Name:        name,
+		Mode:        input.Mode,
+		Uid:         input.Uid,
+		Gid:         input.Gid,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -361,10 +287,12 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
-
 	attr := resp.GetAttr()
-	fs.setInode(attr.GetInode(), childPath)
-	fs.cache.Put(childPath, []byte{}, time.Now(), "")
+	if attr == nil {
+		return fuse.EIO
+	}
+
+	fs.cache.Put(attr.GetInode(), []byte{}, time.Now(), "")
 	fs.fillEntryOut(attr, &out.EntryOut)
 	out.OpenOut.Fh = attr.GetInode()
 	return fuse.OK
@@ -374,18 +302,13 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	parentPath, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
-	childPath := path.Join(parentPath, name)
 	resp, err := fs.client.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId: fs.volumeID,
-		Path:     childPath,
-		Mode:     input.Mode,
-		Uid:      input.Uid,
-		Gid:      input.Gid,
+		VolumeId:    fs.volumeID,
+		ParentInode: input.NodeId,
+		Name:        name,
+		Mode:        input.Mode,
+		Uid:         input.Uid,
+		Gid:         input.Gid,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -393,10 +316,10 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
-
 	attr := resp.GetAttr()
-	fs.setInode(attr.GetInode(), childPath)
-	fs.cache.Put(childPath, []byte{}, time.Now(), "")
+	if attr == nil {
+		return fuse.EIO
+	}
 	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
@@ -405,15 +328,10 @@ func (fs *ObjectFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name s
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	parentPath, ok := fs.getPath(header.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
-	childPath := path.Join(parentPath, name)
 	resp, err := fs.client.Unlink(ctx, &pb.UnlinkRequest{
-		VolumeId: fs.volumeID,
-		Path:     childPath,
+		VolumeId:    fs.volumeID,
+		ParentInode: header.NodeId,
+		Name:        name,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -421,9 +339,6 @@ func (fs *ObjectFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name s
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
-
-	fs.cache.Invalidate(childPath)
-	fs.removePath(childPath)
 	return fuse.OK
 }
 
@@ -431,15 +346,10 @@ func (fs *ObjectFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name st
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	parentPath, ok := fs.getPath(header.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
-	childPath := path.Join(parentPath, name)
 	resp, err := fs.client.Rmdir(ctx, &pb.RmdirRequest{
-		VolumeId: fs.volumeID,
-		Path:     childPath,
+		VolumeId:    fs.volumeID,
+		ParentInode: header.NodeId,
+		Name:        name,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -447,8 +357,6 @@ func (fs *ObjectFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name st
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
-
-	fs.removePath(childPath)
 	return fuse.OK
 }
 
@@ -456,23 +364,12 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	oldParent, ok1 := fs.getPath(input.NodeId)
-	newParent, ok2 := fs.getPath(input.Newdir)
-	if !ok1 || !ok2 {
-		return fuse.ENOENT
-	}
-
-	oldPath := path.Join(oldParent, oldName)
-	newPath := path.Join(newParent, newName)
-
-	if err := fs.syncFileToService(ctx, oldPath); err != nil {
-		return grpcErrorToStatus(err)
-	}
-
 	resp, err := fs.client.Rename(ctx, &pb.RenameRequest{
-		VolumeId: fs.volumeID,
-		OldPath:  oldPath,
-		NewPath:  newPath,
+		VolumeId:       fs.volumeID,
+		OldParentInode: input.NodeId,
+		OldName:        oldName,
+		NewParentInode: input.Newdir,
+		NewName:        newName,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -480,10 +377,6 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
-
-	fs.cache.Invalidate(oldPath)
-	fs.cache.Invalidate(newPath)
-	fs.renamePath(oldPath, newPath)
 	return fuse.OK
 }
 
@@ -501,14 +394,9 @@ func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	dirPath, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
 	resp, err := fs.client.ReadDir(ctx, &pb.ReadDirRequest{
 		VolumeId: fs.volumeID,
-		Path:     dirPath,
+		Inode:    input.NodeId,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -519,19 +407,17 @@ func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 
 	entries := resp.GetEntries()
 	for i := int(input.Offset); i < len(entries); i++ {
-		e := entries[i]
+		entry := entries[i]
 		mode := uint32(syscall.S_IFREG)
-		if e.GetIsDir() {
+		if entry.GetIsDir() {
 			mode = uint32(syscall.S_IFDIR)
 		}
-		fs.setInode(e.GetInode(), path.Join(dirPath, e.GetName()))
-		ok := out.AddDirEntry(fuse.DirEntry{
+		if !out.AddDirEntry(fuse.DirEntry{
 			Mode: mode,
-			Name: e.GetName(),
-			Ino:  e.GetInode(),
+			Name: entry.GetName(),
+			Ino:  entry.GetInode(),
 			Off:  uint64(i + 1),
-		})
-		if !ok {
+		}) {
 			break
 		}
 	}
@@ -542,14 +428,9 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	dirPath, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
 	resp, err := fs.client.ReadDir(ctx, &pb.ReadDirRequest{
 		VolumeId: fs.volumeID,
-		Path:     dirPath,
+		Inode:    input.NodeId,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -560,55 +441,41 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 
 	entries := resp.GetEntries()
 	for i := int(input.Offset); i < len(entries); i++ {
-		e := entries[i]
+		entry := entries[i]
 		mode := uint32(syscall.S_IFREG)
-		if e.GetIsDir() {
+		if entry.GetIsDir() {
 			mode = uint32(syscall.S_IFDIR)
 		}
-		fs.setInode(e.GetInode(), path.Join(dirPath, e.GetName()))
 		entryOut := out.AddDirLookupEntry(fuse.DirEntry{
 			Mode: mode,
-			Name: e.GetName(),
-			Ino:  e.GetInode(),
+			Name: entry.GetName(),
+			Ino:  entry.GetInode(),
 			Off:  uint64(i + 1),
 		})
 		if entryOut == nil {
 			break
 		}
-		fs.fillEntryOut(e, entryOut)
+		fs.fillEntryOut(entry, entryOut)
 	}
 	return fuse.OK
 }
 
 func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
-	p, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return nil, fuse.ENOENT
-	}
-
-	// Check local cache first (dirty or clean range)
-	if data, ok := fs.cache.GetRange(p, int64(input.Offset), int64(input.Size)); ok {
-		return fuse.ReadResultData(data), fuse.OK
-	}
-	if cached, ok := fs.cache.Get(p); ok && len(cached.Data) > 0 {
-		if input.Offset >= uint64(cached.Size) {
-			return fuse.ReadResultData([]byte{}), fuse.OK
-		}
-		end := input.Offset + uint64(input.Size)
-		if end > uint64(cached.Size) {
-			end = uint64(cached.Size)
-		}
-		return fuse.ReadResultData(cached.Data[input.Offset:end]), fuse.OK
-	}
-
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
+	offset := int64(input.Offset)
+	size := int64(input.Size)
+
+	if cachedBytes, ok := fs.cache.GetRange(input.NodeId, offset, size); ok {
+		return fuse.ReadResultData(cachedBytes), fuse.OK
+	}
+
 	resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
 		VolumeId: fs.volumeID,
-		Path:     p,
-		Offset:   int64(input.Offset),
-		Size:     int64(input.Size),
+		Inode:    input.NodeId,
+		Offset:   offset,
+		Size:     size,
 	})
 	if err != nil {
 		return nil, grpcErrorToStatus(err)
@@ -617,53 +484,28 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		return nil, fuse.Status(resp.GetError())
 	}
 
-	if input.Offset == 0 && resp.GetEof() && len(resp.GetData()) > 0 {
-		fs.cache.Put(p, resp.GetData(), time.Now(), "")
-	} else if len(resp.GetData()) > 0 {
-		chunkSize := uint32(32 * 1024)
-		chunkIdx := int(input.Offset / uint64(chunkSize))
-		fs.cache.PutChunk(p, chunkIdx, chunkSize, resp.GetTotalSize(), resp.GetData(), time.Now())
+	data := resp.GetData()
+	if offset == 0 && resp.GetTotalSize() <= int64(len(data)) {
+		fs.cache.Put(input.NodeId, data, time.Now(), "")
 	}
 
-	return fuse.ReadResultData(resp.GetData()), fuse.OK
+	return fuse.ReadResultData(data), fuse.OK
 }
 
 func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
-	p, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return 0, fuse.ENOENT
-	}
-
-	// If not in cache (or clean with no data) and offset > 0, load existing content into cache first
-	cached, exists := fs.cache.Get(p)
-	if (!exists || (cached != nil && !cached.IsDirty && len(cached.Data) == 0)) && input.Offset > 0 {
-		ctx, cancelFunc := makeContext(cancel)
-		resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
-			VolumeId: fs.volumeID,
-			Path:     p,
-			Offset:   0,
-			Size:     0,
-		})
-		cancelFunc()
-		if err == nil && resp.GetError() == 0 && len(resp.GetData()) > 0 {
-			fs.cache.Put(p, resp.GetData(), time.Now(), "")
-		}
-	}
-
-	// Buffer write locally and mark dirty
-	fs.cache.WriteAt(p, int64(input.Offset), data, time.Now())
+	fs.cache.WriteAt(input.NodeId, int64(input.Offset), data, time.Now())
 	return uint32(len(data)), fuse.OK
 }
 
-func (fs *ObjectFS) syncFileToService(ctx context.Context, p string) error {
-	entry, isDirty := fs.cache.GetDirty(p)
+func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
+	entry, isDirty := fs.cache.GetDirty(inode)
 	if !isDirty {
 		return nil
 	}
 
 	resp, err := fs.client.WriteFile(ctx, &pb.WriteFileRequest{
 		VolumeId:  fs.volumeID,
-		Path:      p,
+		Inode:     inode,
 		Offset:    0,
 		Data:      entry.Data,
 		WriteMode: fs.writeMode,
@@ -675,7 +517,7 @@ func (fs *ObjectFS) syncFileToService(ctx context.Context, p string) error {
 		return syscall.Errno(resp.GetError())
 	}
 
-	fs.cache.MarkClean(p)
+	fs.cache.MarkClean(inode)
 	return nil
 }
 
@@ -683,15 +525,9 @@ func (fs *ObjectFS) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Stat
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	p, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
-	if err := fs.syncFileToService(ctx, p); err != nil {
+	if err := fs.syncFileToService(ctx, input.NodeId); err != nil {
 		return grpcErrorToStatus(err)
 	}
-
 	return fuse.OK
 }
 
@@ -699,18 +535,13 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	p, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return fuse.ENOENT
-	}
-
-	if err := fs.syncFileToService(ctx, p); err != nil {
+	if err := fs.syncFileToService(ctx, input.NodeId); err != nil {
 		return grpcErrorToStatus(err)
 	}
 
 	resp, err := fs.client.Fsync(ctx, &pb.FsyncRequest{
 		VolumeId: fs.volumeID,
-		Path:     p,
+		Inode:    input.NodeId,
 	})
 	if err != nil {
 		return grpcErrorToStatus(err)
@@ -725,12 +556,7 @@ func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	ctx, cancelFunc := makeContext(cancel)
 	defer cancelFunc()
 
-	p, ok := fs.getPath(input.NodeId)
-	if !ok {
-		return
-	}
-
-	_ = fs.syncFileToService(ctx, p)
+	_ = fs.syncFileToService(ctx, input.NodeId)
 }
 
 func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
@@ -749,7 +575,6 @@ func (fs *ObjectFS) Access(cancel <-chan struct{}, input *fuse.AccessIn) fuse.St
 	return fuse.OK
 }
 
-// StartWatcher starts a background loop listening to push notifications and invalidating cache.
 func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, nodeID string, cache *NodeCache) {
 	go func() {
 		for {
@@ -773,11 +598,8 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				if err != nil {
 					break
 				}
-				if ev.GetPath() != "" {
-					cache.InvalidateIfNotDirty(ev.GetPath())
-				}
-				if ev.GetOldPath() != "" {
-					cache.InvalidateIfNotDirty(ev.GetOldPath())
+				if ev.GetInode() != 0 {
+					cache.InvalidateIfNotDirty(ev.GetInode())
 				}
 			}
 			time.Sleep(500 * time.Millisecond)

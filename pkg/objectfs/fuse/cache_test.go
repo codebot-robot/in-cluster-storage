@@ -26,41 +26,41 @@ func TestNodeCacheOperations(t *testing.T) {
 
 	// Put entry 1 (30 bytes)
 	data1 := []byte("123456789012345678901234567890")
-	cache.Put("/file1", data1, time.Now(), "sha1")
+	cache.Put(10, data1, time.Now(), "sha1")
 
-	entry1, ok := cache.Get("/file1")
+	entry1, ok := cache.Get(10)
 	if !ok {
-		t.Fatalf("Expected /file1 to be in cache")
+		t.Fatalf("Expected inode 10 to be in cache")
 	}
 	if string(entry1.Data) != string(data1) {
-		t.Fatalf("Data mismatch for /file1: %s", string(entry1.Data))
+		t.Fatalf("Data mismatch for inode 10: %s", string(entry1.Data))
 	}
 
 	// Invalidate entry 1
-	cache.Invalidate("/file1")
-	if _, ok := cache.Get("/file1"); ok {
-		t.Fatalf("Expected /file1 to be invalidated")
+	cache.Invalidate(10)
+	if _, ok := cache.Get(10); ok {
+		t.Fatalf("Expected inode 10 to be invalidated")
 	}
 
 	// Test eviction when capacity exceeded
 	dataA := make([]byte, 60)
 	dataB := make([]byte, 60)
-	cache.Put("/fileA", dataA, time.Now(), "shaA")
+	cache.Put(20, dataA, time.Now(), "shaA")
 	time.Sleep(10 * time.Millisecond)
-	cache.Put("/fileB", dataB, time.Now(), "shaB")
+	cache.Put(30, dataB, time.Now(), "shaB")
 
-	// /fileA should have been evicted because 60 + 60 > 100
-	if _, ok := cache.Get("/fileA"); ok {
-		t.Fatalf("Expected /fileA to be evicted")
+	// Inode 20 should have been evicted because 60 + 60 > 100
+	if _, ok := cache.Get(20); ok {
+		t.Fatalf("Expected inode 20 to be evicted")
 	}
-	if _, ok := cache.Get("/fileB"); !ok {
-		t.Fatalf("Expected /fileB to remain in cache")
+	if _, ok := cache.Get(30); !ok {
+		t.Fatalf("Expected inode 30 to remain in cache")
 	}
 
 	// Test Clear
 	cache.Clear()
-	if _, ok := cache.Get("/fileB"); ok {
-		t.Fatalf("Expected /fileB to be cleared")
+	if _, ok := cache.Get(30); ok {
+		t.Fatalf("Expected inode 30 to be cleared")
 	}
 }
 
@@ -68,13 +68,13 @@ func TestNodeCacheWriteAndDirtyTracking(t *testing.T) {
 	cache := NewNodeCache(1024)
 
 	// Write locally at offset 0
-	cache.WriteAt("/file1.txt", 0, []byte("hello "), time.Now())
+	cache.WriteAt(100, 0, []byte("hello "), time.Now())
 	// Write locally at offset 6
-	cache.WriteAt("/file1.txt", 6, []byte("world!"), time.Now())
+	cache.WriteAt(100, 6, []byte("world!"), time.Now())
 
-	entry, ok := cache.Get("/file1.txt")
+	entry, ok := cache.Get(100)
 	if !ok {
-		t.Fatalf("Expected /file1.txt to be in cache")
+		t.Fatalf("Expected inode 100 to be in cache")
 	}
 	if !entry.IsDirty {
 		t.Fatalf("Expected entry to be marked dirty")
@@ -87,22 +87,22 @@ func TestNodeCacheWriteAndDirtyTracking(t *testing.T) {
 	}
 
 	dirtyEntries := cache.GetDirtyEntries()
-	if len(dirtyEntries) != 1 || dirtyEntries[0].Path != "/file1.txt" {
-		t.Fatalf("Expected 1 dirty entry for /file1.txt, got %v", dirtyEntries)
+	if len(dirtyEntries) != 1 || dirtyEntries[0].Inode != 100 {
+		t.Fatalf("Expected 1 dirty entry for inode 100, got %v", dirtyEntries)
 	}
 
 	// Mark clean
-	cache.MarkClean("/file1.txt")
-	if _, isDirty := cache.GetDirty("/file1.txt"); isDirty {
-		t.Fatalf("Expected /file1.txt to be clean after MarkClean")
+	cache.MarkClean(100)
+	if _, isDirty := cache.GetDirty(100); isDirty {
+		t.Fatalf("Expected inode 100 to be clean after MarkClean")
 	}
 	if len(cache.GetDirtyEntries()) != 0 {
 		t.Fatalf("Expected 0 dirty entries after MarkClean")
 	}
 
 	// Truncate
-	cache.Truncate("/file1.txt", 5, time.Now())
-	entryTrunc, ok := cache.Get("/file1.txt")
+	cache.Truncate(100, 5, time.Now())
+	entryTrunc, ok := cache.Get(100)
 	if !ok || !entryTrunc.IsDirty || string(entryTrunc.Data) != "hello" {
 		t.Fatalf("Expected dirty truncated entry 'hello', got %q (dirty=%v)", string(entryTrunc.Data), entryTrunc.IsDirty)
 	}
@@ -117,28 +117,28 @@ func TestNodeCacheChunkOperations(t *testing.T) {
 	c1 := []byte("ghijklmnopqrstuv")
 	c2 := []byte("wxyz0123456789AB")
 
-	cache.PutChunk("/chunked.bin", 0, chunkSize, totalSize, c0, time.Now())
-	cache.PutChunk("/chunked.bin", 1, chunkSize, totalSize, c1, time.Now())
-	cache.PutChunk("/chunked.bin", 2, chunkSize, totalSize, c2, time.Now())
+	cache.PutChunk(200, 0, chunkSize, totalSize, c0, time.Now())
+	cache.PutChunk(200, 1, chunkSize, totalSize, c1, time.Now())
+	cache.PutChunk(200, 2, chunkSize, totalSize, c2, time.Now())
 
 	// Get individual chunk
-	readC1, ok := cache.GetChunk("/chunked.bin", 1)
+	readC1, ok := cache.GetChunk(200, 1)
 	if !ok || string(readC1) != string(c1) {
 		t.Fatalf("GetChunk 1 failed: ok=%v, data=%q", ok, string(readC1))
 	}
 
 	// Get range spanning across chunk 0 and chunk 1 (offset 10, length 10)
 	// c0[10:16] = "abcdef" (6 bytes) + c1[0:4] = "ghij" (4 bytes) -> "abcdefghij"
-	rangeData, ok := cache.GetRange("/chunked.bin", 10, 10)
+	rangeData, ok := cache.GetRange(200, 10, 10)
 	if !ok || string(rangeData) != "abcdefghij" {
 		t.Fatalf("GetRange failed: ok=%v, data=%q", ok, string(rangeData))
 	}
 
 	// Range with missing chunk should return false (cache miss)
-	cache.Invalidate("/chunked.bin")
-	cache.PutChunk("/chunked.bin", 0, chunkSize, totalSize, c0, time.Now())
+	cache.Invalidate(200)
+	cache.PutChunk(200, 0, chunkSize, totalSize, c0, time.Now())
 	// Chunk 1 is missing
-	_, ok = cache.GetRange("/chunked.bin", 10, 10)
+	_, ok = cache.GetRange(200, 10, 10)
 	if ok {
 		t.Fatalf("Expected cache miss for range requiring missing chunk 1")
 	}
@@ -148,8 +148,8 @@ func TestNodeCacheSparseGetRangeAndWriteAt(t *testing.T) {
 	cache := NewNodeCache(1024 * 1024)
 
 	// Write at offset 10 with length 5 on an empty file -> creates hole of 10 zeroes
-	cache.WriteAt("/sparse.txt", 10, []byte("world"), time.Now())
-	data, ok := cache.GetRange("/sparse.txt", 0, 15)
+	cache.WriteAt(300, 10, []byte("world"), time.Now())
+	data, ok := cache.GetRange(300, 0, 15)
 	if !ok {
 		t.Fatalf("GetRange failed on sparse write")
 	}

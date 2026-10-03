@@ -210,18 +210,17 @@ func (MutationType) EnumDescriptor() ([]byte, []int) {
 type EntryAttr struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Inode          uint64                 `protobuf:"varint,1,opt,name=inode,proto3" json:"inode,omitempty"`
-	Path           string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
-	Name           string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
-	IsDir          bool                   `protobuf:"varint,4,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
-	Size           int64                  `protobuf:"varint,5,opt,name=size,proto3" json:"size,omitempty"`
-	Mode           uint32                 `protobuf:"varint,6,opt,name=mode,proto3" json:"mode,omitempty"`
-	ModTime        *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
-	Sha256         string                 `protobuf:"bytes,8,opt,name=sha256,proto3" json:"sha256,omitempty"`
-	RedirectUrl    string                 `protobuf:"bytes,9,opt,name=redirect_url,json=redirectUrl,proto3" json:"redirect_url,omitempty"`
-	Uid            uint32                 `protobuf:"varint,10,opt,name=uid,proto3" json:"uid,omitempty"`
-	Gid            uint32                 `protobuf:"varint,11,opt,name=gid,proto3" json:"gid,omitempty"`
-	ManifestSha256 string                 `protobuf:"bytes,12,opt,name=manifest_sha256,json=manifestSha256,proto3" json:"manifest_sha256,omitempty"`
-	ContentSha256  string                 `protobuf:"bytes,13,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
+	Name           string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	IsDir          bool                   `protobuf:"varint,3,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
+	Size           int64                  `protobuf:"varint,4,opt,name=size,proto3" json:"size,omitempty"`
+	Mode           uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
+	ModTime        *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
+	Sha256         string                 `protobuf:"bytes,7,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	RedirectUrl    string                 `protobuf:"bytes,8,opt,name=redirect_url,json=redirectUrl,proto3" json:"redirect_url,omitempty"`
+	Uid            uint32                 `protobuf:"varint,9,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid            uint32                 `protobuf:"varint,10,opt,name=gid,proto3" json:"gid,omitempty"`
+	ManifestSha256 string                 `protobuf:"bytes,11,opt,name=manifest_sha256,json=manifestSha256,proto3" json:"manifest_sha256,omitempty"`
+	ContentSha256  string                 `protobuf:"bytes,12,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -261,13 +260,6 @@ func (x *EntryAttr) GetInode() uint64 {
 		return x.Inode
 	}
 	return 0
-}
-
-func (x *EntryAttr) GetPath() string {
-	if x != nil {
-		return x.Path
-	}
-	return ""
 }
 
 func (x *EntryAttr) GetName() string {
@@ -350,7 +342,7 @@ func (x *EntryAttr) GetContentSha256() string {
 type GetAttrRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	Inode         uint64                 `protobuf:"varint,2,opt,name=inode,proto3" json:"inode,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -392,11 +384,11 @@ func (x *GetAttrRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *GetAttrRequest) GetPath() string {
+func (x *GetAttrRequest) GetInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.Inode
 	}
-	return ""
+	return 0
 }
 
 type GetAttrResponse struct {
@@ -454,7 +446,7 @@ func (x *GetAttrResponse) GetError() int32 {
 type LookupRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	ParentPath    string                 `protobuf:"bytes,2,opt,name=parent_path,json=parentPath,proto3" json:"parent_path,omitempty"`
+	ParentInode   uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
 	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -497,11 +489,11 @@ func (x *LookupRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *LookupRequest) GetParentPath() string {
+func (x *LookupRequest) GetParentInode() uint64 {
 	if x != nil {
-		return x.ParentPath
+		return x.ParentInode
 	}
-	return ""
+	return 0
 }
 
 func (x *LookupRequest) GetName() string {
@@ -566,7 +558,7 @@ func (x *LookupResponse) GetError() int32 {
 type ReadDirRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	Inode         uint64                 `protobuf:"varint,2,opt,name=inode,proto3" json:"inode,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -608,11 +600,11 @@ func (x *ReadDirRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *ReadDirRequest) GetPath() string {
+func (x *ReadDirRequest) GetInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.Inode
 	}
-	return ""
+	return 0
 }
 
 type ReadDirResponse struct {
@@ -670,10 +662,11 @@ func (x *ReadDirResponse) GetError() int32 {
 type MkdirRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
-	Mode          uint32                 `protobuf:"varint,3,opt,name=mode,proto3" json:"mode,omitempty"`
-	Uid           uint32                 `protobuf:"varint,4,opt,name=uid,proto3" json:"uid,omitempty"`
-	Gid           uint32                 `protobuf:"varint,5,opt,name=gid,proto3" json:"gid,omitempty"`
+	ParentInode   uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	Mode          uint32                 `protobuf:"varint,4,opt,name=mode,proto3" json:"mode,omitempty"`
+	Uid           uint32                 `protobuf:"varint,5,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid           uint32                 `protobuf:"varint,6,opt,name=gid,proto3" json:"gid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -715,9 +708,16 @@ func (x *MkdirRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *MkdirRequest) GetPath() string {
+func (x *MkdirRequest) GetParentInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.ParentInode
+	}
+	return 0
+}
+
+func (x *MkdirRequest) GetName() string {
+	if x != nil {
+		return x.Name
 	}
 	return ""
 }
@@ -798,11 +798,12 @@ func (x *MkdirResponse) GetError() int32 {
 type CreateFileRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId       string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path           string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
-	Mode           uint32                 `protobuf:"varint,3,opt,name=mode,proto3" json:"mode,omitempty"`
-	InitialContent []byte                 `protobuf:"bytes,4,opt,name=initial_content,json=initialContent,proto3" json:"initial_content,omitempty"`
-	Uid            uint32                 `protobuf:"varint,5,opt,name=uid,proto3" json:"uid,omitempty"`
-	Gid            uint32                 `protobuf:"varint,6,opt,name=gid,proto3" json:"gid,omitempty"`
+	ParentInode    uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name           string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	Mode           uint32                 `protobuf:"varint,4,opt,name=mode,proto3" json:"mode,omitempty"`
+	InitialContent []byte                 `protobuf:"bytes,5,opt,name=initial_content,json=initialContent,proto3" json:"initial_content,omitempty"`
+	Uid            uint32                 `protobuf:"varint,6,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid            uint32                 `protobuf:"varint,7,opt,name=gid,proto3" json:"gid,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -844,9 +845,16 @@ func (x *CreateFileRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *CreateFileRequest) GetPath() string {
+func (x *CreateFileRequest) GetParentInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.ParentInode
+	}
+	return 0
+}
+
+func (x *CreateFileRequest) GetName() string {
+	if x != nil {
+		return x.Name
 	}
 	return ""
 }
@@ -934,7 +942,7 @@ func (x *CreateFileResponse) GetError() int32 {
 type ReadFileRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	Inode         uint64                 `protobuf:"varint,2,opt,name=inode,proto3" json:"inode,omitempty"`
 	Offset        int64                  `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
 	Size          int64                  `protobuf:"varint,4,opt,name=size,proto3" json:"size,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -978,11 +986,11 @@ func (x *ReadFileRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *ReadFileRequest) GetPath() string {
+func (x *ReadFileRequest) GetInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.Inode
 	}
-	return ""
+	return 0
 }
 
 func (x *ReadFileRequest) GetOffset() int64 {
@@ -1078,7 +1086,7 @@ func (x *ReadFileResponse) GetError() int32 {
 type WriteFileRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	Inode         uint64                 `protobuf:"varint,2,opt,name=inode,proto3" json:"inode,omitempty"`
 	Offset        int64                  `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
 	Data          []byte                 `protobuf:"bytes,4,opt,name=data,proto3" json:"data,omitempty"`
 	WriteMode     WriteMode              `protobuf:"varint,5,opt,name=write_mode,json=writeMode,proto3,enum=objectfs.v1alpha1.WriteMode" json:"write_mode,omitempty"`
@@ -1123,11 +1131,11 @@ func (x *WriteFileRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *WriteFileRequest) GetPath() string {
+func (x *WriteFileRequest) GetInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.Inode
 	}
-	return ""
+	return 0
 }
 
 func (x *WriteFileRequest) GetOffset() int64 {
@@ -1222,7 +1230,7 @@ func (x *WriteFileResponse) GetError() int32 {
 type TruncateFileRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	Inode         uint64                 `protobuf:"varint,2,opt,name=inode,proto3" json:"inode,omitempty"`
 	Size          int64                  `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1265,11 +1273,11 @@ func (x *TruncateFileRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *TruncateFileRequest) GetPath() string {
+func (x *TruncateFileRequest) GetInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.Inode
 	}
-	return ""
+	return 0
 }
 
 func (x *TruncateFileRequest) GetSize() int64 {
@@ -1334,7 +1342,8 @@ func (x *TruncateFileResponse) GetError() int32 {
 type UnlinkRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	ParentInode   uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1376,9 +1385,16 @@ func (x *UnlinkRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *UnlinkRequest) GetPath() string {
+func (x *UnlinkRequest) GetParentInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.ParentInode
+	}
+	return 0
+}
+
+func (x *UnlinkRequest) GetName() string {
+	if x != nil {
+		return x.Name
 	}
 	return ""
 }
@@ -1438,7 +1454,8 @@ func (x *UnlinkResponse) GetError() int32 {
 type RmdirRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	ParentInode   uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1480,9 +1497,16 @@ func (x *RmdirRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *RmdirRequest) GetPath() string {
+func (x *RmdirRequest) GetParentInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.ParentInode
+	}
+	return 0
+}
+
+func (x *RmdirRequest) GetName() string {
+	if x != nil {
+		return x.Name
 	}
 	return ""
 }
@@ -1540,12 +1564,14 @@ func (x *RmdirResponse) GetError() int32 {
 }
 
 type RenameRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	OldPath       string                 `protobuf:"bytes,2,opt,name=old_path,json=oldPath,proto3" json:"old_path,omitempty"`
-	NewPath       string                 `protobuf:"bytes,3,opt,name=new_path,json=newPath,proto3" json:"new_path,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId       string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	OldParentInode uint64                 `protobuf:"varint,2,opt,name=old_parent_inode,json=oldParentInode,proto3" json:"old_parent_inode,omitempty"`
+	OldName        string                 `protobuf:"bytes,3,opt,name=old_name,json=oldName,proto3" json:"old_name,omitempty"`
+	NewParentInode uint64                 `protobuf:"varint,4,opt,name=new_parent_inode,json=newParentInode,proto3" json:"new_parent_inode,omitempty"`
+	NewName        string                 `protobuf:"bytes,5,opt,name=new_name,json=newName,proto3" json:"new_name,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *RenameRequest) Reset() {
@@ -1585,16 +1611,30 @@ func (x *RenameRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *RenameRequest) GetOldPath() string {
+func (x *RenameRequest) GetOldParentInode() uint64 {
 	if x != nil {
-		return x.OldPath
+		return x.OldParentInode
+	}
+	return 0
+}
+
+func (x *RenameRequest) GetOldName() string {
+	if x != nil {
+		return x.OldName
 	}
 	return ""
 }
 
-func (x *RenameRequest) GetNewPath() string {
+func (x *RenameRequest) GetNewParentInode() uint64 {
 	if x != nil {
-		return x.NewPath
+		return x.NewParentInode
+	}
+	return 0
+}
+
+func (x *RenameRequest) GetNewName() string {
+	if x != nil {
+		return x.NewName
 	}
 	return ""
 }
@@ -1654,7 +1694,7 @@ func (x *RenameResponse) GetError() int32 {
 type FsyncRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	Inode         uint64                 `protobuf:"varint,2,opt,name=inode,proto3" json:"inode,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1696,11 +1736,11 @@ func (x *FsyncRequest) GetVolumeId() string {
 	return ""
 }
 
-func (x *FsyncRequest) GetPath() string {
+func (x *FsyncRequest) GetInode() uint64 {
 	if x != nil {
-		return x.Path
+		return x.Inode
 	}
-	return ""
+	return 0
 }
 
 type FsyncResponse struct {
@@ -1808,13 +1848,16 @@ func (x *WatchVolumeRequest) GetNodeId() string {
 }
 
 type WatchVolumeResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	EventType     WatchEventType         `protobuf:"varint,1,opt,name=event_type,json=eventType,proto3,enum=objectfs.v1alpha1.WatchEventType" json:"event_type,omitempty"`
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
-	OldPath       string                 `protobuf:"bytes,3,opt,name=old_path,json=oldPath,proto3" json:"old_path,omitempty"`
-	Attr          *EntryAttr             `protobuf:"bytes,4,opt,name=attr,proto3" json:"attr,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	EventType      WatchEventType         `protobuf:"varint,1,opt,name=event_type,json=eventType,proto3,enum=objectfs.v1alpha1.WatchEventType" json:"event_type,omitempty"`
+	Attr           *EntryAttr             `protobuf:"bytes,2,opt,name=attr,proto3" json:"attr,omitempty"`
+	Inode          uint64                 `protobuf:"varint,3,opt,name=inode,proto3" json:"inode,omitempty"`
+	ParentInode    uint64                 `protobuf:"varint,4,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name           string                 `protobuf:"bytes,5,opt,name=name,proto3" json:"name,omitempty"`
+	OldParentInode uint64                 `protobuf:"varint,6,opt,name=old_parent_inode,json=oldParentInode,proto3" json:"old_parent_inode,omitempty"`
+	OldName        string                 `protobuf:"bytes,7,opt,name=old_name,json=oldName,proto3" json:"old_name,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *WatchVolumeResponse) Reset() {
@@ -1854,25 +1897,46 @@ func (x *WatchVolumeResponse) GetEventType() WatchEventType {
 	return WatchEventType_EVENT_UNKNOWN
 }
 
-func (x *WatchVolumeResponse) GetPath() string {
-	if x != nil {
-		return x.Path
-	}
-	return ""
-}
-
-func (x *WatchVolumeResponse) GetOldPath() string {
-	if x != nil {
-		return x.OldPath
-	}
-	return ""
-}
-
 func (x *WatchVolumeResponse) GetAttr() *EntryAttr {
 	if x != nil {
 		return x.Attr
 	}
 	return nil
+}
+
+func (x *WatchVolumeResponse) GetInode() uint64 {
+	if x != nil {
+		return x.Inode
+	}
+	return 0
+}
+
+func (x *WatchVolumeResponse) GetParentInode() uint64 {
+	if x != nil {
+		return x.ParentInode
+	}
+	return 0
+}
+
+func (x *WatchVolumeResponse) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *WatchVolumeResponse) GetOldParentInode() uint64 {
+	if x != nil {
+		return x.OldParentInode
+	}
+	return 0
+}
+
+func (x *WatchVolumeResponse) GetOldName() string {
+	if x != nil {
+		return x.OldName
+	}
+	return ""
 }
 
 type ListBlobsRequest struct {
@@ -2527,20 +2591,22 @@ type MutationRecord struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Type           MutationType           `protobuf:"varint,1,opt,name=type,proto3,enum=objectfs.v1alpha1.MutationType" json:"type,omitempty"`
 	VolumeId       string                 `protobuf:"bytes,2,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Path           string                 `protobuf:"bytes,3,opt,name=path,proto3" json:"path,omitempty"`
-	OldPath        string                 `protobuf:"bytes,4,opt,name=old_path,json=oldPath,proto3" json:"old_path,omitempty"`
-	Mode           uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
-	Size           int64                  `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
-	Offset         int64                  `protobuf:"varint,7,opt,name=offset,proto3" json:"offset,omitempty"`
-	ModTime        *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
-	Sha256         string                 `protobuf:"bytes,9,opt,name=sha256,proto3" json:"sha256,omitempty"`
-	Inode          uint64                 `protobuf:"varint,10,opt,name=inode,proto3" json:"inode,omitempty"`
-	Data           []byte                 `protobuf:"bytes,11,opt,name=data,proto3" json:"data,omitempty"`
-	StreamSeq      uint64                 `protobuf:"varint,12,opt,name=stream_seq,json=streamSeq,proto3" json:"stream_seq,omitempty"`
-	Uid            uint32                 `protobuf:"varint,13,opt,name=uid,proto3" json:"uid,omitempty"`
-	Gid            uint32                 `protobuf:"varint,14,opt,name=gid,proto3" json:"gid,omitempty"`
-	ManifestSha256 string                 `protobuf:"bytes,15,opt,name=manifest_sha256,json=manifestSha256,proto3" json:"manifest_sha256,omitempty"`
-	ContentSha256  string                 `protobuf:"bytes,16,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
+	Mode           uint32                 `protobuf:"varint,3,opt,name=mode,proto3" json:"mode,omitempty"`
+	Size           int64                  `protobuf:"varint,4,opt,name=size,proto3" json:"size,omitempty"`
+	Offset         int64                  `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`
+	ModTime        *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
+	Sha256         string                 `protobuf:"bytes,7,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	Inode          uint64                 `protobuf:"varint,8,opt,name=inode,proto3" json:"inode,omitempty"`
+	Data           []byte                 `protobuf:"bytes,9,opt,name=data,proto3" json:"data,omitempty"`
+	StreamSeq      uint64                 `protobuf:"varint,10,opt,name=stream_seq,json=streamSeq,proto3" json:"stream_seq,omitempty"`
+	Uid            uint32                 `protobuf:"varint,11,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid            uint32                 `protobuf:"varint,12,opt,name=gid,proto3" json:"gid,omitempty"`
+	ManifestSha256 string                 `protobuf:"bytes,13,opt,name=manifest_sha256,json=manifestSha256,proto3" json:"manifest_sha256,omitempty"`
+	ContentSha256  string                 `protobuf:"bytes,14,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
+	ParentInode    uint64                 `protobuf:"varint,15,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name           string                 `protobuf:"bytes,16,opt,name=name,proto3" json:"name,omitempty"`
+	OldParentInode uint64                 `protobuf:"varint,17,opt,name=old_parent_inode,json=oldParentInode,proto3" json:"old_parent_inode,omitempty"`
+	OldName        string                 `protobuf:"bytes,18,opt,name=old_name,json=oldName,proto3" json:"old_name,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -2585,20 +2651,6 @@ func (x *MutationRecord) GetType() MutationType {
 func (x *MutationRecord) GetVolumeId() string {
 	if x != nil {
 		return x.VolumeId
-	}
-	return ""
-}
-
-func (x *MutationRecord) GetPath() string {
-	if x != nil {
-		return x.Path
-	}
-	return ""
-}
-
-func (x *MutationRecord) GetOldPath() string {
-	if x != nil {
-		return x.OldPath
 	}
 	return ""
 }
@@ -2683,6 +2735,34 @@ func (x *MutationRecord) GetManifestSha256() string {
 func (x *MutationRecord) GetContentSha256() string {
 	if x != nil {
 		return x.ContentSha256
+	}
+	return ""
+}
+
+func (x *MutationRecord) GetParentInode() uint64 {
+	if x != nil {
+		return x.ParentInode
+	}
+	return 0
+}
+
+func (x *MutationRecord) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *MutationRecord) GetOldParentInode() uint64 {
+	if x != nil {
+		return x.OldParentInode
+	}
+	return 0
+}
+
+func (x *MutationRecord) GetOldName() string {
+	if x != nil {
+		return x.OldName
 	}
 	return ""
 }
@@ -2935,64 +3015,64 @@ var File_objectfs_proto protoreflect.FileDescriptor
 
 const file_objectfs_proto_rawDesc = "" +
 	"\n" +
-	"\x0eobjectfs.proto\x12\x11objectfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xee\x02\n" +
+	"\x0eobjectfs.proto\x12\x11objectfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xda\x02\n" +
 	"\tEntryAttr\x12\x14\n" +
 	"\x05inode\x18\x01 \x01(\x04R\x05inode\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
-	"\x04name\x18\x03 \x01(\tR\x04name\x12\x15\n" +
-	"\x06is_dir\x18\x04 \x01(\bR\x05isDir\x12\x12\n" +
-	"\x04size\x18\x05 \x01(\x03R\x04size\x12\x12\n" +
-	"\x04mode\x18\x06 \x01(\rR\x04mode\x125\n" +
-	"\bmod_time\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\amodTime\x12\x16\n" +
-	"\x06sha256\x18\b \x01(\tR\x06sha256\x12!\n" +
-	"\fredirect_url\x18\t \x01(\tR\vredirectUrl\x12\x10\n" +
-	"\x03uid\x18\n" +
-	" \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\v \x01(\rR\x03gid\x12'\n" +
-	"\x0fmanifest_sha256\x18\f \x01(\tR\x0emanifestSha256\x12%\n" +
-	"\x0econtent_sha256\x18\r \x01(\tR\rcontentSha256\"A\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x15\n" +
+	"\x06is_dir\x18\x03 \x01(\bR\x05isDir\x12\x12\n" +
+	"\x04size\x18\x04 \x01(\x03R\x04size\x12\x12\n" +
+	"\x04mode\x18\x05 \x01(\rR\x04mode\x125\n" +
+	"\bmod_time\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\amodTime\x12\x16\n" +
+	"\x06sha256\x18\a \x01(\tR\x06sha256\x12!\n" +
+	"\fredirect_url\x18\b \x01(\tR\vredirectUrl\x12\x10\n" +
+	"\x03uid\x18\t \x01(\rR\x03uid\x12\x10\n" +
+	"\x03gid\x18\n" +
+	" \x01(\rR\x03gid\x12'\n" +
+	"\x0fmanifest_sha256\x18\v \x01(\tR\x0emanifestSha256\x12%\n" +
+	"\x0econtent_sha256\x18\f \x01(\tR\rcontentSha256\"C\n" +
 	"\x0eGetAttrRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\"Y\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
+	"\x05inode\x18\x02 \x01(\x04R\x05inode\"Y\n" +
 	"\x0fGetAttrResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"a\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"c\n" +
 	"\rLookupRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1f\n" +
-	"\vparent_path\x18\x02 \x01(\tR\n" +
-	"parentPath\x12\x12\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
+	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
 	"\x04name\x18\x03 \x01(\tR\x04name\"X\n" +
 	"\x0eLookupResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"A\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"C\n" +
 	"\x0eReadDirRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\"_\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
+	"\x05inode\x18\x02 \x01(\x04R\x05inode\"_\n" +
 	"\x0fReadDirResponse\x126\n" +
 	"\aentries\x18\x01 \x03(\v2\x1c.objectfs.v1alpha1.EntryAttrR\aentries\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"w\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"\x9a\x01\n" +
 	"\fMkdirRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
-	"\x04mode\x18\x03 \x01(\rR\x04mode\x12\x10\n" +
-	"\x03uid\x18\x04 \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\x05 \x01(\rR\x03gid\"W\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
+	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12\x12\n" +
+	"\x04mode\x18\x04 \x01(\rR\x04mode\x12\x10\n" +
+	"\x03uid\x18\x05 \x01(\rR\x03uid\x12\x10\n" +
+	"\x03gid\x18\x06 \x01(\rR\x03gid\"W\n" +
 	"\rMkdirResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"\xa5\x01\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"\xc8\x01\n" +
 	"\x11CreateFileRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
-	"\x04mode\x18\x03 \x01(\rR\x04mode\x12'\n" +
-	"\x0finitial_content\x18\x04 \x01(\fR\x0einitialContent\x12\x10\n" +
-	"\x03uid\x18\x05 \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\x06 \x01(\rR\x03gid\"\\\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
+	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12\x12\n" +
+	"\x04mode\x18\x04 \x01(\rR\x04mode\x12'\n" +
+	"\x0finitial_content\x18\x05 \x01(\fR\x0einitialContent\x12\x10\n" +
+	"\x03uid\x18\x06 \x01(\rR\x03uid\x12\x10\n" +
+	"\x03gid\x18\a \x01(\rR\x03gid\"\\\n" +
 	"\x12CreateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"n\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"p\n" +
 	"\x0fReadFileRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\x12\x16\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
+	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x12\n" +
 	"\x04size\x18\x04 \x01(\x03R\x04size\"\x90\x01\n" +
 	"\x10ReadFileResponse\x12\x12\n" +
@@ -3001,10 +3081,10 @@ const file_objectfs_proto_rawDesc = "" +
 	"\x03eof\x18\x03 \x01(\bR\x03eof\x12\x1d\n" +
 	"\n" +
 	"total_size\x18\x04 \x01(\x03R\ttotalSize\x12\x14\n" +
-	"\x05error\x18\x05 \x01(\x05R\x05error\"\xac\x01\n" +
+	"\x05error\x18\x05 \x01(\x05R\x05error\"\xae\x01\n" +
 	"\x10WriteFileRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\x12\x16\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
+	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x12\n" +
 	"\x04data\x18\x04 \x01(\fR\x04data\x12;\n" +
 	"\n" +
@@ -3013,48 +3093,55 @@ const file_objectfs_proto_rawDesc = "" +
 	"\rbytes_written\x18\x01 \x01(\x03R\fbytesWritten\x12\x19\n" +
 	"\bnew_size\x18\x02 \x01(\x03R\anewSize\x125\n" +
 	"\bmod_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\amodTime\x12\x14\n" +
-	"\x05error\x18\x04 \x01(\x05R\x05error\"Z\n" +
+	"\x05error\x18\x04 \x01(\x05R\x05error\"\\\n" +
 	"\x13TruncateFileRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
+	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x12\n" +
 	"\x04size\x18\x03 \x01(\x03R\x04size\"^\n" +
 	"\x14TruncateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"@\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"c\n" +
 	"\rUnlinkRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\"@\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
+	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\"@\n" +
 	"\x0eUnlinkResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"?\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"b\n" +
 	"\fRmdirRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\"?\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
+	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\"?\n" +
 	"\rRmdirResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"b\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"\xb6\x01\n" +
 	"\rRenameRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x19\n" +
-	"\bold_path\x18\x02 \x01(\tR\aoldPath\x12\x19\n" +
-	"\bnew_path\x18\x03 \x01(\tR\anewPath\"X\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12(\n" +
+	"\x10old_parent_inode\x18\x02 \x01(\x04R\x0eoldParentInode\x12\x19\n" +
+	"\bold_name\x18\x03 \x01(\tR\aoldName\x12(\n" +
+	"\x10new_parent_inode\x18\x04 \x01(\x04R\x0enewParentInode\x12\x19\n" +
+	"\bnew_name\x18\x05 \x01(\tR\anewName\"X\n" +
 	"\x0eRenameResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"?\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"A\n" +
 	"\fFsyncRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\"?\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
+	"\x05inode\x18\x02 \x01(\x04R\x05inode\"?\n" +
 	"\rFsyncResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\"J\n" +
 	"\x12WatchVolumeRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x17\n" +
-	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"\xb8\x01\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"\x9b\x02\n" +
 	"\x13WatchVolumeResponse\x12@\n" +
 	"\n" +
-	"event_type\x18\x01 \x01(\x0e2!.objectfs.v1alpha1.WatchEventTypeR\teventType\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\x12\x19\n" +
-	"\bold_path\x18\x03 \x01(\tR\aoldPath\x120\n" +
-	"\x04attr\x18\x04 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\"b\n" +
+	"event_type\x18\x01 \x01(\x0e2!.objectfs.v1alpha1.WatchEventTypeR\teventType\x120\n" +
+	"\x04attr\x18\x02 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
+	"\x05inode\x18\x03 \x01(\x04R\x05inode\x12!\n" +
+	"\fparent_inode\x18\x04 \x01(\x04R\vparentInode\x12\x12\n" +
+	"\x04name\x18\x05 \x01(\tR\x04name\x12(\n" +
+	"\x10old_parent_inode\x18\x06 \x01(\x04R\x0eoldParentInode\x12\x19\n" +
+	"\bold_name\x18\a \x01(\tR\aoldName\"b\n" +
 	"\x10ListBlobsRequest\x12\x19\n" +
 	"\bfrom_sha\x18\x01 \x01(\tR\afromSha\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x1d\n" +
@@ -3096,26 +3183,28 @@ const file_objectfs_proto_rawDesc = "" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"z\n" +
 	"\x16CreateSnapshotResponse\x12#\n" +
 	"\rsnapshot_name\x18\x01 \x01(\tR\fsnapshotName\x12;\n" +
-	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\xdd\x03\n" +
+	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\xaa\x04\n" +
 	"\x0eMutationRecord\x123\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x1f.objectfs.v1alpha1.MutationTypeR\x04type\x12\x1b\n" +
 	"\tvolume_id\x18\x02 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\x12\x19\n" +
-	"\bold_path\x18\x04 \x01(\tR\aoldPath\x12\x12\n" +
-	"\x04mode\x18\x05 \x01(\rR\x04mode\x12\x12\n" +
-	"\x04size\x18\x06 \x01(\x03R\x04size\x12\x16\n" +
-	"\x06offset\x18\a \x01(\x03R\x06offset\x125\n" +
-	"\bmod_time\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\amodTime\x12\x16\n" +
-	"\x06sha256\x18\t \x01(\tR\x06sha256\x12\x14\n" +
-	"\x05inode\x18\n" +
-	" \x01(\x04R\x05inode\x12\x12\n" +
-	"\x04data\x18\v \x01(\fR\x04data\x12\x1d\n" +
+	"\x04mode\x18\x03 \x01(\rR\x04mode\x12\x12\n" +
+	"\x04size\x18\x04 \x01(\x03R\x04size\x12\x16\n" +
+	"\x06offset\x18\x05 \x01(\x03R\x06offset\x125\n" +
+	"\bmod_time\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\amodTime\x12\x16\n" +
+	"\x06sha256\x18\a \x01(\tR\x06sha256\x12\x14\n" +
+	"\x05inode\x18\b \x01(\x04R\x05inode\x12\x12\n" +
+	"\x04data\x18\t \x01(\fR\x04data\x12\x1d\n" +
 	"\n" +
-	"stream_seq\x18\f \x01(\x04R\tstreamSeq\x12\x10\n" +
-	"\x03uid\x18\r \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\x0e \x01(\rR\x03gid\x12'\n" +
-	"\x0fmanifest_sha256\x18\x0f \x01(\tR\x0emanifestSha256\x12%\n" +
-	"\x0econtent_sha256\x18\x10 \x01(\tR\rcontentSha256\"\xb2\x02\n" +
+	"stream_seq\x18\n" +
+	" \x01(\x04R\tstreamSeq\x12\x10\n" +
+	"\x03uid\x18\v \x01(\rR\x03uid\x12\x10\n" +
+	"\x03gid\x18\f \x01(\rR\x03gid\x12'\n" +
+	"\x0fmanifest_sha256\x18\r \x01(\tR\x0emanifestSha256\x12%\n" +
+	"\x0econtent_sha256\x18\x0e \x01(\tR\rcontentSha256\x12!\n" +
+	"\fparent_inode\x18\x0f \x01(\x04R\vparentInode\x12\x12\n" +
+	"\x04name\x18\x10 \x01(\tR\x04name\x12(\n" +
+	"\x10old_parent_inode\x18\x11 \x01(\x04R\x0eoldParentInode\x12\x19\n" +
+	"\bold_name\x18\x12 \x01(\tR\aoldName\"\xb2\x02\n" +
 	"\x05Inode\x12\x15\n" +
 	"\x03ino\x18\x01 \x01(\x04H\x00R\x03ino\x88\x01\x01\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\rR\x04mode\x12\x12\n" +
@@ -3183,7 +3272,7 @@ const file_objectfs_proto_rawDesc = "" +
 	"\aGetBlob\x12!.objectfs.v1alpha1.GetBlobRequest\x1a\".objectfs.v1alpha1.GetBlobResponse0\x01\x12\\\n" +
 	"\vListVolumes\x12%.objectfs.v1alpha1.ListVolumesRequest\x1a&.objectfs.v1alpha1.ListVolumesResponse\x12b\n" +
 	"\rListSnapshots\x12'.objectfs.v1alpha1.ListSnapshotsRequest\x1a(.objectfs.v1alpha1.ListSnapshotsResponse\x12e\n" +
-	"\x0eCreateSnapshot\x12(.objectfs.v1alpha1.CreateSnapshotRequest\x1a).objectfs.v1alpha1.CreateSnapshotResponseBKZIgithub.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1;v1alpha1b\x06proto3"
+	"\x0eCreateSnapshot\x12(.objectfs.v1alpha1.CreateSnapshotRequest\x1a).objectfs.v1alpha1.CreateSnapshotResponseBBZ@github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1b\x06proto3"
 
 var (
 	file_objectfs_proto_rawDescOnce sync.Once

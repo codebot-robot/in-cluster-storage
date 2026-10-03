@@ -240,21 +240,26 @@ func TestTieredMetadataLRUEvictionAndReload(t *testing.T) {
 	)
 	defer vol.Close()
 
+	dirInodes := make(map[int]uint64)
+	fileInodes := make(map[string]uint64)
+
 	// Create 10 files across 3 subdirectories
 	for d := 1; d <= 3; d++ {
-		dirPath := fmt.Sprintf("/dir%d", d)
-		_, err := vol.Mkdir(ctx, dirPath, 0755, 0, 0)
+		dirName := fmt.Sprintf("dir%d", d)
+		dirAttr, err := vol.Mkdir(ctx, 1, dirName, 0755, 0, 0)
 		if err != nil {
-			t.Fatalf("Mkdir %s failed: %v", dirPath, err)
+			t.Fatalf("Mkdir %s failed: %v", dirName, err)
 		}
+		dirInodes[d] = dirAttr.Inode
 
 		for f := 1; f <= 4; f++ {
-			filePath := fmt.Sprintf("%s/file%d.txt", dirPath, f)
+			fileName := fmt.Sprintf("file%d.txt", f)
 			content := []byte(fmt.Sprintf("content of dir%d file%d", d, f))
-			_, err := vol.CreateFile(ctx, filePath, 0644, content, 0, 0)
+			fileAttr, err := vol.CreateFile(ctx, dirAttr.Inode, fileName, 0644, content, 0, 0)
 			if err != nil {
-				t.Fatalf("CreateFile %s failed: %v", filePath, err)
+				t.Fatalf("CreateFile %s failed: %v", fileName, err)
 			}
+			fileInodes[fmt.Sprintf("dir%d/file%d", d, f)] = fileAttr.Inode
 		}
 	}
 
@@ -265,43 +270,45 @@ func TestTieredMetadataLRUEvictionAndReload(t *testing.T) {
 
 	// Read all 10 files back to test transparent LRU cache miss -> local file reload
 	for d := 1; d <= 3; d++ {
-		dirPath := fmt.Sprintf("/dir%d", d)
-		entries, err := vol.ReadDir(ctx, dirPath)
+		dirIno := dirInodes[d]
+		entries, err := vol.ReadDir(ctx, dirIno)
 		if err != nil {
-			t.Fatalf("ReadDir %s failed: %v", dirPath, err)
+			t.Fatalf("ReadDir %d failed: %v", dirIno, err)
 		}
 		if len(entries) != 4 {
-			t.Fatalf("Expected 4 entries in %s, got %d", dirPath, len(entries))
+			t.Fatalf("Expected 4 entries in dir%d, got %d", d, len(entries))
 		}
 
 		for f := 1; f <= 4; f++ {
-			filePath := fmt.Sprintf("%s/file%d.txt", dirPath, f)
-			attr, err := vol.GetAttr(ctx, filePath)
+			fileIno := fileInodes[fmt.Sprintf("dir%d/file%d", d, f)]
+			attr, err := vol.GetAttr(ctx, fileIno)
 			if err != nil {
-				t.Fatalf("GetAttr %s failed: %v", filePath, err)
+				t.Fatalf("GetAttr %d failed: %v", fileIno, err)
 			}
 			expectedContent := fmt.Sprintf("content of dir%d file%d", d, f)
 			if attr.Size != int64(len(expectedContent)) {
-				t.Fatalf("Size mismatch for %s: got %d, want %d", filePath, attr.Size, len(expectedContent))
+				t.Fatalf("Size mismatch for %d: got %d, want %d", fileIno, attr.Size, len(expectedContent))
 			}
 
-			data, total, _, err := vol.ReadFile(ctx, filePath, 0, 100)
+			data, total, _, err := vol.ReadFile(ctx, fileIno, 0, 100)
 			if err != nil {
-				t.Fatalf("ReadFile %s failed: %v", filePath, err)
+				t.Fatalf("ReadFile %d failed: %v", fileIno, err)
 			}
 			if total != int64(len(expectedContent)) || string(data) != expectedContent {
-				t.Fatalf("Content mismatch for %s: got %q, want %q", filePath, string(data), expectedContent)
+				t.Fatalf("Content mismatch for %d: got %q, want %q", fileIno, string(data), expectedContent)
 			}
 		}
 	}
 
 	// Perform mutations on evicted files (write and rename)
-	_, _, _, err := vol.WriteFile(ctx, "/dir1/file1.txt", 0, []byte("updated content!"), pb.WriteMode_LAZY_WRITE)
+	f1Ino := fileInodes["dir1/file1"]
+	_, _, _, err := vol.WriteFile(ctx, f1Ino, 0, []byte("updated content!"), pb.WriteMode_LAZY_WRITE)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	_, err = vol.Rename(ctx, "/dir2/file2.txt", "/dir2/file2_renamed.txt")
+	dir2Ino := dirInodes[2]
+	_, err = vol.Rename(ctx, dir2Ino, "file2.txt", dir2Ino, "file2_renamed.txt")
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
@@ -331,13 +338,13 @@ func TestTieredMetadataLRUEvictionAndReload(t *testing.T) {
 	}
 
 	// Verify updated file in recovered volume
-	upData, _, _, err := recoveredVol.ReadFile(ctx, "/dir1/file1.txt", 0, 100)
+	upData, _, _, err := recoveredVol.ReadFile(ctx, f1Ino, 0, 100)
 	if err != nil || string(upData) != "updated content!" {
 		t.Fatalf("Expected 'updated content!' in recovered volume, got %q (err=%v)", string(upData), err)
 	}
 
 	// Verify renamed file in recovered volume
-	renamedAttr, err := recoveredVol.GetAttr(ctx, "/dir2/file2_renamed.txt")
+	renamedAttr, err := recoveredVol.Lookup(ctx, dir2Ino, "file2_renamed.txt")
 	if err != nil || renamedAttr.Name != "file2_renamed.txt" {
 		t.Fatalf("Expected renamed file in recovered volume: %v", err)
 	}
@@ -356,22 +363,23 @@ func TestLargeDirectoryDeltaEviction(t *testing.T) {
 	defer vol.Close()
 
 	// 1. Create directory /bigdir with 50 files
-	_, err := vol.Mkdir(ctx, "/bigdir", 0755, 0, 0)
+	bigdirAttr, err := vol.Mkdir(ctx, 1, "bigdir", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("Mkdir /bigdir failed: %v", err)
 	}
+	bigdirIno := bigdirAttr.Inode
 
 	for i := 0; i < 50; i++ {
-		filePath := fmt.Sprintf("/bigdir/file_%03d.txt", i)
-		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("data-%d", i)), 0, 0)
+		fileName := fmt.Sprintf("file_%03d.txt", i)
+		_, err := vol.CreateFile(ctx, bigdirIno, fileName, 0644, []byte(fmt.Sprintf("data-%d", i)), 0, 0)
 		if err != nil {
-			t.Fatalf("CreateFile %s failed: %v", filePath, err)
+			t.Fatalf("CreateFile %s failed: %v", fileName, err)
 		}
 	}
 
 	// Force eviction of /bigdir by accessing root and another directory
-	_, _ = vol.Mkdir(ctx, "/otherdir", 0755, 0, 0)
-	_, _ = vol.GetAttr(ctx, "/")
+	_, _ = vol.Mkdir(ctx, 1, "otherdir", 0755, 0, 0)
+	_, _ = vol.GetAttr(ctx, 1)
 
 	// Verify /bigdir is recorded in dirtyDirs
 	if len(vol.dirtyDirs) == 0 {
@@ -379,19 +387,19 @@ func TestLargeDirectoryDeltaEviction(t *testing.T) {
 	}
 
 	// 2. Perform delta operations: delete 1 file and add 1 new file
-	if err := vol.Unlink(ctx, "/bigdir/file_005.txt"); err != nil {
+	if err := vol.Unlink(ctx, bigdirIno, "file_005.txt"); err != nil {
 		t.Fatalf("Unlink file_005 failed: %v", err)
 	}
-	_, err = vol.CreateFile(ctx, "/bigdir/new_file.txt", 0644, []byte("new file content"), 0, 0)
+	_, err = vol.CreateFile(ctx, bigdirIno, "new_file.txt", 0644, []byte("new file content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile new_file.txt failed: %v", err)
 	}
 
 	// Force eviction of /bigdir again
-	_, _ = vol.Mkdir(ctx, "/third_dir", 0755, 0, 0)
+	_, _ = vol.Mkdir(ctx, 1, "third_dir", 0755, 0, 0)
 
 	// 3. ReadDir /bigdir: should replay deltas correctly
-	entries, err := vol.ReadDir(ctx, "/bigdir")
+	entries, err := vol.ReadDir(ctx, bigdirIno)
 	if err != nil {
 		t.Fatalf("ReadDir /bigdir failed: %v", err)
 	}
@@ -432,10 +440,10 @@ func TestAutoSnapshotTriggerOnThreshold(t *testing.T) {
 
 	// Create 10 files which evicts and reaches threshold of 5 dirty records
 	for i := 0; i < 10; i++ {
-		filePath := fmt.Sprintf("/auto_file_%d.txt", i)
-		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("data-%d", i)), 0, 0)
+		fileName := fmt.Sprintf("auto_file_%d.txt", i)
+		_, err := vol.CreateFile(ctx, 1, fileName, 0644, []byte(fmt.Sprintf("data-%d", i)), 0, 0)
 		if err != nil {
-			t.Fatalf("CreateFile %s failed: %v", filePath, err)
+			t.Fatalf("CreateFile %s failed: %v", fileName, err)
 		}
 	}
 
@@ -555,14 +563,17 @@ func TestSnapshotCircularBufferTrimmingAndCap(t *testing.T) {
 	)
 	defer vol.Close()
 
+	fileInodes := make(map[int]uint64)
+
 	// Create 15 files to produce multiple evicted buffer files
 	for i := 1; i <= 15; i++ {
-		filePath := fmt.Sprintf("/file_%02d.txt", i)
+		fileName := fmt.Sprintf("file_%02d.txt", i)
 		content := []byte(fmt.Sprintf("content-data-for-file-%02d", i))
-		_, err := vol.CreateFile(ctx, filePath, 0644, content, 0, 0)
+		attr, err := vol.CreateFile(ctx, 1, fileName, 0644, content, 0, 0)
 		if err != nil {
-			t.Fatalf("CreateFile %s failed: %v", filePath, err)
+			t.Fatalf("CreateFile %s failed: %v", fileName, err)
 		}
+		fileInodes[i] = attr.Inode
 	}
 
 	// Take snapshot
@@ -581,23 +592,24 @@ func TestSnapshotCircularBufferTrimmingAndCap(t *testing.T) {
 
 	// Verify all 15 files can be read from the new base snapshot
 	for i := 1; i <= 15; i++ {
-		filePath := fmt.Sprintf("/file_%02d.txt", i)
+		ino := fileInodes[i]
 		expected := fmt.Sprintf("content-data-for-file-%02d", i)
-		data, total, _, err := vol.ReadFile(ctx, filePath, 0, 100)
+		data, total, _, err := vol.ReadFile(ctx, ino, 0, 100)
 		if err != nil {
-			t.Fatalf("ReadFile %s failed: %v", filePath, err)
+			t.Fatalf("ReadFile %d failed: %v", ino, err)
 		}
 		if total != int64(len(expected)) || string(data) != expected {
-			t.Fatalf("Content mismatch for %s: got %q, want %q", filePath, string(data), expected)
+			t.Fatalf("Content mismatch for %d: got %q, want %q", ino, string(data), expected)
 		}
 	}
 
 	// Perform subsequent mutations and verify a second snapshot succeeds
-	_, _, _, err = vol.WriteFile(ctx, "/file_01.txt", 0, []byte("updated file 1"), pb.WriteMode_LAZY_WRITE)
+	f1Ino := fileInodes[1]
+	_, _, _, err = vol.WriteFile(ctx, f1Ino, 0, []byte("updated file 1"), pb.WriteMode_LAZY_WRITE)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
-	_, err = vol.CreateFile(ctx, "/file_new.txt", 0644, []byte("new file content"), 0, 0)
+	newFileAttr, err := vol.CreateFile(ctx, 1, "file_new.txt", 0644, []byte("new file content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile file_new failed: %v", err)
 	}
@@ -611,11 +623,11 @@ func TestSnapshotCircularBufferTrimmingAndCap(t *testing.T) {
 	}
 
 	// Verify read on updated and new files
-	data1, _, _, err := vol.ReadFile(ctx, "/file_01.txt", 0, 100)
+	data1, _, _, err := vol.ReadFile(ctx, f1Ino, 0, 100)
 	if err != nil || string(data1) != "updated file 1" {
 		t.Fatalf("Expected 'updated file 1', got %q (err: %v)", string(data1), err)
 	}
-	dataNew, _, _, err := vol.ReadFile(ctx, "/file_new.txt", 0, 100)
+	dataNew, _, _, err := vol.ReadFile(ctx, newFileAttr.Inode, 0, 100)
 	if err != nil || string(dataNew) != "new file content" {
 		t.Fatalf("Expected 'new file content', got %q (err: %v)", string(dataNew), err)
 	}
@@ -637,10 +649,10 @@ func TestAutoSnapshotTriggerOnMaxBufferFiles(t *testing.T) {
 
 	// Create files causing multiple file rotations
 	for i := 0; i < 25; i++ {
-		filePath := fmt.Sprintf("/capped_file_%d.txt", i)
-		_, err := vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("some-data-payload-%d", i)), 0, 0)
+		fileName := fmt.Sprintf("capped_file_%d.txt", i)
+		_, err := vol.CreateFile(ctx, 1, fileName, 0644, []byte(fmt.Sprintf("some-data-payload-%d", i)), 0, 0)
 		if err != nil {
-			t.Fatalf("CreateFile %s failed: %v", filePath, err)
+			t.Fatalf("CreateFile %s failed: %v", fileName, err)
 		}
 	}
 
@@ -670,12 +682,14 @@ func TestTwoPhaseSnapshotConcurrentOperations(t *testing.T) {
 	)
 	defer vol.Close()
 
+	var initInodes []uint64
 	// Seed initial files
 	for i := 0; i < 5; i++ {
-		_, err := vol.CreateFile(ctx, fmt.Sprintf("/init_%d.txt", i), 0644, []byte(fmt.Sprintf("initial-%d", i)), 0, 0)
+		attr, err := vol.CreateFile(ctx, 1, fmt.Sprintf("init_%d.txt", i), 0644, []byte(fmt.Sprintf("initial-%d", i)), 0, 0)
 		if err != nil {
 			t.Fatalf("Initial CreateFile failed: %v", err)
 		}
+		initInodes = append(initInodes, attr.Inode)
 	}
 
 	var wg sync.WaitGroup
@@ -687,9 +701,11 @@ func TestTwoPhaseSnapshotConcurrentOperations(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for i := 0; i < 20; i++ {
-			filePath := fmt.Sprintf("/concurrent_file_%d.txt", i)
-			_, _ = vol.CreateFile(ctx, filePath, 0644, []byte(fmt.Sprintf("concurrent-payload-%d", i)), 0, 0)
-			_, _, _, _ = vol.WriteFile(ctx, filePath, 0, []byte(fmt.Sprintf("updated-payload-%d", i)), pb.WriteMode_LAZY_WRITE)
+			fileName := fmt.Sprintf("concurrent_file_%d.txt", i)
+			attr, _ := vol.CreateFile(ctx, 1, fileName, 0644, []byte(fmt.Sprintf("concurrent-payload-%d", i)), 0, 0)
+			if attr != nil {
+				_, _, _, _ = vol.WriteFile(ctx, attr.Inode, 0, []byte(fmt.Sprintf("updated-payload-%d", i)), pb.WriteMode_LAZY_WRITE)
+			}
 			time.Sleep(1 * time.Millisecond)
 		}
 	}()
@@ -700,7 +716,8 @@ func TestTwoPhaseSnapshotConcurrentOperations(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for i := 0; i < 20; i++ {
-			_, _, _, _ = vol.ReadFile(ctx, fmt.Sprintf("/init_%d.txt", i%5), 0, 50)
+			ino := initInodes[i%5]
+			_, _, _, _ = vol.ReadFile(ctx, ino, 0, 50)
 			time.Sleep(1 * time.Millisecond)
 		}
 	}()
