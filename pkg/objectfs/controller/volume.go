@@ -1681,6 +1681,8 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 			node.Ctime = node.ModTime
 		}
 
+		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+
 		return node, nil
 	}
 
