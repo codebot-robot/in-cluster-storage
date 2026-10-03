@@ -143,6 +143,17 @@ type Volume struct {
 
 	sqliteCache         *LRUCache[SQLiteCacheKey, *SQLiteCachedRow]
 	sqliteCacheDisabled bool
+	sqliteOverlay       map[SQLiteCacheKey]SQLiteOverlayEntry
+	unappliedBytes      int64
+	maxUnappliedBytes   int64
+	applierBatchSize    int
+	applierFaultHook    func() error
+	sqliteApplier       *sqliteApplier
+	sqliteAppliedPos    uint64
+	backpressureCond    *sync.Cond
+	flushCond           *sync.Cond
+	closed              bool
+	closedCh            chan struct{}
 
 	snapshotCutoff LocalOffset
 	snapshotMu     sync.Mutex
@@ -239,6 +250,27 @@ func WithSQLiteCacheDisabled(disabled bool) VolumeOption {
 	}
 }
 
+// WithMaxUnappliedBytes sets the maximum byte bound for unapplied overlay rows before applying backpressure.
+func WithMaxUnappliedBytes(maxBytes int64) VolumeOption {
+	return func(v *Volume) {
+		v.maxUnappliedBytes = maxBytes
+	}
+}
+
+// WithApplierBatchSize sets the maximum batch size for the background SQLite applier.
+func WithApplierBatchSize(batchSize int) VolumeOption {
+	return func(v *Volume) {
+		v.applierBatchSize = batchSize
+	}
+}
+
+// WithApplierFaultHook sets a fault injection callback for the background SQLite applier (testing only).
+func WithApplierFaultHook(hook func() error) VolumeOption {
+	return func(v *Volume) {
+		v.applierFaultHook = hook
+	}
+}
+
 // WithLocalStorageDir sets the local directory for evicted metadata storage.
 func WithLocalStorageDir(dir string) VolumeOption {
 	return func(v *Volume) {
@@ -277,23 +309,29 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 			dirtyInodes: make(map[uint64]LocalOffset),
 			dirtyDirs:   make(map[uint64]LocalOffset),
 		},
-		volumeID:         volumeID,
-		rootInodeID:      0,
-		nextInode:        erofs.DefaultInodeStride,
-		backend:          backend,
-		blobStore:        blobStore,
-		broadcaster:      broadcaster,
-		maxInlineLen:     4096,      // 4KB default inline threshold for tiny files
-		chunkSize:        64 * 1024, // 64KB default chunk size
-		durability:       walclient.Local,
-		streamID:         StreamIDForVolume(volumeID),
-		maxBufferFiles:   4,
-		maxDirtyRecords:  100000,
-		maxLocalFileSize: 250 * 1024 * 1024,
-		recoveredContent: make(map[string][]byte),
-		dirParents:       make(map[uint64]uint64),
-		inodeUploads:     make(map[uint64]*InodeUpload),
+		volumeID:          volumeID,
+		rootInodeID:       0,
+		nextInode:         erofs.DefaultInodeStride,
+		backend:           backend,
+		blobStore:         blobStore,
+		broadcaster:       broadcaster,
+		maxInlineLen:      4096,      // 4KB default inline threshold for tiny files
+		chunkSize:         64 * 1024, // 64KB default chunk size
+		durability:        walclient.Local,
+		streamID:          StreamIDForVolume(volumeID),
+		maxBufferFiles:    4,
+		maxDirtyRecords:   100000,
+		maxLocalFileSize:  250 * 1024 * 1024,
+		maxUnappliedBytes: 64 * 1024 * 1024,
+		applierBatchSize:  defaultApplierBatchSize,
+		sqliteOverlay:     make(map[SQLiteCacheKey]SQLiteOverlayEntry),
+		closedCh:          make(chan struct{}),
+		recoveredContent:  make(map[string][]byte),
+		dirParents:        make(map[uint64]uint64),
+		inodeUploads:      make(map[uint64]*InodeUpload),
 	}
+	v.backpressureCond = sync.NewCond(&v.mu)
+	v.flushCond = sync.NewCond(&v.mu)
 
 	v.inodeCache = NewLRUCache[uint64, *CachedInode](10000, v.onEvictInode)
 	v.dirCache = NewLRUCache[uint64, *CachedDir](2000, v.onEvictDir)
@@ -355,6 +393,11 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 				v.applyChangesToSQLiteCacheLocked(initChanges)
 			}
 		}
+		if v.sqliteDB != nil {
+			v.sqliteAppliedPos = v.sqliteDB.Position()
+		}
+		v.sqliteApplier = newSQLiteApplier(v, v.applierBatchSize, v.applierFaultHook)
+		v.sqliteApplier.start()
 		v.rootInodeID = 1
 		v.nextInode = erofs.DefaultInodeStride
 	} else {
@@ -513,7 +556,7 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
 		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(node.ID)}, 1)
 		if pErr == nil {
-			chunkMsgs, sErr := v.sqliteDB.Scan(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+			chunkMsgs, sErr := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 			if sErr == nil {
 				for _, cMsg := range chunkMsgs {
 					chunk := cMsg.(*pb.FileChunk)
@@ -827,6 +870,28 @@ func (v *Volume) Durability() walclient.Level {
 
 // Close closes the volume, local storage, and any underlying WAL streams.
 func (v *Volume) Close() error {
+	v.mu.Lock()
+	v.closed = true
+	if v.closedCh != nil {
+		select {
+		case <-v.closedCh:
+		default:
+			close(v.closedCh)
+		}
+	}
+	if v.backpressureCond != nil {
+		v.backpressureCond.Broadcast()
+	}
+	if v.flushCond != nil {
+		v.flushCond.Broadcast()
+	}
+	applier := v.sqliteApplier
+	v.mu.Unlock()
+
+	if applier != nil {
+		applier.stop()
+	}
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -1206,7 +1271,282 @@ func (v *Volume) SetSQLiteCacheLimits(maxEntries int, maxBytes int64) {
 	}
 }
 
+// ApplyLag returns the difference between the stream sequence of the last committed transaction
+// and the position applied to SQLite.
+func (v *Volume) ApplyLag() uint64 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.lastCommitSeq > v.sqliteAppliedPos {
+		return v.lastCommitSeq - v.sqliteAppliedPos
+	}
+	return 0
+}
+
+// ApplyFailures returns the total number of batch apply failures encountered by the background applier.
+func (v *Volume) ApplyFailures() uint64 {
+	if v.sqliteApplier != nil {
+		return v.sqliteApplier.failures.Load()
+	}
+	return 0
+}
+
+// IsDegraded returns whether the SQLite metadata store is currently in a degraded state due to persistent errors.
+func (v *Volume) IsDegraded() bool {
+	if v.sqliteApplier != nil {
+		return v.sqliteApplier.isDegraded.Load()
+	}
+	return false
+}
+
+// UnappliedBytes returns the current memory footprint in bytes of unapplied overlay rows.
+func (v *Volume) UnappliedBytes() int64 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.unappliedBytes
+}
+
+// SetApplierFaultHook configures a fault injection callback for the background SQLite applier (testing only).
+func (v *Volume) SetApplierFaultHook(hook func() error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.applierFaultHook = hook
+	if v.sqliteApplier != nil {
+		v.sqliteApplier.faultHook = hook
+	}
+}
+
+// SQLiteAppliedPosition returns the highest stream sequence position applied to SQLite.
+func (v *Volume) SQLiteAppliedPosition() uint64 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.sqliteAppliedPos
+}
+
+// FlushOverlay blocks until all currently committed stream transactions have been applied to SQLite.
+func (v *Volume) FlushOverlay(ctx context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.flushOverlayLocked(ctx)
+}
+
+func (v *Volume) flushOverlayLocked(ctx context.Context) error {
+	if v.metadataStore != MetadataStoreSQLite || v.sqliteApplier == nil {
+		return nil
+	}
+
+	targetSeq := v.lastCommitSeq
+	for (v.sqliteAppliedPos < targetSeq || len(v.sqliteOverlay) > 0) && !v.closed {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		v.sqliteApplier.wake()
+		v.flushCond.Wait()
+	}
+	if v.closed {
+		return fmt.Errorf("volume closed")
+	}
+	return nil
+}
+
+func (v *Volume) checkBackpressureLocked(ctx context.Context) error {
+	if v.maxUnappliedBytes <= 0 || v.metadataStore != MetadataStoreSQLite {
+		return nil
+	}
+	if v.unappliedBytes < v.maxUnappliedBytes {
+		return nil
+	}
+
+	ctxDone := ctx.Done()
+	if ctxDone != nil {
+		stopCancel := make(chan struct{})
+		defer close(stopCancel)
+		go func() {
+			select {
+			case <-ctxDone:
+				v.mu.Lock()
+				if v.backpressureCond != nil {
+					v.backpressureCond.Broadcast()
+				}
+				v.mu.Unlock()
+			case <-stopCancel:
+			case <-v.closedCh:
+			}
+		}()
+	}
+
+	for v.unappliedBytes >= v.maxUnappliedBytes && !v.closed {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if v.sqliteApplier != nil {
+			v.sqliteApplier.wake()
+		}
+		v.backpressureCond.Wait()
+	}
+	if v.closed {
+		return fmt.Errorf("volume closed")
+	}
+	return ctx.Err()
+}
+
+func (v *Volume) recordOverlayTxChangesLocked(tx *sds.Tx) {
+	if tx == nil || v.metadataStore != MetadataStoreSQLite {
+		return
+	}
+	changes := tx.Changes()
+	if len(changes) == 0 {
+		return
+	}
+
+	if v.sqliteOverlay == nil {
+		v.sqliteOverlay = make(map[SQLiteCacheKey]SQLiteOverlayEntry)
+	}
+
+	for _, ch := range changes {
+		typeName := ch.TypeName
+		if typeName == "" && v.metadataStream != nil {
+			if def, _, ok := v.metadataStream.Registry().LookupByID(ch.TypeID); ok {
+				typeName = def.GetName()
+			}
+		}
+		if typeName == "" && v.sqliteDB != nil {
+			if def, _, ok := v.sqliteDB.Registry().LookupByID(ch.TypeID); ok {
+				typeName = def.GetName()
+			}
+		}
+		if typeName == "" {
+			continue
+		}
+
+		key := ch.Key
+		if key.IsZero() && len(ch.RawKey) > 0 {
+			key = sds.NewKeyFromBytes(ch.RawKey)
+		}
+		ck := SQLiteCacheKey{Table: typeName, Key: key}
+
+		sz := int64(len(typeName) + len(key.String()) + 96)
+		if ch.Row != nil {
+			sz += int64(proto.Size(ch.Row))
+		}
+
+		if old, ok := v.sqliteOverlay[ck]; ok {
+			v.unappliedBytes += sz - old.Size
+		} else {
+			v.unappliedBytes += sz
+		}
+
+		var op sdsv1.OpRecord_Op
+		switch ch.Op {
+		case sds.OpCreate:
+			op = sdsv1.OpRecord_CREATE
+		case sds.OpUpdate:
+			op = sdsv1.OpRecord_UPDATE
+		case sds.OpDelete:
+			op = sdsv1.OpRecord_DELETE
+		}
+
+		v.sqliteOverlay[ck] = SQLiteOverlayEntry{
+			Op:   op,
+			Row:  ch.Row,
+			Seq:  ch.Seq,
+			Size: sz,
+		}
+	}
+
+	if v.sqliteApplier != nil {
+		v.sqliteApplier.enqueueLocked(changes)
+	}
+}
+
+func (v *Volume) scanSQLiteRowsLocked(ctx context.Context, typeName string, prefixBytes []byte) ([]proto.Message, error) {
+	var sqliteMsgs []proto.Message
+	if v.sqliteDB != nil {
+		var err error
+		sqliteMsgs, err = v.sqliteDB.Scan(ctx, typeName, prefixBytes)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(v.sqliteOverlay) == 0 {
+		return sqliteMsgs, nil
+	}
+
+	type rowEntry struct {
+		key sds.Key
+		msg proto.Message
+	}
+	merged := make(map[string]rowEntry)
+
+	for _, msg := range sqliteMsgs {
+		var k sds.Key
+		switch m := msg.(type) {
+		case *pb.DirEntry:
+			k, _ = pkDirEntry.Extract(m)
+		case *pb.FileChunk:
+			k, _ = pkFileChunk.Extract(m)
+		case *pb.Inode:
+			k, _ = pkInode.Extract(m)
+		}
+		if !k.IsZero() {
+			merged[k.String()] = rowEntry{key: k, msg: msg}
+		}
+	}
+
+	for ck, entry := range v.sqliteOverlay {
+		if ck.Table != typeName {
+			continue
+		}
+		if len(prefixBytes) > 0 && !bytes.HasPrefix(ck.Key.Bytes(), prefixBytes) {
+			continue
+		}
+		kStr := ck.Key.String()
+		if entry.Op == sdsv1.OpRecord_DELETE || entry.Row == nil {
+			delete(merged, kStr)
+		} else {
+			merged[kStr] = rowEntry{key: ck.Key, msg: entry.Row}
+		}
+	}
+
+	rows := make([]rowEntry, 0, len(merged))
+	for _, r := range merged {
+		rows = append(rows, r)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		return bytes.Compare(rows[i].key.Bytes(), rows[j].key.Bytes()) < 0
+	})
+
+	result := make([]proto.Message, len(rows))
+	for i, r := range rows {
+		result[i] = r.msg
+	}
+	return result, nil
+}
+
+func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, typeName string, prefixBytes []byte, limit int) ([]proto.Message, error) {
+	msgs, err := v.scanSQLiteRowsLocked(ctx, typeName, prefixBytes)
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && len(msgs) > limit {
+		msgs = msgs[:limit]
+	}
+	return msgs, nil
+}
+
 func (v *Volume) getSQLiteRowLocked(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
+	// 1. Check unapplied in-memory overlay first
+	if v.sqliteOverlay != nil {
+		ck := SQLiteCacheKey{Table: typeName, Key: key}
+		if entry, ok := v.sqliteOverlay[ck]; ok {
+			if entry.Op == sdsv1.OpRecord_DELETE || entry.Row == nil {
+				return nil, false, nil
+			}
+			return entry.Row, true, nil
+		}
+	}
+
+	// 2. Check read cache
 	if v.sqliteCache != nil && !v.sqliteCacheDisabled {
 		ck := SQLiteCacheKey{Table: typeName, Key: key}
 		if row, ok := v.sqliteCache.Get(ck); ok {
@@ -1221,6 +1561,7 @@ func (v *Volume) getSQLiteRowLocked(ctx context.Context, typeName string, key sd
 		return nil, false, nil
 	}
 
+	// 3. Query SQLite
 	msg, ok, err := v.sqliteDB.Get(ctx, typeName, key)
 	if err != nil {
 		return nil, false, err
@@ -1336,7 +1677,7 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 		if pErr != nil {
 			return nil, pErr
 		}
-		entryMsgs, err := v.sqliteDB.Scan(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
+		entryMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -1576,7 +1917,7 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 		if pErr != nil {
 			return nil, pErr
 		}
-		entryMsgs, err := v.sqliteDB.Scan(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
+		entryMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -1625,15 +1966,7 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 
 func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) error {
 	if v.metadataStore == MetadataStoreSQLite && tx != nil {
-		changes := tx.Changes()
-		if len(changes) > 0 {
-			if v.sqliteDB != nil {
-				if err := v.sqliteDB.ApplyBatch(ctx, changes); err != nil {
-					return fmt.Errorf("failed to apply changes to SQLite metadata store: %w", err)
-				}
-			}
-			v.applyChangesToSQLiteCacheLocked(changes)
-		}
+		v.recordOverlayTxChangesLocked(tx)
 	}
 	return nil
 }
@@ -1646,6 +1979,10 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
+
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, nil, err
+		}
 
 		if parentInodeID == 0 {
 			parentInodeID = v.rootInodeID
@@ -1849,6 +2186,10 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, nil, err
+		}
+
 		if parentInodeID == 0 {
 			parentInodeID = v.rootInodeID
 		}
@@ -1944,7 +2285,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 				if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
 					prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.ID)}, 1)
-					chunkMsgs, _ := v.sqliteDB.Scan(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+					chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 					for _, msg := range chunkMsgs {
 						c := msg.(*pb.FileChunk)
 						if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(c.GetIndex())}); err != nil {
@@ -1995,7 +2336,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 				if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
 					prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.ID)}, 1)
-					chunkMsgs, _ := v.sqliteDB.Scan(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+					chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 					for _, msg := range chunkMsgs {
 						c := msg.(*pb.FileChunk)
 						if _, stillPresent := childInode.Chunks[c.GetIndex()]; !stillPresent {
@@ -2403,6 +2744,10 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return 0, 0, time.Time{}, nil, err
+		}
+
 		if inodeID == 0 {
 			inodeID = v.rootInodeID
 		}
@@ -2717,6 +3062,10 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, nil, err
+		}
+
 		if inodeID == 0 {
 			inodeID = v.rootInodeID
 		}
@@ -2986,6 +3335,10 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, err
+		}
+
 		childInode, err := v.getOrLoadInodeLocked(ctx, childInodeID)
 		if err != nil {
 			return nil, err
@@ -3019,7 +3372,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		}
 		if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
 			prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInodeID)}, 1)
-			chunkMsgs, _ := v.sqliteDB.Scan(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+			chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 			for _, msg := range chunkMsgs {
 				c := msg.(*pb.FileChunk)
 				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
@@ -3096,6 +3449,10 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, err
+		}
+
 		if parentInodeID == 0 {
 			parentInodeID = v.rootInodeID
 		}
@@ -3123,7 +3480,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 			if pErr != nil {
 				return nil, pErr
 			}
-			subEntries, err := v.sqliteDB.ScanLimit(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes, 1)
+			subEntries, err := v.scanLimitSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes, 1)
 			if err != nil {
 				return nil, err
 			}
@@ -3237,6 +3594,10 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
+
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, nil, err
+		}
 
 		if oldParentInodeID == 0 {
 			oldParentInodeID = v.rootInodeID
@@ -3822,6 +4183,9 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 	snapPos := v.safeSnapshotPositionLocked()
 
 	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil && v.backend != nil {
+		if err := v.flushOverlayLocked(ctx); err != nil {
+			return err
+		}
 		snapKey, actualPos, err := sqlite.PublishSnapshot(ctx, v.sqliteDB, v.backend, os.TempDir())
 		if err == nil && v.metadataStream != nil {
 			ptr := &sdsv1.SnapshotPointer{
@@ -4990,6 +5354,17 @@ func (v *Volume) loadFromBackendSQLiteLocked(ctx context.Context) error {
 
 	if v.sqliteCache != nil {
 		v.sqliteCache.Clear()
+	}
+	if v.sqliteOverlay != nil {
+		clear(v.sqliteOverlay)
+		v.unappliedBytes = 0
+	}
+	if v.sqliteDB != nil {
+		v.sqliteAppliedPos = v.sqliteDB.Position()
+	}
+	if v.sqliteApplier == nil {
+		v.sqliteApplier = newSQLiteApplier(v, v.applierBatchSize, v.applierFaultHook)
+		v.sqliteApplier.start()
 	}
 
 	v.updateNextInodeFromSQLiteLocked(ctx)

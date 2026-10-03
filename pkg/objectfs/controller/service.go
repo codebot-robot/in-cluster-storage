@@ -93,13 +93,15 @@ type Server struct {
 	blobStore   *blob.Store
 	broadcaster *EventBroadcaster
 
-	walDir               string
-	walTarget            string
-	defaultDurability    walclient.Level
-	metadataStore        string
-	metadataCacheEntries int
-	metadataCacheBytes   int64
-	streamFactory        func(volumeID string) (walclient.Stream, error)
+	walDir                   string
+	walTarget                string
+	defaultDurability        walclient.Level
+	metadataStore            string
+	metadataCacheEntries     int
+	metadataCacheBytes       int64
+	metadataOverlayMaxBytes  int64
+	metadataApplierBatchSize int
+	streamFactory            func(volumeID string) (walclient.Stream, error)
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -147,6 +149,20 @@ func WithServerMetadataCacheLimits(maxEntries int, maxBytes int64) ServerOption 
 	}
 }
 
+// WithServerMetadataOverlayMaxBytes sets the maximum byte bound for unapplied overlay rows before applying backpressure.
+func WithServerMetadataOverlayMaxBytes(maxBytes int64) ServerOption {
+	return func(s *Server) {
+		s.metadataOverlayMaxBytes = maxBytes
+	}
+}
+
+// WithServerMetadataApplierBatchSize sets the maximum batch size for the background SQLite applier.
+func WithServerMetadataApplierBatchSize(batchSize int) ServerOption {
+	return func(s *Server) {
+		s.metadataApplierBatchSize = batchSize
+	}
+}
+
 func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if backend == nil {
 		backend = NewMemoryBackend()
@@ -191,6 +207,12 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if s.metadataCacheEntries > 0 || s.metadataCacheBytes > 0 {
 			volOpts = append(volOpts, WithMetadataCacheLimits(s.metadataCacheEntries, s.metadataCacheBytes))
+		}
+		if s.metadataOverlayMaxBytes > 0 {
+			volOpts = append(volOpts, WithMaxUnappliedBytes(s.metadataOverlayMaxBytes))
+		}
+		if s.metadataApplierBatchSize > 0 {
+			volOpts = append(volOpts, WithApplierBatchSize(s.metadataApplierBatchSize))
 		}
 
 		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)

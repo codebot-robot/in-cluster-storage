@@ -18,10 +18,13 @@ package controller
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -474,6 +477,9 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
 
 	// 4. Lookup now succeeds directly from cache (hit!)
 	lookupAttr, err := vol.Lookup(ctx, 1, "does_not_exist.txt")
@@ -507,6 +513,9 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	err = vol.Unlink(ctx, 1, "does_not_exist.txt")
 	if err != nil {
 		t.Fatalf("Unlink failed: %v", err)
+	}
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
 	}
 
 	// 7. Lookup after deletion -> immediate negative cache hit (no SQLite query!)
@@ -548,6 +557,9 @@ func TestSQLiteReadCacheCoherence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
 
 	// Old name should be negative cache hit
 	vol.SQLiteCacheResetStats()
@@ -574,6 +586,9 @@ func TestSQLiteReadCacheCoherence(t *testing.T) {
 	_, err = vol.TruncateFile(ctx, fAttr.Inode, 100)
 	if err != nil {
 		t.Fatalf("TruncateFile failed: %v", err)
+	}
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
 	}
 	tAttr, err := vol.GetAttr(ctx, fAttr.Inode)
 	if err != nil {
@@ -725,4 +740,460 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 	stats := vol.SQLiteCacheStats()
 	t.Logf("Concurrent stress test completed: Hits=%d Misses=%d HitRate=%.2f%% Entries=%d Bytes=%d KB",
 		stats.Hits, stats.Misses, stats.HitRate*100, stats.Entries, stats.Bytes/1024)
+}
+
+func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-overlay-lag"
+
+	var faultActive atomic.Bool
+	faultActive.Store(true)
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+		WithApplierFaultHook(func() error {
+			if faultActive.Load() {
+				return errors.New("simulated SQLite apply fault")
+			}
+			return nil
+		}),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// 1. Create directory and files while SQLite applier is stalled by fault hook
+	dirAttr, err := vol.Mkdir(ctx, 1, "testdir", 0755, 1000, 1000)
+	if err != nil {
+		t.Fatalf("Mkdir failed despite log append commit: %v", err)
+	}
+
+	fAttr1, err := vol.CreateFile(ctx, dirAttr.Inode, "file1.txt", 0644, []byte("contents-of-file-1"), 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile 1 failed: %v", err)
+	}
+
+	_, err = vol.CreateFile(ctx, dirAttr.Inode, "file2.txt", 0644, []byte("contents-of-file-2"), 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile 2 failed: %v", err)
+	}
+
+	// Rename file2 to file2_renamed
+	_, err = vol.Rename(ctx, dirAttr.Inode, "file2.txt", dirAttr.Inode, "file2_renamed.txt")
+	if err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+
+	// Create file3, then unlink it
+	_, err = vol.CreateFile(ctx, dirAttr.Inode, "file3.txt", 0644, []byte("temp"), 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile 3 failed: %v", err)
+	}
+	if err := vol.Unlink(ctx, dirAttr.Inode, "file3.txt"); err != nil {
+		t.Fatalf("Unlink failed: %v", err)
+	}
+
+	// Write more data to file1
+	_, _, _, err = vol.WriteFile(ctx, fAttr1.Inode, 0, []byte("updated-contents-1"), 0)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// 2. Verify lag exists and overlay is active
+	lag := vol.ApplyLag()
+	unappliedBytes := vol.UnappliedBytes()
+	if lag == 0 {
+		t.Fatalf("expected ApplyLag > 0 while fault hook is active, got %d", lag)
+	}
+	if unappliedBytes == 0 {
+		t.Fatalf("expected UnappliedBytes > 0, got %d", unappliedBytes)
+	}
+
+	// 3. Reads during lag: MUST return latest state directly from overlay
+	// Lookup file1
+	lAttr1, err := vol.Lookup(ctx, dirAttr.Inode, "file1.txt")
+	if err != nil {
+		t.Fatalf("Lookup file1 failed during lag: %v", err)
+	}
+	if lAttr1.Inode != fAttr1.Inode || lAttr1.Size != int64(len("updated-contents-1")) {
+		t.Fatalf("unexpected attr for file1: %+v", lAttr1)
+	}
+
+	// Lookup renamed file2
+	lAttr2, err := vol.Lookup(ctx, dirAttr.Inode, "file2_renamed.txt")
+	if err != nil {
+		t.Fatalf("Lookup file2_renamed failed during lag: %v", err)
+	}
+	if lAttr2.Name != "file2_renamed.txt" {
+		t.Fatalf("unexpected name: %s", lAttr2.Name)
+	}
+
+	// Lookup old name of file2 -> ENOENT
+	_, err = vol.Lookup(ctx, dirAttr.Inode, "file2.txt")
+	if err == nil {
+		t.Fatalf("expected ENOENT for old name of file2")
+	}
+
+	// Lookup deleted file3 -> ENOENT
+	_, err = vol.Lookup(ctx, dirAttr.Inode, "file3.txt")
+	if err == nil {
+		t.Fatalf("expected ENOENT for unlinked file3")
+	}
+
+	// ReadDir on testdir during lag -> should see file1.txt and file2_renamed.txt (2 entries)
+	entries, err := vol.ReadDir(ctx, dirAttr.Inode)
+	if err != nil {
+		t.Fatalf("ReadDir failed during lag: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries in testdir during lag, got %d", len(entries))
+	}
+	names := []string{entries[0].Name, entries[1].Name}
+	if names[0] != "file1.txt" || names[1] != "file2_renamed.txt" {
+		t.Fatalf("unexpected entries in ReadDir: %v", names)
+	}
+
+	// 4. Clear the fault -> applier retries with backoff and converges to 0 lag
+	faultActive.Store(false)
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed after clearing fault: %v", err)
+	}
+
+	if finalLag := vol.ApplyLag(); finalLag != 0 {
+		t.Fatalf("expected ApplyLag == 0 after flush, got %d", finalLag)
+	}
+	if finalUnapplied := vol.UnappliedBytes(); finalUnapplied != 0 {
+		t.Fatalf("expected UnappliedBytes == 0 after flush, got %d", finalUnapplied)
+	}
+
+	// Verify reads still return correct state once applied to SQLite
+	entriesAfter, err := vol.ReadDir(ctx, dirAttr.Inode)
+	if err != nil {
+		t.Fatalf("ReadDir after flush failed: %v", err)
+	}
+	if len(entriesAfter) != 2 {
+		t.Fatalf("expected 2 entries after flush, got %d", len(entriesAfter))
+	}
+}
+
+func TestSQLiteApplierCoalescing(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-coalesce"
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+		WithApplierBatchSize(100),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Create a single file
+	attr, err := vol.CreateFile(ctx, 1, "hot_file.bin", 0644, []byte("initial"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// Rapidly perform 30 write and truncate operations on the same inode
+	for i := 0; i < 30; i++ {
+		payload := fmt.Sprintf("iteration-%d", i)
+		_, _, _, err = vol.WriteFile(ctx, attr.Inode, 0, []byte(payload), 0)
+		if err != nil {
+			t.Fatalf("WriteFile iter %d failed: %v", i, err)
+		}
+	}
+
+	// Flush overlay to SQLite
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	// Verify final state
+	finalAttr, err := vol.GetAttr(ctx, attr.Inode)
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	expectedLen := int64(len("iteration-29"))
+	if finalAttr.Size != expectedLen {
+		t.Fatalf("expected size %d, got %d", expectedLen, finalAttr.Size)
+	}
+}
+
+func TestSQLiteApplierFaultInjectionAndDegradedState(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-fault-degraded"
+
+	var faultActive atomic.Bool
+	faultActive.Store(true)
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+		WithApplierFaultHook(func() error {
+			if faultActive.Load() {
+				return errors.New("simulated SQLite disk I/O error")
+			}
+			return nil
+		}),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Perform operations that succeed on log append
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("degraded_test_%d.txt", i)
+		_, err := vol.CreateFile(ctx, 1, name, 0644, []byte("sample"), 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, err)
+		}
+	}
+
+	// Wait briefly for applier to retry and trigger degraded threshold (>= 3 consecutive failures)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if vol.IsDegraded() && vol.ApplyFailures() >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !vol.IsDegraded() {
+		t.Fatalf("expected store to be marked DEGRADED after consecutive failures, failures=%d", vol.ApplyFailures())
+	}
+
+	// Clear fault hook
+	faultActive.Store(false)
+
+	// Flush overlay -> should recover from degraded and complete
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed after clearing fault: %v", err)
+	}
+
+	if vol.IsDegraded() {
+		t.Fatalf("expected store to no longer be marked DEGRADED after successful apply")
+	}
+}
+
+func TestSQLiteBackpressureUnderLag(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-backpressure"
+
+	var faultActive atomic.Bool
+	faultActive.Store(true)
+
+	// Configure a tight bound on unapplied overlay bytes (e.g. 1024 bytes)
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+		WithMaxUnappliedBytes(1024),
+		WithApplierFaultHook(func() error {
+			if faultActive.Load() {
+				return errors.New("simulated SQLite backpressure fault")
+			}
+			return nil
+		}),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Write single file that exceeds overlay capacity
+	_, err := vol.CreateFile(ctx, 1, "bp_file.bin", 0644, make([]byte, 1500), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	if vol.UnappliedBytes() < 1024 {
+		t.Fatalf("expected UnappliedBytes >= 1024, got %d", vol.UnappliedBytes())
+	}
+
+	// The next operation with a short timeout should be blocked by backpressure and time out
+	timeoutCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err = vol.CreateFile(timeoutCtx, 1, "blocked.txt", 0644, []byte("data"), 0, 0)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded due to backpressure block, got %v", err)
+	}
+
+	// Clear fault -> applier drains overlay, unapplied bytes decrease, writers proceed
+	faultActive.Store(false)
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	if ub := vol.UnappliedBytes(); ub != 0 {
+		t.Fatalf("expected UnappliedBytes == 0 after flush, got %d", ub)
+	}
+
+	// Now writing succeeds immediately without blocking
+	_, err = vol.CreateFile(ctx, 1, "unblocked.txt", 0644, []byte("success"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile after backpressure release failed: %v", err)
+	}
+}
+
+func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	walDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-crash-burst"
+
+	streamID := StreamIDForVolume(volID)
+	stream, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("Open WAL stream failed: %v", err)
+	}
+
+	var stallApplier atomic.Bool
+	stallApplier.Store(true)
+
+	// Start volume with stalled SQLite applier so writes accumulate in stream and overlay
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+		WithStream(stream),
+		WithApplierFaultHook(func() error {
+			if stallApplier.Load() {
+				return errors.New("stalled SQLite applier to simulate lag before crash")
+			}
+			return nil
+		}),
+	)
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Perform burst of 30 acknowledged file creates and writes
+	expectedFiles := make(map[string]int64)
+	for i := 0; i < 30; i++ {
+		name := fmt.Sprintf("burst_file_%d.txt", i)
+		content := fmt.Sprintf("burst-content-%d", i)
+		attr, cErr := vol.CreateFile(ctx, 1, name, 0644, []byte(content), 0, 0)
+		if cErr != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, cErr)
+		}
+		expectedFiles[name] = attr.Size
+	}
+
+	// Confirm lag is positive (SQLite is behind stream log)
+	if vol.ApplyLag() == 0 {
+		t.Fatalf("expected ApplyLag > 0 before crash simulation")
+	}
+
+	// Abruptly close volume and stream without flushing overlay (simulating kill -9 / crash)
+	_ = vol.Close()
+
+	// 2. Restart from backend: open new stream and volume with the same storage dirs
+	newStream, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("Reopen WAL stream failed: %v", err)
+	}
+
+	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+		WithStream(newStream),
+	)
+	defer vol2.Close()
+
+	if err := vol2.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend on recovered volume failed: %v", err)
+	}
+
+	// 3. Verify ALL acknowledged state is completely restored
+	entries, err := vol2.ReadDir(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReadDir on recovered volume failed: %v", err)
+	}
+	if len(entries) != len(expectedFiles) {
+		t.Fatalf("expected %d entries after crash recovery, got %d", len(expectedFiles), len(entries))
+	}
+
+	for _, entry := range entries {
+		expectedSize, ok := expectedFiles[entry.Name]
+		if !ok {
+			t.Fatalf("unexpected entry %q in recovered directory", entry.Name)
+		}
+		if entry.Size != expectedSize {
+			t.Fatalf("entry %q size %d != expected %d", entry.Name, entry.Size, expectedSize)
+		}
+	}
+}
+
+func TestSQLiteSnapshotFlushesOverlay(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-snap-flush"
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Create files
+	for i := 0; i < 5; i++ {
+		_, err := vol.CreateFile(ctx, 1, fmt.Sprintf("snap_f_%d.txt", i), 0644, []byte("data"), 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile failed: %v", err)
+		}
+	}
+
+	// Trigger snapshot flush to backend
+	if err := vol.FlushToBackend(ctx); err != nil {
+		t.Fatalf("FlushToBackend failed: %v", err)
+	}
+
+	// Verify overlay is completely clean
+	if unapplied := vol.UnappliedBytes(); unapplied != 0 {
+		t.Fatalf("expected UnappliedBytes == 0 after snapshot flush, got %d", unapplied)
+	}
+	if lag := vol.ApplyLag(); lag != 0 {
+		t.Fatalf("expected ApplyLag == 0 after snapshot flush, got %d", lag)
+	}
+
+	// Restore from published snapshot on fresh volume to confirm validity
+	freshDir := t.TempDir()
+	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(freshDir),
+	)
+	defer vol2.Close()
+
+	if err := vol2.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend from published snapshot failed: %v", err)
+	}
+
+	entries, err := vol2.ReadDir(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReadDir on fresh volume failed: %v", err)
+	}
+	if len(entries) != 5 {
+		t.Fatalf("expected 5 files in restored snapshot, got %d", len(entries))
+	}
 }
