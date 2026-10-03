@@ -92,6 +92,11 @@ type metadataResolver struct {
 	dirtyDirs map[uint64]LocalOffset
 }
 
+type InodeUpload struct {
+	wg  sync.WaitGroup
+	err error
+}
+
 type Volume struct {
 	metadataResolver
 
@@ -104,6 +109,10 @@ type Volume struct {
 	broadcaster  *EventBroadcaster
 	maxInlineLen int64
 	chunkSize    uint32
+
+	pendingUploadsMu sync.Mutex
+	pendingUploadsWg sync.WaitGroup
+	inodeUploads     map[uint64]*InodeUpload
 
 	stream     walclient.Stream
 	durability walclient.Level
@@ -219,8 +228,8 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		backend:          backend,
 		blobStore:        blobStore,
 		broadcaster:      broadcaster,
-		maxInlineLen:     32 * 1024, // 32KB default inline threshold
-		chunkSize:        32 * 1024, // 32KB default chunk size
+		maxInlineLen:     4096,      // 4KB default inline threshold for tiny files
+		chunkSize:        64 * 1024, // 64KB default chunk size
 		durability:       walclient.Local,
 		streamID:         StreamIDForVolume(volumeID),
 		maxBufferFiles:   4,
@@ -228,6 +237,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		maxLocalFileSize: 250 * 1024 * 1024,
 		recoveredContent: make(map[string][]byte),
 		dirParents:       make(map[uint64]uint64),
+		inodeUploads:     make(map[uint64]*InodeUpload),
 	}
 
 	v.inodeCache = NewLRUCache[uint64, *CachedInode](10000, v.onEvictInode)
@@ -271,6 +281,90 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	return v
 }
 
+func (v *Volume) registerPendingUpload(ino uint64) func(error) {
+	v.pendingUploadsMu.Lock()
+	defer v.pendingUploadsMu.Unlock()
+
+	if v.inodeUploads == nil {
+		v.inodeUploads = make(map[uint64]*InodeUpload)
+	}
+
+	upload, exists := v.inodeUploads[ino]
+	if !exists {
+		upload = &InodeUpload{}
+		v.inodeUploads[ino] = upload
+	}
+
+	v.pendingUploadsWg.Add(1)
+	upload.wg.Add(1)
+
+	return func(err error) {
+		v.pendingUploadsMu.Lock()
+		defer v.pendingUploadsMu.Unlock()
+
+		if err != nil {
+			upload.err = err
+		}
+		upload.wg.Done()
+		v.pendingUploadsWg.Done()
+	}
+}
+
+func (v *Volume) waitForInodeUploads(ctx context.Context, ino uint64) error {
+	v.pendingUploadsMu.Lock()
+	upload := v.inodeUploads[ino]
+	v.pendingUploadsMu.Unlock()
+
+	if upload != nil {
+		done := make(chan struct{})
+		go func() {
+			upload.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	v.pendingUploadsMu.Lock()
+	var err error
+	if upload := v.inodeUploads[ino]; upload != nil {
+		err = upload.err
+		delete(v.inodeUploads, ino)
+	}
+	v.pendingUploadsMu.Unlock()
+
+	return err
+}
+
+func (v *Volume) waitForVolumeUploads(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		v.pendingUploadsWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	v.pendingUploadsMu.Lock()
+	var firstErr error
+	for ino, upload := range v.inodeUploads {
+		if upload != nil && upload.err != nil && firstErr == nil {
+			firstErr = upload.err
+		}
+		delete(v.inodeUploads, ino)
+	}
+	v.pendingUploadsMu.Unlock()
+
+	return firstErr
+}
+
 type memoryAppender struct {
 	mu       sync.Mutex
 	payloads [][]byte
@@ -296,6 +390,9 @@ func (v *Volume) initMetadataStreamLocked() error {
 	}
 	if _, err := w.RegisterType(&pb.DirEntry{}, 1, 2); err != nil {
 		return fmt.Errorf("failed to register DirEntry type: %w", err)
+	}
+	if _, err := w.RegisterType(&pb.FileChunk{}, 1, 2); err != nil {
+		return fmt.Errorf("failed to register FileChunk type: %w", err)
 	}
 	if _, err := w.RegisterType(&pb.Content{}, 1); err != nil {
 		return fmt.Errorf("failed to register Content type: %w", err)
@@ -343,6 +440,20 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 }
 
 func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkIdx int) ([]byte, error) {
+	if chunkIdx == 0 && len(node.InlineData) > 0 {
+		res := make([]byte, len(node.InlineData))
+		copy(res, node.InlineData)
+		return res, nil
+	}
+
+	if node.StagedChunks != nil {
+		if data, ok := node.StagedChunks[chunkIdx]; ok {
+			res := make([]byte, len(data))
+			copy(res, data)
+			return res, nil
+		}
+	}
+
 	if node.DirtyChunks != nil {
 		if data, ok := node.DirtyChunks[chunkIdx]; ok {
 			res := make([]byte, len(data))
@@ -374,6 +485,27 @@ func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkId
 		}
 	}
 
+	if chunkIdx == 0 && (node.Sha256 != "" || node.ContentSha256 != "") && len(node.Chunks) == 0 {
+		sha := node.Sha256
+		if sha == "" {
+			sha = node.ContentSha256
+		}
+		if v.recoveredContent != nil {
+			if data, ok := v.recoveredContent[sha]; ok {
+				res := make([]byte, len(data))
+				copy(res, data)
+				return res, nil
+			}
+		}
+		if v.blobStore != nil {
+			stream, err := v.blobStore.GetBlob(ctx, sha)
+			if err == nil {
+				defer stream.Close()
+				return io.ReadAll(stream)
+			}
+		}
+	}
+
 	if node.Data != nil && node.ChunkSize > 0 {
 		off := int64(chunkIdx) * int64(node.ChunkSize)
 		if off < node.Size {
@@ -390,7 +522,7 @@ func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkId
 		}
 	}
 
-	return nil, fmt.Errorf("chunk %d not found", chunkIdx)
+	return nil, nil
 }
 
 // persistInode uploads the inode's blob payload if dirty and writes the inode metadata record to local eviction storage.
@@ -399,9 +531,20 @@ func (v *Volume) persistInode(ctx context.Context, node *CachedInode) error {
 		return nil
 	}
 
-	if node.ChunkSize > 0 && v.blobStore != nil {
+	if v.blobStore != nil {
 		dirtyBlobs := make(map[string]blob.ByteStream)
+		if len(node.InlineData) > 0 {
+			sha := fmt.Sprintf("%x", sha256.Sum256(node.InlineData))
+			node.Sha256 = sha
+			node.ContentSha256 = sha
+			dirtyBlobs[sha] = blob.NewByteStreamFromBytes(node.InlineData)
+		}
 		for idx, chunkBytes := range node.DirtyChunks {
+			if idx < len(node.Chunks) && node.Chunks[idx] != "" {
+				dirtyBlobs[node.Chunks[idx]] = blob.NewByteStreamFromBytes(chunkBytes)
+			}
+		}
+		for idx, chunkBytes := range node.StagedChunks {
 			if idx < len(node.Chunks) && node.Chunks[idx] != "" {
 				dirtyBlobs[node.Chunks[idx]] = blob.NewByteStreamFromBytes(chunkBytes)
 			}
@@ -1208,11 +1351,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		dataCopy := make([]byte, len(initialContent))
 		copy(dataCopy, initialContent)
 
-		var stream blob.ByteStream
-		if len(dataCopy) > 0 {
-			stream = blob.NewByteStreamFromBytes(dataCopy)
-		}
-
 		entry, exists := parentDir.Entries[name]
 		if exists {
 			childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
@@ -1233,89 +1371,86 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			childInode.Gid = gid
 			childInode.IsDirty = true
 
-			if len(dataCopy) > int(v.chunkSize) && v.chunkSize > 0 {
-				_, manifest, manifestBlob, _ := blob.ChunkBlobs(stream, v.chunkSize, true)
-				childInode.ChunkSize = v.chunkSize
-				childInode.Chunks = manifest.ChunkHexSHAs()
-				childInode.ManifestSha256 = manifestBlob.SHA256Hex()
-				childInode.ContentSha256 = hashStr
-				childInode.Sha256 = childInode.ManifestSha256
-				childInode.DirtyChunks = make(map[int][]byte)
-				for i := 0; i < len(childInode.Chunks); i++ {
-					start := i * int(v.chunkSize)
-					end := len(dataCopy)
-					if (i+1)*int(v.chunkSize) < end {
-						end = (i + 1) * int(v.chunkSize)
-					}
-					cSlice := make([]byte, end-start)
-					copy(cSlice, dataCopy[start:end])
-					childInode.DirtyChunks[i] = cSlice
+			effectiveChunkSize := childInode.ChunkSize
+			if effectiveChunkSize == 0 {
+				effectiveChunkSize = v.chunkSize
+				if effectiveChunkSize == 0 {
+					effectiveChunkSize = 64 * 1024
 				}
-			} else {
-				childInode.Data = stream
-				childInode.Sha256 = hashStr
-				childInode.ContentSha256 = hashStr
-				childInode.ManifestSha256 = ""
-				childInode.ChunkSize = 0
-				childInode.Chunks = nil
-				childInode.DirtyChunks = nil
+				childInode.ChunkSize = effectiveChunkSize
 			}
 
-			var commitSeq uint64
+			oldNumChunks := len(childInode.Chunks)
 			tx := v.metadataStream.Begin()
-			if childInode.ChunkSize > 0 && len(childInode.DirtyChunks) > 0 {
-				for idx, chunkBytes := range childInode.DirtyChunks {
-					if idx < len(childInode.Chunks) && childInode.Chunks[idx] != "" {
-						if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(childInode.Chunks[idx]), Data: chunkBytes}); err != nil {
-							return nil, nil, fmt.Errorf("failed to log chunk content: %w", err)
-						}
+
+			if len(dataCopy) <= int(v.maxInlineLen) {
+				childInode.InlineData = dataCopy
+				childInode.ContentSha256 = hashStr
+				childInode.Chunks = nil
+				childInode.StagedChunks = nil
+				childInode.DirtyChunks = nil
+				childInode.ManifestSha256 = ""
+
+				for i := 1; i < oldNumChunks; i++ {
+					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(uint32(i))}); err != nil {
+						return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
 					}
 				}
-				if childInode.ManifestSha256 != "" {
-					manifestChunks := make([][32]byte, len(childInode.Chunks))
-					for i, c := range childInode.Chunks {
-						raw, _ := hex.DecodeString(c)
-						if len(raw) == 32 {
-							copy(manifestChunks[i][:], raw)
-						}
-					}
-					manifest := &blob.Manifest{
-						ChunkSize:   childInode.ChunkSize,
-						TotalLength: uint64(childInode.Size),
-						Chunks:      manifestChunks,
-					}
-					manifestBlob, err := blob.EncodeManifest(manifest)
-					if err != nil {
-						return nil, nil, fmt.Errorf("failed to encode manifest: %w", err)
-					}
-					if err := manifestBlob.Stream.Rewind(); err != nil {
-						return nil, nil, fmt.Errorf("failed to rewind manifest stream: %w", err)
-					}
-					mBytes, err := io.ReadAll(manifestBlob.Stream)
-					if err != nil {
-						return nil, nil, fmt.Errorf("failed to read manifest stream: %w", err)
-					}
-					if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(manifestBlob.SHA256Hex()), Data: mBytes}); err != nil {
-						return nil, nil, fmt.Errorf("failed to log manifest content: %w", err)
+				if len(dataCopy) > 0 {
+					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
+						return nil, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 					}
 				}
-			} else if len(dataCopy) > 0 {
-				if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(childInode.Sha256), Data: dataCopy}); err != nil {
-					return nil, nil, fmt.Errorf("failed to log file content: %w", err)
+			} else {
+				childInode.InlineData = nil
+				childInode.ContentSha256 = hashStr
+				childInode.Chunks = nil
+				childInode.StagedChunks = make(map[int][]byte)
+				childInode.DirtyChunks = nil
+
+				blobsMap := make(map[string]blob.ByteStream)
+				cs := int(effectiveChunkSize)
+				numChunks := (len(dataCopy) + cs - 1) / cs
+				for i := 0; i < numChunks; i++ {
+					start := i * cs
+					end := (i + 1) * cs
+					if end > len(dataCopy) {
+						end = len(dataCopy)
+					}
+					cBytes := make([]byte, end-start)
+					copy(cBytes, dataCopy[start:end])
+					cSha := fmt.Sprintf("%x", sha256.Sum256(cBytes))
+					childInode.Chunks = append(childInode.Chunks, cSha)
+					childInode.StagedChunks[i] = cBytes
+					blobsMap[cSha] = blob.NewByteStreamFromBytes(cBytes)
+				}
+
+				if v.blobStore != nil && len(blobsMap) > 0 {
+					if err := v.blobStore.PutBlobs(ctx, blobsMap); err != nil {
+						return nil, nil, fmt.Errorf("failed to upload blobs: %w", err)
+					}
+				}
+
+				for i := numChunks; i < oldNumChunks; i++ {
+					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(uint32(i))}); err != nil {
+						return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
+					}
+				}
+				for i, sha := range childInode.Chunks {
+					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(uint32(i)), Sha256: sha}); err != nil {
+						return nil, nil, fmt.Errorf("failed to log FileChunk: %w", err)
+					}
 				}
 			}
 
 			childInodeMsg := &pb.Inode{
-				Ino:            proto.Uint64(childInode.ID),
-				Mode:           childInode.Mode,
-				Size:           childInode.Size,
-				Mtime:          timestamppb.New(now),
-				IsDir:          false,
-				Sha256:         childInode.Sha256,
-				Etag:           childInode.ETag,
-				ManifestSha256: childInode.ManifestSha256,
-				ContentSha256:  childInode.ContentSha256,
-				ChunkSize:      childInode.ChunkSize,
+				Ino:           proto.Uint64(childInode.ID),
+				Mode:          childInode.Mode,
+				Size:          childInode.Size,
+				Mtime:         timestamppb.New(now),
+				IsDir:         false,
+				ContentSha256: childInode.ContentSha256,
+				ChunkSize:     childInode.ChunkSize,
 			}
 			if _, err := tx.Update(ctx, childInodeMsg); err != nil {
 				return nil, nil, fmt.Errorf("failed to log child inode update: %w", err)
@@ -1337,7 +1472,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 			}
 
-			commitSeq, err = tx.Commit(ctx)
+			commitSeq, err := tx.Commit(ctx)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to commit overwrite file transaction: %w", err)
 			}
@@ -1382,111 +1517,84 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		parentInode.ModTime = now
 		parentInode.IsDirty = true
 
-		childInode := &CachedInode{
-			ID:      childInodeID,
-			Mode:    mode,
-			Size:    int64(len(dataCopy)),
-			ModTime: now,
-			IsDir:   false,
-			Uid:     uid,
-			Gid:     gid,
-			IsDirty: true,
+		effectiveChunkSize := v.chunkSize
+		if effectiveChunkSize == 0 {
+			effectiveChunkSize = 64 * 1024
 		}
 
-		if len(dataCopy) > int(v.chunkSize) && v.chunkSize > 0 {
-			_, manifest, manifestBlob, _ := blob.ChunkBlobs(stream, v.chunkSize, true)
-			childInode.ChunkSize = v.chunkSize
-			childInode.Chunks = manifest.ChunkHexSHAs()
-			childInode.ManifestSha256 = manifestBlob.SHA256Hex()
+		childInode := &CachedInode{
+			ID:        childInodeID,
+			Mode:      mode,
+			Size:      int64(len(dataCopy)),
+			ModTime:   now,
+			IsDir:     false,
+			Uid:       uid,
+			Gid:       gid,
+			ChunkSize: effectiveChunkSize,
+			IsDirty:   true,
+		}
+
+		tx := v.metadataStream.Begin()
+
+		if len(dataCopy) <= int(v.maxInlineLen) {
+			childInode.InlineData = dataCopy
 			childInode.ContentSha256 = hashStr
-			childInode.Sha256 = childInode.ManifestSha256
-			childInode.DirtyChunks = make(map[int][]byte)
-			for i := 0; i < len(childInode.Chunks); i++ {
-				start := i * int(v.chunkSize)
-				end := len(dataCopy)
-				if (i+1)*int(v.chunkSize) < end {
-					end = (i + 1) * int(v.chunkSize)
+
+			if len(dataCopy) > 0 {
+				if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
+					delete(parentDir.Entries, name)
+					delete(parentDir.Added, name)
+					return nil, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 				}
-				cSlice := make([]byte, end-start)
-				copy(cSlice, dataCopy[start:end])
-				childInode.DirtyChunks[i] = cSlice
 			}
 		} else {
-			childInode.Data = stream
-			childInode.Sha256 = hashStr
 			childInode.ContentSha256 = hashStr
-			childInode.ManifestSha256 = ""
-			childInode.ChunkSize = 0
+			childInode.StagedChunks = make(map[int][]byte)
+
+			blobsMap := make(map[string]blob.ByteStream)
+			cs := int(effectiveChunkSize)
+			numChunks := (len(dataCopy) + cs - 1) / cs
+			for i := 0; i < numChunks; i++ {
+				start := i * cs
+				end := (i + 1) * cs
+				if end > len(dataCopy) {
+					end = len(dataCopy)
+				}
+				cBytes := make([]byte, end-start)
+				copy(cBytes, dataCopy[start:end])
+				cSha := fmt.Sprintf("%x", sha256.Sum256(cBytes))
+				childInode.Chunks = append(childInode.Chunks, cSha)
+				childInode.StagedChunks[i] = cBytes
+				blobsMap[cSha] = blob.NewByteStreamFromBytes(cBytes)
+			}
+
+			if v.blobStore != nil && len(blobsMap) > 0 {
+				if err := v.blobStore.PutBlobs(ctx, blobsMap); err != nil {
+					delete(parentDir.Entries, name)
+					delete(parentDir.Added, name)
+					return nil, nil, fmt.Errorf("failed to upload blobs: %w", err)
+				}
+			}
+
+			for i, sha := range childInode.Chunks {
+				if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(uint32(i)), Sha256: sha}); err != nil {
+					delete(parentDir.Entries, name)
+					delete(parentDir.Added, name)
+					return nil, nil, fmt.Errorf("failed to log FileChunk: %w", err)
+				}
+			}
 		}
+
 		v.inodeCache.Put(childInodeID, childInode)
 
-		var commitSeq uint64
-		tx := v.metadataStream.Begin()
-		if childInode.ChunkSize > 0 && len(childInode.DirtyChunks) > 0 {
-			for idx, chunkBytes := range childInode.DirtyChunks {
-				if idx < len(childInode.Chunks) && childInode.Chunks[idx] != "" {
-					if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(childInode.Chunks[idx]), Data: chunkBytes}); err != nil {
-						delete(parentDir.Entries, name)
-						delete(parentDir.Added, name)
-						return nil, nil, fmt.Errorf("failed to log chunk content: %w", err)
-					}
-				}
-			}
-			if childInode.ManifestSha256 != "" {
-				manifestChunks := make([][32]byte, len(childInode.Chunks))
-				for i, c := range childInode.Chunks {
-					raw, _ := hex.DecodeString(c)
-					if len(raw) == 32 {
-						copy(manifestChunks[i][:], raw)
-					}
-				}
-				manifest := &blob.Manifest{
-					ChunkSize:   childInode.ChunkSize,
-					TotalLength: uint64(childInode.Size),
-					Chunks:      manifestChunks,
-				}
-				manifestBlob, err := blob.EncodeManifest(manifest)
-				if err != nil {
-					delete(parentDir.Entries, name)
-					delete(parentDir.Added, name)
-					return nil, nil, fmt.Errorf("failed to encode manifest: %w", err)
-				}
-				if err := manifestBlob.Stream.Rewind(); err != nil {
-					delete(parentDir.Entries, name)
-					delete(parentDir.Added, name)
-					return nil, nil, fmt.Errorf("failed to rewind manifest stream: %w", err)
-				}
-				mBytes, err := io.ReadAll(manifestBlob.Stream)
-				if err != nil {
-					delete(parentDir.Entries, name)
-					delete(parentDir.Added, name)
-					return nil, nil, fmt.Errorf("failed to read manifest stream: %w", err)
-				}
-				if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(manifestBlob.SHA256Hex()), Data: mBytes}); err != nil {
-					delete(parentDir.Entries, name)
-					delete(parentDir.Added, name)
-					return nil, nil, fmt.Errorf("failed to log manifest content: %w", err)
-				}
-			}
-		} else if len(dataCopy) > 0 {
-			if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(childInode.Sha256), Data: dataCopy}); err != nil {
-				delete(parentDir.Entries, name)
-				delete(parentDir.Added, name)
-				return nil, nil, fmt.Errorf("failed to log file content: %w", err)
-			}
-		}
-
 		childInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(childInodeID),
-			Mode:           mode,
-			Size:           int64(len(dataCopy)),
-			Mtime:          timestamppb.New(now),
-			IsDir:          false,
-			Sha256:         childInode.Sha256,
-			Etag:           childInode.ETag,
-			ManifestSha256: childInode.ManifestSha256,
-			ContentSha256:  childInode.ContentSha256,
-			ChunkSize:      childInode.ChunkSize,
+			Ino:           proto.Uint64(childInodeID),
+			Mode:          mode,
+			Size:          int64(len(dataCopy)),
+			Mtime:         timestamppb.New(now),
+			IsDir:         false,
+			ContentSha256: childInode.ContentSha256,
+			ChunkSize:     childInode.ChunkSize,
 		}
 		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
 			delete(parentDir.Entries, name)
@@ -1524,7 +1632,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			delete(parentDir.Added, name)
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
-		commitSeq, err = tx.Commit(ctx)
+		commitSeq, err := tx.Commit(ctx)
 		if err != nil {
 			delete(parentDir.Entries, name)
 			delete(parentDir.Added, name)
@@ -1573,7 +1681,6 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 	if inodeID == 0 {
 		inodeID = v.rootInodeID
 	}
-
 	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
 	v.mu.RUnlock()
 	if err != nil {
@@ -1589,7 +1696,7 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 		return nil, total, node.RedirectURL, nil
 	}
 
-	if offset >= total {
+	if offset >= total || total == 0 {
 		return []byte{}, total, "", nil
 	}
 
@@ -1602,13 +1709,25 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if node.ManifestSha256 != "" || node.ChunkSize > 0 {
+	if len(node.InlineData) > 0 {
+		res := make([]byte, readLen)
+		if offset < int64(len(node.InlineData)) {
+			copyEnd := end
+			if copyEnd > int64(len(node.InlineData)) {
+				copyEnd = int64(len(node.InlineData))
+			}
+			copy(res, node.InlineData[offset:copyEnd])
+		}
+		return res, total, "", nil
+	}
+
+	if node.ManifestSha256 != "" || node.ChunkSize > 0 || len(node.Chunks) > 0 || len(node.StagedChunks) > 0 {
 		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 		cs := int64(node.ChunkSize)
 		if cs == 0 {
 			cs = int64(v.chunkSize)
 			if cs == 0 {
-				cs = 32 * 1024
+				cs = 64 * 1024
 			}
 		}
 		startChunk := int(offset / cs)
@@ -1616,10 +1735,7 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 
 		var res bytes.Buffer
 		for i := startChunk; i <= endChunk; i++ {
-			chunkData, err := v.readChunkLocked(ctx, node, i)
-			if err != nil {
-				return nil, 0, "", fmt.Errorf("failed to read chunk %d: %w", i, err)
-			}
+			chunkData, _ := v.readChunkLocked(ctx, node, i)
 			chunkLen := cs
 			if int64(i+1)*cs > total {
 				chunkLen = total - int64(i)*cs
@@ -1657,19 +1773,19 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 	}
 
 	if node.Data == nil {
-		return []byte{}, total, "", nil
+		return make([]byte, readLen), total, "", nil
 	}
 
-	if _, err := node.Data.Seek(offset, io.SeekStart); err != nil {
-		return nil, 0, "", fmt.Errorf("failed to seek node data: %w", err)
+	if _, err := node.Data.Seek(offset, io.SeekStart); err == nil {
+		res := make([]byte, readLen)
+		n, err := io.ReadFull(node.Data, res)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			return nil, 0, "", fmt.Errorf("failed to read node data: %w", err)
+		}
+		return res[:n], total, "", nil
 	}
 
-	res := make([]byte, readLen)
-	n, err := io.ReadFull(node.Data, res)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return nil, 0, "", fmt.Errorf("failed to read node data: %w", err)
-	}
-	return res[:n], total, "", nil
+	return make([]byte, readLen), total, "", nil
 }
 
 func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, data []byte, writeMode pb.WriteMode) (int64, int64, time.Time, error) {
@@ -1692,13 +1808,12 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 
 		effectiveChunkSize := v.chunkSize
 		if effectiveChunkSize == 0 {
-			effectiveChunkSize = 32 * 1024
-		}
-		if node.ManifestSha256 != "" && node.ChunkSize == 0 {
-			_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+			effectiveChunkSize = 64 * 1024
 		}
 		if node.ChunkSize > 0 {
 			effectiveChunkSize = node.ChunkSize
+		} else {
+			node.ChunkSize = effectiveChunkSize
 		}
 
 		neededLen := offset + int64(len(data))
@@ -1710,156 +1825,6 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		now := time.Now()
 		node.ModTime = now
 		node.IsDirty = true
-
-		if calculatedSize > int64(effectiveChunkSize) || node.ManifestSha256 != "" || node.ChunkSize > 0 {
-			if node.ChunkSize == 0 {
-				var currentData []byte
-				if node.Data != nil {
-					_ = node.Data.Rewind()
-					currentData, _ = io.ReadAll(node.Data)
-					_ = node.Data.Close()
-					node.Data = nil
-				} else if node.Sha256 != "" && v.blobStore != nil {
-					stream, err := v.blobStore.GetBlob(ctx, node.Sha256)
-					if err == nil {
-						currentData, _ = io.ReadAll(stream)
-						_ = stream.Close()
-					}
-				}
-				node.ChunkSize = effectiveChunkSize
-				node.Chunks = nil
-				if node.DirtyChunks == nil {
-					node.DirtyChunks = make(map[int][]byte)
-				}
-				rem := int64(len(currentData))
-				chunkIdx := 0
-				for rem > 0 {
-					take := int64(effectiveChunkSize)
-					if rem < take {
-						take = rem
-					}
-					cSlice := make([]byte, take)
-					copy(cSlice, currentData[int64(chunkIdx)*int64(effectiveChunkSize):int64(chunkIdx)*int64(effectiveChunkSize)+take])
-					node.DirtyChunks[chunkIdx] = cSlice
-					cSha := fmt.Sprintf("%x", sha256.Sum256(cSlice))
-					node.Chunks = append(node.Chunks, cSha)
-					rem -= take
-					chunkIdx++
-				}
-			} else {
-				_ = v.ensureInodeChunksLoadedLocked(ctx, node)
-				if node.DirtyChunks == nil {
-					node.DirtyChunks = make(map[int][]byte)
-				}
-			}
-
-			cs := int64(effectiveChunkSize)
-			startChunk := int(offset / cs)
-			endChunk := int((offset + int64(len(data)) - 1) / cs)
-
-			for len(node.Chunks) <= endChunk {
-				node.Chunks = append(node.Chunks, "")
-			}
-
-			for i := startChunk; i <= endChunk; i++ {
-				chunkStart := int64(i) * cs
-				chunkEnd := chunkStart + cs
-				wStart := offset - chunkStart
-				if wStart < 0 {
-					wStart = 0
-				}
-				wEnd := offset + int64(len(data)) - chunkStart
-				if wEnd > cs {
-					wEnd = cs
-				}
-				dataStart := chunkStart - offset
-				if dataStart < 0 {
-					dataStart = 0
-				}
-				dataEnd := chunkEnd - offset
-				if dataEnd > int64(len(data)) {
-					dataEnd = int64(len(data))
-				}
-
-				chunkData, _ := v.readChunkLocked(ctx, node, i)
-				expectedChunkLen := cs
-				if int64(i+1)*cs > calculatedSize {
-					expectedChunkLen = calculatedSize - int64(i)*cs
-				}
-				if int64(len(chunkData)) < expectedChunkLen {
-					newBuf := make([]byte, expectedChunkLen)
-					copy(newBuf, chunkData)
-					chunkData = newBuf
-				}
-				copy(chunkData[wStart:wEnd], data[dataStart:dataEnd])
-				chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
-				node.Chunks[i] = chunkSha
-				node.DirtyChunks[i] = chunkData
-			}
-
-			node.Size = calculatedSize
-
-			manifestChunks := make([][32]byte, len(node.Chunks))
-			for i, c := range node.Chunks {
-				raw, _ := hex.DecodeString(c)
-				if len(raw) == 32 {
-					copy(manifestChunks[i][:], raw)
-				}
-			}
-			manifest := &blob.Manifest{
-				ChunkSize:   effectiveChunkSize,
-				TotalLength: uint64(node.Size),
-				Chunks:      manifestChunks,
-			}
-			manifestBlob, err := blob.EncodeManifest(manifest)
-			if err == nil {
-				node.ManifestSha256 = manifestBlob.SHA256Hex()
-				node.Sha256 = node.ManifestSha256
-			}
-
-			if offset == 0 && int64(len(data)) == node.Size {
-				h := sha256.Sum256(data)
-				node.ContentSha256 = fmt.Sprintf("%x", h)
-			} else {
-				node.ContentSha256 = ""
-			}
-		} else {
-			var currentData []byte
-			if node.Data != nil {
-				_ = node.Data.Rewind()
-				currentData, _ = io.ReadAll(node.Data)
-				_ = node.Data.Close()
-			}
-
-			if neededLen > int64(len(currentData)) {
-				newBuf := make([]byte, neededLen)
-				copy(newBuf, currentData)
-				currentData = newBuf
-			}
-			copy(currentData[offset:], data)
-			node.Size = int64(len(currentData))
-
-			h := sha256.Sum256(currentData)
-			node.Sha256 = fmt.Sprintf("%x", h)
-			node.ContentSha256 = node.Sha256
-			node.ManifestSha256 = ""
-			node.ChunkSize = 0
-			node.Chunks = nil
-			node.DirtyChunks = nil
-
-			if node.Size <= blob.MemoryThreshold {
-				node.Data = blob.NewByteStreamFromBytes(currentData)
-			} else {
-				tf, err := os.CreateTemp("", "objectfs-node-*")
-				if err == nil {
-					_, _ = tf.Write(currentData)
-					_, _ = tf.Seek(0, io.SeekStart)
-					node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
-				} else {
-					node.Data = blob.NewByteStreamFromBytes(currentData)
-				}
-			}
-		}
 
 		var reqLevel *walclient.Level
 		switch writeMode {
@@ -1874,94 +1839,228 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			reqLevel = &l
 		}
 
-		var commitSeq uint64
-		tx := v.metadataStream.Begin()
-		if node.ChunkSize > 0 && len(node.DirtyChunks) > 0 {
-			for idx, chunkBytes := range node.DirtyChunks {
-				if idx < len(node.Chunks) && node.Chunks[idx] != "" {
-					if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(node.Chunks[idx]), Data: chunkBytes}); err != nil {
-						return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log chunk content: %w", err)
+		// Tiny file check
+		if calculatedSize <= v.maxInlineLen && len(node.Chunks) == 0 {
+			if node.InlineData == nil {
+				if offset == 0 {
+					node.InlineData = make([]byte, len(data))
+					copy(node.InlineData, data)
+				} else {
+					chunk0, _ := v.readChunkLocked(ctx, node, 0)
+					if neededLen > int64(len(chunk0)) {
+						newBuf := make([]byte, neededLen)
+						copy(newBuf, chunk0)
+						chunk0 = newBuf
 					}
+					copy(chunk0[offset:], data)
+					node.InlineData = chunk0
 				}
+			} else {
+				if neededLen > int64(len(node.InlineData)) {
+					newBuf := make([]byte, neededLen)
+					copy(newBuf, node.InlineData)
+					node.InlineData = newBuf
+				}
+				copy(node.InlineData[offset:], data)
 			}
-			if node.ManifestSha256 != "" {
-				manifestChunks := make([][32]byte, len(node.Chunks))
-				for i, c := range node.Chunks {
-					raw, _ := hex.DecodeString(c)
-					if len(raw) == 32 {
-						copy(manifestChunks[i][:], raw)
-					}
-				}
-				manifest := &blob.Manifest{
-					ChunkSize:   node.ChunkSize,
-					TotalLength: uint64(node.Size),
-					Chunks:      manifestChunks,
-				}
-				manifestBlob, err := blob.EncodeManifest(manifest)
-				if err != nil {
-					return 0, 0, time.Time{}, nil, fmt.Errorf("failed to encode manifest: %w", err)
-				}
-				if err := manifestBlob.Stream.Rewind(); err != nil {
-					return 0, 0, time.Time{}, nil, fmt.Errorf("failed to rewind manifest stream: %w", err)
-				}
-				mBytes, err := io.ReadAll(manifestBlob.Stream)
-				if err != nil {
-					return 0, 0, time.Time{}, nil, fmt.Errorf("failed to read manifest stream: %w", err)
-				}
-				if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(manifestBlob.SHA256Hex()), Data: mBytes}); err != nil {
-					return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log manifest content: %w", err)
-				}
+			node.Size = int64(len(node.InlineData))
+			if offset == 0 && int64(len(data)) == node.Size {
+				h := sha256.Sum256(data)
+				node.ContentSha256 = fmt.Sprintf("%x", h)
+			} else {
+				node.ContentSha256 = ""
 			}
-		} else if node.Data != nil && node.Sha256 != "" {
-			if err := node.Data.Rewind(); err != nil {
-				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to rewind node data: %w", err)
+
+			tx := v.metadataStream.Begin()
+			if _, err := tx.Insert(ctx, &pb.FileChunk{
+				Ino:        proto.Uint64(node.ID),
+				Index:      proto.Uint32(0),
+				InlineData: node.InlineData,
+			}); err != nil {
+				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 			}
-			fullBytes, err := io.ReadAll(node.Data)
+			nodeInodeMsg := &pb.Inode{
+				Ino:           proto.Uint64(node.ID),
+				Mode:          node.Mode,
+				Size:          node.Size,
+				Mtime:         timestamppb.New(now),
+				IsDir:         false,
+				ContentSha256: node.ContentSha256,
+				ChunkSize:     node.ChunkSize,
+			}
+			if _, err := tx.Update(ctx, nodeInodeMsg); err != nil {
+				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log node inode update: %w", err)
+			}
+
+			commitSeq, err := tx.Commit(ctx)
 			if err != nil {
-				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to read node data: %w", err)
+				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to commit tiny write transaction: %w", err)
 			}
-			if err := node.Data.Rewind(); err != nil {
-				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to rewind node data after read: %w", err)
+			waitFn := v.makeWaitFn(commitSeq, reqLevel)
+
+			attr := &pb.EntryAttr{
+				Inode:         node.ID,
+				IsDir:         false,
+				Size:          node.Size,
+				Mode:          node.Mode,
+				ModTime:       timestamppb.New(now),
+				ContentSha256: node.ContentSha256,
+				Uid:           node.Uid,
+				Gid:           node.Gid,
 			}
-			if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(node.Sha256), Data: fullBytes}); err != nil {
-				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log file content: %w", err)
-			}
+			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+				EventType: pb.WatchEventType_EVENT_MODIFIED,
+				Attr:      attr,
+				Inode:     node.ID,
+			})
+			v.checkAutoSnapshotTriggerLocked(ctx)
+			return int64(len(data)), node.Size, now, waitFn, nil
 		}
 
-		nodeInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(node.ID),
-			Mode:           node.Mode,
-			Size:           node.Size,
-			Mtime:          timestamppb.New(now),
-			IsDir:          false,
-			Sha256:         node.Sha256,
-			Etag:           node.ETag,
-			ManifestSha256: node.ManifestSha256,
-			ContentSha256:  node.ContentSha256,
-			ChunkSize:      node.ChunkSize,
+		// Chunked file write
+		if len(node.InlineData) > 0 {
+			if node.StagedChunks == nil {
+				node.StagedChunks = make(map[int][]byte)
+			}
+			node.StagedChunks[0] = node.InlineData
+			cSha := fmt.Sprintf("%x", sha256.Sum256(node.InlineData))
+			node.Chunks = []string{cSha}
+			node.InlineData = nil
 		}
-		if _, err := tx.Update(ctx, nodeInodeMsg); err != nil {
-			return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log node inode update: %w", err)
+		if node.StagedChunks == nil {
+			node.StagedChunks = make(map[int][]byte)
+		}
+		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+
+		cs := int64(effectiveChunkSize)
+		startChunk := int(offset / cs)
+		endChunk := int((offset + int64(len(data)) - 1) / cs)
+
+		for len(node.Chunks) <= endChunk {
+			node.Chunks = append(node.Chunks, "")
 		}
 
-		commitSeq, err = tx.Commit(ctx)
-		if err != nil {
-			return 0, 0, time.Time{}, nil, fmt.Errorf("failed to commit write file transaction: %w", err)
+		touchedIndices := make([]int, 0, endChunk-startChunk+1)
+		chunkBlobs := make(map[int][]byte)
+		chunkShas := make(map[int]string)
+
+		for i := startChunk; i <= endChunk; i++ {
+			chunkStart := int64(i) * cs
+			chunkEnd := chunkStart + cs
+			wStart := offset - chunkStart
+			if wStart < 0 {
+				wStart = 0
+			}
+			wEnd := offset + int64(len(data)) - chunkStart
+			if wEnd > cs {
+				wEnd = cs
+			}
+			dataStart := chunkStart - offset
+			if dataStart < 0 {
+				dataStart = 0
+			}
+			dataEnd := chunkEnd - offset
+			if dataEnd > int64(len(data)) {
+				dataEnd = int64(len(data))
+			}
+
+			chunkData, _ := v.readChunkLocked(ctx, node, i)
+			expectedChunkLen := cs
+			if int64(i+1)*cs > calculatedSize {
+				expectedChunkLen = calculatedSize - int64(i)*cs
+			}
+			if int64(len(chunkData)) < expectedChunkLen {
+				newBuf := make([]byte, expectedChunkLen)
+				copy(newBuf, chunkData)
+				chunkData = newBuf
+			}
+			copy(chunkData[wStart:wEnd], data[dataStart:dataEnd])
+			chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
+			node.Chunks[i] = chunkSha
+			node.StagedChunks[i] = chunkData
+
+			touchedIndices = append(touchedIndices, i)
+			cCopy := make([]byte, len(chunkData))
+			copy(cCopy, chunkData)
+			chunkBlobs[i] = cCopy
+			chunkShas[i] = chunkSha
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, reqLevel)
+		node.Size = calculatedSize
+		node.ContentSha256 = ""
+
+		done := v.registerPendingUpload(node.ID)
+		ino := node.ID
+		mode := node.Mode
+
+		go func() {
+			var uploadErr error
+			defer func() { done(uploadErr) }()
+
+			if v.blobStore != nil && len(chunkBlobs) > 0 {
+				blobsMap := make(map[string]blob.ByteStream, len(chunkBlobs))
+				for idx, cBytes := range chunkBlobs {
+					blobsMap[chunkShas[idx]] = blob.NewByteStreamFromBytes(cBytes)
+				}
+				if err := v.blobStore.PutBlobs(context.Background(), blobsMap); err != nil {
+					uploadErr = err
+					return
+				}
+			}
+
+			v.mu.Lock()
+			defer v.mu.Unlock()
+
+			currNode, _ := v.inodeCache.Get(ino)
+			if currNode == nil {
+				return
+			}
+
+			tx := v.metadataStream.Begin()
+			for _, idx := range touchedIndices {
+				cSize := int64(currNode.ChunkSize)
+				if cSize == 0 {
+					cSize = int64(effectiveChunkSize)
+				}
+				if int64(idx)*cSize < currNode.Size {
+					if _, err := tx.Insert(context.Background(), &pb.FileChunk{
+						Ino:    proto.Uint64(ino),
+						Index:  proto.Uint32(uint32(idx)),
+						Sha256: chunkShas[idx],
+					}); err != nil {
+						uploadErr = err
+						return
+					}
+				}
+			}
+
+			nodeInodeMsg := &pb.Inode{
+				Ino:       proto.Uint64(ino),
+				Mode:      mode,
+				Size:      currNode.Size,
+				Mtime:     timestamppb.New(currNode.ModTime),
+				IsDir:     false,
+				ChunkSize: currNode.ChunkSize,
+			}
+			if _, err := tx.Update(context.Background(), nodeInodeMsg); err != nil {
+				uploadErr = err
+				return
+			}
+
+			if _, err := tx.Commit(context.Background()); err != nil {
+				uploadErr = err
+				return
+			}
+		}()
 
 		attr := &pb.EntryAttr{
-			Inode:          node.ID,
-			IsDir:          false,
-			Size:           node.Size,
-			Mode:           node.Mode,
-			ModTime:        timestamppb.New(now),
-			Sha256:         node.Sha256,
-			ManifestSha256: node.ManifestSha256,
-			ContentSha256:  node.ContentSha256,
-			Uid:            node.Uid,
-			Gid:            node.Gid,
+			Inode:   node.ID,
+			IsDir:   false,
+			Size:    node.Size,
+			Mode:    node.Mode,
+			ModTime: timestamppb.New(now),
+			Uid:     node.Uid,
+			Gid:     node.Gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -1970,7 +2069,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		})
 
 		v.checkAutoSnapshotTriggerLocked(ctx)
-		return int64(len(data)), node.Size, now, waitFn, nil
+		return int64(len(data)), node.Size, now, nil, nil
 	}()
 	if err != nil {
 		return 0, 0, time.Time{}, err
@@ -1984,6 +2083,16 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 }
 
 func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (*pb.EntryAttr, error) {
+	if inodeID == 0 {
+		v.mu.RLock()
+		inodeID = v.rootInodeID
+		v.mu.RUnlock()
+	}
+
+	if err := v.waitForInodeUploads(ctx, inodeID); err != nil {
+		return nil, err
+	}
+
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
@@ -2008,186 +2117,135 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		now := time.Now()
 		node.ModTime = now
 		node.IsDirty = true
+		oldNumChunks := len(node.Chunks)
 
-		if node.ManifestSha256 != "" || node.ChunkSize > 0 {
-			_ = v.ensureInodeChunksLoadedLocked(ctx, node)
-			if node.DirtyChunks == nil {
-				node.DirtyChunks = make(map[int][]byte)
+		tx := v.metadataStream.Begin()
+
+		if size == 0 {
+			node.Size = 0
+			node.Chunks = nil
+			node.StagedChunks = nil
+			node.DirtyChunks = nil
+			node.InlineData = nil
+			node.ManifestSha256 = ""
+			node.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256([]byte{}))
+			node.Sha256 = node.ContentSha256
+			if node.Data != nil {
+				_ = node.Data.Close()
+				node.Data = nil
 			}
 
-			if size == 0 {
-				node.Size = 0
-				node.Chunks = nil
-				node.DirtyChunks = nil
-				node.ChunkSize = 0
-				node.ManifestSha256 = ""
-				node.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256([]byte{}))
-				node.Sha256 = node.ContentSha256
-				if node.Data != nil {
-					_ = node.Data.Close()
-					node.Data = nil
+			for i := 0; i < oldNumChunks; i++ {
+				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(uint32(i))}); err != nil {
+					return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
 				}
-			} else {
-				cs := int64(node.ChunkSize)
-				numChunks := int((size + cs - 1) / cs)
-				if numChunks < len(node.Chunks) {
-					for k := range node.DirtyChunks {
-						if k >= numChunks {
-							delete(node.DirtyChunks, k)
-						}
-					}
-					node.Chunks = node.Chunks[:numChunks]
-				} else {
-					for len(node.Chunks) < numChunks {
-						node.Chunks = append(node.Chunks, "")
-					}
-				}
-				if numChunks > 0 {
-					lastIdx := numChunks - 1
-					lastChunkLen := size - int64(lastIdx)*cs
-					chunkData, _ := v.readChunkLocked(ctx, node, lastIdx)
-					if int64(len(chunkData)) > lastChunkLen {
-						chunkData = chunkData[:lastChunkLen]
-					} else if int64(len(chunkData)) < lastChunkLen {
-						newBuf := make([]byte, lastChunkLen)
-						copy(newBuf, chunkData)
-						chunkData = newBuf
-					}
-					chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
-					node.Chunks[lastIdx] = chunkSha
-					node.DirtyChunks[lastIdx] = chunkData
-				}
+			}
+			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(0)}); err != nil {
+				// delete chunk 0 inline if existed
+			}
+		} else if size <= v.maxInlineLen && oldNumChunks <= 1 {
+			chunk0, _ := v.readChunkLocked(ctx, node, 0)
+			if int64(len(chunk0)) > size {
+				chunk0 = chunk0[:size]
+			} else if int64(len(chunk0)) < size {
+				newBuf := make([]byte, size)
+				copy(newBuf, chunk0)
+				chunk0 = newBuf
+			}
+			node.InlineData = chunk0
+			node.Size = size
+			node.Chunks = nil
+			node.StagedChunks = nil
+			node.DirtyChunks = nil
+			node.ContentSha256 = ""
 
-				node.Size = size
-
-				manifestChunks := make([][32]byte, len(node.Chunks))
-				for i, c := range node.Chunks {
-					raw, _ := hex.DecodeString(c)
-					if len(raw) == 32 {
-						copy(manifestChunks[i][:], raw)
-					}
+			for i := 1; i < oldNumChunks; i++ {
+				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(uint32(i))}); err != nil {
+					return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
 				}
-				manifest := &blob.Manifest{
-					ChunkSize:   node.ChunkSize,
-					TotalLength: uint64(node.Size),
-					Chunks:      manifestChunks,
-				}
-				manifestBlob, err := blob.EncodeManifest(manifest)
-				if err == nil {
-					node.ManifestSha256 = manifestBlob.SHA256Hex()
-					node.Sha256 = node.ManifestSha256
-				}
-				node.ContentSha256 = ""
+			}
+			if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(0), InlineData: node.InlineData}); err != nil {
+				return nil, nil, fmt.Errorf("failed to update inline FileChunk: %w", err)
 			}
 		} else {
-			var currentData []byte
-			if node.Data != nil {
-				_ = node.Data.Rewind()
-				currentData, _ = io.ReadAll(node.Data)
-				_ = node.Data.Close()
+			cs := int64(node.ChunkSize)
+			if cs == 0 {
+				cs = int64(v.chunkSize)
+				if cs == 0 {
+					cs = 64 * 1024
+				}
+				node.ChunkSize = uint32(cs)
 			}
+			_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 
-			if size < int64(len(currentData)) {
-				currentData = currentData[:size]
-			} else if size > int64(len(currentData)) {
-				newBuf := make([]byte, size)
-				copy(newBuf, currentData)
-				currentData = newBuf
-			}
-			node.Size = size
-			h := sha256.Sum256(currentData)
-			node.Sha256 = fmt.Sprintf("%x", h)
-			node.ContentSha256 = node.Sha256
-			node.ManifestSha256 = ""
-			node.ChunkSize = 0
-
-			if node.Size <= blob.MemoryThreshold {
-				node.Data = blob.NewByteStreamFromBytes(currentData)
+			newNumChunks := int((size + cs - 1) / cs)
+			if newNumChunks < oldNumChunks {
+				for k := range node.StagedChunks {
+					if k >= newNumChunks {
+						delete(node.StagedChunks, k)
+					}
+				}
+				for i := newNumChunks; i < oldNumChunks; i++ {
+					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(uint32(i))}); err != nil {
+						return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
+					}
+				}
+				node.Chunks = node.Chunks[:newNumChunks]
 			} else {
-				tf, err := os.CreateTemp("", "objectfs-node-*")
-				if err == nil {
-					_, _ = tf.Write(currentData)
-					_, _ = tf.Seek(0, io.SeekStart)
-					node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
-				} else {
-					node.Data = blob.NewByteStreamFromBytes(currentData)
+				for len(node.Chunks) < newNumChunks {
+					node.Chunks = append(node.Chunks, "")
 				}
 			}
+
+			if newNumChunks > 0 {
+				lastIdx := newNumChunks - 1
+				lastChunkLen := size - int64(lastIdx)*cs
+				chunkData, _ := v.readChunkLocked(ctx, node, lastIdx)
+				if int64(len(chunkData)) > lastChunkLen {
+					chunkData = chunkData[:lastChunkLen]
+				} else if int64(len(chunkData)) < lastChunkLen {
+					newBuf := make([]byte, lastChunkLen)
+					copy(newBuf, chunkData)
+					chunkData = newBuf
+				}
+				chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
+				node.Chunks[lastIdx] = chunkSha
+				if node.StagedChunks == nil {
+					node.StagedChunks = make(map[int][]byte)
+				}
+				node.StagedChunks[lastIdx] = chunkData
+
+				if v.blobStore != nil {
+					_ = v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{
+						chunkSha: blob.NewByteStreamFromBytes(chunkData),
+					})
+				}
+				if _, err := tx.Insert(ctx, &pb.FileChunk{
+					Ino:    proto.Uint64(node.ID),
+					Index:  proto.Uint32(uint32(lastIdx)),
+					Sha256: chunkSha,
+				}); err != nil {
+					return nil, nil, fmt.Errorf("failed to log truncated chunk: %w", err)
+				}
+			}
+
+			node.Size = size
+			node.ContentSha256 = ""
 		}
 
-		var commitSeq uint64
-		tx := v.metadataStream.Begin()
-		if node.ChunkSize > 0 {
-			if len(node.DirtyChunks) > 0 {
-				for idx, chunkBytes := range node.DirtyChunks {
-					if idx < len(node.Chunks) && node.Chunks[idx] != "" {
-						if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(node.Chunks[idx]), Data: chunkBytes}); err != nil {
-							return nil, nil, fmt.Errorf("failed to log chunk content: %w", err)
-						}
-					}
-				}
-			}
-			if node.ManifestSha256 != "" {
-				manifestChunks := make([][32]byte, len(node.Chunks))
-				for i, c := range node.Chunks {
-					raw, _ := hex.DecodeString(c)
-					if len(raw) == 32 {
-						copy(manifestChunks[i][:], raw)
-					}
-				}
-				manifest := &blob.Manifest{
-					ChunkSize:   node.ChunkSize,
-					TotalLength: uint64(node.Size),
-					Chunks:      manifestChunks,
-				}
-				manifestBlob, err := blob.EncodeManifest(manifest)
-				if err != nil {
-					return nil, nil, fmt.Errorf("failed to encode manifest: %w", err)
-				}
-				if err := manifestBlob.Stream.Rewind(); err != nil {
-					return nil, nil, fmt.Errorf("failed to rewind manifest stream: %w", err)
-				}
-				mBytes, err := io.ReadAll(manifestBlob.Stream)
-				if err != nil {
-					return nil, nil, fmt.Errorf("failed to read manifest stream: %w", err)
-				}
-				if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(manifestBlob.SHA256Hex()), Data: mBytes}); err != nil {
-					return nil, nil, fmt.Errorf("failed to log manifest content: %w", err)
-				}
-			}
-		} else if node.Data != nil && node.Sha256 != "" {
-			if err := node.Data.Rewind(); err != nil {
-				return nil, nil, fmt.Errorf("failed to rewind node data: %w", err)
-			}
-			fullBytes, err := io.ReadAll(node.Data)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to read node data: %w", err)
-			}
-			if err := node.Data.Rewind(); err != nil {
-				return nil, nil, fmt.Errorf("failed to rewind node data after read: %w", err)
-			}
-			if _, err := tx.Insert(ctx, &pb.Content{Sha256: proto.String(node.Sha256), Data: fullBytes}); err != nil {
-				return nil, nil, fmt.Errorf("failed to log file content: %w", err)
-			}
+		childInodeMsg := &pb.Inode{
+			Ino:       proto.Uint64(node.ID),
+			Mode:      node.Mode,
+			Size:      node.Size,
+			Mtime:     timestamppb.New(now),
+			IsDir:     false,
+			ChunkSize: node.ChunkSize,
 		}
-
-		nodeInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(node.ID),
-			Mode:           node.Mode,
-			Size:           node.Size,
-			Mtime:          timestamppb.New(now),
-			IsDir:          false,
-			Sha256:         node.Sha256,
-			Etag:           node.ETag,
-			ManifestSha256: node.ManifestSha256,
-			ContentSha256:  node.ContentSha256,
-			ChunkSize:      node.ChunkSize,
-		}
-		if _, err := tx.Update(ctx, nodeInodeMsg); err != nil {
+		if _, err := tx.Update(ctx, childInodeMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log node inode update: %w", err)
 		}
 
-		commitSeq, err = tx.Commit(ctx)
+		commitSeq, err := tx.Commit(ctx)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to commit truncate file transaction: %w", err)
 		}
@@ -2195,16 +2253,13 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
 		attr := &pb.EntryAttr{
-			Inode:          node.ID,
-			IsDir:          false,
-			Size:           node.Size,
-			Mode:           node.Mode,
-			ModTime:        timestamppb.New(now),
-			Sha256:         node.Sha256,
-			ManifestSha256: node.ManifestSha256,
-			ContentSha256:  node.ContentSha256,
-			Uid:            node.Uid,
-			Gid:            node.Gid,
+			Inode:   node.ID,
+			IsDir:   false,
+			Size:    node.Size,
+			Mode:    node.Mode,
+			ModTime: timestamppb.New(now),
+			Uid:     node.Uid,
+			Gid:     node.Gid,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
@@ -2226,30 +2281,49 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 }
 
 func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) error {
+	v.mu.Lock()
+	if parentInodeID == 0 {
+		parentInodeID = v.rootInodeID
+	}
+	parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
+	if err != nil {
+		v.mu.Unlock()
+		return err
+	}
+	entry, ok := parentDir.Entries[name]
+	if !ok {
+		v.mu.Unlock()
+		return fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
+	}
+	childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+	if err != nil {
+		v.mu.Unlock()
+		return err
+	}
+	if childInode.IsDir {
+		v.mu.Unlock()
+		return fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
+	}
+	childInodeID := childInode.ID
+	oldNumChunks := len(childInode.Chunks)
+	v.mu.Unlock()
+
+	if err := v.waitForInodeUploads(ctx, childInodeID); err != nil {
+		return err
+	}
+
 	waitFn, err := func() (func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
-
-		if parentInodeID == 0 {
-			parentInodeID = v.rootInodeID
-		}
 
 		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
 		if err != nil {
 			return nil, err
 		}
 
-		entry, ok := parentDir.Entries[name]
-		if !ok {
-			return nil, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
-		}
-
-		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+		childInode, err := v.getOrLoadInodeLocked(ctx, childInodeID)
 		if err != nil {
 			return nil, err
-		}
-		if childInode.IsDir {
-			return nil, fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
 		}
 
 		if childInode.Data != nil {
@@ -2272,7 +2346,15 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
-		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInode.ID)}); err != nil {
+		for i := 0; i < oldNumChunks; i++ {
+			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(uint32(i))}); err != nil {
+				return nil, fmt.Errorf("failed to log FileChunk deletion: %w", err)
+			}
+		}
+		if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(0)}); err != nil {
+			// delete inline chunk 0 if existed
+		}
+		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInodeID)}); err != nil {
 			return nil, fmt.Errorf("failed to log inode deletion: %w", err)
 		}
 		if parentInode != nil {
@@ -2635,10 +2717,22 @@ func (v *Volume) Fsync(ctx context.Context, inodeID uint64) error {
 		inodeID = v.rootInodeID
 	}
 	_, err := v.getOrLoadInodeLocked(ctx, inodeID)
+	isRoot := (inodeID == v.rootInodeID)
 	v.mu.RUnlock()
 	if err != nil {
 		return err
 	}
+
+	if isRoot {
+		if err := v.waitForVolumeUploads(ctx); err != nil {
+			return err
+		}
+	} else {
+		if err := v.waitForInodeUploads(ctx, inodeID); err != nil {
+			return err
+		}
+	}
+
 	if v.stream != nil {
 		if err := v.stream.Flush(ctx); err != nil {
 			return err
@@ -2675,6 +2769,11 @@ type snapshotResolver struct {
 }
 
 func (r *snapshotResolver) getOrLoadInode(ctx context.Context, inodeID uint64) (*CachedInode, error) {
+	if r.vol != nil && r.vol.inodeCache != nil {
+		if node, ok := r.vol.inodeCache.Peek(inodeID); ok {
+			return node, nil
+		}
+	}
 	return r.resolveInode(ctx, inodeID, false)
 }
 
@@ -2728,6 +2827,27 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 			childInode, err := r.getOrLoadInode(ctx, entry.InodeID)
 			if err != nil {
 				return nil, err
+			}
+
+			if childInode.ChunkSize > 0 && len(childInode.Chunks) > 0 {
+				_ = r.vol.ensureInodeChunksLoadedLocked(ctx, childInode)
+				manifestChunks := make([][32]byte, len(childInode.Chunks))
+				for i, c := range childInode.Chunks {
+					raw, _ := hex.DecodeString(c)
+					if len(raw) == 32 {
+						copy(manifestChunks[i][:], raw)
+					}
+				}
+				manifest := &blob.Manifest{
+					ChunkSize:   childInode.ChunkSize,
+					TotalLength: uint64(childInode.Size),
+					Chunks:      manifestChunks,
+				}
+				manifestBlob, err := blob.EncodeManifest(manifest)
+				if err == nil {
+					childInode.ManifestSha256 = manifestBlob.SHA256Hex()
+					dirtyBlobs[manifestBlob.SHA256Hex()] = manifestBlob.Stream
+				}
 			}
 
 			if childInode.ContentSha256 == "" && childInode.Size > 0 {
@@ -3034,6 +3154,8 @@ func (v *Volume) checkAutoSnapshotTriggerLocked(ctx context.Context) {
 }
 
 func (v *Volume) FlushToBackend(ctx context.Context) error {
+	_ = v.waitForVolumeUploads(ctx)
+
 	v.snapshotMu.Lock()
 	defer v.snapshotMu.Unlock()
 
@@ -3404,6 +3526,42 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 	}
 
 	switch row := msg.(type) {
+	case *pb.FileChunk:
+		ino := row.GetIno()
+		idx := int(row.GetIndex())
+		node, _ := v.inodeCache.Get(ino)
+		if node == nil {
+			node = &CachedInode{
+				ID:        ino,
+				ChunkSize: v.chunkSize,
+				IsDirty:   false,
+			}
+			if node.ChunkSize == 0 {
+				node.ChunkSize = 64 * 1024
+			}
+			v.inodeCache.Put(ino, node)
+		}
+		switch change.Op {
+		case sdsv1.OpRecord_CREATE, sdsv1.OpRecord_UPDATE:
+			if len(row.GetInlineData()) > 0 {
+				node.InlineData = row.GetInlineData()
+				node.Chunks = nil
+			} else if row.GetSha256() != "" {
+				node.InlineData = nil
+				for len(node.Chunks) <= idx {
+					node.Chunks = append(node.Chunks, "")
+				}
+				node.Chunks[idx] = row.GetSha256()
+			}
+		case sdsv1.OpRecord_DELETE:
+			if idx < len(node.Chunks) {
+				node.Chunks[idx] = ""
+			}
+			if idx == 0 && len(node.InlineData) > 0 {
+				node.InlineData = nil
+			}
+		}
+
 	case *pb.Content:
 		switch change.Op {
 		case sdsv1.OpRecord_CREATE, sdsv1.OpRecord_UPDATE:
@@ -3433,14 +3591,18 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 			}
 
 			if row.GetIsDir() {
-				node := &CachedInode{
-					ID:      ino,
-					Mode:    row.GetMode(),
-					ModTime: modTime,
-					IsDir:   true,
-					IsDirty: false,
+				node, _ := v.inodeCache.Get(ino)
+				if node == nil {
+					node = &CachedInode{
+						ID:      ino,
+						IsDir:   true,
+						IsDirty: false,
+					}
+					v.inodeCache.Put(ino, node)
 				}
-				v.inodeCache.Put(ino, node)
+				node.Mode = row.GetMode()
+				node.ModTime = modTime
+				node.IsDir = true
 				if _, ok := v.dirCache.Peek(ino); !ok {
 					v.dirCache.Put(ino, &CachedDir{
 						ID:         ino,
@@ -3452,19 +3614,24 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 					})
 				}
 			} else {
-				node := &CachedInode{
-					ID:             ino,
-					Mode:           row.GetMode(),
-					Size:           row.GetSize(),
-					ModTime:        modTime,
-					Sha256:         row.GetSha256(),
-					ManifestSha256: row.GetManifestSha256(),
-					ContentSha256:  row.GetContentSha256(),
-					ChunkSize:      row.GetChunkSize(),
-					ETag:           row.GetEtag(),
-					IsDir:          false,
-					IsDirty:        false,
+				node, _ := v.inodeCache.Get(ino)
+				if node == nil {
+					node = &CachedInode{
+						ID:      ino,
+						IsDir:   false,
+						IsDirty: false,
+					}
+					v.inodeCache.Put(ino, node)
 				}
+				node.Mode = row.GetMode()
+				node.Size = row.GetSize()
+				node.ModTime = modTime
+				node.Sha256 = row.GetSha256()
+				node.ManifestSha256 = row.GetManifestSha256()
+				node.ContentSha256 = row.GetContentSha256()
+				node.ChunkSize = row.GetChunkSize()
+				node.ETag = row.GetEtag()
+				node.IsDir = false
 
 				if node.ChunkSize > 0 && node.ManifestSha256 != "" {
 					if mData, ok := v.recoveredContent[node.ManifestSha256]; ok {
@@ -3482,7 +3649,6 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 						node.Data = blob.NewByteStreamFromBytes(cData)
 					}
 				}
-				v.inodeCache.Put(ino, node)
 			}
 
 		case sdsv1.OpRecord_DELETE:

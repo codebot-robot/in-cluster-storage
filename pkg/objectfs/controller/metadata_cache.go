@@ -183,6 +183,8 @@ type CachedInode struct {
 	ContentSha256  string
 	ChunkSize      uint32
 	Chunks         []string
+	InlineData     []byte
+	StagedChunks   map[int][]byte
 	DirtyChunks    map[int][]byte
 	ETag           string
 	RedirectURL    string

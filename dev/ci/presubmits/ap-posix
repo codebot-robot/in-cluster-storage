@@ -114,9 +114,9 @@ set -o nounset
 set -o pipefail
 
 echo "==> Running fsx data-integrity test..."
-# Note: max file size is set to 1MB (-l 1048576) to avoid files >= 4MB blocked by issue #81.
+# File size limit raised well above 1MB (16MB) using 64 KiB chunked blob-first writes (#143).
 # Mapped writes are disabled (-W) pending kernel page cache writeback coherency.
-"${XFSTESTS_DIR}/fsx" -N 1000 -S 42 -l 1048576 -o 65536 -p 200 -W fsx-test.bin
+"${XFSTESTS_DIR}/fsx" -N 1000 -S 42 -l 16777216 -o 65536 -p 200 -W fsx-test.bin
 echo "fsx passed successfully!"
 echo
 

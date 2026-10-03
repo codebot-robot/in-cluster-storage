@@ -2090,8 +2090,8 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateFile /large.bin failed: %v", err)
 	}
-	if largeAttr.ManifestSha256 == "" {
-		t.Fatalf("expected non-empty ManifestSha256 for chunked file")
+	if largeAttr.Size != int64(len(largeData)) {
+		t.Fatalf("expected Size %d for chunked file, got %d", len(largeData), largeAttr.Size)
 	}
 	if largeAttr.ContentSha256 != largeSha {
 		t.Fatalf("expected ContentSha256 %s, got %s", largeSha, largeAttr.ContentSha256)
@@ -2546,13 +2546,13 @@ func TestSDSCatOnObjectFSStream(t *testing.T) {
 		}
 	}
 
-	// Verify that TypeDefinitions for Inode, DirEntry, Content were announced in-band
+	// Verify that TypeDefinitions for Inode, DirEntry, FileChunk were announced in-band
 	hasInodeDef := slices.Contains(seenTypeDefs, "objectfs.v1alpha1.Inode")
 	hasDirDef := slices.Contains(seenTypeDefs, "objectfs.v1alpha1.DirEntry")
-	hasContentDef := slices.Contains(seenTypeDefs, "objectfs.v1alpha1.Content")
+	hasChunkDef := slices.Contains(seenTypeDefs, "objectfs.v1alpha1.FileChunk")
 
-	if !hasInodeDef || !hasDirDef || !hasContentDef {
-		t.Fatalf("Expected Inode, DirEntry, and Content TypeDefinitions announced in stream, got %v", seenTypeDefs)
+	if !hasInodeDef || !hasDirDef || !hasChunkDef {
+		t.Fatalf("Expected Inode, DirEntry, and FileChunk TypeDefinitions announced in stream, got %v", seenTypeDefs)
 	}
 
 	if seenOps < 3 {
@@ -2606,5 +2606,181 @@ func TestTruncateUpwardAndSparseRead(t *testing.T) {
 		if b != 0 {
 			t.Fatalf("Expected zero byte at offset %d, got %d", 11+i, b)
 		}
+	}
+}
+
+func TestLargeFileBlobFirstAndSparseWrite(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "large-vol"
+	defer server.Close()
+
+	// 1. Create a 1 GiB sparse file with writes at offset 0, 512 MiB, and 1 GiB - 64 KiB
+	targetSize := int64(1 * 1024 * 1024 * 1024) // 1 GiB
+	createResp, err := testCreateFile(ctx, server, volumeID, "/large-1gb.bin", 0644, nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	if createResp.GetError() != 0 {
+		t.Fatalf("CreateFile returned error: %d", createResp.GetError())
+	}
+
+	chunk0 := bytes.Repeat([]byte("A"), 64*1024)
+	chunkMid := bytes.Repeat([]byte("M"), 64*1024)
+	chunkEnd := bytes.Repeat([]byte("Z"), 64*1024)
+
+	midOffset := int64(512 * 1024 * 1024)
+	endOffset := targetSize - int64(64*1024)
+
+	// Write at chunk 0
+	w0, err := testWriteFile(ctx, server, volumeID, "/large-1gb.bin", 0, chunk0, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil || w0.GetError() != 0 {
+		t.Fatalf("WriteFile chunk 0 failed: %v (err=%d)", err, w0.GetError())
+	}
+
+	// Write at 512 MiB
+	wMid, err := testWriteFile(ctx, server, volumeID, "/large-1gb.bin", midOffset, chunkMid, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil || wMid.GetError() != 0 {
+		t.Fatalf("WriteFile mid chunk failed: %v (err=%d)", err, wMid.GetError())
+	}
+
+	// Write at 1 GiB - 64 KiB
+	wEnd, err := testWriteFile(ctx, server, volumeID, "/large-1gb.bin", endOffset, chunkEnd, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil || wEnd.GetError() != 0 {
+		t.Fatalf("WriteFile end chunk failed: %v (err=%d)", err, wEnd.GetError())
+	}
+
+	// Fsync to ensure all uploads and SDS transactions commit
+	ino, _ := resolvePath(ctx, server, volumeID, "/large-1gb.bin")
+	_, err = server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+	})
+	if err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	// Read back chunk 0
+	resp0, err := testReadFile(ctx, server, volumeID, "/large-1gb.bin", 0, 64*1024)
+	if err != nil || !bytes.Equal(resp0.GetData(), chunk0) {
+		t.Fatalf("ReadFile chunk 0 mismatch (err=%v)", err)
+	}
+	if resp0.GetTotalSize() != targetSize {
+		t.Fatalf("Expected total size %d, got %d", targetSize, resp0.GetTotalSize())
+	}
+
+	// Read back sparse hole between chunk 0 and mid chunk (e.g. at 256 MiB)
+	respHole, err := testReadFile(ctx, server, volumeID, "/large-1gb.bin", 256*1024*1024, 1024)
+	if err != nil {
+		t.Fatalf("ReadFile hole failed: %v", err)
+	}
+	for i, b := range respHole.GetData() {
+		if b != 0 {
+			t.Fatalf("Expected zero byte in sparse hole at %d, got %d", i, b)
+		}
+	}
+
+	// Read back mid chunk
+	respMid, err := testReadFile(ctx, server, volumeID, "/large-1gb.bin", midOffset, 64*1024)
+	if err != nil || !bytes.Equal(respMid.GetData(), chunkMid) {
+		t.Fatalf("ReadFile mid chunk mismatch (err=%v)", err)
+	}
+
+	// Read back end chunk
+	respEnd, err := testReadFile(ctx, server, volumeID, "/large-1gb.bin", endOffset, 64*1024)
+	if err != nil || !bytes.Equal(respEnd.GetData(), chunkEnd) {
+		t.Fatalf("ReadFile end chunk mismatch (err=%v)", err)
+	}
+}
+
+func TestWriteThenTruncateAndUnlinkOrdering(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "order-vol"
+	defer server.Close()
+
+	// 1. Write then immediately Truncate
+	createResp, err := testCreateFile(ctx, server, volumeID, "/truncate-test.bin", 0644, nil, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	data128k := bytes.Repeat([]byte("T"), 128*1024)
+	wResp, err := testWriteFile(ctx, server, volumeID, "/truncate-test.bin", 0, data128k, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil || wResp.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Immediately truncate to 32 KiB without fsync
+	truncResp, err := testTruncateFile(ctx, server, volumeID, "/truncate-test.bin", 32*1024)
+	if err != nil || truncResp.GetError() != 0 {
+		t.Fatalf("TruncateFile failed: %v", err)
+	}
+
+	// Read back and verify size is 32 KiB and content matches
+	readResp, err := testReadFile(ctx, server, volumeID, "/truncate-test.bin", 0, 128*1024)
+	if err != nil {
+		t.Fatalf("ReadFile after truncate failed: %v", err)
+	}
+	if readResp.GetTotalSize() != 32*1024 {
+		t.Fatalf("Expected total size 32768, got %d", readResp.GetTotalSize())
+	}
+	if !bytes.Equal(readResp.GetData(), data128k[:32*1024]) {
+		t.Fatalf("Data mismatch after truncate")
+	}
+
+	// 2. Write then immediately Unlink
+	createResp2, err := testCreateFile(ctx, server, volumeID, "/unlink-test.bin", 0644, nil, 0, 0)
+	if err != nil || createResp2.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	wResp2, err := testWriteFile(ctx, server, volumeID, "/unlink-test.bin", 0, data128k, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil || wResp2.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Immediately unlink without waiting for upload
+	unResp, err := testUnlink(ctx, server, volumeID, "/unlink-test.bin")
+	if err != nil || unResp.GetError() != 0 {
+		t.Fatalf("Unlink failed: %v", err)
+	}
+
+	// Read should return error / not found
+	readResp2, err := testReadFile(ctx, server, volumeID, "/unlink-test.bin", 0, 1024)
+	if err == nil && readResp2.GetError() == 0 {
+		t.Fatalf("Expected ReadFile on unlinked file to fail, got data len %d", len(readResp2.GetData()))
+	}
+}
+
+func TestTinyFileInlineLogging(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "tiny-vol"
+	defer server.Close()
+
+	tinyData := []byte("tiny inline content < 4KB")
+	createResp, err := testCreateFile(ctx, server, volumeID, "/tiny.txt", 0644, tinyData, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile tiny failed: %v", err)
+	}
+
+	// Fsync
+	ino, _ := resolvePath(ctx, server, volumeID, "/tiny.txt")
+	_, err = server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+	})
+	if err != nil {
+		t.Fatalf("Fsync tiny failed: %v", err)
+	}
+
+	// Read back
+	readResp, err := testReadFile(ctx, server, volumeID, "/tiny.txt", 0, 100)
+	if err != nil || !bytes.Equal(readResp.GetData(), tinyData) {
+		t.Fatalf("ReadFile tiny mismatch: %q vs %q (err=%v)", string(readResp.GetData()), string(tinyData), err)
 	}
 }
