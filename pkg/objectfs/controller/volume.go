@@ -79,6 +79,8 @@ type FileMetadata struct {
 	Mode           uint32    `json:"mode"`
 	Size           int64     `json:"size"`
 	ModTime        time.Time `json:"mod_time"`
+	Atime          time.Time `json:"atime,omitempty"`
+	Ctime          time.Time `json:"ctime,omitempty"`
 	Sha256         string    `json:"sha256,omitempty"`
 	ManifestSha256 string    `json:"manifest_sha256,omitempty"`
 	ContentSha256  string    `json:"content_sha256,omitempty"`
@@ -738,6 +740,8 @@ func (v *Volume) persistInode(ctx context.Context, node *CachedInode) error {
 			Gid:            node.Gid,
 			ManifestSha256: node.ManifestSha256,
 			ContentSha256:  node.ContentSha256,
+			Atime:          node.Atime,
+			Ctime:          node.Ctime,
 		}
 		payload, err := EncodeInodeRecord(rec)
 		if err != nil {
@@ -953,6 +957,8 @@ func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, pop
 					Mode:           rec.Mode,
 					Size:           rec.Size,
 					ModTime:        rec.ModTime,
+					Atime:          rec.Atime,
+					Ctime:          rec.Ctime,
 					IsDir:          rec.IsDir,
 					Sha256:         rec.Sha256,
 					ManifestSha256: rec.ManifestSha256,
@@ -1015,6 +1021,8 @@ func (r *metadataResolver) resolveInode(ctx context.Context, inodeID uint64, pop
 				Mode:           mode,
 				Size:           int64(erofsInode.Size),
 				ModTime:        mtime,
+				Atime:          mtime,
+				Ctime:          mtime,
 				IsDir:          isDir,
 				Sha256:         shaStr,
 				ManifestSha256: manifestSha,
@@ -1275,10 +1283,18 @@ func (v *Volume) applyChangesToSQLiteCacheLocked(changes []sds.Change) {
 	}
 }
 
-func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
-	if inodeID == 0 {
-		inodeID = v.rootInodeID
+func (v *Volume) normalizeInodeID(id uint64) uint64 {
+	if id == 0 || (v.metadataStore != MetadataStoreSQLite && id == 1) {
+		if v.rootInodeID != 0 {
+			return v.rootInodeID
+		}
+		return 1
 	}
+	return id
+}
+
+func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
+	inodeID = v.normalizeInodeID(inodeID)
 
 	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
 		key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(inodeID)})
@@ -1307,9 +1323,21 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 			ManifestSha256: inode.GetManifestSha256(),
 			ContentSha256:  inode.GetContentSha256(),
 			ChunkSize:      chunkSize,
+			Uid:            inode.GetUid(),
+			Gid:            inode.GetGid(),
 		}
 		if inode.GetMtime() != nil {
 			node.ModTime = inode.GetMtime().AsTime()
+		}
+		if inode.GetAtime() != nil {
+			node.Atime = inode.GetAtime().AsTime()
+		} else {
+			node.Atime = node.ModTime
+		}
+		if inode.GetCtime() != nil {
+			node.Ctime = inode.GetCtime().AsTime()
+		} else {
+			node.Ctime = node.ModTime
 		}
 
 		return node, nil
@@ -1319,9 +1347,7 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 }
 
 func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*CachedDir, error) {
-	if inodeID == 0 {
-		inodeID = v.rootInodeID
-	}
+	inodeID = v.normalizeInodeID(inodeID)
 
 	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
 		dirNode, err := v.getOrLoadInodeLocked(ctx, inodeID)
@@ -1472,13 +1498,27 @@ func (v *Volume) toEntryAttrLocked(ctx context.Context, inodeID uint64, name str
 	if name == "" && inodeID == v.rootInodeID {
 		name = "/"
 	}
+	atime := node.Atime
+	if atime.IsZero() {
+		atime = node.ModTime
+	}
+	ctime := node.Ctime
+	if ctime.IsZero() {
+		ctime = node.ModTime
+	}
+	ino := node.ID
+	if node.ID == v.rootInodeID {
+		ino = 1
+	}
 	return &pb.EntryAttr{
-		Inode:          node.ID,
+		Inode:          ino,
 		Name:           name,
 		IsDir:          node.IsDir,
 		Size:           node.Size,
 		Mode:           node.Mode,
 		ModTime:        timestamppb.New(node.ModTime),
+		Atime:          timestamppb.New(atime),
+		Ctime:          timestamppb.New(ctime),
 		Sha256:         node.Sha256,
 		ManifestSha256: mSha,
 		ContentSha256:  cSha,
@@ -1492,10 +1532,152 @@ func (v *Volume) GetAttr(ctx context.Context, inodeID uint64) (*pb.EntryAttr, er
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	if inodeID == 0 {
-		inodeID = v.rootInodeID
-	}
+	inodeID = v.normalizeInodeID(inodeID)
 	return v.toEntryAttrLocked(ctx, inodeID, "")
+}
+
+func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, atimeNow bool, mtime *time.Time, mtimeNow bool, ctime *time.Time, ctimeNow bool) (*pb.EntryAttr, error) {
+	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+
+		inodeID = v.normalizeInodeID(inodeID)
+
+		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		now := time.Now()
+		modified := false
+
+		if mode != nil {
+			// keep setuid, setgid and sticky (07777), and the file-type bits untouched by chmod
+			node.Mode = (node.Mode & ^uint32(07777)) | (*mode & 07777)
+			modified = true
+		}
+		if uid != nil {
+			node.Uid = *uid
+			modified = true
+		}
+		if gid != nil {
+			node.Gid = *gid
+			modified = true
+		}
+		if atimeNow {
+			node.Atime = now
+			modified = true
+		} else if atime != nil {
+			node.Atime = *atime
+			modified = true
+		}
+		if mtimeNow {
+			node.ModTime = now
+			modified = true
+		} else if mtime != nil {
+			node.ModTime = *mtime
+			modified = true
+		}
+
+		if ctimeNow {
+			node.Ctime = now
+			modified = true
+		} else if ctime != nil {
+			node.Ctime = *ctime
+			modified = true
+		} else if modified {
+			node.Ctime = now
+		}
+
+		if !modified {
+			attr, err := v.toEntryAttrLocked(ctx, inodeID, "")
+			return attr, nil, err
+		}
+
+		node.IsDirty = true
+		v.inodeCache.Put(inodeID, node)
+
+		tx := v.metadataStream.Begin()
+		mAtime := node.Atime
+		if mAtime.IsZero() {
+			mAtime = node.ModTime
+		}
+		mCtime := node.Ctime
+		if mCtime.IsZero() {
+			mCtime = node.ModTime
+		}
+		inodeMsg := &pb.Inode{
+			Ino:            proto.Uint64(node.ID),
+			Mode:           node.Mode,
+			Size:           node.Size,
+			Mtime:          timestamppb.New(node.ModTime),
+			Atime:          timestamppb.New(mAtime),
+			Ctime:          timestamppb.New(mCtime),
+			IsDir:          node.IsDir,
+			Sha256:         node.Sha256,
+			Etag:           node.ETag,
+			ManifestSha256: node.ManifestSha256,
+			ContentSha256:  node.ContentSha256,
+			ChunkSize:      node.ChunkSize,
+			Uid:            node.Uid,
+			Gid:            node.Gid,
+		}
+		if _, err := tx.Update(ctx, inodeMsg); err != nil {
+			return nil, nil, fmt.Errorf("failed to log inode update: %w", err)
+		}
+
+		commitSeq, err := tx.Commit(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to commit setattr transaction: %w", err)
+		}
+		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
+			return nil, nil, err
+		}
+
+		waitFn := v.makeWaitFn(commitSeq, nil)
+
+		mSha := node.ManifestSha256
+		cSha := node.ContentSha256
+		if node.ChunkSize == 0 && mSha == "" {
+			cSha = node.Sha256
+		} else if mSha == "" {
+			mSha = node.Sha256
+		}
+		attr := &pb.EntryAttr{
+			Inode:          node.ID,
+			IsDir:          node.IsDir,
+			Size:           node.Size,
+			Mode:           node.Mode,
+			ModTime:        timestamppb.New(node.ModTime),
+			Atime:          timestamppb.New(mAtime),
+			Ctime:          timestamppb.New(mCtime),
+			Sha256:         node.Sha256,
+			ManifestSha256: mSha,
+			ContentSha256:  cSha,
+			RedirectUrl:    node.RedirectURL,
+			Uid:            node.Uid,
+			Gid:            node.Gid,
+		}
+
+		v.checkAutoSnapshotTriggerLocked(ctx)
+		return attr, waitFn, nil
+	}()
+	if err != nil {
+		return nil, err
+	}
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if v.broadcaster != nil {
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_MODIFIED,
+			Attr:      attr,
+			Inode:     attr.Inode,
+		})
+	}
+	return attr, nil
 }
 
 func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) (*pb.EntryAttr, error) {
@@ -1506,9 +1688,7 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	if parentInodeID == 0 {
-		parentInodeID = v.rootInodeID
-	}
+	parentInodeID = v.normalizeInodeID(parentInodeID)
 
 	if name == "." {
 		return v.toEntryAttrLocked(ctx, parentInodeID, ".")
@@ -1559,9 +1739,7 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	if dirInodeID == 0 {
-		dirInodeID = v.rootInodeID
-	}
+	dirInodeID = v.normalizeInodeID(dirInodeID)
 
 	dirNode, err := v.getOrLoadInodeLocked(ctx, dirInodeID)
 	if err != nil {
@@ -1647,9 +1825,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		if parentInodeID == 0 {
-			parentInodeID = v.rootInodeID
-		}
+		parentInodeID = v.normalizeInodeID(parentInodeID)
 		if name == "" || name == "." || name == ".." {
 			return nil, nil, fmt.Errorf("invalid directory name %q: %w", name, syscall.EINVAL)
 		}
@@ -1687,6 +1863,11 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		}
 		mode |= syscall.S_IFDIR
 
+		if (parentInode.Mode & 02000) != 0 {
+			gid = parentInode.Gid
+			mode |= 02000
+		}
+
 		now := time.Now()
 		childInodeID := v.allocInode()
 
@@ -1703,7 +1884,11 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			parentDir.IsDirty = true
 		}
 		parentInode.ModTime = now
+		parentInode.Ctime = now
 		parentInode.IsDirty = true
+		if v.inodeCache != nil {
+			v.inodeCache.Put(parentInode.ID, parentInode)
+		}
 
 		if v.dirParents == nil {
 			v.dirParents = make(map[uint64]uint64)
@@ -1715,6 +1900,8 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 				ID:      childInodeID,
 				Mode:    mode,
 				ModTime: now,
+				Atime:   now,
+				Ctime:   now,
 				IsDir:   true,
 				Uid:     uid,
 				Gid:     gid,
@@ -1740,6 +1927,10 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			Mode:  mode,
 			Size:  0,
 			Mtime: timestamppb.New(now),
+			Atime: timestamppb.New(now),
+			Ctime: timestamppb.New(now),
+			Uid:   uid,
+			Gid:   gid,
 			IsDir: true,
 		}
 		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
@@ -1767,11 +1958,19 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
+		pAtime := parentInode.Atime
+		if pAtime.IsZero() {
+			pAtime = parentInode.ModTime
+		}
 		parentInodeMsg := &pb.Inode{
 			Ino:            proto.Uint64(parentInode.ID),
 			Mode:           parentInode.Mode,
 			Size:           parentInode.Size,
 			Mtime:          timestamppb.New(now),
+			Atime:          timestamppb.New(pAtime),
+			Ctime:          timestamppb.New(now),
+			Uid:            parentInode.Uid,
+			Gid:            parentInode.Gid,
 			IsDir:          true,
 			Sha256:         parentInode.Sha256,
 			Etag:           parentInode.ETag,
@@ -1815,6 +2014,8 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			Size:    0,
 			Mode:    mode,
 			ModTime: timestamppb.New(now),
+			Atime:   timestamppb.New(now),
+			Ctime:   timestamppb.New(now),
 			Uid:     uid,
 			Gid:     gid,
 		}
@@ -1849,9 +2050,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		if parentInodeID == 0 {
-			parentInodeID = v.rootInodeID
-		}
+		parentInodeID = v.normalizeInodeID(parentInodeID)
 		if name == "" || name == "." || name == ".." {
 			return nil, nil, fmt.Errorf("invalid file name %q: %w", name, syscall.EINVAL)
 		}
@@ -1893,6 +2092,10 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		}
 		mode |= syscall.S_IFREG
 
+		if (parentInode.Mode & 02000) != 0 {
+			gid = parentInode.Gid
+		}
+
 		now := time.Now()
 		var hashStr string
 		if len(initialContent) > 0 {
@@ -1918,9 +2121,17 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			childInode.Mode = mode
 			childInode.Size = int64(len(dataCopy))
 			childInode.ModTime = now
+			childInode.Ctime = now
 			childInode.Uid = uid
 			childInode.Gid = gid
 			childInode.IsDirty = true
+
+			parentInode.ModTime = now
+			parentInode.Ctime = now
+			parentInode.IsDirty = true
+			if v.inodeCache != nil {
+				v.inodeCache.Put(parentInode.ID, parentInode)
+			}
 
 			effectiveChunkSize := childInode.ChunkSize
 			if effectiveChunkSize == 0 {
@@ -2020,11 +2231,19 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				}
 			}
 
+			cAtime := childInode.Atime
+			if cAtime.IsZero() {
+				cAtime = now
+			}
 			childInodeMsg := &pb.Inode{
 				Ino:           proto.Uint64(childInode.ID),
 				Mode:          childInode.Mode,
 				Size:          childInode.Size,
 				Mtime:         timestamppb.New(now),
+				Atime:         timestamppb.New(cAtime),
+				Ctime:         timestamppb.New(now),
+				Uid:           uid,
+				Gid:           gid,
 				IsDir:         false,
 				ContentSha256: childInode.ContentSha256,
 				ChunkSize:     childInode.ChunkSize,
@@ -2033,11 +2252,19 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				return nil, nil, fmt.Errorf("failed to log child inode update: %w", err)
 			}
 
+			pAtime := parentInode.Atime
+			if pAtime.IsZero() {
+				pAtime = parentInode.ModTime
+			}
 			parentInodeMsg := &pb.Inode{
 				Ino:            proto.Uint64(parentInode.ID),
 				Mode:           parentInode.Mode,
 				Size:           parentInode.Size,
 				Mtime:          timestamppb.New(now),
+				Atime:          timestamppb.New(pAtime),
+				Ctime:          timestamppb.New(now),
+				Uid:            parentInode.Uid,
+				Gid:            parentInode.Gid,
 				IsDir:          true,
 				Sha256:         parentInode.Sha256,
 				Etag:           parentInode.ETag,
@@ -2066,6 +2293,8 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				Size:           childInode.Size,
 				Mode:           childInode.Mode,
 				ModTime:        timestamppb.New(now),
+				Atime:          timestamppb.New(cAtime),
+				Ctime:          timestamppb.New(now),
 				Sha256:         childInode.Sha256,
 				ManifestSha256: childInode.ManifestSha256,
 				ContentSha256:  childInode.ContentSha256,
@@ -2097,7 +2326,11 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			parentDir.IsDirty = true
 		}
 		parentInode.ModTime = now
+		parentInode.Ctime = now
 		parentInode.IsDirty = true
+		if v.inodeCache != nil {
+			v.inodeCache.Put(parentInode.ID, parentInode)
+		}
 
 		effectiveChunkSize := v.chunkSize
 		if effectiveChunkSize == 0 {
@@ -2109,6 +2342,8 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			Mode:      mode,
 			Size:      int64(len(dataCopy)),
 			ModTime:   now,
+			Atime:     now,
+			Ctime:     now,
 			IsDir:     false,
 			Uid:       uid,
 			Gid:       gid,
@@ -2183,6 +2418,10 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			Mode:          mode,
 			Size:          int64(len(dataCopy)),
 			Mtime:         timestamppb.New(now),
+			Atime:         timestamppb.New(now),
+			Ctime:         timestamppb.New(now),
+			Uid:           uid,
+			Gid:           gid,
 			IsDir:         false,
 			ContentSha256: childInode.ContentSha256,
 			ChunkSize:     childInode.ChunkSize,
@@ -2210,11 +2449,19 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
+		pAtime := parentInode.Atime
+		if pAtime.IsZero() {
+			pAtime = parentInode.ModTime
+		}
 		parentInodeMsg := &pb.Inode{
 			Ino:            proto.Uint64(parentInode.ID),
 			Mode:           parentInode.Mode,
 			Size:           parentInode.Size,
 			Mtime:          timestamppb.New(now),
+			Atime:          timestamppb.New(pAtime),
+			Ctime:          timestamppb.New(now),
+			Uid:            parentInode.Uid,
+			Gid:            parentInode.Gid,
 			IsDir:          true,
 			Sha256:         parentInode.Sha256,
 			Etag:           parentInode.ETag,
@@ -2254,6 +2501,8 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			Size:           int64(len(dataCopy)),
 			Mode:           mode,
 			ModTime:        timestamppb.New(now),
+			Atime:          timestamppb.New(now),
+			Ctime:          timestamppb.New(now),
 			Sha256:         childInode.Sha256,
 			ManifestSha256: childInode.ManifestSha256,
 			ContentSha256:  childInode.ContentSha256,
@@ -2434,6 +2683,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 
 		now := time.Now()
 		node.ModTime = now
+		node.Ctime = now
 		node.IsDirty = true
 
 		var reqLevel *walclient.Level
@@ -2489,11 +2739,19 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			}); err != nil {
 				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 			}
+			nAtime := node.Atime
+			if nAtime.IsZero() {
+				nAtime = now
+			}
 			nodeInodeMsg := &pb.Inode{
 				Ino:           proto.Uint64(node.ID),
 				Mode:          node.Mode,
 				Size:          node.Size,
 				Mtime:         timestamppb.New(now),
+				Atime:         timestamppb.New(nAtime),
+				Ctime:         timestamppb.New(now),
+				Uid:           node.Uid,
+				Gid:           node.Gid,
 				IsDir:         false,
 				ContentSha256: node.ContentSha256,
 				ChunkSize:     node.ChunkSize,
@@ -2517,6 +2775,8 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 				Size:          node.Size,
 				Mode:          node.Mode,
 				ModTime:       timestamppb.New(now),
+				Atime:         timestamppb.New(nAtime),
+				Ctime:         timestamppb.New(now),
 				ContentSha256: node.ContentSha256,
 				Uid:           node.Uid,
 				Gid:           node.Gid,
@@ -2653,11 +2913,23 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 				}
 			}
 
+			curAtime := currNode.Atime
+			if curAtime.IsZero() {
+				curAtime = currNode.ModTime
+			}
+			curCtime := currNode.Ctime
+			if curCtime.IsZero() {
+				curCtime = currNode.ModTime
+			}
 			nodeInodeMsg := &pb.Inode{
 				Ino:       proto.Uint64(ino),
 				Mode:      mode,
 				Size:      currNode.Size,
 				Mtime:     timestamppb.New(currNode.ModTime),
+				Atime:     timestamppb.New(curAtime),
+				Ctime:     timestamppb.New(curCtime),
+				Uid:       currNode.Uid,
+				Gid:       currNode.Gid,
 				IsDir:     false,
 				ChunkSize: currNode.ChunkSize,
 			}
@@ -2673,12 +2945,18 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			_ = v.applyTxChangesLocked(context.Background(), tx)
 		}()
 
+		nAtime := node.Atime
+		if nAtime.IsZero() {
+			nAtime = now
+		}
 		attr := &pb.EntryAttr{
 			Inode:   node.ID,
 			IsDir:   false,
 			Size:    node.Size,
 			Mode:    node.Mode,
 			ModTime: timestamppb.New(now),
+			Atime:   timestamppb.New(nAtime),
+			Ctime:   timestamppb.New(now),
 			Uid:     node.Uid,
 			Gid:     node.Gid,
 		}
@@ -2703,11 +2981,9 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 }
 
 func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (*pb.EntryAttr, error) {
-	if inodeID == 0 {
-		v.mu.RLock()
-		inodeID = v.rootInodeID
-		v.mu.RUnlock()
-	}
+	v.mu.RLock()
+	inodeID = v.normalizeInodeID(inodeID)
+	v.mu.RUnlock()
 
 	if err := v.waitForInodeUploads(ctx, inodeID); err != nil {
 		return nil, err
@@ -2717,9 +2993,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		if inodeID == 0 {
-			inodeID = v.rootInodeID
-		}
+		inodeID = v.normalizeInodeID(inodeID)
 
 		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
 		if err != nil {
@@ -2736,6 +3010,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 
 		now := time.Now()
 		node.ModTime = now
+		node.Ctime = now
 		node.IsDirty = true
 		oldChunks := node.Chunks
 
@@ -2870,11 +3145,19 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			node.ContentSha256 = ""
 		}
 
+		nAtime := node.Atime
+		if nAtime.IsZero() {
+			nAtime = now
+		}
 		childInodeMsg := &pb.Inode{
 			Ino:       proto.Uint64(node.ID),
 			Mode:      node.Mode,
 			Size:      node.Size,
 			Mtime:     timestamppb.New(now),
+			Atime:     timestamppb.New(nAtime),
+			Ctime:     timestamppb.New(now),
+			Uid:       node.Uid,
+			Gid:       node.Gid,
 			IsDir:     false,
 			ChunkSize: node.ChunkSize,
 		}
@@ -2898,6 +3181,8 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			Size:    node.Size,
 			Mode:    node.Mode,
 			ModTime: timestamppb.New(now),
+			Atime:   timestamppb.New(nAtime),
+			Ctime:   timestamppb.New(now),
 			Uid:     node.Uid,
 			Gid:     node.Gid,
 		}
@@ -2926,9 +3211,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	}
 
 	v.mu.Lock()
-	if parentInodeID == 0 {
-		parentInodeID = v.rootInodeID
-	}
+	parentInodeID = v.normalizeInodeID(parentInodeID)
 
 	var childInodeID uint64
 	var oldChunks map[uint32]string
@@ -3006,10 +3289,15 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			parentDir.IsDirty = true
 		}
 
+		now := time.Now()
 		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
 		if parentInode != nil {
-			parentInode.ModTime = time.Now()
+			parentInode.ModTime = now
+			parentInode.Ctime = now
 			parentInode.IsDirty = true
+			if v.inodeCache != nil {
+				v.inodeCache.Put(parentInode.ID, parentInode)
+			}
 		}
 
 		var commitSeq uint64
@@ -3040,11 +3328,19 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			return nil, fmt.Errorf("failed to log inode deletion: %w", err)
 		}
 		if parentInode != nil {
+			pAtime := parentInode.Atime
+			if pAtime.IsZero() {
+				pAtime = parentInode.ModTime
+			}
 			parentInodeMsg := &pb.Inode{
 				Ino:            proto.Uint64(parentInode.ID),
 				Mode:           parentInode.Mode,
 				Size:           parentInode.Size,
-				Mtime:          timestamppb.New(parentInode.ModTime),
+				Mtime:          timestamppb.New(now),
+				Atime:          timestamppb.New(pAtime),
+				Ctime:          timestamppb.New(now),
+				Uid:            parentInode.Uid,
+				Gid:            parentInode.Gid,
 				IsDir:          true,
 				Sha256:         parentInode.Sha256,
 				Etag:           parentInode.ETag,
@@ -3096,9 +3392,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		if parentInodeID == 0 {
-			parentInodeID = v.rootInodeID
-		}
+		parentInodeID = v.normalizeInodeID(parentInodeID)
 
 		var childInodeID uint64
 		if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
@@ -3166,10 +3460,15 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 
 		delete(v.dirParents, childInodeID)
 
+		now := time.Now()
 		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
 		if parentInode != nil {
-			parentInode.ModTime = time.Now()
+			parentInode.ModTime = now
+			parentInode.Ctime = now
 			parentInode.IsDirty = true
+			if v.inodeCache != nil {
+				v.inodeCache.Put(parentInode.ID, parentInode)
+			}
 		}
 
 		var commitSeq uint64
@@ -3182,11 +3481,19 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 			return nil, fmt.Errorf("failed to log inode deletion: %w", err)
 		}
 		if parentInode != nil {
+			pAtime := parentInode.Atime
+			if pAtime.IsZero() {
+				pAtime = parentInode.ModTime
+			}
 			parentInodeMsg := &pb.Inode{
 				Ino:            proto.Uint64(parentInode.ID),
 				Mode:           parentInode.Mode,
 				Size:           parentInode.Size,
-				Mtime:          timestamppb.New(parentInode.ModTime),
+				Mtime:          timestamppb.New(now),
+				Atime:          timestamppb.New(pAtime),
+				Ctime:          timestamppb.New(now),
+				Uid:            parentInode.Uid,
+				Gid:            parentInode.Gid,
 				IsDir:          true,
 				Sha256:         parentInode.Sha256,
 				Etag:           parentInode.ETag,
@@ -3238,12 +3545,8 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
-		if oldParentInodeID == 0 {
-			oldParentInodeID = v.rootInodeID
-		}
-		if newParentInodeID == 0 {
-			newParentInodeID = v.rootInodeID
-		}
+		oldParentInodeID = v.normalizeInodeID(oldParentInodeID)
+		newParentInodeID = v.normalizeInodeID(newParentInodeID)
 
 		if oldName == "" || oldName == "." || oldName == ".." || newName == "" || newName == "." || newName == ".." {
 			return nil, nil, fmt.Errorf("invalid name for rename: %w", syscall.EINVAL)
@@ -3368,18 +3671,26 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		}
 
 		now := time.Now()
-		childInode.ModTime = now
+		childInode.Ctime = now
 		childInode.IsDirty = true
 
 		oldParentInode, _ := v.getOrLoadInodeLocked(ctx, oldParentInodeID)
 		if oldParentInode != nil {
 			oldParentInode.ModTime = now
+			oldParentInode.Ctime = now
 			oldParentInode.IsDirty = true
+			if v.inodeCache != nil {
+				v.inodeCache.Put(oldParentInode.ID, oldParentInode)
+			}
 		}
 		newParentInode, _ := v.getOrLoadInodeLocked(ctx, newParentInodeID)
 		if newParentInode != nil {
 			newParentInode.ModTime = now
+			newParentInode.Ctime = now
 			newParentInode.IsDirty = true
+			if v.inodeCache != nil {
+				v.inodeCache.Put(newParentInode.ID, newParentInode)
+			}
 		}
 
 		var commitSeq uint64
@@ -3405,11 +3716,19 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			return nil, nil, fmt.Errorf("failed to log new dir entry insertion: %w", err)
 		}
 		if childInode != nil {
+			cAtime := childInode.Atime
+			if cAtime.IsZero() {
+				cAtime = childInode.ModTime
+			}
 			childInodeMsg := &pb.Inode{
 				Ino:            proto.Uint64(childInode.ID),
 				Mode:           childInode.Mode,
 				Size:           childInode.Size,
-				Mtime:          timestamppb.New(now),
+				Mtime:          timestamppb.New(childInode.ModTime),
+				Atime:          timestamppb.New(cAtime),
+				Ctime:          timestamppb.New(now),
+				Uid:            childInode.Uid,
+				Gid:            childInode.Gid,
 				IsDir:          childInode.IsDir,
 				Sha256:         childInode.Sha256,
 				Etag:           childInode.ETag,
@@ -3422,11 +3741,19 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			}
 		}
 		if oldParentInode != nil {
+			oldAtime := oldParentInode.Atime
+			if oldAtime.IsZero() {
+				oldAtime = oldParentInode.ModTime
+			}
 			oldParentInodeMsg := &pb.Inode{
 				Ino:            proto.Uint64(oldParentInode.ID),
 				Mode:           oldParentInode.Mode,
 				Size:           oldParentInode.Size,
 				Mtime:          timestamppb.New(now),
+				Atime:          timestamppb.New(oldAtime),
+				Ctime:          timestamppb.New(now),
+				Uid:            oldParentInode.Uid,
+				Gid:            oldParentInode.Gid,
 				IsDir:          true,
 				Sha256:         oldParentInode.Sha256,
 				Etag:           oldParentInode.ETag,
@@ -3439,11 +3766,19 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			}
 		}
 		if newParentInode != nil && newParentInodeID != oldParentInodeID {
+			newAtime := newParentInode.Atime
+			if newAtime.IsZero() {
+				newAtime = newParentInode.ModTime
+			}
 			newParentInodeMsg := &pb.Inode{
 				Ino:            proto.Uint64(newParentInode.ID),
 				Mode:           newParentInode.Mode,
 				Size:           newParentInode.Size,
 				Mtime:          timestamppb.New(now),
+				Atime:          timestamppb.New(newAtime),
+				Ctime:          timestamppb.New(now),
+				Uid:            newParentInode.Uid,
+				Gid:            newParentInode.Gid,
 				IsDir:          true,
 				Sha256:         newParentInode.Sha256,
 				Etag:           newParentInode.ETag,
@@ -3465,13 +3800,19 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
+		cAtime := childInode.Atime
+		if cAtime.IsZero() {
+			cAtime = childInode.ModTime
+		}
 		attr := &pb.EntryAttr{
 			Inode:   entry.InodeID,
 			Name:    newName,
 			IsDir:   entry.IsDir,
 			Size:    childInode.Size,
 			Mode:    childInode.Mode,
-			ModTime: timestamppb.New(now),
+			ModTime: timestamppb.New(childInode.ModTime),
+			Atime:   timestamppb.New(cAtime),
+			Ctime:   timestamppb.New(now),
 			Sha256:  childInode.Sha256,
 			Uid:     childInode.Uid,
 			Gid:     childInode.Gid,
@@ -3603,6 +3944,8 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 		Mode:    dirInode.Mode,
 		Size:    dirInode.Size,
 		ModTime: dirInode.ModTime,
+		Atime:   dirInode.Atime,
+		Ctime:   dirInode.Ctime,
 		Uid:     dirInode.Uid,
 		Gid:     dirInode.Gid,
 	}
@@ -3723,6 +4066,8 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 				Mode:           childInode.Mode,
 				Size:           childInode.Size,
 				ModTime:        childInode.ModTime,
+				Atime:          childInode.Atime,
+				Ctime:          childInode.Ctime,
 				Sha256:         childInode.Sha256,
 				ManifestSha256: childInode.ManifestSha256,
 				ContentSha256:  childInode.ContentSha256,
@@ -4383,6 +4728,41 @@ func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
 		}
 		return nil
 
+	case MutationSetAttr:
+		inodeID := record.Inode
+		if inodeID == 0 {
+			inodeID = v.rootInodeID
+		}
+		node, _ := v.inodeCache.Get(inodeID)
+		if node == nil {
+			var err error
+			node, err = v.getOrLoadInodeLocked(ctx, inodeID)
+			if err != nil {
+				return err
+			}
+		}
+		if record.Mode != 0 {
+			node.Mode = (node.Mode & ^uint32(07777)) | (record.Mode & 07777)
+		}
+		if record.Uid != 0 {
+			node.Uid = record.Uid
+		}
+		if record.Gid != 0 {
+			node.Gid = record.Gid
+		}
+		if record.ModTime != nil {
+			node.ModTime = record.ModTime.AsTime()
+		}
+		if record.Atime != nil {
+			node.Atime = record.Atime.AsTime()
+		}
+		if record.Ctime != nil {
+			node.Ctime = record.Ctime.AsTime()
+		}
+		node.IsDirty = false
+		v.inodeCache.Put(inodeID, node)
+		return nil
+
 	default:
 		return fmt.Errorf("unknown mutation type: %s", record.Type)
 	}
@@ -4483,6 +4863,19 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 			if modTime.IsZero() {
 				modTime = time.Now()
 			}
+			var atime, ctime time.Time
+			if row.GetAtime() != nil {
+				atime = row.GetAtime().AsTime()
+			}
+			if atime.IsZero() {
+				atime = modTime
+			}
+			if row.GetCtime() != nil {
+				ctime = row.GetCtime().AsTime()
+			}
+			if ctime.IsZero() {
+				ctime = modTime
+			}
 
 			if row.GetIsDir() {
 				node, _ := v.inodeCache.Get(ino)
@@ -4496,6 +4889,10 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 				}
 				node.Mode = row.GetMode()
 				node.ModTime = modTime
+				node.Atime = atime
+				node.Ctime = ctime
+				node.Uid = row.GetUid()
+				node.Gid = row.GetGid()
 				node.IsDir = true
 				if _, ok := v.dirCache.Peek(ino); !ok {
 					v.dirCache.Put(ino, &CachedDir{
@@ -4520,6 +4917,10 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 				node.Mode = row.GetMode()
 				node.Size = row.GetSize()
 				node.ModTime = modTime
+				node.Atime = atime
+				node.Ctime = ctime
+				node.Uid = row.GetUid()
+				node.Gid = row.GetGid()
 				node.Sha256 = row.GetSha256()
 				node.ManifestSha256 = row.GetManifestSha256()
 				node.ContentSha256 = row.GetContentSha256()

@@ -309,6 +309,41 @@ func (s *Server) GetAttr(ctx context.Context, req *pb.GetAttrRequest) (*pb.GetAt
 	return &pb.GetAttrResponse{Attr: attr}, nil
 }
 
+func (s *Server) SetAttr(ctx context.Context, req *pb.SetAttrRequest) (*pb.SetAttrResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	if req.Size != nil {
+		if _, err := vol.TruncateFile(ctx, req.GetInode(), req.GetSize()); err != nil {
+			return &pb.SetAttrResponse{Error: volErrToSyscall(err)}, nil
+		}
+	}
+
+	var atime, mtime, ctime *time.Time
+	if req.GetAtime() != nil {
+		t := req.GetAtime().AsTime()
+		atime = &t
+	}
+	if req.GetMtime() != nil {
+		t := req.GetMtime().AsTime()
+		mtime = &t
+	}
+	if req.GetCtime() != nil {
+		t := req.GetCtime().AsTime()
+		ctime = &t
+	}
+
+	attr, err := vol.SetAttr(ctx, req.GetInode(), req.Mode, req.Uid, req.Gid, atime, req.GetAtimeNow(), mtime, req.GetMtimeNow(), ctime, req.GetCtimeNow())
+	if err != nil {
+		return &pb.SetAttrResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.SetAttrResponse{Attr: attr}, nil
+}
+
 func (s *Server) Lookup(ctx context.Context, req *pb.LookupRequest) (*pb.LookupResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")

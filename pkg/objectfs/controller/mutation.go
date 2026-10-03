@@ -35,6 +35,7 @@ const (
 	MutationUnlink          = pb.MutationType_MUTATION_TYPE_UNLINK
 	MutationRmdir           = pb.MutationType_MUTATION_TYPE_RMDIR
 	MutationRename          = pb.MutationType_MUTATION_TYPE_RENAME
+	MutationSetAttr         = pb.MutationType_MUTATION_TYPE_SETATTR
 )
 
 // MutationRecord aliases the protobuf MutationRecord message.

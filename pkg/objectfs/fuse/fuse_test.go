@@ -23,6 +23,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
@@ -467,8 +468,8 @@ func TestFUSEAttributesOwnerAndNlink(t *testing.T) {
 	if setAttrOut.Attr.Nlink != 1 {
 		t.Fatalf("SetAttr Nlink = %d, want 1", setAttrOut.Attr.Nlink)
 	}
-	if setAttrOut.Attr.Owner.Uid != callerUID || setAttrOut.Attr.Owner.Gid != callerGID {
-		t.Fatalf("SetAttr Owner = %d/%d, want %d/%d", setAttrOut.Attr.Owner.Uid, setAttrOut.Attr.Owner.Gid, callerUID, callerGID)
+	if setAttrOut.Attr.Mode&07777 != 0600 {
+		t.Fatalf("SetAttr Mode = %o, want %o", setAttrOut.Attr.Mode&07777, 0600)
 	}
 
 	// 8. Lookup directory and file
@@ -962,5 +963,116 @@ func TestFUSENameLengthLimit(t *testing.T) {
 		if st := rawFS.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}, "valid.txt", name); st != fuse.Status(syscall.ENAMETOOLONG) {
 			t.Fatalf("[%s] Rename 256-byte newName: expected ENAMETOOLONG (%d), got %v", desc, syscall.ENAMETOOLONG, st)
 		}
+	}
+}
+
+func TestFUSESetAttrAllFields(t *testing.T) {
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	backend := controller.NewMemoryBackend()
+	server := controller.NewServer(backend)
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+	defer func() {
+		grpcServer.Stop()
+		_ = lis.Close()
+	}()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("Failed to dial bufnet: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	volumeID := "test-setattr-fields-vol"
+	cache := NewNodeCache(16 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Create file
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 100, Gid: 200}}},
+		Mode:     0644,
+	}, "test.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// 1. Set mode, uid, gid, mtime, atime
+	targetMtime := time.Date(2025, 6, 1, 12, 0, 0, 123456000, time.UTC)
+	targetAtime := time.Date(2025, 6, 1, 13, 0, 0, 654321000, time.UTC)
+
+	var setAttrOut fuse.AttrOut
+	setIn := &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader:  fuse.InHeader{NodeId: fileID},
+			Valid:     fuse.FATTR_MODE | fuse.FATTR_UID | fuse.FATTR_GID | fuse.FATTR_MTIME | fuse.FATTR_ATIME,
+			Mode:      0750,
+			Owner:     fuse.Owner{Uid: 501, Gid: 601},
+			Mtime:     uint64(targetMtime.Unix()),
+			Mtimensec: uint32(targetMtime.Nanosecond()),
+			Atime:     uint64(targetAtime.Unix()),
+			Atimensec: uint32(targetAtime.Nanosecond()),
+		},
+	}
+	if status := rawFS.SetAttr(nil, setIn, &setAttrOut); status != fuse.OK {
+		t.Fatalf("SetAttr failed: %v", status)
+	}
+
+	if setAttrOut.Attr.Mode&07777 != 0750 {
+		t.Fatalf("Expected mode 0750, got %o", setAttrOut.Attr.Mode&07777)
+	}
+	if setAttrOut.Attr.Owner.Uid != 501 || setAttrOut.Attr.Owner.Gid != 601 {
+		t.Fatalf("Expected owner 501/601, got %d/%d", setAttrOut.Attr.Owner.Uid, setAttrOut.Attr.Owner.Gid)
+	}
+	if setAttrOut.Attr.Mtime != uint64(targetMtime.Unix()) || setAttrOut.Attr.Mtimensec != uint32(targetMtime.Nanosecond()) {
+		t.Fatalf("Mtime mismatch: got %d.%d, want %d.%d", setAttrOut.Attr.Mtime, setAttrOut.Attr.Mtimensec, targetMtime.Unix(), targetMtime.Nanosecond())
+	}
+	if setAttrOut.Attr.Atime != uint64(targetAtime.Unix()) || setAttrOut.Attr.Atimensec != uint32(targetAtime.Nanosecond()) {
+		t.Fatalf("Atime mismatch: got %d.%d, want %d.%d", setAttrOut.Attr.Atime, setAttrOut.Attr.Atimensec, targetAtime.Unix(), targetAtime.Nanosecond())
+	}
+
+	// 2. Set combined size and mode
+	var setAttrCombinedOut fuse.AttrOut
+	setCombinedIn := &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_SIZE | fuse.FATTR_MODE,
+			Size:     1024,
+			Mode:     0640,
+		},
+	}
+	if status := rawFS.SetAttr(nil, setCombinedIn, &setAttrCombinedOut); status != fuse.OK {
+		t.Fatalf("Combined SetAttr failed: %v", status)
+	}
+	if setAttrCombinedOut.Attr.Size != 1024 {
+		t.Fatalf("Expected size 1024, got %d", setAttrCombinedOut.Attr.Size)
+	}
+	if setAttrCombinedOut.Attr.Mode&07777 != 0640 {
+		t.Fatalf("Expected mode 0640, got %o", setAttrCombinedOut.Attr.Mode&07777)
+	}
+
+	// 3. Verify via GetAttr
+	var getAttrOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &getAttrOut); status != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", status)
+	}
+	if getAttrOut.Attr.Size != 1024 {
+		t.Fatalf("GetAttr size = %d, want 1024", getAttrOut.Attr.Size)
+	}
+	if getAttrOut.Attr.Mode&07777 != 0640 {
+		t.Fatalf("GetAttr mode = %o, want 0640", getAttrOut.Attr.Mode&07777)
+	}
+	if getAttrOut.Attr.Owner.Uid != 501 || getAttrOut.Attr.Owner.Gid != 601 {
+		t.Fatalf("GetAttr owner = %d/%d, want 501/601", getAttrOut.Attr.Owner.Uid, getAttrOut.Attr.Owner.Gid)
 	}
 }
