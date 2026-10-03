@@ -228,6 +228,76 @@ func TestLRUCacheOperations(t *testing.T) {
 	}
 }
 
+func TestLRUCacheByteLimitsAndStats(t *testing.T) {
+	evicted := make(map[string]string)
+	sizeFn := func(k string, v string) int64 {
+		return int64(len(k) + len(v))
+	}
+	// Capacity 10 entries, but max 10 bytes limit
+	lru := NewLRUCacheWithLimits[string, string](10, 10, sizeFn, func(k string, v string) {
+		evicted[k] = v
+	})
+
+	// Put "k1": "1234" -> 2 + 4 = 6 bytes
+	lru.Put("k1", "1234")
+	if lru.Bytes() != 6 {
+		t.Fatalf("expected 6 bytes, got %d", lru.Bytes())
+	}
+
+	// Put "k2": "5678" -> 2 + 4 = 6 bytes. Total would be 12 > 10, so k1 must be evicted!
+	lru.Put("k2", "5678")
+	if lru.Bytes() != 6 {
+		t.Fatalf("expected 6 bytes after eviction, got %d", lru.Bytes())
+	}
+	if evicted["k1"] != "1234" {
+		t.Fatalf("expected k1 evicted, got %v", evicted)
+	}
+
+	// Stats tracking
+	val, ok := lru.Get("k2")
+	if !ok || val != "5678" {
+		t.Fatalf("expected k2 found, got %v, %v", val, ok)
+	}
+	_, ok = lru.Get("nonexistent")
+	if ok {
+		t.Fatalf("expected nonexistent not found")
+	}
+
+	if lru.Hits() != 1 {
+		t.Fatalf("expected 1 hit, got %d", lru.Hits())
+	}
+	if lru.Misses() != 1 {
+		t.Fatalf("expected 1 miss, got %d", lru.Misses())
+	}
+	if lru.HitRate() != 0.5 {
+		t.Fatalf("expected hit rate 0.5, got %f", lru.HitRate())
+	}
+
+	lru.ResetStats()
+	if lru.Hits() != 0 || lru.Misses() != 0 || lru.HitRate() != 0.0 {
+		t.Fatalf("expected reset stats, got hits=%d misses=%d hitRate=%f", lru.Hits(), lru.Misses(), lru.HitRate())
+	}
+
+	// Peek should not alter hit/miss stats or LRU order
+	val, ok = lru.Peek("k2")
+	if !ok || val != "5678" {
+		t.Fatalf("expected peek k2 found, got %v", ok)
+	}
+	if lru.Hits() != 0 {
+		t.Fatalf("peek should not increment hits")
+	}
+
+	// Dynamic limit update
+	lru.SetLimits(2, 20)
+	lru.Put("k3", "9012") // 6 bytes -> total 12 bytes <= 20
+	if lru.Len() != 2 {
+		t.Fatalf("expected len 2, got %d", lru.Len())
+	}
+	if lru.Bytes() != 12 {
+		t.Fatalf("expected 12 bytes, got %d", lru.Bytes())
+	}
+}
+
 func TestTieredMetadataLRUEvictionAndReload(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()

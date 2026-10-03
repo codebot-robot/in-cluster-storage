@@ -141,6 +141,9 @@ type Volume struct {
 	metadataStore   MetadataStore
 	sqliteDB        *sqlite.DB
 
+	sqliteCache         *LRUCache[SQLiteCacheKey, *SQLiteCachedRow]
+	sqliteCacheDisabled bool
+
 	snapshotCutoff LocalOffset
 	snapshotMu     sync.Mutex
 
@@ -210,6 +213,29 @@ func WithMaxRAMEntries(maxInodes, maxDirs int) VolumeOption {
 		if maxDirs > 0 && v.dirCache != nil {
 			v.dirCache.capacity = maxDirs
 		}
+		if v.sqliteCache != nil && (maxInodes > 0 || maxDirs > 0) {
+			entries := maxInodes + maxDirs
+			if entries <= 0 {
+				entries = 65536
+			}
+			v.sqliteCache.capacity = entries
+		}
+	}
+}
+
+// WithMetadataCacheLimits sets the maximum entry count and byte capacity for the SQLite metadata read cache.
+func WithMetadataCacheLimits(maxEntries int, maxBytes int64) VolumeOption {
+	return func(v *Volume) {
+		if v.sqliteCache != nil {
+			v.sqliteCache.SetLimits(maxEntries, maxBytes)
+		}
+	}
+}
+
+// WithSQLiteCacheDisabled enables or disables the SQLite metadata read cache.
+func WithSQLiteCacheDisabled(disabled bool) VolumeOption {
+	return func(v *Volume) {
+		v.sqliteCacheDisabled = disabled
 	}
 }
 
@@ -271,6 +297,12 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 
 	v.inodeCache = NewLRUCache[uint64, *CachedInode](10000, v.onEvictInode)
 	v.dirCache = NewLRUCache[uint64, *CachedDir](2000, v.onEvictDir)
+	v.sqliteCache = NewLRUCacheWithLimits[SQLiteCacheKey, *SQLiteCachedRow](
+		65536,
+		64*1024*1024,
+		SQLiteCacheSizeFn,
+		nil,
+	)
 
 	for _, opt := range opts {
 		opt(v)
@@ -307,7 +339,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 					IsDir: true,
 				}
 				keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
-				_ = v.sqliteDB.ApplyBatch(context.Background(), []sds.Change{
+				initChanges := []sds.Change{
 					{
 						Seq:      0,
 						TypeID:   16,
@@ -318,7 +350,9 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 						RawVal:   valBytes,
 						Row:      rootInodeMsg,
 					},
-				})
+				}
+				_ = v.sqliteDB.ApplyBatch(context.Background(), initChanges)
+				v.applyChangesToSQLiteCacheLocked(initChanges)
 			}
 		}
 		v.rootInodeID = 1
@@ -797,6 +831,9 @@ func (v *Volume) Close() error {
 	defer v.mu.Unlock()
 
 	var firstErr error
+	if v.sqliteCache != nil {
+		v.sqliteCache.Clear()
+	}
 	if v.sqliteDB != nil {
 		if err := v.sqliteDB.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -1135,17 +1172,116 @@ func (r *metadataResolver) resolveDir(ctx context.Context, inodeID uint64, popul
 	return nil, fmt.Errorf("directory inode %d not found: %w", inodeID, syscall.ENOENT)
 }
 
+var (
+	pkInode     = sds.NewPrimaryKey(1)
+	pkDirEntry  = sds.NewPrimaryKey(1, 2)
+	pkFileChunk = sds.NewPrimaryKey(1, 2)
+)
+
+// SQLiteCacheStats returns cache hit/miss and memory usage statistics.
+func (v *Volume) SQLiteCacheStats() (hits, misses uint64, hitRate float64, currentEntries int, currentBytes, maxBytes int64) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.sqliteCache == nil {
+		return 0, 0, 0, 0, 0, 0
+	}
+	return v.sqliteCache.Hits(), v.sqliteCache.Misses(), v.sqliteCache.HitRate(), v.sqliteCache.Len(), v.sqliteCache.Bytes(), v.sqliteCache.MaxBytes()
+}
+
+// SQLiteCacheResetStats resets the cache hits and misses counters.
+func (v *Volume) SQLiteCacheResetStats() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.sqliteCache != nil {
+		v.sqliteCache.ResetStats()
+	}
+}
+
+// SetSQLiteCacheLimits updates the entry count and byte capacity of the SQLite read cache.
+func (v *Volume) SetSQLiteCacheLimits(maxEntries int, maxBytes int64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.sqliteCache != nil {
+		v.sqliteCache.SetLimits(maxEntries, maxBytes)
+	}
+}
+
+func (v *Volume) getSQLiteRowLocked(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
+	if v.sqliteCache != nil && !v.sqliteCacheDisabled {
+		ck := SQLiteCacheKey{Table: typeName, Key: string(key.Bytes())}
+		if row, ok := v.sqliteCache.Get(ck); ok {
+			if !row.Exists {
+				return nil, false, nil
+			}
+			return row.Msg, true, nil
+		}
+	}
+
+	if v.sqliteDB == nil {
+		return nil, false, nil
+	}
+
+	msg, ok, err := v.sqliteDB.Get(ctx, typeName, key)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if v.sqliteCache != nil && !v.sqliteCacheDisabled {
+		ck := SQLiteCacheKey{Table: typeName, Key: string(key.Bytes())}
+		if !ok {
+			v.sqliteCache.Put(ck, &SQLiteCachedRow{Exists: false})
+		} else {
+			v.sqliteCache.Put(ck, &SQLiteCachedRow{Exists: true, Msg: msg})
+		}
+	}
+
+	return msg, ok, nil
+}
+
+func (v *Volume) applyChangesToSQLiteCacheLocked(changes []sds.Change) {
+	if v.sqliteCache == nil || v.sqliteCacheDisabled {
+		return
+	}
+	for _, ch := range changes {
+		typeName := ch.TypeName
+		if typeName == "" && v.metadataStream != nil {
+			if def, _, ok := v.metadataStream.Registry().LookupByID(ch.TypeID); ok {
+				typeName = def.GetName()
+			}
+		}
+		if typeName == "" && v.sqliteDB != nil {
+			if def, _, ok := v.sqliteDB.Registry().LookupByID(ch.TypeID); ok {
+				typeName = def.GetName()
+			}
+		}
+		if typeName == "" {
+			continue
+		}
+		ck := SQLiteCacheKey{Table: typeName, Key: string(ch.RawKey)}
+		switch ch.Op {
+		case sds.OpCreate, sds.OpUpdate:
+			if ch.Row != nil {
+				v.sqliteCache.Put(ck, &SQLiteCachedRow{Exists: true, Msg: ch.Row})
+			} else {
+				v.sqliteCache.Remove(ck)
+			}
+		case sds.OpDelete:
+			v.sqliteCache.Put(ck, &SQLiteCachedRow{Exists: false})
+		}
+	}
+}
+
 func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
 	if inodeID == 0 {
 		inodeID = v.rootInodeID
 	}
 
 	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil {
-		key, err := sds.ExtractKey(&pb.Inode{Ino: proto.Uint64(inodeID)}, []int32{1})
+		key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(inodeID)})
 		if err != nil {
 			return nil, err
 		}
-		msg, ok, err := v.sqliteDB.Get(ctx, "objectfs.v1alpha1.Inode", key)
+		msg, ok, err := v.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.Inode", key)
 		if err != nil {
 			return nil, err
 		}
@@ -1223,6 +1359,15 @@ func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*Cache
 				}
 				v.dirParents[de.GetIno()] = inodeID
 			}
+			if v.sqliteCache != nil && !v.sqliteCacheDisabled {
+				if k, kErr := pkDirEntry.Extract(&pb.DirEntry{
+					ParentIno: proto.Uint64(inodeID),
+					Name:      proto.String(name),
+				}); kErr == nil && len(k.Bytes()) > 0 {
+					ck := SQLiteCacheKey{Table: "objectfs.v1alpha1.DirEntry", Key: string(k.Bytes())}
+					v.sqliteCache.Put(ck, &SQLiteCachedRow{Exists: true, Msg: de})
+				}
+			}
 		}
 
 		return dir, nil
@@ -1241,14 +1386,14 @@ func (v *Volume) getDirEntrySQLiteLocked(ctx context.Context, parentInodeID uint
 	if v.sqliteDB == nil {
 		return nil, false, nil
 	}
-	key, err := sds.ExtractKey(&pb.DirEntry{
+	key, err := pkDirEntry.Extract(&pb.DirEntry{
 		ParentIno: proto.Uint64(parentInodeID),
 		Name:      proto.String(name),
-	}, []int32{1, 2})
+	})
 	if err != nil {
 		return nil, false, err
 	}
-	msg, ok, err := v.sqliteDB.Get(ctx, "objectfs.v1alpha1.DirEntry", key)
+	msg, ok, err := v.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.DirEntry", key)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1475,12 +1620,15 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 }
 
 func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) error {
-	if v.metadataStore == MetadataStoreSQLite && v.sqliteDB != nil && tx != nil {
+	if v.metadataStore == MetadataStoreSQLite && tx != nil {
 		changes := tx.Changes()
 		if len(changes) > 0 {
-			if err := v.sqliteDB.ApplyBatch(ctx, changes); err != nil {
-				return fmt.Errorf("failed to apply changes to SQLite metadata store: %w", err)
+			if v.sqliteDB != nil {
+				if err := v.sqliteDB.ApplyBatch(ctx, changes); err != nil {
+					return fmt.Errorf("failed to apply changes to SQLite metadata store: %w", err)
+				}
 			}
+			v.applyChangesToSQLiteCacheLocked(changes)
 		}
 	}
 	return nil
@@ -4791,7 +4939,7 @@ func (v *Volume) loadFromBackendSQLiteLocked(ctx context.Context) error {
 					IsDir: true,
 				}
 				keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
-				_ = v.sqliteDB.ApplyBatch(ctx, []sds.Change{
+				initChanges := []sds.Change{
 					{
 						Seq:      0,
 						TypeID:   16,
@@ -4802,7 +4950,9 @@ func (v *Volume) loadFromBackendSQLiteLocked(ctx context.Context) error {
 						RawVal:   valBytes,
 						Row:      rootInodeMsg,
 					},
-				})
+				}
+				_ = v.sqliteDB.ApplyBatch(ctx, initChanges)
+				v.applyChangesToSQLiteCacheLocked(initChanges)
 			}
 			v.rootInodeID = 1
 			v.nextInode = erofs.DefaultInodeStride
@@ -4832,6 +4982,10 @@ func (v *Volume) loadFromBackendSQLiteLocked(ctx context.Context) error {
 			}
 			sr.ChangeReader().DiscardPending()
 		}
+	}
+
+	if v.sqliteCache != nil {
+		v.sqliteCache.Clear()
 	}
 
 	v.updateNextInodeFromSQLiteLocked(ctx)
