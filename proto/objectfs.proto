@@ -22,6 +22,7 @@ import "google/protobuf/timestamp.proto";
 
 service ObjectFSController {
   rpc GetAttr(GetAttrRequest) returns (GetAttrResponse);
+  rpc SetAttr(SetAttrRequest) returns (SetAttrResponse);
   rpc Lookup(LookupRequest) returns (LookupResponse);
   rpc ReadDir(ReadDirRequest) returns (ReadDirResponse);
   rpc Mkdir(MkdirRequest) returns (MkdirResponse);
@@ -62,6 +63,8 @@ message EntryAttr {
   uint32 gid = 10;
   string manifest_sha256 = 11;
   string content_sha256 = 12;
+  google.protobuf.Timestamp atime = 13;
+  google.protobuf.Timestamp ctime = 14;
 }
 
 message GetAttrRequest {
@@ -70,6 +73,26 @@ message GetAttrRequest {
 }
 
 message GetAttrResponse {
+  EntryAttr attr = 1;
+  int32 error = 2;
+}
+
+message SetAttrRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+  optional uint32 mode = 3;
+  optional uint32 uid = 4;
+  optional uint32 gid = 5;
+  optional int64 size = 6;
+  google.protobuf.Timestamp atime = 7;
+  bool atime_now = 8;
+  google.protobuf.Timestamp mtime = 9;
+  bool mtime_now = 10;
+  google.protobuf.Timestamp ctime = 11;
+  bool ctime_now = 12;
+}
+
+message SetAttrResponse {
   EntryAttr attr = 1;
   int32 error = 2;
 }
@@ -306,6 +329,7 @@ enum MutationType {
   MUTATION_TYPE_UNLINK = 5;
   MUTATION_TYPE_RMDIR = 6;
   MUTATION_TYPE_RENAME = 7;
+  MUTATION_TYPE_SETATTR = 8;
 }
 
 message MutationRecord {
@@ -327,6 +351,8 @@ message MutationRecord {
   string name = 16;
   uint64 old_parent_inode = 17;
   string old_name = 18;
+  google.protobuf.Timestamp atime = 19;
+  google.protobuf.Timestamp ctime = 20;
 }
 
 message Inode {
@@ -340,6 +366,10 @@ message Inode {
   string manifest_sha256 = 8;
   string content_sha256 = 9;
   uint32 chunk_size = 10;
+  uint32 uid = 11;
+  uint32 gid = 12;
+  google.protobuf.Timestamp atime = 13;
+  google.protobuf.Timestamp ctime = 14;
 }
 
 message DirEntry {
