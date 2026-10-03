@@ -76,6 +76,8 @@ type InodeRecord struct {
 	Gid            uint32
 	ManifestSha256 string
 	ContentSha256  string
+	Atime          time.Time
+	Ctime          time.Time
 }
 
 // DirEntry represents a single directory entry.
@@ -154,6 +156,22 @@ func EncodeInodeRecord(rec *InodeRecord) ([]byte, error) {
 	binary.BigEndian.PutUint16(b2[:], uint16(len(contentShaBytes)))
 	buf.Write(b2[:])
 	buf.Write(contentShaBytes)
+
+	// Atime nano (8)
+	atimeNano := rec.Atime.UnixNano()
+	if rec.Atime.IsZero() {
+		atimeNano = rec.ModTime.UnixNano()
+	}
+	binary.BigEndian.PutUint64(b8[:], uint64(atimeNano))
+	buf.Write(b8[:])
+
+	// Ctime nano (8)
+	ctimeNano := rec.Ctime.UnixNano()
+	if rec.Ctime.IsZero() {
+		ctimeNano = rec.ModTime.UnixNano()
+	}
+	binary.BigEndian.PutUint64(b8[:], uint64(ctimeNano))
+	buf.Write(b8[:])
 
 	return buf.Bytes(), nil
 }
@@ -249,6 +267,17 @@ func DecodeInodeRecord(data []byte) (*InodeRecord, error) {
 		contentSha = shaStr
 	}
 
+	atime := modTime
+	ctime := modTime
+	if r.Len() >= 16 {
+		if _, err := io.ReadFull(r, b8[:]); err == nil {
+			atime = time.Unix(0, int64(binary.BigEndian.Uint64(b8[:])))
+		}
+		if _, err := io.ReadFull(r, b8[:]); err == nil {
+			ctime = time.Unix(0, int64(binary.BigEndian.Uint64(b8[:])))
+		}
+	}
+
 	return &InodeRecord{
 		InodeID:        inodeID,
 		Mode:           mode,
@@ -261,6 +290,8 @@ func DecodeInodeRecord(data []byte) (*InodeRecord, error) {
 		Gid:            gid,
 		ManifestSha256: manifestSha,
 		ContentSha256:  contentSha,
+		Atime:          atime,
+		Ctime:          ctime,
 	}, nil
 }
 

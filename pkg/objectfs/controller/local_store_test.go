@@ -558,8 +558,8 @@ func TestAutoSnapshotTriggerOnThreshold(t *testing.T) {
 
 func TestLocalStorageCircularBufferRotationAndTrimming(t *testing.T) {
 	dir := t.TempDir()
-	// Set small file limit to 150 bytes to force frequent file rotation
-	ls, err := NewLocalStorage(dir, WithMaxLocalFileSize(150))
+	// Set small file limit to 200 bytes to force frequent file rotation
+	ls, err := NewLocalStorage(dir, WithMaxLocalFileSize(200))
 	if err != nil {
 		t.Fatalf("NewLocalStorage failed: %v", err)
 	}

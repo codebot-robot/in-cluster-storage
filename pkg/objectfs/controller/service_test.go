@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -49,6 +50,7 @@ import (
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func resolvePath(ctx context.Context, server *Server, volumeID, p string) (uint64, error) {
@@ -161,6 +163,33 @@ func testRename(ctx context.Context, server *Server, volumeID, oldP, newP string
 		NewParentInode: newParentIno,
 		NewName:        path.Base(newP),
 	})
+}
+
+func testSetAttr(ctx context.Context, server *Server, volumeID string, p string, mode, uid, gid *uint32, atime *time.Time, atimeNow bool, mtime *time.Time, mtimeNow bool, ctime *time.Time, ctimeNow bool) (*pb.SetAttrResponse, error) {
+	ino, err := resolvePath(ctx, server, volumeID, p)
+	if err != nil {
+		return &pb.SetAttrResponse{Error: volErrToSyscall(err)}, nil
+	}
+	req := &pb.SetAttrRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Mode:     mode,
+		Uid:      uid,
+		Gid:      gid,
+		AtimeNow: atimeNow,
+		MtimeNow: mtimeNow,
+		CtimeNow: ctimeNow,
+	}
+	if atime != nil {
+		req.Atime = timestamppb.New(*atime)
+	}
+	if mtime != nil {
+		req.Mtime = timestamppb.New(*mtime)
+	}
+	if ctime != nil {
+		req.Ctime = timestamppb.New(*ctime)
+	}
+	return server.SetAttr(ctx, req)
 }
 
 func volGetAttr(ctx context.Context, vol *Volume, p string) (*pb.EntryAttr, error) {
@@ -2991,6 +3020,284 @@ func TestSnapshotSDSRootXattrsRegistryRoundTrip(t *testing.T) {
 	}
 
 	_ = server.Close()
+}
+
+func TestSetAttrAndMetadataTimestamps(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-setattr-ts-vol"
+
+	// Create a test file
+	t0 := time.Now().Add(-1 * time.Hour)
+	createResp, err := testCreateFile(ctx, server, volumeID, "/file.txt", 0644, []byte("hello world"), 100, 200)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	attr := createResp.GetAttr()
+	if attr.GetUid() != 100 || attr.GetGid() != 200 {
+		t.Fatalf("Unexpected initial uid/gid: %d/%d", attr.GetUid(), attr.GetGid())
+	}
+	if attr.GetAtime() == nil || attr.GetCtime() == nil {
+		t.Fatalf("Expected atime and ctime on created file")
+	}
+
+	// 1. Test chmod via SetAttr (preserving file type bits and setting setuid/sticky)
+	newMode := uint32(0755 | syscall.S_ISUID | syscall.S_ISVTX)
+	setResp, err := testSetAttr(ctx, server, volumeID, "/file.txt", &newMode, nil, nil, nil, false, nil, false, nil, false)
+	if err != nil || setResp.GetError() != 0 {
+		t.Fatalf("SetAttr chmod failed: %v", err)
+	}
+	if setResp.GetAttr().GetMode()&07777 != (newMode & 07777) {
+		t.Fatalf("Expected mode %o, got %o", newMode&07777, setResp.GetAttr().GetMode()&07777)
+	}
+	if (setResp.GetAttr().GetMode() & syscall.S_IFREG) == 0 {
+		t.Fatalf("Expected S_IFREG bit retained")
+	}
+
+	// 2. Test chown via SetAttr
+	newUid := uint32(500)
+	newGid := uint32(600)
+	setResp, err = testSetAttr(ctx, server, volumeID, "/file.txt", nil, &newUid, &newGid, nil, false, nil, false, nil, false)
+	if err != nil || setResp.GetError() != 0 {
+		t.Fatalf("SetAttr chown failed: %v", err)
+	}
+	if setResp.GetAttr().GetUid() != 500 || setResp.GetAttr().GetGid() != 600 {
+		t.Fatalf("Expected uid/gid 500/600, got %d/%d", setResp.GetAttr().GetUid(), setResp.GetAttr().GetGid())
+	}
+
+	// 3. Test explicit timestamps via SetAttr
+	explicitAtime := t0.Add(10 * time.Minute)
+	explicitMtime := t0.Add(20 * time.Minute)
+	explicitCtime := t0.Add(30 * time.Minute)
+	setResp, err = testSetAttr(ctx, server, volumeID, "/file.txt", nil, nil, nil, &explicitAtime, false, &explicitMtime, false, &explicitCtime, false)
+	if err != nil || setResp.GetError() != 0 {
+		t.Fatalf("SetAttr timestamps failed: %v", err)
+	}
+	if setResp.GetAttr().GetAtime().AsTime().Unix() != explicitAtime.Unix() {
+		t.Fatalf("Expected atime %v, got %v", explicitAtime, setResp.GetAttr().GetAtime().AsTime())
+	}
+	if setResp.GetAttr().GetModTime().AsTime().Unix() != explicitMtime.Unix() {
+		t.Fatalf("Expected mtime %v, got %v", explicitMtime, setResp.GetAttr().GetModTime().AsTime())
+	}
+	if setResp.GetAttr().GetCtime().AsTime().Unix() != explicitCtime.Unix() {
+		t.Fatalf("Expected ctime %v, got %v", explicitCtime, setResp.GetAttr().GetCtime().AsTime())
+	}
+
+	// 4. Test timestamp NOW via SetAttr
+	beforeNow := time.Now().Add(-1 * time.Second)
+	setResp, err = testSetAttr(ctx, server, volumeID, "/file.txt", nil, nil, nil, nil, true, nil, true, nil, false)
+	if err != nil || setResp.GetError() != 0 {
+		t.Fatalf("SetAttr now failed: %v", err)
+	}
+	if setResp.GetAttr().GetAtime().AsTime().Before(beforeNow) {
+		t.Fatalf("Expected atime updated to now")
+	}
+	if setResp.GetAttr().GetModTime().AsTime().Before(beforeNow) {
+		t.Fatalf("Expected mtime updated to now")
+	}
+	if setResp.GetAttr().GetCtime().AsTime().Before(beforeNow) {
+		t.Fatalf("Expected ctime updated to now")
+	}
+}
+
+func TestSetgidInheritance(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-setgid-vol"
+
+	// Create parent directory with setgid bit (02770) and GID 3000
+	parentMode := uint32(0770 | syscall.S_ISGID)
+	parentGid := uint32(3000)
+	parentUid := uint32(1000)
+	mkdirResp, err := testMkdir(ctx, server, volumeID, "/setgid_dir", parentMode, parentUid, parentGid)
+	if err != nil || mkdirResp.GetError() != 0 {
+		t.Fatalf("Mkdir parent setgid_dir failed: %v", err)
+	}
+	if mkdirResp.GetAttr().GetGid() != 3000 {
+		t.Fatalf("Expected parent GID 3000, got %d", mkdirResp.GetAttr().GetGid())
+	}
+	if mkdirResp.GetAttr().GetMode()&02000 == 0 {
+		t.Fatalf("Expected setgid bit on parent directory")
+	}
+
+	// 1. Create subdirectory inside setgid dir with caller GID 4000
+	// Subdirectory must inherit parent GID 3000 AND setgid bit 02000
+	subDirResp, err := testMkdir(ctx, server, volumeID, "/setgid_dir/subdir", 0755, 1000, 4000)
+	if err != nil || subDirResp.GetError() != 0 {
+		t.Fatalf("Mkdir subdir failed: %v", err)
+	}
+	if subDirResp.GetAttr().GetGid() != 3000 {
+		t.Fatalf("Expected subdir to inherit GID 3000, got %d", subDirResp.GetAttr().GetGid())
+	}
+	if subDirResp.GetAttr().GetMode()&02000 == 0 {
+		t.Fatalf("Expected subdir to inherit setgid bit 02000, got %o", subDirResp.GetAttr().GetMode())
+	}
+
+	// 2. Create regular file inside setgid dir with caller GID 4000
+	// Regular file must inherit parent GID 3000, but NOT setgid bit
+	fileResp, err := testCreateFile(ctx, server, volumeID, "/setgid_dir/child.txt", 0644, []byte("data"), 1000, 4000)
+	if err != nil || fileResp.GetError() != 0 {
+		t.Fatalf("CreateFile child.txt failed: %v", err)
+	}
+	if fileResp.GetAttr().GetGid() != 3000 {
+		t.Fatalf("Expected file to inherit GID 3000, got %d", fileResp.GetAttr().GetGid())
+	}
+	if fileResp.GetAttr().GetMode()&02000 != 0 {
+		t.Fatalf("Expected regular file NOT to inherit setgid bit, got %o", fileResp.GetAttr().GetMode())
+	}
+}
+
+func TestTarExtractionPreservation(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-tar-extract-vol"
+
+	// Create an in-memory tar archive with various modes, owners, timestamps
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+
+	t1 := time.Date(2025, 5, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2025, 5, 2, 11, 0, 0, 0, time.UTC)
+	t3 := time.Date(2025, 5, 3, 12, 0, 0, 0, time.UTC)
+
+	files := []struct {
+		header  *tar.Header
+		content []byte
+	}{
+		{
+			header: &tar.Header{
+				Typeflag: tar.TypeDir,
+				Name:     "mydir",
+				Mode:     0750,
+				Uid:      101,
+				Gid:      201,
+				ModTime:  t1,
+			},
+		},
+		{
+			header: &tar.Header{
+				Typeflag: tar.TypeReg,
+				Name:     "mydir/app.bin",
+				Mode:     0755,
+				Uid:      102,
+				Gid:      202,
+				Size:     11,
+				ModTime:  t2,
+			},
+			content: []byte("binary-data"),
+		},
+		{
+			header: &tar.Header{
+				Typeflag: tar.TypeReg,
+				Name:     "config.json",
+				Mode:     0600,
+				Uid:      103,
+				Gid:      203,
+				Size:     13,
+				ModTime:  t3,
+			},
+			content: []byte(`{"key":"val"}`),
+		},
+	}
+
+	for _, f := range files {
+		if err := tw.WriteHeader(f.header); err != nil {
+			t.Fatalf("WriteHeader failed: %v", err)
+		}
+		if len(f.content) > 0 {
+			if _, err := tw.Write(f.content); err != nil {
+				t.Fatalf("Write content failed: %v", err)
+			}
+		}
+	}
+	tw.Close()
+
+	// Simulate tar extraction into ObjectFS
+	tr := tar.NewReader(&tarBuf)
+	var dirHeaders []*tar.Header
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar.Next failed: %v", err)
+		}
+
+		p := "/" + strings.TrimPrefix(hdr.Name, "/")
+		if hdr.Typeflag == tar.TypeDir {
+			resp, err := testMkdir(ctx, server, volumeID, p, uint32(hdr.Mode), uint32(hdr.Uid), uint32(hdr.Gid))
+			if err != nil || resp.GetError() != 0 {
+				t.Fatalf("testMkdir for %s failed: %v (err=%d)", p, err, resp.GetError())
+			}
+			dirHeaders = append(dirHeaders, hdr)
+		} else {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				t.Fatalf("ReadAll for %s failed: %v", p, err)
+			}
+			resp, err := testCreateFile(ctx, server, volumeID, p, uint32(hdr.Mode), data, uint32(hdr.Uid), uint32(hdr.Gid))
+			if err != nil || resp.GetError() != 0 {
+				t.Fatalf("testCreateFile for %s failed: %v (err=%d)", p, err, resp.GetError())
+			}
+			modeVal := uint32(hdr.Mode)
+			uidVal := uint32(hdr.Uid)
+			gidVal := uint32(hdr.Gid)
+			mtimeVal := hdr.ModTime
+			setResp, err := testSetAttr(ctx, server, volumeID, p, &modeVal, &uidVal, &gidVal, &mtimeVal, false, &mtimeVal, false, nil, false)
+			if err != nil || setResp.GetError() != 0 {
+				t.Fatalf("SetAttr for %s failed: %v (err=%d)", p, err, setResp.GetError())
+			}
+		}
+	}
+
+	// Like tar -x, apply directory metadata/timestamps in a deferred pass after children are extracted
+	for _, hdr := range dirHeaders {
+		p := "/" + strings.TrimPrefix(hdr.Name, "/")
+		modeVal := uint32(hdr.Mode)
+		uidVal := uint32(hdr.Uid)
+		gidVal := uint32(hdr.Gid)
+		mtimeVal := hdr.ModTime
+		setResp, err := testSetAttr(ctx, server, volumeID, p, &modeVal, &uidVal, &gidVal, &mtimeVal, false, &mtimeVal, false, nil, false)
+		if err != nil || setResp.GetError() != 0 {
+			t.Fatalf("SetAttr for directory %s failed: %v (err=%d)", p, err, setResp.GetError())
+		}
+	}
+
+	// Verify all extracted files match their original metadata and content
+	for _, f := range files {
+		p := "/" + strings.TrimPrefix(f.header.Name, "/")
+		attrResp, err := testGetAttr(ctx, server, volumeID, p)
+		if err != nil || attrResp.GetError() != 0 {
+			t.Fatalf("GetAttr for %s failed: %v", p, err)
+		}
+		attr := attrResp.GetAttr()
+		if attr.GetMode()&07777 != uint32(f.header.Mode&07777) {
+			t.Fatalf("File %s mode mismatch: got %o, want %o", p, attr.GetMode()&07777, f.header.Mode&07777)
+		}
+		if attr.GetUid() != uint32(f.header.Uid) {
+			t.Fatalf("File %s uid mismatch: got %d, want %d", p, attr.GetUid(), f.header.Uid)
+		}
+		if attr.GetGid() != uint32(f.header.Gid) {
+			t.Fatalf("File %s gid mismatch: got %d, want %d", p, attr.GetGid(), f.header.Gid)
+		}
+		if attr.GetModTime().AsTime().Unix() != f.header.ModTime.Unix() {
+			t.Fatalf("File %s mtime mismatch: got %v, want %v", p, attr.GetModTime().AsTime(), f.header.ModTime)
+		}
+
+		if len(f.content) > 0 {
+			readResp, err := testReadFile(ctx, server, volumeID, p, 0, int64(len(f.content)))
+			if err != nil || readResp.GetError() != 0 {
+				t.Fatalf("ReadFile for %s failed: %v", p, err)
+			}
+			if !bytes.Equal(readResp.GetData(), f.content) {
+				t.Fatalf("File %s content mismatch", p)
+			}
+		}
+	}
 }
 
 func TestSnapshotRestartRecoveryFromSnapshotPlusStream(t *testing.T) {

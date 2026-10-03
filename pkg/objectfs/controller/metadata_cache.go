@@ -365,6 +365,8 @@ type CachedInode struct {
 	Data           blob.ByteStream
 	Uid            uint32
 	Gid            uint32
+	Atime          time.Time
+	Ctime          time.Time
 	IsDirty        bool
 }
 
