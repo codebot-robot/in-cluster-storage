@@ -105,15 +105,45 @@ func WithDecoderOptions(opts ...record.DecoderOption) Option {
 	}
 }
 
+// withoutCancel returns a context that is not cancelled when ctx is cancelled.
+// In modernc.org/sqlite, every query or exec call on a cancellable context spawns
+// an interruptOnDone background goroutine that listens on ctx.Done(). Since these
+// operations take single-digit microseconds on our local, exclusive-locked SQLite
+// database, stripping cancellation on the internal hot path avoids substantial
+// goroutine creation and channel synchronization overhead.
+func withoutCancel(ctx context.Context) context.Context {
+	return context.WithoutCancel(ctx)
+}
+
 type tableStmts struct {
 	get           *sql.Stmt
 	upsert        *sql.Stmt
 	del           *sql.Stmt
 	scanPrefix    *sql.Stmt
 	scanPrefixLim *sql.Stmt
+	scanGe        *sql.Stmt
+	scanGeLim     *sql.Stmt
 	scanAll       *sql.Stmt
 	scanAllLim    *sql.Stmt
 	count         *sql.Stmt
+}
+
+func (ts *tableStmts) Close() error {
+	var firstErr error
+	for _, s := range []*sql.Stmt{
+		ts.get, ts.upsert, ts.del,
+		ts.scanPrefix, ts.scanPrefixLim,
+		ts.scanGe, ts.scanGeLim,
+		ts.scanAll, ts.scanAllLim,
+		ts.count,
+	} {
+		if s != nil {
+			if err := s.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // DB represents a SQLite projection database for a structured data stream.
@@ -227,14 +257,7 @@ func (d *DB) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, ts := range d.stmts {
-		_ = ts.get.Close()
-		_ = ts.upsert.Close()
-		_ = ts.del.Close()
-		_ = ts.scanPrefix.Close()
-		_ = ts.scanPrefixLim.Close()
-		_ = ts.scanAll.Close()
-		_ = ts.scanAllLim.Close()
-		_ = ts.count.Close()
+		_ = ts.Close()
 	}
 	d.stmts = make(map[string]*tableStmts)
 	if d.sqlDB != nil {
@@ -248,78 +271,50 @@ func (d *DB) ensureTableStmtsLocked(ctx context.Context, tableName string) (*tab
 		return ts, nil
 	}
 
-	cctx := context.WithoutCancel(ctx)
-	getStmt, err := d.sqlDB.PrepareContext(cctx, fmt.Sprintf("SELECT valuedata FROM %q WHERE keydata = ?;", tableName))
-	if err != nil {
+	cctx := withoutCancel(ctx)
+	ts := &tableStmts{}
+	var err error
+	defer func() {
+		if err != nil {
+			_ = ts.Close()
+		}
+	}()
+
+	prepare := func(query string) (*sql.Stmt, error) {
+		return d.sqlDB.PrepareContext(cctx, fmt.Sprintf(query, tableName))
+	}
+
+	if ts.get, err = prepare("SELECT valuedata FROM %q WHERE keydata = ?;"); err != nil {
 		return nil, err
 	}
-	upsertStmt, err := d.sqlDB.PrepareContext(cctx, fmt.Sprintf("INSERT OR REPLACE INTO %q (keydata, valuedata) VALUES (?, ?);", tableName))
-	if err != nil {
-		_ = getStmt.Close()
+	if ts.upsert, err = prepare("INSERT OR REPLACE INTO %q (keydata, valuedata) VALUES (?, ?);"); err != nil {
 		return nil, err
 	}
-	delStmt, err := d.sqlDB.PrepareContext(cctx, fmt.Sprintf("DELETE FROM %q WHERE keydata = ?;", tableName))
-	if err != nil {
-		_ = getStmt.Close()
-		_ = upsertStmt.Close()
+	if ts.del, err = prepare("DELETE FROM %q WHERE keydata = ?;"); err != nil {
 		return nil, err
 	}
-	scanPrefixStmt, err := d.sqlDB.PrepareContext(cctx, fmt.Sprintf("SELECT keydata, valuedata FROM %q WHERE keydata >= ? AND keydata < ? ORDER BY keydata ASC;", tableName))
-	if err != nil {
-		_ = getStmt.Close()
-		_ = upsertStmt.Close()
-		_ = delStmt.Close()
+	if ts.scanPrefix, err = prepare("SELECT keydata, valuedata FROM %q WHERE keydata >= ? AND keydata < ? ORDER BY keydata ASC;"); err != nil {
 		return nil, err
 	}
-	scanPrefixLimStmt, err := d.sqlDB.PrepareContext(cctx, fmt.Sprintf("SELECT keydata, valuedata FROM %q WHERE keydata >= ? AND keydata < ? ORDER BY keydata ASC LIMIT ?;", tableName))
-	if err != nil {
-		_ = getStmt.Close()
-		_ = upsertStmt.Close()
-		_ = delStmt.Close()
-		_ = scanPrefixStmt.Close()
+	if ts.scanPrefixLim, err = prepare("SELECT keydata, valuedata FROM %q WHERE keydata >= ? AND keydata < ? ORDER BY keydata ASC LIMIT ?;"); err != nil {
 		return nil, err
 	}
-	scanAllStmt, err := d.sqlDB.PrepareContext(cctx, fmt.Sprintf("SELECT keydata, valuedata FROM %q ORDER BY keydata ASC;", tableName))
-	if err != nil {
-		_ = getStmt.Close()
-		_ = upsertStmt.Close()
-		_ = delStmt.Close()
-		_ = scanPrefixStmt.Close()
-		_ = scanPrefixLimStmt.Close()
+	if ts.scanGe, err = prepare("SELECT keydata, valuedata FROM %q WHERE keydata >= ? ORDER BY keydata ASC;"); err != nil {
 		return nil, err
 	}
-	scanAllLimStmt, err := d.sqlDB.PrepareContext(cctx, fmt.Sprintf("SELECT keydata, valuedata FROM %q ORDER BY keydata ASC LIMIT ?;", tableName))
-	if err != nil {
-		_ = getStmt.Close()
-		_ = upsertStmt.Close()
-		_ = delStmt.Close()
-		_ = scanPrefixStmt.Close()
-		_ = scanPrefixLimStmt.Close()
-		_ = scanAllStmt.Close()
+	if ts.scanGeLim, err = prepare("SELECT keydata, valuedata FROM %q WHERE keydata >= ? ORDER BY keydata ASC LIMIT ?;"); err != nil {
 		return nil, err
 	}
-	countStmt, err := d.sqlDB.PrepareContext(cctx, fmt.Sprintf("SELECT COUNT(*) FROM %q;", tableName))
-	if err != nil {
-		_ = getStmt.Close()
-		_ = upsertStmt.Close()
-		_ = delStmt.Close()
-		_ = scanPrefixStmt.Close()
-		_ = scanPrefixLimStmt.Close()
-		_ = scanAllStmt.Close()
-		_ = scanAllLimStmt.Close()
+	if ts.scanAll, err = prepare("SELECT keydata, valuedata FROM %q ORDER BY keydata ASC;"); err != nil {
+		return nil, err
+	}
+	if ts.scanAllLim, err = prepare("SELECT keydata, valuedata FROM %q ORDER BY keydata ASC LIMIT ?;"); err != nil {
+		return nil, err
+	}
+	if ts.count, err = prepare("SELECT COUNT(*) FROM %q;"); err != nil {
 		return nil, err
 	}
 
-	ts := &tableStmts{
-		get:           getStmt,
-		upsert:        upsertStmt,
-		del:           delStmt,
-		scanPrefix:    scanPrefixStmt,
-		scanPrefixLim: scanPrefixLimStmt,
-		scanAll:       scanAllStmt,
-		scanAllLim:    scanAllLimStmt,
-		count:         countStmt,
-	}
 	d.stmts[tableName] = ts
 	return ts, nil
 }
@@ -350,12 +345,12 @@ CREATE TABLE IF NOT EXISTS _stream_position (
 	return nil
 }
 
-func (d *DB) loadState(ctx context.Context) error {
-	// 1. Load registry types
+func (d *DB) loadTypes(ctx context.Context) ([]*sdsv1.TypeDefinition, error) {
 	rows, err := d.sqlDB.QueryContext(ctx, "SELECT id, name, fingerprint, descriptors, key_fields FROM _stream_types ORDER BY id ASC")
 	if err != nil {
-		return fmt.Errorf("failed to query _stream_types: %w", err)
+		return nil, fmt.Errorf("failed to query _stream_types: %w", err)
 	}
+	defer rows.Close()
 
 	var defs []*sdsv1.TypeDefinition
 	for rows.Next() {
@@ -366,40 +361,59 @@ func (d *DB) loadState(ctx context.Context) error {
 		var keyFieldsJSON string
 
 		if err := rows.Scan(&id, &name, &fingerprint, &descBytes, &keyFieldsJSON); err != nil {
-			rows.Close()
-			return fmt.Errorf("failed to scan _stream_types row: %w", err)
+			return nil, fmt.Errorf("failed to scan _stream_types row: %w", err)
 		}
 
 		var keyFields []int32
 		if err := json.Unmarshal([]byte(keyFieldsJSON), &keyFields); err != nil {
-			rows.Close()
-			return fmt.Errorf("failed to parse key_fields for type ID %d: %w", id, err)
+			return nil, fmt.Errorf("failed to parse key_fields for type ID %d: %w", id, err)
 		}
 
 		var fds *descriptorpb.FileDescriptorSet
 		if len(descBytes) > 0 {
 			fds = &descriptorpb.FileDescriptorSet{}
 			if err := proto.Unmarshal(descBytes, fds); err != nil {
-				rows.Close()
-				return fmt.Errorf("failed to unmarshal descriptors for type ID %d: %w", id, err)
+				return nil, fmt.Errorf("failed to unmarshal descriptors for type ID %d: %w", id, err)
 			}
 		}
 
-		def := &sdsv1.TypeDefinition{
+		defs = append(defs, &sdsv1.TypeDefinition{
 			Id:          id,
 			Name:        name,
 			Fingerprint: fingerprint,
 			Descriptors: fds,
 			KeyFields:   keyFields,
-		}
-		defs = append(defs, def)
+		})
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("error reading _stream_types: %w", err)
+		return nil, fmt.Errorf("error reading _stream_types: %w", err)
 	}
-	rows.Close()
+	return defs, nil
+}
 
+func (d *DB) loadPosition(ctx context.Context) (string, uint64, bool, error) {
+	rows, err := d.sqlDB.QueryContext(ctx, "SELECT stream_id, position FROM _stream_position LIMIT 1")
+	if err != nil {
+		return "", 0, false, fmt.Errorf("failed to query _stream_position: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var sID string
+		var pos uint64
+		if err := rows.Scan(&sID, &pos); err != nil {
+			return "", 0, false, fmt.Errorf("failed to scan _stream_position: %w", err)
+		}
+		return sID, pos, true, nil
+	}
+	return "", 0, false, nil
+}
+
+func (d *DB) loadState(ctx context.Context) error {
+	defs, err := d.loadTypes(ctx)
+	if err != nil {
+		return err
+	}
 	for _, def := range defs {
 		if err := d.changeReader.Registry().Register(def); err != nil {
 			return fmt.Errorf("failed to register restored type %d (%s): %w", def.GetId(), def.GetName(), err)
@@ -411,26 +425,16 @@ func (d *DB) loadState(ctx context.Context) error {
 		}
 	}
 
-	// 2. Load stream position
-	posRows, err := d.sqlDB.QueryContext(ctx, "SELECT stream_id, position FROM _stream_position LIMIT 1")
+	sID, pos, found, err := d.loadPosition(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to query _stream_position: %w", err)
+		return err
 	}
-
-	if posRows.Next() {
-		var sID string
-		var pos uint64
-		if err := posRows.Scan(&sID, &pos); err != nil {
-			posRows.Close()
-			return fmt.Errorf("failed to scan _stream_position: %w", err)
-		}
+	if found {
 		if d.streamID == "" {
 			d.streamID = sID
 		}
 		d.position = pos
 	}
-	posRows.Close()
-
 	return nil
 }
 
@@ -657,12 +661,10 @@ func (d *DB) updatePositionInTx(ctx context.Context, tx *sql.Tx, seq uint64) err
 	return nil
 }
 
-// Get retrieves a merged proto row from a table by primary key.
-func (d *DB) Get(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
-	cctx := context.WithoutCancel(ctx)
+func (d *DB) getTable(ctx context.Context, typeName string) (*sdsv1.TypeDefinition, *tableStmts, error) {
 	def, _, ok := d.changeReader.Registry().LookupByName(typeName)
 	if !ok {
-		return nil, false, fmt.Errorf("%w: type %q", ErrTypeNotRegistered, typeName)
+		return nil, nil, fmt.Errorf("%w: type %q", ErrTypeNotRegistered, typeName)
 	}
 
 	tableName := TableName(typeName)
@@ -672,22 +674,33 @@ func (d *DB) Get(ctx context.Context, typeName string, key sds.Key) (proto.Messa
 	d.mu.RUnlock()
 
 	if ts == nil {
+		cctx := withoutCancel(ctx)
 		d.mu.Lock()
 		var err error
 		ts, err = d.ensureTableStmtsLocked(cctx, tableName)
 		d.mu.Unlock()
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to prepare stmts for %q: %w", tableName, err)
+			return nil, nil, fmt.Errorf("failed to prepare stmts for %q: %w", tableName, err)
 		}
 	}
+	return def, ts, nil
+}
 
+// Get retrieves a merged proto row from a table by primary key.
+func (d *DB) Get(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
+	def, ts, err := d.getTable(ctx, typeName)
+	if err != nil {
+		return nil, false, err
+	}
+
+	cctx := withoutCancel(ctx)
 	var valuedata []byte
-	err := ts.get.QueryRowContext(cctx, key.Bytes()).Scan(&valuedata)
+	err = ts.get.QueryRowContext(cctx, key.Bytes()).Scan(&valuedata)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to query row from %q: %w", tableName, err)
+		return nil, false, fmt.Errorf("failed to query row from %q: %w", typeName, err)
 	}
 
 	msgType, err := d.changeReader.Registry().ResolveMessageType(def.GetId())
@@ -705,26 +718,15 @@ func (d *DB) Get(ctx context.Context, typeName string, key sds.Key) (proto.Messa
 
 // Count returns the number of rows in the specified table.
 func (d *DB) Count(ctx context.Context, typeName string) (int, error) {
-	cctx := context.WithoutCancel(ctx)
-	tableName := TableName(typeName)
-
-	d.mu.RLock()
-	ts := d.stmts[tableName]
-	d.mu.RUnlock()
-
-	if ts == nil {
-		d.mu.Lock()
-		var err error
-		ts, err = d.ensureTableStmtsLocked(cctx, tableName)
-		d.mu.Unlock()
-		if err != nil {
-			return 0, fmt.Errorf("failed to prepare stmts for %q: %w", tableName, err)
-		}
+	_, ts, err := d.getTable(ctx, typeName)
+	if err != nil {
+		return 0, err
 	}
 
+	cctx := withoutCancel(ctx)
 	var count int
 	if err := ts.count.QueryRowContext(cctx).Scan(&count); err != nil {
-		return 0, fmt.Errorf("failed to count rows in %q: %w", tableName, err)
+		return 0, fmt.Errorf("failed to count rows in %q: %w", typeName, err)
 	}
 	return count, nil
 }
@@ -757,7 +759,7 @@ func (d *DB) SyncRegistry(ctx context.Context, reg *record.Registry) error {
 	if err := d.changeReader.Registry().Import(exported); err != nil {
 		return err
 	}
-	cctx := context.WithoutCancel(ctx)
+	cctx := withoutCancel(ctx)
 	for _, def := range exported.GetTypes() {
 		if err := d.ensureTableSchema(cctx, nil, def); err != nil {
 			return err
@@ -776,7 +778,7 @@ func (d *DB) RegisterType(ctx context.Context, msg proto.Message, keyFields ...i
 	if err != nil {
 		return nil, err
 	}
-	cctx := context.WithoutCancel(ctx)
+	cctx := withoutCancel(ctx)
 	if err := d.ensureTableSchema(cctx, nil, def); err != nil {
 		return nil, err
 	}
@@ -799,10 +801,9 @@ func prefixLimit(prefix []byte) []byte {
 // ordered by keydata ASC. If limit <= 0, all matching rows are returned.
 // If keyPrefix is empty, all rows in the table (up to limit) are returned.
 func (d *DB) ScanLimit(ctx context.Context, typeName string, keyPrefix []byte, limit int) ([]proto.Message, error) {
-	cctx := context.WithoutCancel(ctx)
-	def, _, ok := d.changeReader.Registry().LookupByName(typeName)
-	if !ok {
-		return nil, fmt.Errorf("%w: type %q", ErrTypeNotRegistered, typeName)
+	def, ts, err := d.getTable(ctx, typeName)
+	if err != nil {
+		return nil, err
 	}
 
 	msgType, err := d.changeReader.Registry().ResolveMessageType(def.GetId())
@@ -810,22 +811,7 @@ func (d *DB) ScanLimit(ctx context.Context, typeName string, keyPrefix []byte, l
 		return nil, fmt.Errorf("failed to resolve message type for %q: %w", typeName, err)
 	}
 
-	tableName := TableName(typeName)
-
-	d.mu.RLock()
-	ts := d.stmts[tableName]
-	d.mu.RUnlock()
-
-	if ts == nil {
-		d.mu.Lock()
-		var err error
-		ts, err = d.ensureTableStmtsLocked(cctx, tableName)
-		d.mu.Unlock()
-		if err != nil {
-			return nil, fmt.Errorf("failed to prepare stmts for %q: %w", tableName, err)
-		}
-	}
-
+	cctx := withoutCancel(ctx)
 	var rows *sql.Rows
 	if len(keyPrefix) == 0 {
 		if limit > 0 {
@@ -843,16 +829,14 @@ func (d *DB) ScanLimit(ctx context.Context, typeName string, keyPrefix []byte, l
 			}
 		} else {
 			if limit > 0 {
-				query := fmt.Sprintf("SELECT keydata, valuedata FROM %q WHERE keydata >= ? ORDER BY keydata ASC LIMIT ?;", tableName)
-				rows, err = d.sqlDB.QueryContext(cctx, query, keyPrefix, limit)
+				rows, err = ts.scanGeLim.QueryContext(cctx, keyPrefix, limit)
 			} else {
-				query := fmt.Sprintf("SELECT keydata, valuedata FROM %q WHERE keydata >= ? ORDER BY keydata ASC;", tableName)
-				rows, err = d.sqlDB.QueryContext(cctx, query, keyPrefix)
+				rows, err = ts.scanGe.QueryContext(cctx, keyPrefix)
 			}
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to scan rows from %q: %w", tableName, err)
+		return nil, fmt.Errorf("failed to scan rows from %q: %w", typeName, err)
 	}
 	defer rows.Close()
 

@@ -204,7 +204,9 @@ func (tx *Tx) Insert(ctx context.Context, msg proto.Message) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_ = tx.recordChange(seq, sdsv1.OpRecord_CREATE, msg)
+	if err := tx.recordChange(seq, sdsv1.OpRecord_CREATE, msg); err != nil {
+		panic(fmt.Sprintf("sds: failed to record transaction change for create: %v", err))
+	}
 	return seq, nil
 }
 
@@ -217,7 +219,9 @@ func (tx *Tx) Create(ctx context.Context, msg proto.Message) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_ = tx.recordChange(seq, sdsv1.OpRecord_CREATE, msg)
+	if err := tx.recordChange(seq, sdsv1.OpRecord_CREATE, msg); err != nil {
+		panic(fmt.Sprintf("sds: failed to record transaction change for create: %v", err))
+	}
 	return seq, nil
 }
 
@@ -230,7 +234,9 @@ func (tx *Tx) Update(ctx context.Context, msg proto.Message) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_ = tx.recordChange(seq, sdsv1.OpRecord_UPDATE, msg)
+	if err := tx.recordChange(seq, sdsv1.OpRecord_UPDATE, msg); err != nil {
+		panic(fmt.Sprintf("sds: failed to record transaction change for update: %v", err))
+	}
 	return seq, nil
 }
 
@@ -243,7 +249,9 @@ func (tx *Tx) Delete(ctx context.Context, msg proto.Message) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_ = tx.recordChange(seq, sdsv1.OpRecord_DELETE, msg)
+	if err := tx.recordChange(seq, sdsv1.OpRecord_DELETE, msg); err != nil {
+		panic(fmt.Sprintf("sds: failed to record transaction change for delete: %v", err))
+	}
 	return seq, nil
 }
 

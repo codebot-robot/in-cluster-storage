@@ -97,6 +97,47 @@ func buildMD(t *testing.T, name string, fields []*descriptorpb.FieldDescriptorPr
 	return d.(protoreflect.MessageDescriptor)
 }
 
+func readAllSQLiteRows(ctx context.Context, t *testing.T, db *sqlite.DB, sqlTableName, fullTableName string) map[string]proto.Message {
+	t.Helper()
+	querySQL := fmt.Sprintf("SELECT keydata, valuedata FROM %q;", sqlTableName)
+	rows, err := db.SQLDB().QueryContext(ctx, querySQL)
+	if err != nil {
+		t.Fatalf("failed to query rows from %q: %v", sqlTableName, err)
+	}
+	defer rows.Close()
+
+	sqliteRows := make(map[string]proto.Message)
+	for rows.Next() {
+		var keydata, valuedata []byte
+		if err := rows.Scan(&keydata, &valuedata); err != nil {
+			t.Fatalf("failed to scan row for %q: %v", sqlTableName, err)
+		}
+
+		def, _, ok := db.Registry().LookupByName(fullTableName)
+		if !ok {
+			t.Fatalf("type not found for table %q in registry", fullTableName)
+		}
+
+		msgType, err := db.Registry().ResolveMessageType(def.GetId())
+		if err != nil {
+			t.Fatalf("failed to resolve message type for %q: %v", fullTableName, err)
+		}
+
+		msg := msgType.New().Interface()
+		if err := sds.MergeKeyAndNonKey(msg, keydata, valuedata); err != nil {
+			t.Fatalf("failed to merge proto key and value for %q: %v", fullTableName, err)
+		}
+
+		key, err := sds.ExtractKey(msg, def.GetKeyFields())
+		if err != nil {
+			t.Fatalf("failed to extract key from sqlite row: %v", err)
+		}
+
+		sqliteRows[key.String()] = msg
+	}
+	return sqliteRows
+}
+
 func verifySQLiteMatchesMemStore(t *testing.T, ctx context.Context, db *sqlite.DB, store *memtable.MemStore) {
 	t.Helper()
 
@@ -121,47 +162,7 @@ func verifySQLiteMatchesMemStore(t *testing.T, ctx context.Context, db *sqlite.D
 		}
 
 		// Read all (keydata, valuedata) rows from SQLite
-		querySQL := fmt.Sprintf("SELECT keydata, valuedata FROM %q;", sqlTableName)
-		rows, err := db.SQLDB().QueryContext(ctx, querySQL)
-		if err != nil {
-			t.Fatalf("failed to query rows from %q: %v", sqlTableName, err)
-		}
-
-		sqliteRows := make(map[string]proto.Message)
-		for rows.Next() {
-			var keydata, valuedata []byte
-			if err := rows.Scan(&keydata, &valuedata); err != nil {
-				rows.Close()
-				t.Fatalf("failed to scan row for %q: %v", sqlTableName, err)
-			}
-
-			def, _, ok := db.Registry().LookupByName(fullTableName)
-			if !ok {
-				rows.Close()
-				t.Fatalf("type not found for table %q in registry", fullTableName)
-			}
-
-			msgType, err := db.Registry().ResolveMessageType(def.GetId())
-			if err != nil {
-				rows.Close()
-				t.Fatalf("failed to resolve message type for %q: %v", fullTableName, err)
-			}
-
-			msg := msgType.New().Interface()
-			if err := sds.MergeKeyAndNonKey(msg, keydata, valuedata); err != nil {
-				rows.Close()
-				t.Fatalf("failed to merge proto key and value for %q: %v", fullTableName, err)
-			}
-
-			key, err := sds.ExtractKey(msg, def.GetKeyFields())
-			if err != nil {
-				rows.Close()
-				t.Fatalf("failed to extract key from sqlite row: %v", err)
-			}
-
-			sqliteRows[key.String()] = msg
-		}
-		rows.Close()
+		sqliteRows := readAllSQLiteRows(ctx, t, db, sqlTableName, fullTableName)
 
 		// Compare with memtable rows
 		for _, memRow := range memTable.Rows() {
