@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -3238,5 +3239,225 @@ func TestSnapshotSafePositionAndS3Watermark(t *testing.T) {
 	}
 	if snapPos == 0 {
 		t.Fatalf("Expected non-zero snapshot position")
+	}
+}
+
+func TestNameLengthLimit(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "vol-name-limit"
+
+	validNames := map[string]string{
+		"ascii_255":   strings.Repeat("a", 255),
+		"utf8_3b_255": strings.Repeat("日", 85),
+		"utf8_2b_255": strings.Repeat("é", 127) + "x",
+		"utf8_4b_255": strings.Repeat("🎉", 63) + "xyz",
+	}
+
+	tooLongNames := map[string]string{
+		"ascii_256":   strings.Repeat("a", 256),
+		"utf8_3b_256": strings.Repeat("日", 85) + "x",
+		"utf8_2b_256": strings.Repeat("é", 128),
+		"utf8_4b_256": strings.Repeat("🎉", 64),
+	}
+
+	for desc, name := range validNames {
+		if len(name) != 255 {
+			t.Fatalf("%s length is %d, expected 255", desc, len(name))
+		}
+
+		// 1. Lookup non-existent 255-byte name -> should return ENOENT, NOT ENAMETOOLONG
+		lookupResp, err := server.Lookup(ctx, &pb.LookupRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+		})
+		if err != nil {
+			t.Fatalf("[%s] Lookup error: %v", desc, err)
+		}
+		if lookupResp.GetError() != int32(syscall.ENOENT) {
+			t.Fatalf("[%s] Expected ENOENT for Lookup, got error code %d", desc, lookupResp.GetError())
+		}
+
+		// 2. Mkdir 255-byte name -> succeeds
+		mkdirResp, err := server.Mkdir(ctx, &pb.MkdirRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+			Mode:        0755,
+		})
+		if err != nil || mkdirResp.GetError() != 0 {
+			t.Fatalf("[%s] Mkdir failed: %v (err=%d)", desc, err, mkdirResp.GetError())
+		}
+
+		// 3. Lookup existing 255-byte name -> succeeds
+		lookupResp, err = server.Lookup(ctx, &pb.LookupRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+		})
+		if err != nil || lookupResp.GetError() != 0 {
+			t.Fatalf("[%s] Lookup existing dir failed: %v (err=%d)", desc, err, lookupResp.GetError())
+		}
+
+		// 4. Rmdir 255-byte name -> succeeds
+		rmdirResp, err := server.Rmdir(ctx, &pb.RmdirRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+		})
+		if err != nil || rmdirResp.GetError() != 0 {
+			t.Fatalf("[%s] Rmdir failed: %v (err=%d)", desc, err, rmdirResp.GetError())
+		}
+
+		// 5. CreateFile 255-byte name -> succeeds
+		createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+			Mode:        0644,
+		})
+		if err != nil || createResp.GetError() != 0 {
+			t.Fatalf("[%s] CreateFile failed: %v (err=%d)", desc, err, createResp.GetError())
+		}
+
+		// 6. Rename 255-byte name -> another 255-byte name succeeds
+		renamedName := strings.Repeat("b", 255)
+		renameResp, err := server.Rename(ctx, &pb.RenameRequest{
+			VolumeId:       volumeID,
+			OldParentInode: 1,
+			OldName:        name,
+			NewParentInode: 1,
+			NewName:        renamedName,
+		})
+		if err != nil || renameResp.GetError() != 0 {
+			t.Fatalf("[%s] Rename to 255-byte name failed: %v (err=%d)", desc, err, renameResp.GetError())
+		}
+
+		// 7. Unlink renamed 255-byte file -> succeeds
+		unlinkResp, err := server.Unlink(ctx, &pb.UnlinkRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        renamedName,
+		})
+		if err != nil || unlinkResp.GetError() != 0 {
+			t.Fatalf("[%s] Unlink failed: %v (err=%d)", desc, err, unlinkResp.GetError())
+		}
+
+		// 8. ResolvePath with 255-byte component -> does not fail with ENAMETOOLONG
+		_, err = resolvePath(ctx, server, volumeID, "/"+name)
+		if err != nil && !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("[%s] ResolvePath returned unexpected error: %v", desc, err)
+		}
+	}
+
+	for desc, name := range tooLongNames {
+		if len(name) < 256 {
+			t.Fatalf("%s length is %d, expected >= 256", desc, len(name))
+		}
+
+		// 1. Lookup 256-byte name -> ENAMETOOLONG
+		lookupResp, err := server.Lookup(ctx, &pb.LookupRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+		})
+		if err != nil {
+			t.Fatalf("[%s] Lookup returned unexpected RPC error: %v", desc, err)
+		}
+		if lookupResp.GetError() != int32(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Expected ENAMETOOLONG (%d) for Lookup, got %d", desc, syscall.ENAMETOOLONG, lookupResp.GetError())
+		}
+
+		// 2. Mkdir 256-byte name -> ENAMETOOLONG
+		mkdirResp, err := server.Mkdir(ctx, &pb.MkdirRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+			Mode:        0755,
+		})
+		if err != nil {
+			t.Fatalf("[%s] Mkdir returned unexpected RPC error: %v", desc, err)
+		}
+		if mkdirResp.GetError() != int32(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Expected ENAMETOOLONG (%d) for Mkdir, got %d", desc, syscall.ENAMETOOLONG, mkdirResp.GetError())
+		}
+
+		// 3. CreateFile 256-byte name -> ENAMETOOLONG
+		createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+			Mode:        0644,
+		})
+		if err != nil {
+			t.Fatalf("[%s] CreateFile returned unexpected RPC error: %v", desc, err)
+		}
+		if createResp.GetError() != int32(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Expected ENAMETOOLONG (%d) for CreateFile, got %d", desc, syscall.ENAMETOOLONG, createResp.GetError())
+		}
+
+		// 4. Unlink 256-byte name -> ENAMETOOLONG
+		unlinkResp, err := server.Unlink(ctx, &pb.UnlinkRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+		})
+		if err != nil {
+			t.Fatalf("[%s] Unlink returned unexpected RPC error: %v", desc, err)
+		}
+		if unlinkResp.GetError() != int32(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Expected ENAMETOOLONG (%d) for Unlink, got %d", desc, syscall.ENAMETOOLONG, unlinkResp.GetError())
+		}
+
+		// 5. Rmdir 256-byte name -> ENAMETOOLONG
+		rmdirResp, err := server.Rmdir(ctx, &pb.RmdirRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        name,
+		})
+		if err != nil {
+			t.Fatalf("[%s] Rmdir returned unexpected RPC error: %v", desc, err)
+		}
+		if rmdirResp.GetError() != int32(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Expected ENAMETOOLONG (%d) for Rmdir, got %d", desc, syscall.ENAMETOOLONG, rmdirResp.GetError())
+		}
+
+		// 6. Rename with 256-byte oldName -> ENAMETOOLONG
+		renameResp, err := server.Rename(ctx, &pb.RenameRequest{
+			VolumeId:       volumeID,
+			OldParentInode: 1,
+			OldName:        name,
+			NewParentInode: 1,
+			NewName:        "valid.txt",
+		})
+		if err != nil {
+			t.Fatalf("[%s] Rename returned unexpected RPC error: %v", desc, err)
+		}
+		if renameResp.GetError() != int32(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Expected ENAMETOOLONG (%d) for Rename oldName, got %d", desc, syscall.ENAMETOOLONG, renameResp.GetError())
+		}
+
+		// 7. Rename with 256-byte newName -> ENAMETOOLONG
+		renameResp2, err := server.Rename(ctx, &pb.RenameRequest{
+			VolumeId:       volumeID,
+			OldParentInode: 1,
+			OldName:        "valid.txt",
+			NewParentInode: 1,
+			NewName:        name,
+		})
+		if err != nil {
+			t.Fatalf("[%s] Rename returned unexpected RPC error: %v", desc, err)
+		}
+		if renameResp2.GetError() != int32(syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Expected ENAMETOOLONG (%d) for Rename newName, got %d", desc, syscall.ENAMETOOLONG, renameResp2.GetError())
+		}
+
+		// 8. ResolvePath with 256-byte component -> ENAMETOOLONG
+		_, err = resolvePath(ctx, server, volumeID, "/"+name)
+		if !errors.Is(err, syscall.ENAMETOOLONG) {
+			t.Fatalf("[%s] Expected ENAMETOOLONG for ResolvePath, got %v", desc, err)
+		}
 	}
 }

@@ -79,6 +79,9 @@ func volErrToSyscall(err error) int32 {
 	if errors.Is(err, syscall.ENOSPC) {
 		return int32(syscall.ENOSPC)
 	}
+	if errors.Is(err, syscall.ENAMETOOLONG) {
+		return int32(syscall.ENAMETOOLONG)
+	}
 	return int32(syscall.EIO)
 }
 
