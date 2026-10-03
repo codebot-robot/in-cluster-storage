@@ -36,14 +36,16 @@ import (
 )
 
 var (
-	port          = flag.Int("port", 50051, "The server port")
-	csiEndpoint   = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
-	backendFlag   = flag.String("backend", "memory://", "Object storage backend URL (e.g. memory://, file:///path, s3://bucket/prefix, gs://bucket/prefix)")
-	flushInterval = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
-	walDir        = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
-	walTarget     = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer:50051)")
-	walDurability = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
-	metadataStore = flag.String("metadata-store", "legacy", "Metadata store type (legacy or sqlite)")
+	port                 = flag.Int("port", 50051, "The server port")
+	csiEndpoint          = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
+	backendFlag          = flag.String("backend", "memory://", "Object storage backend URL (e.g. memory://, file:///path, s3://bucket/prefix, gs://bucket/prefix)")
+	flushInterval        = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
+	walDir               = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
+	walTarget            = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer:50051)")
+	walDurability        = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
+	metadataStore        = flag.String("metadata-store", "legacy", "Metadata store type (legacy or sqlite)")
+	metadataCacheEntries = flag.Int("metadata-cache-entries", 0, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
+	metadataCacheBytes   = flag.Int64("metadata-cache-bytes", 64*1024*1024, "Maximum byte size of metadata read cache")
 )
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -76,6 +78,9 @@ func main() {
 	var serverOpts []controller.ServerOption
 	if *metadataStore != "" {
 		serverOpts = append(serverOpts, controller.WithServerMetadataStore(*metadataStore))
+	}
+	if *metadataCacheEntries > 0 || *metadataCacheBytes > 0 {
+		serverOpts = append(serverOpts, controller.WithServerMetadataCacheLimits(*metadataCacheEntries, *metadataCacheBytes))
 	}
 	// TODO: We always want to assume a WAL, and maybe it would be nice to have a wal-client mode that was local-only e.g. for testing.
 	if *walDir != "" {

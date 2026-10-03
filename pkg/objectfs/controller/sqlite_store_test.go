@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
@@ -421,4 +423,306 @@ func TestSQLiteMetadataStoreCrashRecoveryWithStream(t *testing.T) {
 	if len(entries) != 10 {
 		t.Fatalf("expected 10 replayed entries, got %d", len(entries))
 	}
+}
+
+func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-cache-test"
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	vol.SQLiteCacheResetStats()
+
+	// 1. Point lookup of non-existent file -> miss + negative cache entry created
+	_, err := vol.Lookup(ctx, 1, "does_not_exist.txt")
+	if err == nil {
+		t.Fatalf("expected error looking up non-existent file")
+	}
+	stats := vol.SQLiteCacheStats()
+	if stats.Misses != 1 || stats.Hits != 0 {
+		t.Fatalf("expected 1 miss and 0 hits on first lookup, got misses=%d hits=%d", stats.Misses, stats.Hits)
+	}
+	if stats.Entries == 0 {
+		t.Fatalf("expected negative cache entry stored, got entries=%d", stats.Entries)
+	}
+
+	// 2. Second lookup of the same non-existent file -> negative cache hit (no SQLite query!)
+	_, err = vol.Lookup(ctx, 1, "does_not_exist.txt")
+	if err == nil {
+		t.Fatalf("expected error looking up non-existent file")
+	}
+	stats = vol.SQLiteCacheStats()
+	if stats.Hits != 1 || stats.Misses != 1 {
+		t.Fatalf("expected 1 hit and 1 miss after second lookup, got hits=%d misses=%d", stats.Hits, stats.Misses)
+	}
+	if stats.HitRate != 0.5 {
+		t.Fatalf("expected hitRate 0.5, got %f", stats.HitRate)
+	}
+
+	// 3. Create the file -> replaces negative cache entry with positive entry in same transaction
+	attr, err := vol.CreateFile(ctx, 1, "does_not_exist.txt", 0644, []byte("now I exist"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// 4. Lookup now succeeds directly from cache (hit!)
+	lookupAttr, err := vol.Lookup(ctx, 1, "does_not_exist.txt")
+	if err != nil {
+		t.Fatalf("Lookup failed: %v", err)
+	}
+	if lookupAttr.Inode != attr.Inode || lookupAttr.Size != int64(len("now I exist")) {
+		t.Fatalf("unexpected lookup attr: %+v", lookupAttr)
+	}
+	stats = vol.SQLiteCacheStats()
+	// Lookup checks DirEntry (hit) and toEntryAttr checks Inode (hit)
+	if stats.Hits < 2 {
+		t.Fatalf("expected hits >= 2, got %d", stats.Hits)
+	}
+
+	// 5. Stat the inode -> cache hit!
+	vol.SQLiteCacheResetStats()
+	statAttr, err := vol.GetAttr(ctx, attr.Inode)
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if statAttr.Inode != attr.Inode {
+		t.Fatalf("mismatched stat inode: %d vs %d", statAttr.Inode, attr.Inode)
+	}
+	stats = vol.SQLiteCacheStats()
+	if stats.Hits != 1 || stats.Misses != 0 {
+		t.Fatalf("expected 1 hit 0 misses on GetAttr, got hits=%d misses=%d", stats.Hits, stats.Misses)
+	}
+
+	// 6. Delete file -> updates cache entry to negative
+	err = vol.Unlink(ctx, 1, "does_not_exist.txt")
+	if err != nil {
+		t.Fatalf("Unlink failed: %v", err)
+	}
+
+	// 7. Lookup after deletion -> immediate negative cache hit (no SQLite query!)
+	vol.SQLiteCacheResetStats()
+	_, err = vol.Lookup(ctx, 1, "does_not_exist.txt")
+	if err == nil {
+		t.Fatalf("expected error looking up unlinked file")
+	}
+	stats = vol.SQLiteCacheStats()
+	if stats.Hits != 1 || stats.Misses != 0 {
+		t.Fatalf("expected 1 hit (negative cache hit) and 0 misses, got hits=%d misses=%d", stats.Hits, stats.Misses)
+	}
+}
+
+func TestSQLiteReadCacheCoherence(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-coherence"
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Create file
+	fAttr, err := vol.CreateFile(ctx, 1, "initial.txt", 0644, []byte("hello"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// Rename file
+	_, err = vol.Rename(ctx, 1, "initial.txt", 1, "renamed.txt")
+	if err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+
+	// Old name should be negative cache hit
+	vol.SQLiteCacheResetStats()
+	_, err = vol.Lookup(ctx, 1, "initial.txt")
+	if err == nil {
+		t.Fatalf("expected error for old name after rename")
+	}
+	stats := vol.SQLiteCacheStats()
+	if stats.Hits != 1 || stats.Misses != 0 {
+		t.Fatalf("expected 1 negative hit for old name, got hits=%d misses=%d", stats.Hits, stats.Misses)
+	}
+
+	// New name should be positive cache hit
+	vol.SQLiteCacheResetStats()
+	rAttr, err := vol.Lookup(ctx, 1, "renamed.txt")
+	if err != nil {
+		t.Fatalf("Lookup for renamed file failed: %v", err)
+	}
+	if rAttr.Inode != fAttr.Inode {
+		t.Fatalf("mismatched inode: %d vs %d", rAttr.Inode, fAttr.Inode)
+	}
+
+	// Truncate file updates cached inode size
+	_, err = vol.TruncateFile(ctx, fAttr.Inode, 100)
+	if err != nil {
+		t.Fatalf("TruncateFile failed: %v", err)
+	}
+	tAttr, err := vol.GetAttr(ctx, fAttr.Inode)
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if tAttr.Size != 100 {
+		t.Fatalf("expected size 100 after truncate, got %d", tAttr.Size)
+	}
+
+	// WriteFile updates cached inode size and mtime
+	_, newSize, _, err := vol.WriteFile(ctx, fAttr.Inode, 100, []byte(" appended"), 0)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if newSize != 109 {
+		t.Fatalf("expected size 109 after write, got %d", newSize)
+	}
+	wAttr, err := vol.GetAttr(ctx, fAttr.Inode)
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if wAttr.Size != 109 {
+		t.Fatalf("expected size 109 in cached inode after write, got %d", wAttr.Size)
+	}
+}
+
+func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-limits"
+
+	// Bounded to 50 entries and 10 KB
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+		WithMetadataCacheLimits(50, 10*1024),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	var inodes []uint64
+	for i := 0; i < 200; i++ {
+		attr, err := vol.CreateFile(ctx, 1, fmt.Sprintf("file_%d.txt", i), 0644, []byte("content"), 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile failed: %v", err)
+		}
+		inodes = append(inodes, attr.Inode)
+	}
+
+	stats := vol.SQLiteCacheStats()
+	if stats.Entries > 50 {
+		t.Fatalf("expected <= 50 cache entries, got %d", stats.Entries)
+	}
+	if stats.Bytes > 10*1024 {
+		t.Fatalf("expected <= %d bytes, got %d bytes", stats.MaxBytes, stats.Bytes)
+	}
+
+	// Lookup an early evicted file -> cache miss, reloads cleanly from SQLite
+	vol.SQLiteCacheResetStats()
+	attr, err := vol.Lookup(ctx, 1, "file_0.txt")
+	if err != nil {
+		t.Fatalf("Lookup for evicted file_0.txt failed: %v", err)
+	}
+	if attr.Inode != inodes[0] {
+		t.Fatalf("mismatched inode for reloaded file_0.txt: %d vs %d", attr.Inode, inodes[0])
+	}
+	stats = vol.SQLiteCacheStats()
+	if stats.Misses == 0 {
+		t.Fatalf("expected at least 1 cache miss for evicted file_0.txt")
+	}
+}
+
+func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-concurrent-stress"
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataStore("sqlite"),
+		WithLocalStorageDir(localDir),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Pre-create initial files and directories
+	var initInodes []uint64
+	for i := 0; i < 30; i++ {
+		attr, err := vol.CreateFile(ctx, 1, fmt.Sprintf("init_%d.txt", i), 0644, []byte("init"), 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile failed: %v", err)
+		}
+		initInodes = append(initInodes, attr.Inode)
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Reader goroutines doing concurrent GetAttr and Lookup
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					idx := readerID % len(initInodes)
+					_, _ = vol.GetAttr(ctx, initInodes[idx])
+					_, _ = vol.Lookup(ctx, 1, fmt.Sprintf("init_%d.txt", idx))
+					// Also lookup non-existent files to stress negative caching concurrently
+					_, _ = vol.Lookup(ctx, 1, fmt.Sprintf("missing_%d.txt", readerID))
+				}
+			}
+		}(r)
+	}
+
+	// Writer goroutines creating, renaming, and unlinking
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func(writerID int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				name := fmt.Sprintf("w_%d_%d.txt", writerID, i)
+				attr, err := vol.CreateFile(ctx, 1, name, 0644, []byte("data"), 0, 0)
+				if err == nil {
+					renamed := fmt.Sprintf("w_%d_%d_renamed.txt", writerID, i)
+					_, _ = vol.Rename(ctx, 1, name, 1, renamed)
+					_, _ = vol.GetAttr(ctx, attr.Inode)
+					_ = vol.Unlink(ctx, 1, renamed)
+				}
+			}
+		}(w)
+	}
+
+	// Let readers and writers run
+	time.Sleep(300 * time.Millisecond)
+	close(done)
+	wg.Wait()
+
+	stats := vol.SQLiteCacheStats()
+	t.Logf("Concurrent stress test completed: Hits=%d Misses=%d HitRate=%.2f%% Entries=%d Bytes=%d KB",
+		stats.Hits, stats.Misses, stats.HitRate*100, stats.Entries, stats.Bytes/1024)
 }

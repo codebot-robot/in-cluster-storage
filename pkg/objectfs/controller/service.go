@@ -93,11 +93,13 @@ type Server struct {
 	blobStore   *blob.Store
 	broadcaster *EventBroadcaster
 
-	walDir            string
-	walTarget         string
-	defaultDurability walclient.Level
-	metadataStore     string
-	streamFactory     func(volumeID string) (walclient.Stream, error)
+	walDir               string
+	walTarget            string
+	defaultDurability    walclient.Level
+	metadataStore        string
+	metadataCacheEntries int
+	metadataCacheBytes   int64
+	streamFactory        func(volumeID string) (walclient.Stream, error)
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -134,6 +136,14 @@ func WithServerStreamFactory(factory func(volumeID string) (walclient.Stream, er
 func WithServerDurability(durability walclient.Level) ServerOption {
 	return func(s *Server) {
 		s.defaultDurability = durability
+	}
+}
+
+// WithServerMetadataCacheLimits configures the metadata read cache entry and byte capacity.
+func WithServerMetadataCacheLimits(maxEntries int, maxBytes int64) ServerOption {
+	return func(s *Server) {
+		s.metadataCacheEntries = maxEntries
+		s.metadataCacheBytes = maxBytes
 	}
 }
 
@@ -178,6 +188,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		volOpts = append(volOpts, WithDurability(s.defaultDurability))
 		if s.metadataStore != "" {
 			volOpts = append(volOpts, WithMetadataStore(s.metadataStore))
+		}
+		if s.metadataCacheEntries > 0 || s.metadataCacheBytes > 0 {
+			volOpts = append(volOpts, WithMetadataCacheLimits(s.metadataCacheEntries, s.metadataCacheBytes))
 		}
 
 		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)

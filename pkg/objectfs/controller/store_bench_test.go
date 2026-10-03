@@ -19,6 +19,7 @@ package controller
 import (
 	"fmt"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,15 +30,25 @@ import (
 )
 
 func BenchmarkMetadataStoreOperations(b *testing.B) {
-	modes := []string{"legacy", "sqlite"}
-	for _, mode := range modes {
-		b.Run(fmt.Sprintf("mode=%s", mode), func(b *testing.B) {
+	configs := []struct {
+		name         string
+		store        string
+		cacheDisable bool
+	}{
+		{name: "legacy", store: "legacy", cacheDisable: false},
+		{name: "sqlite_cache_on", store: "sqlite", cacheDisable: false},
+		{name: "sqlite_cache_off", store: "sqlite", cacheDisable: true},
+	}
+
+	for _, cfg := range configs {
+		b.Run(fmt.Sprintf("mode=%s", cfg.name), func(b *testing.B) {
 			b.Run("Create", func(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-create-"+mode, backend, broadcaster,
-					WithMetadataStore(mode),
+				vol := NewVolume("bench-create-"+cfg.name, backend, broadcaster,
+					WithMetadataStore(cfg.store),
+					WithSQLiteCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
 				)
 				_ = vol.LoadFromBackend(ctx)
@@ -57,8 +68,9 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-stat-"+mode, backend, broadcaster,
-					WithMetadataStore(mode),
+				vol := NewVolume("bench-stat-"+cfg.name, backend, broadcaster,
+					WithMetadataStore(cfg.store),
+					WithSQLiteCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
 				)
 				_ = vol.LoadFromBackend(ctx)
@@ -78,12 +90,41 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				}
 			})
 
+			b.Run("StatParallel", func(b *testing.B) {
+				ctx := b.Context()
+				backend := inmemorystorage.New()
+				broadcaster := NewEventBroadcaster()
+				vol := NewVolume("bench-stat-par-"+cfg.name, backend, broadcaster,
+					WithMetadataStore(cfg.store),
+					WithSQLiteCacheDisabled(cfg.cacheDisable),
+					WithLocalStorageDir(b.TempDir()),
+				)
+				_ = vol.LoadFromBackend(ctx)
+				defer vol.Close()
+
+				attr, err := vol.CreateFile(ctx, 1, "target.txt", 0644, []byte("data"), 0, 0)
+				if err != nil {
+					b.Fatalf("CreateFile failed: %v", err)
+				}
+
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						_, err := vol.GetAttr(ctx, attr.Inode)
+						if err != nil {
+							b.Fatalf("GetAttr failed: %v", err)
+						}
+					}
+				})
+			})
+
 			b.Run("Lookup", func(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-lookup-"+mode, backend, broadcaster,
-					WithMetadataStore(mode),
+				vol := NewVolume("bench-lookup-"+cfg.name, backend, broadcaster,
+					WithMetadataStore(cfg.store),
+					WithSQLiteCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
 				)
 				_ = vol.LoadFromBackend(ctx)
@@ -103,12 +144,41 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				}
 			})
 
+			b.Run("LookupParallel", func(b *testing.B) {
+				ctx := b.Context()
+				backend := inmemorystorage.New()
+				broadcaster := NewEventBroadcaster()
+				vol := NewVolume("bench-lookup-par-"+cfg.name, backend, broadcaster,
+					WithMetadataStore(cfg.store),
+					WithSQLiteCacheDisabled(cfg.cacheDisable),
+					WithLocalStorageDir(b.TempDir()),
+				)
+				_ = vol.LoadFromBackend(ctx)
+				defer vol.Close()
+
+				_, err := vol.CreateFile(ctx, 1, "target.txt", 0644, []byte("data"), 0, 0)
+				if err != nil {
+					b.Fatalf("CreateFile failed: %v", err)
+				}
+
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						_, err := vol.Lookup(ctx, 1, "target.txt")
+						if err != nil {
+							b.Fatalf("Lookup failed: %v", err)
+						}
+					}
+				})
+			})
+
 			b.Run("ReadDir", func(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-readdir-"+mode, backend, broadcaster,
-					WithMetadataStore(mode),
+				vol := NewVolume("bench-readdir-"+cfg.name, backend, broadcaster,
+					WithMetadataStore(cfg.store),
+					WithSQLiteCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
 				)
 				_ = vol.LoadFromBackend(ctx)
@@ -135,8 +205,9 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-rename-"+mode, backend, broadcaster,
-					WithMetadataStore(mode),
+				vol := NewVolume("bench-rename-"+cfg.name, backend, broadcaster,
+					WithMetadataStore(cfg.store),
+					WithSQLiteCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
 				)
 				_ = vol.LoadFromBackend(ctx)
@@ -147,11 +218,13 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					b.Fatalf("CreateFile failed: %v", err)
 				}
 
+				var cnt uint64
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
+					c := atomic.AddUint64(&cnt, 1)
 					from := "name_a.txt"
 					to := "name_b.txt"
-					if i%2 == 1 {
+					if c%2 == 0 {
 						from = "name_b.txt"
 						to = "name_a.txt"
 					}
@@ -239,12 +312,21 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		t.Logf("[%s] Add to empty dir: %v | Add to 10k entry dir: %v", mode, emptyDur, largeDur)
 	}
 
-	// 2. Cache-Miss / Scale Latency (Exceeding Legacy 10,000 Inode LRU)
+	// 2. Cache-Miss & Scale Latency (15,000 files across 100 dirs)
 	t.Log("\n--- 2. Cache-Miss & Scale Latency (15,000 files across 100 dirs) ---")
-	for _, mode := range []string{"legacy", "sqlite"} {
+	for _, cfg := range []struct {
+		name         string
+		store        string
+		cacheDisable bool
+	}{
+		{name: "legacy", store: "legacy", cacheDisable: false},
+		{name: "sqlite (cache ON)", store: "sqlite", cacheDisable: false},
+		{name: "sqlite (cache OFF)", store: "sqlite", cacheDisable: true},
+	} {
 		backend := inmemorystorage.New()
-		vol := NewVolume("cachemiss-"+mode, backend, NewEventBroadcaster(),
-			WithMetadataStore(mode),
+		vol := NewVolume("cachemiss-"+cfg.name, backend, NewEventBroadcaster(),
+			WithMetadataStore(cfg.store),
+			WithSQLiteCacheDisabled(cfg.cacheDisable),
 			WithLocalStorageDir(t.TempDir()),
 		)
 		_ = vol.LoadFromBackend(ctx)
@@ -260,6 +342,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		}
 
 		// Lookup earliest created files (evicted from memory in legacy store)
+		vol.SQLiteCacheResetStats()
 		start := time.Now()
 		for i := 0; i < 1000; i++ {
 			_, _ = vol.GetAttr(ctx, fileInos[i])
@@ -272,13 +355,68 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		}
 		lookupDur := time.Since(start)
 
+		stats := vol.SQLiteCacheStats()
+		t.Logf("[%s] Stat 1,000 inodes: %v (avg %v/op) | Lookup 10 dirs: %v (avg %v/op) | Cache: hits=%d misses=%d hitRate=%.2f%% entries=%d bytes=%d KB",
+			cfg.name, statDur, statDur/1000, lookupDur, lookupDur/10, stats.Hits, stats.Misses, stats.HitRate*100, stats.Entries, stats.Bytes/1024)
 		_ = vol.Close()
-		t.Logf("[%s] Stat 1,000 evicted inodes: %v (avg %v/op) | Lookup 10 dirs: %v",
-			mode, statDur, statDur/1000, lookupDur/10)
 	}
 
-	// 3. Cold Start Recovery Times
-	t.Log("\n--- 3. Cold Start Time to Serve First Request ---")
+	// 3. SQLite Read Cache Scale & Hit Rate Analysis (10,000 and 50,000 files)
+	t.Log("\n--- 3. SQLite Read Cache Scale & Hit Rate Analysis (Byte-Bound Governed) ---")
+	for _, numFiles := range []int{10000, 50000} {
+		for _, cacheOn := range []bool{true, false} {
+			backend := inmemorystorage.New()
+			vol := NewVolume(fmt.Sprintf("hitrate-scale-%d", numFiles), backend, NewEventBroadcaster(),
+				WithMetadataStore("sqlite"),
+				WithSQLiteCacheDisabled(!cacheOn),
+				WithMetadataCacheLimits(0, 64*1024*1024),
+				WithLocalStorageDir(t.TempDir()),
+			)
+			_ = vol.LoadFromBackend(ctx)
+
+			var createdInos []uint64
+			for i := 0; i < numFiles; i++ {
+				fAttr, _ := vol.CreateFile(ctx, 1, fmt.Sprintf("f%d.txt", i), 0644, []byte("data"), 0, 0)
+				createdInos = append(createdInos, fAttr.Inode)
+			}
+
+			// Measure repeat Stat lookups (hot path)
+			vol.SQLiteCacheResetStats()
+			start := time.Now()
+			for i := 0; i < 5000; i++ {
+				_, _ = vol.GetAttr(ctx, createdInos[i])
+			}
+			hotStatDur := time.Since(start)
+
+			// Measure repeat name Lookups
+			start = time.Now()
+			for i := 0; i < 5000; i++ {
+				_, _ = vol.Lookup(ctx, 1, fmt.Sprintf("f%d.txt", i))
+			}
+			hotLookupDur := time.Since(start)
+
+			// Measure negative lookups with repeated misses (100 distinct missing names x 50 repetitions = 5,000 lookups)
+			start = time.Now()
+			for rep := 0; rep < 50; rep++ {
+				for i := 0; i < 100; i++ {
+					_, _ = vol.Lookup(ctx, 1, fmt.Sprintf("missing_%d.txt", i))
+				}
+			}
+			enoentDur := time.Since(start)
+
+			stats := vol.SQLiteCacheStats()
+			cacheStatus := "cache ON"
+			if !cacheOn {
+				cacheStatus = "cache OFF"
+			}
+			t.Logf("[%s @ %d files] Stat 5k: %v (%v/op) | Lookup 5k: %v (%v/op) | ENOENT 5k (100x50): %v (%v/op) | Hits=%d Misses=%d HitRate=%.2f%% | Mem=%d KB / %d KB (entries=%d)",
+				cacheStatus, numFiles, hotStatDur, hotStatDur/5000, hotLookupDur, hotLookupDur/5000, enoentDur, enoentDur/5000, stats.Hits, stats.Misses, stats.HitRate*100, stats.Bytes/1024, stats.MaxBytes/1024, stats.Entries)
+			_ = vol.Close()
+		}
+	}
+
+	// 4. Cold Start Recovery Times
+	t.Log("\n--- 4. Cold Start Time to Serve First Request ---")
 	{
 		backend := inmemorystorage.New()
 		streamID := uuid.New()
@@ -351,8 +489,8 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		t.Logf("Cold start from EROFS snapshot:            %v", erofsColdStartDur)
 	}
 
-	// 4. Memory Consumption Comparison
-	t.Log("\n--- 4. Memory Consumption Comparison (15,000 files) ---")
+	// 5. Memory Consumption Comparison
+	t.Log("\n--- 5. Memory Consumption Comparison (15,000 files) ---")
 	for _, mode := range []string{"legacy", "sqlite"} {
 		runtime.GC()
 		var m1 runtime.MemStats
