@@ -2308,6 +2308,7 @@ type SnapshotInfo struct {
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	Size          int64                  `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
+	Position      uint64                 `protobuf:"varint,4,opt,name=position,proto3" json:"position,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2359,6 +2360,13 @@ func (x *SnapshotInfo) GetCreatedAt() *timestamppb.Timestamp {
 func (x *SnapshotInfo) GetSize() int64 {
 	if x != nil {
 		return x.Size
+	}
+	return 0
+}
+
+func (x *SnapshotInfo) GetPosition() uint64 {
+	if x != nil {
+		return x.Position
 	}
 	return 0
 }

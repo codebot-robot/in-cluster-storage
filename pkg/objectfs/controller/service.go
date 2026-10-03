@@ -651,38 +651,38 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 	}
 	fromSnapshot := req.GetFromSnapshot()
 
-	var filtered []string
+	var snapInfos []*pb.SnapshotInfo
 	for _, snap := range allSnapshots {
 		if fromSnapshot != "" && snap <= fromSnapshot {
 			continue
 		}
-		snapTime := parseSnapshotTime(snap)
-		if !fromTime.IsZero() && !snapTime.IsZero() && snapTime.Before(fromTime) {
-			continue
+		info, err := vol.GetSnapshotInfo(ctx, snap)
+		if err != nil {
+			info = &pb.SnapshotInfo{
+				Name: snap,
+			}
+			t := parseSnapshotTime(snap)
+			if !t.IsZero() {
+				info.CreatedAt = timestamppb.New(t)
+			}
 		}
-		if !toTime.IsZero() && !snapTime.IsZero() && snapTime.After(toTime) {
-			continue
+		if info.CreatedAt != nil {
+			st := info.CreatedAt.AsTime()
+			if !fromTime.IsZero() && st.Before(fromTime) {
+				continue
+			}
+			if !toTime.IsZero() && st.After(toTime) {
+				continue
+			}
 		}
-		filtered = append(filtered, snap)
+		snapInfos = append(snapInfos, info)
 	}
 
 	limit := int(req.GetLimit())
 	endOfData := true
-	if limit > 0 && len(filtered) > limit {
-		filtered = filtered[:limit]
+	if limit > 0 && len(snapInfos) > limit {
+		snapInfos = snapInfos[:limit]
 		endOfData = false
-	}
-
-	var snapInfos []*pb.SnapshotInfo
-	for _, snap := range filtered {
-		info := &pb.SnapshotInfo{
-			Name: snap,
-		}
-		t := parseSnapshotTime(snap)
-		if !t.IsZero() {
-			info.CreatedAt = timestamppb.New(t)
-		}
-		snapInfos = append(snapInfos, info)
 	}
 
 	return &pb.ListSnapshotsResponse{
@@ -704,12 +704,15 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		return nil, status.Errorf(codes.Internal, "failed to create snapshot: %v", err)
 	}
 
-	snapInfo := &pb.SnapshotInfo{
-		Name: snapName,
-	}
-	t := parseSnapshotTime(snapName)
-	if !t.IsZero() {
-		snapInfo.CreatedAt = timestamppb.New(t)
+	snapInfo, err := vol.GetSnapshotInfo(ctx, snapName)
+	if err != nil {
+		snapInfo = &pb.SnapshotInfo{
+			Name: snapName,
+		}
+		t := parseSnapshotTime(snapName)
+		if !t.IsZero() {
+			snapInfo.CreatedAt = timestamppb.New(t)
+		}
 	}
 
 	return &pb.CreateSnapshotResponse{

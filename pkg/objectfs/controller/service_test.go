@@ -22,11 +22,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -38,12 +40,14 @@ import (
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 func resolvePath(ctx context.Context, server *Server, volumeID, p string) (uint64, error) {
@@ -2844,5 +2848,395 @@ func TestHugeSparseTruncateAndUnlink(t *testing.T) {
 	unResp, err := testUnlink(ctx, server, volumeID, "/huge.bin")
 	if err != nil || unResp.GetError() != 0 {
 		t.Fatalf("Unlink failed: %v (err=%d)", err, unResp.GetError())
+	}
+}
+
+func TestSnapshotSDSRootXattrsRegistryRoundTrip(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-sds-root-xattrs"
+
+	server := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+
+	// Create files and directories to ensure Inode, DirEntry, and Content types are active
+	_, err := testMkdir(ctx, server, volumeID, "/documents", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+	_, err = testCreateFile(ctx, server, volumeID, "/documents/notes.txt", 0644, []byte("structured streams snapshot xattrs"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// Create snapshot
+	snapResp, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+	snapName := snapResp.GetSnapshotName()
+
+	// 1. Verify 20-digit position naming: <stream_seq, 20 digits>.erofs
+	if len(snapName) != 26 || !strings.HasSuffix(snapName, ".erofs") {
+		t.Fatalf("Expected 20-digit position-named snapshot (length 26), got %s", snapName)
+	}
+	posStr := strings.TrimSuffix(snapName, ".erofs")
+	snapPos, err := strconv.ParseUint(posStr, 10, 64)
+	if err != nil || snapPos == 0 {
+		t.Fatalf("Failed to parse positive uint64 position from snapshot name %s: %v", snapName, err)
+	}
+
+	// 2. Verify meta/latest is NOT written
+	var latestBuf bytes.Buffer
+	latestErr := backend.GetObject(ctx, "", path.Join("volumes", volumeID, "meta", "latest"), 0, 0, &latestBuf)
+	if latestErr == nil && latestBuf.Len() > 0 {
+		t.Fatalf("Expected meta/latest to NOT exist, but found latest pointer: %s", latestBuf.String())
+	}
+
+	// 3. Inspect root xattrs in the snapshot EROFS image
+	var imgBuf bytes.Buffer
+	snapKey := path.Join("volumes", volumeID, "meta", snapName)
+	if err := backend.GetObject(ctx, "", snapKey, 0, 0, &imgBuf); err != nil {
+		t.Fatalf("Failed to read snapshot image %s: %v", snapKey, err)
+	}
+
+	reader, err := erofs.NewReader(bytes.NewReader(imgBuf.Bytes()))
+	if err != nil {
+		t.Fatalf("Failed to create EROFS reader for snapshot: %v", err)
+	}
+
+	rootXattrs, err := reader.GetXattrs(reader.GetRootNID())
+	if err != nil {
+		t.Fatalf("Failed to get root xattrs: %v", err)
+	}
+
+	// Check trusted.sds.position
+	posVal, ok := rootXattrs.Others["trusted.sds.position"]
+	if !ok || posVal != strconv.FormatUint(snapPos, 10) {
+		t.Fatalf("trusted.sds.position mismatch: got %q, expected %d", posVal, snapPos)
+	}
+
+	// Check trusted.sds.snapshot_time
+	timeVal, ok := rootXattrs.Others["trusted.sds.snapshot_time"]
+	if !ok || timeVal == "" {
+		t.Fatalf("trusted.sds.snapshot_time missing in root xattrs")
+	}
+	snapTime, err := time.Parse(time.RFC3339Nano, timeVal)
+	if err != nil {
+		t.Fatalf("trusted.sds.snapshot_time is not RFC3339Nano (%q): %v", timeVal, err)
+	}
+	if time.Since(snapTime) > 1*time.Minute {
+		t.Fatalf("trusted.sds.snapshot_time is unreasonably old: %v", snapTime)
+	}
+
+	// Check trusted.sds.registry
+	regVal, ok := rootXattrs.Others["trusted.sds.registry"]
+	if !ok || len(regVal) == 0 {
+		t.Fatalf("trusted.sds.registry missing in root xattrs")
+	}
+
+	var regProto sdsv1.Registry
+	if err := proto.Unmarshal([]byte(regVal), &regProto); err != nil {
+		t.Fatalf("Failed to unmarshal trusted.sds.registry: %v", err)
+	}
+
+	// Verify registry round-trip
+	newReg := record.NewRegistry()
+	if err := newReg.Import(&regProto); err != nil {
+		t.Fatalf("Failed to import registry from snapshot root xattr: %v", err)
+	}
+
+	// Verify all registered types exist in the imported registry
+	_, _, foundInode := newReg.LookupByName("objectfs.v1alpha1.Inode")
+	_, _, foundDir := newReg.LookupByName("objectfs.v1alpha1.DirEntry")
+	_, _, foundContent := newReg.LookupByName("objectfs.v1alpha1.Content")
+	if !foundInode || !foundDir || !foundContent {
+		t.Fatalf("Imported registry missing types: Inode=%v, Dir=%v, Content=%v", foundInode, foundDir, foundContent)
+	}
+
+	// 4. Verify SnapshotPointer record was appended to stream
+	vol := server.GetVolume(volumeID)
+	files, err := filepath.Glob(filepath.Join(walDir, fmt.Sprintf("stream-%s-*.wal", vol.StreamID())))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("No WAL segment file found: %v", err)
+	}
+	clientRecs, _, err := wal.ScanClientSegmentFile(files[0])
+	if err != nil {
+		t.Fatalf("Failed to scan segment file: %v", err)
+	}
+
+	dec := record.NewDecoder(record.WithDecoderRegistry(newReg))
+	var seenSnapshotPointer *sdsv1.SnapshotPointer
+	for _, rec := range clientRecs {
+		item, err := dec.Decode(rec.Payload)
+		if err == nil && item.TypeID == record.TypeIDSnapshotPointer {
+			if ptr, ok := item.Message.(*sdsv1.SnapshotPointer); ok {
+				seenSnapshotPointer = ptr
+			}
+		}
+	}
+
+	if seenSnapshotPointer == nil {
+		t.Fatalf("Expected SnapshotPointer record appended to stream after snapshot upload")
+	}
+	if seenSnapshotPointer.GetPosition() != snapPos {
+		t.Fatalf("SnapshotPointer position mismatch: got %d, expected %d", seenSnapshotPointer.GetPosition(), snapPos)
+	}
+	if seenSnapshotPointer.GetFormat() != "erofs" {
+		t.Fatalf("SnapshotPointer format mismatch: got %q, want 'erofs'", seenSnapshotPointer.GetFormat())
+	}
+	if seenSnapshotPointer.GetLocation() != snapKey {
+		t.Fatalf("SnapshotPointer location mismatch: got %q, want %q", seenSnapshotPointer.GetLocation(), snapKey)
+	}
+
+	_ = server.Close()
+}
+
+func TestSnapshotRestartRecoveryFromSnapshotPlusStream(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-sds-restart-recovery"
+
+	// 1. Initial server instance
+	server1 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+
+	_, err := testMkdir(ctx, server1, volumeID, "/base", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir /base failed: %v", err)
+	}
+	_, err = testCreateFile(ctx, server1, volumeID, "/base/snapfile.txt", 0644, []byte("content from snapshot"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// 2. Take Snapshot 1
+	snapResp, err := server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+	snapName := snapResp.GetSnapshotName()
+
+	// 3. Mutate after Snapshot 1 (logged in SDS stream)
+	_, err = testCreateFile(ctx, server1, volumeID, "/base/after_snap.txt", 0644, []byte("content appended after snapshot"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile after snapshot failed: %v", err)
+	}
+
+	_, err = testWriteFile(ctx, server1, volumeID, "/base/snapfile.txt", 0, []byte("modified snapshot file content!"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	_, err = testMkdir(ctx, server1, volumeID, "/newdir", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir /newdir failed: %v", err)
+	}
+
+	// Close initial server
+	_ = server1.Close()
+
+	// 4. Start second server instance simulating crash restart recovery
+	server2 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+
+	// Verify volume recovered from snapshot + stream suffix
+	vol2 := server2.GetVolume(volumeID)
+	if vol2 == nil {
+		t.Fatalf("Expected volume to be loaded on restart")
+	}
+
+	// Verify modified snapshot file
+	read1, err := testReadFile(ctx, server2, volumeID, "/base/snapfile.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("ReadFile /base/snapfile.txt failed: %v", err)
+	}
+	if string(read1.Data) != "modified snapshot file content!" {
+		t.Fatalf("Modified snapshot file mismatch: got %q", string(read1.Data))
+	}
+
+	// Verify file created after snapshot
+	read2, err := testReadFile(ctx, server2, volumeID, "/base/after_snap.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("ReadFile /base/after_snap.txt failed: %v", err)
+	}
+	if string(read2.Data) != "content appended after snapshot" {
+		t.Fatalf("After snap file mismatch: got %q", string(read2.Data))
+	}
+
+	// Verify new directory
+	dirResp, err := testReadDir(ctx, server2, volumeID, "/")
+	if err != nil {
+		t.Fatalf("ReadDir / failed: %v", err)
+	}
+	var entryNames []string
+	for _, e := range dirResp.Entries {
+		entryNames = append(entryNames, e.Name)
+	}
+	if !slices.Contains(entryNames, "base") || !slices.Contains(entryNames, "newdir") {
+		t.Fatalf("Expected / to contain 'base' and 'newdir', got %v", entryNames)
+	}
+
+	// Verify ListSnapshots still discovers Snapshot 1
+	listResp, err := server2.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("ListSnapshots on recovered server failed: %v", err)
+	}
+	if len(listResp.GetSnapshots()) != 1 || listResp.GetSnapshots()[0].GetName() != snapName {
+		t.Fatalf("Expected snapshot %s, got %v", snapName, listResp.GetSnapshots())
+	}
+	if listResp.GetSnapshots()[0].GetPosition() == 0 {
+		t.Fatalf("Expected non-zero position on listed snapshot")
+	}
+
+	_ = server2.Close()
+}
+
+func TestSnapshotLatestListingHighestPositionWins(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	volumeID := "test-highest-pos"
+
+	// Create dummy snapshot objects in backend
+	vol := NewVolume(volumeID, backend, NewEventBroadcaster())
+
+	// Put 3 snapshot images with different positions
+	positions := []uint64{5, 20, 10}
+	for _, pos := range positions {
+		snapName := fmt.Sprintf("%020d.erofs", pos)
+		snapKey := path.Join("volumes", volumeID, "meta", snapName)
+		_, _ = backend.PutObject(ctx, "", snapKey, blob.NewByteStreamFromBytes([]byte("dummy-erofs")))
+	}
+
+	// Listing should sort by position
+	list, err := vol.ListSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshots failed: %v", err)
+	}
+	expectedList := []string{
+		"00000000000000000005.erofs",
+		"00000000000000000010.erofs",
+		"00000000000000000020.erofs",
+	}
+	if !slices.Equal(list, expectedList) {
+		t.Fatalf("ListSnapshots order mismatch: got %v, want %v", list, expectedList)
+	}
+
+	// findLatestSnapshotNameLocked should pick 00000000000000000020.erofs
+	latest, err := vol.findLatestSnapshotNameLocked(ctx)
+	if err != nil {
+		t.Fatalf("findLatestSnapshotNameLocked failed: %v", err)
+	}
+	if latest != "00000000000000000020.erofs" {
+		t.Fatalf("Expected latest snapshot to be 00000000000000000020.erofs, got %s", latest)
+	}
+}
+
+func TestSnapshotFlushReferencedContentAndDropUnreferenced(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-sds-flush-content"
+
+	server := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+
+	// Write file A with content A
+	_, err := testCreateFile(ctx, server, volumeID, "/fileA.txt", 0644, []byte("content A original"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// Overwrite file A with content B (content A is now unreferenced)
+	_, err = testWriteFile(ctx, server, volumeID, "/fileA.txt", 0, []byte("content B overwritten"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Create snapshot
+	_, err = server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+
+	// Verify referenced content B is in blob store
+	vol := server.GetVolume(volumeID)
+	if vol == nil {
+		t.Fatalf("Volume not found")
+	}
+
+	inoA, err := resolvePath(ctx, server, volumeID, "/fileA.txt")
+	if err != nil {
+		t.Fatalf("resolvePath /fileA.txt failed: %v", err)
+	}
+
+	attr, err := vol.GetAttr(ctx, inoA)
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if attr.ContentSha256 == "" {
+		t.Fatalf("Expected non-empty ContentSha256")
+	}
+
+	blobReader, err := vol.blobStore.GetBlob(ctx, attr.ContentSha256)
+	if err != nil {
+		t.Fatalf("Expected referenced blob %s in blob store: %v", attr.ContentSha256, err)
+	}
+	data, _ := io.ReadAll(blobReader)
+	_ = blobReader.Close()
+	if string(data) != "content B overwritten" {
+		t.Fatalf("Expected content B, got %q", string(data))
+	}
+
+	// Verify unreferenced content is dropped from recoveredContent
+	if len(vol.recoveredContent) != 0 {
+		t.Fatalf("Expected recoveredContent to be emptied after flush, got %d items", len(vol.recoveredContent))
+	}
+
+	_ = server.Close()
+}
+
+func TestSnapshotSafePositionAndS3Watermark(t *testing.T) {
+	ctx := t.Context()
+	bufDir := t.TempDir()
+	_, target, cleanup := startTestWalBufferServer(t, bufDir)
+	defer cleanup()
+
+	clientDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-sds-safe-watermark"
+
+	server := NewServer(backend, WithServerWAL(clientDir, target, walclient.Permanent))
+	defer func() { _ = server.Close() }()
+
+	// 1. Create file with Permanent durability
+	_, err := testCreateFile(ctx, server, volumeID, "/safe_test.txt", 0644, []byte("safe watermark test content"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	vol := server.GetVolume(volumeID)
+	if vol == nil || vol.Stream() == nil {
+		t.Fatalf("Expected active volume and stream")
+	}
+
+	// 2. Create snapshot
+	snapResp, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+	snapName := snapResp.GetSnapshotName()
+
+	// 3. Verify snapshot position does not exceed s3Seq
+	_, _, s3Seq := vol.Stream().Watermarks()
+	posStr := strings.TrimSuffix(snapName, ".erofs")
+	snapPos, err := strconv.ParseUint(posStr, 10, 64)
+	if err != nil {
+		t.Fatalf("Failed to parse position from snapshot name %s: %v", snapName, err)
+	}
+
+	if snapPos > s3Seq {
+		t.Fatalf("Snapshot position %d exceeds permanent s3Seq watermark %d", snapPos, s3Seq)
+	}
+	if snapPos == 0 {
+		t.Fatalf("Expected non-zero snapshot position")
 	}
 }

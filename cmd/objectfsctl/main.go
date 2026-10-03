@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -361,6 +362,8 @@ func newSnapshotsListCommand(opts *options) *cobra.Command {
 			if listOpts.from != "" {
 				if strings.HasSuffix(listOpts.from, ".erofs") {
 					fromSnapshot = listOpts.from
+				} else if pos, err := strconv.ParseUint(listOpts.from, 10, 64); err == nil {
+					fromSnapshot = fmt.Sprintf("%020d.erofs", pos)
 				} else if t, ok := parseTimeFlag(listOpts.from); ok && listOpts.fromTime == "" {
 					fromTimePb = timestamppb.New(t)
 				} else {

@@ -66,9 +66,8 @@ Mounting on Kubernetes worker nodes is currently handled via a user-space **FUSE
 |                             Cloud Object Storage (GCS / S3)                             |
 |                                                                                         |
 |  Metadata (Snapshots & WAL):                                                            |
-|    volumes/<volID>/meta/<timestamp>.erofs        (Immutable EROFS snapshot image)       |
-|    volumes/<volID>/meta/latest                   (Pointer to latest snapshot)           |
-|    wal/segments/<first_pos>-<last_pos>.wal       (Streams WAL segment logs)             |
+|    volumes/<volID>/meta/<stream_seq, 20 digits>.erofs (Immutable EROFS snapshot projection) |
+|    wal/segments/<first_pos>-<last_pos>.wal            (Streams WAL segment logs)             |
 |                                                                                         |
 |  Data Blobs:                                                                            |
 |    blobs/<sha256>                                (Standalone loose blob for > 64MB)     |
@@ -150,21 +149,27 @@ To prevent unbounded RAM consumption when serving filesystems with millions of f
    - On cache miss, entries are transparently reloaded by following delta chains from local storage on top of the base EROFS snapshot.
    - **Two-Phase Non-Blocking Snapshots & Circular Buffer Trimming:** When buffer file count (`WithMaxBufferFiles(4)`), dirty records, or file size thresholds are reached, an automatic snapshot is taken. During Phase 1 and 2, in-memory dirty records are persisted to the circular log and point-in-time metadata pointers are captured; the global volume lock is then released while the immutable EROFS snapshot is compiled and uploaded to cloud object storage. In Phase 4, the base snapshot reader is updated, committed in-memory dirty records are pruned, and older circular buffer files are trimmed and deleted from disk, capping local disk usage and preventing buffer overflow.
 
-### 3. Periodic Snapshots in EROFS Format
+### 3. Periodic Snapshots as Structured Data Stream Projections
 
-To prevent the metadata change-log from growing indefinitely and to provide instant point-in-time recovery, ObjectFS periodically compiles the filesystem hierarchy into an immutable **EROFS (Enhanced Read-Only File System)** snapshot image.
+ObjectFS writes filesystem metadata as a Structured Data Stream (SDS) using three registered relational tables: `Inode`, `DirEntry`, and `Content`. To prevent the change-log from growing indefinitely and to provide point-in-time recovery, ObjectFS periodically compiles the filesystem hierarchy into an immutable **EROFS (Enhanced Read-Only File System)** snapshot image serving as an SDS **projection**.
 
-#### Why EROFS?
+#### Why EROFS as a Projection?
 - **Deterministic & Compact:** EROFS is a lightweight, read-only filesystem format supported in Linux kernels (>= 5.4). It organizes inodes, directory tables, and extended attributes with minimal space overhead.
 - **Composefs Alignment:** ObjectFS follows the Composefs pattern: the EROFS snapshot contains directory hierarchies, file names, sizes, modes, and timestamps, but **contains no file data blocks**.
 - **Digest Association via Extended Attributes:** Inode data associations are embedded directly in EROFS xattrs:
   - `user.digest`: The SHA-256 content hash of the blob.
   - `user.sha256`: Duplicate digest xattr for broad tool compatibility.
+- **Embedded Schema Registry & Stream Position:** Snapshots embed SDS metadata in extended attributes on the root directory node:
+  - `trusted.sds.position`: Stream sequence position of the snapshot.
+  - `trusted.sds.registry`: Serialized `sds.v1.Registry` containing all table schemas and fingerprints.
+  - `trusted.sds.snapshot_time`: RFC3339Nano creation timestamp.
 
-#### Snapshot Storage Hierarchy
+#### Snapshot Storage Hierarchy & Discovery
 Snapshots are written to cloud object storage under the volume metadata prefix:
-- `volumes/<volumeID>/meta/<timestamp>.erofs` (e.g. `volumes/vol-1/meta/20260925T120000.000000Z.erofs`)
-- `volumes/<volumeID>/meta/latest` (Text pointer containing the name of the most recent valid snapshot; TODO: eliminate this file in favor of direct snapshot discovery)
+- `volumes/<volumeID>/meta/<stream_seq, 20 digits>.erofs` (e.g. `volumes/vol-1/meta/00000000000000000042.erofs`)
+- **No `meta/latest` pointer:** Snapshots are discovered by lexicographical listing where the highest stream sequence position wins, eliminating dual-object synchronization and skew.
+- **Content Flushing:** Referenced `Content` rows are flushed to the blob store during snapshot compilation, while unreferenced rows are safely discarded. Following snapshot upload, a `SnapshotPointer` framework record is appended to the SDS log.
+- **Crash Recovery:** Controller memory is reconstructed on startup by mounting the latest EROFS snapshot projection, extracting its position and registry from root xattrs, and replaying subsequent records from that position using `sds.StreamReader`.
 
 ---
 
@@ -304,9 +309,9 @@ The following items represent the planned roadmap and architectural evolution fo
 
 ### 1. Integration with the Streams Layer (Metadata Change-Log)
 - [x] **Wire Streams as Authoritative Change-Log:** Replace the current in-memory mutation log with the Streams service ([`docs/streams.md`](streams.md)). Every `mkdir`, `create`, `write`, `rename`, and `unlink` will be logged as an append-only Streams record with configurable durability (`Local`, `Witness`, `Permanent`).
-- [ ] **Deterministic Crash Recovery:** Rebuild controller memory on startup by mounting the latest EROFS snapshot and replaying outstanding change-log records from the Streams log.
+- [x] **Deterministic Crash Recovery:** Rebuild controller memory on startup by mounting the latest EROFS snapshot and replaying outstanding change-log records from the Streams log.
 - [ ] **Multi-Writer Ordering:** Use the central Streams buffer sequence numbers to establish linearizable ordering across multiple concurrent node writers.
-- [ ] **Eliminate "latest" Snapshot Pointer Object:** Remove the `volumes/<volID>/meta/latest` pointer file; discover the most recent valid snapshot via lexicographical listing or timestamp markers to avoid single-object update contention.
+- [x] **Eliminate "latest" Snapshot Pointer Object:** Remove the `volumes/<volID>/meta/latest` pointer file; discover the most recent valid snapshot via lexicographical listing or timestamp markers to avoid single-object update contention.
 - [x] **Tiered Metadata Caching (Hot in Memory, Cold on Disk):** Refactor the controller metadata engine so only "hot" active directories and inodes are kept in RAM, while the full metadata state resides on fast local disk (replicated from cloud EROFS snapshots) to scale to millions of files without unbounded memory usage.
 
 ### 2. Convergence with AgentFS (Kernel-Native EROFS Mounting)

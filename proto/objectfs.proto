@@ -272,6 +272,7 @@ message SnapshotInfo {
   string name = 1;
   google.protobuf.Timestamp created_at = 2;
   int64 size = 3;
+  uint64 position = 4;
 }
 
 message ListSnapshotsRequest {
