@@ -126,37 +126,42 @@ func verifySQLiteMatchesMemStore(t *testing.T, ctx context.Context, db *sqlite.D
 		if err != nil {
 			t.Fatalf("failed to query rows from %q: %v", sqlTableName, err)
 		}
-		defer rows.Close()
 
 		sqliteRows := make(map[string]proto.Message)
 		for rows.Next() {
 			var keydata, valuedata []byte
 			if err := rows.Scan(&keydata, &valuedata); err != nil {
+				rows.Close()
 				t.Fatalf("failed to scan row for %q: %v", sqlTableName, err)
 			}
 
 			def, _, ok := db.Registry().LookupByName(fullTableName)
 			if !ok {
+				rows.Close()
 				t.Fatalf("type not found for table %q in registry", fullTableName)
 			}
 
 			msgType, err := db.Registry().ResolveMessageType(def.GetId())
 			if err != nil {
+				rows.Close()
 				t.Fatalf("failed to resolve message type for %q: %v", fullTableName, err)
 			}
 
 			msg := msgType.New().Interface()
 			if err := sds.MergeKeyAndNonKey(msg, keydata, valuedata); err != nil {
+				rows.Close()
 				t.Fatalf("failed to merge proto key and value for %q: %v", fullTableName, err)
 			}
 
 			key, err := sds.ExtractKey(msg, def.GetKeyFields())
 			if err != nil {
+				rows.Close()
 				t.Fatalf("failed to extract key from sqlite row: %v", err)
 			}
 
 			sqliteRows[key.String()] = msg
 		}
+		rows.Close()
 
 		// Compare with memtable rows
 		for _, memRow := range memTable.Rows() {

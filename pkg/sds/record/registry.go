@@ -37,8 +37,9 @@ var (
 )
 
 type typeEntry struct {
-	def        *sdsv1.TypeDefinition
-	descriptor protoreflect.MessageDescriptor
+	def          *sdsv1.TypeDefinition
+	descriptor   protoreflect.MessageDescriptor
+	resolvedType protoreflect.MessageType
 }
 
 // Registry maintains the in-band type definitions for a structured stream.
@@ -254,13 +255,30 @@ func (r *Registry) LookupByName(name string) (*sdsv1.TypeDefinition, protoreflec
 // ResolveMessageType returns a protoreflect.MessageType for the given type ID.
 // If the generated Go type is present in protoregistry.GlobalTypes and has a matching fingerprint,
 // its MessageType is returned. Otherwise, dynamicpb.NewMessageType is returned.
+// Resolved MessageType results are cached per typeEntry (keyed by definition fingerprint).
 func (r *Registry) ResolveMessageType(id uint32) (protoreflect.MessageType, error) {
 	r.mu.RLock()
 	entry, ok := r.types[id]
+	if ok && entry.resolvedType != nil {
+		msgType := entry.resolvedType
+		r.mu.RUnlock()
+		return msgType, nil
+	}
 	r.mu.RUnlock()
 
 	if !ok {
 		return nil, fmt.Errorf("%w: %d", ErrTypeNotRegistered, id)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	entry, ok = r.types[id]
+	if !ok {
+		return nil, fmt.Errorf("%w: %d", ErrTypeNotRegistered, id)
+	}
+	if entry.resolvedType != nil {
+		return entry.resolvedType, nil
 	}
 
 	// Check if compiled Go type exists in protoregistry.GlobalTypes.
@@ -270,13 +288,15 @@ func (r *Registry) ResolveMessageType(id uint32) (protoreflect.MessageType, erro
 		compiledMD := globalType.Descriptor()
 		if compiledFP, _, err := ComputeMessageFingerprint(compiledMD); err == nil {
 			if bytes.Equal(compiledFP, entry.def.GetFingerprint()) {
+				entry.resolvedType = globalType
 				return globalType, nil
 			}
 		}
 	}
 
 	// Fallback to dynamicpb.
-	return dynamicpb.NewMessageType(entry.descriptor), nil
+	entry.resolvedType = dynamicpb.NewMessageType(entry.descriptor)
+	return entry.resolvedType, nil
 }
 
 // Export returns the entire registry state as a Registry proto message.
