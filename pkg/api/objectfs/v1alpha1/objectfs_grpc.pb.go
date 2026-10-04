@@ -50,6 +50,8 @@ const (
 	ObjectFSController_Symlink_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/Symlink"
 	ObjectFSController_Readlink_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/Readlink"
 	ObjectFSController_Link_FullMethodName           = "/objectfs.v1alpha1.ObjectFSController/Link"
+	ObjectFSController_Open_FullMethodName           = "/objectfs.v1alpha1.ObjectFSController/Open"
+	ObjectFSController_Release_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/Release"
 	ObjectFSController_ListBlobs_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/ListBlobs"
 	ObjectFSController_GetBlob_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/GetBlob"
 	ObjectFSController_ListVolumes_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/ListVolumes"
@@ -78,6 +80,8 @@ type ObjectFSControllerClient interface {
 	Symlink(ctx context.Context, in *SymlinkRequest, opts ...grpc.CallOption) (*SymlinkResponse, error)
 	Readlink(ctx context.Context, in *ReadlinkRequest, opts ...grpc.CallOption) (*ReadlinkResponse, error)
 	Link(ctx context.Context, in *LinkRequest, opts ...grpc.CallOption) (*LinkResponse, error)
+	Open(ctx context.Context, in *OpenRequest, opts ...grpc.CallOption) (*OpenResponse, error)
+	Release(ctx context.Context, in *ReleaseRequest, opts ...grpc.CallOption) (*ReleaseResponse, error)
 	ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error)
 	GetBlob(ctx context.Context, in *GetBlobRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetBlobResponse], error)
 	ListVolumes(ctx context.Context, in *ListVolumesRequest, opts ...grpc.CallOption) (*ListVolumesResponse, error)
@@ -272,6 +276,26 @@ func (c *objectFSControllerClient) Link(ctx context.Context, in *LinkRequest, op
 	return out, nil
 }
 
+func (c *objectFSControllerClient) Open(ctx context.Context, in *OpenRequest, opts ...grpc.CallOption) (*OpenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(OpenResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_Open_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) Release(ctx context.Context, in *ReleaseRequest, opts ...grpc.CallOption) (*ReleaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_Release_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *objectFSControllerClient) ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListBlobsResponse)
@@ -352,6 +376,8 @@ type ObjectFSControllerServer interface {
 	Symlink(context.Context, *SymlinkRequest) (*SymlinkResponse, error)
 	Readlink(context.Context, *ReadlinkRequest) (*ReadlinkResponse, error)
 	Link(context.Context, *LinkRequest) (*LinkResponse, error)
+	Open(context.Context, *OpenRequest) (*OpenResponse, error)
+	Release(context.Context, *ReleaseRequest) (*ReleaseResponse, error)
 	ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error)
 	GetBlob(*GetBlobRequest, grpc.ServerStreamingServer[GetBlobResponse]) error
 	ListVolumes(context.Context, *ListVolumesRequest) (*ListVolumesResponse, error)
@@ -417,6 +443,12 @@ func (UnimplementedObjectFSControllerServer) Readlink(context.Context, *Readlink
 }
 func (UnimplementedObjectFSControllerServer) Link(context.Context, *LinkRequest) (*LinkResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Link not implemented")
+}
+func (UnimplementedObjectFSControllerServer) Open(context.Context, *OpenRequest) (*OpenResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Open not implemented")
+}
+func (UnimplementedObjectFSControllerServer) Release(context.Context, *ReleaseRequest) (*ReleaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Release not implemented")
 }
 func (UnimplementedObjectFSControllerServer) ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListBlobs not implemented")
@@ -753,6 +785,42 @@ func _ObjectFSController_Link_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ObjectFSController_Open_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(OpenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).Open(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_Open_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).Open(ctx, req.(*OpenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_Release_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).Release(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_Release_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).Release(ctx, req.(*ReleaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ObjectFSController_ListBlobs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListBlobsRequest)
 	if err := dec(in); err != nil {
@@ -906,6 +974,14 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Link",
 			Handler:    _ObjectFSController_Link_Handler,
+		},
+		{
+			MethodName: "Open",
+			Handler:    _ObjectFSController_Open_Handler,
+		},
+		{
+			MethodName: "Release",
+			Handler:    _ObjectFSController_Release_Handler,
 		},
 		{
 			MethodName: "ListBlobs",

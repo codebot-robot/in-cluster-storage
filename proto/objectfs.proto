@@ -38,6 +38,8 @@ service ObjectFSController {
   rpc Symlink(SymlinkRequest) returns (SymlinkResponse);
   rpc Readlink(ReadlinkRequest) returns (ReadlinkResponse);
   rpc Link(LinkRequest) returns (LinkResponse);
+  rpc Open(OpenRequest) returns (OpenResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
 
   rpc ListBlobs(ListBlobsRequest) returns (ListBlobsResponse);
   rpc GetBlob(GetBlobRequest) returns (stream GetBlobResponse);
@@ -152,6 +154,7 @@ message CreateFileRequest {
 message CreateFileResponse {
   EntryAttr attr = 1;
   int32 error = 2;
+  uint64 fh = 3;
 }
 
 message ReadFileRequest {
@@ -299,6 +302,27 @@ message LinkResponse {
   int32 error = 2;
 }
 
+message OpenRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+  uint32 flags = 3;
+}
+
+message OpenResponse {
+  uint64 fh = 1;
+  int32 error = 2;
+}
+
+message ReleaseRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+  uint64 fh = 3;
+}
+
+message ReleaseResponse {
+  int32 error = 1;
+}
+
 message ListBlobsRequest {
   string from_sha = 1;
   int32 limit = 2;
@@ -381,6 +405,7 @@ message Inode {
   uint32 nlink = 15;
   string symlink_target = 16;
   uint32 rdev = 17;
+  optional uint64 parent_ino = 18;
 }
 
 message DirEntry {
