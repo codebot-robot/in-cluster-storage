@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/klog/v2"
 )
 
 // MaxNameLength is the maximum allowed byte length for a path component name
@@ -130,11 +131,7 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 		if (out.Mode & syscall.S_IFMT) == 0 {
 			out.Mode |= syscall.S_IFREG
 		}
-		if attr.GetNlink() > 0 {
-			out.Nlink = attr.GetNlink()
-		} else {
-			out.Nlink = 1
-		}
+		out.Nlink = attr.GetNlink()
 	}
 	out.Rdev = attr.GetRdev()
 	if attr.GetModTime() != nil {
@@ -375,7 +372,7 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 
 	fs.cache.Put(attr.GetInode(), []byte{}, time.Now(), "")
 	fs.fillEntryOut(attr, &out.EntryOut)
-	out.OpenOut.Fh = attr.GetInode()
+	out.OpenOut.Fh = resp.GetFh()
 	return fuse.OK
 }
 
@@ -475,7 +472,21 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 }
 
 func (fs *ObjectFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
-	out.Fh = input.NodeId
+	ctx, cancelFunc := makeContext(cancel)
+	defer cancelFunc()
+
+	resp, err := fs.client.Open(ctx, &pb.OpenRequest{
+		VolumeId: fs.volumeID,
+		Inode:    input.NodeId,
+		Flags:    input.Flags,
+	})
+	if err != nil {
+		return grpcErrorToStatus(err)
+	}
+	if resp.GetError() != 0 {
+		return fuse.Status(resp.GetError())
+	}
+	out.Fh = resp.GetFh()
 	return fuse.OK
 }
 
@@ -853,7 +864,21 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 }
 
 func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
-	// Release only cleans up file handles; data synchronization is performed in Flush.
+	ctx, cancelFunc := makeContext(cancel)
+	defer cancelFunc()
+
+	resp, err := fs.client.Release(ctx, &pb.ReleaseRequest{
+		VolumeId: fs.volumeID,
+		Inode:    input.NodeId,
+		Fh:       input.Fh,
+	})
+	if err != nil {
+		klog.Warningf("Release RPC failed for volume %s, inode %d, fh %d: %v", fs.volumeID, input.NodeId, input.Fh, err)
+		return
+	}
+	if resp.GetError() != 0 {
+		klog.Warningf("Release returned error %d for volume %s, inode %d, fh %d", resp.GetError(), fs.volumeID, input.NodeId, input.Fh)
+	}
 }
 
 func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
