@@ -31,6 +31,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -246,7 +247,7 @@ func TestControllerServiceOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get root attr: %v", err)
 	}
-	if !rootAttr.Attr.IsDir {
+	if !rootAttr.GetAttr().GetInode().GetIsDir() {
 		t.Fatalf("Expected root to be directory")
 	}
 
@@ -262,13 +263,13 @@ func TestControllerServiceOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to mkdir /subdir: %v", err)
 	}
-	if !mkdirResp.Attr.IsDir || mkdirResp.Attr.Name != "subdir" {
-		t.Fatalf("Unexpected mkdir attr: %v", mkdirResp.Attr)
+	if !mkdirResp.GetAttr().GetInode().GetIsDir() || mkdirResp.GetAttr().GetName() != "subdir" {
+		t.Fatalf("Unexpected mkdir attr: %v", mkdirResp.GetAttr())
 	}
-	if mkdirResp.Attr.Uid != 1001 || mkdirResp.Attr.Gid != 1002 {
-		t.Fatalf("Unexpected mkdir owner: uid=%d, gid=%d", mkdirResp.Attr.Uid, mkdirResp.Attr.Gid)
+	if mkdirResp.GetAttr().GetInode().GetUid() != 1001 || mkdirResp.GetAttr().GetInode().GetGid() != 1002 {
+		t.Fatalf("Unexpected mkdir owner: uid=%d, gid=%d", mkdirResp.GetAttr().GetInode().GetUid(), mkdirResp.GetAttr().GetInode().GetGid())
 	}
-	subdirIno := mkdirResp.Attr.Inode
+	subdirIno := mkdirResp.GetAttr().GetInode().GetIno()
 
 	// 3. Create file
 	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
@@ -283,13 +284,13 @@ func TestControllerServiceOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create file: %v", err)
 	}
-	if createResp.Attr.Size != int64(len("initial content")) {
-		t.Fatalf("Unexpected file size: %d", createResp.Attr.Size)
+	if createResp.GetAttr().GetInode().GetSize() != int64(len("initial content")) {
+		t.Fatalf("Unexpected file size: %d", createResp.GetAttr().GetInode().GetSize())
 	}
-	if createResp.Attr.Uid != 5001 || createResp.Attr.Gid != 5002 {
-		t.Fatalf("Unexpected file owner: uid=%d, gid=%d", createResp.Attr.Uid, createResp.Attr.Gid)
+	if createResp.GetAttr().GetInode().GetUid() != 5001 || createResp.GetAttr().GetInode().GetGid() != 5002 {
+		t.Fatalf("Unexpected file owner: uid=%d, gid=%d", createResp.GetAttr().GetInode().GetUid(), createResp.GetAttr().GetInode().GetGid())
 	}
-	fileIno := createResp.Attr.Inode
+	fileIno := createResp.GetAttr().GetInode().GetIno()
 
 	// 4. Lookup
 	lookupResp, err := server.Lookup(ctx, &pb.LookupRequest{
@@ -300,11 +301,11 @@ func TestControllerServiceOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to lookup: %v", err)
 	}
-	if lookupResp.Attr.Name != "hello.txt" || lookupResp.Attr.Inode != fileIno {
-		t.Fatalf("Unexpected attr in lookup: %v", lookupResp.Attr)
+	if lookupResp.GetAttr().GetName() != "hello.txt" || lookupResp.GetAttr().GetInode().GetIno() != fileIno {
+		t.Fatalf("Unexpected attr in lookup: %v", lookupResp.GetAttr())
 	}
-	if lookupResp.Attr.Uid != 5001 || lookupResp.Attr.Gid != 5002 {
-		t.Fatalf("Unexpected owner in lookup: uid=%d, gid=%d", lookupResp.Attr.Uid, lookupResp.Attr.Gid)
+	if lookupResp.GetAttr().GetInode().GetUid() != 5001 || lookupResp.GetAttr().GetInode().GetGid() != 5002 {
+		t.Fatalf("Unexpected owner in lookup: uid=%d, gid=%d", lookupResp.GetAttr().GetInode().GetUid(), lookupResp.GetAttr().GetInode().GetGid())
 	}
 
 	// 5. Read file
@@ -373,8 +374,8 @@ func TestControllerServiceOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to rename: %v", err)
 	}
-	if renameResp.Attr.Name != "renamed.txt" {
-		t.Fatalf("Unexpected rename attr: %v", renameResp.Attr)
+	if renameResp.GetAttr().GetName() != "renamed.txt" {
+		t.Fatalf("Unexpected rename attr: %v", renameResp.GetAttr())
 	}
 
 	// Verify old name not found in lookup
@@ -399,8 +400,8 @@ func TestControllerServiceOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to truncate: %v", err)
 	}
-	if truncResp.Attr.Size != 7 {
-		t.Fatalf("Expected size 7 after truncate, got %d", truncResp.Attr.Size)
+	if truncResp.GetAttr().GetInode().GetSize() != 7 {
+		t.Fatalf("Expected size 7 after truncate, got %d", truncResp.GetAttr().GetInode().GetSize())
 	}
 
 	// 10. Unlink & Rmdir
@@ -684,6 +685,147 @@ func TestEventBroadcasterSlowSubscriber(t *testing.T) {
 			t.Fatalf("Timed out waiting for full subscriber channel to be closed")
 		}
 	}
+}
+
+func TestConcurrentAttributeMutationAndReadRace(t *testing.T) {
+	ctx := t.Context()
+	server := NewServer(nil)
+	volumeID := "test-race-vol"
+
+	// Create test files
+	const numFiles = 5
+	var inos []uint64
+	var names []string
+	for i := 0; i < numFiles; i++ {
+		name := fmt.Sprintf("race_file_%d.txt", i)
+		createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:       volumeID,
+			ParentInode:    1,
+			Name:           name,
+			Mode:           0644,
+			InitialContent: []byte("initial-content"),
+			Uid:            1000,
+			Gid:            1000,
+		})
+		if err != nil || createResp.GetError() != 0 {
+			t.Fatalf("CreateFile %s failed: %v", name, err)
+		}
+		inos = append(inos, createResp.GetAttr().GetInode().GetIno())
+		names = append(names, name)
+	}
+
+	subCh := server.broadcaster.Subscribe(volumeID)
+	defer server.broadcaster.Unsubscribe(volumeID, subCh)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// 1. Subscriber goroutine reading and marshaling WatchVolume events
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			case ev, ok := <-subCh:
+				if !ok {
+					return
+				}
+				// Marshal event to simulate gRPC network serialization
+				_, _ = proto.Marshal(ev)
+				if ev.GetAttr() != nil && ev.GetAttr().GetInode() != nil {
+					_ = ev.GetAttr().GetInode().GetSize()
+					_ = ev.GetAttr().GetInode().GetMode()
+					_ = ev.GetAttr().GetInode().GetMtime()
+				}
+			}
+		}
+	}()
+
+	// 2. Reader goroutines doing parallel GetAttr and Lookup
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					ino := inos[readerID%numFiles]
+					name := names[readerID%numFiles]
+
+					getResp, err := server.GetAttr(ctx, &pb.GetAttrRequest{
+						VolumeId: volumeID,
+						Inode:    ino,
+					})
+					if err == nil {
+						_, _ = proto.Marshal(getResp)
+					}
+
+					lookupResp, err := server.Lookup(ctx, &pb.LookupRequest{
+						VolumeId:    volumeID,
+						ParentInode: 1,
+						Name:        name,
+					})
+					if err == nil {
+						_, _ = proto.Marshal(lookupResp)
+					}
+				}
+			}
+		}(r)
+	}
+
+	// 3. Writer goroutines doing concurrent SetAttr and WriteFile on the same inodes
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(writerID int) {
+			defer wg.Done()
+			var counter uint32
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					counter++
+					ino := inos[writerID%numFiles]
+					mode := uint32(0600 + (counter % 64))
+					uid := uint32(1000 + counter)
+					gid := uint32(2000 + counter)
+					mtime := time.Now()
+
+					setResp, err := server.SetAttr(ctx, &pb.SetAttrRequest{
+						VolumeId: volumeID,
+						Inode:    ino,
+						Mode:     &mode,
+						Uid:      &uid,
+						Gid:      &gid,
+						Mtime:    timestamppb.New(mtime),
+					})
+					if err == nil {
+						_, _ = proto.Marshal(setResp)
+					}
+
+					data := []byte(fmt.Sprintf("write-payload-%d-%d", writerID, counter))
+					writeResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+						VolumeId:  volumeID,
+						Inode:     ino,
+						Offset:    0,
+						Data:      data,
+						WriteMode: pb.WriteMode_WRITE_MODE_UNSPECIFIED,
+					})
+					if err == nil {
+						_, _ = proto.Marshal(writeResp)
+					}
+				}
+			}
+		}(w)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
 
 func TestErofsSnapshotCreationAndRecovery(t *testing.T) {
@@ -1320,8 +1462,8 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
-	if mkdirResp.Attr.Name != "testdir" {
-		t.Fatalf("Unexpected mkdir name: %s", mkdirResp.Attr.Name)
+	if mkdirResp.GetAttr().GetName() != "testdir" {
+		t.Fatalf("Unexpected mkdir name: %s", mkdirResp.GetAttr().GetName())
 	}
 
 	vol := server.GetVolume(volumeID)
@@ -1339,8 +1481,8 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
-	if createResp.Attr.Size != int64(len("hello streams")) {
-		t.Fatalf("Unexpected size: %d", createResp.Attr.Size)
+	if createResp.GetAttr().GetInode().GetSize() != int64(len("hello streams")) {
+		t.Fatalf("Unexpected size: %d", createResp.GetAttr().GetInode().GetSize())
 	}
 
 	localSeq2, _, _ := vol.Stream().Watermarks()
@@ -1362,8 +1504,8 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TruncateFile failed: %v", err)
 	}
-	if truncResp.Attr.Size != 5 {
-		t.Fatalf("Unexpected truncated size: %d", truncResp.Attr.Size)
+	if truncResp.GetAttr().GetInode().GetSize() != 5 {
+		t.Fatalf("Unexpected truncated size: %d", truncResp.GetAttr().GetInode().GetSize())
 	}
 
 	// 5. Rename should log to stream
@@ -1371,8 +1513,8 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
-	if renameResp.Attr.Name != "renamed.txt" {
-		t.Fatalf("Unexpected rename name: %s", renameResp.Attr.Name)
+	if renameResp.GetAttr().GetName() != "renamed.txt" {
+		t.Fatalf("Unexpected rename name: %s", renameResp.GetAttr().GetName())
 	}
 
 	// 6. Unlink should log to stream
@@ -1447,7 +1589,7 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	// Verify that state reflects both the snapshot AND replayed WAL mutations:
 	// - /base should exist
 	baseAttr, err := testGetAttr(ctx, server2, volumeID, "/base")
-	if err != nil || !baseAttr.Attr.IsDir {
+	if err != nil || !baseAttr.GetAttr().GetInode().GetIsDir() {
 		t.Fatalf("Recovered base directory missing or not dir: %v", err)
 	}
 
@@ -1464,8 +1606,8 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expected /base/renamed_initial.txt to exist: %v", err)
 	}
-	if renamedAttr.Attr.Size != int64(len("initial snapshot content")) {
-		t.Fatalf("Unexpected size on renamed file: %d", renamedAttr.Attr.Size)
+	if renamedAttr.GetAttr().GetInode().GetSize() != int64(len("initial snapshot content")) {
+		t.Fatalf("Unexpected size on renamed file: %d", renamedAttr.GetAttr().GetInode().GetSize())
 	}
 
 	// - /base/post_snapshot.txt should exist and have correct size and content
@@ -1543,52 +1685,52 @@ func TestApplyRecordDirect(t *testing.T) {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
 
-	attr, err := vol.GetAttr(ctx, dirAttr.Inode)
-	if err != nil || !attr.IsDir {
-		t.Fatalf("Expected directory inode %d: %v", dirAttr.Inode, err)
+	attr, err := vol.GetAttr(ctx, dirAttr.GetInode().GetIno())
+	if err != nil || !attr.GetInode().GetIsDir() {
+		t.Fatalf("Expected directory inode %d: %v", dirAttr.GetInode().GetIno(), err)
 	}
 
 	// Direct CreateFile
-	fileAttr, err := vol.CreateFile(ctx, dirAttr.Inode, "foo.txt", 0644, []byte("test"), 0, 0)
+	fileAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "foo.txt", 0644, []byte("test"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 
-	data, total, _, err := vol.ReadFile(ctx, fileAttr.Inode, 0, 100)
+	data, total, _, err := vol.ReadFile(ctx, fileAttr.GetInode().GetIno(), 0, 100)
 	if err != nil || total != 4 || string(data) != "test" {
 		t.Fatalf("Unexpected file content: %s (err: %v)", string(data), err)
 	}
 
 	// Direct TruncateFile
-	_, err = vol.TruncateFile(ctx, fileAttr.Inode, 2)
+	_, err = vol.TruncateFile(ctx, fileAttr.GetInode().GetIno(), 2)
 	if err != nil {
 		t.Fatalf("TruncateFile failed: %v", err)
 	}
-	data, total, _, err = vol.ReadFile(ctx, fileAttr.Inode, 0, 100)
+	data, total, _, err = vol.ReadFile(ctx, fileAttr.GetInode().GetIno(), 0, 100)
 	if err != nil || total != 2 || string(data) != "te" {
 		t.Fatalf("Unexpected truncated content: %s (err: %v)", string(data), err)
 	}
 
 	// Direct Rename
-	_, err = vol.Rename(ctx, dirAttr.Inode, "foo.txt", dirAttr.Inode, "bar.txt")
+	_, err = vol.Rename(ctx, dirAttr.GetInode().GetIno(), "foo.txt", dirAttr.GetInode().GetIno(), "bar.txt")
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
-	_, err = vol.Lookup(ctx, dirAttr.Inode, "foo.txt")
+	_, err = vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "foo.txt")
 	if err == nil {
 		t.Fatalf("Expected foo.txt to be removed after rename")
 	}
-	barAttr, err := vol.Lookup(ctx, dirAttr.Inode, "bar.txt")
-	if err != nil || barAttr.Name != "bar.txt" {
+	barAttr, err := vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "bar.txt")
+	if err != nil || barAttr.GetName() != "bar.txt" {
 		t.Fatalf("Expected bar.txt to exist: %v", err)
 	}
 
 	// Direct Unlink
-	err = vol.Unlink(ctx, dirAttr.Inode, "bar.txt")
+	err = vol.Unlink(ctx, dirAttr.GetInode().GetIno(), "bar.txt")
 	if err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
-	_, err = vol.Lookup(ctx, dirAttr.Inode, "bar.txt")
+	_, err = vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "bar.txt")
 	if err == nil {
 		t.Fatalf("Expected bar.txt to be unlinked")
 	}
@@ -1609,17 +1751,17 @@ func TestApplyRecordDirect(t *testing.T) {
 		t.Fatalf("Symlink failed: %v", err)
 	}
 	lookupSym, err := vol.Lookup(ctx, 1, "symlink.txt")
-	if err != nil || lookupSym.SymlinkTarget != "target.txt" || lookupSym.Nlink != 1 {
+	if err != nil || lookupSym.GetInode().GetSymlinkTarget() != "target.txt" || lookupSym.GetInode().GetNlink() != 1 {
 		t.Fatalf("Unexpected symlink attr: %v, err: %v", lookupSym, err)
 	}
 
 	// Direct Link
-	_, err = vol.Link(ctx, symAttr.Inode, 1, "symlink_link.txt")
+	_, err = vol.Link(ctx, symAttr.GetInode().GetIno(), 1, "symlink_link.txt")
 	if err != nil {
 		t.Fatalf("Link failed: %v", err)
 	}
 	lookupLink, err := vol.Lookup(ctx, 1, "symlink_link.txt")
-	if err != nil || lookupLink.Inode != symAttr.Inode || lookupLink.Nlink != 2 {
+	if err != nil || lookupLink.GetInode().GetIno() != symAttr.GetInode().GetIno() || lookupLink.GetInode().GetNlink() != 2 {
 		t.Fatalf("Unexpected link attr: %v, err: %v", lookupLink, err)
 	}
 }
@@ -1634,26 +1776,26 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
-	if fileAttr.Nlink != 1 {
-		t.Fatalf("Expected Nlink 1, got %d", fileAttr.Nlink)
+	if fileAttr.GetInode().GetNlink() != 1 {
+		t.Fatalf("Expected Nlink 1, got %d", fileAttr.GetInode().GetNlink())
 	}
 
 	// 2. Create a hard link
-	linkAttr, err := vol.Link(ctx, fileAttr.Inode, 1, "link1.txt")
+	linkAttr, err := vol.Link(ctx, fileAttr.GetInode().GetIno(), 1, "link1.txt")
 	if err != nil {
 		t.Fatalf("Link failed: %v", err)
 	}
-	if linkAttr.Inode != fileAttr.Inode {
-		t.Fatalf("Expected same inode %d, got %d", fileAttr.Inode, linkAttr.Inode)
+	if linkAttr.GetInode().GetIno() != fileAttr.GetInode().GetIno() {
+		t.Fatalf("Expected same inode %d, got %d", fileAttr.GetInode().GetIno(), linkAttr.GetInode().GetIno())
 	}
-	if linkAttr.Nlink != 2 {
-		t.Fatalf("Expected Nlink 2, got %d", linkAttr.Nlink)
+	if linkAttr.GetInode().GetNlink() != 2 {
+		t.Fatalf("Expected Nlink 2, got %d", linkAttr.GetInode().GetNlink())
 	}
 
 	// Verify orig.txt has Nlink 2
 	origAttr, err := vol.Lookup(ctx, 1, "orig.txt")
-	if err != nil || origAttr.Nlink != 2 {
-		t.Fatalf("Expected orig.txt Nlink 2, got %d, err %v", origAttr.Nlink, err)
+	if err != nil || origAttr.GetInode().GetNlink() != 2 {
+		t.Fatalf("Expected orig.txt Nlink 2, got %d, err %v", origAttr.GetInode().GetNlink(), err)
 	}
 
 	// Hard link to a directory should fail with EPERM
@@ -1661,13 +1803,13 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
-	_, err = vol.Link(ctx, dirAttr.Inode, 1, "dirlink")
+	_, err = vol.Link(ctx, dirAttr.GetInode().GetIno(), 1, "dirlink")
 	if !errors.Is(err, syscall.EPERM) {
 		t.Fatalf("Expected EPERM for linking directory, got: %v", err)
 	}
 
 	// Hard link to an existing name should fail with EEXIST
-	_, err = vol.Link(ctx, fileAttr.Inode, 1, "link1.txt")
+	_, err = vol.Link(ctx, fileAttr.GetInode().GetIno(), 1, "link1.txt")
 	if !errors.Is(err, syscall.EEXIST) {
 		t.Fatalf("Expected EEXIST for existing name, got: %v", err)
 	}
@@ -1677,24 +1819,24 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Symlink failed: %v", err)
 	}
-	if (symAttr.Mode & syscall.S_IFMT) != syscall.S_IFLNK {
-		t.Fatalf("Expected S_IFLNK mode, got %o", symAttr.Mode)
+	if (symAttr.GetInode().GetMode() & syscall.S_IFMT) != syscall.S_IFLNK {
+		t.Fatalf("Expected S_IFLNK mode, got %o", symAttr.GetInode().GetMode())
 	}
-	if symAttr.SymlinkTarget != "orig.txt" {
-		t.Fatalf("Expected target 'orig.txt', got %q", symAttr.SymlinkTarget)
+	if symAttr.GetInode().GetSymlinkTarget() != "orig.txt" {
+		t.Fatalf("Expected target 'orig.txt', got %q", symAttr.GetInode().GetSymlinkTarget())
 	}
-	if symAttr.Nlink != 1 {
-		t.Fatalf("Expected symlink Nlink 1, got %d", symAttr.Nlink)
+	if symAttr.GetInode().GetNlink() != 1 {
+		t.Fatalf("Expected symlink Nlink 1, got %d", symAttr.GetInode().GetNlink())
 	}
 
 	// 4. Readlink
-	target, err := vol.Readlink(ctx, symAttr.Inode)
+	target, err := vol.Readlink(ctx, symAttr.GetInode().GetIno())
 	if err != nil || target != "orig.txt" {
 		t.Fatalf("Readlink failed: target=%q, err=%v", target, err)
 	}
 
 	// Readlink on regular file should return EINVAL
-	_, err = vol.Readlink(ctx, fileAttr.Inode)
+	_, err = vol.Readlink(ctx, fileAttr.GetInode().GetIno())
 	if !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("Expected EINVAL for Readlink on regular file, got: %v", err)
 	}
@@ -1708,12 +1850,12 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 		t.Fatalf("Expected ENOENT after unlink, got: %v", err)
 	}
 	remainingAttr, err := vol.Lookup(ctx, 1, "link1.txt")
-	if err != nil || remainingAttr.Nlink != 1 {
-		t.Fatalf("Expected link1.txt Nlink 1, got %d, err %v", remainingAttr.Nlink, err)
+	if err != nil || remainingAttr.GetInode().GetNlink() != 1 {
+		t.Fatalf("Expected link1.txt Nlink 1, got %d, err %v", remainingAttr.GetInode().GetNlink(), err)
 	}
 
 	// Read content through link1.txt inode
-	data, total, _, err := vol.ReadFile(ctx, fileAttr.Inode, 0, 100)
+	data, total, _, err := vol.ReadFile(ctx, fileAttr.GetInode().GetIno(), 0, 100)
 	if err != nil || total != 8 || string(data) != "contents" {
 		t.Fatalf("Expected 'contents', got %q (total=%d, err=%v)", string(data), total, err)
 	}
@@ -1722,7 +1864,7 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	if err := vol.Unlink(ctx, 1, "link1.txt"); err != nil {
 		t.Fatalf("Unlink link1.txt failed: %v", err)
 	}
-	_, err = vol.GetAttr(ctx, fileAttr.Inode)
+	_, err = vol.GetAttr(ctx, fileAttr.GetInode().GetIno())
 	if !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("Expected ENOENT for unlinked inode with no open handles, got: %v", err)
 	}
@@ -1908,7 +2050,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 
 		// Root GetAttr
 		rootAttr, err := testGetAttr(ctx, server, volumeID, "/")
-		if err != nil || !rootAttr.Attr.IsDir {
+		if err != nil || !rootAttr.GetAttr().GetInode().GetIsDir() {
 			t.Errorf("GetAttr root failed while write is waiting for durability: %v", err)
 			return
 		}
@@ -1919,14 +2061,14 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 			ParentInode: 1,
 			Name:        "blocking_file.txt",
 		})
-		if err != nil || lookupResp.Attr.Name != "blocking_file.txt" {
+		if err != nil || lookupResp.GetAttr().GetName() != "blocking_file.txt" {
 			t.Errorf("Lookup new file failed while write is waiting for durability: %v", err)
 			return
 		}
 
 		// GetAttr on the new file
 		fileAttr, err := testGetAttr(ctx, server, volumeID, "/blocking_file.txt")
-		if err != nil || fileAttr.Attr.Size != int64(len("initial-data")) {
+		if err != nil || fileAttr.GetAttr().GetInode().GetSize() != int64(len("initial-data")) {
 			t.Errorf("GetAttr new file failed while write is waiting for durability: %v", err)
 			return
 		}
@@ -1952,8 +2094,8 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 		if res.err != nil {
 			t.Fatalf("CreateFile failed: %v", res.err)
 		}
-		if res.resp.Attr.Name != "blocking_file.txt" {
-			t.Fatalf("Unexpected CreateFile attr: %v", res.resp.Attr)
+		if res.resp.GetAttr().GetName() != "blocking_file.txt" {
+			t.Fatalf("Unexpected CreateFile attr: %v", res.resp.GetAttr())
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("Timed out waiting for CreateFile to return after unblocking stream")
@@ -2007,7 +2149,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 
 	// Verify in-memory state is still visible (not rolled back)
 	attr, err := testGetAttr(ctx, server2, vol2, "/fail_durability.txt")
-	if err != nil || attr.GetError() != 0 || attr.Attr.Inode == 0 {
+	if err != nil || attr.GetError() != 0 || attr.GetAttr().GetInode().GetIno() == 0 {
 		t.Fatalf("Expected in-memory state to remain intact after durability wait failure: %v (attr: %v)", err, attr)
 	}
 }
@@ -2076,7 +2218,7 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 		}
 	}, func() {
 		attr, err := testGetAttr(ctx, server, volumeID, "/test_file.txt")
-		if err != nil || attr.Attr.Size != 7 {
+		if err != nil || attr.GetAttr().GetInode().GetSize() != 7 {
 			t.Errorf("GetAttr during CreateFile failed: %v", err)
 		}
 	})
@@ -2102,7 +2244,7 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 		}
 	}, func() {
 		dirAttr, err := testGetAttr(ctx, server, volumeID, "/newdir")
-		if err != nil || !dirAttr.Attr.IsDir {
+		if err != nil || !dirAttr.GetAttr().GetInode().GetIsDir() {
 			t.Errorf("GetAttr during Mkdir durability wait failed: %v", err)
 		}
 	})
@@ -2115,7 +2257,7 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 		}
 	}, func() {
 		renamedAttr, err := testGetAttr(ctx, server, volumeID, "/renamed_file.txt")
-		if err != nil || renamedAttr.GetError() != 0 || renamedAttr.Attr == nil || renamedAttr.Attr.Inode == 0 {
+		if err != nil || renamedAttr.GetError() != 0 || renamedAttr.GetAttr() == nil || renamedAttr.GetAttr().GetInode().GetIno() == 0 {
 			t.Errorf("GetAttr during Rename durability wait failed: %v", err)
 		}
 	})
@@ -2173,11 +2315,11 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 		t.Fatalf("CreateFile /small.txt failed: %v", err)
 	}
 	smallSha := fmt.Sprintf("%x", sha256.Sum256(smallData))
-	if smallAttr.ManifestSha256 != "" {
-		t.Fatalf("expected empty ManifestSha256 for small file, got %s", smallAttr.ManifestSha256)
+	if smallAttr.GetInode().GetManifestSha256() != "" {
+		t.Fatalf("expected empty ManifestSha256 for small file, got %s", smallAttr.GetInode().GetManifestSha256())
 	}
-	if smallAttr.ContentSha256 != smallSha {
-		t.Fatalf("expected ContentSha256 %s, got %s", smallSha, smallAttr.ContentSha256)
+	if smallAttr.GetInode().GetContentSha256() != smallSha {
+		t.Fatalf("expected ContentSha256 %s, got %s", smallSha, smallAttr.GetInode().GetContentSha256())
 	}
 
 	// 2. Large file > 1 chunk (e.g. 40 KiB = 2.5 chunks)
@@ -2191,11 +2333,11 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateFile /large.bin failed: %v", err)
 	}
-	if largeAttr.Size != int64(len(largeData)) {
-		t.Fatalf("expected Size %d for chunked file, got %d", len(largeData), largeAttr.Size)
+	if largeAttr.GetInode().GetSize() != int64(len(largeData)) {
+		t.Fatalf("expected Size %d for chunked file, got %d", len(largeData), largeAttr.GetInode().GetSize())
 	}
-	if largeAttr.ContentSha256 != largeSha {
-		t.Fatalf("expected ContentSha256 %s, got %s", largeSha, largeAttr.ContentSha256)
+	if largeAttr.GetInode().GetContentSha256() != largeSha {
+		t.Fatalf("expected ContentSha256 %s, got %s", largeSha, largeAttr.GetInode().GetContentSha256())
 	}
 
 	// 3. Read partial ranges spanning chunk boundaries
@@ -2227,8 +2369,8 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 		t.Fatalf("GetAttr after random write failed: %v", err)
 	}
 	// ContentSha256 should be cleared (marked unknown) after random write
-	if updatedAttr.ContentSha256 != "" {
-		t.Fatalf("expected ContentSha256 to be unknown (\"\") after random write, got %s", updatedAttr.ContentSha256)
+	if updatedAttr.GetInode().GetContentSha256() != "" {
+		t.Fatalf("expected ContentSha256 to be unknown (\"\") after random write, got %s", updatedAttr.GetInode().GetContentSha256())
 	}
 
 	// Read back modified range
@@ -2247,8 +2389,8 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAttr post-snapshot failed: %v", err)
 	}
-	if postSnapAttr.ContentSha256 != newLargeSha {
-		t.Fatalf("expected recomputed ContentSha256 %s post-snapshot, got %s", newLargeSha, postSnapAttr.ContentSha256)
+	if postSnapAttr.GetInode().GetContentSha256() != newLargeSha {
+		t.Fatalf("expected recomputed ContentSha256 %s post-snapshot, got %s", newLargeSha, postSnapAttr.GetInode().GetContentSha256())
 	}
 
 	// 6. Test migration: writing to an unchunked file that grows > chunkSize turns into chunked
@@ -2265,7 +2407,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAttr for grown file failed: %v", err)
 	}
-	if growAttr.ManifestSha256 == "" {
+	if growAttr.GetInode().GetManifestSha256() == "" {
 		t.Fatalf("expected grown file to have ManifestSha256 populated")
 	}
 
@@ -2274,8 +2416,8 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TruncateFile failed: %v", err)
 	}
-	if truncAttr.Size != 18*1024 {
-		t.Fatalf("expected size %d after truncation, got %d", 18*1024, truncAttr.Size)
+	if truncAttr.GetInode().GetSize() != 18*1024 {
+		t.Fatalf("expected size %d after truncation, got %d", 18*1024, truncAttr.GetInode().GetSize())
 	}
 	truncData, total, _, err := volReadFile(ctx, vol, "/large.bin", 0, 20*1024)
 	if err != nil || total != 18*1024 || len(truncData) != 18*1024 {
@@ -2310,9 +2452,9 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 		t.Fatalf("Failed to get /dir1 attr: %v", err)
 	}
 
-	file1InoInitial := create1.Attr.Inode
-	dir1InoInitial := dir1Attr.Attr.Inode
-	file2InoInitial := create2.Attr.Inode
+	file1InoInitial := create1.GetAttr().GetInode().GetIno()
+	dir1InoInitial := dir1Attr.GetAttr().GetInode().GetIno()
+	file2InoInitial := create2.GetAttr().GetInode().GetIno()
 
 	if file1InoInitial == 0 || dir1InoInitial == 0 || file2InoInitial == 0 {
 		t.Fatalf("Expected non-zero inode IDs, got file1=%d, dir1=%d, file2=%d", file1InoInitial, dir1InoInitial, file2InoInitial)
@@ -2330,24 +2472,24 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get /file1.txt after snap 1: %v", err)
 	}
-	if file1AttrAfterSnap1.Attr.Inode != file1InoInitial {
-		t.Fatalf("Inode changed after snap 1: expected %d, got %d", file1InoInitial, file1AttrAfterSnap1.Attr.Inode)
+	if file1AttrAfterSnap1.GetAttr().GetInode().GetIno() != file1InoInitial {
+		t.Fatalf("Inode changed after snap 1: expected %d, got %d", file1InoInitial, file1AttrAfterSnap1.GetAttr().GetInode().GetIno())
 	}
 
 	dir1AttrAfterSnap1, err := testGetAttr(ctx, server, volumeID, "/dir1")
 	if err != nil {
 		t.Fatalf("Failed to get /dir1 after snap 1: %v", err)
 	}
-	if dir1AttrAfterSnap1.Attr.Inode != dir1InoInitial {
-		t.Fatalf("Dir inode changed after snap 1: expected %d, got %d", dir1InoInitial, dir1AttrAfterSnap1.Attr.Inode)
+	if dir1AttrAfterSnap1.GetAttr().GetInode().GetIno() != dir1InoInitial {
+		t.Fatalf("Dir inode changed after snap 1: expected %d, got %d", dir1InoInitial, dir1AttrAfterSnap1.GetAttr().GetInode().GetIno())
 	}
 
 	file2AttrAfterSnap1, err := testGetAttr(ctx, server, volumeID, "/dir1/file2.txt")
 	if err != nil {
 		t.Fatalf("Failed to get /dir1/file2.txt after snap 1: %v", err)
 	}
-	if file2AttrAfterSnap1.Attr.Inode != file2InoInitial {
-		t.Fatalf("File2 inode changed after snap 1: expected %d, got %d", file2InoInitial, file2AttrAfterSnap1.Attr.Inode)
+	if file2AttrAfterSnap1.GetAttr().GetInode().GetIno() != file2InoInitial {
+		t.Fatalf("File2 inode changed after snap 1: expected %d, got %d", file2InoInitial, file2AttrAfterSnap1.GetAttr().GetInode().GetIno())
 	}
 
 	// Read and verify EROFS snapshot 1 image directly
@@ -2380,7 +2522,7 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create /file3.txt: %v", err)
 	}
-	file3InoInitial := create3.Attr.Inode
+	file3InoInitial := create3.GetAttr().GetInode().GetIno()
 
 	// 4. Take second snapshot
 	snap2Resp, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
@@ -2394,32 +2536,32 @@ func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get /file1.txt after snap 2: %v", err)
 	}
-	if file1AttrAfterSnap2.Attr.Inode != file1InoInitial {
-		t.Fatalf("Inode changed after snap 2: expected %d, got %d", file1InoInitial, file1AttrAfterSnap2.Attr.Inode)
+	if file1AttrAfterSnap2.GetAttr().GetInode().GetIno() != file1InoInitial {
+		t.Fatalf("Inode changed after snap 2: expected %d, got %d", file1InoInitial, file1AttrAfterSnap2.GetAttr().GetInode().GetIno())
 	}
 
 	dir1AttrAfterSnap2, err := testGetAttr(ctx, server, volumeID, "/dir1")
 	if err != nil {
 		t.Fatalf("Failed to get /dir1 after snap 2: %v", err)
 	}
-	if dir1AttrAfterSnap2.Attr.Inode != dir1InoInitial {
-		t.Fatalf("Dir inode changed after snap 2: expected %d, got %d", dir1InoInitial, dir1AttrAfterSnap2.Attr.Inode)
+	if dir1AttrAfterSnap2.GetAttr().GetInode().GetIno() != dir1InoInitial {
+		t.Fatalf("Dir inode changed after snap 2: expected %d, got %d", dir1InoInitial, dir1AttrAfterSnap2.GetAttr().GetInode().GetIno())
 	}
 
 	file2AttrAfterSnap2, err := testGetAttr(ctx, server, volumeID, "/dir1/file2.txt")
 	if err != nil {
 		t.Fatalf("Failed to get /dir1/file2.txt after snap 2: %v", err)
 	}
-	if file2AttrAfterSnap2.Attr.Inode != file2InoInitial {
-		t.Fatalf("File2 inode changed after snap 2: expected %d, got %d", file2InoInitial, file2AttrAfterSnap2.Attr.Inode)
+	if file2AttrAfterSnap2.GetAttr().GetInode().GetIno() != file2InoInitial {
+		t.Fatalf("File2 inode changed after snap 2: expected %d, got %d", file2InoInitial, file2AttrAfterSnap2.GetAttr().GetInode().GetIno())
 	}
 
 	file3AttrAfterSnap2, err := testGetAttr(ctx, server, volumeID, "/file3.txt")
 	if err != nil {
 		t.Fatalf("Failed to get /file3.txt after snap 2: %v", err)
 	}
-	if file3AttrAfterSnap2.Attr.Inode != file3InoInitial {
-		t.Fatalf("File3 inode changed after snap 2: expected %d, got %d", file3InoInitial, file3AttrAfterSnap2.Attr.Inode)
+	if file3AttrAfterSnap2.GetAttr().GetInode().GetIno() != file3InoInitial {
+		t.Fatalf("File3 inode changed after snap 2: expected %d, got %d", file3InoInitial, file3AttrAfterSnap2.GetAttr().GetInode().GetIno())
 	}
 
 	// Read and verify EROFS snapshot 2 image directly
@@ -2554,7 +2696,7 @@ func TestSDSStepReplayScratch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replayed GetAttr /hello.txt failed: %v", err)
 	}
-	if repHelloAttr.Inode != liveHelloAttr.Inode || repHelloAttr.Size != liveHelloAttr.Size {
+	if repHelloAttr.GetInode().GetIno() != liveHelloAttr.GetInode().GetIno() || repHelloAttr.GetInode().GetSize() != liveHelloAttr.GetInode().GetSize() {
 		t.Fatalf("Replayed /hello.txt attr mismatch: %+v vs %+v", repHelloAttr, liveHelloAttr)
 	}
 	repHelloData, _, _, err := volReadFile(ctx, replayedVol, "/hello.txt", 0, 100)
@@ -2566,7 +2708,7 @@ func TestSDSStepReplayScratch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replayed GetAttr /docs/doc2_renamed.txt failed: %v", err)
 	}
-	if repRenamedAttr.Inode != liveRenamedAttr.Inode || repRenamedAttr.Size != liveRenamedAttr.Size {
+	if repRenamedAttr.GetInode().GetIno() != liveRenamedAttr.GetInode().GetIno() || repRenamedAttr.GetInode().GetSize() != liveRenamedAttr.GetInode().GetSize() {
 		t.Fatalf("Replayed doc2_renamed attr mismatch: %+v vs %+v", repRenamedAttr, liveRenamedAttr)
 	}
 	repRenamedData, _, _, err := volReadFile(ctx, replayedVol, "/docs/doc2_renamed.txt", 0, 100)
@@ -2922,8 +3064,8 @@ func TestHugeSparseTruncateAndUnlink(t *testing.T) {
 	if err != nil || attrResp.GetError() != 0 {
 		t.Fatalf("GetAttr failed: %v", err)
 	}
-	if attrResp.GetAttr().GetSize() != hugeSize {
-		t.Fatalf("Expected size %d, got %d", hugeSize, attrResp.GetAttr().GetSize())
+	if attrResp.GetAttr().GetInode().GetSize() != hugeSize {
+		t.Fatalf("Expected size %d, got %d", hugeSize, attrResp.GetAttr().GetInode().GetSize())
 	}
 
 	// Read a few bytes from the end (sparse hole reads as zeros)
@@ -3101,10 +3243,10 @@ func TestSetAttrAndMetadataTimestamps(t *testing.T) {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 	attr := createResp.GetAttr()
-	if attr.GetUid() != 100 || attr.GetGid() != 200 {
-		t.Fatalf("Unexpected initial uid/gid: %d/%d", attr.GetUid(), attr.GetGid())
+	if attr.GetInode().GetUid() != 100 || attr.GetInode().GetGid() != 200 {
+		t.Fatalf("Unexpected initial uid/gid: %d/%d", attr.GetInode().GetUid(), attr.GetInode().GetGid())
 	}
-	if attr.GetAtime() == nil || attr.GetCtime() == nil {
+	if attr.GetInode().GetAtime() == nil || attr.GetInode().GetCtime() == nil {
 		t.Fatalf("Expected atime and ctime on created file")
 	}
 
@@ -3114,10 +3256,10 @@ func TestSetAttrAndMetadataTimestamps(t *testing.T) {
 	if err != nil || setResp.GetError() != 0 {
 		t.Fatalf("SetAttr chmod failed: %v", err)
 	}
-	if setResp.GetAttr().GetMode()&07777 != (newMode & 07777) {
-		t.Fatalf("Expected mode %o, got %o", newMode&07777, setResp.GetAttr().GetMode()&07777)
+	if setResp.GetAttr().GetInode().GetMode()&07777 != (newMode & 07777) {
+		t.Fatalf("Expected mode %o, got %o", newMode&07777, setResp.GetAttr().GetInode().GetMode()&07777)
 	}
-	if (setResp.GetAttr().GetMode() & syscall.S_IFREG) == 0 {
+	if (setResp.GetAttr().GetInode().GetMode() & syscall.S_IFREG) == 0 {
 		t.Fatalf("Expected S_IFREG bit retained")
 	}
 
@@ -3128,8 +3270,8 @@ func TestSetAttrAndMetadataTimestamps(t *testing.T) {
 	if err != nil || setResp.GetError() != 0 {
 		t.Fatalf("SetAttr chown failed: %v", err)
 	}
-	if setResp.GetAttr().GetUid() != 500 || setResp.GetAttr().GetGid() != 600 {
-		t.Fatalf("Expected uid/gid 500/600, got %d/%d", setResp.GetAttr().GetUid(), setResp.GetAttr().GetGid())
+	if setResp.GetAttr().GetInode().GetUid() != 500 || setResp.GetAttr().GetInode().GetGid() != 600 {
+		t.Fatalf("Expected uid/gid 500/600, got %d/%d", setResp.GetAttr().GetInode().GetUid(), setResp.GetAttr().GetInode().GetGid())
 	}
 
 	// 3. Test explicit timestamps via SetAttr
@@ -3140,14 +3282,14 @@ func TestSetAttrAndMetadataTimestamps(t *testing.T) {
 	if err != nil || setResp.GetError() != 0 {
 		t.Fatalf("SetAttr timestamps failed: %v", err)
 	}
-	if setResp.GetAttr().GetAtime().AsTime().Unix() != explicitAtime.Unix() {
-		t.Fatalf("Expected atime %v, got %v", explicitAtime, setResp.GetAttr().GetAtime().AsTime())
+	if setResp.GetAttr().GetInode().GetAtime().AsTime().Unix() != explicitAtime.Unix() {
+		t.Fatalf("Expected atime %v, got %v", explicitAtime, setResp.GetAttr().GetInode().GetAtime().AsTime())
 	}
-	if setResp.GetAttr().GetModTime().AsTime().Unix() != explicitMtime.Unix() {
-		t.Fatalf("Expected mtime %v, got %v", explicitMtime, setResp.GetAttr().GetModTime().AsTime())
+	if setResp.GetAttr().GetInode().GetMtime().AsTime().Unix() != explicitMtime.Unix() {
+		t.Fatalf("Expected mtime %v, got %v", explicitMtime, setResp.GetAttr().GetInode().GetMtime().AsTime())
 	}
-	if setResp.GetAttr().GetCtime().AsTime().Unix() != explicitCtime.Unix() {
-		t.Fatalf("Expected ctime %v, got %v", explicitCtime, setResp.GetAttr().GetCtime().AsTime())
+	if setResp.GetAttr().GetInode().GetCtime().AsTime().Unix() != explicitCtime.Unix() {
+		t.Fatalf("Expected ctime %v, got %v", explicitCtime, setResp.GetAttr().GetInode().GetCtime().AsTime())
 	}
 
 	// 4. Test timestamp NOW via SetAttr
@@ -3156,13 +3298,13 @@ func TestSetAttrAndMetadataTimestamps(t *testing.T) {
 	if err != nil || setResp.GetError() != 0 {
 		t.Fatalf("SetAttr now failed: %v", err)
 	}
-	if setResp.GetAttr().GetAtime().AsTime().Before(beforeNow) {
+	if setResp.GetAttr().GetInode().GetAtime().AsTime().Before(beforeNow) {
 		t.Fatalf("Expected atime updated to now")
 	}
-	if setResp.GetAttr().GetModTime().AsTime().Before(beforeNow) {
+	if setResp.GetAttr().GetInode().GetMtime().AsTime().Before(beforeNow) {
 		t.Fatalf("Expected mtime updated to now")
 	}
-	if setResp.GetAttr().GetCtime().AsTime().Before(beforeNow) {
+	if setResp.GetAttr().GetInode().GetCtime().AsTime().Before(beforeNow) {
 		t.Fatalf("Expected ctime updated to now")
 	}
 }
@@ -3181,10 +3323,10 @@ func TestSetgidInheritance(t *testing.T) {
 	if err != nil || mkdirResp.GetError() != 0 {
 		t.Fatalf("Mkdir parent setgid_dir failed: %v", err)
 	}
-	if mkdirResp.GetAttr().GetGid() != 3000 {
-		t.Fatalf("Expected parent GID 3000, got %d", mkdirResp.GetAttr().GetGid())
+	if mkdirResp.GetAttr().GetInode().GetGid() != 3000 {
+		t.Fatalf("Expected parent GID 3000, got %d", mkdirResp.GetAttr().GetInode().GetGid())
 	}
-	if mkdirResp.GetAttr().GetMode()&02000 == 0 {
+	if mkdirResp.GetAttr().GetInode().GetMode()&02000 == 0 {
 		t.Fatalf("Expected setgid bit on parent directory")
 	}
 
@@ -3194,11 +3336,11 @@ func TestSetgidInheritance(t *testing.T) {
 	if err != nil || subDirResp.GetError() != 0 {
 		t.Fatalf("Mkdir subdir failed: %v", err)
 	}
-	if subDirResp.GetAttr().GetGid() != 3000 {
-		t.Fatalf("Expected subdir to inherit GID 3000, got %d", subDirResp.GetAttr().GetGid())
+	if subDirResp.GetAttr().GetInode().GetGid() != 3000 {
+		t.Fatalf("Expected subdir to inherit GID 3000, got %d", subDirResp.GetAttr().GetInode().GetGid())
 	}
-	if subDirResp.GetAttr().GetMode()&02000 == 0 {
-		t.Fatalf("Expected subdir to inherit setgid bit 02000, got %o", subDirResp.GetAttr().GetMode())
+	if subDirResp.GetAttr().GetInode().GetMode()&02000 == 0 {
+		t.Fatalf("Expected subdir to inherit setgid bit 02000, got %o", subDirResp.GetAttr().GetInode().GetMode())
 	}
 
 	// 2. Create regular file inside setgid dir with caller GID 4000
@@ -3207,11 +3349,11 @@ func TestSetgidInheritance(t *testing.T) {
 	if err != nil || fileResp.GetError() != 0 {
 		t.Fatalf("CreateFile child.txt failed: %v", err)
 	}
-	if fileResp.GetAttr().GetGid() != 3000 {
-		t.Fatalf("Expected file to inherit GID 3000, got %d", fileResp.GetAttr().GetGid())
+	if fileResp.GetAttr().GetInode().GetGid() != 3000 {
+		t.Fatalf("Expected file to inherit GID 3000, got %d", fileResp.GetAttr().GetInode().GetGid())
 	}
-	if fileResp.GetAttr().GetMode()&02000 != 0 {
-		t.Fatalf("Expected regular file NOT to inherit setgid bit, got %o", fileResp.GetAttr().GetMode())
+	if fileResp.GetAttr().GetInode().GetMode()&02000 != 0 {
+		t.Fatalf("Expected regular file NOT to inherit setgid bit, got %o", fileResp.GetAttr().GetInode().GetMode())
 	}
 }
 
@@ -3341,17 +3483,17 @@ func TestTarExtractionPreservation(t *testing.T) {
 			t.Fatalf("GetAttr for %s failed: %v", p, err)
 		}
 		attr := attrResp.GetAttr()
-		if attr.GetMode()&07777 != uint32(f.header.Mode&07777) {
-			t.Fatalf("File %s mode mismatch: got %o, want %o", p, attr.GetMode()&07777, f.header.Mode&07777)
+		if attr.GetInode().GetMode()&07777 != uint32(f.header.Mode&07777) {
+			t.Fatalf("File %s mode mismatch: got %o, want %o", p, attr.GetInode().GetMode()&07777, f.header.Mode&07777)
 		}
-		if attr.GetUid() != uint32(f.header.Uid) {
-			t.Fatalf("File %s uid mismatch: got %d, want %d", p, attr.GetUid(), f.header.Uid)
+		if attr.GetInode().GetUid() != uint32(f.header.Uid) {
+			t.Fatalf("File %s uid mismatch: got %d, want %d", p, attr.GetInode().GetUid(), f.header.Uid)
 		}
-		if attr.GetGid() != uint32(f.header.Gid) {
-			t.Fatalf("File %s gid mismatch: got %d, want %d", p, attr.GetGid(), f.header.Gid)
+		if attr.GetInode().GetGid() != uint32(f.header.Gid) {
+			t.Fatalf("File %s gid mismatch: got %d, want %d", p, attr.GetInode().GetGid(), f.header.Gid)
 		}
-		if attr.GetModTime().AsTime().Unix() != f.header.ModTime.Unix() {
-			t.Fatalf("File %s mtime mismatch: got %v, want %v", p, attr.GetModTime().AsTime(), f.header.ModTime)
+		if attr.GetInode().GetMtime().AsTime().Unix() != f.header.ModTime.Unix() {
+			t.Fatalf("File %s mtime mismatch: got %v, want %v", p, attr.GetInode().GetMtime().AsTime(), f.header.ModTime)
 		}
 
 		if len(f.content) > 0 {
@@ -3546,13 +3688,13 @@ func TestSnapshotFlushReferencedContentAndDropUnreferenced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAttr failed: %v", err)
 	}
-	if attr.ContentSha256 == "" {
+	if attr.GetInode().GetContentSha256() == "" {
 		t.Fatalf("Expected non-empty ContentSha256")
 	}
 
-	blobReader, err := vol.blobStore.GetBlob(ctx, attr.ContentSha256)
+	blobReader, err := vol.blobStore.GetBlob(ctx, attr.GetInode().GetContentSha256())
 	if err != nil {
-		t.Fatalf("Expected referenced blob %s in blob store: %v", attr.ContentSha256, err)
+		t.Fatalf("Expected referenced blob %s in blob store: %v", attr.GetInode().GetContentSha256(), err)
 	}
 	data, _ := io.ReadAll(blobReader)
 	_ = blobReader.Close()
@@ -3853,11 +3995,11 @@ func TestControllerMknodSpecialFiles(t *testing.T) {
 	if err != nil || fifoResp.GetError() != 0 {
 		t.Fatalf("CreateFile FIFO failed: err=%v, code=%d", err, fifoResp.GetError())
 	}
-	if (fifoResp.GetAttr().GetMode() & syscall.S_IFMT) != syscall.S_IFIFO {
-		t.Fatalf("Expected S_IFIFO in attr mode, got %o", fifoResp.GetAttr().GetMode())
+	if (fifoResp.GetAttr().GetInode().GetMode() & syscall.S_IFMT) != syscall.S_IFIFO {
+		t.Fatalf("Expected S_IFIFO in attr mode, got %o", fifoResp.GetAttr().GetInode().GetMode())
 	}
-	if fifoResp.GetAttr().GetSize() != 0 {
-		t.Fatalf("Expected FIFO size 0, got %d", fifoResp.GetAttr().GetSize())
+	if fifoResp.GetAttr().GetInode().GetSize() != 0 {
+		t.Fatalf("Expected FIFO size 0, got %d", fifoResp.GetAttr().GetInode().GetSize())
 	}
 
 	// Create a Char device node
@@ -3873,11 +4015,11 @@ func TestControllerMknodSpecialFiles(t *testing.T) {
 	if err != nil || chrResp.GetError() != 0 {
 		t.Fatalf("CreateFile CHR failed: err=%v, code=%d", err, chrResp.GetError())
 	}
-	if (chrResp.GetAttr().GetMode() & syscall.S_IFMT) != syscall.S_IFCHR {
-		t.Fatalf("Expected S_IFCHR in attr mode, got %o", chrResp.GetAttr().GetMode())
+	if (chrResp.GetAttr().GetInode().GetMode() & syscall.S_IFMT) != syscall.S_IFCHR {
+		t.Fatalf("Expected S_IFCHR in attr mode, got %o", chrResp.GetAttr().GetInode().GetMode())
 	}
-	if chrResp.GetAttr().GetRdev() != 0x0103 {
-		t.Fatalf("Expected Rdev 0x0103, got 0x%x", chrResp.GetAttr().GetRdev())
+	if chrResp.GetAttr().GetInode().GetRdev() != 0x0103 {
+		t.Fatalf("Expected Rdev 0x0103, got 0x%x", chrResp.GetAttr().GetInode().GetRdev())
 	}
 
 	// Create a Block device node
@@ -3893,11 +4035,11 @@ func TestControllerMknodSpecialFiles(t *testing.T) {
 	if err != nil || blkResp.GetError() != 0 {
 		t.Fatalf("CreateFile BLK failed: err=%v, code=%d", err, blkResp.GetError())
 	}
-	if (blkResp.GetAttr().GetMode() & syscall.S_IFMT) != syscall.S_IFBLK {
-		t.Fatalf("Expected S_IFBLK in attr mode, got %o", blkResp.GetAttr().GetMode())
+	if (blkResp.GetAttr().GetInode().GetMode() & syscall.S_IFMT) != syscall.S_IFBLK {
+		t.Fatalf("Expected S_IFBLK in attr mode, got %o", blkResp.GetAttr().GetInode().GetMode())
 	}
-	if blkResp.GetAttr().GetRdev() != 0x0801 {
-		t.Fatalf("Expected Rdev 0x0801, got 0x%x", blkResp.GetAttr().GetRdev())
+	if blkResp.GetAttr().GetInode().GetRdev() != 0x0801 {
+		t.Fatalf("Expected Rdev 0x0801, got 0x%x", blkResp.GetAttr().GetInode().GetRdev())
 	}
 
 	// Create a Socket
@@ -3912,8 +4054,8 @@ func TestControllerMknodSpecialFiles(t *testing.T) {
 	if err != nil || sockResp.GetError() != 0 {
 		t.Fatalf("CreateFile SOCK failed: err=%v, code=%d", err, sockResp.GetError())
 	}
-	if (sockResp.GetAttr().GetMode() & syscall.S_IFMT) != syscall.S_IFSOCK {
-		t.Fatalf("Expected S_IFSOCK in attr mode, got %o", sockResp.GetAttr().GetMode())
+	if (sockResp.GetAttr().GetInode().GetMode() & syscall.S_IFMT) != syscall.S_IFSOCK {
+		t.Fatalf("Expected S_IFSOCK in attr mode, got %o", sockResp.GetAttr().GetInode().GetMode())
 	}
 
 	// Attempt to recreate existing FIFO -> EEXIST
@@ -3939,25 +4081,25 @@ func TestControllerMknodSpecialFiles(t *testing.T) {
 	for _, entry := range readDirResp.GetEntries() {
 		found[entry.GetName()] = entry
 	}
-	if entry, ok := found["my_fifo"]; !ok || (entry.GetMode()&syscall.S_IFMT) != syscall.S_IFIFO {
+	if entry, ok := found["my_fifo"]; !ok || (entry.GetInode().GetMode()&syscall.S_IFMT) != syscall.S_IFIFO {
 		t.Fatalf("ReadDir did not return valid FIFO entry: %v", entry)
 	}
-	if entry, ok := found["my_chr"]; !ok || (entry.GetMode()&syscall.S_IFMT) != syscall.S_IFCHR || entry.GetRdev() != 0x0103 {
+	if entry, ok := found["my_chr"]; !ok || (entry.GetInode().GetMode()&syscall.S_IFMT) != syscall.S_IFCHR || entry.GetInode().GetRdev() != 0x0103 {
 		t.Fatalf("ReadDir did not return valid CHR entry: %v", entry)
 	}
-	if entry, ok := found["my_blk"]; !ok || (entry.GetMode()&syscall.S_IFMT) != syscall.S_IFBLK || entry.GetRdev() != 0x0801 {
+	if entry, ok := found["my_blk"]; !ok || (entry.GetInode().GetMode()&syscall.S_IFMT) != syscall.S_IFBLK || entry.GetInode().GetRdev() != 0x0801 {
 		t.Fatalf("ReadDir did not return valid BLK entry: %v", entry)
 	}
-	if entry, ok := found["my_sock"]; !ok || (entry.GetMode()&syscall.S_IFMT) != syscall.S_IFSOCK {
+	if entry, ok := found["my_sock"]; !ok || (entry.GetInode().GetMode()&syscall.S_IFMT) != syscall.S_IFSOCK {
 		t.Fatalf("ReadDir did not return valid SOCK entry: %v", entry)
 	}
 
 	// GetAttr verification
-	chrAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Inode: chrResp.GetAttr().GetInode()})
+	chrAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Inode: chrResp.GetAttr().GetInode().GetIno()})
 	if err != nil || chrAttr.GetError() != 0 {
 		t.Fatalf("GetAttr CHR failed: err=%v, code=%d", err, chrAttr.GetError())
 	}
-	if chrAttr.GetAttr().GetRdev() != 0x0103 {
-		t.Fatalf("GetAttr CHR Rdev expected 0x0103, got 0x%x", chrAttr.GetAttr().GetRdev())
+	if chrAttr.GetAttr().GetInode().GetRdev() != 0x0103 {
+		t.Fatalf("GetAttr CHR Rdev expected 0x0103, got 0x%x", chrAttr.GetAttr().GetInode().GetRdev())
 	}
 }

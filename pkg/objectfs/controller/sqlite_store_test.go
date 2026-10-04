@@ -56,7 +56,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAttr(1) failed: %v", err)
 	}
-	if !rootAttr.IsDir {
+	if !rootAttr.GetInode().GetIsDir() {
 		t.Errorf("expected root to be dir")
 	}
 
@@ -65,31 +65,31 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
-	if dirAttr.Inode == 0 || dirAttr.Name != "mydir" || !dirAttr.IsDir {
+	if dirAttr.GetInode().GetIno() == 0 || dirAttr.GetName() != "mydir" || !dirAttr.GetInode().GetIsDir() {
 		t.Fatalf("unexpected dirAttr: %+v", dirAttr)
 	}
 
 	// 3. CreateFile (inline)
 	data1 := []byte("hello sqlite world")
-	fileAttr, err := vol.CreateFile(ctx, dirAttr.Inode, "hello.txt", 0644, data1, 1000, 1000)
+	fileAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "hello.txt", 0644, data1, 1000, 1000)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
-	if fileAttr.Size != int64(len(data1)) {
-		t.Errorf("file size mismatch: got %d, want %d", fileAttr.Size, len(data1))
+	if fileAttr.GetInode().GetSize() != int64(len(data1)) {
+		t.Errorf("file size mismatch: got %d, want %d", fileAttr.GetInode().GetSize(), len(data1))
 	}
 
 	// 4. Lookup
-	lookupAttr, err := vol.Lookup(ctx, dirAttr.Inode, "hello.txt")
+	lookupAttr, err := vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "hello.txt")
 	if err != nil {
 		t.Fatalf("Lookup failed: %v", err)
 	}
-	if lookupAttr.Inode != fileAttr.Inode {
-		t.Errorf("lookup inode mismatch: %d vs %d", lookupAttr.Inode, fileAttr.Inode)
+	if lookupAttr.GetInode().GetIno() != fileAttr.GetInode().GetIno() {
+		t.Errorf("lookup inode mismatch: %d vs %d", lookupAttr.GetInode().GetIno(), fileAttr.GetInode().GetIno())
 	}
 
 	// 5. ReadFile
-	readData, totalSize, _, err := vol.ReadFile(ctx, fileAttr.Inode, 0, 100)
+	readData, totalSize, _, err := vol.ReadFile(ctx, fileAttr.GetInode().GetIno(), 0, 100)
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
@@ -102,11 +102,11 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	for i := range largeData {
 		largeData[i] = byte(i % 251)
 	}
-	chunkAttr, err := vol.CreateFile(ctx, dirAttr.Inode, "large.bin", 0644, nil, 1000, 1000)
+	chunkAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "large.bin", 0644, nil, 1000, 1000)
 	if err != nil {
 		t.Fatalf("CreateFile large.bin failed: %v", err)
 	}
-	nWritten, newSize, _, err := vol.WriteFile(ctx, chunkAttr.Inode, 0, largeData, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	nWritten, newSize, _, err := vol.WriteFile(ctx, chunkAttr.GetInode().GetIno(), 0, largeData, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 		t.Errorf("WriteFile result mismatch: nWritten=%d, newSize=%d", nWritten, newSize)
 	}
 
-	readChunk, _, _, err := vol.ReadFile(ctx, chunkAttr.Inode, 0, int64(len(largeData)))
+	readChunk, _, _, err := vol.ReadFile(ctx, chunkAttr.GetInode().GetIno(), 0, int64(len(largeData)))
 	if err != nil {
 		t.Fatalf("ReadFile large.bin failed: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	}
 
 	// 7. ReadDir
-	entries, err := vol.ReadDir(ctx, dirAttr.Inode)
+	entries, err := vol.ReadDir(ctx, dirAttr.GetInode().GetIno())
 	if err != nil {
 		t.Fatalf("ReadDir failed: %v", err)
 	}
@@ -132,33 +132,33 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	}
 
 	// 8. Rename
-	renamedAttr, err := vol.Rename(ctx, dirAttr.Inode, "hello.txt", dirAttr.Inode, "greeting.txt")
+	renamedAttr, err := vol.Rename(ctx, dirAttr.GetInode().GetIno(), "hello.txt", dirAttr.GetInode().GetIno(), "greeting.txt")
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
-	if renamedAttr.Name != "greeting.txt" {
-		t.Errorf("renamed name mismatch: %s", renamedAttr.Name)
+	if renamedAttr.GetName() != "greeting.txt" {
+		t.Errorf("renamed name mismatch: %s", renamedAttr.GetName())
 	}
 
 	// 9. Unlink
-	if err := vol.Unlink(ctx, dirAttr.Inode, "greeting.txt"); err != nil {
+	if err := vol.Unlink(ctx, dirAttr.GetInode().GetIno(), "greeting.txt"); err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
-	if _, err := vol.Lookup(ctx, dirAttr.Inode, "greeting.txt"); err == nil {
+	if _, err := vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "greeting.txt"); err == nil {
 		t.Errorf("expected ENOENT after unlink")
 	}
 
 	// 10. Truncate
-	if _, err := vol.TruncateFile(ctx, chunkAttr.Inode, 10); err != nil {
+	if _, err := vol.TruncateFile(ctx, chunkAttr.GetInode().GetIno(), 10); err != nil {
 		t.Fatalf("TruncateFile failed: %v", err)
 	}
-	tAttr, _ := vol.GetAttr(ctx, chunkAttr.Inode)
-	if tAttr.Size != 10 {
-		t.Errorf("expected truncated size 10, got %d", tAttr.Size)
+	tAttr, _ := vol.GetAttr(ctx, chunkAttr.GetInode().GetIno())
+	if tAttr.GetInode().GetSize() != 10 {
+		t.Errorf("expected truncated size 10, got %d", tAttr.GetInode().GetSize())
 	}
 
 	// 11. Clean up large.bin and Rmdir
-	if err := vol.Unlink(ctx, dirAttr.Inode, "large.bin"); err != nil {
+	if err := vol.Unlink(ctx, dirAttr.GetInode().GetIno(), "large.bin"); err != nil {
 		t.Fatalf("Unlink large.bin failed: %v", err)
 	}
 	if err := vol.Rmdir(ctx, 1, "mydir"); err != nil {
@@ -188,7 +188,7 @@ func TestSQLiteMetadataStoreRecoveryFromLocalDB(t *testing.T) {
 	}
 
 	content := []byte("persisted in sqlite")
-	fileAttr, err := vol1.CreateFile(ctx, dirAttr.Inode, "test.txt", 0644, content, 0, 0)
+	fileAttr, err := vol1.CreateFile(ctx, dirAttr.GetInode().GetIno(), "test.txt", 0644, content, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -209,15 +209,15 @@ func TestSQLiteMetadataStoreRecoveryFromLocalDB(t *testing.T) {
 		t.Fatalf("LoadFromBackend run 2 failed: %v", err)
 	}
 
-	lookupAttr, err := vol2.Lookup(ctx, dirAttr.Inode, "test.txt")
+	lookupAttr, err := vol2.Lookup(ctx, dirAttr.GetInode().GetIno(), "test.txt")
 	if err != nil {
 		t.Fatalf("Lookup after local restart failed: %v", err)
 	}
-	if lookupAttr.Inode != fileAttr.Inode {
-		t.Errorf("inode mismatch: %d vs %d", lookupAttr.Inode, fileAttr.Inode)
+	if lookupAttr.GetInode().GetIno() != fileAttr.GetInode().GetIno() {
+		t.Errorf("inode mismatch: %d vs %d", lookupAttr.GetInode().GetIno(), fileAttr.GetInode().GetIno())
 	}
 
-	data, _, _, err := vol2.ReadFile(ctx, lookupAttr.Inode, 0, 100)
+	data, _, _, err := vol2.ReadFile(ctx, lookupAttr.GetInode().GetIno(), 0, 100)
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestSQLiteMetadataStoreRecoveryFromPublishedSnapshot(t *testing.T) {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
 	content := []byte("snapshot restored content")
-	fileAttr, err := vol1.CreateFile(ctx, dirAttr.Inode, "file.txt", 0644, content, 0, 0)
+	fileAttr, err := vol1.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file.txt", 0644, content, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -273,15 +273,15 @@ func TestSQLiteMetadataStoreRecoveryFromPublishedSnapshot(t *testing.T) {
 		t.Fatalf("LoadFromBackend from snapshot failed: %v", err)
 	}
 
-	lookupAttr, err := vol2.Lookup(ctx, dirAttr.Inode, "file.txt")
+	lookupAttr, err := vol2.Lookup(ctx, dirAttr.GetInode().GetIno(), "file.txt")
 	if err != nil {
 		t.Fatalf("Lookup after snapshot restore failed: %v", err)
 	}
-	if lookupAttr.Inode != fileAttr.Inode {
-		t.Errorf("inode mismatch: %d vs %d", lookupAttr.Inode, fileAttr.Inode)
+	if lookupAttr.GetInode().GetIno() != fileAttr.GetInode().GetIno() {
+		t.Errorf("inode mismatch: %d vs %d", lookupAttr.GetInode().GetIno(), fileAttr.GetInode().GetIno())
 	}
 
-	data, _, _, err := vol2.ReadFile(ctx, lookupAttr.Inode, 0, 100)
+	data, _, _, err := vol2.ReadFile(ctx, lookupAttr.GetInode().GetIno(), 0, 100)
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestSQLiteMetadataStoreRecoveryFromErofsSnapshot(t *testing.T) {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
 	content := []byte("erofs imported content")
-	_, err = vol1.CreateFile(ctx, dirAttr.Inode, "doc.txt", 0644, content, 0, 0)
+	_, err = vol1.CreateFile(ctx, dirAttr.GetInode().GetIno(), "doc.txt", 0644, content, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -347,15 +347,15 @@ func TestSQLiteMetadataStoreRecoveryFromErofsSnapshot(t *testing.T) {
 		t.Fatalf("Lookup erofsdir after EROFS import failed: %v", err)
 	}
 
-	lookupAttr, err := vol2.Lookup(ctx, dirLookup.Inode, "doc.txt")
+	lookupAttr, err := vol2.Lookup(ctx, dirLookup.GetInode().GetIno(), "doc.txt")
 	if err != nil {
 		t.Fatalf("Lookup doc.txt after EROFS import failed: %v", err)
 	}
-	if lookupAttr.Size != int64(len(content)) {
-		t.Errorf("size mismatch: %d vs %d", lookupAttr.Size, len(content))
+	if lookupAttr.GetInode().GetSize() != int64(len(content)) {
+		t.Errorf("size mismatch: %d vs %d", lookupAttr.GetInode().GetSize(), len(content))
 	}
 
-	data, _, _, err := vol2.ReadFile(ctx, lookupAttr.Inode, 0, 100)
+	data, _, _, err := vol2.ReadFile(ctx, lookupAttr.GetInode().GetIno(), 0, 100)
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lookup failed: %v", err)
 	}
-	if lookupAttr.Inode != attr.Inode || lookupAttr.Size != int64(len("now I exist")) {
+	if lookupAttr.GetInode().GetIno() != attr.GetInode().GetIno() || lookupAttr.GetInode().GetSize() != int64(len("now I exist")) {
 		t.Fatalf("unexpected lookup attr: %+v", lookupAttr)
 	}
 	stats = vol.MetadataCacheStats()
@@ -497,12 +497,12 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 
 	// 5. Stat the inode -> cache hit!
 	vol.MetadataCacheResetStats()
-	statAttr, err := vol.GetAttr(ctx, attr.Inode)
+	statAttr, err := vol.GetAttr(ctx, attr.GetInode().GetIno())
 	if err != nil {
 		t.Fatalf("GetAttr failed: %v", err)
 	}
-	if statAttr.Inode != attr.Inode {
-		t.Fatalf("mismatched stat inode: %d vs %d", statAttr.Inode, attr.Inode)
+	if statAttr.GetInode().GetIno() != attr.GetInode().GetIno() {
+		t.Fatalf("mismatched stat inode: %d vs %d", statAttr.GetInode().GetIno(), attr.GetInode().GetIno())
 	}
 	stats = vol.MetadataCacheStats()
 	if stats.Hits != 1 || stats.Misses != 0 {
@@ -578,40 +578,40 @@ func TestSQLiteReadCacheCoherence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lookup for renamed file failed: %v", err)
 	}
-	if rAttr.Inode != fAttr.Inode {
-		t.Fatalf("mismatched inode: %d vs %d", rAttr.Inode, fAttr.Inode)
+	if rAttr.GetInode().GetIno() != fAttr.GetInode().GetIno() {
+		t.Fatalf("mismatched inode: %d vs %d", rAttr.GetInode().GetIno(), fAttr.GetInode().GetIno())
 	}
 
 	// Truncate file updates cached inode size
-	_, err = vol.TruncateFile(ctx, fAttr.Inode, 100)
+	_, err = vol.TruncateFile(ctx, fAttr.GetInode().GetIno(), 100)
 	if err != nil {
 		t.Fatalf("TruncateFile failed: %v", err)
 	}
 	if err := vol.FlushOverlay(ctx); err != nil {
 		t.Fatalf("FlushOverlay failed: %v", err)
 	}
-	tAttr, err := vol.GetAttr(ctx, fAttr.Inode)
+	tAttr, err := vol.GetAttr(ctx, fAttr.GetInode().GetIno())
 	if err != nil {
 		t.Fatalf("GetAttr failed: %v", err)
 	}
-	if tAttr.Size != 100 {
-		t.Fatalf("expected size 100 after truncate, got %d", tAttr.Size)
+	if tAttr.GetInode().GetSize() != 100 {
+		t.Fatalf("expected size 100 after truncate, got %d", tAttr.GetInode().GetSize())
 	}
 
 	// WriteFile updates cached inode size and mtime
-	_, newSize, _, err := vol.WriteFile(ctx, fAttr.Inode, 100, []byte(" appended"), 0)
+	_, newSize, _, err := vol.WriteFile(ctx, fAttr.GetInode().GetIno(), 100, []byte(" appended"), 0)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 	if newSize != 109 {
 		t.Fatalf("expected size 109 after write, got %d", newSize)
 	}
-	wAttr, err := vol.GetAttr(ctx, fAttr.Inode)
+	wAttr, err := vol.GetAttr(ctx, fAttr.GetInode().GetIno())
 	if err != nil {
 		t.Fatalf("GetAttr failed: %v", err)
 	}
-	if wAttr.Size != 109 {
-		t.Fatalf("expected size 109 in cached inode after write, got %d", wAttr.Size)
+	if wAttr.GetInode().GetSize() != 109 {
+		t.Fatalf("expected size 109 in cached inode after write, got %d", wAttr.GetInode().GetSize())
 	}
 }
 
@@ -639,7 +639,7 @@ func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateFile failed: %v", err)
 		}
-		inodes = append(inodes, attr.Inode)
+		inodes = append(inodes, attr.GetInode().GetIno())
 	}
 
 	stats := vol.MetadataCacheStats()
@@ -656,8 +656,8 @@ func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lookup for evicted file_0.txt failed: %v", err)
 	}
-	if attr.Inode != inodes[0] {
-		t.Fatalf("mismatched inode for reloaded file_0.txt: %d vs %d", attr.Inode, inodes[0])
+	if attr.GetInode().GetIno() != inodes[0] {
+		t.Fatalf("mismatched inode for reloaded file_0.txt: %d vs %d", attr.GetInode().GetIno(), inodes[0])
 	}
 	stats = vol.MetadataCacheStats()
 	if stats.Misses == 0 {
@@ -688,7 +688,7 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateFile failed: %v", err)
 		}
-		initInodes = append(initInodes, attr.Inode)
+		initInodes = append(initInodes, attr.GetInode().GetIno())
 	}
 
 	done := make(chan struct{})
@@ -725,7 +725,7 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 				if err == nil {
 					renamed := fmt.Sprintf("w_%d_%d_renamed.txt", writerID, i)
 					_, _ = vol.Rename(ctx, 1, name, 1, renamed)
-					_, _ = vol.GetAttr(ctx, attr.Inode)
+					_, _ = vol.GetAttr(ctx, attr.GetInode().GetIno())
 					_ = vol.Unlink(ctx, 1, renamed)
 				}
 			}
@@ -773,33 +773,33 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 		t.Fatalf("Mkdir failed despite log append commit: %v", err)
 	}
 
-	fAttr1, err := vol.CreateFile(ctx, dirAttr.Inode, "file1.txt", 0644, []byte("contents-of-file-1"), 1000, 1000)
+	fAttr1, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file1.txt", 0644, []byte("contents-of-file-1"), 1000, 1000)
 	if err != nil {
 		t.Fatalf("CreateFile 1 failed: %v", err)
 	}
 
-	_, err = vol.CreateFile(ctx, dirAttr.Inode, "file2.txt", 0644, []byte("contents-of-file-2"), 1000, 1000)
+	_, err = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file2.txt", 0644, []byte("contents-of-file-2"), 1000, 1000)
 	if err != nil {
 		t.Fatalf("CreateFile 2 failed: %v", err)
 	}
 
 	// Rename file2 to file2_renamed
-	_, err = vol.Rename(ctx, dirAttr.Inode, "file2.txt", dirAttr.Inode, "file2_renamed.txt")
+	_, err = vol.Rename(ctx, dirAttr.GetInode().GetIno(), "file2.txt", dirAttr.GetInode().GetIno(), "file2_renamed.txt")
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
 
 	// Create file3, then unlink it
-	_, err = vol.CreateFile(ctx, dirAttr.Inode, "file3.txt", 0644, []byte("temp"), 1000, 1000)
+	_, err = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file3.txt", 0644, []byte("temp"), 1000, 1000)
 	if err != nil {
 		t.Fatalf("CreateFile 3 failed: %v", err)
 	}
-	if err := vol.Unlink(ctx, dirAttr.Inode, "file3.txt"); err != nil {
+	if err := vol.Unlink(ctx, dirAttr.GetInode().GetIno(), "file3.txt"); err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
 
 	// Write more data to file1
-	_, _, _, err = vol.WriteFile(ctx, fAttr1.Inode, 0, []byte("updated-contents-1"), 0)
+	_, _, _, err = vol.WriteFile(ctx, fAttr1.GetInode().GetIno(), 0, []byte("updated-contents-1"), 0)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
@@ -816,44 +816,44 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 
 	// 3. Reads during lag: MUST return latest state directly from overlay
 	// Lookup file1
-	lAttr1, err := vol.Lookup(ctx, dirAttr.Inode, "file1.txt")
+	lAttr1, err := vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "file1.txt")
 	if err != nil {
 		t.Fatalf("Lookup file1 failed during lag: %v", err)
 	}
-	if lAttr1.Inode != fAttr1.Inode || lAttr1.Size != int64(len("updated-contents-1")) {
+	if lAttr1.GetInode().GetIno() != fAttr1.GetInode().GetIno() || lAttr1.GetInode().GetSize() != int64(len("updated-contents-1")) {
 		t.Fatalf("unexpected attr for file1: %+v", lAttr1)
 	}
 
 	// Lookup renamed file2
-	lAttr2, err := vol.Lookup(ctx, dirAttr.Inode, "file2_renamed.txt")
+	lAttr2, err := vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "file2_renamed.txt")
 	if err != nil {
 		t.Fatalf("Lookup file2_renamed failed during lag: %v", err)
 	}
-	if lAttr2.Name != "file2_renamed.txt" {
-		t.Fatalf("unexpected name: %s", lAttr2.Name)
+	if lAttr2.GetName() != "file2_renamed.txt" {
+		t.Fatalf("unexpected name: %s", lAttr2.GetName())
 	}
 
 	// Lookup old name of file2 -> ENOENT
-	_, err = vol.Lookup(ctx, dirAttr.Inode, "file2.txt")
+	_, err = vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "file2.txt")
 	if err == nil {
 		t.Fatalf("expected ENOENT for old name of file2")
 	}
 
 	// Lookup deleted file3 -> ENOENT
-	_, err = vol.Lookup(ctx, dirAttr.Inode, "file3.txt")
+	_, err = vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "file3.txt")
 	if err == nil {
 		t.Fatalf("expected ENOENT for unlinked file3")
 	}
 
 	// ReadDir on testdir during lag -> should see file1.txt and file2_renamed.txt (2 entries)
-	entries, err := vol.ReadDir(ctx, dirAttr.Inode)
+	entries, err := vol.ReadDir(ctx, dirAttr.GetInode().GetIno())
 	if err != nil {
 		t.Fatalf("ReadDir failed during lag: %v", err)
 	}
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries in testdir during lag, got %d", len(entries))
 	}
-	names := []string{entries[0].Name, entries[1].Name}
+	names := []string{entries[0].GetName(), entries[1].GetName()}
 	if names[0] != "file1.txt" || names[1] != "file2_renamed.txt" {
 		t.Fatalf("unexpected entries in ReadDir: %v", names)
 	}
@@ -872,7 +872,7 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 	}
 
 	// Verify reads still return correct state once applied to SQLite
-	entriesAfter, err := vol.ReadDir(ctx, dirAttr.Inode)
+	entriesAfter, err := vol.ReadDir(ctx, dirAttr.GetInode().GetIno())
 	if err != nil {
 		t.Fatalf("ReadDir after flush failed: %v", err)
 	}
@@ -907,7 +907,7 @@ func TestSQLiteApplierCoalescing(t *testing.T) {
 	// Rapidly perform 30 write and truncate operations on the same inode
 	for i := 0; i < 30; i++ {
 		payload := fmt.Sprintf("iteration-%d", i)
-		_, _, _, err = vol.WriteFile(ctx, attr.Inode, 0, []byte(payload), 0)
+		_, _, _, err = vol.WriteFile(ctx, attr.GetInode().GetIno(), 0, []byte(payload), 0)
 		if err != nil {
 			t.Fatalf("WriteFile iter %d failed: %v", i, err)
 		}
@@ -919,13 +919,13 @@ func TestSQLiteApplierCoalescing(t *testing.T) {
 	}
 
 	// Verify final state
-	finalAttr, err := vol.GetAttr(ctx, attr.Inode)
+	finalAttr, err := vol.GetAttr(ctx, attr.GetInode().GetIno())
 	if err != nil {
 		t.Fatalf("GetAttr failed: %v", err)
 	}
 	expectedLen := int64(len("iteration-29"))
-	if finalAttr.Size != expectedLen {
-		t.Fatalf("expected size %d, got %d", expectedLen, finalAttr.Size)
+	if finalAttr.GetInode().GetSize() != expectedLen {
+		t.Fatalf("expected size %d, got %d", expectedLen, finalAttr.GetInode().GetSize())
 	}
 }
 
@@ -1092,7 +1092,7 @@ func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
 		if cErr != nil {
 			t.Fatalf("CreateFile %d failed: %v", i, cErr)
 		}
-		expectedFiles[name] = attr.Size
+		expectedFiles[name] = attr.GetInode().GetSize()
 	}
 
 	// Confirm lag is positive (SQLite is behind stream log)
@@ -1130,12 +1130,12 @@ func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
 	}
 
 	for _, entry := range entries {
-		expectedSize, ok := expectedFiles[entry.Name]
+		expectedSize, ok := expectedFiles[entry.GetName()]
 		if !ok {
-			t.Fatalf("unexpected entry %q in recovered directory", entry.Name)
+			t.Fatalf("unexpected entry %q in recovered directory", entry.GetName())
 		}
-		if entry.Size != expectedSize {
-			t.Fatalf("entry %q size %d != expected %d", entry.Name, entry.Size, expectedSize)
+		if entry.GetInode().GetSize() != expectedSize {
+			t.Fatalf("entry %q size %d != expected %d", entry.GetName(), entry.GetInode().GetSize(), expectedSize)
 		}
 	}
 }
@@ -1285,15 +1285,15 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lookup after_rename failed after recovery: %v", err)
 	}
-	if renamedAttr.Inode != fAttr.Inode {
-		t.Fatalf("mismatched inode: %d vs %d", renamedAttr.Inode, fAttr.Inode)
+	if renamedAttr.GetInode().GetIno() != fAttr.GetInode().GetIno() {
+		t.Fatalf("mismatched inode: %d vs %d", renamedAttr.GetInode().GetIno(), fAttr.GetInode().GetIno())
 	}
 
 	entries, err := vol2.ReadDir(ctx, 1)
 	if err != nil {
 		t.Fatalf("ReadDir failed after recovery: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Name != "after_rename.txt" {
+	if len(entries) != 1 || entries[0].GetName() != "after_rename.txt" {
 		t.Fatalf("unexpected entries after recovery: %+v", entries)
 	}
 }
@@ -1389,7 +1389,7 @@ func TestLegacyErofsVolumeMigrationAndReplayToSQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
-	_, err = vol1.CreateFile(ctx, dirAttr.Inode, "subfile1.txt", 0644, []byte("subfile 1 data"), 0, 0)
+	_, err = vol1.CreateFile(ctx, dirAttr.GetInode().GetIno(), "subfile1.txt", 0644, []byte("subfile 1 data"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile subfile1 failed: %v", err)
 	}
@@ -1404,11 +1404,11 @@ func TestLegacyErofsVolumeMigrationAndReplayToSQLite(t *testing.T) {
 	}
 
 	// Post-snapshot mutations (in flight / stream-only state)
-	_, err = vol1.CreateFile(ctx, dirAttr.Inode, "subfile2.txt", 0644, []byte("subfile 2 post-snapshot data"), 0, 0)
+	_, err = vol1.CreateFile(ctx, dirAttr.GetInode().GetIno(), "subfile2.txt", 0644, []byte("subfile 2 post-snapshot data"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile subfile2 failed: %v", err)
 	}
-	_, _, _, err = vol1.WriteFile(ctx, file1Attr.Inode, 0, []byte("file 1 updated via stream!"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	_, _, _, err = vol1.WriteFile(ctx, file1Attr.GetInode().GetIno(), 0, []byte("file 1 updated via stream!"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("WriteFile file1 failed: %v", err)
 	}
@@ -1445,7 +1445,7 @@ func TestLegacyErofsVolumeMigrationAndReplayToSQLite(t *testing.T) {
 		t.Fatalf("Expected 2 entries in root, got %d", len(entries))
 	}
 
-	dirEntries, err := vol2.ReadDir(ctx, dirAttr.Inode)
+	dirEntries, err := vol2.ReadDir(ctx, dirAttr.GetInode().GetIno())
 	if err != nil {
 		t.Fatalf("ReadDir dir1 failed: %v", err)
 	}
@@ -1454,7 +1454,7 @@ func TestLegacyErofsVolumeMigrationAndReplayToSQLite(t *testing.T) {
 	}
 
 	// Verify file1 content is the updated stream content
-	f1Data, _, _, err := vol2.ReadFile(ctx, file1Attr.Inode, 0, 100)
+	f1Data, _, _, err := vol2.ReadFile(ctx, file1Attr.GetInode().GetIno(), 0, 100)
 	if err != nil {
 		t.Fatalf("ReadFile file1 failed: %v", err)
 	}
@@ -1463,11 +1463,11 @@ func TestLegacyErofsVolumeMigrationAndReplayToSQLite(t *testing.T) {
 	}
 
 	// Verify subfile1 content from EROFS
-	sub1Attr, err := vol2.Lookup(ctx, dirAttr.Inode, "subfile1.txt")
+	sub1Attr, err := vol2.Lookup(ctx, dirAttr.GetInode().GetIno(), "subfile1.txt")
 	if err != nil {
 		t.Fatalf("Lookup subfile1 failed: %v", err)
 	}
-	sub1Data, _, _, err := vol2.ReadFile(ctx, sub1Attr.Inode, 0, 100)
+	sub1Data, _, _, err := vol2.ReadFile(ctx, sub1Attr.GetInode().GetIno(), 0, 100)
 	if err != nil {
 		t.Fatalf("ReadFile subfile1 failed: %v", err)
 	}
@@ -1505,13 +1505,13 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
 
-	f1Attr, err := vol.CreateFile(ctx, dirAttr.Inode, "f1.txt", 0644, []byte("memory-index-content"), 0, 0)
+	f1Attr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "f1.txt", 0644, []byte("memory-index-content"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile f1 failed: %v", err)
 	}
 
 	// 2. Read back
-	data, _, _, err := vol.ReadFile(ctx, f1Attr.Inode, 0, 100)
+	data, _, _, err := vol.ReadFile(ctx, f1Attr.GetInode().GetIno(), 0, 100)
 	if err != nil || string(data) != "memory-index-content" {
 		t.Fatalf("ReadFile failed: got %q, err %v", string(data), err)
 	}
@@ -1526,7 +1526,7 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 	}
 
 	// 4. Add more data after snapshot
-	f2Attr, err := vol.CreateFile(ctx, dirAttr.Inode, "f2.txt", 0644, []byte("f2-content-after-snap"), 0, 0)
+	f2Attr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "f2.txt", 0644, []byte("f2-content-after-snap"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile f2 failed: %v", err)
 	}
@@ -1548,12 +1548,12 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 	}
 
 	// Verify both f1 and f2 exist
-	entries, err := vol2.ReadDir(ctx, dirAttr.Inode)
+	entries, err := vol2.ReadDir(ctx, dirAttr.GetInode().GetIno())
 	if err != nil || len(entries) != 2 {
 		t.Fatalf("expected 2 entries in dir, got %d (err: %v)", len(entries), err)
 	}
 
-	f2Data, _, _, err := vol2.ReadFile(ctx, f2Attr.Inode, 0, 100)
+	f2Data, _, _, err := vol2.ReadFile(ctx, f2Attr.GetInode().GetIno(), 0, 100)
 	if err != nil || string(f2Data) != "f2-content-after-snap" {
 		t.Fatalf("ReadFile f2 failed: got %q, err %v", string(f2Data), err)
 	}
@@ -1602,27 +1602,27 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 			}
 
 			// Verify chunk 10 before truncate
-			c10Data, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(10*chunkSize), int64(chunkSize))
+			c10Data, _, _, err := vol.ReadFile(ctx, attr.GetInode().GetIno(), int64(10*chunkSize), int64(chunkSize))
 			if err != nil || len(c10Data) != chunkSize || c10Data[0] != byte(11) {
 				t.Fatalf("Initial read of chunk 10 failed: len=%d, err=%v", len(c10Data), err)
 			}
 
 			// 2. First truncate down: from 20 chunks to 15 chunks (983,040 bytes)
 			t1Size := int64(15 * chunkSize)
-			_, err = vol.TruncateFile(ctx, attr.Inode, t1Size)
+			_, err = vol.TruncateFile(ctx, attr.GetInode().GetIno(), t1Size)
 			if err != nil {
 				t.Fatalf("First TruncateFile failed: %v", err)
 			}
 
 			// 3. Second truncate down: from 15 chunks to 11 chunks + 1000 bytes (721,920 bytes)
 			t2Size := int64(11*chunkSize + 1000)
-			_, err = vol.TruncateFile(ctx, attr.Inode, t2Size)
+			_, err = vol.TruncateFile(ctx, attr.GetInode().GetIno(), t2Size)
 			if err != nil {
 				t.Fatalf("Second TruncateFile failed: %v", err)
 			}
 
 			// 4. Read untouched chunk 5 (offset = 5 * 64KB) -> must be byte 6
-			c5Data, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(5*chunkSize), int64(chunkSize))
+			c5Data, _, _, err := vol.ReadFile(ctx, attr.GetInode().GetIno(), int64(5*chunkSize), int64(chunkSize))
 			if err != nil || len(c5Data) != chunkSize {
 				t.Fatalf("ReadFile chunk 5 failed: len=%d err=%v", len(c5Data), err)
 			}
@@ -1633,7 +1633,7 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 			}
 
 			// 5. Read untouched chunk 10 (offset = 10 * 64KB) -> must be byte 11
-			c10After, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(10*chunkSize), int64(chunkSize))
+			c10After, _, _, err := vol.ReadFile(ctx, attr.GetInode().GetIno(), int64(10*chunkSize), int64(chunkSize))
 			if err != nil || len(c10After) != chunkSize {
 				t.Fatalf("ReadFile chunk 10 failed: len=%d err=%v", len(c10After), err)
 			}
@@ -1644,7 +1644,7 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 			}
 
 			// 6. Read last partial chunk 11 (offset = 11 * 64KB, length = 1000 bytes)
-			c11Data, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(11*chunkSize), 1000)
+			c11Data, _, _, err := vol.ReadFile(ctx, attr.GetInode().GetIno(), int64(11*chunkSize), 1000)
 			if err != nil || len(c11Data) != 1000 {
 				t.Fatalf("ReadFile chunk 11 failed: len=%d err=%v", len(c11Data), err)
 			}
@@ -1655,7 +1655,7 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 			}
 
 			// 7. Read beyond EOF (chunk 13) -> must return 0 bytes
-			pastEOF, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(13*chunkSize), int64(chunkSize))
+			pastEOF, _, _, err := vol.ReadFile(ctx, attr.GetInode().GetIno(), int64(13*chunkSize), int64(chunkSize))
 			if err != nil || len(pastEOF) != 0 {
 				t.Fatalf("ReadFile past EOF failed: len=%d err=%v", len(pastEOF), err)
 			}
@@ -1665,7 +1665,7 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 				t.Fatalf("FlushOverlay failed: %v", err)
 			}
 
-			c10Flushed, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(10*chunkSize), int64(chunkSize))
+			c10Flushed, _, _, err := vol.ReadFile(ctx, attr.GetInode().GetIno(), int64(10*chunkSize), int64(chunkSize))
 			if err != nil || len(c10Flushed) != chunkSize || c10Flushed[0] != byte(11) {
 				t.Fatalf("Post-flush ReadFile chunk 10 failed: len=%d err=%v", len(c10Flushed), err)
 			}

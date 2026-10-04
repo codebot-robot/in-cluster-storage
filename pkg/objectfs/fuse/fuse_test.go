@@ -34,6 +34,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func createTestClient(t *testing.T) (pb.ObjectFSControllerClient, func()) {
@@ -1711,5 +1713,73 @@ func TestMultipleOpenHandlesAndRelease(t *testing.T) {
 	var lookupOut fuse.EntryOut
 	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "multi.txt", &lookupOut); status != fuse.Status(syscall.ENOENT) {
 		t.Fatalf("Expected ENOENT for unlinked multi.txt after all handles released, got %v", status)
+	}
+}
+
+func TestFillAttrOutFromEmbeddedInode(t *testing.T) {
+	fs := &ObjectFS{}
+
+	mtime := time.Date(2026, 1, 2, 3, 4, 5, 123456789, time.UTC)
+	atime := time.Date(2026, 1, 2, 4, 5, 6, 987654321, time.UTC)
+	ctime := time.Date(2026, 1, 2, 5, 6, 7, 555555555, time.UTC)
+
+	entry := &pb.EntryAttr{
+		Name: "test_entry",
+		Inode: &pb.Inode{
+			Ino:            proto.Uint64(42),
+			Mode:           0644,
+			Size:           12345,
+			Mtime:          timestamppb.New(mtime),
+			Atime:          timestamppb.New(atime),
+			Ctime:          timestamppb.New(ctime),
+			Uid:            1001,
+			Gid:            1002,
+			Nlink:          3,
+			Rdev:           0x0103,
+			IsDir:          false,
+			SymlinkTarget:  "target",
+			ContentSha256:  "sha-content",
+			ManifestSha256: "sha-manifest",
+			ParentIno:      proto.Uint64(1),
+			Etag:           "etag-val",
+			ChunkSize:      16384,
+		},
+	}
+
+	var attr fuse.Attr
+	fs.fillAttrOut(entry, &attr)
+
+	if attr.Ino != 42 {
+		t.Errorf("Ino mismatch: got %d, want 42", attr.Ino)
+	}
+	if attr.Size != 12345 {
+		t.Errorf("Size mismatch: got %d, want 12345", attr.Size)
+	}
+	if (attr.Mode&syscall.S_IFMT) != syscall.S_IFREG || (attr.Mode&0777) != 0644 {
+		t.Errorf("Mode mismatch: got %o", attr.Mode)
+	}
+	if attr.Nlink != 3 {
+		t.Errorf("Nlink mismatch: got %d, want 3", attr.Nlink)
+	}
+	if attr.Rdev != 0x0103 {
+		t.Errorf("Rdev mismatch: got 0x%x, want 0x0103", attr.Rdev)
+	}
+	if attr.Owner.Uid != 1001 || attr.Owner.Gid != 1002 {
+		t.Errorf("Owner mismatch: uid=%d, gid=%d", attr.Owner.Uid, attr.Owner.Gid)
+	}
+	if attr.Mtime != uint64(mtime.Unix()) || attr.Mtimensec != uint32(mtime.Nanosecond()) {
+		t.Errorf("Mtime mismatch: %d.%d vs %d.%d", attr.Mtime, attr.Mtimensec, mtime.Unix(), mtime.Nanosecond())
+	}
+	if attr.Atime != uint64(atime.Unix()) || attr.Atimensec != uint32(atime.Nanosecond()) {
+		t.Errorf("Atime mismatch: %d.%d vs %d.%d", attr.Atime, attr.Atimensec, atime.Unix(), atime.Nanosecond())
+	}
+	if attr.Ctime != uint64(ctime.Unix()) || attr.Ctimensec != uint32(ctime.Nanosecond()) {
+		t.Errorf("Ctime mismatch: %d.%d vs %d.%d", attr.Ctime, attr.Ctimensec, ctime.Unix(), ctime.Nanosecond())
+	}
+
+	var entryOut fuse.EntryOut
+	fs.fillEntryOut(entry, &entryOut)
+	if entryOut.NodeId != 42 {
+		t.Errorf("NodeId mismatch: got %d, want 42", entryOut.NodeId)
 	}
 }

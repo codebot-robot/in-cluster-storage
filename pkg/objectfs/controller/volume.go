@@ -1047,60 +1047,18 @@ func toEntryAttr(row *pb.Inode, name, redirectURL string, rootInodeID uint64) *p
 	if row == nil {
 		return nil
 	}
-	mSha := row.GetManifestSha256()
-	cSha := row.GetContentSha256()
-	if row.GetChunkSize() == 0 && mSha == "" {
-		cSha = row.GetSha256()
-	} else if mSha == "" {
-		mSha = row.GetSha256()
-	}
 	ino := row.GetIno()
 	if name == "" && (ino == rootInodeID || ino == 1) {
 		name = "/"
 	}
-	atime := row.GetAtime()
-	if atime == nil {
-		atime = row.GetMtime()
-	}
-	ctime := row.GetCtime()
-	if ctime == nil {
-		ctime = row.GetMtime()
-	}
-	mtime := row.GetMtime()
-	if mtime == nil {
-		mtime = timestamppb.Now()
-		if atime == nil {
-			atime = mtime
-		}
-		if ctime == nil {
-			ctime = mtime
-		}
-	}
-	nlink := row.GetNlink()
-	if nlink == 0 && row.GetIsDir() {
-		nlink = 2
-	}
-	if ino == rootInodeID && rootInodeID != 0 {
-		ino = 1
+	rowCopy := proto.Clone(row).(*pb.Inode)
+	if rootInodeID != 0 && ino == rootInodeID && rootInodeID != 1 {
+		rowCopy.Ino = proto.Uint64(1)
 	}
 	return &pb.EntryAttr{
-		Inode:          ino,
-		Name:           name,
-		IsDir:          row.GetIsDir(),
-		Size:           row.GetSize(),
-		Mode:           row.GetMode(),
-		ModTime:        mtime,
-		Atime:          atime,
-		Ctime:          ctime,
-		Sha256:         row.GetSha256(),
-		ManifestSha256: mSha,
-		ContentSha256:  cSha,
-		RedirectUrl:    redirectURL,
-		Uid:            row.GetUid(),
-		Gid:            row.GetGid(),
-		Nlink:          nlink,
-		SymlinkTarget:  row.GetSymlinkTarget(),
-		Rdev:           row.GetRdev(),
+		Inode:       rowCopy,
+		Name:        name,
+		RedirectUrl: redirectURL,
 	}
 }
 
@@ -1212,7 +1170,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
 			Attr:      attr,
-			Inode:     attr.Inode,
+			Inode:     attr.GetInode().GetIno(),
 		})
 	}
 	return attr, nil

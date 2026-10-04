@@ -117,13 +117,17 @@ func grpcErrorToStatus(err error) fuse.Status {
 }
 
 func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
-	out.Ino = attr.GetInode()
-	out.Size = uint64(attr.GetSize())
-	out.Mode = attr.GetMode()
-	if attr.GetIsDir() {
+	if attr == nil || attr.GetInode() == nil {
+		return
+	}
+	inoRow := attr.GetInode()
+	out.Ino = inoRow.GetIno()
+	out.Size = uint64(inoRow.GetSize())
+	out.Mode = inoRow.GetMode()
+	if inoRow.GetIsDir() {
 		out.Mode |= syscall.S_IFDIR
-		if attr.GetNlink() > 0 {
-			out.Nlink = attr.GetNlink()
+		if inoRow.GetNlink() > 0 {
+			out.Nlink = inoRow.GetNlink()
 		} else {
 			out.Nlink = 2
 		}
@@ -131,11 +135,11 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 		if (out.Mode & syscall.S_IFMT) == 0 {
 			out.Mode |= syscall.S_IFREG
 		}
-		out.Nlink = attr.GetNlink()
+		out.Nlink = inoRow.GetNlink()
 	}
-	out.Rdev = attr.GetRdev()
-	if attr.GetModTime() != nil {
-		t := attr.GetModTime().AsTime()
+	out.Rdev = inoRow.GetRdev()
+	if inoRow.GetMtime() != nil {
+		t := inoRow.GetMtime().AsTime()
 		out.Mtime = uint64(t.Unix())
 		out.Mtimensec = uint32(t.Nanosecond())
 		out.Atime = out.Mtime
@@ -143,25 +147,27 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 		out.Ctime = out.Mtime
 		out.Ctimensec = out.Mtimensec
 	}
-	if attr.GetAtime() != nil {
-		t := attr.GetAtime().AsTime()
+	if inoRow.GetAtime() != nil {
+		t := inoRow.GetAtime().AsTime()
 		out.Atime = uint64(t.Unix())
 		out.Atimensec = uint32(t.Nanosecond())
 	}
-	if attr.GetCtime() != nil {
-		t := attr.GetCtime().AsTime()
+	if inoRow.GetCtime() != nil {
+		t := inoRow.GetCtime().AsTime()
 		out.Ctime = uint64(t.Unix())
 		out.Ctimensec = uint32(t.Nanosecond())
 	}
 	out.Owner = fuse.Owner{
-		Uid: attr.GetUid(),
-		Gid: attr.GetGid(),
+		Uid: inoRow.GetUid(),
+		Gid: inoRow.GetGid(),
 	}
 }
 
 func (fs *ObjectFS) fillEntryOut(attr *pb.EntryAttr, out *fuse.EntryOut) {
 	fs.fillAttrOut(attr, &out.Attr)
-	out.NodeId = attr.GetInode()
+	if attr != nil && attr.GetInode() != nil {
+		out.NodeId = attr.GetInode().GetIno()
+	}
 	out.Generation = 1
 	out.SetEntryTimeout(1 * time.Second)
 	out.SetAttrTimeout(1 * time.Second)
@@ -370,7 +376,7 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 		return fuse.EIO
 	}
 
-	fs.cache.Put(attr.GetInode(), []byte{}, time.Now(), "")
+	fs.cache.Put(attr.GetInode().GetIno(), []byte{}, time.Now(), "")
 	fs.fillEntryOut(attr, &out.EntryOut)
 	out.OpenOut.Fh = resp.GetFh()
 	return fuse.OK
@@ -513,8 +519,9 @@ func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 	entries := resp.GetEntries()
 	for i := int(input.Offset); i < len(entries); i++ {
 		entry := entries[i]
-		mode := entry.GetMode()
-		if entry.GetIsDir() {
+		inoRow := entry.GetInode()
+		mode := inoRow.GetMode()
+		if inoRow.GetIsDir() {
 			mode = (mode & ^uint32(syscall.S_IFMT)) | syscall.S_IFDIR
 		} else if (mode & syscall.S_IFMT) == 0 {
 			mode |= syscall.S_IFREG
@@ -522,7 +529,7 @@ func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 		if !out.AddDirEntry(fuse.DirEntry{
 			Mode: mode,
 			Name: entry.GetName(),
-			Ino:  entry.GetInode(),
+			Ino:  inoRow.GetIno(),
 			Off:  uint64(i + 1),
 		}) {
 			break
@@ -549,8 +556,9 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 	entries := resp.GetEntries()
 	for i := int(input.Offset); i < len(entries); i++ {
 		entry := entries[i]
-		mode := entry.GetMode()
-		if entry.GetIsDir() {
+		inoRow := entry.GetInode()
+		mode := inoRow.GetMode()
+		if inoRow.GetIsDir() {
 			mode = (mode & ^uint32(syscall.S_IFMT)) | syscall.S_IFDIR
 		} else if (mode & syscall.S_IFMT) == 0 {
 			mode |= syscall.S_IFREG
@@ -558,7 +566,7 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 		entryOut := out.AddDirLookupEntry(fuse.DirEntry{
 			Mode: mode,
 			Name: entry.GetName(),
-			Ino:  entry.GetInode(),
+			Ino:  inoRow.GetIno(),
 			Off:  uint64(i + 1),
 		})
 		if entryOut == nil {
