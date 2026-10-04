@@ -19,6 +19,8 @@ package controller
 import (
 	"sync"
 
+	"google.golang.org/protobuf/proto"
+
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 )
@@ -332,4 +334,23 @@ type CachedInode struct {
 	RedirectURL  string
 	Data         blob.ByteStream
 	IsDirty      bool
+}
+
+// mutate applies fn to a cloned copy of Row and updates Row to the new clone.
+// It returns the newly created row. This ensures rows are never mutated in place.
+func (n *CachedInode) mutate(fn func(*pb.Inode)) *pb.Inode {
+	if n == nil {
+		return nil
+	}
+	var newRow *pb.Inode
+	if n.Row != nil {
+		newRow = proto.Clone(n.Row).(*pb.Inode)
+	} else {
+		newRow = &pb.Inode{}
+	}
+	if fn != nil {
+		fn(newRow)
+	}
+	n.Row = newRow
+	return newRow
 }
