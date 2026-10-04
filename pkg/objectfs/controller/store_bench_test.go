@@ -84,7 +84,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					_, err := vol.GetAttr(ctx, attr.Inode)
+					_, err := vol.GetAttr(ctx, attr.GetInode().GetIno())
 					if err != nil {
 						b.Fatalf("GetAttr failed: %v", err)
 					}
@@ -111,7 +111,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				b.ResetTimer()
 				b.RunParallel(func(pb *testing.PB) {
 					for pb.Next() {
-						_, err := vol.GetAttr(ctx, attr.Inode)
+						_, err := vol.GetAttr(ctx, attr.GetInode().GetIno())
 						if err != nil {
 							b.Fatalf("GetAttr failed: %v", err)
 						}
@@ -190,12 +190,12 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					b.Fatalf("Mkdir failed: %v", err)
 				}
 				for j := 0; j < 100; j++ {
-					_, _ = vol.CreateFile(ctx, dirAttr.Inode, fmt.Sprintf("f%d.txt", j), 0644, []byte("x"), 0, 0)
+					_, _ = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), fmt.Sprintf("f%d.txt", j), 0644, []byte("x"), 0, 0)
 				}
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					entries, err := vol.ReadDir(ctx, dirAttr.Inode)
+					entries, err := vol.ReadDir(ctx, dirAttr.GetInode().GetIno())
 					if err != nil || len(entries) != 100 {
 						b.Fatalf("ReadDir failed: %v (entries=%d)", err, len(entries))
 					}
@@ -262,11 +262,11 @@ func Benchmark64KiBFsyncedWrite(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _, err := vol.WriteFile(ctx, fileAttr.Inode, 0, data64KiB, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+		_, _, _, err := vol.WriteFile(ctx, fileAttr.GetInode().GetIno(), 0, data64KiB, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 		if err != nil {
 			b.Fatalf("WriteFile failed: %v", err)
 		}
-		if err := vol.Fsync(ctx, fileAttr.Inode); err != nil {
+		if err := vol.Fsync(ctx, fileAttr.GetInode().GetIno()); err != nil {
 			b.Fatalf("Fsync failed: %v", err)
 		}
 	}
@@ -293,18 +293,18 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		// Empty directory addition
 		emptyDir, _ := vol.Mkdir(ctx, 1, "empty_dir", 0755, 0, 0)
 		start := time.Now()
-		_, _ = vol.CreateFile(ctx, emptyDir.Inode, "first_entry.txt", 0644, []byte("x"), 0, 0)
+		_, _ = vol.CreateFile(ctx, emptyDir.GetInode().GetIno(), "first_entry.txt", 0644, []byte("x"), 0, 0)
 		emptyDur := time.Since(start)
 
 		// Populate large directory with 10,000 entries
 		largeDir, _ := vol.Mkdir(ctx, 1, "large_dir", 0755, 0, 0)
 		for i := 0; i < 10000; i++ {
-			_, _ = vol.CreateFile(ctx, largeDir.Inode, fmt.Sprintf("f%d.txt", i), 0644, []byte("x"), 0, 0)
+			_, _ = vol.CreateFile(ctx, largeDir.GetInode().GetIno(), fmt.Sprintf("f%d.txt", i), 0644, []byte("x"), 0, 0)
 		}
 
 		// Add one entry to 10,000 entry directory
 		start = time.Now()
-		_, _ = vol.CreateFile(ctx, largeDir.Inode, "extra_entry.txt", 0644, []byte("x"), 0, 0)
+		_, _ = vol.CreateFile(ctx, largeDir.GetInode().GetIno(), "extra_entry.txt", 0644, []byte("x"), 0, 0)
 		largeDur := time.Since(start)
 
 		_ = vol.Close()
@@ -335,8 +335,8 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		for d := 0; d < 150; d++ {
 			dirAttr, _ := vol.Mkdir(ctx, 1, fmt.Sprintf("dir_%d", d), 0755, 0, 0)
 			for f := 0; f < 100; f++ {
-				fAttr, _ := vol.CreateFile(ctx, dirAttr.Inode, fmt.Sprintf("file_%d.txt", f), 0644, []byte("val"), 0, 0)
-				fileInos = append(fileInos, fAttr.Inode)
+				fAttr, _ := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), fmt.Sprintf("file_%d.txt", f), 0644, []byte("val"), 0, 0)
+				fileInos = append(fileInos, fAttr.GetInode().GetIno())
 			}
 		}
 
@@ -376,7 +376,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 			var createdInos []uint64
 			for i := 0; i < numFiles; i++ {
 				fAttr, _ := vol.CreateFile(ctx, 1, fmt.Sprintf("f%d.txt", i), 0644, []byte("data"), 0, 0)
-				createdInos = append(createdInos, fAttr.Inode)
+				createdInos = append(createdInos, fAttr.GetInode().GetIno())
 			}
 
 			// Measure repeat Stat lookups (hot path)
@@ -540,7 +540,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		dirAttr, _ := vol.Mkdir(ctx, 1, "hot_dir", 0755, 0, 0)
 		startCreate := time.Now()
 		for i := 0; i < 100; i++ {
-			_, _ = vol.CreateFile(ctx, dirAttr.Inode, fmt.Sprintf("f_%d.txt", i), 0644, []byte("val"), 0, 0)
+			_, _ = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), fmt.Sprintf("f_%d.txt", i), 0644, []byte("val"), 0, 0)
 		}
 		createDur := time.Since(startCreate)
 		_ = vol.FlushOverlay(ctx)
@@ -551,7 +551,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		data64K := make([]byte, 64*1024)
 		startWrite := time.Now()
 		for i := 0; i < 100; i++ {
-			_, _, _, _ = vol.WriteFile(ctx, fAttr.Inode, 0, data64K, 0)
+			_, _, _, _ = vol.WriteFile(ctx, fAttr.GetInode().GetIno(), 0, data64K, 0)
 		}
 		writeDur := time.Since(startWrite)
 		_ = vol.FlushOverlay(ctx)
@@ -598,7 +598,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		// Read from overlay (before flush)
 		startOverlay := time.Now()
 		for i := 0; i < 1000; i++ {
-			_, _ = vol.GetAttr(ctx, fAttr.Inode)
+			_, _ = vol.GetAttr(ctx, fAttr.GetInode().GetIno())
 		}
 		overlayDur := time.Since(startOverlay)
 
@@ -606,7 +606,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		_ = vol.FlushOverlay(ctx)
 		startCache := time.Now()
 		for i := 0; i < 1000; i++ {
-			_, _ = vol.GetAttr(ctx, fAttr.Inode)
+			_, _ = vol.GetAttr(ctx, fAttr.GetInode().GetIno())
 		}
 		cacheDur := time.Since(startCache)
 

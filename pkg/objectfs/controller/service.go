@@ -423,7 +423,7 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	if err != nil {
 		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
-	fh := vol.AllocFh(attr.Inode)
+	fh := vol.AllocFh(attr.GetInode().GetIno())
 	return &pb.CreateFileResponse{Attr: attr, Fh: fh}, nil
 }
 
