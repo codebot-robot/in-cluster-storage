@@ -143,79 +143,6 @@ func (WatchEventType) EnumDescriptor() ([]byte, []int) {
 	return file_proto_objectfs_proto_rawDescGZIP(), []int{1}
 }
 
-type MutationType int32
-
-const (
-	MutationType_MUTATION_TYPE_UNSPECIFIED   MutationType = 0
-	MutationType_MUTATION_TYPE_MKDIR         MutationType = 1
-	MutationType_MUTATION_TYPE_CREATE_FILE   MutationType = 2
-	MutationType_MUTATION_TYPE_WRITE_FILE    MutationType = 3
-	MutationType_MUTATION_TYPE_TRUNCATE_FILE MutationType = 4
-	MutationType_MUTATION_TYPE_UNLINK        MutationType = 5
-	MutationType_MUTATION_TYPE_RMDIR         MutationType = 6
-	MutationType_MUTATION_TYPE_RENAME        MutationType = 7
-	MutationType_MUTATION_TYPE_SETATTR       MutationType = 8
-	MutationType_MUTATION_TYPE_SYMLINK       MutationType = 9
-	MutationType_MUTATION_TYPE_LINK          MutationType = 10
-)
-
-// Enum value maps for MutationType.
-var (
-	MutationType_name = map[int32]string{
-		0:  "MUTATION_TYPE_UNSPECIFIED",
-		1:  "MUTATION_TYPE_MKDIR",
-		2:  "MUTATION_TYPE_CREATE_FILE",
-		3:  "MUTATION_TYPE_WRITE_FILE",
-		4:  "MUTATION_TYPE_TRUNCATE_FILE",
-		5:  "MUTATION_TYPE_UNLINK",
-		6:  "MUTATION_TYPE_RMDIR",
-		7:  "MUTATION_TYPE_RENAME",
-		8:  "MUTATION_TYPE_SETATTR",
-		9:  "MUTATION_TYPE_SYMLINK",
-		10: "MUTATION_TYPE_LINK",
-	}
-	MutationType_value = map[string]int32{
-		"MUTATION_TYPE_UNSPECIFIED":   0,
-		"MUTATION_TYPE_MKDIR":         1,
-		"MUTATION_TYPE_CREATE_FILE":   2,
-		"MUTATION_TYPE_WRITE_FILE":    3,
-		"MUTATION_TYPE_TRUNCATE_FILE": 4,
-		"MUTATION_TYPE_UNLINK":        5,
-		"MUTATION_TYPE_RMDIR":         6,
-		"MUTATION_TYPE_RENAME":        7,
-		"MUTATION_TYPE_SETATTR":       8,
-		"MUTATION_TYPE_SYMLINK":       9,
-		"MUTATION_TYPE_LINK":          10,
-	}
-)
-
-func (x MutationType) Enum() *MutationType {
-	p := new(MutationType)
-	*p = x
-	return p
-}
-
-func (x MutationType) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (MutationType) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_objectfs_proto_enumTypes[2].Descriptor()
-}
-
-func (MutationType) Type() protoreflect.EnumType {
-	return &file_proto_objectfs_proto_enumTypes[2]
-}
-
-func (x MutationType) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use MutationType.Descriptor instead.
-func (MutationType) EnumDescriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{2}
-}
-
 type EntryAttr struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Inode          uint64                 `protobuf:"varint,1,opt,name=inode,proto3" json:"inode,omitempty"`
@@ -3196,234 +3123,6 @@ func (x *CreateSnapshotResponse) GetSnapshot() *SnapshotInfo {
 	return nil
 }
 
-type MutationRecord struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Type           MutationType           `protobuf:"varint,1,opt,name=type,proto3,enum=objectfs.v1alpha1.MutationType" json:"type,omitempty"`
-	VolumeId       string                 `protobuf:"bytes,2,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Mode           uint32                 `protobuf:"varint,3,opt,name=mode,proto3" json:"mode,omitempty"`
-	Size           int64                  `protobuf:"varint,4,opt,name=size,proto3" json:"size,omitempty"`
-	Offset         int64                  `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`
-	ModTime        *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
-	Sha256         string                 `protobuf:"bytes,7,opt,name=sha256,proto3" json:"sha256,omitempty"`
-	Inode          uint64                 `protobuf:"varint,8,opt,name=inode,proto3" json:"inode,omitempty"`
-	Data           []byte                 `protobuf:"bytes,9,opt,name=data,proto3" json:"data,omitempty"`
-	StreamSeq      uint64                 `protobuf:"varint,10,opt,name=stream_seq,json=streamSeq,proto3" json:"stream_seq,omitempty"`
-	Uid            uint32                 `protobuf:"varint,11,opt,name=uid,proto3" json:"uid,omitempty"`
-	Gid            uint32                 `protobuf:"varint,12,opt,name=gid,proto3" json:"gid,omitempty"`
-	ManifestSha256 string                 `protobuf:"bytes,13,opt,name=manifest_sha256,json=manifestSha256,proto3" json:"manifest_sha256,omitempty"`
-	ContentSha256  string                 `protobuf:"bytes,14,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
-	ParentInode    uint64                 `protobuf:"varint,15,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
-	Name           string                 `protobuf:"bytes,16,opt,name=name,proto3" json:"name,omitempty"`
-	OldParentInode uint64                 `protobuf:"varint,17,opt,name=old_parent_inode,json=oldParentInode,proto3" json:"old_parent_inode,omitempty"`
-	OldName        string                 `protobuf:"bytes,18,opt,name=old_name,json=oldName,proto3" json:"old_name,omitempty"`
-	Atime          *timestamppb.Timestamp `protobuf:"bytes,19,opt,name=atime,proto3" json:"atime,omitempty"`
-	Ctime          *timestamppb.Timestamp `protobuf:"bytes,20,opt,name=ctime,proto3" json:"ctime,omitempty"`
-	SymlinkTarget  string                 `protobuf:"bytes,21,opt,name=symlink_target,json=symlinkTarget,proto3" json:"symlink_target,omitempty"`
-	Nlink          uint32                 `protobuf:"varint,22,opt,name=nlink,proto3" json:"nlink,omitempty"`
-	OldInode       uint64                 `protobuf:"varint,23,opt,name=old_inode,json=oldInode,proto3" json:"old_inode,omitempty"`
-	Rdev           uint32                 `protobuf:"varint,24,opt,name=rdev,proto3" json:"rdev,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
-}
-
-func (x *MutationRecord) Reset() {
-	*x = MutationRecord{}
-	mi := &file_proto_objectfs_proto_msgTypes[47]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *MutationRecord) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*MutationRecord) ProtoMessage() {}
-
-func (x *MutationRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[47]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use MutationRecord.ProtoReflect.Descriptor instead.
-func (*MutationRecord) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{47}
-}
-
-func (x *MutationRecord) GetType() MutationType {
-	if x != nil {
-		return x.Type
-	}
-	return MutationType_MUTATION_TYPE_UNSPECIFIED
-}
-
-func (x *MutationRecord) GetVolumeId() string {
-	if x != nil {
-		return x.VolumeId
-	}
-	return ""
-}
-
-func (x *MutationRecord) GetMode() uint32 {
-	if x != nil {
-		return x.Mode
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetSize() int64 {
-	if x != nil {
-		return x.Size
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetOffset() int64 {
-	if x != nil {
-		return x.Offset
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetModTime() *timestamppb.Timestamp {
-	if x != nil {
-		return x.ModTime
-	}
-	return nil
-}
-
-func (x *MutationRecord) GetSha256() string {
-	if x != nil {
-		return x.Sha256
-	}
-	return ""
-}
-
-func (x *MutationRecord) GetInode() uint64 {
-	if x != nil {
-		return x.Inode
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetData() []byte {
-	if x != nil {
-		return x.Data
-	}
-	return nil
-}
-
-func (x *MutationRecord) GetStreamSeq() uint64 {
-	if x != nil {
-		return x.StreamSeq
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetUid() uint32 {
-	if x != nil {
-		return x.Uid
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetGid() uint32 {
-	if x != nil {
-		return x.Gid
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetManifestSha256() string {
-	if x != nil {
-		return x.ManifestSha256
-	}
-	return ""
-}
-
-func (x *MutationRecord) GetContentSha256() string {
-	if x != nil {
-		return x.ContentSha256
-	}
-	return ""
-}
-
-func (x *MutationRecord) GetParentInode() uint64 {
-	if x != nil {
-		return x.ParentInode
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
-func (x *MutationRecord) GetOldParentInode() uint64 {
-	if x != nil {
-		return x.OldParentInode
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetOldName() string {
-	if x != nil {
-		return x.OldName
-	}
-	return ""
-}
-
-func (x *MutationRecord) GetAtime() *timestamppb.Timestamp {
-	if x != nil {
-		return x.Atime
-	}
-	return nil
-}
-
-func (x *MutationRecord) GetCtime() *timestamppb.Timestamp {
-	if x != nil {
-		return x.Ctime
-	}
-	return nil
-}
-
-func (x *MutationRecord) GetSymlinkTarget() string {
-	if x != nil {
-		return x.SymlinkTarget
-	}
-	return ""
-}
-
-func (x *MutationRecord) GetNlink() uint32 {
-	if x != nil {
-		return x.Nlink
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetOldInode() uint64 {
-	if x != nil {
-		return x.OldInode
-	}
-	return 0
-}
-
-func (x *MutationRecord) GetRdev() uint32 {
-	if x != nil {
-		return x.Rdev
-	}
-	return 0
-}
-
 type Inode struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Ino            *uint64                `protobuf:"varint,1,opt,name=ino,proto3,oneof" json:"ino,omitempty"`
@@ -3449,7 +3148,7 @@ type Inode struct {
 
 func (x *Inode) Reset() {
 	*x = Inode{}
-	mi := &file_proto_objectfs_proto_msgTypes[48]
+	mi := &file_proto_objectfs_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3461,7 +3160,7 @@ func (x *Inode) String() string {
 func (*Inode) ProtoMessage() {}
 
 func (x *Inode) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[48]
+	mi := &file_proto_objectfs_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3474,7 +3173,7 @@ func (x *Inode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Inode.ProtoReflect.Descriptor instead.
 func (*Inode) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{48}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *Inode) GetIno() uint64 {
@@ -3609,7 +3308,7 @@ type DirEntry struct {
 
 func (x *DirEntry) Reset() {
 	*x = DirEntry{}
-	mi := &file_proto_objectfs_proto_msgTypes[49]
+	mi := &file_proto_objectfs_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3621,7 +3320,7 @@ func (x *DirEntry) String() string {
 func (*DirEntry) ProtoMessage() {}
 
 func (x *DirEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[49]
+	mi := &file_proto_objectfs_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3634,7 +3333,7 @@ func (x *DirEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DirEntry.ProtoReflect.Descriptor instead.
 func (*DirEntry) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{49}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *DirEntry) GetParentIno() uint64 {
@@ -3682,7 +3381,7 @@ type Content struct {
 
 func (x *Content) Reset() {
 	*x = Content{}
-	mi := &file_proto_objectfs_proto_msgTypes[50]
+	mi := &file_proto_objectfs_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3694,7 +3393,7 @@ func (x *Content) String() string {
 func (*Content) ProtoMessage() {}
 
 func (x *Content) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[50]
+	mi := &file_proto_objectfs_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3707,7 +3406,7 @@ func (x *Content) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Content.ProtoReflect.Descriptor instead.
 func (*Content) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{50}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *Content) GetSha256() string {
@@ -3736,7 +3435,7 @@ type FileChunk struct {
 
 func (x *FileChunk) Reset() {
 	*x = FileChunk{}
-	mi := &file_proto_objectfs_proto_msgTypes[51]
+	mi := &file_proto_objectfs_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3748,7 +3447,7 @@ func (x *FileChunk) String() string {
 func (*FileChunk) ProtoMessage() {}
 
 func (x *FileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[51]
+	mi := &file_proto_objectfs_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3761,7 +3460,7 @@ func (x *FileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileChunk.ProtoReflect.Descriptor instead.
 func (*FileChunk) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{51}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *FileChunk) GetIno() uint64 {
@@ -4016,34 +3715,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"z\n" +
 	"\x16CreateSnapshotResponse\x12#\n" +
 	"\rsnapshot_name\x18\x01 \x01(\tR\fsnapshotName\x12;\n" +
-	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\xfc\x05\n" +
-	"\x0eMutationRecord\x123\n" +
-	"\x04type\x18\x01 \x01(\x0e2\x1f.objectfs.v1alpha1.MutationTypeR\x04type\x12\x1b\n" +
-	"\tvolume_id\x18\x02 \x01(\tR\bvolumeId\x12\x12\n" +
-	"\x04mode\x18\x03 \x01(\rR\x04mode\x12\x12\n" +
-	"\x04size\x18\x04 \x01(\x03R\x04size\x12\x16\n" +
-	"\x06offset\x18\x05 \x01(\x03R\x06offset\x125\n" +
-	"\bmod_time\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\amodTime\x12\x16\n" +
-	"\x06sha256\x18\a \x01(\tR\x06sha256\x12\x14\n" +
-	"\x05inode\x18\b \x01(\x04R\x05inode\x12\x12\n" +
-	"\x04data\x18\t \x01(\fR\x04data\x12\x1d\n" +
-	"\n" +
-	"stream_seq\x18\n" +
-	" \x01(\x04R\tstreamSeq\x12\x10\n" +
-	"\x03uid\x18\v \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\f \x01(\rR\x03gid\x12'\n" +
-	"\x0fmanifest_sha256\x18\r \x01(\tR\x0emanifestSha256\x12%\n" +
-	"\x0econtent_sha256\x18\x0e \x01(\tR\rcontentSha256\x12!\n" +
-	"\fparent_inode\x18\x0f \x01(\x04R\vparentInode\x12\x12\n" +
-	"\x04name\x18\x10 \x01(\tR\x04name\x12(\n" +
-	"\x10old_parent_inode\x18\x11 \x01(\x04R\x0eoldParentInode\x12\x19\n" +
-	"\bold_name\x18\x12 \x01(\tR\aoldName\x120\n" +
-	"\x05atime\x18\x13 \x01(\v2\x1a.google.protobuf.TimestampR\x05atime\x120\n" +
-	"\x05ctime\x18\x14 \x01(\v2\x1a.google.protobuf.TimestampR\x05ctime\x12%\n" +
-	"\x0esymlink_target\x18\x15 \x01(\tR\rsymlinkTarget\x12\x14\n" +
-	"\x05nlink\x18\x16 \x01(\rR\x05nlink\x12\x1b\n" +
-	"\told_inode\x18\x17 \x01(\x04R\boldInode\x12\x12\n" +
-	"\x04rdev\x18\x18 \x01(\rR\x04rdev\"\x8b\x04\n" +
+	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\x8b\x04\n" +
 	"\x05Inode\x12\x15\n" +
 	"\x03ino\x18\x01 \x01(\x04H\x00R\x03ino\x88\x01\x01\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\rR\x04mode\x12\x12\n" +
@@ -4097,20 +3769,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\rEVENT_CREATED\x10\x01\x12\x12\n" +
 	"\x0eEVENT_MODIFIED\x10\x02\x12\x11\n" +
 	"\rEVENT_DELETED\x10\x03\x12\x11\n" +
-	"\rEVENT_RENAMED\x10\x04*\xbf\x02\n" +
-	"\fMutationType\x12\x1d\n" +
-	"\x19MUTATION_TYPE_UNSPECIFIED\x10\x00\x12\x17\n" +
-	"\x13MUTATION_TYPE_MKDIR\x10\x01\x12\x1d\n" +
-	"\x19MUTATION_TYPE_CREATE_FILE\x10\x02\x12\x1c\n" +
-	"\x18MUTATION_TYPE_WRITE_FILE\x10\x03\x12\x1f\n" +
-	"\x1bMUTATION_TYPE_TRUNCATE_FILE\x10\x04\x12\x18\n" +
-	"\x14MUTATION_TYPE_UNLINK\x10\x05\x12\x17\n" +
-	"\x13MUTATION_TYPE_RMDIR\x10\x06\x12\x18\n" +
-	"\x14MUTATION_TYPE_RENAME\x10\a\x12\x19\n" +
-	"\x15MUTATION_TYPE_SETATTR\x10\b\x12\x19\n" +
-	"\x15MUTATION_TYPE_SYMLINK\x10\t\x12\x16\n" +
-	"\x12MUTATION_TYPE_LINK\x10\n" +
-	"2\xe9\x0e\n" +
+	"\rEVENT_RENAMED\x10\x042\xe9\x0e\n" +
 	"\x12ObjectFSController\x12P\n" +
 	"\aGetAttr\x12!.objectfs.v1alpha1.GetAttrRequest\x1a\".objectfs.v1alpha1.GetAttrResponse\x12P\n" +
 	"\aSetAttr\x12!.objectfs.v1alpha1.SetAttrRequest\x1a\".objectfs.v1alpha1.SetAttrResponse\x12M\n" +
@@ -4148,149 +3807,143 @@ func file_proto_objectfs_proto_rawDescGZIP() []byte {
 	return file_proto_objectfs_proto_rawDescData
 }
 
-var file_proto_objectfs_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_proto_objectfs_proto_msgTypes = make([]protoimpl.MessageInfo, 52)
+var file_proto_objectfs_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_proto_objectfs_proto_msgTypes = make([]protoimpl.MessageInfo, 51)
 var file_proto_objectfs_proto_goTypes = []any{
 	(WriteMode)(0),                 // 0: objectfs.v1alpha1.WriteMode
 	(WatchEventType)(0),            // 1: objectfs.v1alpha1.WatchEventType
-	(MutationType)(0),              // 2: objectfs.v1alpha1.MutationType
-	(*EntryAttr)(nil),              // 3: objectfs.v1alpha1.EntryAttr
-	(*GetAttrRequest)(nil),         // 4: objectfs.v1alpha1.GetAttrRequest
-	(*GetAttrResponse)(nil),        // 5: objectfs.v1alpha1.GetAttrResponse
-	(*SetAttrRequest)(nil),         // 6: objectfs.v1alpha1.SetAttrRequest
-	(*SetAttrResponse)(nil),        // 7: objectfs.v1alpha1.SetAttrResponse
-	(*LookupRequest)(nil),          // 8: objectfs.v1alpha1.LookupRequest
-	(*LookupResponse)(nil),         // 9: objectfs.v1alpha1.LookupResponse
-	(*ReadDirRequest)(nil),         // 10: objectfs.v1alpha1.ReadDirRequest
-	(*ReadDirResponse)(nil),        // 11: objectfs.v1alpha1.ReadDirResponse
-	(*MkdirRequest)(nil),           // 12: objectfs.v1alpha1.MkdirRequest
-	(*MkdirResponse)(nil),          // 13: objectfs.v1alpha1.MkdirResponse
-	(*CreateFileRequest)(nil),      // 14: objectfs.v1alpha1.CreateFileRequest
-	(*CreateFileResponse)(nil),     // 15: objectfs.v1alpha1.CreateFileResponse
-	(*ReadFileRequest)(nil),        // 16: objectfs.v1alpha1.ReadFileRequest
-	(*ReadFileResponse)(nil),       // 17: objectfs.v1alpha1.ReadFileResponse
-	(*WriteFileRequest)(nil),       // 18: objectfs.v1alpha1.WriteFileRequest
-	(*WriteFileResponse)(nil),      // 19: objectfs.v1alpha1.WriteFileResponse
-	(*TruncateFileRequest)(nil),    // 20: objectfs.v1alpha1.TruncateFileRequest
-	(*TruncateFileResponse)(nil),   // 21: objectfs.v1alpha1.TruncateFileResponse
-	(*UnlinkRequest)(nil),          // 22: objectfs.v1alpha1.UnlinkRequest
-	(*UnlinkResponse)(nil),         // 23: objectfs.v1alpha1.UnlinkResponse
-	(*RmdirRequest)(nil),           // 24: objectfs.v1alpha1.RmdirRequest
-	(*RmdirResponse)(nil),          // 25: objectfs.v1alpha1.RmdirResponse
-	(*RenameRequest)(nil),          // 26: objectfs.v1alpha1.RenameRequest
-	(*RenameResponse)(nil),         // 27: objectfs.v1alpha1.RenameResponse
-	(*FsyncRequest)(nil),           // 28: objectfs.v1alpha1.FsyncRequest
-	(*FsyncResponse)(nil),          // 29: objectfs.v1alpha1.FsyncResponse
-	(*WatchVolumeRequest)(nil),     // 30: objectfs.v1alpha1.WatchVolumeRequest
-	(*WatchVolumeResponse)(nil),    // 31: objectfs.v1alpha1.WatchVolumeResponse
-	(*SymlinkRequest)(nil),         // 32: objectfs.v1alpha1.SymlinkRequest
-	(*SymlinkResponse)(nil),        // 33: objectfs.v1alpha1.SymlinkResponse
-	(*ReadlinkRequest)(nil),        // 34: objectfs.v1alpha1.ReadlinkRequest
-	(*ReadlinkResponse)(nil),       // 35: objectfs.v1alpha1.ReadlinkResponse
-	(*LinkRequest)(nil),            // 36: objectfs.v1alpha1.LinkRequest
-	(*LinkResponse)(nil),           // 37: objectfs.v1alpha1.LinkResponse
-	(*ListBlobsRequest)(nil),       // 38: objectfs.v1alpha1.ListBlobsRequest
-	(*ListBlobsResponse)(nil),      // 39: objectfs.v1alpha1.ListBlobsResponse
-	(*GetBlobRequest)(nil),         // 40: objectfs.v1alpha1.GetBlobRequest
-	(*GetBlobResponse)(nil),        // 41: objectfs.v1alpha1.GetBlobResponse
-	(*ListVolumesRequest)(nil),     // 42: objectfs.v1alpha1.ListVolumesRequest
-	(*VolumeInfo)(nil),             // 43: objectfs.v1alpha1.VolumeInfo
-	(*ListVolumesResponse)(nil),    // 44: objectfs.v1alpha1.ListVolumesResponse
-	(*SnapshotInfo)(nil),           // 45: objectfs.v1alpha1.SnapshotInfo
-	(*ListSnapshotsRequest)(nil),   // 46: objectfs.v1alpha1.ListSnapshotsRequest
-	(*ListSnapshotsResponse)(nil),  // 47: objectfs.v1alpha1.ListSnapshotsResponse
-	(*CreateSnapshotRequest)(nil),  // 48: objectfs.v1alpha1.CreateSnapshotRequest
-	(*CreateSnapshotResponse)(nil), // 49: objectfs.v1alpha1.CreateSnapshotResponse
-	(*MutationRecord)(nil),         // 50: objectfs.v1alpha1.MutationRecord
-	(*Inode)(nil),                  // 51: objectfs.v1alpha1.Inode
-	(*DirEntry)(nil),               // 52: objectfs.v1alpha1.DirEntry
-	(*Content)(nil),                // 53: objectfs.v1alpha1.Content
-	(*FileChunk)(nil),              // 54: objectfs.v1alpha1.FileChunk
-	(*timestamppb.Timestamp)(nil),  // 55: google.protobuf.Timestamp
+	(*EntryAttr)(nil),              // 2: objectfs.v1alpha1.EntryAttr
+	(*GetAttrRequest)(nil),         // 3: objectfs.v1alpha1.GetAttrRequest
+	(*GetAttrResponse)(nil),        // 4: objectfs.v1alpha1.GetAttrResponse
+	(*SetAttrRequest)(nil),         // 5: objectfs.v1alpha1.SetAttrRequest
+	(*SetAttrResponse)(nil),        // 6: objectfs.v1alpha1.SetAttrResponse
+	(*LookupRequest)(nil),          // 7: objectfs.v1alpha1.LookupRequest
+	(*LookupResponse)(nil),         // 8: objectfs.v1alpha1.LookupResponse
+	(*ReadDirRequest)(nil),         // 9: objectfs.v1alpha1.ReadDirRequest
+	(*ReadDirResponse)(nil),        // 10: objectfs.v1alpha1.ReadDirResponse
+	(*MkdirRequest)(nil),           // 11: objectfs.v1alpha1.MkdirRequest
+	(*MkdirResponse)(nil),          // 12: objectfs.v1alpha1.MkdirResponse
+	(*CreateFileRequest)(nil),      // 13: objectfs.v1alpha1.CreateFileRequest
+	(*CreateFileResponse)(nil),     // 14: objectfs.v1alpha1.CreateFileResponse
+	(*ReadFileRequest)(nil),        // 15: objectfs.v1alpha1.ReadFileRequest
+	(*ReadFileResponse)(nil),       // 16: objectfs.v1alpha1.ReadFileResponse
+	(*WriteFileRequest)(nil),       // 17: objectfs.v1alpha1.WriteFileRequest
+	(*WriteFileResponse)(nil),      // 18: objectfs.v1alpha1.WriteFileResponse
+	(*TruncateFileRequest)(nil),    // 19: objectfs.v1alpha1.TruncateFileRequest
+	(*TruncateFileResponse)(nil),   // 20: objectfs.v1alpha1.TruncateFileResponse
+	(*UnlinkRequest)(nil),          // 21: objectfs.v1alpha1.UnlinkRequest
+	(*UnlinkResponse)(nil),         // 22: objectfs.v1alpha1.UnlinkResponse
+	(*RmdirRequest)(nil),           // 23: objectfs.v1alpha1.RmdirRequest
+	(*RmdirResponse)(nil),          // 24: objectfs.v1alpha1.RmdirResponse
+	(*RenameRequest)(nil),          // 25: objectfs.v1alpha1.RenameRequest
+	(*RenameResponse)(nil),         // 26: objectfs.v1alpha1.RenameResponse
+	(*FsyncRequest)(nil),           // 27: objectfs.v1alpha1.FsyncRequest
+	(*FsyncResponse)(nil),          // 28: objectfs.v1alpha1.FsyncResponse
+	(*WatchVolumeRequest)(nil),     // 29: objectfs.v1alpha1.WatchVolumeRequest
+	(*WatchVolumeResponse)(nil),    // 30: objectfs.v1alpha1.WatchVolumeResponse
+	(*SymlinkRequest)(nil),         // 31: objectfs.v1alpha1.SymlinkRequest
+	(*SymlinkResponse)(nil),        // 32: objectfs.v1alpha1.SymlinkResponse
+	(*ReadlinkRequest)(nil),        // 33: objectfs.v1alpha1.ReadlinkRequest
+	(*ReadlinkResponse)(nil),       // 34: objectfs.v1alpha1.ReadlinkResponse
+	(*LinkRequest)(nil),            // 35: objectfs.v1alpha1.LinkRequest
+	(*LinkResponse)(nil),           // 36: objectfs.v1alpha1.LinkResponse
+	(*ListBlobsRequest)(nil),       // 37: objectfs.v1alpha1.ListBlobsRequest
+	(*ListBlobsResponse)(nil),      // 38: objectfs.v1alpha1.ListBlobsResponse
+	(*GetBlobRequest)(nil),         // 39: objectfs.v1alpha1.GetBlobRequest
+	(*GetBlobResponse)(nil),        // 40: objectfs.v1alpha1.GetBlobResponse
+	(*ListVolumesRequest)(nil),     // 41: objectfs.v1alpha1.ListVolumesRequest
+	(*VolumeInfo)(nil),             // 42: objectfs.v1alpha1.VolumeInfo
+	(*ListVolumesResponse)(nil),    // 43: objectfs.v1alpha1.ListVolumesResponse
+	(*SnapshotInfo)(nil),           // 44: objectfs.v1alpha1.SnapshotInfo
+	(*ListSnapshotsRequest)(nil),   // 45: objectfs.v1alpha1.ListSnapshotsRequest
+	(*ListSnapshotsResponse)(nil),  // 46: objectfs.v1alpha1.ListSnapshotsResponse
+	(*CreateSnapshotRequest)(nil),  // 47: objectfs.v1alpha1.CreateSnapshotRequest
+	(*CreateSnapshotResponse)(nil), // 48: objectfs.v1alpha1.CreateSnapshotResponse
+	(*Inode)(nil),                  // 49: objectfs.v1alpha1.Inode
+	(*DirEntry)(nil),               // 50: objectfs.v1alpha1.DirEntry
+	(*Content)(nil),                // 51: objectfs.v1alpha1.Content
+	(*FileChunk)(nil),              // 52: objectfs.v1alpha1.FileChunk
+	(*timestamppb.Timestamp)(nil),  // 53: google.protobuf.Timestamp
 }
 var file_proto_objectfs_proto_depIdxs = []int32{
-	55, // 0: objectfs.v1alpha1.EntryAttr.mod_time:type_name -> google.protobuf.Timestamp
-	55, // 1: objectfs.v1alpha1.EntryAttr.atime:type_name -> google.protobuf.Timestamp
-	55, // 2: objectfs.v1alpha1.EntryAttr.ctime:type_name -> google.protobuf.Timestamp
-	3,  // 3: objectfs.v1alpha1.GetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	55, // 4: objectfs.v1alpha1.SetAttrRequest.atime:type_name -> google.protobuf.Timestamp
-	55, // 5: objectfs.v1alpha1.SetAttrRequest.mtime:type_name -> google.protobuf.Timestamp
-	55, // 6: objectfs.v1alpha1.SetAttrRequest.ctime:type_name -> google.protobuf.Timestamp
-	3,  // 7: objectfs.v1alpha1.SetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	3,  // 8: objectfs.v1alpha1.LookupResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	3,  // 9: objectfs.v1alpha1.ReadDirResponse.entries:type_name -> objectfs.v1alpha1.EntryAttr
-	3,  // 10: objectfs.v1alpha1.MkdirResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	3,  // 11: objectfs.v1alpha1.CreateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	53, // 0: objectfs.v1alpha1.EntryAttr.mod_time:type_name -> google.protobuf.Timestamp
+	53, // 1: objectfs.v1alpha1.EntryAttr.atime:type_name -> google.protobuf.Timestamp
+	53, // 2: objectfs.v1alpha1.EntryAttr.ctime:type_name -> google.protobuf.Timestamp
+	2,  // 3: objectfs.v1alpha1.GetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	53, // 4: objectfs.v1alpha1.SetAttrRequest.atime:type_name -> google.protobuf.Timestamp
+	53, // 5: objectfs.v1alpha1.SetAttrRequest.mtime:type_name -> google.protobuf.Timestamp
+	53, // 6: objectfs.v1alpha1.SetAttrRequest.ctime:type_name -> google.protobuf.Timestamp
+	2,  // 7: objectfs.v1alpha1.SetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	2,  // 8: objectfs.v1alpha1.LookupResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	2,  // 9: objectfs.v1alpha1.ReadDirResponse.entries:type_name -> objectfs.v1alpha1.EntryAttr
+	2,  // 10: objectfs.v1alpha1.MkdirResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	2,  // 11: objectfs.v1alpha1.CreateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	0,  // 12: objectfs.v1alpha1.WriteFileRequest.write_mode:type_name -> objectfs.v1alpha1.WriteMode
-	55, // 13: objectfs.v1alpha1.WriteFileResponse.mod_time:type_name -> google.protobuf.Timestamp
-	3,  // 14: objectfs.v1alpha1.TruncateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	3,  // 15: objectfs.v1alpha1.RenameResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	53, // 13: objectfs.v1alpha1.WriteFileResponse.mod_time:type_name -> google.protobuf.Timestamp
+	2,  // 14: objectfs.v1alpha1.TruncateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	2,  // 15: objectfs.v1alpha1.RenameResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	1,  // 16: objectfs.v1alpha1.WatchVolumeResponse.event_type:type_name -> objectfs.v1alpha1.WatchEventType
-	3,  // 17: objectfs.v1alpha1.WatchVolumeResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	3,  // 18: objectfs.v1alpha1.SymlinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	3,  // 19: objectfs.v1alpha1.LinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	43, // 20: objectfs.v1alpha1.ListVolumesResponse.volumes:type_name -> objectfs.v1alpha1.VolumeInfo
-	55, // 21: objectfs.v1alpha1.SnapshotInfo.created_at:type_name -> google.protobuf.Timestamp
-	55, // 22: objectfs.v1alpha1.ListSnapshotsRequest.from_time:type_name -> google.protobuf.Timestamp
-	55, // 23: objectfs.v1alpha1.ListSnapshotsRequest.to_time:type_name -> google.protobuf.Timestamp
-	45, // 24: objectfs.v1alpha1.ListSnapshotsResponse.snapshots:type_name -> objectfs.v1alpha1.SnapshotInfo
-	45, // 25: objectfs.v1alpha1.CreateSnapshotResponse.snapshot:type_name -> objectfs.v1alpha1.SnapshotInfo
-	2,  // 26: objectfs.v1alpha1.MutationRecord.type:type_name -> objectfs.v1alpha1.MutationType
-	55, // 27: objectfs.v1alpha1.MutationRecord.mod_time:type_name -> google.protobuf.Timestamp
-	55, // 28: objectfs.v1alpha1.MutationRecord.atime:type_name -> google.protobuf.Timestamp
-	55, // 29: objectfs.v1alpha1.MutationRecord.ctime:type_name -> google.protobuf.Timestamp
-	55, // 30: objectfs.v1alpha1.Inode.mtime:type_name -> google.protobuf.Timestamp
-	55, // 31: objectfs.v1alpha1.Inode.atime:type_name -> google.protobuf.Timestamp
-	55, // 32: objectfs.v1alpha1.Inode.ctime:type_name -> google.protobuf.Timestamp
-	4,  // 33: objectfs.v1alpha1.ObjectFSController.GetAttr:input_type -> objectfs.v1alpha1.GetAttrRequest
-	6,  // 34: objectfs.v1alpha1.ObjectFSController.SetAttr:input_type -> objectfs.v1alpha1.SetAttrRequest
-	8,  // 35: objectfs.v1alpha1.ObjectFSController.Lookup:input_type -> objectfs.v1alpha1.LookupRequest
-	10, // 36: objectfs.v1alpha1.ObjectFSController.ReadDir:input_type -> objectfs.v1alpha1.ReadDirRequest
-	12, // 37: objectfs.v1alpha1.ObjectFSController.Mkdir:input_type -> objectfs.v1alpha1.MkdirRequest
-	14, // 38: objectfs.v1alpha1.ObjectFSController.CreateFile:input_type -> objectfs.v1alpha1.CreateFileRequest
-	16, // 39: objectfs.v1alpha1.ObjectFSController.ReadFile:input_type -> objectfs.v1alpha1.ReadFileRequest
-	18, // 40: objectfs.v1alpha1.ObjectFSController.WriteFile:input_type -> objectfs.v1alpha1.WriteFileRequest
-	20, // 41: objectfs.v1alpha1.ObjectFSController.TruncateFile:input_type -> objectfs.v1alpha1.TruncateFileRequest
-	22, // 42: objectfs.v1alpha1.ObjectFSController.Unlink:input_type -> objectfs.v1alpha1.UnlinkRequest
-	24, // 43: objectfs.v1alpha1.ObjectFSController.Rmdir:input_type -> objectfs.v1alpha1.RmdirRequest
-	26, // 44: objectfs.v1alpha1.ObjectFSController.Rename:input_type -> objectfs.v1alpha1.RenameRequest
-	28, // 45: objectfs.v1alpha1.ObjectFSController.Fsync:input_type -> objectfs.v1alpha1.FsyncRequest
-	30, // 46: objectfs.v1alpha1.ObjectFSController.WatchVolume:input_type -> objectfs.v1alpha1.WatchVolumeRequest
-	32, // 47: objectfs.v1alpha1.ObjectFSController.Symlink:input_type -> objectfs.v1alpha1.SymlinkRequest
-	34, // 48: objectfs.v1alpha1.ObjectFSController.Readlink:input_type -> objectfs.v1alpha1.ReadlinkRequest
-	36, // 49: objectfs.v1alpha1.ObjectFSController.Link:input_type -> objectfs.v1alpha1.LinkRequest
-	38, // 50: objectfs.v1alpha1.ObjectFSController.ListBlobs:input_type -> objectfs.v1alpha1.ListBlobsRequest
-	40, // 51: objectfs.v1alpha1.ObjectFSController.GetBlob:input_type -> objectfs.v1alpha1.GetBlobRequest
-	42, // 52: objectfs.v1alpha1.ObjectFSController.ListVolumes:input_type -> objectfs.v1alpha1.ListVolumesRequest
-	46, // 53: objectfs.v1alpha1.ObjectFSController.ListSnapshots:input_type -> objectfs.v1alpha1.ListSnapshotsRequest
-	48, // 54: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:input_type -> objectfs.v1alpha1.CreateSnapshotRequest
-	5,  // 55: objectfs.v1alpha1.ObjectFSController.GetAttr:output_type -> objectfs.v1alpha1.GetAttrResponse
-	7,  // 56: objectfs.v1alpha1.ObjectFSController.SetAttr:output_type -> objectfs.v1alpha1.SetAttrResponse
-	9,  // 57: objectfs.v1alpha1.ObjectFSController.Lookup:output_type -> objectfs.v1alpha1.LookupResponse
-	11, // 58: objectfs.v1alpha1.ObjectFSController.ReadDir:output_type -> objectfs.v1alpha1.ReadDirResponse
-	13, // 59: objectfs.v1alpha1.ObjectFSController.Mkdir:output_type -> objectfs.v1alpha1.MkdirResponse
-	15, // 60: objectfs.v1alpha1.ObjectFSController.CreateFile:output_type -> objectfs.v1alpha1.CreateFileResponse
-	17, // 61: objectfs.v1alpha1.ObjectFSController.ReadFile:output_type -> objectfs.v1alpha1.ReadFileResponse
-	19, // 62: objectfs.v1alpha1.ObjectFSController.WriteFile:output_type -> objectfs.v1alpha1.WriteFileResponse
-	21, // 63: objectfs.v1alpha1.ObjectFSController.TruncateFile:output_type -> objectfs.v1alpha1.TruncateFileResponse
-	23, // 64: objectfs.v1alpha1.ObjectFSController.Unlink:output_type -> objectfs.v1alpha1.UnlinkResponse
-	25, // 65: objectfs.v1alpha1.ObjectFSController.Rmdir:output_type -> objectfs.v1alpha1.RmdirResponse
-	27, // 66: objectfs.v1alpha1.ObjectFSController.Rename:output_type -> objectfs.v1alpha1.RenameResponse
-	29, // 67: objectfs.v1alpha1.ObjectFSController.Fsync:output_type -> objectfs.v1alpha1.FsyncResponse
-	31, // 68: objectfs.v1alpha1.ObjectFSController.WatchVolume:output_type -> objectfs.v1alpha1.WatchVolumeResponse
-	33, // 69: objectfs.v1alpha1.ObjectFSController.Symlink:output_type -> objectfs.v1alpha1.SymlinkResponse
-	35, // 70: objectfs.v1alpha1.ObjectFSController.Readlink:output_type -> objectfs.v1alpha1.ReadlinkResponse
-	37, // 71: objectfs.v1alpha1.ObjectFSController.Link:output_type -> objectfs.v1alpha1.LinkResponse
-	39, // 72: objectfs.v1alpha1.ObjectFSController.ListBlobs:output_type -> objectfs.v1alpha1.ListBlobsResponse
-	41, // 73: objectfs.v1alpha1.ObjectFSController.GetBlob:output_type -> objectfs.v1alpha1.GetBlobResponse
-	44, // 74: objectfs.v1alpha1.ObjectFSController.ListVolumes:output_type -> objectfs.v1alpha1.ListVolumesResponse
-	47, // 75: objectfs.v1alpha1.ObjectFSController.ListSnapshots:output_type -> objectfs.v1alpha1.ListSnapshotsResponse
-	49, // 76: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:output_type -> objectfs.v1alpha1.CreateSnapshotResponse
-	55, // [55:77] is the sub-list for method output_type
-	33, // [33:55] is the sub-list for method input_type
-	33, // [33:33] is the sub-list for extension type_name
-	33, // [33:33] is the sub-list for extension extendee
-	0,  // [0:33] is the sub-list for field type_name
+	2,  // 17: objectfs.v1alpha1.WatchVolumeResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	2,  // 18: objectfs.v1alpha1.SymlinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	2,  // 19: objectfs.v1alpha1.LinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	42, // 20: objectfs.v1alpha1.ListVolumesResponse.volumes:type_name -> objectfs.v1alpha1.VolumeInfo
+	53, // 21: objectfs.v1alpha1.SnapshotInfo.created_at:type_name -> google.protobuf.Timestamp
+	53, // 22: objectfs.v1alpha1.ListSnapshotsRequest.from_time:type_name -> google.protobuf.Timestamp
+	53, // 23: objectfs.v1alpha1.ListSnapshotsRequest.to_time:type_name -> google.protobuf.Timestamp
+	44, // 24: objectfs.v1alpha1.ListSnapshotsResponse.snapshots:type_name -> objectfs.v1alpha1.SnapshotInfo
+	44, // 25: objectfs.v1alpha1.CreateSnapshotResponse.snapshot:type_name -> objectfs.v1alpha1.SnapshotInfo
+	53, // 26: objectfs.v1alpha1.Inode.mtime:type_name -> google.protobuf.Timestamp
+	53, // 27: objectfs.v1alpha1.Inode.atime:type_name -> google.protobuf.Timestamp
+	53, // 28: objectfs.v1alpha1.Inode.ctime:type_name -> google.protobuf.Timestamp
+	3,  // 29: objectfs.v1alpha1.ObjectFSController.GetAttr:input_type -> objectfs.v1alpha1.GetAttrRequest
+	5,  // 30: objectfs.v1alpha1.ObjectFSController.SetAttr:input_type -> objectfs.v1alpha1.SetAttrRequest
+	7,  // 31: objectfs.v1alpha1.ObjectFSController.Lookup:input_type -> objectfs.v1alpha1.LookupRequest
+	9,  // 32: objectfs.v1alpha1.ObjectFSController.ReadDir:input_type -> objectfs.v1alpha1.ReadDirRequest
+	11, // 33: objectfs.v1alpha1.ObjectFSController.Mkdir:input_type -> objectfs.v1alpha1.MkdirRequest
+	13, // 34: objectfs.v1alpha1.ObjectFSController.CreateFile:input_type -> objectfs.v1alpha1.CreateFileRequest
+	15, // 35: objectfs.v1alpha1.ObjectFSController.ReadFile:input_type -> objectfs.v1alpha1.ReadFileRequest
+	17, // 36: objectfs.v1alpha1.ObjectFSController.WriteFile:input_type -> objectfs.v1alpha1.WriteFileRequest
+	19, // 37: objectfs.v1alpha1.ObjectFSController.TruncateFile:input_type -> objectfs.v1alpha1.TruncateFileRequest
+	21, // 38: objectfs.v1alpha1.ObjectFSController.Unlink:input_type -> objectfs.v1alpha1.UnlinkRequest
+	23, // 39: objectfs.v1alpha1.ObjectFSController.Rmdir:input_type -> objectfs.v1alpha1.RmdirRequest
+	25, // 40: objectfs.v1alpha1.ObjectFSController.Rename:input_type -> objectfs.v1alpha1.RenameRequest
+	27, // 41: objectfs.v1alpha1.ObjectFSController.Fsync:input_type -> objectfs.v1alpha1.FsyncRequest
+	29, // 42: objectfs.v1alpha1.ObjectFSController.WatchVolume:input_type -> objectfs.v1alpha1.WatchVolumeRequest
+	31, // 43: objectfs.v1alpha1.ObjectFSController.Symlink:input_type -> objectfs.v1alpha1.SymlinkRequest
+	33, // 44: objectfs.v1alpha1.ObjectFSController.Readlink:input_type -> objectfs.v1alpha1.ReadlinkRequest
+	35, // 45: objectfs.v1alpha1.ObjectFSController.Link:input_type -> objectfs.v1alpha1.LinkRequest
+	37, // 46: objectfs.v1alpha1.ObjectFSController.ListBlobs:input_type -> objectfs.v1alpha1.ListBlobsRequest
+	39, // 47: objectfs.v1alpha1.ObjectFSController.GetBlob:input_type -> objectfs.v1alpha1.GetBlobRequest
+	41, // 48: objectfs.v1alpha1.ObjectFSController.ListVolumes:input_type -> objectfs.v1alpha1.ListVolumesRequest
+	45, // 49: objectfs.v1alpha1.ObjectFSController.ListSnapshots:input_type -> objectfs.v1alpha1.ListSnapshotsRequest
+	47, // 50: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:input_type -> objectfs.v1alpha1.CreateSnapshotRequest
+	4,  // 51: objectfs.v1alpha1.ObjectFSController.GetAttr:output_type -> objectfs.v1alpha1.GetAttrResponse
+	6,  // 52: objectfs.v1alpha1.ObjectFSController.SetAttr:output_type -> objectfs.v1alpha1.SetAttrResponse
+	8,  // 53: objectfs.v1alpha1.ObjectFSController.Lookup:output_type -> objectfs.v1alpha1.LookupResponse
+	10, // 54: objectfs.v1alpha1.ObjectFSController.ReadDir:output_type -> objectfs.v1alpha1.ReadDirResponse
+	12, // 55: objectfs.v1alpha1.ObjectFSController.Mkdir:output_type -> objectfs.v1alpha1.MkdirResponse
+	14, // 56: objectfs.v1alpha1.ObjectFSController.CreateFile:output_type -> objectfs.v1alpha1.CreateFileResponse
+	16, // 57: objectfs.v1alpha1.ObjectFSController.ReadFile:output_type -> objectfs.v1alpha1.ReadFileResponse
+	18, // 58: objectfs.v1alpha1.ObjectFSController.WriteFile:output_type -> objectfs.v1alpha1.WriteFileResponse
+	20, // 59: objectfs.v1alpha1.ObjectFSController.TruncateFile:output_type -> objectfs.v1alpha1.TruncateFileResponse
+	22, // 60: objectfs.v1alpha1.ObjectFSController.Unlink:output_type -> objectfs.v1alpha1.UnlinkResponse
+	24, // 61: objectfs.v1alpha1.ObjectFSController.Rmdir:output_type -> objectfs.v1alpha1.RmdirResponse
+	26, // 62: objectfs.v1alpha1.ObjectFSController.Rename:output_type -> objectfs.v1alpha1.RenameResponse
+	28, // 63: objectfs.v1alpha1.ObjectFSController.Fsync:output_type -> objectfs.v1alpha1.FsyncResponse
+	30, // 64: objectfs.v1alpha1.ObjectFSController.WatchVolume:output_type -> objectfs.v1alpha1.WatchVolumeResponse
+	32, // 65: objectfs.v1alpha1.ObjectFSController.Symlink:output_type -> objectfs.v1alpha1.SymlinkResponse
+	34, // 66: objectfs.v1alpha1.ObjectFSController.Readlink:output_type -> objectfs.v1alpha1.ReadlinkResponse
+	36, // 67: objectfs.v1alpha1.ObjectFSController.Link:output_type -> objectfs.v1alpha1.LinkResponse
+	38, // 68: objectfs.v1alpha1.ObjectFSController.ListBlobs:output_type -> objectfs.v1alpha1.ListBlobsResponse
+	40, // 69: objectfs.v1alpha1.ObjectFSController.GetBlob:output_type -> objectfs.v1alpha1.GetBlobResponse
+	43, // 70: objectfs.v1alpha1.ObjectFSController.ListVolumes:output_type -> objectfs.v1alpha1.ListVolumesResponse
+	46, // 71: objectfs.v1alpha1.ObjectFSController.ListSnapshots:output_type -> objectfs.v1alpha1.ListSnapshotsResponse
+	48, // 72: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:output_type -> objectfs.v1alpha1.CreateSnapshotResponse
+	51, // [51:73] is the sub-list for method output_type
+	29, // [29:51] is the sub-list for method input_type
+	29, // [29:29] is the sub-list for extension type_name
+	29, // [29:29] is the sub-list for extension extendee
+	0,  // [0:29] is the sub-list for field type_name
 }
 
 func init() { file_proto_objectfs_proto_init() }
@@ -4299,17 +3952,17 @@ func file_proto_objectfs_proto_init() {
 		return
 	}
 	file_proto_objectfs_proto_msgTypes[3].OneofWrappers = []any{}
+	file_proto_objectfs_proto_msgTypes[47].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[48].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[49].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[50].OneofWrappers = []any{}
-	file_proto_objectfs_proto_msgTypes[51].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_objectfs_proto_rawDesc), len(file_proto_objectfs_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   52,
+			NumEnums:      2,
+			NumMessages:   51,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

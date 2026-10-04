@@ -363,47 +363,6 @@ message CreateSnapshotResponse {
   SnapshotInfo snapshot = 2;
 }
 
-enum MutationType {
-  MUTATION_TYPE_UNSPECIFIED = 0;
-  MUTATION_TYPE_MKDIR = 1;
-  MUTATION_TYPE_CREATE_FILE = 2;
-  MUTATION_TYPE_WRITE_FILE = 3;
-  MUTATION_TYPE_TRUNCATE_FILE = 4;
-  MUTATION_TYPE_UNLINK = 5;
-  MUTATION_TYPE_RMDIR = 6;
-  MUTATION_TYPE_RENAME = 7;
-  MUTATION_TYPE_SETATTR = 8;
-  MUTATION_TYPE_SYMLINK = 9;
-  MUTATION_TYPE_LINK = 10;
-}
-
-message MutationRecord {
-  MutationType type = 1;
-  string volume_id = 2;
-  uint32 mode = 3;
-  int64 size = 4;
-  int64 offset = 5;
-  google.protobuf.Timestamp mod_time = 6;
-  string sha256 = 7;
-  uint64 inode = 8;
-  bytes data = 9;
-  uint64 stream_seq = 10;
-  uint32 uid = 11;
-  uint32 gid = 12;
-  string manifest_sha256 = 13;
-  string content_sha256 = 14;
-  uint64 parent_inode = 15;
-  string name = 16;
-  uint64 old_parent_inode = 17;
-  string old_name = 18;
-  google.protobuf.Timestamp atime = 19;
-  google.protobuf.Timestamp ctime = 20;
-  string symlink_target = 21;
-  uint32 nlink = 22;
-  uint64 old_inode = 23;
-  uint32 rdev = 24;
-}
-
 message Inode {
   optional uint64 ino = 1;
   uint32 mode = 2;

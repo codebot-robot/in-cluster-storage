@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -534,30 +533,16 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 		t.Fatalf("FlushAll failed: %v", err)
 	}
 
-	// Verify raw objects and metadata file exist in backend
-	var f1Buf bytes.Buffer
-	err = backend.GetObject(ctx, volumeID, "file1.txt", 0, 100, &f1Buf)
-	f1Data := f1Buf.Bytes()
-	if err != nil || string(f1Data) != "file 1 initial data" {
-		t.Fatalf("Expected file1 in backend with initial data, got: %q, err: %v", string(f1Data), err)
+	// Verify snapshots exist in backend
+	snaps, err := backend.ListObjects(ctx, "", "volumes/"+volumeID+"/meta/")
+	if err != nil || len(snaps) == 0 {
+		t.Fatalf("Expected snapshot in backend, got: %v (err=%v)", snaps, err)
 	}
 
+	// Verify metadata JSON file is NOT uploaded
 	var metaBuf bytes.Buffer
-	err = backend.GetObject(ctx, volumeID, MetadataFileName, 0, 0, &metaBuf)
-	metaBytes := metaBuf.Bytes()
-	if err != nil || len(metaBytes) == 0 {
-		t.Fatalf("Expected metadata file in backend, got err: %v", err)
-	}
-
-	var meta VolumeMetadata
-	if err := json.Unmarshal(metaBytes, &meta); err != nil {
-		t.Fatalf("Failed to unmarshal metadata: %v", err)
-	}
-	if len(meta.Entries) != 3 { // root /, /file1.txt, /file2.txt
-		t.Fatalf("Expected 3 entries in metadata, got %d", len(meta.Entries))
-	}
-	if meta.Entries["/file1.txt"].Size != int64(len("file 1 initial data")) {
-		t.Fatalf("Unexpected file1 metadata size: %d", meta.Entries["/file1.txt"].Size)
+	if err := backend.GetObject(ctx, volumeID, ".objectfs-metadata.json", 0, 0, &metaBuf); err == nil {
+		t.Fatalf("Expected no .objectfs-metadata.json in backend, but found one")
 	}
 
 	// Incremental write: modify only file2
@@ -577,19 +562,6 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 		t.Fatalf("Second FlushAll failed: %v", err)
 	}
 
-	// Verify file2 updated and file1 deleted in backend
-	var f2Buf bytes.Buffer
-	err = backend.GetObject(ctx, volumeID, "file2.txt", 0, 100, &f2Buf)
-	f2Data := f2Buf.Bytes()
-	if err != nil || string(f2Data) != "file 2 updated content!" {
-		t.Fatalf("Expected updated file2 in backend, got: %q, err: %v", string(f2Data), err)
-	}
-
-	var f1DeletedBuf bytes.Buffer
-	if err := backend.GetObject(ctx, volumeID, "file1.txt", 0, 100, &f1DeletedBuf); err == nil {
-		t.Fatalf("Expected file1 to be deleted from backend after unlink & flush")
-	}
-
 	// Test Recovery / LoadFromBackend
 	// Create a new server pointing to the same backend
 	newServer := NewServer(backend)
@@ -599,6 +571,12 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 	}
 	if string(readResp.GetData()) != "file 2 updated content!" {
 		t.Fatalf("Expected recovered server to read 'file 2 updated content!', got: %q", string(readResp.GetData()))
+	}
+
+	// Verify unlinked file1 is not found on recovered server
+	resp, err := testReadFile(ctx, newServer, volumeID, "/file1.txt", 0, 100)
+	if err != nil || resp.GetError() == 0 {
+		t.Fatalf("Expected file1 to be absent on recovered server, got resp=%v, err=%v", resp, err)
 	}
 }
 
@@ -620,12 +598,14 @@ func TestPeriodicFlusherLifecycle(t *testing.T) {
 
 	server.StopPeriodicFlush()
 
-	// Verify backend received the file
-	var autoBuf bytes.Buffer
-	err = backend.GetObject(ctx, volumeID, "auto-flushed.txt", 0, 100, &autoBuf)
-	data := autoBuf.Bytes()
-	if err != nil || string(data) != "auto flushed data" {
-		t.Fatalf("Expected periodic flusher to sync auto-flushed.txt to backend, got %q (err=%v)", string(data), err)
+	// Verify recovered server reads the auto-flushed file
+	newServer := NewServer(backend)
+	readResp, err := testReadFile(ctx, newServer, volumeID, "/auto-flushed.txt", 0, 100)
+	if err != nil {
+		t.Fatalf("Failed to read auto-flushed file from recovered server: %v", err)
+	}
+	if string(readResp.GetData()) != "auto flushed data" {
+		t.Fatalf("Expected 'auto flushed data', got %q", string(readResp.GetData()))
 	}
 }
 
@@ -1557,141 +1537,90 @@ func TestApplyRecordDirect(t *testing.T) {
 	backend := NewMemoryBackend()
 	vol := NewVolume("apply-test", backend, NewEventBroadcaster())
 
-	// Apply Mkdir
-	err := vol.ApplyRecordLocked(&MutationRecord{
-		Type:        MutationMkdir,
-		VolumeId:    "apply-test",
-		ParentInode: 1,
-		Name:        "c",
-		Mode:        0755,
-		Inode:       10,
-	})
+	// Direct Mkdir
+	dirAttr, err := vol.Mkdir(ctx, 1, "c", 0755, 0, 0)
 	if err != nil {
-		t.Fatalf("Apply Mkdir failed: %v", err)
+		t.Fatalf("Mkdir failed: %v", err)
 	}
 
-	attr, err := vol.GetAttr(ctx, 10)
+	attr, err := vol.GetAttr(ctx, dirAttr.Inode)
 	if err != nil || !attr.IsDir {
-		t.Fatalf("Expected directory inode 10: %v", err)
+		t.Fatalf("Expected directory inode %d: %v", dirAttr.Inode, err)
 	}
 
-	// Apply CreateFile
-	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:        MutationCreateFile,
-		VolumeId:    "apply-test",
-		ParentInode: 10,
-		Name:        "foo.txt",
-		Mode:        0644,
-		Size:        4,
-		Inode:       11,
-		Data:        []byte("test"),
-	})
+	// Direct CreateFile
+	fileAttr, err := vol.CreateFile(ctx, dirAttr.Inode, "foo.txt", 0644, []byte("test"), 0, 0)
 	if err != nil {
-		t.Fatalf("Apply CreateFile failed: %v", err)
+		t.Fatalf("CreateFile failed: %v", err)
 	}
 
-	data, total, _, err := vol.ReadFile(ctx, 11, 0, 100)
+	data, total, _, err := vol.ReadFile(ctx, fileAttr.Inode, 0, 100)
 	if err != nil || total != 4 || string(data) != "test" {
 		t.Fatalf("Unexpected file content: %s (err: %v)", string(data), err)
 	}
 
-	// Apply TruncateFile
-	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:     MutationTruncateFile,
-		VolumeId: "apply-test",
-		Inode:    11,
-		Size:     2,
-	})
+	// Direct TruncateFile
+	_, err = vol.TruncateFile(ctx, fileAttr.Inode, 2)
 	if err != nil {
-		t.Fatalf("Apply TruncateFile failed: %v", err)
+		t.Fatalf("TruncateFile failed: %v", err)
 	}
-	data, total, _, err = vol.ReadFile(ctx, 11, 0, 100)
+	data, total, _, err = vol.ReadFile(ctx, fileAttr.Inode, 0, 100)
 	if err != nil || total != 2 || string(data) != "te" {
 		t.Fatalf("Unexpected truncated content: %s (err: %v)", string(data), err)
 	}
 
-	// Apply Rename
-	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:           MutationRename,
-		VolumeId:       "apply-test",
-		OldParentInode: 10,
-		OldName:        "foo.txt",
-		ParentInode:    10,
-		Name:           "bar.txt",
-	})
+	// Direct Rename
+	_, err = vol.Rename(ctx, dirAttr.Inode, "foo.txt", dirAttr.Inode, "bar.txt")
 	if err != nil {
-		t.Fatalf("Apply Rename failed: %v", err)
+		t.Fatalf("Rename failed: %v", err)
 	}
-	_, err = vol.Lookup(ctx, 10, "foo.txt")
+	_, err = vol.Lookup(ctx, dirAttr.Inode, "foo.txt")
 	if err == nil {
 		t.Fatalf("Expected foo.txt to be removed after rename")
 	}
-	barAttr, err := vol.Lookup(ctx, 10, "bar.txt")
+	barAttr, err := vol.Lookup(ctx, dirAttr.Inode, "bar.txt")
 	if err != nil || barAttr.Name != "bar.txt" {
 		t.Fatalf("Expected bar.txt to exist: %v", err)
 	}
 
-	// Apply Unlink
-	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:        MutationUnlink,
-		VolumeId:    "apply-test",
-		ParentInode: 10,
-		Name:        "bar.txt",
-	})
+	// Direct Unlink
+	err = vol.Unlink(ctx, dirAttr.Inode, "bar.txt")
 	if err != nil {
-		t.Fatalf("Apply Unlink failed: %v", err)
+		t.Fatalf("Unlink failed: %v", err)
 	}
-	_, err = vol.Lookup(ctx, 10, "bar.txt")
+	_, err = vol.Lookup(ctx, dirAttr.Inode, "bar.txt")
 	if err == nil {
 		t.Fatalf("Expected bar.txt to be unlinked")
 	}
 
-	// Apply Rmdir
-	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:        MutationRmdir,
-		VolumeId:    "apply-test",
-		ParentInode: 1,
-		Name:        "c",
-	})
+	// Direct Rmdir
+	err = vol.Rmdir(ctx, 1, "c")
 	if err != nil {
-		t.Fatalf("Apply Rmdir failed: %v", err)
+		t.Fatalf("Rmdir failed: %v", err)
 	}
 	_, err = vol.Lookup(ctx, 1, "c")
 	if err == nil {
 		t.Fatalf("Expected c to be deleted")
 	}
 
-	// Apply Symlink
-	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:          MutationSymlink,
-		VolumeId:      "apply-test",
-		ParentInode:   1,
-		Name:          "symlink.txt",
-		Inode:         20,
-		SymlinkTarget: "target.txt",
-	})
+	// Direct Symlink
+	symAttr, err := vol.Symlink(ctx, 1, "symlink.txt", "target.txt", 0, 0)
 	if err != nil {
-		t.Fatalf("Apply Symlink failed: %v", err)
+		t.Fatalf("Symlink failed: %v", err)
 	}
-	symAttr, err := vol.Lookup(ctx, 1, "symlink.txt")
-	if err != nil || symAttr.SymlinkTarget != "target.txt" || symAttr.Nlink != 1 {
-		t.Fatalf("Unexpected symlink attr: %v, err: %v", symAttr, err)
+	lookupSym, err := vol.Lookup(ctx, 1, "symlink.txt")
+	if err != nil || lookupSym.SymlinkTarget != "target.txt" || lookupSym.Nlink != 1 {
+		t.Fatalf("Unexpected symlink attr: %v, err: %v", lookupSym, err)
 	}
 
-	// Apply Link
-	err = vol.ApplyRecordLocked(&MutationRecord{
-		Type:        MutationLink,
-		VolumeId:    "apply-test",
-		OldInode:    20,
-		ParentInode: 1,
-		Name:        "symlink_link.txt",
-	})
+	// Direct Link
+	_, err = vol.Link(ctx, symAttr.Inode, 1, "symlink_link.txt")
 	if err != nil {
-		t.Fatalf("Apply Link failed: %v", err)
+		t.Fatalf("Link failed: %v", err)
 	}
-	linkAttr, err := vol.Lookup(ctx, 1, "symlink_link.txt")
-	if err != nil || linkAttr.Inode != 20 || linkAttr.Nlink != 2 {
-		t.Fatalf("Unexpected link attr: %v, err: %v", linkAttr, err)
+	lookupLink, err := vol.Lookup(ctx, 1, "symlink_link.txt")
+	if err != nil || lookupLink.Inode != symAttr.Inode || lookupLink.Nlink != 2 {
+		t.Fatalf("Unexpected link attr: %v, err: %v", lookupLink, err)
 	}
 }
 
