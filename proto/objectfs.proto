@@ -35,6 +35,9 @@ service ObjectFSController {
   rpc Rename(RenameRequest) returns (RenameResponse);
   rpc Fsync(FsyncRequest) returns (FsyncResponse);
   rpc WatchVolume(WatchVolumeRequest) returns (stream WatchVolumeResponse);
+  rpc Symlink(SymlinkRequest) returns (SymlinkResponse);
+  rpc Readlink(ReadlinkRequest) returns (ReadlinkResponse);
+  rpc Link(LinkRequest) returns (LinkResponse);
 
   rpc ListBlobs(ListBlobsRequest) returns (ListBlobsResponse);
   rpc GetBlob(GetBlobRequest) returns (stream GetBlobResponse);
@@ -65,6 +68,8 @@ message EntryAttr {
   string content_sha256 = 12;
   google.protobuf.Timestamp atime = 13;
   google.protobuf.Timestamp ctime = 14;
+  uint32 nlink = 15;
+  string symlink_target = 16;
 }
 
 message GetAttrRequest {
@@ -256,6 +261,42 @@ message WatchVolumeResponse {
   string old_name = 7;
 }
 
+message SymlinkRequest {
+  string volume_id = 1;
+  uint64 parent_inode = 2;
+  string name = 3;
+  string target = 4;
+  uint32 uid = 5;
+  uint32 gid = 6;
+}
+
+message SymlinkResponse {
+  EntryAttr attr = 1;
+  int32 error = 2;
+}
+
+message ReadlinkRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+}
+
+message ReadlinkResponse {
+  string target = 1;
+  int32 error = 2;
+}
+
+message LinkRequest {
+  string volume_id = 1;
+  uint64 old_inode = 2;
+  uint64 new_parent_inode = 3;
+  string new_name = 4;
+}
+
+message LinkResponse {
+  EntryAttr attr = 1;
+  int32 error = 2;
+}
+
 message ListBlobsRequest {
   string from_sha = 1;
   int32 limit = 2;
@@ -330,6 +371,8 @@ enum MutationType {
   MUTATION_TYPE_RMDIR = 6;
   MUTATION_TYPE_RENAME = 7;
   MUTATION_TYPE_SETATTR = 8;
+  MUTATION_TYPE_SYMLINK = 9;
+  MUTATION_TYPE_LINK = 10;
 }
 
 message MutationRecord {
@@ -353,6 +396,9 @@ message MutationRecord {
   string old_name = 18;
   google.protobuf.Timestamp atime = 19;
   google.protobuf.Timestamp ctime = 20;
+  string symlink_target = 21;
+  uint32 nlink = 22;
+  uint64 old_inode = 23;
 }
 
 message Inode {
@@ -370,6 +416,8 @@ message Inode {
   uint32 gid = 12;
   google.protobuf.Timestamp atime = 13;
   google.protobuf.Timestamp ctime = 14;
+  uint32 nlink = 15;
+  string symlink_target = 16;
 }
 
 message DirEntry {
