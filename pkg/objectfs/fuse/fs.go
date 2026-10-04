@@ -121,10 +121,16 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 	out.Mode = attr.GetMode()
 	if attr.GetIsDir() {
 		out.Mode |= syscall.S_IFDIR
-		out.Nlink = 2
+		if attr.GetNlink() > 0 {
+			out.Nlink = attr.GetNlink()
+		} else {
+			out.Nlink = 2
+		}
 	} else {
-		out.Mode |= syscall.S_IFREG
-		out.Nlink = 1
+		if (out.Mode & syscall.S_IFMT) == 0 {
+			out.Mode |= syscall.S_IFREG
+		}
+		out.Nlink = attr.GetNlink()
 	}
 	if attr.GetModTime() != nil {
 		t := attr.GetModTime().AsTime()
@@ -490,9 +496,13 @@ func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 	entries := resp.GetEntries()
 	for i := int(input.Offset); i < len(entries); i++ {
 		entry := entries[i]
-		mode := uint32(syscall.S_IFREG)
-		if entry.GetIsDir() {
-			mode = uint32(syscall.S_IFDIR)
+		mode := entry.GetMode()
+		if mode&syscall.S_IFMT == 0 {
+			if entry.GetIsDir() {
+				mode |= syscall.S_IFDIR
+			} else {
+				mode |= syscall.S_IFREG
+			}
 		}
 		if !out.AddDirEntry(fuse.DirEntry{
 			Mode: mode,
@@ -524,9 +534,13 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 	entries := resp.GetEntries()
 	for i := int(input.Offset); i < len(entries); i++ {
 		entry := entries[i]
-		mode := uint32(syscall.S_IFREG)
-		if entry.GetIsDir() {
-			mode = uint32(syscall.S_IFDIR)
+		mode := entry.GetMode()
+		if mode&syscall.S_IFMT == 0 {
+			if entry.GetIsDir() {
+				mode |= syscall.S_IFDIR
+			} else {
+				mode |= syscall.S_IFREG
+			}
 		}
 		entryOut := out.AddDirLookupEntry(fuse.DirEntry{
 			Mode: mode,
@@ -539,6 +553,79 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 		}
 		fs.fillEntryOut(entry, entryOut)
 	}
+	return fuse.OK
+}
+
+func (fs *ObjectFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, pointedTo string, linkName string, out *fuse.EntryOut) fuse.Status {
+	if len(linkName) > MaxNameLength {
+		return fuse.Status(syscall.ENAMETOOLONG)
+	}
+	ctx, cancelFunc := makeContext(cancel)
+	defer cancelFunc()
+
+	resp, err := fs.client.Symlink(ctx, &pb.SymlinkRequest{
+		VolumeId:    fs.volumeID,
+		ParentInode: header.NodeId,
+		Name:        linkName,
+		Target:      pointedTo,
+		Uid:         header.Uid,
+		Gid:         header.Gid,
+	})
+	if err != nil {
+		return grpcErrorToStatus(err)
+	}
+	if resp.GetError() != 0 {
+		return fuse.Status(resp.GetError())
+	}
+	attr := resp.GetAttr()
+	if attr == nil {
+		return fuse.EIO
+	}
+	fs.fillEntryOut(attr, out)
+	return fuse.OK
+}
+
+func (fs *ObjectFS) Readlink(cancel <-chan struct{}, header *fuse.InHeader) ([]byte, fuse.Status) {
+	ctx, cancelFunc := makeContext(cancel)
+	defer cancelFunc()
+
+	resp, err := fs.client.Readlink(ctx, &pb.ReadlinkRequest{
+		VolumeId: fs.volumeID,
+		Inode:    header.NodeId,
+	})
+	if err != nil {
+		return nil, grpcErrorToStatus(err)
+	}
+	if resp.GetError() != 0 {
+		return nil, fuse.Status(resp.GetError())
+	}
+	return []byte(resp.GetTarget()), fuse.OK
+}
+
+func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename string, out *fuse.EntryOut) fuse.Status {
+	if len(filename) > MaxNameLength {
+		return fuse.Status(syscall.ENAMETOOLONG)
+	}
+	ctx, cancelFunc := makeContext(cancel)
+	defer cancelFunc()
+
+	resp, err := fs.client.Link(ctx, &pb.LinkRequest{
+		VolumeId:       fs.volumeID,
+		OldInode:       input.Oldnodeid,
+		NewParentInode: input.NodeId,
+		NewName:        filename,
+	})
+	if err != nil {
+		return grpcErrorToStatus(err)
+	}
+	if resp.GetError() != 0 {
+		return fuse.Status(resp.GetError())
+	}
+	attr := resp.GetAttr()
+	if attr == nil {
+		return fuse.EIO
+	}
+	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
 

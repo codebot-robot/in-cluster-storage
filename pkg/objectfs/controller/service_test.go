@@ -1660,6 +1660,143 @@ func TestApplyRecordDirect(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected c to be deleted")
 	}
+
+	// Apply Symlink
+	err = vol.ApplyRecordLocked(&MutationRecord{
+		Type:          MutationSymlink,
+		VolumeId:      "apply-test",
+		ParentInode:   1,
+		Name:          "symlink.txt",
+		Inode:         20,
+		SymlinkTarget: "target.txt",
+	})
+	if err != nil {
+		t.Fatalf("Apply Symlink failed: %v", err)
+	}
+	symAttr, err := vol.Lookup(ctx, 1, "symlink.txt")
+	if err != nil || symAttr.SymlinkTarget != "target.txt" || symAttr.Nlink != 1 {
+		t.Fatalf("Unexpected symlink attr: %v, err: %v", symAttr, err)
+	}
+
+	// Apply Link
+	err = vol.ApplyRecordLocked(&MutationRecord{
+		Type:        MutationLink,
+		VolumeId:    "apply-test",
+		OldInode:    20,
+		ParentInode: 1,
+		Name:        "symlink_link.txt",
+	})
+	if err != nil {
+		t.Fatalf("Apply Link failed: %v", err)
+	}
+	linkAttr, err := vol.Lookup(ctx, 1, "symlink_link.txt")
+	if err != nil || linkAttr.Inode != 20 || linkAttr.Nlink != 2 {
+		t.Fatalf("Unexpected link attr: %v, err: %v", linkAttr, err)
+	}
+}
+
+func TestSymlinkAndHardlinkOperations(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	vol := NewVolume("symlink-test", backend, NewEventBroadcaster())
+
+	// 1. Create a regular file
+	fileAttr, err := vol.CreateFile(ctx, 1, "orig.txt", 0644, []byte("contents"), 100, 200)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	if fileAttr.Nlink != 1 {
+		t.Fatalf("Expected Nlink 1, got %d", fileAttr.Nlink)
+	}
+
+	// 2. Create a hard link
+	linkAttr, err := vol.Link(ctx, fileAttr.Inode, 1, "link1.txt")
+	if err != nil {
+		t.Fatalf("Link failed: %v", err)
+	}
+	if linkAttr.Inode != fileAttr.Inode {
+		t.Fatalf("Expected same inode %d, got %d", fileAttr.Inode, linkAttr.Inode)
+	}
+	if linkAttr.Nlink != 2 {
+		t.Fatalf("Expected Nlink 2, got %d", linkAttr.Nlink)
+	}
+
+	// Verify orig.txt has Nlink 2
+	origAttr, err := vol.Lookup(ctx, 1, "orig.txt")
+	if err != nil || origAttr.Nlink != 2 {
+		t.Fatalf("Expected orig.txt Nlink 2, got %d, err %v", origAttr.Nlink, err)
+	}
+
+	// Hard link to a directory should fail with EPERM
+	dirAttr, err := vol.Mkdir(ctx, 1, "subdir", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+	_, err = vol.Link(ctx, dirAttr.Inode, 1, "dirlink")
+	if !errors.Is(err, syscall.EPERM) {
+		t.Fatalf("Expected EPERM for linking directory, got: %v", err)
+	}
+
+	// Hard link to an existing name should fail with EEXIST
+	_, err = vol.Link(ctx, fileAttr.Inode, 1, "link1.txt")
+	if !errors.Is(err, syscall.EEXIST) {
+		t.Fatalf("Expected EEXIST for existing name, got: %v", err)
+	}
+
+	// 3. Create a symlink
+	symAttr, err := vol.Symlink(ctx, 1, "sym.lnk", "orig.txt", 100, 200)
+	if err != nil {
+		t.Fatalf("Symlink failed: %v", err)
+	}
+	if (symAttr.Mode & syscall.S_IFMT) != syscall.S_IFLNK {
+		t.Fatalf("Expected S_IFLNK mode, got %o", symAttr.Mode)
+	}
+	if symAttr.SymlinkTarget != "orig.txt" {
+		t.Fatalf("Expected target 'orig.txt', got %q", symAttr.SymlinkTarget)
+	}
+	if symAttr.Nlink != 1 {
+		t.Fatalf("Expected symlink Nlink 1, got %d", symAttr.Nlink)
+	}
+
+	// 4. Readlink
+	target, err := vol.Readlink(ctx, symAttr.Inode)
+	if err != nil || target != "orig.txt" {
+		t.Fatalf("Readlink failed: target=%q, err=%v", target, err)
+	}
+
+	// Readlink on regular file should return EINVAL
+	_, err = vol.Readlink(ctx, fileAttr.Inode)
+	if !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("Expected EINVAL for Readlink on regular file, got: %v", err)
+	}
+
+	// 5. Unlink orig.txt -> link1.txt still exists with Nlink 1
+	if err := vol.Unlink(ctx, 1, "orig.txt"); err != nil {
+		t.Fatalf("Unlink orig.txt failed: %v", err)
+	}
+	_, err = vol.Lookup(ctx, 1, "orig.txt")
+	if !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("Expected ENOENT after unlink, got: %v", err)
+	}
+	remainingAttr, err := vol.Lookup(ctx, 1, "link1.txt")
+	if err != nil || remainingAttr.Nlink != 1 {
+		t.Fatalf("Expected link1.txt Nlink 1, got %d, err %v", remainingAttr.Nlink, err)
+	}
+
+	// Read content through link1.txt inode
+	data, total, _, err := vol.ReadFile(ctx, fileAttr.Inode, 0, 100)
+	if err != nil || total != 8 || string(data) != "contents" {
+		t.Fatalf("Expected 'contents', got %q (total=%d, err=%v)", string(data), total, err)
+	}
+
+	// 6. Unlink link1.txt -> file link count drops to 0
+	if err := vol.Unlink(ctx, 1, "link1.txt"); err != nil {
+		t.Fatalf("Unlink link1.txt failed: %v", err)
+	}
+	unlinkedAttr, err := vol.GetAttr(ctx, fileAttr.Inode)
+	if err != nil || unlinkedAttr.Nlink != 0 {
+		t.Fatalf("Expected unlinked inode Nlink 0, got %d, err %v", unlinkedAttr.Nlink, err)
+	}
 }
 
 func TestTargetlessWALDurabilityFastFail(t *testing.T) {

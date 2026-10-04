@@ -352,6 +352,8 @@ type CachedInode struct {
 	Gid            uint32
 	Atime          time.Time
 	Ctime          time.Time
+	Nlink          uint32
+	SymlinkTarget  string
 	IsDirty        bool
 }
 

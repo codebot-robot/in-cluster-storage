@@ -1076,3 +1076,106 @@ func TestFUSESetAttrAllFields(t *testing.T) {
 		t.Fatalf("GetAttr owner = %d/%d, want 501/601", getAttrOut.Attr.Owner.Uid, getAttrOut.Attr.Owner.Gid)
 	}
 }
+
+func TestFUSESymlinkAndLinkOperations(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-fuse-symlinks"
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, NewNodeCache(1024*1024))
+
+	// 1. Create a regular file
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "orig.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	origID := createOut.NodeId
+	if createOut.Attr.Nlink != 1 {
+		t.Fatalf("Expected initial Nlink to be 1, got %d", createOut.Attr.Nlink)
+	}
+
+	// 2. Create hard link to orig.txt
+	var linkOut fuse.EntryOut
+	if status := rawFS.Link(nil, &fuse.LinkIn{
+		InHeader:  fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Oldnodeid: origID,
+	}, "hardlink.txt", &linkOut); status != fuse.OK {
+		t.Fatalf("Link failed: %v", status)
+	}
+	if linkOut.NodeId != origID {
+		t.Fatalf("Expected hard link node ID %d, got %d", origID, linkOut.NodeId)
+	}
+	if linkOut.Attr.Nlink != 2 {
+		t.Fatalf("Expected hard link Nlink to be 2, got %d", linkOut.Attr.Nlink)
+	}
+
+	// Verify orig.txt now has Nlink 2 via GetAttr
+	var getAttrOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: origID}}, &getAttrOut); status != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", status)
+	}
+	if getAttrOut.Attr.Nlink != 2 {
+		t.Fatalf("Expected orig.txt Nlink to be 2, got %d", getAttrOut.Attr.Nlink)
+	}
+
+	// 3. Create symlink
+	var symlinkOut fuse.EntryOut
+	target := "orig.txt"
+	if status := rawFS.Symlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID, Uid: 100, Gid: 200}, target, "symlink.lnk", &symlinkOut); status != fuse.OK {
+		t.Fatalf("Symlink failed: %v", status)
+	}
+	if symlinkOut.Attr.Mode&syscall.S_IFMT != syscall.S_IFLNK {
+		t.Fatalf("Expected symlink mode S_IFLNK, got %o", symlinkOut.Attr.Mode)
+	}
+	if symlinkOut.Attr.Nlink != 1 {
+		t.Fatalf("Expected symlink Nlink to be 1, got %d", symlinkOut.Attr.Nlink)
+	}
+	if symlinkOut.Attr.Size != uint64(len(target)) {
+		t.Fatalf("Expected symlink size %d, got %d", len(target), symlinkOut.Attr.Size)
+	}
+
+	// 4. Readlink
+	linkTargetBytes, status := rawFS.Readlink(nil, &fuse.InHeader{NodeId: symlinkOut.NodeId})
+	if status != fuse.OK {
+		t.Fatalf("Readlink failed: %v", status)
+	}
+	if string(linkTargetBytes) != target {
+		t.Fatalf("Readlink returned %q, want %q", string(linkTargetBytes), target)
+	}
+
+	// 5. ReadDir should list entries with proper types
+	dirEntries := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	if status := rawFS.ReadDir(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, dirEntries); status != fuse.OK {
+		t.Fatalf("ReadDir failed: %v", status)
+	}
+
+	// 6. Unlink orig.txt - hardlink.txt should still exist with Nlink 1
+	if status := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "orig.txt"); status != fuse.OK {
+		t.Fatalf("Unlink orig.txt failed: %v", status)
+	}
+	var lookupOut fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "hardlink.txt", &lookupOut); status != fuse.OK {
+		t.Fatalf("Lookup hardlink.txt failed: %v", status)
+	}
+	if lookupOut.NodeId != origID || lookupOut.Attr.Nlink != 1 {
+		t.Fatalf("Expected hardlink.txt to have Nlink 1 and node %d, got Nlink %d node %d", origID, lookupOut.Attr.Nlink, lookupOut.NodeId)
+	}
+
+	// 7. Hard link on directory should return EPERM
+	var dirEntryOut fuse.EntryOut
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0755,
+	}, "subdir", &dirEntryOut); status != fuse.OK {
+		t.Fatalf("Mkdir failed: %v", status)
+	}
+	if status := rawFS.Link(nil, &fuse.LinkIn{
+		InHeader:  fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Oldnodeid: dirEntryOut.NodeId,
+	}, "dirlink", &linkOut); status != fuse.Status(syscall.EPERM) {
+		t.Fatalf("Expected EPERM when linking directory, got %v", status)
+	}
+}
