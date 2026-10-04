@@ -1059,6 +1059,7 @@ type CreateFileResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Attr          *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
 	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	Fh            uint64                 `protobuf:"varint,3,opt,name=fh,proto3" json:"fh,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1103,6 +1104,13 @@ func (x *CreateFileResponse) GetAttr() *EntryAttr {
 func (x *CreateFileResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *CreateFileResponse) GetFh() uint64 {
+	if x != nil {
+		return x.Fh
 	}
 	return 0
 }
@@ -2467,6 +2475,222 @@ func (x *LinkResponse) GetError() int32 {
 	return 0
 }
 
+type OpenRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	Inode         uint64                 `protobuf:"varint,2,opt,name=inode,proto3" json:"inode,omitempty"`
+	Flags         uint32                 `protobuf:"varint,3,opt,name=flags,proto3" json:"flags,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OpenRequest) Reset() {
+	*x = OpenRequest{}
+	mi := &file_proto_objectfs_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OpenRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OpenRequest) ProtoMessage() {}
+
+func (x *OpenRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_objectfs_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OpenRequest.ProtoReflect.Descriptor instead.
+func (*OpenRequest) Descriptor() ([]byte, []int) {
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *OpenRequest) GetVolumeId() string {
+	if x != nil {
+		return x.VolumeId
+	}
+	return ""
+}
+
+func (x *OpenRequest) GetInode() uint64 {
+	if x != nil {
+		return x.Inode
+	}
+	return 0
+}
+
+func (x *OpenRequest) GetFlags() uint32 {
+	if x != nil {
+		return x.Flags
+	}
+	return 0
+}
+
+type OpenResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Fh            uint64                 `protobuf:"varint,1,opt,name=fh,proto3" json:"fh,omitempty"`
+	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OpenResponse) Reset() {
+	*x = OpenResponse{}
+	mi := &file_proto_objectfs_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OpenResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OpenResponse) ProtoMessage() {}
+
+func (x *OpenResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_objectfs_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OpenResponse.ProtoReflect.Descriptor instead.
+func (*OpenResponse) Descriptor() ([]byte, []int) {
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *OpenResponse) GetFh() uint64 {
+	if x != nil {
+		return x.Fh
+	}
+	return 0
+}
+
+func (x *OpenResponse) GetError() int32 {
+	if x != nil {
+		return x.Error
+	}
+	return 0
+}
+
+type ReleaseRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	Inode         uint64                 `protobuf:"varint,2,opt,name=inode,proto3" json:"inode,omitempty"`
+	Fh            uint64                 `protobuf:"varint,3,opt,name=fh,proto3" json:"fh,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseRequest) Reset() {
+	*x = ReleaseRequest{}
+	mi := &file_proto_objectfs_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseRequest) ProtoMessage() {}
+
+func (x *ReleaseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_objectfs_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseRequest.ProtoReflect.Descriptor instead.
+func (*ReleaseRequest) Descriptor() ([]byte, []int) {
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *ReleaseRequest) GetVolumeId() string {
+	if x != nil {
+		return x.VolumeId
+	}
+	return ""
+}
+
+func (x *ReleaseRequest) GetInode() uint64 {
+	if x != nil {
+		return x.Inode
+	}
+	return 0
+}
+
+func (x *ReleaseRequest) GetFh() uint64 {
+	if x != nil {
+		return x.Fh
+	}
+	return 0
+}
+
+type ReleaseResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Error         int32                  `protobuf:"varint,1,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseResponse) Reset() {
+	*x = ReleaseResponse{}
+	mi := &file_proto_objectfs_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseResponse) ProtoMessage() {}
+
+func (x *ReleaseResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_objectfs_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseResponse.ProtoReflect.Descriptor instead.
+func (*ReleaseResponse) Descriptor() ([]byte, []int) {
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *ReleaseResponse) GetError() int32 {
+	if x != nil {
+		return x.Error
+	}
+	return 0
+}
+
 type ListBlobsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	FromSha       string                 `protobuf:"bytes,1,opt,name=from_sha,json=fromSha,proto3" json:"from_sha,omitempty"`
@@ -2478,7 +2702,7 @@ type ListBlobsRequest struct {
 
 func (x *ListBlobsRequest) Reset() {
 	*x = ListBlobsRequest{}
-	mi := &file_proto_objectfs_proto_msgTypes[35]
+	mi := &file_proto_objectfs_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2490,7 +2714,7 @@ func (x *ListBlobsRequest) String() string {
 func (*ListBlobsRequest) ProtoMessage() {}
 
 func (x *ListBlobsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[35]
+	mi := &file_proto_objectfs_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2503,7 +2727,7 @@ func (x *ListBlobsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBlobsRequest.ProtoReflect.Descriptor instead.
 func (*ListBlobsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{35}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *ListBlobsRequest) GetFromSha() string {
@@ -2537,7 +2761,7 @@ type ListBlobsResponse struct {
 
 func (x *ListBlobsResponse) Reset() {
 	*x = ListBlobsResponse{}
-	mi := &file_proto_objectfs_proto_msgTypes[36]
+	mi := &file_proto_objectfs_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2549,7 +2773,7 @@ func (x *ListBlobsResponse) String() string {
 func (*ListBlobsResponse) ProtoMessage() {}
 
 func (x *ListBlobsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[36]
+	mi := &file_proto_objectfs_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2562,7 +2786,7 @@ func (x *ListBlobsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBlobsResponse.ProtoReflect.Descriptor instead.
 func (*ListBlobsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{36}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *ListBlobsResponse) GetSha256() []string {
@@ -2590,7 +2814,7 @@ type GetBlobRequest struct {
 
 func (x *GetBlobRequest) Reset() {
 	*x = GetBlobRequest{}
-	mi := &file_proto_objectfs_proto_msgTypes[37]
+	mi := &file_proto_objectfs_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2602,7 +2826,7 @@ func (x *GetBlobRequest) String() string {
 func (*GetBlobRequest) ProtoMessage() {}
 
 func (x *GetBlobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[37]
+	mi := &file_proto_objectfs_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2615,7 +2839,7 @@ func (x *GetBlobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetBlobRequest.ProtoReflect.Descriptor instead.
 func (*GetBlobRequest) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{37}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *GetBlobRequest) GetSha256() string {
@@ -2648,7 +2872,7 @@ type GetBlobResponse struct {
 
 func (x *GetBlobResponse) Reset() {
 	*x = GetBlobResponse{}
-	mi := &file_proto_objectfs_proto_msgTypes[38]
+	mi := &file_proto_objectfs_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2660,7 +2884,7 @@ func (x *GetBlobResponse) String() string {
 func (*GetBlobResponse) ProtoMessage() {}
 
 func (x *GetBlobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[38]
+	mi := &file_proto_objectfs_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2673,7 +2897,7 @@ func (x *GetBlobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetBlobResponse.ProtoReflect.Descriptor instead.
 func (*GetBlobResponse) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{38}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *GetBlobResponse) GetData() []byte {
@@ -2693,7 +2917,7 @@ type ListVolumesRequest struct {
 
 func (x *ListVolumesRequest) Reset() {
 	*x = ListVolumesRequest{}
-	mi := &file_proto_objectfs_proto_msgTypes[39]
+	mi := &file_proto_objectfs_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2705,7 +2929,7 @@ func (x *ListVolumesRequest) String() string {
 func (*ListVolumesRequest) ProtoMessage() {}
 
 func (x *ListVolumesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[39]
+	mi := &file_proto_objectfs_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2718,7 +2942,7 @@ func (x *ListVolumesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVolumesRequest.ProtoReflect.Descriptor instead.
 func (*ListVolumesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{39}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *ListVolumesRequest) GetLimit() int32 {
@@ -2744,7 +2968,7 @@ type VolumeInfo struct {
 
 func (x *VolumeInfo) Reset() {
 	*x = VolumeInfo{}
-	mi := &file_proto_objectfs_proto_msgTypes[40]
+	mi := &file_proto_objectfs_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2756,7 +2980,7 @@ func (x *VolumeInfo) String() string {
 func (*VolumeInfo) ProtoMessage() {}
 
 func (x *VolumeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[40]
+	mi := &file_proto_objectfs_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2769,7 +2993,7 @@ func (x *VolumeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumeInfo.ProtoReflect.Descriptor instead.
 func (*VolumeInfo) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{40}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *VolumeInfo) GetVolumeId() string {
@@ -2789,7 +3013,7 @@ type ListVolumesResponse struct {
 
 func (x *ListVolumesResponse) Reset() {
 	*x = ListVolumesResponse{}
-	mi := &file_proto_objectfs_proto_msgTypes[41]
+	mi := &file_proto_objectfs_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2801,7 +3025,7 @@ func (x *ListVolumesResponse) String() string {
 func (*ListVolumesResponse) ProtoMessage() {}
 
 func (x *ListVolumesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[41]
+	mi := &file_proto_objectfs_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2814,7 +3038,7 @@ func (x *ListVolumesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVolumesResponse.ProtoReflect.Descriptor instead.
 func (*ListVolumesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{41}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *ListVolumesResponse) GetVolumes() []*VolumeInfo {
@@ -2843,7 +3067,7 @@ type SnapshotInfo struct {
 
 func (x *SnapshotInfo) Reset() {
 	*x = SnapshotInfo{}
-	mi := &file_proto_objectfs_proto_msgTypes[42]
+	mi := &file_proto_objectfs_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2855,7 +3079,7 @@ func (x *SnapshotInfo) String() string {
 func (*SnapshotInfo) ProtoMessage() {}
 
 func (x *SnapshotInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[42]
+	mi := &file_proto_objectfs_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2868,7 +3092,7 @@ func (x *SnapshotInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotInfo.ProtoReflect.Descriptor instead.
 func (*SnapshotInfo) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{42}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *SnapshotInfo) GetName() string {
@@ -2912,7 +3136,7 @@ type ListSnapshotsRequest struct {
 
 func (x *ListSnapshotsRequest) Reset() {
 	*x = ListSnapshotsRequest{}
-	mi := &file_proto_objectfs_proto_msgTypes[43]
+	mi := &file_proto_objectfs_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2924,7 +3148,7 @@ func (x *ListSnapshotsRequest) String() string {
 func (*ListSnapshotsRequest) ProtoMessage() {}
 
 func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[43]
+	mi := &file_proto_objectfs_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2937,7 +3161,7 @@ func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*ListSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{43}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *ListSnapshotsRequest) GetVolumeId() string {
@@ -2985,7 +3209,7 @@ type ListSnapshotsResponse struct {
 
 func (x *ListSnapshotsResponse) Reset() {
 	*x = ListSnapshotsResponse{}
-	mi := &file_proto_objectfs_proto_msgTypes[44]
+	mi := &file_proto_objectfs_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2997,7 +3221,7 @@ func (x *ListSnapshotsResponse) String() string {
 func (*ListSnapshotsResponse) ProtoMessage() {}
 
 func (x *ListSnapshotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[44]
+	mi := &file_proto_objectfs_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3010,7 +3234,7 @@ func (x *ListSnapshotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSnapshotsResponse.ProtoReflect.Descriptor instead.
 func (*ListSnapshotsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{44}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *ListSnapshotsResponse) GetSnapshots() []*SnapshotInfo {
@@ -3036,7 +3260,7 @@ type CreateSnapshotRequest struct {
 
 func (x *CreateSnapshotRequest) Reset() {
 	*x = CreateSnapshotRequest{}
-	mi := &file_proto_objectfs_proto_msgTypes[45]
+	mi := &file_proto_objectfs_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3048,7 +3272,7 @@ func (x *CreateSnapshotRequest) String() string {
 func (*CreateSnapshotRequest) ProtoMessage() {}
 
 func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[45]
+	mi := &file_proto_objectfs_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3061,7 +3285,7 @@ func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{45}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *CreateSnapshotRequest) GetVolumeId() string {
@@ -3081,7 +3305,7 @@ type CreateSnapshotResponse struct {
 
 func (x *CreateSnapshotResponse) Reset() {
 	*x = CreateSnapshotResponse{}
-	mi := &file_proto_objectfs_proto_msgTypes[46]
+	mi := &file_proto_objectfs_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3093,7 +3317,7 @@ func (x *CreateSnapshotResponse) String() string {
 func (*CreateSnapshotResponse) ProtoMessage() {}
 
 func (x *CreateSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[46]
+	mi := &file_proto_objectfs_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3106,7 +3330,7 @@ func (x *CreateSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{46}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *CreateSnapshotResponse) GetSnapshotName() string {
@@ -3142,13 +3366,14 @@ type Inode struct {
 	Nlink          uint32                 `protobuf:"varint,15,opt,name=nlink,proto3" json:"nlink,omitempty"`
 	SymlinkTarget  string                 `protobuf:"bytes,16,opt,name=symlink_target,json=symlinkTarget,proto3" json:"symlink_target,omitempty"`
 	Rdev           uint32                 `protobuf:"varint,17,opt,name=rdev,proto3" json:"rdev,omitempty"`
+	ParentIno      *uint64                `protobuf:"varint,18,opt,name=parent_ino,json=parentIno,proto3,oneof" json:"parent_ino,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Inode) Reset() {
 	*x = Inode{}
-	mi := &file_proto_objectfs_proto_msgTypes[47]
+	mi := &file_proto_objectfs_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3160,7 +3385,7 @@ func (x *Inode) String() string {
 func (*Inode) ProtoMessage() {}
 
 func (x *Inode) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[47]
+	mi := &file_proto_objectfs_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3173,7 +3398,7 @@ func (x *Inode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Inode.ProtoReflect.Descriptor instead.
 func (*Inode) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{47}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *Inode) GetIno() uint64 {
@@ -3295,6 +3520,13 @@ func (x *Inode) GetRdev() uint32 {
 	return 0
 }
 
+func (x *Inode) GetParentIno() uint64 {
+	if x != nil && x.ParentIno != nil {
+		return *x.ParentIno
+	}
+	return 0
+}
+
 type DirEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ParentIno     *uint64                `protobuf:"varint,1,opt,name=parent_ino,json=parentIno,proto3,oneof" json:"parent_ino,omitempty"`
@@ -3308,7 +3540,7 @@ type DirEntry struct {
 
 func (x *DirEntry) Reset() {
 	*x = DirEntry{}
-	mi := &file_proto_objectfs_proto_msgTypes[48]
+	mi := &file_proto_objectfs_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3320,7 +3552,7 @@ func (x *DirEntry) String() string {
 func (*DirEntry) ProtoMessage() {}
 
 func (x *DirEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[48]
+	mi := &file_proto_objectfs_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3333,7 +3565,7 @@ func (x *DirEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DirEntry.ProtoReflect.Descriptor instead.
 func (*DirEntry) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{48}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *DirEntry) GetParentIno() uint64 {
@@ -3381,7 +3613,7 @@ type Content struct {
 
 func (x *Content) Reset() {
 	*x = Content{}
-	mi := &file_proto_objectfs_proto_msgTypes[49]
+	mi := &file_proto_objectfs_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3393,7 +3625,7 @@ func (x *Content) String() string {
 func (*Content) ProtoMessage() {}
 
 func (x *Content) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[49]
+	mi := &file_proto_objectfs_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3406,7 +3638,7 @@ func (x *Content) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Content.ProtoReflect.Descriptor instead.
 func (*Content) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{49}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *Content) GetSha256() string {
@@ -3435,7 +3667,7 @@ type FileChunk struct {
 
 func (x *FileChunk) Reset() {
 	*x = FileChunk{}
-	mi := &file_proto_objectfs_proto_msgTypes[50]
+	mi := &file_proto_objectfs_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3447,7 +3679,7 @@ func (x *FileChunk) String() string {
 func (*FileChunk) ProtoMessage() {}
 
 func (x *FileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_objectfs_proto_msgTypes[50]
+	mi := &file_proto_objectfs_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3460,7 +3692,7 @@ func (x *FileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileChunk.ProtoReflect.Descriptor instead.
 func (*FileChunk) Descriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{50}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *FileChunk) GetIno() uint64 {
@@ -3573,10 +3805,11 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x0finitial_content\x18\x05 \x01(\fR\x0einitialContent\x12\x10\n" +
 	"\x03uid\x18\x06 \x01(\rR\x03uid\x12\x10\n" +
 	"\x03gid\x18\a \x01(\rR\x03gid\x12\x12\n" +
-	"\x04rdev\x18\b \x01(\rR\x04rdev\"\\\n" +
+	"\x04rdev\x18\b \x01(\rR\x04rdev\"l\n" +
 	"\x12CreateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"p\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12\x0e\n" +
+	"\x02fh\x18\x03 \x01(\x04R\x02fh\"p\n" +
 	"\x0fReadFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x16\n" +
@@ -3672,7 +3905,20 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\bnew_name\x18\x04 \x01(\tR\anewName\"V\n" +
 	"\fLinkResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"b\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"V\n" +
+	"\vOpenRequest\x12\x1b\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
+	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x14\n" +
+	"\x05flags\x18\x03 \x01(\rR\x05flags\"4\n" +
+	"\fOpenResponse\x12\x0e\n" +
+	"\x02fh\x18\x01 \x01(\x04R\x02fh\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"S\n" +
+	"\x0eReleaseRequest\x12\x1b\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
+	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x0e\n" +
+	"\x02fh\x18\x03 \x01(\x04R\x02fh\"'\n" +
+	"\x0fReleaseResponse\x12\x14\n" +
+	"\x05error\x18\x01 \x01(\x05R\x05error\"b\n" +
 	"\x10ListBlobsRequest\x12\x19\n" +
 	"\bfrom_sha\x18\x01 \x01(\tR\afromSha\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x1d\n" +
@@ -3715,7 +3961,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"z\n" +
 	"\x16CreateSnapshotResponse\x12#\n" +
 	"\rsnapshot_name\x18\x01 \x01(\tR\fsnapshotName\x12;\n" +
-	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\x8b\x04\n" +
+	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\xbe\x04\n" +
 	"\x05Inode\x12\x15\n" +
 	"\x03ino\x18\x01 \x01(\x04H\x00R\x03ino\x88\x01\x01\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\rR\x04mode\x12\x12\n" +
@@ -3735,8 +3981,11 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05ctime\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\x05ctime\x12\x14\n" +
 	"\x05nlink\x18\x0f \x01(\rR\x05nlink\x12%\n" +
 	"\x0esymlink_target\x18\x10 \x01(\tR\rsymlinkTarget\x12\x12\n" +
-	"\x04rdev\x18\x11 \x01(\rR\x04rdevB\x06\n" +
-	"\x04_ino\"\x9c\x01\n" +
+	"\x04rdev\x18\x11 \x01(\rR\x04rdev\x12\"\n" +
+	"\n" +
+	"parent_ino\x18\x12 \x01(\x04H\x01R\tparentIno\x88\x01\x01B\x06\n" +
+	"\x04_inoB\r\n" +
+	"\v_parent_ino\"\x9c\x01\n" +
 	"\bDirEntry\x12\"\n" +
 	"\n" +
 	"parent_ino\x18\x01 \x01(\x04H\x00R\tparentIno\x88\x01\x01\x12\x17\n" +
@@ -3769,7 +4018,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\rEVENT_CREATED\x10\x01\x12\x12\n" +
 	"\x0eEVENT_MODIFIED\x10\x02\x12\x11\n" +
 	"\rEVENT_DELETED\x10\x03\x12\x11\n" +
-	"\rEVENT_RENAMED\x10\x042\xe9\x0e\n" +
+	"\rEVENT_RENAMED\x10\x042\x84\x10\n" +
 	"\x12ObjectFSController\x12P\n" +
 	"\aGetAttr\x12!.objectfs.v1alpha1.GetAttrRequest\x1a\".objectfs.v1alpha1.GetAttrResponse\x12P\n" +
 	"\aSetAttr\x12!.objectfs.v1alpha1.SetAttrRequest\x1a\".objectfs.v1alpha1.SetAttrResponse\x12M\n" +
@@ -3788,7 +4037,9 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\vWatchVolume\x12%.objectfs.v1alpha1.WatchVolumeRequest\x1a&.objectfs.v1alpha1.WatchVolumeResponse0\x01\x12P\n" +
 	"\aSymlink\x12!.objectfs.v1alpha1.SymlinkRequest\x1a\".objectfs.v1alpha1.SymlinkResponse\x12S\n" +
 	"\bReadlink\x12\".objectfs.v1alpha1.ReadlinkRequest\x1a#.objectfs.v1alpha1.ReadlinkResponse\x12G\n" +
-	"\x04Link\x12\x1e.objectfs.v1alpha1.LinkRequest\x1a\x1f.objectfs.v1alpha1.LinkResponse\x12V\n" +
+	"\x04Link\x12\x1e.objectfs.v1alpha1.LinkRequest\x1a\x1f.objectfs.v1alpha1.LinkResponse\x12G\n" +
+	"\x04Open\x12\x1e.objectfs.v1alpha1.OpenRequest\x1a\x1f.objectfs.v1alpha1.OpenResponse\x12P\n" +
+	"\aRelease\x12!.objectfs.v1alpha1.ReleaseRequest\x1a\".objectfs.v1alpha1.ReleaseResponse\x12V\n" +
 	"\tListBlobs\x12#.objectfs.v1alpha1.ListBlobsRequest\x1a$.objectfs.v1alpha1.ListBlobsResponse\x12R\n" +
 	"\aGetBlob\x12!.objectfs.v1alpha1.GetBlobRequest\x1a\".objectfs.v1alpha1.GetBlobResponse0\x01\x12\\\n" +
 	"\vListVolumes\x12%.objectfs.v1alpha1.ListVolumesRequest\x1a&.objectfs.v1alpha1.ListVolumesResponse\x12b\n" +
@@ -3808,7 +4059,7 @@ func file_proto_objectfs_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_objectfs_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_objectfs_proto_msgTypes = make([]protoimpl.MessageInfo, 51)
+var file_proto_objectfs_proto_msgTypes = make([]protoimpl.MessageInfo, 55)
 var file_proto_objectfs_proto_goTypes = []any{
 	(WriteMode)(0),                 // 0: objectfs.v1alpha1.WriteMode
 	(WatchEventType)(0),            // 1: objectfs.v1alpha1.WatchEventType
@@ -3847,54 +4098,58 @@ var file_proto_objectfs_proto_goTypes = []any{
 	(*ReadlinkResponse)(nil),       // 34: objectfs.v1alpha1.ReadlinkResponse
 	(*LinkRequest)(nil),            // 35: objectfs.v1alpha1.LinkRequest
 	(*LinkResponse)(nil),           // 36: objectfs.v1alpha1.LinkResponse
-	(*ListBlobsRequest)(nil),       // 37: objectfs.v1alpha1.ListBlobsRequest
-	(*ListBlobsResponse)(nil),      // 38: objectfs.v1alpha1.ListBlobsResponse
-	(*GetBlobRequest)(nil),         // 39: objectfs.v1alpha1.GetBlobRequest
-	(*GetBlobResponse)(nil),        // 40: objectfs.v1alpha1.GetBlobResponse
-	(*ListVolumesRequest)(nil),     // 41: objectfs.v1alpha1.ListVolumesRequest
-	(*VolumeInfo)(nil),             // 42: objectfs.v1alpha1.VolumeInfo
-	(*ListVolumesResponse)(nil),    // 43: objectfs.v1alpha1.ListVolumesResponse
-	(*SnapshotInfo)(nil),           // 44: objectfs.v1alpha1.SnapshotInfo
-	(*ListSnapshotsRequest)(nil),   // 45: objectfs.v1alpha1.ListSnapshotsRequest
-	(*ListSnapshotsResponse)(nil),  // 46: objectfs.v1alpha1.ListSnapshotsResponse
-	(*CreateSnapshotRequest)(nil),  // 47: objectfs.v1alpha1.CreateSnapshotRequest
-	(*CreateSnapshotResponse)(nil), // 48: objectfs.v1alpha1.CreateSnapshotResponse
-	(*Inode)(nil),                  // 49: objectfs.v1alpha1.Inode
-	(*DirEntry)(nil),               // 50: objectfs.v1alpha1.DirEntry
-	(*Content)(nil),                // 51: objectfs.v1alpha1.Content
-	(*FileChunk)(nil),              // 52: objectfs.v1alpha1.FileChunk
-	(*timestamppb.Timestamp)(nil),  // 53: google.protobuf.Timestamp
+	(*OpenRequest)(nil),            // 37: objectfs.v1alpha1.OpenRequest
+	(*OpenResponse)(nil),           // 38: objectfs.v1alpha1.OpenResponse
+	(*ReleaseRequest)(nil),         // 39: objectfs.v1alpha1.ReleaseRequest
+	(*ReleaseResponse)(nil),        // 40: objectfs.v1alpha1.ReleaseResponse
+	(*ListBlobsRequest)(nil),       // 41: objectfs.v1alpha1.ListBlobsRequest
+	(*ListBlobsResponse)(nil),      // 42: objectfs.v1alpha1.ListBlobsResponse
+	(*GetBlobRequest)(nil),         // 43: objectfs.v1alpha1.GetBlobRequest
+	(*GetBlobResponse)(nil),        // 44: objectfs.v1alpha1.GetBlobResponse
+	(*ListVolumesRequest)(nil),     // 45: objectfs.v1alpha1.ListVolumesRequest
+	(*VolumeInfo)(nil),             // 46: objectfs.v1alpha1.VolumeInfo
+	(*ListVolumesResponse)(nil),    // 47: objectfs.v1alpha1.ListVolumesResponse
+	(*SnapshotInfo)(nil),           // 48: objectfs.v1alpha1.SnapshotInfo
+	(*ListSnapshotsRequest)(nil),   // 49: objectfs.v1alpha1.ListSnapshotsRequest
+	(*ListSnapshotsResponse)(nil),  // 50: objectfs.v1alpha1.ListSnapshotsResponse
+	(*CreateSnapshotRequest)(nil),  // 51: objectfs.v1alpha1.CreateSnapshotRequest
+	(*CreateSnapshotResponse)(nil), // 52: objectfs.v1alpha1.CreateSnapshotResponse
+	(*Inode)(nil),                  // 53: objectfs.v1alpha1.Inode
+	(*DirEntry)(nil),               // 54: objectfs.v1alpha1.DirEntry
+	(*Content)(nil),                // 55: objectfs.v1alpha1.Content
+	(*FileChunk)(nil),              // 56: objectfs.v1alpha1.FileChunk
+	(*timestamppb.Timestamp)(nil),  // 57: google.protobuf.Timestamp
 }
 var file_proto_objectfs_proto_depIdxs = []int32{
-	53, // 0: objectfs.v1alpha1.EntryAttr.mod_time:type_name -> google.protobuf.Timestamp
-	53, // 1: objectfs.v1alpha1.EntryAttr.atime:type_name -> google.protobuf.Timestamp
-	53, // 2: objectfs.v1alpha1.EntryAttr.ctime:type_name -> google.protobuf.Timestamp
+	57, // 0: objectfs.v1alpha1.EntryAttr.mod_time:type_name -> google.protobuf.Timestamp
+	57, // 1: objectfs.v1alpha1.EntryAttr.atime:type_name -> google.protobuf.Timestamp
+	57, // 2: objectfs.v1alpha1.EntryAttr.ctime:type_name -> google.protobuf.Timestamp
 	2,  // 3: objectfs.v1alpha1.GetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	53, // 4: objectfs.v1alpha1.SetAttrRequest.atime:type_name -> google.protobuf.Timestamp
-	53, // 5: objectfs.v1alpha1.SetAttrRequest.mtime:type_name -> google.protobuf.Timestamp
-	53, // 6: objectfs.v1alpha1.SetAttrRequest.ctime:type_name -> google.protobuf.Timestamp
+	57, // 4: objectfs.v1alpha1.SetAttrRequest.atime:type_name -> google.protobuf.Timestamp
+	57, // 5: objectfs.v1alpha1.SetAttrRequest.mtime:type_name -> google.protobuf.Timestamp
+	57, // 6: objectfs.v1alpha1.SetAttrRequest.ctime:type_name -> google.protobuf.Timestamp
 	2,  // 7: objectfs.v1alpha1.SetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 8: objectfs.v1alpha1.LookupResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 9: objectfs.v1alpha1.ReadDirResponse.entries:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 10: objectfs.v1alpha1.MkdirResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 11: objectfs.v1alpha1.CreateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	0,  // 12: objectfs.v1alpha1.WriteFileRequest.write_mode:type_name -> objectfs.v1alpha1.WriteMode
-	53, // 13: objectfs.v1alpha1.WriteFileResponse.mod_time:type_name -> google.protobuf.Timestamp
+	57, // 13: objectfs.v1alpha1.WriteFileResponse.mod_time:type_name -> google.protobuf.Timestamp
 	2,  // 14: objectfs.v1alpha1.TruncateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 15: objectfs.v1alpha1.RenameResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	1,  // 16: objectfs.v1alpha1.WatchVolumeResponse.event_type:type_name -> objectfs.v1alpha1.WatchEventType
 	2,  // 17: objectfs.v1alpha1.WatchVolumeResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 18: objectfs.v1alpha1.SymlinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 19: objectfs.v1alpha1.LinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	42, // 20: objectfs.v1alpha1.ListVolumesResponse.volumes:type_name -> objectfs.v1alpha1.VolumeInfo
-	53, // 21: objectfs.v1alpha1.SnapshotInfo.created_at:type_name -> google.protobuf.Timestamp
-	53, // 22: objectfs.v1alpha1.ListSnapshotsRequest.from_time:type_name -> google.protobuf.Timestamp
-	53, // 23: objectfs.v1alpha1.ListSnapshotsRequest.to_time:type_name -> google.protobuf.Timestamp
-	44, // 24: objectfs.v1alpha1.ListSnapshotsResponse.snapshots:type_name -> objectfs.v1alpha1.SnapshotInfo
-	44, // 25: objectfs.v1alpha1.CreateSnapshotResponse.snapshot:type_name -> objectfs.v1alpha1.SnapshotInfo
-	53, // 26: objectfs.v1alpha1.Inode.mtime:type_name -> google.protobuf.Timestamp
-	53, // 27: objectfs.v1alpha1.Inode.atime:type_name -> google.protobuf.Timestamp
-	53, // 28: objectfs.v1alpha1.Inode.ctime:type_name -> google.protobuf.Timestamp
+	46, // 20: objectfs.v1alpha1.ListVolumesResponse.volumes:type_name -> objectfs.v1alpha1.VolumeInfo
+	57, // 21: objectfs.v1alpha1.SnapshotInfo.created_at:type_name -> google.protobuf.Timestamp
+	57, // 22: objectfs.v1alpha1.ListSnapshotsRequest.from_time:type_name -> google.protobuf.Timestamp
+	57, // 23: objectfs.v1alpha1.ListSnapshotsRequest.to_time:type_name -> google.protobuf.Timestamp
+	48, // 24: objectfs.v1alpha1.ListSnapshotsResponse.snapshots:type_name -> objectfs.v1alpha1.SnapshotInfo
+	48, // 25: objectfs.v1alpha1.CreateSnapshotResponse.snapshot:type_name -> objectfs.v1alpha1.SnapshotInfo
+	57, // 26: objectfs.v1alpha1.Inode.mtime:type_name -> google.protobuf.Timestamp
+	57, // 27: objectfs.v1alpha1.Inode.atime:type_name -> google.protobuf.Timestamp
+	57, // 28: objectfs.v1alpha1.Inode.ctime:type_name -> google.protobuf.Timestamp
 	3,  // 29: objectfs.v1alpha1.ObjectFSController.GetAttr:input_type -> objectfs.v1alpha1.GetAttrRequest
 	5,  // 30: objectfs.v1alpha1.ObjectFSController.SetAttr:input_type -> objectfs.v1alpha1.SetAttrRequest
 	7,  // 31: objectfs.v1alpha1.ObjectFSController.Lookup:input_type -> objectfs.v1alpha1.LookupRequest
@@ -3912,35 +4167,39 @@ var file_proto_objectfs_proto_depIdxs = []int32{
 	31, // 43: objectfs.v1alpha1.ObjectFSController.Symlink:input_type -> objectfs.v1alpha1.SymlinkRequest
 	33, // 44: objectfs.v1alpha1.ObjectFSController.Readlink:input_type -> objectfs.v1alpha1.ReadlinkRequest
 	35, // 45: objectfs.v1alpha1.ObjectFSController.Link:input_type -> objectfs.v1alpha1.LinkRequest
-	37, // 46: objectfs.v1alpha1.ObjectFSController.ListBlobs:input_type -> objectfs.v1alpha1.ListBlobsRequest
-	39, // 47: objectfs.v1alpha1.ObjectFSController.GetBlob:input_type -> objectfs.v1alpha1.GetBlobRequest
-	41, // 48: objectfs.v1alpha1.ObjectFSController.ListVolumes:input_type -> objectfs.v1alpha1.ListVolumesRequest
-	45, // 49: objectfs.v1alpha1.ObjectFSController.ListSnapshots:input_type -> objectfs.v1alpha1.ListSnapshotsRequest
-	47, // 50: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:input_type -> objectfs.v1alpha1.CreateSnapshotRequest
-	4,  // 51: objectfs.v1alpha1.ObjectFSController.GetAttr:output_type -> objectfs.v1alpha1.GetAttrResponse
-	6,  // 52: objectfs.v1alpha1.ObjectFSController.SetAttr:output_type -> objectfs.v1alpha1.SetAttrResponse
-	8,  // 53: objectfs.v1alpha1.ObjectFSController.Lookup:output_type -> objectfs.v1alpha1.LookupResponse
-	10, // 54: objectfs.v1alpha1.ObjectFSController.ReadDir:output_type -> objectfs.v1alpha1.ReadDirResponse
-	12, // 55: objectfs.v1alpha1.ObjectFSController.Mkdir:output_type -> objectfs.v1alpha1.MkdirResponse
-	14, // 56: objectfs.v1alpha1.ObjectFSController.CreateFile:output_type -> objectfs.v1alpha1.CreateFileResponse
-	16, // 57: objectfs.v1alpha1.ObjectFSController.ReadFile:output_type -> objectfs.v1alpha1.ReadFileResponse
-	18, // 58: objectfs.v1alpha1.ObjectFSController.WriteFile:output_type -> objectfs.v1alpha1.WriteFileResponse
-	20, // 59: objectfs.v1alpha1.ObjectFSController.TruncateFile:output_type -> objectfs.v1alpha1.TruncateFileResponse
-	22, // 60: objectfs.v1alpha1.ObjectFSController.Unlink:output_type -> objectfs.v1alpha1.UnlinkResponse
-	24, // 61: objectfs.v1alpha1.ObjectFSController.Rmdir:output_type -> objectfs.v1alpha1.RmdirResponse
-	26, // 62: objectfs.v1alpha1.ObjectFSController.Rename:output_type -> objectfs.v1alpha1.RenameResponse
-	28, // 63: objectfs.v1alpha1.ObjectFSController.Fsync:output_type -> objectfs.v1alpha1.FsyncResponse
-	30, // 64: objectfs.v1alpha1.ObjectFSController.WatchVolume:output_type -> objectfs.v1alpha1.WatchVolumeResponse
-	32, // 65: objectfs.v1alpha1.ObjectFSController.Symlink:output_type -> objectfs.v1alpha1.SymlinkResponse
-	34, // 66: objectfs.v1alpha1.ObjectFSController.Readlink:output_type -> objectfs.v1alpha1.ReadlinkResponse
-	36, // 67: objectfs.v1alpha1.ObjectFSController.Link:output_type -> objectfs.v1alpha1.LinkResponse
-	38, // 68: objectfs.v1alpha1.ObjectFSController.ListBlobs:output_type -> objectfs.v1alpha1.ListBlobsResponse
-	40, // 69: objectfs.v1alpha1.ObjectFSController.GetBlob:output_type -> objectfs.v1alpha1.GetBlobResponse
-	43, // 70: objectfs.v1alpha1.ObjectFSController.ListVolumes:output_type -> objectfs.v1alpha1.ListVolumesResponse
-	46, // 71: objectfs.v1alpha1.ObjectFSController.ListSnapshots:output_type -> objectfs.v1alpha1.ListSnapshotsResponse
-	48, // 72: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:output_type -> objectfs.v1alpha1.CreateSnapshotResponse
-	51, // [51:73] is the sub-list for method output_type
-	29, // [29:51] is the sub-list for method input_type
+	37, // 46: objectfs.v1alpha1.ObjectFSController.Open:input_type -> objectfs.v1alpha1.OpenRequest
+	39, // 47: objectfs.v1alpha1.ObjectFSController.Release:input_type -> objectfs.v1alpha1.ReleaseRequest
+	41, // 48: objectfs.v1alpha1.ObjectFSController.ListBlobs:input_type -> objectfs.v1alpha1.ListBlobsRequest
+	43, // 49: objectfs.v1alpha1.ObjectFSController.GetBlob:input_type -> objectfs.v1alpha1.GetBlobRequest
+	45, // 50: objectfs.v1alpha1.ObjectFSController.ListVolumes:input_type -> objectfs.v1alpha1.ListVolumesRequest
+	49, // 51: objectfs.v1alpha1.ObjectFSController.ListSnapshots:input_type -> objectfs.v1alpha1.ListSnapshotsRequest
+	51, // 52: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:input_type -> objectfs.v1alpha1.CreateSnapshotRequest
+	4,  // 53: objectfs.v1alpha1.ObjectFSController.GetAttr:output_type -> objectfs.v1alpha1.GetAttrResponse
+	6,  // 54: objectfs.v1alpha1.ObjectFSController.SetAttr:output_type -> objectfs.v1alpha1.SetAttrResponse
+	8,  // 55: objectfs.v1alpha1.ObjectFSController.Lookup:output_type -> objectfs.v1alpha1.LookupResponse
+	10, // 56: objectfs.v1alpha1.ObjectFSController.ReadDir:output_type -> objectfs.v1alpha1.ReadDirResponse
+	12, // 57: objectfs.v1alpha1.ObjectFSController.Mkdir:output_type -> objectfs.v1alpha1.MkdirResponse
+	14, // 58: objectfs.v1alpha1.ObjectFSController.CreateFile:output_type -> objectfs.v1alpha1.CreateFileResponse
+	16, // 59: objectfs.v1alpha1.ObjectFSController.ReadFile:output_type -> objectfs.v1alpha1.ReadFileResponse
+	18, // 60: objectfs.v1alpha1.ObjectFSController.WriteFile:output_type -> objectfs.v1alpha1.WriteFileResponse
+	20, // 61: objectfs.v1alpha1.ObjectFSController.TruncateFile:output_type -> objectfs.v1alpha1.TruncateFileResponse
+	22, // 62: objectfs.v1alpha1.ObjectFSController.Unlink:output_type -> objectfs.v1alpha1.UnlinkResponse
+	24, // 63: objectfs.v1alpha1.ObjectFSController.Rmdir:output_type -> objectfs.v1alpha1.RmdirResponse
+	26, // 64: objectfs.v1alpha1.ObjectFSController.Rename:output_type -> objectfs.v1alpha1.RenameResponse
+	28, // 65: objectfs.v1alpha1.ObjectFSController.Fsync:output_type -> objectfs.v1alpha1.FsyncResponse
+	30, // 66: objectfs.v1alpha1.ObjectFSController.WatchVolume:output_type -> objectfs.v1alpha1.WatchVolumeResponse
+	32, // 67: objectfs.v1alpha1.ObjectFSController.Symlink:output_type -> objectfs.v1alpha1.SymlinkResponse
+	34, // 68: objectfs.v1alpha1.ObjectFSController.Readlink:output_type -> objectfs.v1alpha1.ReadlinkResponse
+	36, // 69: objectfs.v1alpha1.ObjectFSController.Link:output_type -> objectfs.v1alpha1.LinkResponse
+	38, // 70: objectfs.v1alpha1.ObjectFSController.Open:output_type -> objectfs.v1alpha1.OpenResponse
+	40, // 71: objectfs.v1alpha1.ObjectFSController.Release:output_type -> objectfs.v1alpha1.ReleaseResponse
+	42, // 72: objectfs.v1alpha1.ObjectFSController.ListBlobs:output_type -> objectfs.v1alpha1.ListBlobsResponse
+	44, // 73: objectfs.v1alpha1.ObjectFSController.GetBlob:output_type -> objectfs.v1alpha1.GetBlobResponse
+	47, // 74: objectfs.v1alpha1.ObjectFSController.ListVolumes:output_type -> objectfs.v1alpha1.ListVolumesResponse
+	50, // 75: objectfs.v1alpha1.ObjectFSController.ListSnapshots:output_type -> objectfs.v1alpha1.ListSnapshotsResponse
+	52, // 76: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:output_type -> objectfs.v1alpha1.CreateSnapshotResponse
+	53, // [53:77] is the sub-list for method output_type
+	29, // [29:53] is the sub-list for method input_type
 	29, // [29:29] is the sub-list for extension type_name
 	29, // [29:29] is the sub-list for extension extendee
 	0,  // [0:29] is the sub-list for field type_name
@@ -3952,17 +4211,17 @@ func file_proto_objectfs_proto_init() {
 		return
 	}
 	file_proto_objectfs_proto_msgTypes[3].OneofWrappers = []any{}
-	file_proto_objectfs_proto_msgTypes[47].OneofWrappers = []any{}
-	file_proto_objectfs_proto_msgTypes[48].OneofWrappers = []any{}
-	file_proto_objectfs_proto_msgTypes[49].OneofWrappers = []any{}
-	file_proto_objectfs_proto_msgTypes[50].OneofWrappers = []any{}
+	file_proto_objectfs_proto_msgTypes[51].OneofWrappers = []any{}
+	file_proto_objectfs_proto_msgTypes[52].OneofWrappers = []any{}
+	file_proto_objectfs_proto_msgTypes[53].OneofWrappers = []any{}
+	file_proto_objectfs_proto_msgTypes[54].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_objectfs_proto_rawDesc), len(file_proto_objectfs_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   51,
+			NumMessages:   55,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

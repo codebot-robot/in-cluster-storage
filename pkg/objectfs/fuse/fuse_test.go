@@ -1452,3 +1452,264 @@ func TestFUSEUnflushedHoleAndDirtyWriteRead(t *testing.T) {
 		t.Fatalf("Read data mismatch for spanning uncached clean and dirty chunks")
 	}
 }
+
+func TestDirectoryLinkCountsAndDotDotOnRename(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-dir-nlink-rename"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Mkdir src_parent (nlink 2) and dst_parent (nlink 2)
+	var srcPOut, dstPOut fuse.EntryOut
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "src_parent", &srcPOut); status != fuse.OK {
+		t.Fatalf("Mkdir src_parent failed: %v", status)
+	}
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "dst_parent", &dstPOut); status != fuse.OK {
+		t.Fatalf("Mkdir dst_parent failed: %v", status)
+	}
+	if srcPOut.Attr.Nlink != 2 || dstPOut.Attr.Nlink != 2 {
+		t.Fatalf("Expected initial nlink 2, got src=%d dst=%d", srcPOut.Attr.Nlink, dstPOut.Attr.Nlink)
+	}
+
+	// 2. Mkdir src_parent/sub (src_parent nlink becomes 3)
+	var subOut fuse.EntryOut
+	if status := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: srcPOut.NodeId}, Mode: 0755}, "sub", &subOut); status != fuse.OK {
+		t.Fatalf("Mkdir sub failed: %v", status)
+	}
+
+	var statSrcP fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: srcPOut.NodeId}}, &statSrcP); status != fuse.OK {
+		t.Fatalf("GetAttr src_parent failed: %v", status)
+	}
+	if statSrcP.Attr.Nlink != 3 {
+		t.Fatalf("Expected src_parent nlink 3 after child mkdir, got %d", statSrcP.Attr.Nlink)
+	}
+
+	// 3. Verify lookup ".." in src_parent/sub is src_parent
+	var dotdotOut fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: subOut.NodeId}, "..", &dotdotOut); status != fuse.OK {
+		t.Fatalf("Lookup '..' in sub failed: %v", status)
+	}
+	if dotdotOut.NodeId != srcPOut.NodeId {
+		t.Fatalf("Expected sub/.. to be src_parent (%d), got %d", srcPOut.NodeId, dotdotOut.NodeId)
+	}
+
+	// 4. Rename src_parent/sub -> dst_parent/sub
+	if status := rawFS.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: srcPOut.NodeId}, Newdir: dstPOut.NodeId}, "sub", "sub"); status != fuse.OK {
+		t.Fatalf("Rename failed: %v", status)
+	}
+
+	// 5. Check nlink on src_parent (should be 2) and dst_parent (should be 3)
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: srcPOut.NodeId}}, &statSrcP); status != fuse.OK {
+		t.Fatalf("GetAttr src_parent failed: %v", status)
+	}
+	if statSrcP.Attr.Nlink != 2 {
+		t.Fatalf("Expected src_parent nlink 2 after rename, got %d", statSrcP.Attr.Nlink)
+	}
+
+	var statDstP fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: dstPOut.NodeId}}, &statDstP); status != fuse.OK {
+		t.Fatalf("GetAttr dst_parent failed: %v", status)
+	}
+	if statDstP.Attr.Nlink != 3 {
+		t.Fatalf("Expected dst_parent nlink 3 after rename, got %d", statDstP.Attr.Nlink)
+	}
+
+	// 6. Verify lookup ".." in dst_parent/sub is dst_parent
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: subOut.NodeId}, "..", &dotdotOut); status != fuse.OK {
+		t.Fatalf("Lookup '..' in moved sub failed: %v", status)
+	}
+	if dotdotOut.NodeId != dstPOut.NodeId {
+		t.Fatalf("Expected moved sub/.. to be dst_parent (%d), got %d", dstPOut.NodeId, dotdotOut.NodeId)
+	}
+}
+
+func TestRenameOntoNonEmptyDirectoryAndMultiplyHardlinked(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-rename-edge-cases"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Test 1: Rename onto non-empty directory returns ENOTEMPTY
+	var dirA, dirB, dirBChild fuse.EntryOut
+	rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "dirA", &dirA)
+	rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "dirB", &dirB)
+	rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: dirB.NodeId}, Mode: 0755}, "child", &dirBChild)
+
+	if status := rawFS.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}, "dirA", "dirB"); status != fuse.Status(syscall.ENOTEMPTY) && status != fuse.Status(syscall.EEXIST) {
+		t.Fatalf("Expected ENOTEMPTY or EEXIST renaming onto non-empty dir, got: %v", status)
+	}
+
+	// Test 2: Rename onto multiply hardlinked file
+	var file1, file2 fuse.CreateOut
+	rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, "file1", &file1)
+	rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, "file2", &file2)
+
+	var link1 fuse.EntryOut
+	if status := rawFS.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Oldnodeid: file1.NodeId}, "file1_link", &link1); status != fuse.OK {
+		t.Fatalf("Link failed: %v", status)
+	}
+	if link1.Attr.Nlink != 2 {
+		t.Fatalf("Expected link1 nlink 2, got %d", link1.Attr.Nlink)
+	}
+
+	// Rename file2 onto file1
+	if status := rawFS.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}, "file2", "file1"); status != fuse.OK {
+		t.Fatalf("Rename file2 onto file1 failed: %v", status)
+	}
+
+	// file1_link should remain with nlink 1
+	var statLink1 fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: file1.NodeId}}, &statLink1); status != fuse.OK {
+		t.Fatalf("GetAttr on file1 inode failed: %v", status)
+	}
+	if statLink1.Attr.Nlink != 1 {
+		t.Fatalf("Expected file1_link nlink 1 after overwrite, got %d", statLink1.Attr.Nlink)
+	}
+}
+
+func TestOpenUnlinkedFileSemantics(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-open-unlinked"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Create file and open it
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, "temp.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create temp.txt failed: %v", status)
+	}
+	fileIno := createOut.NodeId
+
+	// Write data
+	writeData := []byte("hello open unlinked world")
+	_, status := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileIno}, Offset: 0}, writeData)
+	if status != fuse.OK {
+		t.Fatalf("Write failed: %v", status)
+	}
+	rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileIno}})
+
+	// 2. Unlink the file while open
+	if status := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "temp.txt"); status != fuse.OK {
+		t.Fatalf("Unlink failed: %v", status)
+	}
+
+	// 3. fstat on open handle -> nlink must be 0
+	var statOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileIno}}, &statOut); status != fuse.OK {
+		t.Fatalf("GetAttr on open unlinked file failed: %v", status)
+	}
+	if statOut.Attr.Nlink != 0 {
+		t.Fatalf("Expected nlink 0 on open unlinked file, got %d", statOut.Attr.Nlink)
+	}
+
+	// 4. Read data through open handle
+	readBuf := make([]byte, 50)
+	readRes, status := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileIno}, Size: 50, Offset: 0}, readBuf)
+	if status != fuse.OK {
+		t.Fatalf("Read on open unlinked file failed: %v", status)
+	}
+	readBytes, _ := readRes.Bytes(readBuf)
+	if string(readBytes) != "hello open unlinked world" {
+		t.Fatalf("Expected read data 'hello open unlinked world', got %q", string(readBytes))
+	}
+
+	// 5. Release file handle
+	rawFS.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: fileIno}, Fh: createOut.OpenOut.Fh})
+
+	// 6. After release, lookup in root confirms temp.txt does not exist
+	var lookupOut fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "temp.txt", &lookupOut); status != fuse.Status(syscall.ENOENT) {
+		t.Fatalf("Expected ENOENT for unlinked temp.txt, got %v", status)
+	}
+}
+
+func TestMultipleOpenHandlesAndRelease(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-multi-open-handles"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Create file (assigns handle 1)
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, "multi.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create multi.txt failed: %v", status)
+	}
+	fileIno := createOut.NodeId
+	fh1 := createOut.OpenOut.Fh
+
+	// 2. Open file second time (assigns handle 2)
+	var openOut2 fuse.OpenOut
+	if status := rawFS.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: fileIno}}, &openOut2); status != fuse.OK {
+		t.Fatalf("Open 2 failed: %v", status)
+	}
+	fh2 := openOut2.Fh
+
+	// 3. Open file third time (assigns handle 3)
+	var openOut3 fuse.OpenOut
+	if status := rawFS.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: fileIno}}, &openOut3); status != fuse.OK {
+		t.Fatalf("Open 3 failed: %v", status)
+	}
+	fh3 := openOut3.Fh
+
+	if fh1 == fh2 || fh2 == fh3 || fh1 == fh3 {
+		t.Fatalf("Expected distinct handles for each open, got fh1=%d fh2=%d fh3=%d", fh1, fh2, fh3)
+	}
+
+	// Write data
+	writeData := []byte("multi handle test content")
+	_, status := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileIno}, Fh: fh1, Offset: 0}, writeData)
+	if status != fuse.OK {
+		t.Fatalf("Write failed: %v", status)
+	}
+	rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileIno}, Fh: fh1})
+
+	// 4. Unlink file while 3 handles are open
+	if status := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "multi.txt"); status != fuse.OK {
+		t.Fatalf("Unlink failed: %v", status)
+	}
+
+	// 5. Release first handle (2 handles remain)
+	rawFS.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: fileIno}, Fh: fh1})
+
+	// 6. Read through handle 2
+	readBuf := make([]byte, 50)
+	readRes, status := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileIno}, Fh: fh2, Size: 50, Offset: 0}, readBuf)
+	if status != fuse.OK {
+		t.Fatalf("Read on handle 2 failed: %v", status)
+	}
+	readBytes, _ := readRes.Bytes(readBuf)
+	if string(readBytes) != "multi handle test content" {
+		t.Fatalf("Expected 'multi handle test content', got %q", string(readBytes))
+	}
+
+	// 7. Release second handle (1 handle remains)
+	rawFS.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: fileIno}, Fh: fh2})
+
+	// 8. Read through handle 3
+	readRes3, status := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileIno}, Fh: fh3, Size: 50, Offset: 0}, readBuf)
+	if status != fuse.OK {
+		t.Fatalf("Read on handle 3 failed: %v", status)
+	}
+	readBytes3, _ := readRes3.Bytes(readBuf)
+	if string(readBytes3) != "multi handle test content" {
+		t.Fatalf("Expected 'multi handle test content', got %q", string(readBytes3))
+	}
+
+	// 9. Release final handle
+	rawFS.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: fileIno}, Fh: fh3})
+
+	// 10. Lookup in root confirms file is gone
+	var lookupOut fuse.EntryOut
+	if status := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "multi.txt", &lookupOut); status != fuse.Status(syscall.ENOENT) {
+		t.Fatalf("Expected ENOENT for unlinked multi.txt after all handles released, got %v", status)
+	}
+}

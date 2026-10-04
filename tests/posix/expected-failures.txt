@@ -15,12 +15,4 @@
 # Expected failing tests for pjdfstest against objectfs.
 # As POSIX features are implemented in objectfs (e.g. chmod, chown, utimes, symlinks,
 # hard links, xattrs), tests that begin passing must be removed from this list.
-chown/00.t
-link/00.t
-rename/00.t
-rename/20.t
-rename/23.t
-rename/24.t
-unlink/00.t
-unlink/08.t
-unlink/14.t
+

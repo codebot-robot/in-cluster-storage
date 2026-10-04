@@ -423,7 +423,8 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	if err != nil {
 		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.CreateFileResponse{Attr: attr}, nil
+	fh := vol.AllocFh(attr.Inode)
+	return &pb.CreateFileResponse{Attr: attr, Fh: fh}, nil
 }
 
 func (s *Server) ReadFile(ctx context.Context, req *pb.ReadFileRequest) (*pb.ReadFileResponse, error) {
@@ -582,6 +583,35 @@ func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkRespons
 		return &pb.LinkResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.LinkResponse{Attr: attr}, nil
+}
+
+func (s *Server) Open(ctx context.Context, req *pb.OpenRequest) (*pb.OpenResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	fh, err := vol.Open(ctx, req.GetInode(), req.GetFlags())
+	if err != nil {
+		return &pb.OpenResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.OpenResponse{Fh: fh}, nil
+}
+
+func (s *Server) Release(ctx context.Context, req *pb.ReleaseRequest) (*pb.ReleaseResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	if err := vol.Release(ctx, req.GetInode(), req.GetFh()); err != nil {
+		return &pb.ReleaseResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.ReleaseResponse{}, nil
 }
 
 func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSController_WatchVolumeServer) error {

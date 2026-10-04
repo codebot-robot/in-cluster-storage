@@ -1718,13 +1718,13 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 		t.Fatalf("Expected 'contents', got %q (total=%d, err=%v)", string(data), total, err)
 	}
 
-	// 6. Unlink link1.txt -> file link count drops to 0
+	// 6. Unlink link1.txt -> file is deleted (no open handles)
 	if err := vol.Unlink(ctx, 1, "link1.txt"); err != nil {
 		t.Fatalf("Unlink link1.txt failed: %v", err)
 	}
-	unlinkedAttr, err := vol.GetAttr(ctx, fileAttr.Inode)
-	if err != nil || unlinkedAttr.Nlink != 0 {
-		t.Fatalf("Expected unlinked inode Nlink 0, got %d, err %v", unlinkedAttr.Nlink, err)
+	_, err = vol.GetAttr(ctx, fileAttr.Inode)
+	if !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("Expected ENOENT for unlinked inode with no open handles, got: %v", err)
 	}
 }
 
