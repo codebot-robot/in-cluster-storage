@@ -539,6 +539,51 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	return &pb.FsyncResponse{Success: true}, nil
 }
 
+func (s *Server) Symlink(ctx context.Context, req *pb.SymlinkRequest) (*pb.SymlinkResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	attr, err := vol.Symlink(ctx, req.GetParentInode(), req.GetName(), req.GetTarget(), req.GetUid(), req.GetGid())
+	if err != nil {
+		return &pb.SymlinkResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.SymlinkResponse{Attr: attr}, nil
+}
+
+func (s *Server) Readlink(ctx context.Context, req *pb.ReadlinkRequest) (*pb.ReadlinkResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	target, err := vol.Readlink(ctx, req.GetInode())
+	if err != nil {
+		return &pb.ReadlinkResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.ReadlinkResponse{Target: target}, nil
+}
+
+func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	attr, err := vol.Link(ctx, req.GetOldInode(), req.GetNewParentInode(), req.GetNewName())
+	if err != nil {
+		return &pb.LinkResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.LinkResponse{Attr: attr}, nil
+}
+
 func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSController_WatchVolumeServer) error {
 	if req.GetVolumeId() == "" {
 		return status.Error(codes.InvalidArgument, "volume_id is required")

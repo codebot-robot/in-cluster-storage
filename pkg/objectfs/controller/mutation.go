@@ -36,6 +36,8 @@ const (
 	MutationRmdir           = pb.MutationType_MUTATION_TYPE_RMDIR
 	MutationRename          = pb.MutationType_MUTATION_TYPE_RENAME
 	MutationSetAttr         = pb.MutationType_MUTATION_TYPE_SETATTR
+	MutationSymlink         = pb.MutationType_MUTATION_TYPE_SYMLINK
+	MutationLink            = pb.MutationType_MUTATION_TYPE_LINK
 )
 
 // MutationRecord aliases the protobuf MutationRecord message.
