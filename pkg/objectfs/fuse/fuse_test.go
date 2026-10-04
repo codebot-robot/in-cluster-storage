@@ -17,6 +17,7 @@ limitations under the License.
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -1259,5 +1260,195 @@ func TestFUSEMknodSpecialFiles(t *testing.T) {
 	}
 	if getAttrOut.Attr.Mode&syscall.S_IFMT != syscall.S_IFCHR {
 		t.Fatalf("GetAttr Mode expected S_IFCHR, got %o", getAttrOut.Attr.Mode)
+	}
+}
+
+func TestFUSETruncateAndUnalignedWriteWithCacheInvalidation(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, "vol-trunc-test", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "trunc_unaligned.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Write 200 KiB pattern (pattern[i] = byte(i % 251 + 1))
+	initialSize := 200 * 1024
+	pattern := make([]byte, initialSize)
+	for i := range pattern {
+		pattern[i] = byte(i%251 + 1)
+	}
+	written, status := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, pattern)
+	if status != fuse.OK || int(written) != initialSize {
+		t.Fatalf("Initial write failed: status=%v, written=%d", status, written)
+	}
+	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Flush failed: %v", status)
+	}
+
+	// Truncate down to 150 KiB
+	truncSize := uint64(150 * 1024)
+	var attrOut fuse.AttrOut
+	if status := rawFS.SetAttr(nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_SIZE,
+			Size:     truncSize,
+		},
+	}, &attrOut); status != fuse.OK {
+		t.Fatalf("SetAttr truncate failed: %v", status)
+	}
+
+	// Invalidate client cache (simulating WatchVolume arrival)
+	cache.InvalidateIfNotDirty(fileID)
+
+	// Write 4096 bytes at offset 0 with distinct marker
+	patch0 := bytes.Repeat([]byte{0xAA}, 4096)
+	written, status = rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, patch0)
+	if status != fuse.OK || int(written) != len(patch0) {
+		t.Fatalf("Write at offset 0 failed: status=%v, written=%d", status, written)
+	}
+
+	// Write 1000 bytes at offset 70000 (chunk 1 unaligned)
+	patch1 := bytes.Repeat([]byte{0xBB}, 1000)
+	written, status = rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 70000}, patch1)
+	if status != fuse.OK || int(written) != len(patch1) {
+		t.Fatalf("Write at offset 70000 failed: status=%v, written=%d", status, written)
+	}
+
+	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Flush failed: %v", status)
+	}
+
+	// Invalidate client cache and read back through FUSE
+	cache.InvalidateIfNotDirty(fileID)
+
+	expected := make([]byte, truncSize)
+	copy(expected, pattern[:truncSize])
+	copy(expected[0:4096], patch0)
+	copy(expected[70000:71000], patch1)
+
+	readBuf := make([]byte, truncSize)
+	readRes, status := rawFS.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     uint32(truncSize),
+	}, readBuf)
+	if status != fuse.OK {
+		t.Fatalf("Read failed: %v", status)
+	}
+	readBytes, readStatus := readRes.Bytes(readBuf)
+	if readStatus != fuse.OK {
+		t.Fatalf("Failed to extract read bytes: %v", readStatus)
+	}
+	if len(readBytes) != len(expected) {
+		t.Fatalf("Read length mismatch: got %d, want %d", len(readBytes), len(expected))
+	}
+	for i := range expected {
+		if readBytes[i] != expected[i] {
+			t.Fatalf("Data mismatch at offset %d (chunk %d): got 0x%02x, want 0x%02x", i, i/int(DefaultChunkSize), readBytes[i], expected[i])
+		}
+	}
+}
+
+func TestFUSEUnflushedHoleAndDirtyWriteRead(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, "vol-unflushed-test", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "unflushed_hole.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// 1. Write 4 KiB at offset 200 KiB without flushing
+	patchData := bytes.Repeat([]byte{0x42}, 4096)
+	written, status := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 200 * 1024}, patchData)
+	if status != fuse.OK || int(written) != len(patchData) {
+		t.Fatalf("Write at offset 200 KiB failed: status=%v, written=%d", status, written)
+	}
+
+	// 2. Read [0, 204 KiB) without flushing -> must return 200 KiB zeros + 4 KiB patchData
+	totalSize := uint64(204 * 1024)
+	readBuf := make([]byte, totalSize)
+	readRes, status := rawFS.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     uint32(totalSize),
+	}, readBuf)
+	if status != fuse.OK {
+		t.Fatalf("Read failed: %v", status)
+	}
+	readBytes, readStatus := readRes.Bytes(readBuf)
+	if readStatus != fuse.OK {
+		t.Fatalf("Failed to extract read bytes: %v", readStatus)
+	}
+	if uint64(len(readBytes)) != totalSize {
+		t.Fatalf("Read length mismatch: got %d, want %d", len(readBytes), totalSize)
+	}
+
+	expected := make([]byte, totalSize)
+	copy(expected[200*1024:], patchData)
+	if !bytes.Equal(readBytes, expected) {
+		t.Fatalf("Read data mismatch for unflushed hole read")
+	}
+
+	// 3. Variant: flush 64 KiB clean data at offset 0, write 4 KiB at offset 200 KiB without flushing,
+	// evict/clear chunk 0 from cache, and read [0, 204 KiB).
+	chunk0Data := bytes.Repeat([]byte{0x77}, 64*1024)
+	written, status = rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, chunk0Data)
+	if status != fuse.OK || int(written) != len(chunk0Data) {
+		t.Fatalf("Write chunk 0 failed: status=%v, written=%d", status, written)
+	}
+	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Flush failed: %v", status)
+	}
+
+	// Dirty write extending past controller size (e.g. at 200 KiB)
+	written, status = rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 200 * 1024}, patchData)
+	if status != fuse.OK || int(written) != len(patchData) {
+		t.Fatalf("Write at offset 200 KiB failed: status=%v, written=%d", status, written)
+	}
+
+	// Delete chunk 0 from cache to simulate uncached clean chunk + unflushed dirty chunk
+	cache.mu.Lock()
+	if entry, ok := cache.entries[fileID]; ok {
+		delete(entry.Chunks, 0)
+	}
+	cache.mu.Unlock()
+
+	readBuf2 := make([]byte, totalSize)
+	readRes2, status := rawFS.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     uint32(totalSize),
+	}, readBuf2)
+	if status != fuse.OK {
+		t.Fatalf("Read spanning uncached clean and dirty chunks failed: %v", status)
+	}
+	readBytes2, readStatus2 := readRes2.Bytes(readBuf2)
+	if readStatus2 != fuse.OK {
+		t.Fatalf("Failed to extract read bytes: %v", readStatus2)
+	}
+	if uint64(len(readBytes2)) != totalSize {
+		t.Fatalf("Read length mismatch: got %d, want %d", len(readBytes2), totalSize)
+	}
+
+	copy(expected[0:64*1024], chunk0Data)
+	if !bytes.Equal(readBytes2, expected) {
+		t.Fatalf("Read data mismatch for spanning uncached clean and dirty chunks")
 	}
 }

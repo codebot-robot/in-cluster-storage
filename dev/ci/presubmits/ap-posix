@@ -36,8 +36,19 @@ if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/nul
 fi
 
 WORK_DIR="$(mktemp -d /tmp/posix-gate.XXXXXX)"
+DEV_DIR="$(mktemp -d /tmp/objectfs-posix.XXXXXX)"
+export OBJECTFS_DEV_DIR="${DEV_DIR}"
+
 cleanup() {
-  rm -rf "${WORK_DIR}"
+  local exit_code=$?
+  if [[ ${exit_code} -ne 0 ]]; then
+    ARTIFACTS_DIR="${ARTIFACTS:-${REPO_ROOT}/.artifacts}"
+    mkdir -p "${ARTIFACTS_DIR}"
+    cp -f "${DEV_DIR}/controller.log" "${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f "${DEV_DIR}/mount.log" "${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f core* "${ARTIFACTS_DIR}/" 2>/dev/null || true
+  fi
+  rm -rf "${WORK_DIR}" "${DEV_DIR}"
 }
 trap cleanup EXIT
 
@@ -113,21 +124,30 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-echo "==> Running fsx data-integrity test..."
+echo "==> Running fsx data-integrity test across multiple seeds..."
 # File size limit raised well above 1MB (16MB) using 64 KiB chunked blob-first writes (#143).
 # Mapped writes are disabled (-W) pending kernel page cache writeback coherency.
-set +o errexit
-"${XFSTESTS_DIR}/fsx" -N 1000 -S 42 -l 16777216 -o 65536 -p 200 -W fsx-test.bin
-fsx_exit=\$?
-set -o errexit
-if [[ \${fsx_exit} -ne 0 ]]; then
-  echo "fsx failed with exit code \${fsx_exit}"
-  mkdir -p "${REPO_ROOT}/.artifacts"
-  cp -f fsx-test.bin.fsxops "${REPO_ROOT}/.artifacts/" 2>/dev/null || true
-  cp -f fsx-test.bin.fsxgood "${REPO_ROOT}/.artifacts/" 2>/dev/null || true
-  exit \${fsx_exit}
-fi
-echo "fsx passed successfully!"
+FSX_SEEDS=(42 1337 2026 777 9999)
+for seed in "\${FSX_SEEDS[@]}"; do
+  echo "--- fsx run (seed=\${seed}, 1000 ops) ---"
+  set +o errexit
+  "${XFSTESTS_DIR}/fsx" -N 1000 -S "\${seed}" -l 16777216 -o 65536 -p 200 -W fsx-test.bin
+  fsx_exit=\$?
+  set -o errexit
+  if [[ \${fsx_exit} -ne 0 ]]; then
+    echo "fsx failed on seed \${seed} with exit code \${fsx_exit}"
+    ARTIFACTS_DIR="\${ARTIFACTS:-${REPO_ROOT}/.artifacts}"
+    mkdir -p "\${ARTIFACTS_DIR}"
+    cp -f fsx-test.bin.fsxops "\${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f fsx-test.bin.fsxgood "\${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f "${DEV_DIR}/controller.log" "\${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f "${DEV_DIR}/mount.log" "\${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f core* "\${ARTIFACTS_DIR}/" 2>/dev/null || true
+    exit \${fsx_exit}
+  fi
+  rm -f fsx-test.bin fsx-test.bin.fsxops fsx-test.bin.fsxgood
+done
+echo "fsx passed successfully across all seeds!"
 echo
 
 echo "==> Running pjdfstest POSIX conformance test suite..."
@@ -206,7 +226,7 @@ echo
 echo "============================================================"
 echo "POSIX & Data-Integrity Conformance Summary:"
 echo "------------------------------------------------------------"
-echo "  fsx data-integrity test: PASS (1000 ops, seed=42, max_len=1MB)"
+echo "  fsx data-integrity test: PASS (5 seeds, 1000 ops each, max_len=16MB)"
 echo "------------------------------------------------------------"
 echo "  pjdfstest POSIX test suite:"
 echo "    Total tests executed:  \${total_count}"

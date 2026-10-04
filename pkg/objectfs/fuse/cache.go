@@ -104,18 +104,13 @@ func (c *NodeCache) GetRange(inode uint64, offset, length int64) ([]byte, bool) 
 		end = entry.Size
 	}
 
-	if len(entry.Data) > 0 {
-		if offset >= int64(len(entry.Data)) {
+	if len(entry.Chunks) == 0 && len(entry.Data) > 0 {
+		if end <= int64(len(entry.Data)) {
 			res := make([]byte, end-offset)
+			copy(res, entry.Data[offset:end])
 			return res, true
 		}
-		res := make([]byte, end-offset)
-		copyLen := end
-		if copyLen > int64(len(entry.Data)) {
-			copyLen = int64(len(entry.Data))
-		}
-		copy(res, entry.Data[offset:copyLen])
-		return res, true
+		return nil, false
 	}
 
 	cs := int64(entry.ChunkSize)
@@ -326,11 +321,14 @@ func entryBytes(e *CachedEntry) int64 {
 	if e == nil {
 		return 0
 	}
-	total := int64(len(e.Data))
-	for _, chunk := range e.Chunks {
-		total += int64(len(chunk))
+	if len(e.Chunks) > 0 {
+		var total int64
+		for _, chunk := range e.Chunks {
+			total += int64(len(chunk))
+		}
+		return total
 	}
-	return total
+	return int64(len(e.Data))
 }
 
 func (c *NodeCache) Put(inode uint64, data []byte, modTime time.Time, sha256 string) {
@@ -339,7 +337,7 @@ func (c *NodeCache) Put(inode uint64, data []byte, modTime time.Time, sha256 str
 
 	if old, ok := c.entries[inode]; ok {
 		// If existing entry is dirty, don't overwrite dirty uncommitted data with stale data
-		if old.IsDirty {
+		if old.IsDirty || len(old.DirtyChunks) > 0 {
 			return
 		}
 		c.curBytes -= entryBytes(old)
@@ -352,7 +350,7 @@ func (c *NodeCache) Put(inode uint64, data []byte, modTime time.Time, sha256 str
 	buf := make([]byte, len(data))
 	copy(buf, data)
 
-	c.entries[inode] = &CachedEntry{
+	entry := &CachedEntry{
 		Inode:       inode,
 		Data:        buf,
 		Size:        dataLen,
@@ -364,7 +362,33 @@ func (c *NodeCache) Put(inode uint64, data []byte, modTime time.Time, sha256 str
 		Chunks:      make(map[int][]byte),
 		DirtyChunks: make(map[int]bool),
 	}
+
+	cs := int64(DefaultChunkSize)
+	numChunks := int((dataLen + cs - 1) / cs)
+	for i := 0; i < numChunks; i++ {
+		cStart := int64(i) * cs
+		cEnd := cStart + cs
+		if cEnd > dataLen {
+			cEnd = dataLen
+		}
+		cBuf := make([]byte, cEnd-cStart)
+		copy(cBuf, data[cStart:cEnd])
+		entry.Chunks[i] = cBuf
+	}
+
+	c.entries[inode] = entry
 	c.curBytes += dataLen
+}
+
+func (c *NodeCache) GetSize(inode uint64) (int64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.entries[inode]
+	if !ok {
+		return 0, false
+	}
+	return entry.Size, true
 }
 
 func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime time.Time) int64 {
@@ -447,15 +471,7 @@ func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime tim
 	entry.ModTime = modTime
 	entry.LastRead = time.Now()
 	entry.IsDirty = true
-
-	if newSize <= 16*1024*1024 {
-		if int64(len(entry.Data)) < newSize {
-			newBuf := make([]byte, newSize)
-			copy(newBuf, entry.Data)
-			entry.Data = newBuf
-		}
-		copy(entry.Data[offset:], data)
-	}
+	entry.Data = nil
 
 	c.evictIfNeededLocked(0)
 	return entry.Size
@@ -497,7 +513,6 @@ func (c *NodeCache) Truncate(inode uint64, size int64, modTime time.Time) {
 			if int64(len(chunk)) > lastChunkLen {
 				c.curBytes -= (int64(len(chunk)) - lastChunkLen)
 				entry.Chunks[idx] = chunk[:lastChunkLen]
-				entry.DirtyChunks[idx] = true
 			}
 		}
 	}
