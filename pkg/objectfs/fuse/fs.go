@@ -632,57 +632,152 @@ func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename st
 }
 
 func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
-	ctx, cancelFunc := makeContext(cancel)
-	defer cancelFunc()
-
 	offset := int64(input.Offset)
 	size := int64(input.Size)
+
+	if size <= 0 {
+		return fuse.ReadResultData([]byte{}), fuse.OK
+	}
 
 	if cachedBytes, ok := fs.cache.GetRange(input.NodeId, offset, size); ok {
 		return fuse.ReadResultData(cachedBytes), fuse.OK
 	}
 
-	resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
-		VolumeId: fs.volumeID,
-		Inode:    input.NodeId,
-		Offset:   offset,
-		Size:     size,
-	})
-	if err != nil {
-		return nil, grpcErrorToStatus(err)
-	}
-	if resp.GetError() != 0 {
-		return nil, fuse.Status(resp.GetError())
+	ctx, cancelFunc := makeContext(cancel)
+	defer cancelFunc()
+
+	cs := int64(DefaultChunkSize)
+	startChunk := int(offset / cs)
+	endChunk := int((offset + size - 1) / cs)
+
+	clientSize, hasClientEntry := fs.cache.GetSize(input.NodeId)
+	var totalSize int64
+	if hasClientEntry {
+		totalSize = clientSize
 	}
 
-	data := resp.GetData()
-	if offset == 0 && resp.GetEof() && len(data) > 0 {
-		fs.cache.Put(input.NodeId, data, time.Now(), "")
-	} else if len(data) > 0 {
-		chunkSize := DefaultChunkSize
-		chunkIdx := int(offset / int64(chunkSize))
-		fs.cache.PutChunk(input.NodeId, chunkIdx, chunkSize, resp.GetTotalSize(), data, time.Now())
+	var result []byte
+	for i := startChunk; i <= endChunk; i++ {
+		chunkStart := int64(i) * cs
+		rStart := offset - chunkStart
+		if rStart < 0 {
+			rStart = 0
+		}
+		rEnd := offset + size - chunkStart
+		if rEnd > cs {
+			rEnd = cs
+		}
+
+		// 1. Check if chunk is in cache
+		if cachedChunk, ok := fs.cache.GetChunk(input.NodeId, i); ok {
+			chunkLen := int64(len(cachedChunk))
+			if hasClientEntry && totalSize > 0 {
+				expectedLen := cs
+				if int64(i+1)*cs > totalSize {
+					expectedLen = totalSize - chunkStart
+				}
+				if expectedLen < 0 {
+					expectedLen = 0
+				}
+				if chunkLen < expectedLen {
+					padded := make([]byte, expectedLen)
+					copy(padded, cachedChunk)
+					cachedChunk = padded
+					chunkLen = expectedLen
+				}
+			}
+			if rStart < chunkLen {
+				end := rEnd
+				if end > chunkLen {
+					end = chunkLen
+				}
+				result = append(result, cachedChunk[rStart:end]...)
+			}
+			continue
+		}
+
+		// 2. Not in cache: fetch chunk from controller
+		resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
+			VolumeId: fs.volumeID,
+			Inode:    input.NodeId,
+			Offset:   chunkStart,
+			Size:     cs,
+		})
+		if err != nil {
+			return nil, grpcErrorToStatus(err)
+		}
+		if resp.GetError() != 0 {
+			return nil, fuse.Status(resp.GetError())
+		}
+
+		if resp.GetTotalSize() > totalSize {
+			totalSize = resp.GetTotalSize()
+		}
+
+		fetchedData := resp.GetData()
+		// Cache full clean chunk if complete
+		if (int64(len(fetchedData)) == cs || resp.GetEof()) && len(fetchedData) > 0 {
+			fs.cache.PutChunk(input.NodeId, i, uint32(cs), resp.GetTotalSize(), fetchedData, time.Now())
+		}
+
+		// If chunk has fewer bytes than expected by totalSize (e.g. hole or unflushed write), zero pad
+		expectedChunkLen := cs
+		if int64(i+1)*cs > totalSize {
+			expectedChunkLen = totalSize - chunkStart
+		}
+		if expectedChunkLen < 0 {
+			expectedChunkLen = 0
+		}
+		if int64(len(fetchedData)) < expectedChunkLen {
+			padded := make([]byte, expectedChunkLen)
+			copy(padded, fetchedData)
+			fetchedData = padded
+		}
+
+		fetchedLen := int64(len(fetchedData))
+		if rStart < fetchedLen {
+			end := rEnd
+			if end > fetchedLen {
+				end = fetchedLen
+			}
+			result = append(result, fetchedData[rStart:end]...)
+		}
 	}
 
-	return fuse.ReadResultData(data), fuse.OK
+	return fuse.ReadResultData(result), fuse.OK
 }
 
 func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
-	// If partial chunk write at offset > 0 and chunk not in cache, load existing chunk content into cache first
+	// If any chunk touched by write is not fully overwritten and not in cache, load existing chunk content into cache first
 	cs := int64(DefaultChunkSize)
 	startChunk := int64(input.Offset) / cs
-	if int64(input.Offset)%cs != 0 {
-		if _, ok := fs.cache.GetChunk(input.NodeId, int(startChunk)); !ok {
-			ctx, cancelFunc := makeContext(cancel)
-			resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
-				VolumeId: fs.volumeID,
-				Inode:    input.NodeId,
-				Offset:   startChunk * cs,
-				Size:     cs,
-			})
-			cancelFunc()
-			if err == nil && resp.GetError() == 0 && len(resp.GetData()) > 0 {
-				fs.cache.PutChunk(input.NodeId, int(startChunk), DefaultChunkSize, resp.GetTotalSize(), resp.GetData(), time.Now())
+	endChunk := (int64(input.Offset) + int64(len(data)) - 1) / cs
+
+	for i := startChunk; i <= endChunk; i++ {
+		chunkStart := i * cs
+		chunkEnd := chunkStart + cs
+		wStart := int64(input.Offset)
+		if wStart < chunkStart {
+			wStart = chunkStart
+		}
+		wEnd := int64(input.Offset) + int64(len(data))
+		if wEnd > chunkEnd {
+			wEnd = chunkEnd
+		}
+
+		if wStart > chunkStart || wEnd < chunkEnd {
+			if _, ok := fs.cache.GetChunk(input.NodeId, int(i)); !ok {
+				ctx, cancelFunc := makeContext(cancel)
+				resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
+					VolumeId: fs.volumeID,
+					Inode:    input.NodeId,
+					Offset:   chunkStart,
+					Size:     cs,
+				})
+				cancelFunc()
+				if err == nil && resp.GetError() == 0 && len(resp.GetData()) > 0 {
+					fs.cache.PutChunk(input.NodeId, int(i), DefaultChunkSize, resp.GetTotalSize(), resp.GetData(), time.Now())
+				}
 			}
 		}
 	}
