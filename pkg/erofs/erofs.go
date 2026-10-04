@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 )
 
@@ -60,10 +61,14 @@ const (
 )
 
 const (
-	S_IFMT  = 0170000
-	S_IFREG = 0100000
-	S_IFDIR = 0040000
-	S_IFLNK = 0120000
+	S_IFMT   = 0170000
+	S_IFREG  = 0100000
+	S_IFDIR  = 0040000
+	S_IFCHR  = 0020000
+	S_IFBLK  = 0060000
+	S_IFIFO  = 0010000
+	S_IFSOCK = 0140000
+	S_IFLNK  = 0120000
 )
 
 type ErrorCode int
@@ -187,6 +192,7 @@ type Inode struct {
 	Nlink       uint32
 	Version     uint16 // 0 for compact, 1 for extended
 	DataLayout  uint16
+	Rdev        uint32
 }
 
 // Dirent represents a directory entry.
@@ -321,6 +327,7 @@ func ReadInode(r io.ReaderAt, sb *Superblock, nid uint64) (*Inode, error) {
 		inode.Size = uint64(binary.LittleEndian.Uint32(buf[8:12]))
 		// buf[12:16] is reserved
 		inode.RawBlkaddr = binary.LittleEndian.Uint32(buf[16:20])
+		inode.Rdev = inode.RawBlkaddr
 		inode.Ino = binary.LittleEndian.Uint32(buf[20:24])
 		inode.UID = uint32(binary.LittleEndian.Uint16(buf[24:26]))
 		inode.GID = uint32(binary.LittleEndian.Uint16(buf[26:28]))
@@ -333,6 +340,7 @@ func ReadInode(r io.ReaderAt, sb *Superblock, nid uint64) (*Inode, error) {
 		inode.Mode = binary.LittleEndian.Uint16(buf[4:6])
 		inode.Size = binary.LittleEndian.Uint64(buf[8:16])
 		inode.RawBlkaddr = binary.LittleEndian.Uint32(buf[16:20])
+		inode.Rdev = inode.RawBlkaddr
 		inode.Ino = binary.LittleEndian.Uint32(buf[20:24])
 		inode.UID = binary.LittleEndian.Uint32(buf[24:28])
 		inode.GID = binary.LittleEndian.Uint32(buf[28:32])
@@ -720,6 +728,11 @@ func (reader *Reader) GetRootNID() uint64 {
 	return reader.sb.GetRootNID()
 }
 
+// ReadInode reads and parses an inode from the EROFS image by NID.
+func (reader *Reader) ReadInode(nid uint64) (*Inode, error) {
+	return ReadInode(reader.r, reader.sb, nid)
+}
+
 // ReadFileContent returns an io.Reader to stream the content of a regular/symlink file.
 func (reader *Reader) ReadFileContent(nid uint64) (io.Reader, error) {
 	inode, err := ReadInode(reader.r, reader.sb, nid)
@@ -1092,6 +1105,12 @@ type MetadataOnlyNode interface {
 	IsMetadataOnly() bool
 }
 
+// RdevNode is an optional interface for device nodes returning their device number.
+type RdevNode interface {
+	Node
+	Rdev() uint32
+}
+
 // memoryNode implements the Node interface for virtual in-memory trees.
 type memoryNode struct {
 	name           string
@@ -1102,6 +1121,7 @@ type memoryNode struct {
 	mtime          uint64
 	size           uint64
 	ino            uint64
+	rdev           uint32
 	content        []byte
 	children       []Node
 	xattrs         Xattrs
@@ -1114,7 +1134,11 @@ func (m *memoryNode) Mode() uint16  { return m.mode }
 func (m *memoryNode) UID() uint32   { return m.uid }
 func (m *memoryNode) GID() uint32   { return m.gid }
 func (m *memoryNode) Mtime() uint64 { return m.mtime }
+func (m *memoryNode) Rdev() uint32  { return m.rdev }
 func (m *memoryNode) Size() uint64 {
+	if (m.mode&S_IFMT) == S_IFCHR || (m.mode&S_IFMT) == S_IFBLK || (m.mode&S_IFMT) == S_IFIFO || (m.mode&S_IFMT) == S_IFSOCK {
+		return 0
+	}
 	if m.isMetadataOnly || m.size > 0 {
 		return m.size
 	}
@@ -1138,6 +1162,12 @@ func (m *memoryNode) Open() (io.ReadCloser, error) {
 }
 
 type MemoryNodeOption func(*memoryNode)
+
+func WithRdev(rdev uint32) MemoryNodeOption {
+	return func(m *memoryNode) {
+		m.rdev = rdev
+	}
+}
 
 func WithXattrs(xattrs Xattrs) MemoryNodeOption {
 	return func(m *memoryNode) {
@@ -1205,6 +1235,7 @@ type fileSystemNode struct {
 	size   uint64
 	ino    uint64
 	target string
+	rdev   uint32
 }
 
 // newFileSystemNode instantiates and caches file system information, calling Lstat exactly once.
@@ -1220,8 +1251,23 @@ func newFileSystemNode(name string, path string) (Node, error) {
 		mode |= S_IFDIR
 	} else if (m & uint32(os.ModeSymlink)) != 0 {
 		mode |= S_IFLNK
+	} else if (m & uint32(os.ModeDevice)) != 0 {
+		if (m & uint32(os.ModeCharDevice)) != 0 {
+			mode |= S_IFCHR
+		} else {
+			mode |= S_IFBLK
+		}
+	} else if (m & uint32(os.ModeNamedPipe)) != 0 {
+		mode |= S_IFIFO
+	} else if (m & uint32(os.ModeSocket)) != 0 {
+		mode |= S_IFSOCK
 	} else {
 		mode |= S_IFREG
+	}
+
+	var rdev uint32
+	if sysStat, ok := st.Sys().(*syscall.Stat_t); ok {
+		rdev = uint32(sysStat.Rdev)
 	}
 
 	node := &fileSystemNode{
@@ -1231,6 +1277,7 @@ func newFileSystemNode(name string, path string) (Node, error) {
 		mode:  mode,
 		mtime: uint64(st.ModTime().Unix()),
 		size:  uint64(st.Size()),
+		rdev:  rdev,
 	}
 
 	if (mode & S_IFMT) == S_IFLNK {
@@ -1260,6 +1307,7 @@ func (f *fileSystemNode) Mode() uint16  { return f.mode }
 func (f *fileSystemNode) UID() uint32   { return 0 }
 func (f *fileSystemNode) GID() uint32   { return 0 }
 func (f *fileSystemNode) Mtime() uint64 { return f.mtime }
+func (f *fileSystemNode) Rdev() uint32  { return f.rdev }
 func (f *fileSystemNode) Size() uint64  { return f.size }
 func (f *fileSystemNode) Ino() uint64   { return f.ino }
 
@@ -1411,6 +1459,7 @@ type nodeInfo struct {
 	gid            uint32
 	mtime          uint64
 	size           uint64
+	rdev           uint32
 	dataLen        uint64
 	dataOffset     int64
 	dirData        []byte
@@ -1450,7 +1499,9 @@ func marshalCompactNode(n *nodeInfo) []byte {
 	binary.LittleEndian.PutUint16(buf[6:8], nlink)
 	binary.LittleEndian.PutUint32(buf[8:12], uint32(n.size))
 	binary.LittleEndian.PutUint32(buf[12:16], 0) // reserved
-	if n.dataLen > 0 {
+	if (n.mode&S_IFMT) == S_IFCHR || (n.mode&S_IFMT) == S_IFBLK {
+		binary.LittleEndian.PutUint32(buf[16:20], n.rdev)
+	} else if n.dataLen > 0 {
 		binary.LittleEndian.PutUint32(buf[16:20], uint32(n.dataOffset/BlockSize4K))
 	} else {
 		binary.LittleEndian.PutUint32(buf[16:20], 0)
@@ -1474,7 +1525,9 @@ func marshalExtendedNode(n *nodeInfo) []byte {
 	binary.LittleEndian.PutUint16(buf[6:8], 0) // reserved
 
 	binary.LittleEndian.PutUint64(buf[8:16], n.size)
-	if n.dataLen > 0 {
+	if (n.mode&S_IFMT) == S_IFCHR || (n.mode&S_IFMT) == S_IFBLK {
+		binary.LittleEndian.PutUint32(buf[16:20], n.rdev)
+	} else if n.dataLen > 0 {
 		binary.LittleEndian.PutUint32(buf[16:20], uint32(n.dataOffset/BlockSize4K))
 	} else {
 		binary.LittleEndian.PutUint32(buf[16:20], 0)
@@ -1528,6 +1581,11 @@ func WriteImage(w io.WriterAt, root Node) error {
 			headerSize = 64
 		}
 
+		var rdev uint32
+		if rdevNode, ok := n.(RdevNode); ok {
+			rdev = rdevNode.Rdev()
+		}
+
 		info := &nodeInfo{
 			node:       n,
 			nid:        nid,
@@ -1541,6 +1599,7 @@ func WriteImage(w io.WriterAt, root Node) error {
 			gid:        n.GID(),
 			mtime:      n.Mtime(),
 			size:       n.Size(),
+			rdev:       rdev,
 		}
 		if info.isDir {
 			info.mode |= S_IFDIR
@@ -1762,8 +1821,21 @@ func WriteImage(w io.WriterAt, root Node) error {
 				var ft uint8 = FTRegFile
 				if childInfo.isDir {
 					ft = FTDir
-				} else if (childInfo.mode & S_IFMT) == S_IFLNK {
-					ft = FTSymlink
+				} else {
+					switch childInfo.mode & S_IFMT {
+					case S_IFLNK:
+						ft = FTSymlink
+					case S_IFCHR:
+						ft = FTChrDev
+					case S_IFBLK:
+						ft = FTBlkDev
+					case S_IFIFO:
+						ft = FTFifo
+					case S_IFSOCK:
+						ft = FTSock
+					default:
+						ft = FTRegFile
+					}
 				}
 				dirents = append(dirents, Dirent{NID: childInfo.nid, Name: childInfo.name, FileType: ft})
 			}
@@ -1776,7 +1848,10 @@ func WriteImage(w io.WriterAt, root Node) error {
 			n.size = uint64(len(dirBlock))
 			n.dataLen = uint64(len(dirBlock))
 		} else {
-			if n.isMetadataOnly {
+			if (n.mode&S_IFMT) == S_IFCHR || (n.mode&S_IFMT) == S_IFBLK || (n.mode&S_IFMT) == S_IFIFO || (n.mode&S_IFMT) == S_IFSOCK {
+				n.dataLen = 0
+				n.size = 0
+			} else if n.isMetadataOnly {
 				n.dataLen = 0
 			} else {
 				n.dataLen = n.size

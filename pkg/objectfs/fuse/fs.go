@@ -130,8 +130,13 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 		if (out.Mode & syscall.S_IFMT) == 0 {
 			out.Mode |= syscall.S_IFREG
 		}
-		out.Nlink = attr.GetNlink()
+		if attr.GetNlink() > 0 {
+			out.Nlink = attr.GetNlink()
+		} else {
+			out.Nlink = 1
+		}
 	}
+	out.Rdev = attr.GetRdev()
 	if attr.GetModTime() != nil {
 		t := attr.GetModTime().AsTime()
 		out.Mtime = uint64(t.Unix())
@@ -386,6 +391,7 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 		ParentInode: input.NodeId,
 		Name:        name,
 		Mode:        input.Mode,
+		Rdev:        input.Rdev,
 		Uid:         input.Uid,
 		Gid:         input.Gid,
 	})
@@ -497,12 +503,10 @@ func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 	for i := int(input.Offset); i < len(entries); i++ {
 		entry := entries[i]
 		mode := entry.GetMode()
-		if mode&syscall.S_IFMT == 0 {
-			if entry.GetIsDir() {
-				mode |= syscall.S_IFDIR
-			} else {
-				mode |= syscall.S_IFREG
-			}
+		if entry.GetIsDir() {
+			mode = (mode & ^uint32(syscall.S_IFMT)) | syscall.S_IFDIR
+		} else if (mode & syscall.S_IFMT) == 0 {
+			mode |= syscall.S_IFREG
 		}
 		if !out.AddDirEntry(fuse.DirEntry{
 			Mode: mode,
@@ -535,12 +539,10 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 	for i := int(input.Offset); i < len(entries); i++ {
 		entry := entries[i]
 		mode := entry.GetMode()
-		if mode&syscall.S_IFMT == 0 {
-			if entry.GetIsDir() {
-				mode |= syscall.S_IFDIR
-			} else {
-				mode |= syscall.S_IFREG
-			}
+		if entry.GetIsDir() {
+			mode = (mode & ^uint32(syscall.S_IFMT)) | syscall.S_IFDIR
+		} else if (mode & syscall.S_IFMT) == 0 {
+			mode |= syscall.S_IFREG
 		}
 		entryOut := out.AddDirLookupEntry(fuse.DirEntry{
 			Mode: mode,

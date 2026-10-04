@@ -1179,3 +1179,85 @@ func TestFUSESymlinkAndLinkOperations(t *testing.T) {
 		t.Fatalf("Expected EPERM when linking directory, got %v", status)
 	}
 }
+
+func TestFUSEMknodSpecialFiles(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "fuse-mknod-vol"
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Mknod FIFO
+	var fifoOut fuse.EntryOut
+	status := rawFS.Mknod(nil, &fuse.MknodIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     syscall.S_IFIFO | 0644,
+	}, "test_fifo", &fifoOut)
+	if status != fuse.OK {
+		t.Fatalf("Mknod FIFO failed: %v", status)
+	}
+	if fifoOut.Attr.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("Expected S_IFIFO, got %o", fifoOut.Attr.Mode)
+	}
+
+	// 2. Mknod Char Dev
+	var chrOut fuse.EntryOut
+	status = rawFS.Mknod(nil, &fuse.MknodIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     syscall.S_IFCHR | 0660,
+		Rdev:     0x0103,
+	}, "test_chr", &chrOut)
+	if status != fuse.OK {
+		t.Fatalf("Mknod CHR failed: %v", status)
+	}
+	if chrOut.Attr.Mode&syscall.S_IFMT != syscall.S_IFCHR {
+		t.Fatalf("Expected S_IFCHR, got %o", chrOut.Attr.Mode)
+	}
+	if chrOut.Attr.Rdev != 0x0103 {
+		t.Fatalf("Expected Rdev 0x0103, got 0x%x", chrOut.Attr.Rdev)
+	}
+
+	// 3. Mknod Block Dev
+	var blkOut fuse.EntryOut
+	status = rawFS.Mknod(nil, &fuse.MknodIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     syscall.S_IFBLK | 0660,
+		Rdev:     0x0801,
+	}, "test_blk", &blkOut)
+	if status != fuse.OK {
+		t.Fatalf("Mknod BLK failed: %v", status)
+	}
+	if blkOut.Attr.Mode&syscall.S_IFMT != syscall.S_IFBLK {
+		t.Fatalf("Expected S_IFBLK, got %o", blkOut.Attr.Mode)
+	}
+	if blkOut.Attr.Rdev != 0x0801 {
+		t.Fatalf("Expected Rdev 0x0801, got 0x%x", blkOut.Attr.Rdev)
+	}
+
+	// 4. Mknod Socket
+	var sockOut fuse.EntryOut
+	status = rawFS.Mknod(nil, &fuse.MknodIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     syscall.S_IFSOCK | 0777,
+	}, "test_sock", &sockOut)
+	if status != fuse.OK {
+		t.Fatalf("Mknod SOCK failed: %v", status)
+	}
+	if sockOut.Attr.Mode&syscall.S_IFMT != syscall.S_IFSOCK {
+		t.Fatalf("Expected S_IFSOCK, got %o", sockOut.Attr.Mode)
+	}
+
+	// Verify GetAttr on CHR node reports Rdev
+	var getAttrOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: chrOut.NodeId}}, &getAttrOut); status != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", status)
+	}
+	if getAttrOut.Attr.Rdev != 0x0103 {
+		t.Fatalf("GetAttr Rdev expected 0x0103, got 0x%x", getAttrOut.Attr.Rdev)
+	}
+	if getAttrOut.Attr.Mode&syscall.S_IFMT != syscall.S_IFCHR {
+		t.Fatalf("GetAttr Mode expected S_IFCHR, got %o", getAttrOut.Attr.Mode)
+	}
+}

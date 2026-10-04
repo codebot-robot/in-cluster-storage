@@ -1011,3 +1011,69 @@ func TestErofsPerInodeBudgetEnforcement(t *testing.T) {
 		t.Errorf("expected error to contain inode %q, got: %v", expectedInode, err)
 	}
 }
+
+func TestErofsSpecialFiles(t *testing.T) {
+	chrNode := NewMemoryNode("test_chr", false, S_IFCHR|0660, nil, nil, WithIno(8), WithRdev(0x0103))
+	blkNode := NewMemoryNode("test_blk", false, S_IFBLK|0660, nil, nil, WithIno(16), WithRdev(0x0801))
+	fifoNode := NewMemoryNode("test_fifo", false, S_IFIFO|0644, nil, nil, WithIno(24))
+	sockNode := NewMemoryNode("test_sock", false, S_IFSOCK|0666, nil, nil, WithIno(32))
+
+	root := NewMemoryNode("", true, 0755, nil, []Node{chrNode, blkNode, fifoNode, sockNode}, WithIno(0))
+
+	mw := &memoryWriterAt{}
+	if err := WriteImage(mw, root); err != nil {
+		t.Fatalf("WriteImage failed: %v", err)
+	}
+
+	readerAt := bytes.NewReader(mw.buf)
+	if err := Fsck(readerAt); err != nil {
+		t.Fatalf("Fsck failed on special files image: %v", err)
+	}
+
+	reader, err := NewReader(readerAt)
+	if err != nil {
+		t.Fatalf("NewReader failed: %v", err)
+	}
+
+	dirents, err := reader.ListDirectory(0)
+	if err != nil {
+		t.Fatalf("ListDirectory failed: %v", err)
+	}
+
+	type fileCheck struct {
+		ft   uint8
+		mode uint16
+		rdev uint32
+	}
+	expected := map[string]fileCheck{
+		"test_chr":  {ft: FTChrDev, mode: S_IFCHR | 0660, rdev: 0x0103},
+		"test_blk":  {ft: FTBlkDev, mode: S_IFBLK | 0660, rdev: 0x0801},
+		"test_fifo": {ft: FTFifo, mode: S_IFIFO | 0644, rdev: 0},
+		"test_sock": {ft: FTSock, mode: S_IFSOCK | 0666, rdev: 0},
+	}
+
+	for _, de := range dirents {
+		if de.Name == "." || de.Name == ".." {
+			continue
+		}
+		exp, ok := expected[de.Name]
+		if !ok {
+			t.Errorf("unexpected dirent: %s", de.Name)
+			continue
+		}
+		if de.FileType != exp.ft {
+			t.Errorf("%s: expected FileType %d, got %d", de.Name, exp.ft, de.FileType)
+		}
+		inode, err := reader.ReadInode(de.NID)
+		if err != nil {
+			t.Errorf("%s: ReadInode failed: %v", de.Name, err)
+			continue
+		}
+		if inode.Mode != exp.mode {
+			t.Errorf("%s: expected Mode 0%o, got 0%o", de.Name, exp.mode, inode.Mode)
+		}
+		if inode.Rdev != exp.rdev {
+			t.Errorf("%s: expected Rdev 0x%x, got 0x%x", de.Name, exp.rdev, inode.Rdev)
+		}
+	}
+}

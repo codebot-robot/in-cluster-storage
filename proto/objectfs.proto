@@ -70,6 +70,7 @@ message EntryAttr {
   google.protobuf.Timestamp ctime = 14;
   uint32 nlink = 15;
   string symlink_target = 16;
+  uint32 rdev = 17;
 }
 
 message GetAttrRequest {
@@ -145,6 +146,7 @@ message CreateFileRequest {
   bytes initial_content = 5;
   uint32 uid = 6;
   uint32 gid = 7;
+  uint32 rdev = 8;
 }
 
 message CreateFileResponse {
@@ -399,6 +401,7 @@ message MutationRecord {
   string symlink_target = 21;
   uint32 nlink = 22;
   uint64 old_inode = 23;
+  uint32 rdev = 24;
 }
 
 message Inode {
@@ -418,6 +421,7 @@ message Inode {
   google.protobuf.Timestamp ctime = 14;
   uint32 nlink = 15;
   string symlink_target = 16;
+  uint32 rdev = 17;
 }
 
 message DirEntry {

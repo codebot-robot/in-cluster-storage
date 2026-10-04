@@ -3905,3 +3905,130 @@ func TestNameLengthLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestControllerMknodSpecialFiles(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-mknod-vol"
+
+	// Create a FIFO
+	fifoResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "my_fifo",
+		Mode:        syscall.S_IFIFO | 0644,
+		Uid:         1000,
+		Gid:         1000,
+	})
+	if err != nil || fifoResp.GetError() != 0 {
+		t.Fatalf("CreateFile FIFO failed: err=%v, code=%d", err, fifoResp.GetError())
+	}
+	if (fifoResp.GetAttr().GetMode() & syscall.S_IFMT) != syscall.S_IFIFO {
+		t.Fatalf("Expected S_IFIFO in attr mode, got %o", fifoResp.GetAttr().GetMode())
+	}
+	if fifoResp.GetAttr().GetSize() != 0 {
+		t.Fatalf("Expected FIFO size 0, got %d", fifoResp.GetAttr().GetSize())
+	}
+
+	// Create a Char device node
+	chrResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "my_chr",
+		Mode:        syscall.S_IFCHR | 0660,
+		Rdev:        0x0103, // null device (major 1, minor 3)
+		Uid:         0,
+		Gid:         0,
+	})
+	if err != nil || chrResp.GetError() != 0 {
+		t.Fatalf("CreateFile CHR failed: err=%v, code=%d", err, chrResp.GetError())
+	}
+	if (chrResp.GetAttr().GetMode() & syscall.S_IFMT) != syscall.S_IFCHR {
+		t.Fatalf("Expected S_IFCHR in attr mode, got %o", chrResp.GetAttr().GetMode())
+	}
+	if chrResp.GetAttr().GetRdev() != 0x0103 {
+		t.Fatalf("Expected Rdev 0x0103, got 0x%x", chrResp.GetAttr().GetRdev())
+	}
+
+	// Create a Block device node
+	blkResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "my_blk",
+		Mode:        syscall.S_IFBLK | 0660,
+		Rdev:        0x0801, // sda1
+		Uid:         0,
+		Gid:         0,
+	})
+	if err != nil || blkResp.GetError() != 0 {
+		t.Fatalf("CreateFile BLK failed: err=%v, code=%d", err, blkResp.GetError())
+	}
+	if (blkResp.GetAttr().GetMode() & syscall.S_IFMT) != syscall.S_IFBLK {
+		t.Fatalf("Expected S_IFBLK in attr mode, got %o", blkResp.GetAttr().GetMode())
+	}
+	if blkResp.GetAttr().GetRdev() != 0x0801 {
+		t.Fatalf("Expected Rdev 0x0801, got 0x%x", blkResp.GetAttr().GetRdev())
+	}
+
+	// Create a Socket
+	sockResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "my_sock",
+		Mode:        syscall.S_IFSOCK | 0777,
+		Uid:         1000,
+		Gid:         1000,
+	})
+	if err != nil || sockResp.GetError() != 0 {
+		t.Fatalf("CreateFile SOCK failed: err=%v, code=%d", err, sockResp.GetError())
+	}
+	if (sockResp.GetAttr().GetMode() & syscall.S_IFMT) != syscall.S_IFSOCK {
+		t.Fatalf("Expected S_IFSOCK in attr mode, got %o", sockResp.GetAttr().GetMode())
+	}
+
+	// Attempt to recreate existing FIFO -> EEXIST
+	dupResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "my_fifo",
+		Mode:        syscall.S_IFIFO | 0644,
+	})
+	if err != nil || dupResp.GetError() != int32(syscall.EEXIST) {
+		t.Fatalf("Expected EEXIST recreating FIFO, got err=%v, code=%d", err, dupResp.GetError())
+	}
+
+	// ReadDir verification
+	readDirResp, err := server.ReadDir(ctx, &pb.ReadDirRequest{
+		VolumeId: volumeID,
+		Inode:    1,
+	})
+	if err != nil || readDirResp.GetError() != 0 {
+		t.Fatalf("ReadDir failed: err=%v, code=%d", err, readDirResp.GetError())
+	}
+	found := make(map[string]*pb.EntryAttr)
+	for _, entry := range readDirResp.GetEntries() {
+		found[entry.GetName()] = entry
+	}
+	if entry, ok := found["my_fifo"]; !ok || (entry.GetMode()&syscall.S_IFMT) != syscall.S_IFIFO {
+		t.Fatalf("ReadDir did not return valid FIFO entry: %v", entry)
+	}
+	if entry, ok := found["my_chr"]; !ok || (entry.GetMode()&syscall.S_IFMT) != syscall.S_IFCHR || entry.GetRdev() != 0x0103 {
+		t.Fatalf("ReadDir did not return valid CHR entry: %v", entry)
+	}
+	if entry, ok := found["my_blk"]; !ok || (entry.GetMode()&syscall.S_IFMT) != syscall.S_IFBLK || entry.GetRdev() != 0x0801 {
+		t.Fatalf("ReadDir did not return valid BLK entry: %v", entry)
+	}
+	if entry, ok := found["my_sock"]; !ok || (entry.GetMode()&syscall.S_IFMT) != syscall.S_IFSOCK {
+		t.Fatalf("ReadDir did not return valid SOCK entry: %v", entry)
+	}
+
+	// GetAttr verification
+	chrAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Inode: chrResp.GetAttr().GetInode()})
+	if err != nil || chrAttr.GetError() != 0 {
+		t.Fatalf("GetAttr CHR failed: err=%v, code=%d", err, chrAttr.GetError())
+	}
+	if chrAttr.GetAttr().GetRdev() != 0x0103 {
+		t.Fatalf("GetAttr CHR Rdev expected 0x0103, got 0x%x", chrAttr.GetAttr().GetRdev())
+	}
+}

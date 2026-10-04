@@ -419,7 +419,7 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	attr, err := vol.CreateFile(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetInitialContent(), req.GetUid(), req.GetGid())
+	attr, err := vol.CreateFile(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetInitialContent(), req.GetUid(), req.GetGid(), req.GetRdev())
 	if err != nil {
 		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
