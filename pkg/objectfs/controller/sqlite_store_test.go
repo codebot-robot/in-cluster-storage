@@ -1365,3 +1365,113 @@ func TestSQLiteSnapshotFlushNoStarvationUnderContinuousWrites(t *testing.T) {
 		t.Fatalf("Writer goroutine failed: %v", errVal)
 	}
 }
+
+func TestLegacyErofsVolumeMigrationAndReplayToSQLite(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	volID := "vol-legacy-migration"
+
+	walDir := t.TempDir()
+	streamID := StreamIDForVolume(volID)
+	stream, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("OpenStream failed: %v", err)
+	}
+
+	vol1Dir := t.TempDir()
+	vol1 := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithStream(stream),
+		WithLocalStorageDir(vol1Dir),
+	)
+
+	// Create initial directory and file before snapshot
+	dirAttr, err := vol1.Mkdir(ctx, 1, "dir1", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+	_, err = vol1.CreateFile(ctx, dirAttr.Inode, "subfile1.txt", 0644, []byte("subfile 1 data"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile subfile1 failed: %v", err)
+	}
+	file1Attr, err := vol1.CreateFile(ctx, 1, "file1.txt", 0644, []byte("file 1 initial"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile file1 failed: %v", err)
+	}
+
+	// Snapshot to backend (creates EROFS snapshot)
+	if err := vol1.FlushToBackend(ctx); err != nil {
+		t.Fatalf("FlushToBackend failed: %v", err)
+	}
+
+	// Post-snapshot mutations (in flight / stream-only state)
+	_, err = vol1.CreateFile(ctx, dirAttr.Inode, "subfile2.txt", 0644, []byte("subfile 2 post-snapshot data"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile subfile2 failed: %v", err)
+	}
+	_, _, _, err = vol1.WriteFile(ctx, file1Attr.Inode, 0, []byte("file 1 updated via stream!"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("WriteFile file1 failed: %v", err)
+	}
+
+	// Close vol1
+	if err := vol1.Close(); err != nil {
+		t.Fatalf("vol1 Close failed: %v", err)
+	}
+
+	// Start a fresh volume with a new local storage dir (no local SQLite file, no published SQLite snapshot)
+	// Only the EROFS snapshot in backend + WAL stream exist
+	stream2, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("OpenStream 2 failed: %v", err)
+	}
+
+	vol2Dir := t.TempDir()
+	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithStream(stream2),
+		WithLocalStorageDir(vol2Dir),
+	)
+	defer vol2.Close()
+
+	if err := vol2.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend on upgraded volume failed: %v", err)
+	}
+
+	// Verify that EROFS snapshot was imported AND stream changes beyond snapshot were replayed
+	entries, err := vol2.ReadDir(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReadDir root failed: %v", err)
+	}
+	if len(entries) != 2 { // dir1, file1.txt
+		t.Fatalf("Expected 2 entries in root, got %d", len(entries))
+	}
+
+	dirEntries, err := vol2.ReadDir(ctx, dirAttr.Inode)
+	if err != nil {
+		t.Fatalf("ReadDir dir1 failed: %v", err)
+	}
+	if len(dirEntries) != 2 { // subfile1.txt (from EROFS) and subfile2.txt (from stream replay)
+		t.Fatalf("Expected 2 entries in dir1, got %d", len(dirEntries))
+	}
+
+	// Verify file1 content is the updated stream content
+	f1Data, _, _, err := vol2.ReadFile(ctx, file1Attr.Inode, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadFile file1 failed: %v", err)
+	}
+	if string(f1Data) != "file 1 updated via stream!" {
+		t.Fatalf("Expected 'file 1 updated via stream!', got %q", string(f1Data))
+	}
+
+	// Verify subfile1 content from EROFS
+	sub1Attr, err := vol2.Lookup(ctx, dirAttr.Inode, "subfile1.txt")
+	if err != nil {
+		t.Fatalf("Lookup subfile1 failed: %v", err)
+	}
+	sub1Data, _, _, err := vol2.ReadFile(ctx, sub1Attr.Inode, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadFile subfile1 failed: %v", err)
+	}
+	if string(sub1Data) != "subfile 1 data" {
+		t.Fatalf("Expected 'subfile 1 data', got %q", string(sub1Data))
+	}
+}

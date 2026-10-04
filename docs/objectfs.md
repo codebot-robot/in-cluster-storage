@@ -134,20 +134,29 @@ Every filesystem operation that mutates state—such as `mkdir`, `create`, `writ
 
 > **Note on Implementation Roadmap:** ObjectFS currently maintains volume state in memory and flushes snapshots periodically to object storage. Integrating the Streams layer ([`docs/streams.md`](streams.md)) as the live, authoritative change-log is the primary next step for ObjectFS metadata durability and multi-writer synchronization.
 
-### 2. Tiered Metadata Storage & In-Memory LRU Caching
+### 2. SQLite Metadata Storage, In-Memory Read Cache & Write-Behind Architecture
 
-To prevent unbounded RAM consumption when serving filesystems with millions of files, ObjectFS decouples metadata storage into **two tables** (inodes and directories) backed by an active in-memory LRU cache and local append-only eviction storage:
+To provide bounded memory consumption, fast indexing, and ACID transaction safety when serving millions of files and directories, ObjectFS uses an embedded **SQLite metadata store** with an asynchronous write-behind applier and an in-memory LRU read cache:
 
-1. **Two-Table Architecture (Inodes & Directories):**
-   - **Inodes Table:** Maps inode IDs to attributes (`mode`, `size`, `mtime`, `sha256`, `etag`). Clean entries are served directly from the base EROFS snapshot; modified entries are held in memory or loaded from local eviction files.
-   - **Directories Table:** Maps directory inode IDs to child entries (`name -> childInodeID, isDir, mode`). For large directories, changes are recorded as incremental delta mutation records (deleted names + added/updated entries) rather than rewriting the entire directory structure.
+1. **Relational Schema Architecture (Inodes, DirEntries & FileChunks):**
+   - **`objectfs.v1alpha1.Inode`:** Stores inode metadata (`ino`, `mode`, `size`, `mtime`, `atime`, `ctime`, `uid`, `gid`, `is_dir`, `sha256`, `etag`, `content_sha256`, `chunk_size`, `manifest_sha256`).
+   - **`objectfs.v1alpha1.DirEntry`:** Stores directory hierarchy (`parent_ino`, `name`, `ino`, `is_dir`, `mode`), enabling sub-millisecond single-entry lookups (`WHERE parent_ino = ? AND name = ?`) and sorted range scans for directory listings (`WHERE parent_ino = ?`).
+   - **`objectfs.v1alpha1.FileChunk`:** Stores content block mappings (`ino`, `index`, `sha256`, `inline_data`) for chunked files and inline data.
 
-2. **LRU Cache & Circular Buffer Eviction Storage:**
-   - Active inodes and directories are cached in RAM up to configurable capacities (`WithMaxRAMEntries(maxInodes, maxDirs)`).
-   - When memory pressure triggers eviction, dirty inodes and directory deltas are serialized with CRC32 checksums and appended to 16 rotating circular local buffer files (`meta-00.dat` ... `meta-15.dat`).
-   - Evicted entries are indexed in memory using compact 32-bit packed pointers (4 bits for file index, 28 bits for byte offset within a 256MB file), keeping memory footprint under a few bytes per evicted entry.
-   - On cache miss, entries are transparently reloaded by following delta chains from local storage on top of the base EROFS snapshot.
-   - **Two-Phase Non-Blocking Snapshots & Circular Buffer Trimming:** When buffer file count (`WithMaxBufferFiles(4)`), dirty records, or file size thresholds are reached, an automatic snapshot is taken. During Phase 1 and 2, in-memory dirty records are persisted to the circular log and point-in-time metadata pointers are captured; the global volume lock is then released while the immutable EROFS snapshot is compiled and uploaded to cloud object storage. In Phase 4, the base snapshot reader is updated, committed in-memory dirty records are pruned, and older circular buffer files are trimmed and deleted from disk, capping local disk usage and preventing buffer overflow.
+2. **In-Memory Read Cache & Unapplied Overlay:**
+   - **Read Cache:** Inodes and directory entries are cached in memory using a thread-safe LRU cache bounded by entry count and byte capacity (defaults to 64MB, configurable via `--metadata-cache-max-bytes`). Missing rows are loaded transparently from SQLite.
+   - **Write-Behind Overlay & Async Applier:** Mutations append to the authoritative Structured Data Stream (SDS) / WAL log immediately and update an in-memory unapplied overlay map for zero-latency read-your-own-writes visibility. A background applier coalesces and batches committed transactions into SQLite (`WAL` journal mode with `NORMAL` synchronous settings) without blocking client operations. Backpressure is applied if the unapplied overlay exceeds configurable limits.
+
+3. **Multi-Tier Volume Recovery:**
+   When the controller starts or recovers, volume metadata is restored using a prioritized four-step recovery hierarchy:
+   - **1. Local SQLite File (`metadata.sqlite`):** If a local SQLite database exists on disk, its position is loaded immediately for fast zero-download cold starts.
+   - **2. Published SQLite Snapshot:** If local state is missing (e.g. after pod relocation), the latest published SQLite snapshot is downloaded from cloud storage and restored.
+   - **3. EROFS Snapshot Import:** For legacy volumes that only have EROFS snapshots, the latest EROFS snapshot image is imported into SQLite once.
+   - **4. Authoritative SDS Stream Replay:** Any stream changes logged beyond the snapshot position are replayed from the SDS stream, ensuring full point-in-time recovery of in-flight and post-snapshot mutations.
+
+4. **Snapshot Publishing & Projections:**
+   - **SQLite Snapshot Publishing:** Point-in-time SQLite database snapshots are uploaded to cloud object storage using SQLite backup APIs, and a `SnapshotPointer` with format `sqlite` is logged to the stream.
+   - **EROFS Snapshot Projections:** ObjectFS compiles immutable EROFS filesystem snapshots serving as SDS projections for kernel-level image mounting and Composefs integration, accompanied by `SnapshotPointer` records.
 
 ### 3. Periodic Snapshots as Structured Data Stream Projections
 

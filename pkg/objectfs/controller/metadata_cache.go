@@ -345,6 +345,14 @@ func SQLiteCacheSizeFn(k SQLiteCacheKey, v *SQLiteCachedRow) int64 {
 	return size
 }
 
+// DirEntry represents a single directory entry.
+type DirEntry struct {
+	Name    string
+	InodeID uint64
+	IsDir   bool
+	Mode    uint32
+}
+
 // CachedInode represents an inode metadata entry held in memory.
 type CachedInode struct {
 	ID             uint64
@@ -372,10 +380,9 @@ type CachedInode struct {
 
 // CachedDir represents a directory metadata entry held in memory.
 type CachedDir struct {
-	ID         uint64
-	Entries    map[string]DirEntry
-	Added      map[string]bool
-	Deleted    map[string]bool
-	PrevOffset LocalOffset
-	IsDirty    bool
+	ID      uint64
+	Entries map[string]DirEntry
+	Added   map[string]bool
+	Deleted map[string]bool
+	IsDirty bool
 }
