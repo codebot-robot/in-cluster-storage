@@ -354,6 +354,7 @@ type CachedInode struct {
 	Ctime          time.Time
 	Nlink          uint32
 	SymlinkTarget  string
+	Rdev           uint32
 	IsDirty        bool
 }
 
