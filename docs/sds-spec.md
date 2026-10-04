@@ -298,3 +298,30 @@ To reconstruct the dataset state at any target position $Q$:
 ## 9. Conformance & Test Vectors
 
 To verify compliant implementations across languages, the SDS test suite provides golden test vectors in `pkg/sds/testdata/vectors/`. Compliant decoders and readers **MUST** pass all conformance test vectors, including valid operations, transaction boundaries, schema evolution, and all error conditions.
+
+---
+
+## 10. Local Index Contract
+
+A **Local Index** (`LocalIndex`) is the normative interface for a derived, local, queryable view of a stream at a known stream sequence position.
+
+```go
+type LocalIndex interface {
+    Position() uint64                                                            // last applied stream sequence position
+    SyncRegistry(ctx context.Context, reg *record.Registry) error                // type definitions in force
+    ApplyBatch(ctx context.Context, changes []Change) error                      // atomic, advancing Position in the same commit
+    Get(ctx context.Context, typeName string, key Key) (proto.Message, bool, error)
+    Scan(ctx context.Context, typeName string, keyPrefix []byte) iter.Seq2[proto.Message, error] // key-byte order
+    Close() error
+}
+```
+
+### 10.1 Contract Guarantees
+
+1. **Atomic Application & Position Advancement:** `ApplyBatch` must apply the slice of row mutations and advance the recorded position to the batch maximum sequence in a single atomic transaction.
+2. **Idempotent Suffix Replay:** Re-applying an already applied log suffix is a no-op / idempotent; the position and state remain consistent.
+3. **Transaction Boundary Batching:** Applier batches cut only on transaction boundaries (never splitting mutations that share a sequence number).
+4. **Canonical Key-Byte Ordering:** `Scan` returns rows strictly in canonical key-byte order (`bytes.Compare` on deterministic key bytes).
+5. **Snapshot Consistency:** A published snapshot is immutable and consistent at its recorded position $P$.
+6. **Deterministic Rebuild:** Any index can be completely rebuilt or recovered by restoring the latest snapshot at $P$ and replaying log records in $(P, Q]$.
+

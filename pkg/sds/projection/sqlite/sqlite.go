@@ -23,18 +23,93 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
 	_ "modernc.org/sqlite" // Pure-Go SQLite driver registration
 )
+
+var (
+	_ sds.LocalIndex   = (*DB)(nil)
+	_ sds.Snapshotter  = (*DB)(nil)
+	_ sds.IndexFactory = (*Factory)(nil)
+)
+
+// Factory implements sds.IndexFactory for SQLite local indexes.
+type Factory struct{}
+
+func init() {
+	sds.RegisterIndexFactory(&Factory{})
+}
+
+// Format returns the format identifier "sqlite".
+func (f *Factory) Format() string {
+	return "sqlite"
+}
+
+// OpenLocal opens an existing SQLite index in dir if present.
+func (f *Factory) OpenLocal(ctx context.Context, streamID string, dir string) (sds.LocalIndex, bool, error) {
+	if dir == "" {
+		return nil, false, nil
+	}
+	dbPath := filepath.Join(dir, "metadata.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, false, nil
+	}
+	db, err := Open(ctx, dbPath,
+		WithStreamID(streamID),
+		WithLockingMode("EXCLUSIVE"),
+		WithJournalMode("WAL"),
+		WithSynchronous("NORMAL"),
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	return db, true, nil
+}
+
+// FindLatestSnapshot finds the latest SQLite snapshot in object storage.
+func (f *Factory) FindLatestSnapshot(ctx context.Context, backend objectstore.Backend, streamID string, maxPos uint64) (string, uint64, error) {
+	return FindLatestSnapshot(ctx, backend, streamID, maxPos)
+}
+
+// RestoreSnapshot restores a SQLite snapshot from object storage into dir.
+func (f *Factory) RestoreSnapshot(ctx context.Context, backend objectstore.Backend, streamID string, key string, dir string) (sds.LocalIndex, uint64, error) {
+	_ = os.MkdirAll(dir, 0755)
+	dbPath := filepath.Join(dir, "metadata.sqlite")
+	_ = os.Remove(dbPath)
+	return RestoreSnapshotKey(ctx, backend, streamID, key, dbPath,
+		WithLockingMode("EXCLUSIVE"),
+		WithJournalMode("WAL"),
+		WithSynchronous("NORMAL"),
+	)
+}
+
+// NewEmpty creates a new empty SQLite database in dir.
+func (f *Factory) NewEmpty(ctx context.Context, streamID string, dir string) (sds.LocalIndex, error) {
+	_ = os.MkdirAll(dir, 0755)
+	dbPath := filepath.Join(dir, "metadata.sqlite")
+	_ = os.Remove(dbPath)
+	_ = os.Remove(dbPath + "-wal")
+	_ = os.Remove(dbPath + "-shm")
+	return Open(ctx, dbPath,
+		WithStreamID(streamID),
+		WithLockingMode("EXCLUSIVE"),
+		WithJournalMode("WAL"),
+		WithSynchronous("NORMAL"),
+	)
+}
 
 var (
 	// ErrTypeNotRegistered is returned when a change is encountered for an unregistered type ID.
@@ -867,13 +942,85 @@ func (d *DB) ScanLimit(ctx context.Context, typeName string, keyPrefix []byte, l
 	return result, nil
 }
 
-// Scan retrieves merged proto rows from a table matching a canonical key prefix,
-// ordered by keydata ASC. If keyPrefix is empty, it returns all rows in the table.
-func (d *DB) Scan(ctx context.Context, typeName string, keyPrefix []byte) ([]proto.Message, error) {
-	return d.ScanLimit(ctx, typeName, keyPrefix, 0)
+// Scan yields merged proto rows matching keyPrefix in canonical key-byte order.
+// If keyPrefix is empty, all rows in the table are yielded.
+func (d *DB) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter.Seq2[proto.Message, error] {
+	return func(yield func(proto.Message, error) bool) {
+		def, ts, err := d.getTable(ctx, typeName)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+
+		msgType, err := d.changeReader.Registry().ResolveMessageType(def.GetId())
+		if err != nil {
+			yield(nil, fmt.Errorf("failed to resolve message type for %q: %w", typeName, err))
+			return
+		}
+
+		cctx := withoutCancel(ctx)
+		var rows *sql.Rows
+		if len(keyPrefix) == 0 {
+			rows, err = ts.scanAll.QueryContext(cctx)
+		} else {
+			limitBytes := prefixLimit(keyPrefix)
+			if limitBytes != nil {
+				rows, err = ts.scanPrefix.QueryContext(cctx, keyPrefix, limitBytes)
+			} else {
+				rows, err = ts.scanGe.QueryContext(cctx, keyPrefix)
+			}
+		}
+		if err != nil {
+			yield(nil, fmt.Errorf("failed to scan rows from %q: %w", typeName, err))
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var keydata, valuedata []byte
+			if err := rows.Scan(&keydata, &valuedata); err != nil {
+				yield(nil, fmt.Errorf("failed to scan row: %w", err))
+				return
+			}
+
+			if len(keyPrefix) > 0 && !bytes.HasPrefix(keydata, keyPrefix) {
+				continue
+			}
+
+			target := msgType.New().Interface()
+			if err := sds.MergeKeyAndNonKey(target, keydata, valuedata); err != nil {
+				yield(nil, fmt.Errorf("failed to merge proto key and value: %w", err))
+				return
+			}
+			if !yield(target, nil) {
+				return
+			}
+		}
+		if err := rows.Err(); err != nil {
+			yield(nil, err)
+			return
+		}
+	}
+}
+
+// ScanSlice returns a slice of all merged proto rows matching keyPrefix.
+func (d *DB) ScanSlice(ctx context.Context, typeName string, keyPrefix []byte) ([]proto.Message, error) {
+	var result []proto.Message
+	for msg, err := range d.Scan(ctx, typeName, keyPrefix) {
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, msg)
+	}
+	return result, nil
 }
 
 // Rows returns all merged proto rows from the specified table.
 func (d *DB) Rows(ctx context.Context, typeName string) ([]proto.Message, error) {
-	return d.ScanLimit(ctx, typeName, nil, 0)
+	return d.ScanSlice(ctx, typeName, nil)
+}
+
+// PublishSnapshot creates an atomic snapshot of the DB and uploads it to object storage.
+func (d *DB) PublishSnapshot(ctx context.Context, backend objectstore.Backend) (string, uint64, error) {
+	return PublishSnapshot(ctx, d, backend, os.TempDir())
 }

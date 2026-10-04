@@ -233,7 +233,7 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Feed seq %d error: %v", seq, err)
 		}
-		if err := store.ApplyBatch(changes); err != nil {
+		if err := store.ApplyBatch(ctx, changes); err != nil {
 			t.Fatalf("ApplyBatch error: %v", err)
 		}
 	}
@@ -270,8 +270,8 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 	k2, _ := sds.ExtractKey(c2, []int32{1})
 	k3, _ := sds.ExtractKey(c3, []int32{1})
 
-	if msg1, ok := store.Get("testpkg.Customer", k1); !ok {
-		t.Errorf("Customer 1 not found")
+	if msg1, ok, err := store.Get(ctx, "testpkg.Customer", k1); err != nil || !ok {
+		t.Errorf("Customer 1 not found: %v", err)
 	} else {
 		dyn := msg1.(*dynamicpb.Message)
 		if dyn.Get(dyn.Descriptor().Fields().ByName("name")).String() != "Alice" {
@@ -279,8 +279,8 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 		}
 	}
 
-	if msg2, ok := store.Get("testpkg.Customer", k2); !ok {
-		t.Errorf("Customer 2 not found")
+	if msg2, ok, err := store.Get(ctx, "testpkg.Customer", k2); err != nil || !ok {
+		t.Errorf("Customer 2 not found: %v", err)
 	} else {
 		dyn := msg2.(*dynamicpb.Message)
 		if dyn.Get(dyn.Descriptor().Fields().ByName("name")).String() != "Bob" {
@@ -289,7 +289,7 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 	}
 
 	// Customer 3 should be deleted
-	if _, ok := store.Get("testpkg.Customer", k3); ok {
+	if _, ok, _ := store.Get(ctx, "testpkg.Customer", k3); ok {
 		t.Errorf("Customer 3 should have been deleted")
 	}
 
@@ -303,8 +303,8 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 	k103, _ := sds.ExtractKey(o103, []int32{1})
 	k104, _ := sds.ExtractKey(o104, []int32{1})
 
-	if msg101, ok := store.Get("testpkg.Order", k101); !ok {
-		t.Errorf("Order 101 not found")
+	if msg101, ok, err := store.Get(ctx, "testpkg.Order", k101); err != nil || !ok {
+		t.Errorf("Order 101 not found: %v", err)
 	} else {
 		dyn := msg101.(*dynamicpb.Message)
 		// Should have updated total $65.00
@@ -313,8 +313,8 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 		}
 	}
 
-	if msg102, ok := store.Get("testpkg.Order", k102); !ok {
-		t.Errorf("Order 102 not found")
+	if msg102, ok, err := store.Get(ctx, "testpkg.Order", k102); err != nil || !ok {
+		t.Errorf("Order 102 not found: %v", err)
 	} else {
 		dyn := msg102.(*dynamicpb.Message)
 		if dyn.Get(dyn.Descriptor().Fields().ByName("total")).Float() != 75.50 {
@@ -322,8 +322,8 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 		}
 	}
 
-	if msg103, ok := store.Get("testpkg.Order", k103); !ok {
-		t.Errorf("Order 103 not found")
+	if msg103, ok, err := store.Get(ctx, "testpkg.Order", k103); err != nil || !ok {
+		t.Errorf("Order 103 not found: %v", err)
 	} else {
 		dyn := msg103.(*dynamicpb.Message)
 		if dyn.Get(dyn.Descriptor().Fields().ByName("total")).Float() != 30.00 {
@@ -332,7 +332,7 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 	}
 
 	// Order 104 was uncommitted -> must not exist in table
-	if _, ok := store.Get("testpkg.Order", k104); ok {
+	if _, ok, _ := store.Get(ctx, "testpkg.Order", k104); ok {
 		t.Errorf("uncommitted Order 104 should not exist in table")
 	}
 

@@ -1,20 +1,18 @@
-/*
-Copyright 2026 Google LLC
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-package controller
+package view
 
 import (
 	"context"
@@ -23,9 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
-	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 )
 
@@ -36,19 +32,9 @@ const (
 	defaultApplierMaxBackoff  = 1 * time.Second
 )
 
-// SQLiteOverlayEntry represents a committed but unapplied row change held in memory.
-type SQLiteOverlayEntry struct {
-	Op   sdsv1.OpRecord_Op
-	Row  proto.Message
-	Seq  uint64
-	Size int64
-}
-
-// sqliteApplier is a background worker that applies overlay row changes to SQLite in log order in batches.
-type sqliteApplier struct {
-	v         *Volume
+type applier struct {
+	v         *View
 	batchSize int
-	queue     []sds.Change
 	wakeCh    chan struct{}
 	stopCh    chan struct{}
 	doneCh    chan struct{}
@@ -60,11 +46,11 @@ type sqliteApplier struct {
 	faultHook      func() error
 }
 
-func newSQLiteApplier(v *Volume, batchSize int, faultHook func() error) *sqliteApplier {
+func newApplier(v *View, batchSize int, faultHook func() error) *applier {
 	if batchSize <= 0 {
 		batchSize = defaultApplierBatchSize
 	}
-	return &sqliteApplier{
+	return &applier{
 		v:         v,
 		batchSize: batchSize,
 		wakeCh:    make(chan struct{}, 1),
@@ -74,11 +60,11 @@ func newSQLiteApplier(v *Volume, batchSize int, faultHook func() error) *sqliteA
 	}
 }
 
-func (a *sqliteApplier) start() {
+func (a *applier) start() {
 	go a.loop()
 }
 
-func (a *sqliteApplier) stop() {
+func (a *applier) stop() {
 	a.v.mu.Lock()
 	if !a.stopped {
 		a.stopped = true
@@ -90,35 +76,28 @@ func (a *sqliteApplier) stop() {
 	<-a.doneCh
 }
 
-func (a *sqliteApplier) wake() {
+func (a *applier) wakeLocked() {
 	select {
 	case a.wakeCh <- struct{}{}:
 	default:
 	}
 }
 
-func (a *sqliteApplier) wakeLocked() {
-	select {
-	case a.wakeCh <- struct{}{}:
-	default:
-	}
-}
-
-func (a *sqliteApplier) enqueueLocked(changes []sds.Change) {
+func (a *applier) enqueueLocked(changes []sds.Change) {
 	if len(changes) == 0 {
 		return
 	}
-	a.queue = append(a.queue, changes...)
+	a.v.queue = append(a.v.queue, changes...)
 	a.wakeLocked()
 }
 
-func (a *sqliteApplier) loop() {
+func (a *applier) loop() {
 	defer close(a.doneCh)
 
 	for {
-		// 1. Wait for work under volume mutex
+		// 1. Wait for work under view mutex
 		a.v.mu.Lock()
-		for len(a.queue) == 0 && !a.stopped {
+		for len(a.v.queue) == 0 && !a.stopped {
 			a.v.mu.Unlock()
 			select {
 			case <-a.wakeCh:
@@ -127,7 +106,7 @@ func (a *sqliteApplier) loop() {
 			a.v.mu.Lock()
 		}
 
-		if len(a.queue) == 0 && a.stopped {
+		if len(a.v.queue) == 0 && a.stopped {
 			a.v.mu.Unlock()
 			return
 		}
@@ -140,10 +119,10 @@ func (a *sqliteApplier) loop() {
 			targetSize = defaultApplierBatchSize
 		}
 		batchLimit := 0
-		for batchLimit < len(a.queue) {
-			currentSeq := a.queue[batchLimit].Seq
+		for batchLimit < len(a.v.queue) {
+			currentSeq := a.v.queue[batchLimit].Seq
 			nextLimit := batchLimit + 1
-			for nextLimit < len(a.queue) && a.queue[nextLimit].Seq == currentSeq {
+			for nextLimit < len(a.v.queue) && a.v.queue[nextLimit].Seq == currentSeq {
 				nextLimit++
 			}
 			batchLimit = nextLimit
@@ -151,7 +130,7 @@ func (a *sqliteApplier) loop() {
 				break
 			}
 		}
-		batch := a.queue[:batchLimit]
+		batch := a.v.queue[:batchLimit]
 
 		// Coalesce repeated changes in batch by (table, key)
 		type coalescedKey struct {
@@ -168,13 +147,8 @@ func (a *sqliteApplier) loop() {
 
 		for _, ch := range batch {
 			typeName := ch.TypeName
-			if typeName == "" && a.v.metadataStream != nil {
-				if def, _, ok := a.v.metadataStream.Registry().LookupByID(ch.TypeID); ok {
-					typeName = def.GetName()
-				}
-			}
-			if typeName == "" && a.v.sqliteDB != nil {
-				if def, _, ok := a.v.sqliteDB.Registry().LookupByID(ch.TypeID); ok {
+			if typeName == "" && a.v.reg != nil {
+				if def, _, ok := a.v.reg.LookupByID(ch.TypeID); ok {
 					typeName = def.GetName()
 				}
 			}
@@ -182,6 +156,8 @@ func (a *sqliteApplier) loop() {
 			if key.IsZero() && len(ch.RawKey) > 0 {
 				key = sds.NewKeyFromBytes(ch.RawKey)
 			}
+			ch.TypeName = typeName
+			ch.Key = key
 			ck := coalescedKey{typeName: typeName, key: key}
 			if _, exists := coalescedMap[ck]; !exists {
 				order = append(order, ck)
@@ -201,13 +177,13 @@ func (a *sqliteApplier) loop() {
 		}
 		a.v.mu.Unlock()
 
-		// 2. Apply batch to SQLite outside volume mutex
+		// 2. Apply batch to LocalIndex outside view mutex
 		var applyErr error
 		if a.faultHook != nil {
 			applyErr = a.faultHook()
 		}
-		if applyErr == nil && a.v.sqliteDB != nil && len(coalescedChanges) > 0 {
-			applyErr = a.v.sqliteDB.ApplyBatch(context.Background(), coalescedChanges)
+		if applyErr == nil && a.v.index != nil && len(coalescedChanges) > 0 {
+			applyErr = a.v.index.ApplyBatch(context.Background(), coalescedChanges)
 		}
 
 		if applyErr != nil {
@@ -215,7 +191,7 @@ func (a *sqliteApplier) loop() {
 			fails := a.consecutiveErr.Add(1)
 			if fails >= defaultDegradedThreshold && !a.isDegraded.Load() {
 				a.isDegraded.Store(true)
-				klog.Warningf("SQLite applier marked DEGRADED after %d consecutive failures: %v", fails, applyErr)
+				klog.Warningf("View applier marked DEGRADED after %d consecutive failures: %v", fails, applyErr)
 			}
 
 			// Exponential backoff with jitter
@@ -245,47 +221,47 @@ func (a *sqliteApplier) loop() {
 			continue
 		}
 
-		// 3. Batch applied successfully! Clean up under volume mutex
+		// 3. Batch applied successfully! Clean up under view mutex
 		a.v.mu.Lock()
 		if a.isDegraded.Load() {
 			a.isDegraded.Store(false)
-			klog.Infof("SQLite applier recovered from degraded state at seq %d", batchMaxSeq)
+			klog.Infof("View applier recovered from degraded state at seq %d", batchMaxSeq)
 		}
 		a.consecutiveErr.Store(0)
 
 		// Dequeue the applied batch
-		a.queue = a.queue[batchLimit:]
+		a.v.queue = a.v.queue[batchLimit:]
 
 		// Update overlay and read cache for each coalesced key
 		for ck, cv := range coalescedMap {
-			cacheKey := SQLiteCacheKey{Table: ck.typeName, Key: ck.key}
-			if overlayEntry, exists := a.v.sqliteOverlay[cacheKey]; exists {
+			cacheKey := CacheKey{Table: ck.typeName, Key: ck.key}
+			if overlayEntry, exists := a.v.overlay[cacheKey]; exists {
 				if overlayEntry.Seq <= batchMaxSeq {
-					delete(a.v.sqliteOverlay, cacheKey)
+					delete(a.v.overlay, cacheKey)
 					a.v.unappliedBytes -= overlayEntry.Size
 					if a.v.unappliedBytes < 0 {
 						a.v.unappliedBytes = 0
 					}
 
 					// Update read cache with clean entry
-					if a.v.sqliteCache != nil && !a.v.sqliteCacheDisabled {
+					if a.v.cache != nil && !a.v.cacheDisabled {
 						switch cv.change.Op {
 						case sds.OpCreate, sds.OpUpdate:
 							if cv.change.Row != nil {
-								a.v.sqliteCache.Put(cacheKey, &SQLiteCachedRow{Exists: true, Msg: cv.change.Row})
+								a.v.cache.Put(cacheKey, &CachedRow{Exists: true, Msg: cv.change.Row})
 							} else {
-								a.v.sqliteCache.Remove(cacheKey)
+								a.v.cache.Remove(cacheKey)
 							}
 						case sds.OpDelete:
-							a.v.sqliteCache.Put(cacheKey, &SQLiteCachedRow{Exists: false})
+							a.v.cache.Put(cacheKey, &CachedRow{Exists: false})
 						}
 					}
 				}
 			}
 		}
 
-		if batchMaxSeq > a.v.sqliteAppliedPos {
-			a.v.sqliteAppliedPos = batchMaxSeq
+		if batchMaxSeq > a.v.appliedPos {
+			a.v.appliedPos = batchMaxSeq
 		}
 
 		// Signal any blocked writers or flush waiters

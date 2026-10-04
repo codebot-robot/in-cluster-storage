@@ -96,7 +96,7 @@ type Server struct {
 	walDir                   string
 	walTarget                string
 	defaultDurability        walclient.Level
-	metadataStore            string
+	metadataIndex            string
 	metadataCacheEntries     int
 	metadataCacheBytes       int64
 	metadataOverlayMaxBytes  int64
@@ -111,10 +111,10 @@ type Server struct {
 // ServerOption configures the controller Server.
 type ServerOption func(*Server)
 
-// WithServerMetadataStore configures the metadata store (legacy or sqlite).
-func WithServerMetadataStore(store string) ServerOption {
+// WithServerMetadataIndex configures the metadata index engine ("sqlite" or "memory").
+func WithServerMetadataIndex(index string) ServerOption {
 	return func(s *Server) {
-		s.metadataStore = store
+		s.metadataIndex = index
 	}
 }
 
@@ -202,8 +202,8 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 			volOpts = append(volOpts, WithStream(stream))
 		}
 		volOpts = append(volOpts, WithDurability(s.defaultDurability))
-		if s.metadataStore != "" {
-			volOpts = append(volOpts, WithMetadataStore(s.metadataStore))
+		if s.metadataIndex != "" {
+			volOpts = append(volOpts, WithMetadataIndex(s.metadataIndex))
 		}
 		if s.metadataCacheEntries > 0 || s.metadataCacheBytes > 0 {
 			volOpts = append(volOpts, WithMetadataCacheLimits(s.metadataCacheEntries, s.metadataCacheBytes))

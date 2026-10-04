@@ -113,7 +113,17 @@ func FindLatestSnapshot(ctx context.Context, backend objectstore.Backend, stream
 // RestoreSnapshot downloads the latest SQLite snapshot at or before maxPosition,
 // opens it at targetPath, loads the type registry and stream position, and returns the DB.
 func RestoreSnapshot(ctx context.Context, backend objectstore.Backend, streamID string, maxPosition uint64, targetPath string, opts ...Option) (*DB, uint64, error) {
-	key, pos, err := FindLatestSnapshot(ctx, backend, streamID, maxPosition)
+	key, _, err := FindLatestSnapshot(ctx, backend, streamID, maxPosition)
+	if err != nil {
+		return nil, 0, err
+	}
+	return RestoreSnapshotKey(ctx, backend, streamID, key, targetPath, opts...)
+}
+
+// RestoreSnapshotKey downloads a SQLite snapshot by object key, opens it at targetPath,
+// loads the type registry and stream position, and returns the DB.
+func RestoreSnapshotKey(ctx context.Context, backend objectstore.Backend, streamID string, key string, targetPath string, opts ...Option) (*DB, uint64, error) {
+	_, pos, err := ParseSnapshotKey(key)
 	if err != nil {
 		return nil, 0, err
 	}

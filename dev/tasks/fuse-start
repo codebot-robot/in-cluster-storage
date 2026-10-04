@@ -214,7 +214,7 @@ echo "Starting objectfs-controller on ${SERVER_ADDR} (backend file://${STORE_DIR
   exec "${BIN_DIR}/objectfs-controller" \
     --port "${OBJECTFS_PORT}" \
     --backend "file://${STORE_DIR}" \
-    --metadata-store "${OBJECTFS_METADATA_STORE:-sqlite}" \
+    --metadata-index "${OBJECTFS_METADATA_INDEX:-sqlite}" \
     --flush-interval 1m
 ) >"${CONTROLLER_LOG}" 2>&1 &
 CONTROLLER_PID=$!

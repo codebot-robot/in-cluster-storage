@@ -194,6 +194,20 @@ Given a snapshot at `P`, a reader that wants the state at `Q >= P` restores the 
 
 Snapshots are also the **retention anchor**. Segments older than the oldest snapshot anyone still needs can be deleted; the log need not be retained from the beginning of time, and definitions from before the retention window survive in the snapshot registry.
 
+### The Local Index Concept
+
+In structured data streams, the stream log is the single source of truth. Applications (such as ObjectFS controllers or serving nodes) maintain a **local, queryable index** (`sds.LocalIndex`) derived from the stream at a known sequence position.
+
+The local index is abstracted behind an interface that decouples the stream abstraction from any specific storage engine:
+- **SQLite:** The default, persistent OLTP local index with ACID transactions and SQL query capability.
+- **MemTable:** An in-memory, transient implementation for testing, ephemeral nodes, and small stream volumes.
+
+To keep index writes off the critical request path, the generic `sds/view` layer wraps any `LocalIndex` with:
+1. **Unapplied Overlay:** In-memory map of committed row mutations that immediately overlays index and cache reads during ingestion lag.
+2. **Read Cache:** Bounded LRU cache of recently decoded protobuf rows.
+3. **Write-Behind Applier:** Background worker that cuts batches strictly at transaction boundaries, coalesces duplicate row updates, applies backpressure when lag exceeds memory bounds, and atomically commits changes to the underlying `LocalIndex`.
+4. **Deterministic Rebuild & Snapshots:** An index at position $P$ can be published to immutable object storage or restored from a snapshot and rolled forward to $Q \ge P$ by replaying log records in $(P, Q]$.
+
 ### SQLite (OLTP)
 
 - One database file per stream (or per shard if a stream is sharded).

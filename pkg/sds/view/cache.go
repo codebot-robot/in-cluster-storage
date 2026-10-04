@@ -1,26 +1,24 @@
-/*
-Copyright 2026 Google LLC
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-package controller
+package view
 
 import (
 	"sync"
-	"time"
 
-	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds"
+	"google.golang.org/protobuf/proto"
 )
 
 type cacheElement[K comparable, V any] struct {
@@ -272,21 +270,6 @@ func (c *LRUCache[K, V]) Stats() LRUCacheStats {
 	}
 }
 
-// Hits returns the total number of successful cache hits. Thread-safe.
-func (c *LRUCache[K, V]) Hits() uint64 {
-	return c.Stats().Hits
-}
-
-// Misses returns the total number of cache misses. Thread-safe.
-func (c *LRUCache[K, V]) Misses() uint64 {
-	return c.Stats().Misses
-}
-
-// HitRate returns the ratio of hits to total lookups (0.0 to 1.0). Thread-safe.
-func (c *LRUCache[K, V]) HitRate() float64 {
-	return c.Stats().HitRate
-}
-
 // ResetStats resets the hits and misses counters. Thread-safe.
 func (c *LRUCache[K, V]) ResetStats() {
 	c.mu.Lock()
@@ -296,70 +279,23 @@ func (c *LRUCache[K, V]) ResetStats() {
 	c.misses = 0
 }
 
-// ForEach iterates over all items in the cache. Thread-safe.
-func (c *LRUCache[K, V]) ForEach(fn func(key K, value V)) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// CacheKey identifies a decoded row in the view read cache by table name and canonical key.
+type CacheKey struct {
+	Table string
+	Key   sds.Key
+}
 
-	for k, elem := range c.items {
-		fn(k, elem.value)
+// CachedRow holds a decoded protobuf message row or a negative entry marker.
+type CachedRow struct {
+	Msg    proto.Message
+	Exists bool
+}
+
+// CacheSizeFn calculates the approximate memory footprint of a cached row without proto.Size overhead.
+func CacheSizeFn(k CacheKey, v *CachedRow) int64 {
+	size := int64(len(k.Table) + len(k.Key.String()) + 96)
+	if v != nil && v.Exists {
+		size += 128
 	}
-}
-
-// EvictAll evicts all elements currently in cache, invoking the onEvict callback for each. Thread-safe.
-func (c *LRUCache[K, V]) EvictAll() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for c.tail != nil {
-		oldest := c.tail
-		c.removeElement(oldest)
-		delete(c.items, oldest.key)
-		c.curBytes -= oldest.size
-		if c.onEvict != nil {
-			c.onEvict(oldest.key, oldest.value)
-		}
-	}
-}
-
-// DirEntry represents a single directory entry.
-type DirEntry struct {
-	Name    string
-	InodeID uint64
-	IsDir   bool
-	Mode    uint32
-}
-
-// CachedInode represents an inode metadata entry held in memory.
-type CachedInode struct {
-	ID             uint64
-	Mode           uint32
-	Size           int64
-	ModTime        time.Time
-	IsDir          bool
-	Sha256         string
-	ManifestSha256 string
-	ContentSha256  string
-	ChunkSize      uint32
-	Chunks         map[uint32]string
-	InlineData     []byte
-	StagedChunks   map[int][]byte
-	DirtyChunks    map[int][]byte
-	ETag           string
-	RedirectURL    string
-	Data           blob.ByteStream
-	Uid            uint32
-	Gid            uint32
-	Atime          time.Time
-	Ctime          time.Time
-	IsDirty        bool
-}
-
-// CachedDir represents a directory metadata entry held in memory.
-type CachedDir struct {
-	ID      uint64
-	Entries map[string]DirEntry
-	Added   map[string]bool
-	Deleted map[string]bool
-	IsDirty bool
+	return size
 }

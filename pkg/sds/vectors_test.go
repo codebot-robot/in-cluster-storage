@@ -760,7 +760,7 @@ func generateAllVectors(ctx context.Context) ([]GoldenVector, error) {
 				break
 			}
 
-			if err := store.ApplyBatch(changes); err != nil {
+			if err := store.ApplyBatch(ctx, changes); err != nil {
 				return nil, fmt.Errorf("memtable apply error in vector %s: %w", v.Name, err)
 			}
 		}
@@ -897,7 +897,7 @@ func TestGoldenVectors(t *testing.T) {
 					break
 				}
 
-				if err := store.ApplyBatch(changes); err != nil {
+				if err := store.ApplyBatch(t.Context(), changes); err != nil {
 					t.Fatalf("failed to apply changes at seq %d: %v", seq, err)
 				}
 			}
