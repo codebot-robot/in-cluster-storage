@@ -279,7 +279,7 @@ func TestReplayAndCompareWithMemTable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("memReader.Feed failed: %v", err)
 		}
-		if err := memStore.ApplyBatch(changes); err != nil {
+		if err := memStore.ApplyBatch(ctx, changes); err != nil {
 			t.Fatalf("memStore.ApplyBatch failed: %v", err)
 		}
 
@@ -337,7 +337,7 @@ func TestSnapshotRestoreAndTailFollow(t *testing.T) {
 	memReader := sds.NewChangeReader()
 	for i, p := range allPayloads {
 		changes, _ := memReader.Feed(uint64(i+1), p)
-		memStore.ApplyBatch(changes)
+		memStore.ApplyBatch(ctx, changes)
 	}
 
 	// Restore SQLite projection from snapshot
@@ -523,7 +523,7 @@ func TestIdempotentReapplySuffix(t *testing.T) {
 	memReader := sds.NewChangeReader()
 	for i, p := range payloads {
 		changes, _ := memReader.Feed(uint64(i+1), p)
-		memStore.ApplyBatch(changes)
+		memStore.ApplyBatch(ctx, changes)
 	}
 
 	verifySQLiteMatchesMemStore(t, ctx, db, memStore)
@@ -635,7 +635,7 @@ func TestRandomLogReplayConformance(t *testing.T) {
 	for i, p := range payloads {
 		seq := uint64(i + 1)
 		changes, _ := memReader.Feed(seq, p)
-		memStore.ApplyBatch(changes)
+		memStore.ApplyBatch(ctx, changes)
 		db.Feed(ctx, seq, p)
 	}
 
@@ -736,9 +736,9 @@ func TestKeyPrefixScan(t *testing.T) {
 		t.Fatalf("EncodeKeyPrefix for parent 1 failed: %v", err)
 	}
 
-	p1Rows, err := db.Scan(ctx, "testpkg.DirEntry", p1Prefix)
+	p1Rows, err := db.ScanSlice(ctx, "testpkg.DirEntry", p1Prefix)
 	if err != nil {
-		t.Fatalf("db.Scan parent 1 failed: %v", err)
+		t.Fatalf("db.ScanSlice parent 1 failed: %v", err)
 	}
 	if len(p1Rows) != 3 {
 		t.Fatalf("expected 3 rows for parent 1, got %d", len(p1Rows))
@@ -763,18 +763,18 @@ func TestKeyPrefixScan(t *testing.T) {
 		t.Fatalf("EncodeKeyPrefix for parent 2 failed: %v", err)
 	}
 
-	p2Rows, err := db.Scan(ctx, "testpkg.DirEntry", p2Prefix)
+	p2Rows, err := db.ScanSlice(ctx, "testpkg.DirEntry", p2Prefix)
 	if err != nil {
-		t.Fatalf("db.Scan parent 2 failed: %v", err)
+		t.Fatalf("db.ScanSlice parent 2 failed: %v", err)
 	}
 	if len(p2Rows) != 2 {
 		t.Fatalf("expected 2 rows for parent 2, got %d", len(p2Rows))
 	}
 
 	// 3. Scan all (empty prefix)
-	allRows, err := db.Scan(ctx, "testpkg.DirEntry", nil)
+	allRows, err := db.ScanSlice(ctx, "testpkg.DirEntry", nil)
 	if err != nil {
-		t.Fatalf("db.Scan all failed: %v", err)
+		t.Fatalf("db.ScanSlice all failed: %v", err)
 	}
 	if len(allRows) != 6 {
 		t.Fatalf("expected 6 total rows, got %d", len(allRows))
