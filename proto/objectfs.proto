@@ -56,23 +56,9 @@ enum WriteMode {
 }
 
 message EntryAttr {
-  uint64 inode = 1;
+  Inode inode = 1;
   string name = 2;
-  bool is_dir = 3;
-  int64 size = 4;
-  uint32 mode = 5;
-  google.protobuf.Timestamp mod_time = 6;
-  string sha256 = 7;
-  string redirect_url = 8;
-  uint32 uid = 9;
-  uint32 gid = 10;
-  string manifest_sha256 = 11;
-  string content_sha256 = 12;
-  google.protobuf.Timestamp atime = 13;
-  google.protobuf.Timestamp ctime = 14;
-  uint32 nlink = 15;
-  string symlink_target = 16;
-  uint32 rdev = 17;
+  string redirect_url = 3;
 }
 
 message GetAttrRequest {
