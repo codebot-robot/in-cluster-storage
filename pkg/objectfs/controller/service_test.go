@@ -689,11 +689,11 @@ func TestEventBroadcasterSlowSubscriber(t *testing.T) {
 
 func TestConcurrentAttributeMutationAndReadRace(t *testing.T) {
 	ctx := t.Context()
-	server := NewServer(nil)
+	server := NewServer(nil, WithServerMetadataApplierBatchSize(5))
 	volumeID := "test-race-vol"
 
 	// Create test files
-	const numFiles = 5
+	const numFiles = 6
 	var inos []uint64
 	var names []string
 	for i := 0; i < numFiles; i++ {
@@ -714,36 +714,42 @@ func TestConcurrentAttributeMutationAndReadRace(t *testing.T) {
 		names = append(names, name)
 	}
 
-	subCh := server.broadcaster.Subscribe(volumeID)
-	defer server.broadcaster.Unsubscribe(volumeID, subCh)
+	subCh1 := server.broadcaster.Subscribe(volumeID)
+	defer server.broadcaster.Unsubscribe(volumeID, subCh1)
+	subCh2 := server.broadcaster.Subscribe(volumeID)
+	defer server.broadcaster.Unsubscribe(volumeID, subCh2)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 
-	// 1. Subscriber goroutine reading and marshaling WatchVolume events
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			case ev, ok := <-subCh:
-				if !ok {
+	// 1. Subscriber goroutines reading and marshaling WatchVolume events
+	for _, ch := range []chan *pb.WatchVolumeResponse{subCh1, subCh2} {
+		wg.Add(1)
+		go func(subCh chan *pb.WatchVolumeResponse) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
 					return
-				}
-				// Marshal event to simulate gRPC network serialization
-				_, _ = proto.Marshal(ev)
-				if ev.GetAttr() != nil && ev.GetAttr().GetInode() != nil {
-					_ = ev.GetAttr().GetInode().GetSize()
-					_ = ev.GetAttr().GetInode().GetMode()
-					_ = ev.GetAttr().GetInode().GetMtime()
+				case ev, ok := <-subCh:
+					if !ok {
+						return
+					}
+					// Marshal event to simulate gRPC network serialization
+					_, _ = proto.Marshal(ev)
+					if ev.GetAttr() != nil && ev.GetAttr().GetInode() != nil {
+						_ = ev.GetAttr().GetInode().GetSize()
+						_ = ev.GetAttr().GetInode().GetMode()
+						_ = ev.GetAttr().GetInode().GetMtime()
+						_ = ev.GetAttr().GetInode().GetUid()
+						_ = ev.GetAttr().GetInode().GetGid()
+					}
 				}
 			}
-		}
-	}()
+		}(ch)
+	}
 
-	// 2. Reader goroutines doing parallel GetAttr and Lookup
+	// 2. Reader goroutines doing parallel GetAttr, Lookup, and ReadDir
 	for r := 0; r < 4; r++ {
 		wg.Add(1)
 		go func(readerID int) {
@@ -762,6 +768,11 @@ func TestConcurrentAttributeMutationAndReadRace(t *testing.T) {
 					})
 					if err == nil {
 						_, _ = proto.Marshal(getResp)
+						if getResp.GetAttr() != nil && getResp.GetAttr().GetInode() != nil {
+							_ = getResp.GetAttr().GetInode().GetSize()
+							_ = getResp.GetAttr().GetInode().GetMode()
+							_ = getResp.GetAttr().GetInode().GetMtime()
+						}
 					}
 
 					lookupResp, err := server.Lookup(ctx, &pb.LookupRequest{
@@ -771,13 +782,32 @@ func TestConcurrentAttributeMutationAndReadRace(t *testing.T) {
 					})
 					if err == nil {
 						_, _ = proto.Marshal(lookupResp)
+						if lookupResp.GetAttr() != nil && lookupResp.GetAttr().GetInode() != nil {
+							_ = lookupResp.GetAttr().GetInode().GetSize()
+							_ = lookupResp.GetAttr().GetInode().GetMode()
+						}
+					}
+
+					readDirResp, err := server.ReadDir(ctx, &pb.ReadDirRequest{
+						VolumeId: volumeID,
+						Inode:    1,
+					})
+					if err == nil {
+						_, _ = proto.Marshal(readDirResp)
+						for _, ent := range readDirResp.GetEntries() {
+							if ent.GetInode() != nil {
+								_ = ent.GetInode().GetSize()
+								_ = ent.GetInode().GetMode()
+								_ = ent.GetInode().GetMtime()
+							}
+						}
 					}
 				}
 			}
 		}(r)
 	}
 
-	// 3. Writer goroutines doing concurrent SetAttr and WriteFile on the same inodes
+	// 3. Writer goroutines doing concurrent SetAttr, WriteFile, and Rename on the same inodes
 	for w := 0; w < 4; w++ {
 		wg.Add(1)
 		go func(writerID int) {
@@ -818,6 +848,26 @@ func TestConcurrentAttributeMutationAndReadRace(t *testing.T) {
 					if err == nil {
 						_, _ = proto.Marshal(writeResp)
 					}
+
+					// Concurrent Rename between alternate names
+					origName := fmt.Sprintf("race_file_%d.txt", writerID)
+					altName := fmt.Sprintf("race_file_%d_alt.txt", writerID)
+					var fromName, toName string
+					if counter%2 == 1 {
+						fromName, toName = origName, altName
+					} else {
+						fromName, toName = altName, origName
+					}
+					renResp, err := server.Rename(ctx, &pb.RenameRequest{
+						VolumeId:       volumeID,
+						OldParentInode: 1,
+						OldName:        fromName,
+						NewParentInode: 1,
+						NewName:        toName,
+					})
+					if err == nil {
+						_, _ = proto.Marshal(renResp)
+					}
 				}
 			}
 		}(w)
@@ -826,6 +876,100 @@ func TestConcurrentAttributeMutationAndReadRace(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+func TestOverlayEntryKeepsRowAsOfChange(t *testing.T) {
+	ctx := t.Context()
+	var faultErr atomic.Pointer[error]
+	vol := NewVolume("test-cow-overlay-vol", nil, NewEventBroadcaster(),
+		WithApplierBatchSize(100),
+		WithApplierFaultHook(func() error {
+			if ep := faultErr.Load(); ep != nil {
+				return *ep
+			}
+			return nil
+		}),
+	)
+	defer vol.Close()
+
+	// Stall the SQLite background applier so changes accumulate and remain in the overlay
+	stalled := errors.New("stalled applier to hold overlay entries")
+	faultErr.Store(&stalled)
+
+	// Create initial file
+	initialContent := []byte("initial-file-content")
+	attr1, err := vol.CreateFile(ctx, 1, "testfile.txt", 0644, initialContent, 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := attr1.GetInode().GetIno()
+
+	// Capture the row as created
+	row1 := attr1.GetInode()
+	if row1.GetSize() != int64(len(initialContent)) {
+		t.Fatalf("expected size %d, got %d", len(initialContent), row1.GetSize())
+	}
+	if row1.GetMode()&0777 != 0644 {
+		t.Fatalf("expected mode 0644, got %o", row1.GetMode()&0777)
+	}
+
+	// 1. Mutate attributes via SetAttr
+	newMode := uint32(0755)
+	newUid := uint32(2000)
+	attr2, err := vol.SetAttr(ctx, ino, &newMode, &newUid, nil, nil, false, nil, false, nil, false)
+	if err != nil {
+		t.Fatalf("SetAttr failed: %v", err)
+	}
+	row2 := attr2.GetInode()
+
+	// row1 MUST retain its previous values (copy-on-write)
+	if row1.GetMode()&0777 != 0644 || row1.GetUid() != 1000 {
+		t.Fatalf("row1 was mutated in place after SetAttr! mode=%o uid=%d", row1.GetMode()&0777, row1.GetUid())
+	}
+	if row2.GetMode()&0777 != 0755 || row2.GetUid() != 2000 {
+		t.Fatalf("row2 unexpected values: mode=%o uid=%d", row2.GetMode()&0777, row2.GetUid())
+	}
+
+	// 2. Mutate file size via WriteFile
+	appendData := []byte(" extended content")
+	_, newSize, _, err := vol.WriteFile(ctx, ino, int64(len(initialContent)), appendData, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	attr3, err := vol.GetAttr(ctx, ino)
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	row3 := attr3.GetInode()
+
+	if row1.GetSize() != int64(len(initialContent)) {
+		t.Fatalf("row1 was mutated in place after WriteFile! size=%d", row1.GetSize())
+	}
+	if row2.GetSize() != int64(len(initialContent)) {
+		t.Fatalf("row2 was mutated in place after WriteFile! size=%d", row2.GetSize())
+	}
+	if row3.GetSize() != newSize {
+		t.Fatalf("row3 unexpected size: got %d, want %d", row3.GetSize(), newSize)
+	}
+
+	// 3. Mutate file size via TruncateFile
+	attr4, err := vol.TruncateFile(ctx, ino, 5)
+	if err != nil {
+		t.Fatalf("TruncateFile failed: %v", err)
+	}
+	row4 := attr4.GetInode()
+
+	if row1.GetSize() != int64(len(initialContent)) || row2.GetSize() != int64(len(initialContent)) || row3.GetSize() != newSize {
+		t.Fatalf("previous rows mutated after TruncateFile! row1.size=%d row2.size=%d row3.size=%d",
+			row1.GetSize(), row2.GetSize(), row3.GetSize())
+	}
+	if row4.GetSize() != 5 {
+		t.Fatalf("row4 unexpected size: got %d, want 5", row4.GetSize())
+	}
+
+	// Clear fault and verify flush
+	faultErr.Store(nil)
 }
 
 func TestErofsSnapshotCreationAndRecovery(t *testing.T) {
