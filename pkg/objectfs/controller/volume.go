@@ -21,7 +21,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -43,7 +42,6 @@ import (
 	_ "github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
-	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
@@ -51,40 +49,12 @@ import (
 )
 
 const (
-	MetadataFileName        = ".objectfs-metadata.json"
 	defaultApplierBatchSize = 100
 
 	// MaxNameLength is the maximum allowed byte length for a path component name
 	// (matching the POSIX NAME_MAX limit of 255 bytes advertised by statfs).
 	MaxNameLength = 255
 )
-
-type VolumeMetadata struct {
-	VolumeID    string                  `json:"volume_id"`
-	Version     int                     `json:"version"`
-	LastFlushed time.Time               `json:"last_flushed"`
-	NextInode   uint64                  `json:"next_inode"`
-	Entries     map[string]FileMetadata `json:"entries"`
-}
-
-type FileMetadata struct {
-	Inode          uint64    `json:"inode"`
-	Path           string    `json:"path"`
-	Name           string    `json:"name"`
-	IsDir          bool      `json:"is_dir"`
-	Mode           uint32    `json:"mode"`
-	Size           int64     `json:"size"`
-	ModTime        time.Time `json:"mod_time"`
-	Atime          time.Time `json:"atime,omitempty"`
-	Ctime          time.Time `json:"ctime,omitempty"`
-	Sha256         string    `json:"sha256,omitempty"`
-	ManifestSha256 string    `json:"manifest_sha256,omitempty"`
-	ContentSha256  string    `json:"content_sha256,omitempty"`
-	ETag           string    `json:"etag,omitempty"`
-	Uid            uint32    `json:"uid,omitempty"`
-	Gid            uint32    `json:"gid,omitempty"`
-	Rdev           uint32    `json:"rdev,omitempty"`
-}
 
 type InodeUpload struct {
 	wg  sync.WaitGroup
@@ -127,9 +97,7 @@ type Volume struct {
 
 	snapshotMu sync.Mutex
 
-	lastFlushedMetadata    *VolumeMetadata
-	deletedPathsSinceFlush []string
-	dirParents             map[uint64]uint64
+	dirParents map[uint64]uint64
 }
 
 // VolumeOption configures a Volume instance.
@@ -495,11 +463,11 @@ func (v *Volume) initMetadataStreamLocked() error {
 }
 
 func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *CachedInode) error {
-	if node.ChunkSize > 0 && len(node.Chunks) > 0 {
+	if node.Row.GetChunkSize() > 0 && len(node.Chunks) > 0 {
 		return nil
 	}
 	if v.metadataView != nil {
-		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(node.ID)}, 1)
+		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno())}, 1)
 		if pErr == nil {
 			chunkMsgs, sErr := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 			if sErr == nil {
@@ -563,10 +531,10 @@ func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkId
 		}
 	}
 
-	if chunkIdx == 0 && (node.Sha256 != "" || node.ContentSha256 != "") && len(node.Chunks) == 0 {
-		sha := node.Sha256
+	if chunkIdx == 0 && (node.Row.GetSha256() != "" || node.Row.GetContentSha256() != "") && len(node.Chunks) == 0 {
+		sha := node.Row.GetSha256()
 		if sha == "" {
-			sha = node.ContentSha256
+			sha = node.Row.GetContentSha256()
 		}
 		if v.recoveredContent != nil {
 			if data, ok := v.recoveredContent[sha]; ok {
@@ -584,12 +552,12 @@ func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkId
 		}
 	}
 
-	if node.Data != nil && node.ChunkSize > 0 {
-		off := int64(chunkIdx) * int64(node.ChunkSize)
-		if off < node.Size {
-			readLen := int64(node.ChunkSize)
-			if off+readLen > node.Size {
-				readLen = node.Size - off
+	if node.Data != nil && node.Row.GetChunkSize() > 0 {
+		off := int64(chunkIdx) * int64(node.Row.GetChunkSize())
+		if off < node.Row.GetSize() {
+			readLen := int64(node.Row.GetChunkSize())
+			if off+readLen > node.Row.GetSize() {
+				readLen = node.Row.GetSize() - off
 			}
 			buf := make([]byte, readLen)
 			_ = node.Data.Rewind()
@@ -932,96 +900,17 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 		return nil, fmt.Errorf("inode %d: %w", inodeID, syscall.ENOENT)
 	}
 	inode := msg.(*pb.Inode)
-	chunkSize := inode.GetChunkSize()
-	if chunkSize == 0 && v.chunkSize > 0 {
-		chunkSize = v.chunkSize
+	cloned := proto.Clone(inode).(*pb.Inode)
+	if cloned.GetChunkSize() == 0 && v.chunkSize > 0 {
+		cloned.ChunkSize = v.chunkSize
 	}
 	node := &CachedInode{
-		ID:             inode.GetIno(),
-		Mode:           inode.GetMode(),
-		Size:           inode.GetSize(),
-		IsDir:          inode.GetIsDir(),
-		Sha256:         inode.GetSha256(),
-		ETag:           inode.GetEtag(),
-		ManifestSha256: inode.GetManifestSha256(),
-		ContentSha256:  inode.GetContentSha256(),
-		ChunkSize:      chunkSize,
-		Uid:            inode.GetUid(),
-		Gid:            inode.GetGid(),
-		Nlink:          inode.GetNlink(),
-		SymlinkTarget:  inode.GetSymlinkTarget(),
-		Rdev:           inode.GetRdev(),
-	}
-	if inode.GetMtime() != nil {
-		node.ModTime = inode.GetMtime().AsTime()
-	}
-	if inode.GetAtime() != nil {
-		node.Atime = inode.GetAtime().AsTime()
-	} else {
-		node.Atime = node.ModTime
-	}
-	if inode.GetCtime() != nil {
-		node.Ctime = inode.GetCtime().AsTime()
-	} else {
-		node.Ctime = node.ModTime
+		Row: cloned,
 	}
 
 	_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 
 	return node, nil
-}
-
-func (v *Volume) getOrLoadDirLocked(ctx context.Context, inodeID uint64) (*CachedDir, error) {
-	inodeID = v.normalizeInodeID(inodeID)
-
-	dirNode, err := v.getOrLoadInodeLocked(ctx, inodeID)
-	if err != nil {
-		return nil, err
-	}
-	if !dirNode.IsDir {
-		return nil, fmt.Errorf("inode %d: %w", inodeID, syscall.ENOTDIR)
-	}
-
-	prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(inodeID)}, 1)
-	if pErr != nil {
-		return nil, pErr
-	}
-	entryMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	dir := &CachedDir{
-		ID:      inodeID,
-		Entries: make(map[string]DirEntry, len(entryMsgs)),
-		Added:   make(map[string]bool),
-		Deleted: make(map[string]bool),
-	}
-
-	for _, msg := range entryMsgs {
-		de := msg.(*pb.DirEntry)
-		name := de.GetName()
-		dir.Entries[name] = DirEntry{
-			Name:    name,
-			InodeID: de.GetIno(),
-			IsDir:   de.GetIsDir(),
-			Mode:    de.GetMode(),
-		}
-		if de.GetIsDir() {
-			if v.dirParents == nil {
-				v.dirParents = make(map[uint64]uint64)
-			}
-			v.dirParents[de.GetIno()] = inodeID
-		}
-	}
-
-	return dir, nil
-}
-
-type InodeEntry struct {
-	InodeID uint64
-	IsDir   bool
-	Mode    uint32
 }
 
 func (v *Volume) getDirEntrySQLiteLocked(ctx context.Context, parentInodeID uint64, name string) (*pb.DirEntry, bool, error) {
@@ -1081,56 +970,73 @@ func (v *Volume) resolvePathLocked(ctx context.Context, p string) (uint64, uint6
 	return currInodeID, parentInodeID, baseName, nil
 }
 
+func toEntryAttr(row *pb.Inode, name, redirectURL string, rootInodeID uint64) *pb.EntryAttr {
+	if row == nil {
+		return nil
+	}
+	mSha := row.GetManifestSha256()
+	cSha := row.GetContentSha256()
+	if row.GetChunkSize() == 0 && mSha == "" {
+		cSha = row.GetSha256()
+	} else if mSha == "" {
+		mSha = row.GetSha256()
+	}
+	ino := row.GetIno()
+	if name == "" && (ino == rootInodeID || ino == 1) {
+		name = "/"
+	}
+	atime := row.GetAtime()
+	if atime == nil {
+		atime = row.GetMtime()
+	}
+	ctime := row.GetCtime()
+	if ctime == nil {
+		ctime = row.GetMtime()
+	}
+	mtime := row.GetMtime()
+	if mtime == nil {
+		mtime = timestamppb.Now()
+		if atime == nil {
+			atime = mtime
+		}
+		if ctime == nil {
+			ctime = mtime
+		}
+	}
+	nlink := row.GetNlink()
+	if nlink == 0 && row.GetIsDir() {
+		nlink = 2
+	}
+	if ino == rootInodeID && rootInodeID != 0 {
+		ino = 1
+	}
+	return &pb.EntryAttr{
+		Inode:          ino,
+		Name:           name,
+		IsDir:          row.GetIsDir(),
+		Size:           row.GetSize(),
+		Mode:           row.GetMode(),
+		ModTime:        mtime,
+		Atime:          atime,
+		Ctime:          ctime,
+		Sha256:         row.GetSha256(),
+		ManifestSha256: mSha,
+		ContentSha256:  cSha,
+		RedirectUrl:    redirectURL,
+		Uid:            row.GetUid(),
+		Gid:            row.GetGid(),
+		Nlink:          nlink,
+		SymlinkTarget:  row.GetSymlinkTarget(),
+		Rdev:           row.GetRdev(),
+	}
+}
+
 func (v *Volume) toEntryAttrLocked(ctx context.Context, inodeID uint64, name string) (*pb.EntryAttr, error) {
 	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
 	if err != nil {
 		return nil, err
 	}
-	mSha := node.ManifestSha256
-	cSha := node.ContentSha256
-	if node.ChunkSize == 0 && mSha == "" {
-		cSha = node.Sha256
-	} else if mSha == "" {
-		mSha = node.Sha256
-	}
-	if name == "" && inodeID == v.rootInodeID {
-		name = "/"
-	}
-	atime := node.Atime
-	if atime.IsZero() {
-		atime = node.ModTime
-	}
-	ctime := node.Ctime
-	if ctime.IsZero() {
-		ctime = node.ModTime
-	}
-	ino := node.ID
-	if node.ID == v.rootInodeID {
-		ino = 1
-	}
-	nlink := node.Nlink
-	if nlink == 0 && node.IsDir {
-		nlink = 2
-	}
-	return &pb.EntryAttr{
-		Inode:          ino,
-		Name:           name,
-		IsDir:          node.IsDir,
-		Size:           node.Size,
-		Mode:           node.Mode,
-		ModTime:        timestamppb.New(node.ModTime),
-		Atime:          timestamppb.New(atime),
-		Ctime:          timestamppb.New(ctime),
-		Sha256:         node.Sha256,
-		ManifestSha256: mSha,
-		ContentSha256:  cSha,
-		RedirectUrl:    node.RedirectURL,
-		Uid:            node.Uid,
-		Gid:            node.Gid,
-		Nlink:          nlink,
-		SymlinkTarget:  node.SymlinkTarget,
-		Rdev:           node.Rdev,
-	}, nil
+	return toEntryAttr(node.Row, name, node.RedirectURL, v.rootInodeID), nil
 }
 
 func (v *Volume) GetAttr(ctx context.Context, inodeID uint64) (*pb.EntryAttr, error) {
@@ -1162,40 +1068,40 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 
 		if mode != nil {
 			// keep setuid, setgid and sticky (07777), and the file-type bits untouched by chmod
-			node.Mode = (node.Mode & ^uint32(07777)) | (*mode & 07777)
+			node.Row.Mode = (node.Row.GetMode() & ^uint32(07777)) | (*mode & 07777)
 			modified = true
 		}
 		if uid != nil {
-			node.Uid = *uid
+			node.Row.Uid = *uid
 			modified = true
 		}
 		if gid != nil {
-			node.Gid = *gid
+			node.Row.Gid = *gid
 			modified = true
 		}
 		if atimeNow {
-			node.Atime = now
+			node.Row.Atime = timestamppb.New(now)
 			modified = true
 		} else if atime != nil {
-			node.Atime = *atime
+			node.Row.Atime = timestamppb.New(*atime)
 			modified = true
 		}
 		if mtimeNow {
-			node.ModTime = now
+			node.Row.Mtime = timestamppb.New(now)
 			modified = true
 		} else if mtime != nil {
-			node.ModTime = *mtime
+			node.Row.Mtime = timestamppb.New(*mtime)
 			modified = true
 		}
 
 		if ctimeNow {
-			node.Ctime = now
+			node.Row.Ctime = timestamppb.New(now)
 			modified = true
 		} else if ctime != nil {
-			node.Ctime = *ctime
+			node.Row.Ctime = timestamppb.New(*ctime)
 			modified = true
 		} else if modified {
-			node.Ctime = now
+			node.Row.Ctime = timestamppb.New(now)
 		}
 
 		if !modified {
@@ -1204,34 +1110,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 		}
 
 		tx := v.metadataStream.Begin()
-		mAtime := node.Atime
-		if mAtime.IsZero() {
-			mAtime = node.ModTime
-		}
-		mCtime := node.Ctime
-		if mCtime.IsZero() {
-			mCtime = node.ModTime
-		}
-		inodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(node.ID),
-			Mode:           node.Mode,
-			Size:           node.Size,
-			Mtime:          timestamppb.New(node.ModTime),
-			Atime:          timestamppb.New(mAtime),
-			Ctime:          timestamppb.New(mCtime),
-			IsDir:          node.IsDir,
-			Sha256:         node.Sha256,
-			Etag:           node.ETag,
-			ManifestSha256: node.ManifestSha256,
-			ContentSha256:  node.ContentSha256,
-			ChunkSize:      node.ChunkSize,
-			Uid:            node.Uid,
-			Gid:            node.Gid,
-			Nlink:          node.Nlink,
-			SymlinkTarget:  node.SymlinkTarget,
-			Rdev:           node.Rdev,
-		}
-		if _, err := tx.Update(ctx, inodeMsg); err != nil {
+		if _, err := tx.Update(ctx, node.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log inode update: %w", err)
 		}
 
@@ -1245,36 +1124,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		mSha := node.ManifestSha256
-		cSha := node.ContentSha256
-		if node.ChunkSize == 0 && mSha == "" {
-			cSha = node.Sha256
-		} else if mSha == "" {
-			mSha = node.Sha256
-		}
-		nlink := node.Nlink
-		if nlink == 0 && node.IsDir {
-			nlink = 2
-		}
-		attr := &pb.EntryAttr{
-			Inode:          node.ID,
-			IsDir:          node.IsDir,
-			Size:           node.Size,
-			Mode:           node.Mode,
-			ModTime:        timestamppb.New(node.ModTime),
-			Atime:          timestamppb.New(mAtime),
-			Ctime:          timestamppb.New(mCtime),
-			Sha256:         node.Sha256,
-			ManifestSha256: mSha,
-			ContentSha256:  cSha,
-			RedirectUrl:    node.RedirectURL,
-			Uid:            node.Uid,
-			Gid:            node.Gid,
-			Nlink:          nlink,
-			SymlinkTarget:  node.SymlinkTarget,
-			Rdev:           node.Rdev,
-		}
-
+		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
 		return attr, waitFn, nil
 	}()
 	if err != nil {
@@ -1316,7 +1166,7 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 		if err != nil {
 			return nil, err
 		}
-		if !parentNode.IsDir {
+		if !parentNode.Row.GetIsDir() {
 			return nil, syscall.ENOTDIR
 		}
 		pIno, ok := v.dirParents[parentInodeID]
@@ -1346,7 +1196,7 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 	if err != nil {
 		return nil, err
 	}
-	if !dirNode.IsDir {
+	if !dirNode.Row.GetIsDir() {
 		return nil, fmt.Errorf("inode %d is not a directory: %w", dirInodeID, syscall.ENOTDIR)
 	}
 
@@ -1408,7 +1258,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		if err != nil {
 			return nil, nil, err
 		}
-		if !parentInode.IsDir {
+		if !parentInode.Row.GetIsDir() {
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
@@ -1425,16 +1275,16 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		}
 		mode |= syscall.S_IFDIR
 
-		if (parentInode.Mode & 02000) != 0 {
-			gid = parentInode.Gid
+		if (parentInode.Row.GetMode() & 02000) != 0 {
+			gid = parentInode.Row.GetGid()
 			mode |= 02000
 		}
 
 		now := time.Now()
 		childInodeID := v.allocInode()
 
-		parentInode.ModTime = now
-		parentInode.Ctime = now
+		parentInode.Row.Mtime = timestamppb.New(now)
+		parentInode.Row.Ctime = timestamppb.New(now)
 
 		if v.dirParents == nil {
 			v.dirParents = make(map[uint64]uint64)
@@ -1471,27 +1321,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
-		pAtime := parentInode.Atime
-		if pAtime.IsZero() {
-			pAtime = parentInode.ModTime
-		}
-		parentInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(parentInode.ID),
-			Mode:           parentInode.Mode,
-			Size:           parentInode.Size,
-			Mtime:          timestamppb.New(now),
-			Atime:          timestamppb.New(pAtime),
-			Ctime:          timestamppb.New(now),
-			Uid:            parentInode.Uid,
-			Gid:            parentInode.Gid,
-			IsDir:          true,
-			Sha256:         parentInode.Sha256,
-			Etag:           parentInode.ETag,
-			ManifestSha256: parentInode.ManifestSha256,
-			ContentSha256:  parentInode.ContentSha256,
-			ChunkSize:      parentInode.ChunkSize,
-		}
-		if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
+		if _, err := tx.Update(ctx, parentInode.Row); err != nil {
 			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
@@ -1508,19 +1338,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := &pb.EntryAttr{
-			Inode:   childInodeID,
-			Name:    name,
-			IsDir:   true,
-			Size:    0,
-			Mode:    mode,
-			ModTime: timestamppb.New(now),
-			Atime:   timestamppb.New(now),
-			Ctime:   timestamppb.New(now),
-			Uid:     uid,
-			Gid:     gid,
-			Nlink:   2,
-		}
+		attr := toEntryAttr(childInodeMsg, name, "", v.rootInodeID)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:   pb.WatchEventType_EVENT_CREATED,
 			Attr:        attr,
@@ -1569,7 +1387,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		if err != nil {
 			return nil, nil, err
 		}
-		if !parentInode.IsDir {
+		if !parentInode.Row.GetIsDir() {
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
@@ -1600,8 +1418,8 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("unsupported file type %o: %w", fileType, syscall.EINVAL)
 		}
 
-		if (parentInode.Mode & 02000) != 0 {
-			gid = parentInode.Gid
+		if (parentInode.Row.GetMode() & 02000) != 0 {
+			gid = parentInode.Row.GetGid()
 		}
 
 		now := time.Now()
@@ -1621,61 +1439,61 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			if err != nil {
 				return nil, nil, err
 			}
-			if childInode.IsDir {
+			if childInode.Row.GetIsDir() {
 				return nil, nil, fmt.Errorf("cannot overwrite directory with file: %w", syscall.EISDIR)
 			}
-			if fileType != syscall.S_IFREG || (childInode.Mode&syscall.S_IFMT) != syscall.S_IFREG {
+			if fileType != syscall.S_IFREG || (childInode.Row.GetMode()&syscall.S_IFMT) != syscall.S_IFREG {
 				return nil, nil, fmt.Errorf("file %q already exists: %w", name, syscall.EEXIST)
 			}
 			if childInode.Data != nil {
 				_ = childInode.Data.Close()
 				childInode.Data = nil
 			}
-			childInode.Mode = mode
-			childInode.Size = int64(len(dataCopy))
-			childInode.ModTime = now
-			childInode.Ctime = now
-			childInode.Uid = uid
-			childInode.Gid = gid
+			childInode.Row.Mode = mode
+			childInode.Row.Size = int64(len(dataCopy))
+			childInode.Row.Mtime = timestamppb.New(now)
+			childInode.Row.Ctime = timestamppb.New(now)
+			childInode.Row.Uid = uid
+			childInode.Row.Gid = gid
 
-			parentInode.ModTime = now
-			parentInode.Ctime = now
+			parentInode.Row.Mtime = timestamppb.New(now)
+			parentInode.Row.Ctime = timestamppb.New(now)
 
-			effectiveChunkSize := childInode.ChunkSize
+			effectiveChunkSize := childInode.Row.GetChunkSize()
 			if effectiveChunkSize == 0 {
 				effectiveChunkSize = v.chunkSize
 				if effectiveChunkSize == 0 {
 					effectiveChunkSize = 64 * 1024
 				}
-				childInode.ChunkSize = effectiveChunkSize
+				childInode.Row.ChunkSize = effectiveChunkSize
 			}
 
 			tx := v.metadataStream.Begin()
 
 			if len(dataCopy) <= int(v.maxInlineLen) {
 				childInode.InlineData = dataCopy
-				childInode.ContentSha256 = hashStr
+				childInode.Row.ContentSha256 = hashStr
 				childInode.Chunks = nil
 				childInode.StagedChunks = nil
 				childInode.DirtyChunks = nil
-				childInode.ManifestSha256 = ""
+				childInode.Row.ManifestSha256 = ""
 
-				prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.ID)}, 1)
+				prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno())}, 1)
 				chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 				for _, msg := range chunkMsgs {
 					c := msg.(*pb.FileChunk)
-					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(c.GetIndex())}); err != nil {
+					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(c.GetIndex())}); err != nil {
 						return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
 					}
 				}
 				if len(dataCopy) > 0 {
-					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
+					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
 						return nil, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 					}
 				}
 			} else {
 				childInode.InlineData = nil
-				childInode.ContentSha256 = hashStr
+				childInode.Row.ContentSha256 = hashStr
 				childInode.Chunks = make(map[uint32]string)
 				childInode.StagedChunks = make(map[int][]byte)
 				childInode.DirtyChunks = nil
@@ -1703,70 +1521,27 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 					}
 				}
 
-				prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.ID)}, 1)
+				prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno())}, 1)
 				chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 				for _, msg := range chunkMsgs {
 					c := msg.(*pb.FileChunk)
 					if _, stillPresent := childInode.Chunks[c.GetIndex()]; !stillPresent {
-						if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(c.GetIndex())}); err != nil {
+						if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(c.GetIndex())}); err != nil {
 							return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
 						}
 					}
 				}
 				for i, sha := range childInode.Chunks {
-					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.ID), Index: proto.Uint32(i), Sha256: sha}); err != nil {
+					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(i), Sha256: sha}); err != nil {
 						return nil, nil, fmt.Errorf("failed to log FileChunk: %w", err)
 					}
 				}
 			}
 
-			cAtime := childInode.Atime
-			if cAtime.IsZero() {
-				cAtime = now
-			}
-			childInodeMsg := &pb.Inode{
-				Ino:           proto.Uint64(childInode.ID),
-				Mode:          childInode.Mode,
-				Size:          childInode.Size,
-				Mtime:         timestamppb.New(now),
-				Atime:         timestamppb.New(cAtime),
-				Ctime:         timestamppb.New(now),
-				Uid:           uid,
-				Gid:           gid,
-				IsDir:         false,
-				ContentSha256: childInode.ContentSha256,
-				ChunkSize:     childInode.ChunkSize,
-				Nlink:         childInode.Nlink,
-				SymlinkTarget: childInode.SymlinkTarget,
-				Rdev:          childInode.Rdev,
-			}
-			if _, err := tx.Update(ctx, childInodeMsg); err != nil {
+			if _, err := tx.Update(ctx, childInode.Row); err != nil {
 				return nil, nil, fmt.Errorf("failed to log child inode update: %w", err)
 			}
-
-			pAtime := parentInode.Atime
-			if pAtime.IsZero() {
-				pAtime = parentInode.ModTime
-			}
-			parentInodeMsg := &pb.Inode{
-				Ino:            proto.Uint64(parentInode.ID),
-				Mode:           parentInode.Mode,
-				Size:           parentInode.Size,
-				Mtime:          timestamppb.New(now),
-				Atime:          timestamppb.New(pAtime),
-				Ctime:          timestamppb.New(now),
-				Uid:            parentInode.Uid,
-				Gid:            parentInode.Gid,
-				IsDir:          true,
-				Sha256:         parentInode.Sha256,
-				Etag:           parentInode.ETag,
-				ManifestSha256: parentInode.ManifestSha256,
-				ContentSha256:  parentInode.ContentSha256,
-				ChunkSize:      parentInode.ChunkSize,
-				Nlink:          parentInode.Nlink,
-				SymlinkTarget:  parentInode.SymlinkTarget,
-			}
-			if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
+			if _, err := tx.Update(ctx, parentInode.Row); err != nil {
 				return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 			}
 
@@ -1780,28 +1555,11 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 			waitFn := v.makeWaitFn(commitSeq, nil)
 
-			attr := &pb.EntryAttr{
-				Inode:          childInode.ID,
-				Name:           name,
-				IsDir:          false,
-				Size:           childInode.Size,
-				Mode:           childInode.Mode,
-				ModTime:        timestamppb.New(now),
-				Atime:          timestamppb.New(cAtime),
-				Ctime:          timestamppb.New(now),
-				Sha256:         childInode.Sha256,
-				ManifestSha256: childInode.ManifestSha256,
-				ContentSha256:  childInode.ContentSha256,
-				Uid:            uid,
-				Gid:            gid,
-				Nlink:          childInode.Nlink,
-				SymlinkTarget:  childInode.SymlinkTarget,
-				Rdev:           childInode.Rdev,
-			}
+			attr := toEntryAttr(childInode.Row, name, childInode.RedirectURL, v.rootInodeID)
 			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 				EventType:   pb.WatchEventType_EVENT_MODIFIED,
 				Attr:        attr,
-				Inode:       childInode.ID,
+				Inode:       childInode.Row.GetIno(),
 				ParentInode: parentInodeID,
 				Name:        name,
 			})
@@ -1809,8 +1567,8 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		}
 
 		childInodeID := v.allocInode()
-		parentInode.ModTime = now
-		parentInode.Ctime = now
+		parentInode.Row.Mtime = timestamppb.New(now)
+		parentInode.Row.Ctime = timestamppb.New(now)
 
 		effectiveChunkSize := v.chunkSize
 		if effectiveChunkSize == 0 {
@@ -1818,18 +1576,21 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		}
 
 		childInode := &CachedInode{
-			ID:        childInodeID,
-			Mode:      mode,
-			Size:      int64(len(dataCopy)),
-			ModTime:   now,
-			Atime:     now,
-			Ctime:     now,
-			IsDir:     false,
-			Uid:       uid,
-			Gid:       gid,
-			Nlink:     1,
-			Rdev:      dev,
-			ChunkSize: effectiveChunkSize,
+			Row: &pb.Inode{
+				Ino:           proto.Uint64(childInodeID),
+				Mode:          mode,
+				Size:          int64(len(dataCopy)),
+				Mtime:         timestamppb.New(now),
+				Atime:         timestamppb.New(now),
+				Ctime:         timestamppb.New(now),
+				Uid:           uid,
+				Gid:           gid,
+				IsDir:         false,
+				Nlink:         1,
+				ChunkSize:     effectiveChunkSize,
+				Rdev:          dev,
+				ContentSha256: hashStr,
+			},
 		}
 
 		tx := v.metadataStream.Begin()
@@ -1837,7 +1598,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		if fileType == syscall.S_IFREG {
 			if len(dataCopy) <= int(v.maxInlineLen) {
 				childInode.InlineData = dataCopy
-				childInode.ContentSha256 = hashStr
 
 				if len(dataCopy) > 0 {
 					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
@@ -1845,7 +1605,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 					}
 				}
 			} else {
-				childInode.ContentSha256 = hashStr
 				childInode.Chunks = make(map[uint32]string)
 				childInode.StagedChunks = make(map[int][]byte)
 
@@ -1880,22 +1639,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			}
 		}
 
-		childInodeMsg := &pb.Inode{
-			Ino:           proto.Uint64(childInodeID),
-			Mode:          mode,
-			Size:          childInode.Size,
-			Mtime:         timestamppb.New(now),
-			Atime:         timestamppb.New(now),
-			Ctime:         timestamppb.New(now),
-			Uid:           uid,
-			Gid:           gid,
-			IsDir:         false,
-			Nlink:         1,
-			ContentSha256: childInode.ContentSha256,
-			ChunkSize:     childInode.ChunkSize,
-			Rdev:          dev,
-		}
-		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
+		if _, err := tx.Insert(ctx, childInode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log child inode creation: %w", err)
 		}
 
@@ -1910,29 +1654,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
-		pAtime := parentInode.Atime
-		if pAtime.IsZero() {
-			pAtime = parentInode.ModTime
-		}
-		parentInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(parentInode.ID),
-			Mode:           parentInode.Mode,
-			Size:           parentInode.Size,
-			Mtime:          timestamppb.New(now),
-			Atime:          timestamppb.New(pAtime),
-			Ctime:          timestamppb.New(now),
-			Uid:            parentInode.Uid,
-			Gid:            parentInode.Gid,
-			IsDir:          true,
-			Sha256:         parentInode.Sha256,
-			Etag:           parentInode.ETag,
-			ManifestSha256: parentInode.ManifestSha256,
-			ContentSha256:  parentInode.ContentSha256,
-			ChunkSize:      parentInode.ChunkSize,
-			Nlink:          parentInode.Nlink,
-			SymlinkTarget:  parentInode.SymlinkTarget,
-		}
-		if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
+		if _, err := tx.Update(ctx, parentInode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 		commitSeq, err := tx.Commit(ctx)
@@ -1945,23 +1667,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := &pb.EntryAttr{
-			Inode:          childInodeID,
-			Name:           name,
-			IsDir:          false,
-			Size:           childInode.Size,
-			Mode:           mode,
-			ModTime:        timestamppb.New(now),
-			Atime:          timestamppb.New(now),
-			Ctime:          timestamppb.New(now),
-			Sha256:         childInode.Sha256,
-			ManifestSha256: childInode.ManifestSha256,
-			ContentSha256:  childInode.ContentSha256,
-			Uid:            uid,
-			Gid:            gid,
-			Nlink:          1,
-			Rdev:           dev,
-		}
+		attr := toEntryAttr(childInode.Row, name, "", v.rootInodeID)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:   pb.WatchEventType_EVENT_CREATED,
 			Attr:        attr,
@@ -2005,7 +1711,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 		if err != nil {
 			return nil, nil, err
 		}
-		if !parentInode.IsDir {
+		if !parentInode.Row.GetIsDir() {
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
@@ -2018,45 +1724,34 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 		}
 
 		mode := uint32(0777 | syscall.S_IFLNK)
-		if (parentInode.Mode & 02000) != 0 {
-			gid = parentInode.Gid
+		if (parentInode.Row.GetMode() & 02000) != 0 {
+			gid = parentInode.Row.GetGid()
 		}
 
 		now := time.Now()
 		childInodeID := v.allocInode()
-		parentInode.ModTime = now
-		parentInode.Ctime = now
+		parentInode.Row.Mtime = timestamppb.New(now)
+		parentInode.Row.Ctime = timestamppb.New(now)
 
 		childInode := &CachedInode{
-			ID:            childInodeID,
-			Mode:          mode,
-			Size:          int64(len(target)),
-			ModTime:       now,
-			Atime:         now,
-			Ctime:         now,
-			IsDir:         false,
-			Uid:           uid,
-			Gid:           gid,
-			Nlink:         1,
-			SymlinkTarget: target,
+			Row: &pb.Inode{
+				Ino:           proto.Uint64(childInodeID),
+				Mode:          mode,
+				Size:          int64(len(target)),
+				Mtime:         timestamppb.New(now),
+				Atime:         timestamppb.New(now),
+				Ctime:         timestamppb.New(now),
+				Uid:           uid,
+				Gid:           gid,
+				IsDir:         false,
+				Nlink:         1,
+				SymlinkTarget: target,
+			},
 		}
 
 		tx := v.metadataStream.Begin()
 
-		childInodeMsg := &pb.Inode{
-			Ino:           proto.Uint64(childInodeID),
-			Mode:          mode,
-			Size:          int64(len(target)),
-			Mtime:         timestamppb.New(now),
-			Atime:         timestamppb.New(now),
-			Ctime:         timestamppb.New(now),
-			Uid:           uid,
-			Gid:           gid,
-			IsDir:         false,
-			Nlink:         1,
-			SymlinkTarget: target,
-		}
-		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
+		if _, err := tx.Insert(ctx, childInode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log symlink inode creation: %w", err)
 		}
 
@@ -2071,29 +1766,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
-		pAtime := parentInode.Atime
-		if pAtime.IsZero() {
-			pAtime = parentInode.ModTime
-		}
-		parentInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(parentInode.ID),
-			Mode:           parentInode.Mode,
-			Size:           parentInode.Size,
-			Mtime:          timestamppb.New(now),
-			Atime:          timestamppb.New(pAtime),
-			Ctime:          timestamppb.New(now),
-			Uid:            parentInode.Uid,
-			Gid:            parentInode.Gid,
-			IsDir:          true,
-			Sha256:         parentInode.Sha256,
-			Etag:           parentInode.ETag,
-			ManifestSha256: parentInode.ManifestSha256,
-			ContentSha256:  parentInode.ContentSha256,
-			ChunkSize:      parentInode.ChunkSize,
-			Nlink:          parentInode.Nlink,
-			SymlinkTarget:  parentInode.SymlinkTarget,
-		}
-		if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
+		if _, err := tx.Update(ctx, parentInode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 
@@ -2107,20 +1780,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := &pb.EntryAttr{
-			Inode:         childInodeID,
-			Name:          name,
-			IsDir:         false,
-			Size:          childInode.Size,
-			Mode:          childInode.Mode,
-			ModTime:       timestamppb.New(now),
-			Atime:         timestamppb.New(now),
-			Ctime:         timestamppb.New(now),
-			Uid:           uid,
-			Gid:           gid,
-			Nlink:         1,
-			SymlinkTarget: target,
-		}
+		attr := toEntryAttr(childInode.Row, name, "", v.rootInodeID)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:   pb.WatchEventType_EVENT_CREATED,
 			Attr:        attr,
@@ -2150,10 +1810,10 @@ func (v *Volume) Readlink(ctx context.Context, inodeID uint64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if (node.Mode&syscall.S_IFMT) != syscall.S_IFLNK && node.SymlinkTarget == "" {
+	if (node.Row.GetMode()&syscall.S_IFMT) != syscall.S_IFLNK && node.Row.GetSymlinkTarget() == "" {
 		return "", syscall.EINVAL
 	}
-	return node.SymlinkTarget, nil
+	return node.Row.GetSymlinkTarget(), nil
 }
 
 func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID uint64, newName string) (*pb.EntryAttr, error) {
@@ -2180,7 +1840,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 		if err != nil {
 			return nil, nil, err
 		}
-		if oldNode.IsDir || (oldNode.Mode&syscall.S_IFDIR) != 0 {
+		if oldNode.Row.GetIsDir() || (oldNode.Row.GetMode()&syscall.S_IFDIR) != 0 {
 			return nil, nil, syscall.EPERM // POSIX: directories cannot be hard-linked
 		}
 
@@ -2188,7 +1848,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 		if err != nil {
 			return nil, nil, err
 		}
-		if !newParentInode.IsDir {
+		if !newParentInode.Row.GetIsDir() {
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", newParentInodeID, syscall.ENOTDIR)
 		}
 
@@ -2201,77 +1861,33 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 		}
 
 		now := time.Now()
-		if oldNode.Nlink == 0 {
-			oldNode.Nlink = 1
+		if oldNode.Row.GetNlink() == 0 {
+			oldNode.Row.Nlink = 1
 		}
-		oldNode.Nlink++
-		oldNode.Ctime = now
+		oldNode.Row.Nlink++
+		oldNode.Row.Ctime = timestamppb.New(now)
 
-		newParentInode.ModTime = now
-		newParentInode.Ctime = now
+		newParentInode.Row.Mtime = timestamppb.New(now)
+		newParentInode.Row.Ctime = timestamppb.New(now)
 
 		tx := v.metadataStream.Begin()
 
-		oAtime := oldNode.Atime
-		if oAtime.IsZero() {
-			oAtime = oldNode.ModTime
-		}
-		oldInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(oldNode.ID),
-			Mode:           oldNode.Mode,
-			Size:           oldNode.Size,
-			Mtime:          timestamppb.New(oldNode.ModTime),
-			Atime:          timestamppb.New(oAtime),
-			Ctime:          timestamppb.New(now),
-			Uid:            oldNode.Uid,
-			Gid:            oldNode.Gid,
-			IsDir:          false,
-			Sha256:         oldNode.Sha256,
-			Etag:           oldNode.ETag,
-			ManifestSha256: oldNode.ManifestSha256,
-			ContentSha256:  oldNode.ContentSha256,
-			ChunkSize:      oldNode.ChunkSize,
-			Nlink:          oldNode.Nlink,
-			SymlinkTarget:  oldNode.SymlinkTarget,
-		}
-		if _, err := tx.Update(ctx, oldInodeMsg); err != nil {
+		if _, err := tx.Update(ctx, oldNode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log linked inode update: %w", err)
 		}
 
 		dirEntryMsg := &pb.DirEntry{
 			ParentIno: proto.Uint64(newParentInodeID),
 			Name:      proto.String(newName),
-			Ino:       oldNode.ID,
+			Ino:       oldNode.Row.GetIno(),
 			IsDir:     false,
-			Mode:      oldNode.Mode,
+			Mode:      oldNode.Row.GetMode(),
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
-		pAtime := newParentInode.Atime
-		if pAtime.IsZero() {
-			pAtime = newParentInode.ModTime
-		}
-		parentInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(newParentInode.ID),
-			Mode:           newParentInode.Mode,
-			Size:           newParentInode.Size,
-			Mtime:          timestamppb.New(now),
-			Atime:          timestamppb.New(pAtime),
-			Ctime:          timestamppb.New(now),
-			Uid:            newParentInode.Uid,
-			Gid:            newParentInode.Gid,
-			IsDir:          true,
-			Sha256:         newParentInode.Sha256,
-			Etag:           newParentInode.ETag,
-			ManifestSha256: newParentInode.ManifestSha256,
-			ContentSha256:  newParentInode.ContentSha256,
-			ChunkSize:      newParentInode.ChunkSize,
-			Nlink:          newParentInode.Nlink,
-			SymlinkTarget:  newParentInode.SymlinkTarget,
-		}
-		if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
+		if _, err := tx.Update(ctx, newParentInode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 
@@ -2285,34 +1901,11 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		mSha := oldNode.ManifestSha256
-		cSha := oldNode.ContentSha256
-		if oldNode.ChunkSize == 0 && mSha == "" {
-			cSha = oldNode.Sha256
-		} else if mSha == "" {
-			mSha = oldNode.Sha256
-		}
-		attr := &pb.EntryAttr{
-			Inode:          oldNode.ID,
-			Name:           newName,
-			IsDir:          false,
-			Size:           oldNode.Size,
-			Mode:           oldNode.Mode,
-			ModTime:        timestamppb.New(oldNode.ModTime),
-			Atime:          timestamppb.New(oAtime),
-			Ctime:          timestamppb.New(now),
-			Uid:            oldNode.Uid,
-			Gid:            oldNode.Gid,
-			Sha256:         oldNode.Sha256,
-			ManifestSha256: mSha,
-			ContentSha256:  cSha,
-			Nlink:          oldNode.Nlink,
-			SymlinkTarget:  oldNode.SymlinkTarget,
-		}
+		attr := toEntryAttr(oldNode.Row, newName, "", v.rootInodeID)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:   pb.WatchEventType_EVENT_CREATED,
 			Attr:        attr,
-			Inode:       oldNode.ID,
+			Inode:       oldNode.Row.GetIno(),
 			ParentInode: newParentInodeID,
 			Name:        newName,
 		})
@@ -2344,11 +1937,11 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 		return nil, 0, "", err
 	}
 
-	if node.IsDir {
+	if node.Row.GetIsDir() {
 		return nil, 0, "", fmt.Errorf("cannot read directory as file: %w", syscall.EISDIR)
 	}
 
-	total := node.Size
+	total := node.Row.GetSize()
 	if node.RedirectURL != "" && length > v.maxInlineLen {
 		return nil, total, node.RedirectURL, nil
 	}
@@ -2378,9 +1971,9 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 		return res, total, "", nil
 	}
 
-	if node.ManifestSha256 != "" || node.ChunkSize > 0 || len(node.Chunks) > 0 || len(node.StagedChunks) > 0 {
+	if node.Row.GetManifestSha256() != "" || node.Row.GetChunkSize() > 0 || len(node.Chunks) > 0 || len(node.StagedChunks) > 0 {
 		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
-		cs := int64(node.ChunkSize)
+		cs := int64(node.Row.GetChunkSize())
 		if cs == 0 {
 			cs = int64(v.chunkSize)
 			if cs == 0 {
@@ -2420,9 +2013,9 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 	}
 
 	// Lazy load data from blob store if not currently in memory
-	if node.Data == nil && node.Size > 0 {
-		if node.Sha256 != "" && v.blobStore != nil {
-			stream, err := v.blobStore.GetBlob(ctx, node.Sha256)
+	if node.Data == nil && node.Row.GetSize() > 0 {
+		if node.Row.GetSha256() != "" && v.blobStore != nil {
+			stream, err := v.blobStore.GetBlob(ctx, node.Row.GetSha256())
 			if err == nil {
 				node.Data = stream
 			}
@@ -2463,7 +2056,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			return 0, 0, time.Time{}, nil, err
 		}
 
-		if node.IsDir {
+		if node.Row.GetIsDir() {
 			return 0, 0, time.Time{}, nil, fmt.Errorf("cannot write to directory: %w", syscall.EISDIR)
 		}
 
@@ -2471,21 +2064,21 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		if effectiveChunkSize == 0 {
 			effectiveChunkSize = 64 * 1024
 		}
-		if node.ChunkSize > 0 {
-			effectiveChunkSize = node.ChunkSize
+		if node.Row.GetChunkSize() > 0 {
+			effectiveChunkSize = node.Row.GetChunkSize()
 		} else {
-			node.ChunkSize = effectiveChunkSize
+			node.Row.ChunkSize = effectiveChunkSize
 		}
 
 		neededLen := offset + int64(len(data))
 		calculatedSize := neededLen
-		if calculatedSize < node.Size {
-			calculatedSize = node.Size
+		if calculatedSize < node.Row.GetSize() {
+			calculatedSize = node.Row.GetSize()
 		}
 
 		now := time.Now()
-		node.ModTime = now
-		node.Ctime = now
+		node.Row.Mtime = timestamppb.New(now)
+		node.Row.Ctime = timestamppb.New(now)
 		node.IsDirty = true
 
 		var reqLevel *walclient.Level
@@ -2525,43 +2118,23 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 				}
 				copy(node.InlineData[offset:], data)
 			}
-			node.Size = int64(len(node.InlineData))
-			if offset == 0 && int64(len(data)) == node.Size {
+			node.Row.Size = int64(len(node.InlineData))
+			if offset == 0 && int64(len(data)) == node.Row.GetSize() {
 				h := sha256.Sum256(data)
-				node.ContentSha256 = fmt.Sprintf("%x", h)
+				node.Row.ContentSha256 = fmt.Sprintf("%x", h)
 			} else {
-				node.ContentSha256 = ""
+				node.Row.ContentSha256 = ""
 			}
 
 			tx := v.metadataStream.Begin()
 			if _, err := tx.Insert(ctx, &pb.FileChunk{
-				Ino:        proto.Uint64(node.ID),
+				Ino:        proto.Uint64(node.Row.GetIno()),
 				Index:      proto.Uint32(0),
 				InlineData: node.InlineData,
 			}); err != nil {
 				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 			}
-			nAtime := node.Atime
-			if nAtime.IsZero() {
-				nAtime = now
-			}
-			nodeInodeMsg := &pb.Inode{
-				Ino:           proto.Uint64(node.ID),
-				Mode:          node.Mode,
-				Size:          node.Size,
-				Mtime:         timestamppb.New(now),
-				Atime:         timestamppb.New(nAtime),
-				Ctime:         timestamppb.New(now),
-				Uid:           node.Uid,
-				Gid:           node.Gid,
-				IsDir:         false,
-				ContentSha256: node.ContentSha256,
-				ChunkSize:     node.ChunkSize,
-				Nlink:         node.Nlink,
-				SymlinkTarget: node.SymlinkTarget,
-				Rdev:          node.Rdev,
-			}
-			if _, err := tx.Update(ctx, nodeInodeMsg); err != nil {
+			if _, err := tx.Update(ctx, node.Row); err != nil {
 				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log node inode update: %w", err)
 			}
 
@@ -2574,24 +2147,13 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			}
 			waitFn := v.makeWaitFn(commitSeq, reqLevel)
 
-			attr := &pb.EntryAttr{
-				Inode:         node.ID,
-				IsDir:         false,
-				Size:          node.Size,
-				Mode:          node.Mode,
-				ModTime:       timestamppb.New(now),
-				Atime:         timestamppb.New(nAtime),
-				Ctime:         timestamppb.New(now),
-				ContentSha256: node.ContentSha256,
-				Uid:           node.Uid,
-				Gid:           node.Gid,
-			}
+			attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
 			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 				EventType: pb.WatchEventType_EVENT_MODIFIED,
 				Attr:      attr,
-				Inode:     node.ID,
+				Inode:     node.Row.GetIno(),
 			})
-			return int64(len(data)), node.Size, now, waitFn, nil
+			return int64(len(data)), node.Row.GetSize(), now, waitFn, nil
 		}
 
 		// Chunked file write
@@ -2613,7 +2175,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 
 		cs := int64(effectiveChunkSize)
-		node.ChunkSize = uint32(effectiveChunkSize)
+		node.Row.ChunkSize = uint32(effectiveChunkSize)
 		startChunk := int(offset / cs)
 		endChunk := int((offset + int64(len(data)) - 1) / cs)
 
@@ -2663,10 +2225,8 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			chunkShas[i] = chunkSha
 		}
 
-		node.Size = calculatedSize
-		node.ContentSha256 = ""
-		node.ModTime = now
-		node.Ctime = now
+		node.Row.Size = calculatedSize
+		node.Row.ContentSha256 = ""
 
 		numChunks := int((calculatedSize + cs - 1) / cs)
 		manifestChunks := make([][32]byte, numChunks)
@@ -2685,18 +2245,18 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		}
 		manifestBlob, mErr := blob.EncodeManifest(manifest)
 		if mErr == nil {
-			node.ManifestSha256 = manifestBlob.SHA256Hex()
+			node.Row.ManifestSha256 = manifestBlob.SHA256Hex()
 		}
 
 		tx := v.metadataStream.Begin()
 		for _, idx := range touchedIndices {
-			cSize := int64(node.ChunkSize)
+			cSize := int64(node.Row.GetChunkSize())
 			if cSize == 0 {
 				cSize = int64(effectiveChunkSize)
 			}
-			if int64(idx)*cSize < node.Size {
+			if int64(idx)*cSize < node.Row.GetSize() {
 				if _, err := tx.Insert(ctx, &pb.FileChunk{
-					Ino:    proto.Uint64(node.ID),
+					Ino:    proto.Uint64(node.Row.GetIno()),
 					Index:  proto.Uint32(uint32(idx)),
 					Sha256: chunkShas[idx],
 				}); err != nil {
@@ -2705,27 +2265,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			}
 		}
 
-		nAtime := node.Atime
-		if nAtime.IsZero() {
-			nAtime = now
-		}
-		nodeInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(node.ID),
-			Mode:           node.Mode,
-			Size:           node.Size,
-			Mtime:          timestamppb.New(now),
-			Atime:          timestamppb.New(nAtime),
-			Ctime:          timestamppb.New(now),
-			Uid:            node.Uid,
-			Gid:            node.Gid,
-			IsDir:          false,
-			ChunkSize:      node.ChunkSize,
-			ManifestSha256: node.ManifestSha256,
-			Nlink:          node.Nlink,
-			SymlinkTarget:  node.SymlinkTarget,
-			Rdev:           node.Rdev,
-		}
-		if _, err := tx.Update(ctx, nodeInodeMsg); err != nil {
+		if _, err := tx.Update(ctx, node.Row); err != nil {
 			return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inode update: %w", err)
 		}
 
@@ -2739,7 +2279,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 
 		waitFn := v.makeWaitFn(commitSeq, reqLevel)
 
-		done := v.registerPendingUpload(node.ID)
+		done := v.registerPendingUpload(node.Row.GetIno())
 		go func() {
 			var uploadErr error
 			defer func() { done(uploadErr) }()
@@ -2756,28 +2296,14 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			}
 		}()
 
-		nAtime = node.Atime
-		if nAtime.IsZero() {
-			nAtime = now
-		}
-		attr := &pb.EntryAttr{
-			Inode:   node.ID,
-			IsDir:   false,
-			Size:    node.Size,
-			Mode:    node.Mode,
-			ModTime: timestamppb.New(now),
-			Atime:   timestamppb.New(nAtime),
-			Ctime:   timestamppb.New(now),
-			Uid:     node.Uid,
-			Gid:     node.Gid,
-		}
+		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
 			Attr:      attr,
-			Inode:     node.ID,
+			Inode:     node.Row.GetIno(),
 		})
 
-		return int64(len(data)), node.Size, now, waitFn, nil
+		return int64(len(data)), node.Row.GetSize(), now, waitFn, nil
 	}()
 	if err != nil {
 		return 0, 0, time.Time{}, err
@@ -2814,7 +2340,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			return nil, nil, err
 		}
 
-		if node.IsDir {
+		if node.Row.GetIsDir() {
 			return nil, nil, fmt.Errorf("cannot truncate directory: %w", syscall.EISDIR)
 		}
 
@@ -2823,33 +2349,33 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		}
 
 		now := time.Now()
-		node.ModTime = now
-		node.Ctime = now
+		node.Row.Mtime = timestamppb.New(now)
+		node.Row.Ctime = timestamppb.New(now)
 		node.IsDirty = true
 		oldChunks := node.Chunks
 
 		tx := v.metadataStream.Begin()
 
 		if size == 0 {
-			node.Size = 0
+			node.Row.Size = 0
 			node.Chunks = nil
 			node.StagedChunks = nil
 			node.DirtyChunks = nil
 			node.InlineData = nil
-			node.ManifestSha256 = ""
-			node.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256([]byte{}))
-			node.Sha256 = node.ContentSha256
+			node.Row.ManifestSha256 = ""
+			node.Row.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256([]byte{}))
+			node.Row.Sha256 = node.Row.ContentSha256
 			if node.Data != nil {
 				_ = node.Data.Close()
 				node.Data = nil
 			}
 
 			for i := range oldChunks {
-				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(i)}); err != nil {
+				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(i)}); err != nil {
 					return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
 				}
 			}
-			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(0)}); err != nil {
+			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(0)}); err != nil {
 				// delete chunk 0 inline if existed
 			}
 		} else if size <= v.maxInlineLen && len(oldChunks) <= 1 {
@@ -2862,30 +2388,30 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 				chunk0 = newBuf
 			}
 			node.InlineData = chunk0
-			node.Size = size
+			node.Row.Size = size
 			node.Chunks = nil
 			node.StagedChunks = nil
 			node.DirtyChunks = nil
-			node.ContentSha256 = ""
+			node.Row.ContentSha256 = ""
 
 			for i := range oldChunks {
 				if i != 0 {
-					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(i)}); err != nil {
+					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(i)}); err != nil {
 						return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
 					}
 				}
 			}
-			if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(0), InlineData: node.InlineData}); err != nil {
+			if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(0), InlineData: node.InlineData}); err != nil {
 				return nil, nil, fmt.Errorf("failed to update inline FileChunk: %w", err)
 			}
 		} else {
-			cs := int64(node.ChunkSize)
+			cs := int64(node.Row.GetChunkSize())
 			if cs == 0 {
 				cs = int64(v.chunkSize)
 				if cs == 0 {
 					cs = 64 * 1024
 				}
-				node.ChunkSize = uint32(cs)
+				node.Row.ChunkSize = uint32(cs)
 			}
 			_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 
@@ -2903,13 +2429,13 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			for i := range node.Chunks {
 				if int(i) >= newNumChunks {
 					delete(node.Chunks, i)
-					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.ID), Index: proto.Uint32(i)}); err != nil {
+					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(i)}); err != nil {
 						return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
 					}
 				}
 			}
 
-			if newNumChunks > 0 && size < node.Size {
+			if newNumChunks > 0 && size < node.Row.GetSize() {
 				lastIdx := newNumChunks - 1
 				lastChunkLen := size - int64(lastIdx)*cs
 				if chunkData, ok := node.StagedChunks[lastIdx]; ok && int64(len(chunkData)) > lastChunkLen {
@@ -2923,7 +2449,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 						})
 					}
 					if _, err := tx.Insert(ctx, &pb.FileChunk{
-						Ino:    proto.Uint64(node.ID),
+						Ino:    proto.Uint64(node.Row.GetIno()),
 						Index:  proto.Uint32(uint32(lastIdx)),
 						Sha256: chunkSha,
 					}); err != nil {
@@ -2945,7 +2471,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 							})
 						}
 						if _, err := tx.Insert(ctx, &pb.FileChunk{
-							Ino:    proto.Uint64(node.ID),
+							Ino:    proto.Uint64(node.Row.GetIno()),
 							Index:  proto.Uint32(uint32(lastIdx)),
 							Sha256: chunkSha,
 						}); err != nil {
@@ -2955,30 +2481,11 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 				}
 			}
 
-			node.Size = size
-			node.ContentSha256 = ""
+			node.Row.Size = size
+			node.Row.ContentSha256 = ""
 		}
 
-		nAtime := node.Atime
-		if nAtime.IsZero() {
-			nAtime = now
-		}
-		childInodeMsg := &pb.Inode{
-			Ino:           proto.Uint64(node.ID),
-			Mode:          node.Mode,
-			Size:          node.Size,
-			Mtime:         timestamppb.New(now),
-			Atime:         timestamppb.New(nAtime),
-			Ctime:         timestamppb.New(now),
-			Uid:           node.Uid,
-			Gid:           node.Gid,
-			IsDir:         false,
-			ChunkSize:     node.ChunkSize,
-			Nlink:         node.Nlink,
-			SymlinkTarget: node.SymlinkTarget,
-			Rdev:          node.Rdev,
-		}
-		if _, err := tx.Update(ctx, childInodeMsg); err != nil {
+		if _, err := tx.Update(ctx, node.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log node inode update: %w", err)
 		}
 
@@ -2992,27 +2499,11 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		nlink := node.Nlink
-		if nlink == 0 && node.IsDir {
-			nlink = 2
-		}
-		attr := &pb.EntryAttr{
-			Inode:         node.ID,
-			IsDir:         false,
-			Size:          node.Size,
-			Mode:          node.Mode,
-			ModTime:       timestamppb.New(now),
-			Atime:         timestamppb.New(nAtime),
-			Ctime:         timestamppb.New(now),
-			Uid:           node.Uid,
-			Gid:           node.Gid,
-			Nlink:         nlink,
-			SymlinkTarget: node.SymlinkTarget,
-		}
+		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType: pb.WatchEventType_EVENT_MODIFIED,
 			Attr:      attr,
-			Inode:     node.ID,
+			Inode:     node.Row.GetIno(),
 		})
 		return attr, waitFn, nil
 	}()
@@ -3050,11 +2541,11 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		v.mu.Unlock()
 		return err
 	}
-	if childInode.IsDir {
+	if childInode.Row.GetIsDir() {
 		v.mu.Unlock()
 		return fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
 	}
-	childInodeID = childInode.ID
+	childInodeID = childInode.Row.GetIno()
 	v.mu.Unlock()
 
 	if err := v.waitForInodeUploads(ctx, childInodeID); err != nil {
@@ -3079,17 +2570,17 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		}
 
 		now := time.Now()
-		if childInode.Nlink > 1 {
-			childInode.Nlink--
+		if childInode.Row.GetNlink() > 1 {
+			childInode.Row.Nlink--
 		} else {
-			childInode.Nlink = 0
+			childInode.Row.Nlink = 0
 		}
-		childInode.Ctime = now
+		childInode.Row.Ctime = timestamppb.New(now)
 
 		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
 		if parentInode != nil {
-			parentInode.ModTime = now
-			parentInode.Ctime = now
+			parentInode.Row.Mtime = timestamppb.New(now)
+			parentInode.Row.Ctime = timestamppb.New(now)
 		}
 
 		var commitSeq uint64
@@ -3098,56 +2589,12 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
 
-		cAtime := childInode.Atime
-		if cAtime.IsZero() {
-			cAtime = childInode.ModTime
-		}
-		childInodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(childInode.ID),
-			Mode:           childInode.Mode,
-			Size:           childInode.Size,
-			Mtime:          timestamppb.New(childInode.ModTime),
-			Atime:          timestamppb.New(cAtime),
-			Ctime:          timestamppb.New(now),
-			Uid:            childInode.Uid,
-			Gid:            childInode.Gid,
-			IsDir:          false,
-			Sha256:         childInode.Sha256,
-			Etag:           childInode.ETag,
-			ManifestSha256: childInode.ManifestSha256,
-			ContentSha256:  childInode.ContentSha256,
-			ChunkSize:      childInode.ChunkSize,
-			Nlink:          childInode.Nlink,
-			SymlinkTarget:  childInode.SymlinkTarget,
-		}
-		if _, err := tx.Update(ctx, childInodeMsg); err != nil {
+		if _, err := tx.Update(ctx, childInode.Row); err != nil {
 			return nil, fmt.Errorf("failed to log child inode update: %w", err)
 		}
 
 		if parentInode != nil {
-			pAtime := parentInode.Atime
-			if pAtime.IsZero() {
-				pAtime = parentInode.ModTime
-			}
-			parentInodeMsg := &pb.Inode{
-				Ino:            proto.Uint64(parentInode.ID),
-				Mode:           parentInode.Mode,
-				Size:           parentInode.Size,
-				Mtime:          timestamppb.New(now),
-				Atime:          timestamppb.New(pAtime),
-				Ctime:          timestamppb.New(now),
-				Uid:            parentInode.Uid,
-				Gid:            parentInode.Gid,
-				IsDir:          true,
-				Sha256:         parentInode.Sha256,
-				Etag:           parentInode.ETag,
-				ManifestSha256: parentInode.ManifestSha256,
-				ContentSha256:  parentInode.ContentSha256,
-				ChunkSize:      parentInode.ChunkSize,
-				Nlink:          parentInode.Nlink,
-				SymlinkTarget:  parentInode.SymlinkTarget,
-			}
-			if _, err := tx.Update(ctx, parentInodeMsg); err != nil {
+			if _, err := tx.Update(ctx, parentInode.Row); err != nil {
 				return nil, fmt.Errorf("failed to log parent inode update: %w", err)
 			}
 		}
@@ -3163,7 +2610,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:   pb.WatchEventType_EVENT_DELETED,
-			Inode:       childInode.ID,
+			Inode:       childInode.Row.GetIno(),
 			ParentInode: parentInodeID,
 			Name:        name,
 		})
@@ -3209,7 +2656,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		if err != nil {
 			return nil, err
 		}
-		if !childInode.IsDir {
+		if !childInode.Row.GetIsDir() {
 			return nil, fmt.Errorf("cannot rmdir non-directory %s: %w", name, syscall.ENOTDIR)
 		}
 
@@ -3231,8 +2678,8 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		now := time.Now()
 		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
 		if parentInode != nil {
-			parentInode.ModTime = now
-			parentInode.Ctime = now
+			parentInode.Row.Mtime = timestamppb.New(now)
+			parentInode.Row.Ctime = timestamppb.New(now)
 		}
 
 		var commitSeq uint64
@@ -3244,27 +2691,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 			return nil, fmt.Errorf("failed to log inode deletion: %w", err)
 		}
 		if parentInode != nil {
-			pAtime := parentInode.Atime
-			if pAtime.IsZero() {
-				pAtime = parentInode.ModTime
-			}
-			parentInodeMsg := &pb.Inode{
-				Ino:            proto.Uint64(parentInode.ID),
-				Mode:           parentInode.Mode,
-				Size:           parentInode.Size,
-				Mtime:          timestamppb.New(now),
-				Atime:          timestamppb.New(pAtime),
-				Ctime:          timestamppb.New(now),
-				Uid:            parentInode.Uid,
-				Gid:            parentInode.Gid,
-				IsDir:          true,
-				Sha256:         parentInode.Sha256,
-				Etag:           parentInode.ETag,
-				ManifestSha256: parentInode.ManifestSha256,
-				ContentSha256:  parentInode.ContentSha256,
-				ChunkSize:      parentInode.ChunkSize,
-			}
-			if _, err = tx.Update(ctx, parentInodeMsg); err != nil {
+			if _, err = tx.Update(ctx, parentInode.Row); err != nil {
 				return nil, fmt.Errorf("failed to log parent inode update: %w", err)
 			}
 		}
@@ -3318,7 +2745,6 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			return nil, nil, fmt.Errorf("invalid name for rename: %w", syscall.EINVAL)
 		}
 
-		var entry InodeEntry
 		var targetExists bool
 		var targetInodeID uint64
 
@@ -3329,17 +2755,12 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		if !ok {
 			return nil, nil, fmt.Errorf("source %s not found in parent %d: %w", oldName, oldParentInodeID, syscall.ENOENT)
 		}
-		entry = InodeEntry{
-			InodeID: oldDe.GetIno(),
-			IsDir:   oldDe.GetIsDir(),
-			Mode:    oldDe.GetMode(),
-		}
 
 		newParentInode, err := v.getOrLoadInodeLocked(ctx, newParentInodeID)
 		if err != nil {
 			return nil, nil, err
 		}
-		if !newParentInode.IsDir {
+		if !newParentInode.Row.GetIsDir() {
 			return nil, nil, fmt.Errorf("target parent %d is not a directory: %w", newParentInodeID, syscall.ENOTDIR)
 		}
 
@@ -3352,15 +2773,15 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			targetInodeID = targetDe.GetIno()
 		}
 
-		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+		childInode, err := v.getOrLoadInodeLocked(ctx, oldDe.GetIno())
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if childInode.IsDir && newParentInodeID != oldParentInodeID {
+		if childInode.Row.GetIsDir() && newParentInodeID != oldParentInodeID {
 			currCheck := newParentInodeID
 			for currCheck != 0 && currCheck != v.rootInodeID {
-				if currCheck == childInode.ID {
+				if currCheck == childInode.Row.GetIno() {
 					return nil, nil, fmt.Errorf("cannot move directory into its own subdirectory: %w", syscall.EINVAL)
 				}
 				pIno, ok := v.dirParents[currCheck]
@@ -3372,7 +2793,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			if v.dirParents == nil {
 				v.dirParents = make(map[uint64]uint64)
 			}
-			v.dirParents[childInode.ID] = newParentInodeID
+			v.dirParents[childInode.Row.GetIno()] = newParentInodeID
 		}
 
 		now := time.Now()
@@ -3383,26 +2804,25 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 				if targetInode.Data != nil {
 					_ = targetInode.Data.Close()
 				}
-				if targetInode.Nlink > 1 {
-					targetInode.Nlink--
+				if targetInode.Row.GetNlink() > 1 {
+					targetInode.Row.Nlink--
 				} else {
-					targetInode.Nlink = 0
+					targetInode.Row.Nlink = 0
 				}
-				targetInode.Ctime = now
+				targetInode.Row.Ctime = timestamppb.New(now)
 			}
 		}
 
-		childInode.Ctime = now
+		childInode.Row.Ctime = timestamppb.New(now)
 
 		oldParentInode, _ := v.getOrLoadInodeLocked(ctx, oldParentInodeID)
 		if oldParentInode != nil {
-			oldParentInode.ModTime = now
-			oldParentInode.Ctime = now
+			oldParentInode.Row.Mtime = timestamppb.New(now)
+			oldParentInode.Row.Ctime = timestamppb.New(now)
 		}
-		newParentInode, _ = v.getOrLoadInodeLocked(ctx, newParentInodeID)
 		if newParentInode != nil {
-			newParentInode.ModTime = now
-			newParentInode.Ctime = now
+			newParentInode.Row.Mtime = timestamppb.New(now)
+			newParentInode.Row.Ctime = timestamppb.New(now)
 		}
 
 		var commitSeq uint64
@@ -3415,121 +2835,38 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 				return nil, nil, fmt.Errorf("failed to log target dir entry deletion: %w", err)
 			}
 			if targetInode != nil {
-				tAtime := targetInode.Atime
-				if tAtime.IsZero() {
-					tAtime = targetInode.ModTime
-				}
-				targetInodeMsg := &pb.Inode{
-					Ino:            proto.Uint64(targetInode.ID),
-					Mode:           targetInode.Mode,
-					Size:           targetInode.Size,
-					Mtime:          timestamppb.New(targetInode.ModTime),
-					Atime:          timestamppb.New(tAtime),
-					Ctime:          timestamppb.New(now),
-					Uid:            targetInode.Uid,
-					Gid:            targetInode.Gid,
-					IsDir:          targetInode.IsDir,
-					Sha256:         targetInode.Sha256,
-					Etag:           targetInode.ETag,
-					ManifestSha256: targetInode.ManifestSha256,
-					ContentSha256:  targetInode.ContentSha256,
-					ChunkSize:      targetInode.ChunkSize,
-					Nlink:          targetInode.Nlink,
-					SymlinkTarget:  targetInode.SymlinkTarget,
-				}
-				if _, err := tx.Update(ctx, targetInodeMsg); err != nil {
-					return nil, nil, fmt.Errorf("failed to log target inode update: %w", err)
+				if targetInode.Row.GetNlink() == 0 {
+					if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(targetInode.Row.GetIno())}); err != nil {
+						return nil, nil, fmt.Errorf("failed to log target inode deletion: %w", err)
+					}
+				} else {
+					if _, err := tx.Update(ctx, targetInode.Row); err != nil {
+						return nil, nil, fmt.Errorf("failed to log target inode update: %w", err)
+					}
 				}
 			}
 		}
 		if _, err := tx.Insert(ctx, &pb.DirEntry{
 			ParentIno: proto.Uint64(newParentInodeID),
 			Name:      proto.String(newName),
-			Ino:       entry.InodeID,
-			IsDir:     entry.IsDir,
-			Mode:      entry.Mode,
+			Ino:       childInode.Row.GetIno(),
+			IsDir:     childInode.Row.GetIsDir(),
+			Mode:      childInode.Row.GetMode(),
 		}); err != nil {
 			return nil, nil, fmt.Errorf("failed to log new dir entry insertion: %w", err)
 		}
 		if childInode != nil {
-			cAtime := childInode.Atime
-			if cAtime.IsZero() {
-				cAtime = childInode.ModTime
-			}
-			childInodeMsg := &pb.Inode{
-				Ino:            proto.Uint64(childInode.ID),
-				Mode:           childInode.Mode,
-				Size:           childInode.Size,
-				Mtime:          timestamppb.New(childInode.ModTime),
-				Atime:          timestamppb.New(cAtime),
-				Ctime:          timestamppb.New(now),
-				Uid:            childInode.Uid,
-				Gid:            childInode.Gid,
-				IsDir:          childInode.IsDir,
-				Sha256:         childInode.Sha256,
-				Etag:           childInode.ETag,
-				ManifestSha256: childInode.ManifestSha256,
-				ContentSha256:  childInode.ContentSha256,
-				ChunkSize:      childInode.ChunkSize,
-				Nlink:          childInode.Nlink,
-				SymlinkTarget:  childInode.SymlinkTarget,
-				Rdev:           childInode.Rdev,
-			}
-			if _, err := tx.Update(ctx, childInodeMsg); err != nil {
+			if _, err := tx.Update(ctx, childInode.Row); err != nil {
 				return nil, nil, fmt.Errorf("failed to log child inode update: %w", err)
 			}
 		}
 		if oldParentInode != nil {
-			oldAtime := oldParentInode.Atime
-			if oldAtime.IsZero() {
-				oldAtime = oldParentInode.ModTime
-			}
-			oldParentInodeMsg := &pb.Inode{
-				Ino:            proto.Uint64(oldParentInode.ID),
-				Mode:           oldParentInode.Mode,
-				Size:           oldParentInode.Size,
-				Mtime:          timestamppb.New(now),
-				Atime:          timestamppb.New(oldAtime),
-				Ctime:          timestamppb.New(now),
-				Uid:            oldParentInode.Uid,
-				Gid:            oldParentInode.Gid,
-				IsDir:          true,
-				Sha256:         oldParentInode.Sha256,
-				Etag:           oldParentInode.ETag,
-				ManifestSha256: oldParentInode.ManifestSha256,
-				ContentSha256:  oldParentInode.ContentSha256,
-				ChunkSize:      oldParentInode.ChunkSize,
-				Nlink:          oldParentInode.Nlink,
-				SymlinkTarget:  oldParentInode.SymlinkTarget,
-			}
-			if _, err := tx.Update(ctx, oldParentInodeMsg); err != nil {
+			if _, err := tx.Update(ctx, oldParentInode.Row); err != nil {
 				return nil, nil, fmt.Errorf("failed to log old parent inode update: %w", err)
 			}
 		}
 		if newParentInode != nil && newParentInodeID != oldParentInodeID {
-			newAtime := newParentInode.Atime
-			if newAtime.IsZero() {
-				newAtime = newParentInode.ModTime
-			}
-			newParentInodeMsg := &pb.Inode{
-				Ino:            proto.Uint64(newParentInode.ID),
-				Mode:           newParentInode.Mode,
-				Size:           newParentInode.Size,
-				Mtime:          timestamppb.New(now),
-				Atime:          timestamppb.New(newAtime),
-				Ctime:          timestamppb.New(now),
-				Uid:            newParentInode.Uid,
-				Gid:            newParentInode.Gid,
-				IsDir:          true,
-				Sha256:         newParentInode.Sha256,
-				Etag:           newParentInode.ETag,
-				ManifestSha256: newParentInode.ManifestSha256,
-				ContentSha256:  newParentInode.ContentSha256,
-				ChunkSize:      newParentInode.ChunkSize,
-				Nlink:          newParentInode.Nlink,
-				SymlinkTarget:  newParentInode.SymlinkTarget,
-			}
-			if _, err := tx.Update(ctx, newParentInodeMsg); err != nil {
+			if _, err := tx.Update(ctx, newParentInode.Row); err != nil {
 				return nil, nil, fmt.Errorf("failed to log new parent inode update: %w", err)
 			}
 		}
@@ -3543,29 +2880,11 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		cAtime := childInode.Atime
-		if cAtime.IsZero() {
-			cAtime = childInode.ModTime
-		}
-		attr := &pb.EntryAttr{
-			Inode:         entry.InodeID,
-			Name:          newName,
-			IsDir:         entry.IsDir,
-			Size:          childInode.Size,
-			Mode:          childInode.Mode,
-			ModTime:       timestamppb.New(childInode.ModTime),
-			Atime:         timestamppb.New(cAtime),
-			Ctime:         timestamppb.New(now),
-			Sha256:        childInode.Sha256,
-			Uid:           childInode.Uid,
-			Gid:           childInode.Gid,
-			Nlink:         childInode.Nlink,
-			SymlinkTarget: childInode.SymlinkTarget,
-		}
+		attr := toEntryAttr(childInode.Row, newName, childInode.RedirectURL, v.rootInodeID)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:      pb.WatchEventType_EVENT_RENAMED,
 			Attr:           attr,
-			Inode:          entry.InodeID,
+			Inode:          childInode.Row.GetIno(),
 			OldParentInode: oldParentInodeID,
 			OldName:        oldName,
 			ParentInode:    newParentInodeID,
@@ -3637,6 +2956,97 @@ func (b *bufferWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
+func inodeToErofsNode(row *pb.Inode, name string, inlineData []byte, children []erofs.Node, rootXattrs *erofs.Xattrs, isRoot bool) erofs.Node {
+	var xattrs erofs.Xattrs
+	if row.GetContentSha256() != "" {
+		xattrs.UserDigest = row.GetContentSha256()
+	} else if row.GetSha256() != "" {
+		xattrs.UserDigest = row.GetSha256()
+	}
+	if row.GetManifestSha256() != "" {
+		xattrs.UserManifest = row.GetManifestSha256()
+	}
+
+	var mtimeUnix uint64
+	if row.GetMtime() != nil {
+		mtimeUnix = uint64(row.GetMtime().AsTime().Unix())
+	}
+
+	if row.GetIsDir() {
+		dirNodeName := name
+		if dirNodeName == "/" || isRoot {
+			dirNodeName = ""
+		}
+		var dirOpts []erofs.MemoryNodeOption
+		dirOpts = append(dirOpts,
+			erofs.WithIno(row.GetIno()),
+			erofs.WithMtime(mtimeUnix),
+			erofs.WithUID(row.GetUid()),
+			erofs.WithGID(row.GetGid()),
+		)
+		if rootXattrs != nil && isRoot {
+			dirOpts = append(dirOpts, erofs.WithXattrs(*rootXattrs))
+		}
+		return erofs.NewMemoryNode(
+			dirNodeName,
+			true,
+			uint16(row.GetMode()),
+			nil,
+			children,
+			dirOpts...,
+		)
+	}
+
+	if row.GetSymlinkTarget() != "" || (row.GetMode()&syscall.S_IFMT) == syscall.S_IFLNK {
+		return erofs.NewMemoryNode(
+			name,
+			false,
+			uint16(row.GetMode()),
+			[]byte(row.GetSymlinkTarget()),
+			nil,
+			erofs.WithIno(row.GetIno()),
+			erofs.WithSize(uint64(len(row.GetSymlinkTarget()))),
+			erofs.WithMtime(mtimeUnix),
+			erofs.WithUID(row.GetUid()),
+			erofs.WithGID(row.GetGid()),
+			erofs.WithXattrs(xattrs),
+		)
+	}
+
+	if len(inlineData) > 0 {
+		return erofs.NewMemoryNode(
+			name,
+			false,
+			uint16(row.GetMode()),
+			inlineData,
+			nil,
+			erofs.WithIno(row.GetIno()),
+			erofs.WithSize(uint64(row.GetSize())),
+			erofs.WithMtime(mtimeUnix),
+			erofs.WithUID(row.GetUid()),
+			erofs.WithGID(row.GetGid()),
+			erofs.WithRdev(row.GetRdev()),
+			erofs.WithXattrs(xattrs),
+		)
+	}
+
+	return erofs.NewMemoryNode(
+		name,
+		false,
+		uint16(row.GetMode()),
+		nil,
+		nil,
+		erofs.WithIno(row.GetIno()),
+		erofs.WithMetadataOnly(true),
+		erofs.WithSize(uint64(row.GetSize())),
+		erofs.WithMtime(mtimeUnix),
+		erofs.WithUID(row.GetUid()),
+		erofs.WithGID(row.GetGid()),
+		erofs.WithRdev(row.GetRdev()),
+		erofs.WithXattrs(xattrs),
+	)
+}
+
 type snapshotResolver struct {
 	vol        *Volume
 	rootXattrs *erofs.Xattrs
@@ -3649,67 +3059,51 @@ func (r *snapshotResolver) getOrLoadInode(ctx context.Context, inodeID uint64) (
 	return nil, fmt.Errorf("no volume attached")
 }
 
-func (r *snapshotResolver) getOrLoadDir(ctx context.Context, inodeID uint64) (map[string]DirEntry, error) {
-	if r.vol != nil {
-		dir, err := r.vol.getOrLoadDirLocked(ctx, inodeID)
-		if err != nil {
-			return nil, err
-		}
-		return dir.Entries, nil
-	}
-	return nil, fmt.Errorf("no volume attached")
-}
-
-func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64, dirName, currentPath string, dirtyBlobs map[string]blob.ByteStream, currentEntries map[string]FileMetadata) (erofs.Node, error) {
-	entries, err := r.getOrLoadDir(ctx, dirInodeID)
-	if err != nil {
-		return nil, err
-	}
+func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64, dirName, currentPath string, dirtyBlobs map[string]blob.ByteStream) (erofs.Node, error) {
 	dirInode, err := r.getOrLoadInode(ctx, dirInodeID)
 	if err != nil {
 		return nil, err
 	}
 
-	currentEntries[currentPath] = FileMetadata{
-		Inode:   dirInode.ID,
-		Path:    currentPath,
-		Name:    dirName,
-		IsDir:   true,
-		Mode:    dirInode.Mode,
-		Size:    dirInode.Size,
-		ModTime: dirInode.ModTime,
-		Atime:   dirInode.Atime,
-		Ctime:   dirInode.Ctime,
-		Uid:     dirInode.Uid,
-		Gid:     dirInode.Gid,
+	prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(dirInodeID)}, 1)
+	if pErr != nil {
+		return nil, pErr
+	}
+	entryMsgs, err := r.vol.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
+	if err != nil {
+		return nil, err
 	}
 
-	var childNames []string
-	for name := range entries {
-		childNames = append(childNames, name)
+	names := make([]string, 0, len(entryMsgs))
+	entriesMap := make(map[string]*pb.DirEntry, len(entryMsgs))
+	for _, msg := range entryMsgs {
+		de := msg.(*pb.DirEntry)
+		name := de.GetName()
+		names = append(names, name)
+		entriesMap[name] = de
 	}
-	sort.Strings(childNames)
+	sort.Strings(names)
 
 	var children []erofs.Node
-	for _, name := range childNames {
-		entry := entries[name]
+	for _, name := range names {
+		de := entriesMap[name]
 		childPath := path.Join(currentPath, name)
-		if entry.IsDir {
-			childDirNode, err := r.buildErofsTree(ctx, entry.InodeID, name, childPath, dirtyBlobs, currentEntries)
+		if de.GetIsDir() {
+			childDirNode, err := r.buildErofsTree(ctx, de.GetIno(), name, childPath, dirtyBlobs)
 			if err != nil {
 				return nil, err
 			}
 			children = append(children, childDirNode)
 		} else {
-			childInode, err := r.getOrLoadInode(ctx, entry.InodeID)
+			childInode, err := r.getOrLoadInode(ctx, de.GetIno())
 			if err != nil {
 				return nil, err
 			}
 
-			if childInode.ChunkSize > 0 && len(childInode.Chunks) > 0 {
+			if childInode.Row.GetChunkSize() > 0 && len(childInode.Chunks) > 0 {
 				_ = r.vol.ensureInodeChunksLoadedLocked(ctx, childInode)
-				cs := int64(childInode.ChunkSize)
-				numChunks := int((childInode.Size + cs - 1) / cs)
+				cs := int64(childInode.Row.GetChunkSize())
+				numChunks := int((childInode.Row.GetSize() + cs - 1) / cs)
 				manifestChunks := make([][32]byte, numChunks)
 				for i := 0; i < numChunks; i++ {
 					if c, ok := childInode.Chunks[uint32(i)]; ok && c != "" {
@@ -3720,34 +3114,34 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 					}
 				}
 				manifest := &blob.Manifest{
-					ChunkSize:   childInode.ChunkSize,
-					TotalLength: uint64(childInode.Size),
+					ChunkSize:   childInode.Row.GetChunkSize(),
+					TotalLength: uint64(childInode.Row.GetSize()),
 					Chunks:      manifestChunks,
 				}
 				manifestBlob, err := blob.EncodeManifest(manifest)
 				if err == nil {
-					childInode.ManifestSha256 = manifestBlob.SHA256Hex()
+					childInode.Row.ManifestSha256 = manifestBlob.SHA256Hex()
 					dirtyBlobs[manifestBlob.SHA256Hex()] = manifestBlob.Stream
 				}
 			}
 
-			if childInode.ContentSha256 == "" && childInode.Size > 0 {
+			if childInode.Row.GetContentSha256() == "" && childInode.Row.GetSize() > 0 {
 				hasher := sha256.New()
-				if childInode.ManifestSha256 != "" || childInode.ChunkSize > 0 {
+				if childInode.Row.GetManifestSha256() != "" || childInode.Row.GetChunkSize() > 0 {
 					_ = r.vol.ensureInodeChunksLoadedLocked(ctx, childInode)
-					cs := int64(childInode.ChunkSize)
+					cs := int64(childInode.Row.GetChunkSize())
 					if cs == 0 {
 						cs = 64 * 1024
 					}
-					numChunks := int((childInode.Size + cs - 1) / cs)
+					numChunks := int((childInode.Row.GetSize() + cs - 1) / cs)
 					for i := 0; i < numChunks; i++ {
 						chunkBytes, err := r.vol.readChunkLocked(ctx, childInode, i)
 						if err == nil && len(chunkBytes) > 0 {
 							hasher.Write(chunkBytes)
 						} else {
 							chunkLen := cs
-							if int64(i+1)*cs > childInode.Size {
-								chunkLen = childInode.Size - int64(i)*cs
+							if int64(i+1)*cs > childInode.Row.GetSize() {
+								chunkLen = childInode.Row.GetSize() - int64(i)*cs
 							}
 							if chunkLen > 0 {
 								hasher.Write(make([]byte, chunkLen))
@@ -3757,34 +3151,18 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 				} else if childInode.Data != nil {
 					_ = childInode.Data.Rewind()
 					_, _ = io.Copy(hasher, childInode.Data)
-				} else if childInode.Sha256 != "" && r.vol.blobStore != nil {
-					stream, err := r.vol.blobStore.GetBlob(ctx, childInode.Sha256)
+				} else if childInode.Row.GetSha256() != "" && r.vol.blobStore != nil {
+					stream, err := r.vol.blobStore.GetBlob(ctx, childInode.Row.GetSha256())
 					if err == nil {
 						_, _ = io.Copy(hasher, stream)
 						_ = stream.Close()
 					}
 				}
-				childInode.ContentSha256 = fmt.Sprintf("%x", hasher.Sum(nil))
+				childInode.Row.ContentSha256 = fmt.Sprintf("%x", hasher.Sum(nil))
 				if r.vol != nil {
 					r.vol.mu.Lock()
 					if r.vol.metadataView != nil {
-						nodeMsg := &pb.Inode{
-							Ino:            proto.Uint64(childInode.ID),
-							Mode:           childInode.Mode,
-							Size:           childInode.Size,
-							Mtime:          timestamppb.New(childInode.ModTime),
-							Atime:          timestamppb.New(childInode.Atime),
-							Ctime:          timestamppb.New(childInode.Ctime),
-							Uid:            childInode.Uid,
-							Gid:            childInode.Gid,
-							IsDir:          false,
-							Sha256:         childInode.Sha256,
-							Etag:           childInode.ETag,
-							ManifestSha256: childInode.ManifestSha256,
-							ContentSha256:  childInode.ContentSha256,
-							ChunkSize:      childInode.ChunkSize,
-							Rdev:           childInode.Rdev,
-						}
+						nodeMsg := childInode.Row
 						kBytes, vBytes, _ := sds.SplitKeyAndNonKey(nodeMsg, []int32{1})
 						ch := sds.Change{
 							TypeID:   16,
@@ -3803,27 +3181,27 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 
 			// Collect dirty / unpersisted blobs for flush
 			if len(childInode.InlineData) > 0 {
-				if childInode.ContentSha256 == "" {
-					childInode.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256(childInode.InlineData))
+				if childInode.Row.GetContentSha256() == "" {
+					childInode.Row.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256(childInode.InlineData))
 				}
-				if childInode.Sha256 == "" {
-					childInode.Sha256 = childInode.ContentSha256
+				if childInode.Row.GetSha256() == "" {
+					childInode.Row.Sha256 = childInode.Row.GetContentSha256()
 				}
-				dirtyBlobs[childInode.Sha256] = blob.NewByteStreamFromBytes(childInode.InlineData)
+				dirtyBlobs[childInode.Row.GetSha256()] = blob.NewByteStreamFromBytes(childInode.InlineData)
 			}
-			if childInode.Sha256 != "" {
-				if cData, ok := r.vol.recoveredContent[childInode.Sha256]; ok {
-					dirtyBlobs[childInode.Sha256] = blob.NewByteStreamFromBytes(cData)
+			if childInode.Row.GetSha256() != "" {
+				if cData, ok := r.vol.recoveredContent[childInode.Row.GetSha256()]; ok {
+					dirtyBlobs[childInode.Row.GetSha256()] = blob.NewByteStreamFromBytes(cData)
 				} else if childInode.Data != nil {
 					_ = childInode.Data.Rewind()
 					dataBytes, _ := io.ReadAll(childInode.Data)
 					_ = childInode.Data.Rewind()
-					dirtyBlobs[childInode.Sha256] = blob.NewByteStreamFromBytes(dataBytes)
+					dirtyBlobs[childInode.Row.GetSha256()] = blob.NewByteStreamFromBytes(dataBytes)
 				}
 			}
-			if childInode.ManifestSha256 != "" {
-				if mData, ok := r.vol.recoveredContent[childInode.ManifestSha256]; ok {
-					dirtyBlobs[childInode.ManifestSha256] = blob.NewByteStreamFromBytes(mData)
+			if childInode.Row.GetManifestSha256() != "" {
+				if mData, ok := r.vol.recoveredContent[childInode.Row.GetManifestSha256()]; ok {
+					dirtyBlobs[childInode.Row.GetManifestSha256()] = blob.NewByteStreamFromBytes(mData)
 				}
 			}
 			for _, chunkSha := range childInode.Chunks {
@@ -3842,145 +3220,12 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 				}
 			}
 
-			meta := FileMetadata{
-				Inode:          childInode.ID,
-				Path:           childPath,
-				Name:           name,
-				IsDir:          false,
-				Mode:           childInode.Mode,
-				Size:           childInode.Size,
-				ModTime:        childInode.ModTime,
-				Atime:          childInode.Atime,
-				Ctime:          childInode.Ctime,
-				Sha256:         childInode.Sha256,
-				ManifestSha256: childInode.ManifestSha256,
-				ContentSha256:  childInode.ContentSha256,
-				ETag:           childInode.ETag,
-				Uid:            childInode.Uid,
-				Gid:            childInode.Gid,
-				Rdev:           childInode.Rdev,
-			}
-
-			needsUpload := childInode.ETag == ""
-			if r.vol.lastFlushedMetadata != nil {
-				if lastEntry, exists := r.vol.lastFlushedMetadata.Entries[childPath]; !exists || lastEntry.Sha256 != childInode.Sha256 {
-					needsUpload = true
-				}
-			}
-			fetchSha := childInode.Sha256
-			if childInode.ManifestSha256 != "" {
-				fetchSha = childInode.ManifestSha256
-			}
-			if fetchSha == "" {
-				fetchSha = childInode.ContentSha256
-			}
-			if needsUpload && fetchSha != "" && r.vol.backend != nil {
-				key := strings.TrimPrefix(childPath, "/")
-				var blobReader blob.ByteStream
-				if dbStream, ok := dirtyBlobs[fetchSha]; ok {
-					_ = dbStream.Rewind()
-					blobReader = dbStream
-				} else if r.vol.blobStore != nil {
-					bs, bErr := r.vol.blobStore.GetBlob(ctx, fetchSha)
-					if bErr == nil {
-						blobReader = bs
-					}
-				}
-				if blobReader != nil {
-					etag, err := r.vol.backend.PutObject(ctx, r.vol.volumeID, key, blobReader)
-					if err == nil {
-						childInode.ETag = etag
-						meta.ETag = etag
-					}
-					_ = blobReader.Rewind()
-				}
-			}
-
-			currentEntries[childPath] = meta
-
-			var xattrs erofs.Xattrs
-			if childInode.ContentSha256 != "" {
-				xattrs.UserDigest = childInode.ContentSha256
-			} else if childInode.Sha256 != "" {
-				xattrs.UserDigest = childInode.Sha256
-			}
-			if childInode.ManifestSha256 != "" {
-				xattrs.UserManifest = childInode.ManifestSha256
-			}
-
-			var leafNode erofs.Node
-			if childInode.SymlinkTarget != "" || (childInode.Mode&syscall.S_IFMT) == syscall.S_IFLNK {
-				leafNode = erofs.NewMemoryNode(
-					name,
-					false,
-					uint16(childInode.Mode),
-					[]byte(childInode.SymlinkTarget),
-					nil,
-					erofs.WithIno(childInode.ID),
-					erofs.WithSize(uint64(len(childInode.SymlinkTarget))),
-					erofs.WithMtime(uint64(childInode.ModTime.Unix())),
-					erofs.WithUID(childInode.Uid),
-					erofs.WithGID(childInode.Gid),
-					erofs.WithXattrs(xattrs),
-				)
-			} else if len(childInode.InlineData) > 0 {
-				leafNode = erofs.NewMemoryNode(
-					name,
-					false,
-					uint16(childInode.Mode),
-					childInode.InlineData,
-					nil,
-					erofs.WithIno(childInode.ID),
-					erofs.WithSize(uint64(childInode.Size)),
-					erofs.WithMtime(uint64(childInode.ModTime.Unix())),
-					erofs.WithUID(childInode.Uid),
-					erofs.WithGID(childInode.Gid),
-					erofs.WithRdev(childInode.Rdev),
-					erofs.WithXattrs(xattrs),
-				)
-			} else {
-				leafNode = erofs.NewMemoryNode(
-					name,
-					false,
-					uint16(childInode.Mode),
-					nil,
-					nil,
-					erofs.WithIno(childInode.ID),
-					erofs.WithMetadataOnly(true),
-					erofs.WithSize(uint64(childInode.Size)),
-					erofs.WithMtime(uint64(childInode.ModTime.Unix())),
-					erofs.WithUID(childInode.Uid),
-					erofs.WithGID(childInode.Gid),
-					erofs.WithRdev(childInode.Rdev),
-					erofs.WithXattrs(xattrs),
-				)
-			}
+			leafNode := inodeToErofsNode(childInode.Row, name, childInode.InlineData, nil, nil, false)
 			children = append(children, leafNode)
 		}
 	}
 
-	dirNodeName := dirName
-	if dirNodeName == "/" {
-		dirNodeName = ""
-	}
-	var dirOpts []erofs.MemoryNodeOption
-	dirOpts = append(dirOpts,
-		erofs.WithIno(dirInode.ID),
-		erofs.WithMtime(uint64(dirInode.ModTime.Unix())),
-		erofs.WithUID(dirInode.Uid),
-		erofs.WithGID(dirInode.Gid),
-	)
-	if r.rootXattrs != nil && currentPath == "/" {
-		dirOpts = append(dirOpts, erofs.WithXattrs(*r.rootXattrs))
-	}
-	return erofs.NewMemoryNode(
-		dirNodeName,
-		true,
-		uint16(dirInode.Mode),
-		nil,
-		children,
-		dirOpts...,
-	), nil
+	return inodeToErofsNode(dirInode.Row, dirName, nil, children, r.rootXattrs, currentPath == "/"), nil
 }
 
 func (v *Volume) flushToBackendLocked(ctx context.Context) error {
@@ -4015,10 +3260,6 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		}
 	}
 
-	delPaths := make([]string, len(v.deletedPathsSinceFlush))
-	copy(delPaths, v.deletedPathsSinceFlush)
-	v.deletedPathsSinceFlush = nil
-
 	var regBytes []byte
 	if v.metadataStream != nil {
 		regProto := v.metadataStream.Registry().Export()
@@ -4041,17 +3282,10 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 	v.mu.Unlock()
 
 	var erofsBuf bufferWriterAt
-	var currentEntries map[string]FileMetadata
 	snapshotName := fmt.Sprintf("%020d.erofs", snapPos)
 	snapshotKey := path.Join("volumes", v.volumeID, "meta", snapshotName)
 
 	snapErr := func() error {
-		for _, delPath := range delPaths {
-			key := strings.TrimPrefix(delPath, "/")
-			_ = v.backend.DeleteObject(ctx, v.volumeID, key)
-		}
-
-		currentEntries = make(map[string]FileMetadata)
 		dirtyBlobs := make(map[string]blob.ByteStream)
 
 		resolver := &snapshotResolver{
@@ -4059,18 +3293,9 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 			rootXattrs: &rootXattrs,
 		}
 
-		erofsTree, err := resolver.buildErofsTree(ctx, v.rootInodeID, "/", "/", dirtyBlobs, currentEntries)
+		erofsTree, err := resolver.buildErofsTree(ctx, v.rootInodeID, "/", "/", dirtyBlobs)
 		if err != nil {
 			return fmt.Errorf("failed to build hierarchy for snapshot: %w", err)
-		}
-
-		if v.lastFlushedMetadata != nil {
-			for oldPath := range v.lastFlushedMetadata.Entries {
-				if _, stillExists := currentEntries[oldPath]; !stillExists {
-					key := strings.TrimPrefix(oldPath, "/")
-					_ = v.backend.DeleteObject(ctx, v.volumeID, key)
-				}
-			}
 		}
 
 		if len(dirtyBlobs) > 0 && v.blobStore != nil {
@@ -4125,22 +3350,6 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 	}
 	v.recoveredContent = make(map[string][]byte)
 
-	newMeta := VolumeMetadata{
-		VolumeID:    v.volumeID,
-		Version:     2,
-		LastFlushed: time.Now(),
-		NextInode:   v.nextInode,
-		Entries:     currentEntries,
-	}
-
-	metaBytes, err := json.MarshalIndent(newMeta, "", "  ")
-	if err == nil {
-		metaStream := blob.NewByteStreamFromBytes(metaBytes)
-		_, _ = v.backend.PutObject(ctx, v.volumeID, MetadataFileName, metaStream)
-		_ = metaStream.Close()
-	}
-	v.lastFlushedMetadata = &newMeta
-
 	return nil
 }
 
@@ -4187,659 +3396,6 @@ func (v *Volume) findLatestSnapshotNameLocked(ctx context.Context) (string, erro
 	return snapshots[len(snapshots)-1].name, nil
 }
 
-// ApplyRecordLocked applies a single mutation record to the filesystem tables in SQLite.
-func (v *Volume) ApplyRecordLocked(record *MutationRecord) error {
-	ctx := context.Background()
-	if record.Inode >= v.nextInode {
-		v.nextInode = ((record.Inode / erofs.DefaultInodeStride) + 1) * erofs.DefaultInodeStride
-	}
-
-	var changes []sds.Change
-	now := time.Now()
-	if record.ModTime != nil {
-		now = record.ModTime.AsTime()
-	}
-
-	switch record.Type {
-	case MutationMkdir:
-		parentInodeID := record.ParentInode
-		if parentInodeID == 0 {
-			parentInodeID = v.rootInodeID
-		}
-		mode := record.Mode
-		if mode == 0 {
-			mode = 0755
-		}
-		mode |= syscall.S_IFDIR
-
-		inodeID := record.Inode
-		if inodeID == 0 {
-			inodeID = v.allocInode()
-		}
-
-		childInodeMsg := &pb.Inode{
-			Ino:   proto.Uint64(inodeID),
-			Mode:  mode,
-			Size:  0,
-			Mtime: timestamppb.New(now),
-			Atime: timestamppb.New(now),
-			Ctime: timestamppb.New(now),
-			Uid:   record.Uid,
-			Gid:   record.Gid,
-			IsDir: true,
-		}
-		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(childInodeMsg, []int32{1})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   16,
-			TypeName: "objectfs.v1alpha1.Inode",
-			Op:       sds.OpCreate,
-			Key:      sds.NewKeyFromBytes(kBytes),
-			RawKey:   kBytes,
-			RawVal:   vBytes,
-			Row:      childInodeMsg,
-		})
-
-		dirEntryMsg := &pb.DirEntry{
-			ParentIno: proto.Uint64(parentInodeID),
-			Name:      proto.String(record.Name),
-			Ino:       inodeID,
-			IsDir:     true,
-			Mode:      mode,
-		}
-		dkBytes, dvBytes, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   17,
-			TypeName: "objectfs.v1alpha1.DirEntry",
-			Op:       sds.OpCreate,
-			Key:      sds.NewKeyFromBytes(dkBytes),
-			RawKey:   dkBytes,
-			RawVal:   dvBytes,
-			Row:      dirEntryMsg,
-		})
-
-		if v.dirParents == nil {
-			v.dirParents = make(map[uint64]uint64)
-		}
-		v.dirParents[inodeID] = parentInodeID
-
-	case MutationCreateFile:
-		parentInodeID := record.ParentInode
-		if parentInodeID == 0 {
-			parentInodeID = v.rootInodeID
-		}
-		mode := record.Mode
-		fileType := mode & syscall.S_IFMT
-		if fileType == 0 {
-			if (mode & 0777) == 0 {
-				mode |= 0644
-			}
-			mode |= syscall.S_IFREG
-		}
-
-		inodeID := record.Inode
-		if inodeID == 0 {
-			inodeID = v.allocInode()
-		}
-
-		childInodeMsg := &pb.Inode{
-			Ino:           proto.Uint64(inodeID),
-			Mode:          mode,
-			Size:          record.Size,
-			Mtime:         timestamppb.New(now),
-			Atime:         timestamppb.New(now),
-			Ctime:         timestamppb.New(now),
-			Uid:           record.Uid,
-			Gid:           record.Gid,
-			IsDir:         false,
-			ContentSha256: record.ContentSha256,
-			Rdev:          record.Rdev,
-		}
-		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(childInodeMsg, []int32{1})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   16,
-			TypeName: "objectfs.v1alpha1.Inode",
-			Op:       sds.OpCreate,
-			Key:      sds.NewKeyFromBytes(kBytes),
-			RawKey:   kBytes,
-			RawVal:   vBytes,
-			Row:      childInodeMsg,
-		})
-
-		dirEntryMsg := &pb.DirEntry{
-			ParentIno: proto.Uint64(parentInodeID),
-			Name:      proto.String(record.Name),
-			Ino:       inodeID,
-			IsDir:     false,
-			Mode:      mode,
-		}
-		dkBytes, dvBytes, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   17,
-			TypeName: "objectfs.v1alpha1.DirEntry",
-			Op:       sds.OpCreate,
-			Key:      sds.NewKeyFromBytes(dkBytes),
-			RawKey:   dkBytes,
-			RawVal:   dvBytes,
-			Row:      dirEntryMsg,
-		})
-
-		if len(record.Data) > 0 {
-			chunkMsg := &pb.FileChunk{
-				Ino:        proto.Uint64(inodeID),
-				Index:      proto.Uint32(0),
-				InlineData: record.Data,
-			}
-			ckBytes, cvBytes, _ := sds.SplitKeyAndNonKey(chunkMsg, []int32{1, 2})
-			changes = append(changes, sds.Change{
-				Seq:      record.StreamSeq,
-				TypeID:   18,
-				TypeName: "objectfs.v1alpha1.FileChunk",
-				Op:       sds.OpCreate,
-				Key:      sds.NewKeyFromBytes(ckBytes),
-				RawKey:   ckBytes,
-				RawVal:   cvBytes,
-				Row:      chunkMsg,
-			})
-		}
-
-	case MutationWriteFile:
-		inodeID := record.Inode
-		if inodeID == 0 {
-			return nil
-		}
-		existing, err := v.getOrLoadInodeLocked(ctx, inodeID)
-		if err != nil {
-			return err
-		}
-		var currentData []byte
-		if len(existing.InlineData) > 0 {
-			currentData = existing.InlineData
-		}
-		neededLen := record.Offset + int64(len(record.Data))
-		if neededLen > int64(len(currentData)) {
-			newBuf := make([]byte, neededLen)
-			copy(newBuf, currentData)
-			currentData = newBuf
-		}
-		copy(currentData[record.Offset:], record.Data)
-		newSize := int64(len(currentData))
-		if record.Size > newSize {
-			newSize = record.Size
-		}
-
-		inodeMsg := &pb.Inode{
-			Ino:           proto.Uint64(inodeID),
-			Mode:          existing.Mode,
-			Size:          newSize,
-			Mtime:         timestamppb.New(now),
-			Atime:         timestamppb.New(now),
-			Ctime:         timestamppb.New(now),
-			Uid:           existing.Uid,
-			Gid:           existing.Gid,
-			IsDir:         false,
-			ContentSha256: record.ContentSha256,
-		}
-		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(inodeMsg, []int32{1})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   16,
-			TypeName: "objectfs.v1alpha1.Inode",
-			Op:       sds.OpUpdate,
-			Key:      sds.NewKeyFromBytes(kBytes),
-			RawKey:   kBytes,
-			RawVal:   vBytes,
-			Row:      inodeMsg,
-		})
-
-		chunkMsg := &pb.FileChunk{
-			Ino:        proto.Uint64(inodeID),
-			Index:      proto.Uint32(0),
-			InlineData: currentData,
-		}
-		ckBytes, cvBytes, _ := sds.SplitKeyAndNonKey(chunkMsg, []int32{1, 2})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   18,
-			TypeName: "objectfs.v1alpha1.FileChunk",
-			Op:       sds.OpCreate,
-			Key:      sds.NewKeyFromBytes(ckBytes),
-			RawKey:   ckBytes,
-			RawVal:   cvBytes,
-			Row:      chunkMsg,
-		})
-
-	case MutationTruncateFile:
-		inodeID := record.Inode
-		if inodeID == 0 {
-			return nil
-		}
-		existing, err := v.getOrLoadInodeLocked(ctx, inodeID)
-		if err != nil {
-			return err
-		}
-		var currentData []byte
-		if len(existing.InlineData) > 0 {
-			currentData = existing.InlineData
-		}
-		if record.Size < int64(len(currentData)) {
-			currentData = currentData[:record.Size]
-		} else if record.Size > int64(len(currentData)) {
-			newBuf := make([]byte, record.Size)
-			copy(newBuf, currentData)
-			currentData = newBuf
-		}
-		inodeMsg := &pb.Inode{
-			Ino:           proto.Uint64(inodeID),
-			Mode:          existing.Mode,
-			Size:          record.Size,
-			Mtime:         timestamppb.New(now),
-			Atime:         timestamppb.New(now),
-			Ctime:         timestamppb.New(now),
-			Uid:           existing.Uid,
-			Gid:           existing.Gid,
-			IsDir:         false,
-			ContentSha256: record.ContentSha256,
-		}
-		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(inodeMsg, []int32{1})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   16,
-			TypeName: "objectfs.v1alpha1.Inode",
-			Op:       sds.OpUpdate,
-			Key:      sds.NewKeyFromBytes(kBytes),
-			RawKey:   kBytes,
-			RawVal:   vBytes,
-			Row:      inodeMsg,
-		})
-
-		chunkMsg := &pb.FileChunk{
-			Ino:        proto.Uint64(inodeID),
-			Index:      proto.Uint32(0),
-			InlineData: currentData,
-		}
-		ckBytes, cvBytes, _ := sds.SplitKeyAndNonKey(chunkMsg, []int32{1, 2})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   18,
-			TypeName: "objectfs.v1alpha1.FileChunk",
-			Op:       sds.OpCreate,
-			Key:      sds.NewKeyFromBytes(ckBytes),
-			RawKey:   ckBytes,
-			RawVal:   cvBytes,
-			Row:      chunkMsg,
-		})
-
-	case MutationUnlink:
-		parentInodeID := record.ParentInode
-		if parentInodeID == 0 {
-			parentInodeID = v.rootInodeID
-		}
-		de, ok, _ := v.getDirEntrySQLiteLocked(ctx, parentInodeID, record.Name)
-		dirEntryMsg := &pb.DirEntry{
-			ParentIno: proto.Uint64(parentInodeID),
-			Name:      proto.String(record.Name),
-		}
-		dkBytes, _, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   17,
-			TypeName: "objectfs.v1alpha1.DirEntry",
-			Op:       sds.OpDelete,
-			Key:      sds.NewKeyFromBytes(dkBytes),
-			RawKey:   dkBytes,
-			Row:      dirEntryMsg,
-		})
-		if ok && de != nil {
-			childInode, err := v.getOrLoadInodeLocked(ctx, de.GetIno())
-			if err == nil && childInode != nil {
-				if childInode.Nlink > 1 {
-					childInode.Nlink--
-				} else {
-					childInode.Nlink = 0
-				}
-				childInode.Ctime = now
-				cAtime := childInode.Atime
-				if cAtime.IsZero() {
-					cAtime = childInode.ModTime
-				}
-				inoMsg := &pb.Inode{
-					Ino:            proto.Uint64(childInode.ID),
-					Mode:           childInode.Mode,
-					Size:           childInode.Size,
-					Mtime:          timestamppb.New(childInode.ModTime),
-					Atime:          timestamppb.New(cAtime),
-					Ctime:          timestamppb.New(now),
-					Uid:            childInode.Uid,
-					Gid:            childInode.Gid,
-					IsDir:          false,
-					Sha256:         childInode.Sha256,
-					Etag:           childInode.ETag,
-					ManifestSha256: childInode.ManifestSha256,
-					ContentSha256:  childInode.ContentSha256,
-					ChunkSize:      childInode.ChunkSize,
-					Nlink:          childInode.Nlink,
-					SymlinkTarget:  childInode.SymlinkTarget,
-				}
-				ikBytes, ivBytes, _ := sds.SplitKeyAndNonKey(inoMsg, []int32{1})
-				changes = append(changes, sds.Change{
-					Seq:      record.StreamSeq,
-					TypeID:   16,
-					TypeName: "objectfs.v1alpha1.Inode",
-					Op:       sds.OpUpdate,
-					Key:      sds.NewKeyFromBytes(ikBytes),
-					RawKey:   ikBytes,
-					RawVal:   ivBytes,
-					Row:      inoMsg,
-				})
-			}
-		}
-
-	case MutationRmdir:
-		parentInodeID := record.ParentInode
-		if parentInodeID == 0 {
-			parentInodeID = v.rootInodeID
-		}
-		de, ok, _ := v.getDirEntrySQLiteLocked(ctx, parentInodeID, record.Name)
-		dirEntryMsg := &pb.DirEntry{
-			ParentIno: proto.Uint64(parentInodeID),
-			Name:      proto.String(record.Name),
-		}
-		dkBytes, _, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   17,
-			TypeName: "objectfs.v1alpha1.DirEntry",
-			Op:       sds.OpDelete,
-			Key:      sds.NewKeyFromBytes(dkBytes),
-			RawKey:   dkBytes,
-			Row:      dirEntryMsg,
-		})
-		if ok && de != nil {
-			delete(v.dirParents, de.GetIno())
-			inoMsg := &pb.Inode{Ino: proto.Uint64(de.GetIno())}
-			ikBytes, _, _ := sds.SplitKeyAndNonKey(inoMsg, []int32{1})
-			changes = append(changes, sds.Change{
-				Seq:      record.StreamSeq,
-				TypeID:   16,
-				TypeName: "objectfs.v1alpha1.Inode",
-				Op:       sds.OpDelete,
-				Key:      sds.NewKeyFromBytes(ikBytes),
-				RawKey:   ikBytes,
-				Row:      inoMsg,
-			})
-		}
-
-	case MutationRename:
-		oldParentInodeID := record.OldParentInode
-		if oldParentInodeID == 0 {
-			oldParentInodeID = v.rootInodeID
-		}
-		newParentInodeID := record.ParentInode
-		if newParentInodeID == 0 {
-			newParentInodeID = v.rootInodeID
-		}
-		oldDe, ok, _ := v.getDirEntrySQLiteLocked(ctx, oldParentInodeID, record.OldName)
-		delMsg := &pb.DirEntry{
-			ParentIno: proto.Uint64(oldParentInodeID),
-			Name:      proto.String(record.OldName),
-		}
-		dkBytes, _, _ := sds.SplitKeyAndNonKey(delMsg, []int32{1, 2})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   17,
-			TypeName: "objectfs.v1alpha1.DirEntry",
-			Op:       sds.OpDelete,
-			Key:      sds.NewKeyFromBytes(dkBytes),
-			RawKey:   dkBytes,
-			Row:      delMsg,
-		})
-		if ok && oldDe != nil {
-			insMsg := &pb.DirEntry{
-				ParentIno: proto.Uint64(newParentInodeID),
-				Name:      proto.String(record.Name),
-				Ino:       oldDe.GetIno(),
-				IsDir:     oldDe.GetIsDir(),
-				Mode:      oldDe.GetMode(),
-			}
-			ikBytes, ivBytes, _ := sds.SplitKeyAndNonKey(insMsg, []int32{1, 2})
-			changes = append(changes, sds.Change{
-				Seq:      record.StreamSeq,
-				TypeID:   17,
-				TypeName: "objectfs.v1alpha1.DirEntry",
-				Op:       sds.OpCreate,
-				Key:      sds.NewKeyFromBytes(ikBytes),
-				RawKey:   ikBytes,
-				RawVal:   ivBytes,
-				Row:      insMsg,
-			})
-			if oldDe.GetIsDir() {
-				if v.dirParents == nil {
-					v.dirParents = make(map[uint64]uint64)
-				}
-				v.dirParents[oldDe.GetIno()] = newParentInodeID
-			}
-		}
-
-	case MutationSymlink:
-		parentInodeID := record.ParentInode
-		if parentInodeID == 0 {
-			parentInodeID = v.rootInodeID
-		}
-		mode := uint32(0777 | syscall.S_IFLNK)
-		inodeID := record.Inode
-		if inodeID == 0 {
-			inodeID = v.allocInode()
-		}
-
-		childInodeMsg := &pb.Inode{
-			Ino:           proto.Uint64(inodeID),
-			Mode:          mode,
-			Size:          int64(len(record.SymlinkTarget)),
-			Mtime:         timestamppb.New(now),
-			Atime:         timestamppb.New(now),
-			Ctime:         timestamppb.New(now),
-			Uid:           record.Uid,
-			Gid:           record.Gid,
-			IsDir:         false,
-			Nlink:         1,
-			SymlinkTarget: record.SymlinkTarget,
-		}
-		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(childInodeMsg, []int32{1})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   16,
-			TypeName: "objectfs.v1alpha1.Inode",
-			Op:       sds.OpCreate,
-			Key:      sds.NewKeyFromBytes(kBytes),
-			RawKey:   kBytes,
-			RawVal:   vBytes,
-			Row:      childInodeMsg,
-		})
-
-		dirEntryMsg := &pb.DirEntry{
-			ParentIno: proto.Uint64(parentInodeID),
-			Name:      proto.String(record.Name),
-			Ino:       inodeID,
-			IsDir:     false,
-			Mode:      mode,
-		}
-		dkBytes, dvBytes, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   17,
-			TypeName: "objectfs.v1alpha1.DirEntry",
-			Op:       sds.OpCreate,
-			Key:      sds.NewKeyFromBytes(dkBytes),
-			RawKey:   dkBytes,
-			RawVal:   dvBytes,
-			Row:      dirEntryMsg,
-		})
-
-	case MutationLink:
-		oldInodeID := record.OldInode
-		newParentInodeID := record.ParentInode
-		if newParentInodeID == 0 {
-			newParentInodeID = v.rootInodeID
-		}
-		existing, err := v.getOrLoadInodeLocked(ctx, oldInodeID)
-		if err == nil && existing != nil {
-			if existing.Nlink == 0 {
-				existing.Nlink = 1
-			}
-			existing.Nlink++
-			existing.Ctime = now
-			oldInodeMsg := &pb.Inode{
-				Ino:            proto.Uint64(existing.ID),
-				Mode:           existing.Mode,
-				Size:           existing.Size,
-				Mtime:          timestamppb.New(existing.ModTime),
-				Atime:          timestamppb.New(existing.Atime),
-				Ctime:          timestamppb.New(now),
-				Uid:            existing.Uid,
-				Gid:            existing.Gid,
-				IsDir:          false,
-				Sha256:         existing.Sha256,
-				Etag:           existing.ETag,
-				ManifestSha256: existing.ManifestSha256,
-				ContentSha256:  existing.ContentSha256,
-				ChunkSize:      existing.ChunkSize,
-				Nlink:          existing.Nlink,
-				SymlinkTarget:  existing.SymlinkTarget,
-			}
-			kBytes, vBytes, _ := sds.SplitKeyAndNonKey(oldInodeMsg, []int32{1})
-			changes = append(changes, sds.Change{
-				Seq:      record.StreamSeq,
-				TypeID:   16,
-				TypeName: "objectfs.v1alpha1.Inode",
-				Op:       sds.OpUpdate,
-				Key:      sds.NewKeyFromBytes(kBytes),
-				RawKey:   kBytes,
-				RawVal:   vBytes,
-				Row:      oldInodeMsg,
-			})
-
-			dirEntryMsg := &pb.DirEntry{
-				ParentIno: proto.Uint64(newParentInodeID),
-				Name:      proto.String(record.Name),
-				Ino:       oldInodeID,
-				IsDir:     false,
-				Mode:      existing.Mode,
-			}
-			dkBytes, dvBytes, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
-			changes = append(changes, sds.Change{
-				Seq:      record.StreamSeq,
-				TypeID:   17,
-				TypeName: "objectfs.v1alpha1.DirEntry",
-				Op:       sds.OpCreate,
-				Key:      sds.NewKeyFromBytes(dkBytes),
-				RawKey:   dkBytes,
-				RawVal:   dvBytes,
-				Row:      dirEntryMsg,
-			})
-		}
-
-	case MutationSetAttr:
-		inodeID := record.Inode
-		if inodeID == 0 {
-			inodeID = v.rootInodeID
-		}
-		existing, err := v.getOrLoadInodeLocked(ctx, inodeID)
-		if err != nil {
-			return err
-		}
-		mode := existing.Mode
-		if record.Mode != 0 {
-			mode = (existing.Mode & ^uint32(07777)) | (record.Mode & 07777)
-		}
-		uid := existing.Uid
-		if record.Uid != 0 {
-			uid = record.Uid
-		}
-		gid := existing.Gid
-		if record.Gid != 0 {
-			gid = record.Gid
-		}
-		mtime := existing.ModTime
-		if record.ModTime != nil {
-			mtime = record.ModTime.AsTime()
-		}
-		atime := existing.Atime
-		if record.Atime != nil {
-			atime = record.Atime.AsTime()
-		}
-		ctime := existing.Ctime
-		if record.Ctime != nil {
-			ctime = record.Ctime.AsTime()
-		}
-
-		inodeMsg := &pb.Inode{
-			Ino:            proto.Uint64(inodeID),
-			Mode:           mode,
-			Size:           existing.Size,
-			Mtime:          timestamppb.New(mtime),
-			Atime:          timestamppb.New(atime),
-			Ctime:          timestamppb.New(ctime),
-			Uid:            uid,
-			Gid:            gid,
-			IsDir:          existing.IsDir,
-			Sha256:         existing.Sha256,
-			ManifestSha256: existing.ManifestSha256,
-			ContentSha256:  existing.ContentSha256,
-			ChunkSize:      existing.ChunkSize,
-			Nlink:          existing.Nlink,
-			SymlinkTarget:  existing.SymlinkTarget,
-		}
-		kBytes, vBytes, _ := sds.SplitKeyAndNonKey(inodeMsg, []int32{1})
-		changes = append(changes, sds.Change{
-			Seq:      record.StreamSeq,
-			TypeID:   16,
-			TypeName: "objectfs.v1alpha1.Inode",
-			Op:       sds.OpUpdate,
-			Key:      sds.NewKeyFromBytes(kBytes),
-			RawKey:   kBytes,
-			RawVal:   vBytes,
-			Row:      inodeMsg,
-		})
-
-	default:
-		return fmt.Errorf("unknown mutation type: %s", record.Type)
-	}
-
-	if len(changes) > 0 && v.metadataView != nil {
-		if err := v.metadataView.ApplyChangesSync(ctx, changes); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (v *Volume) replayRecordsLocked(records []*MutationRecord) error {
-	for _, rec := range records {
-		if err := v.ApplyRecordLocked(rec); err != nil {
-			return fmt.Errorf("failed to apply record %v: %w", rec, err)
-		}
-	}
-	return nil
-}
-
-func (v *Volume) replayClientRecordsLocked(records []*wal.ClientRecord) error {
-	for _, cr := range records {
-		mut, err := DecodeMutationRecord(cr.Payload)
-		if err != nil {
-			return fmt.Errorf("failed to decode mutation record at seq %d: %w", cr.StreamSeq, err)
-		}
-		mut.StreamSeq = cr.StreamSeq
-		if err := v.ApplyRecordLocked(mut); err != nil {
-			return fmt.Errorf("failed to apply mutation record at seq %d: %w", cr.StreamSeq, err)
-		}
-	}
-	return nil
-}
-
 // ApplySDSChangeLocked applies a single committed SDS change to the metadata index.
 func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) error {
 	if v.metadataView != nil {
@@ -4872,20 +3428,6 @@ func (v *Volume) ReplaySDSChanges(changes []sds.Change) error {
 		}
 	}
 	return nil
-}
-
-// ReplayRecords applies an ordered list of mutation records to the volume.
-func (v *Volume) ReplayRecords(records []*MutationRecord) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.replayRecordsLocked(records)
-}
-
-// ReplayClientRecords decodes and applies an ordered list of WAL client records to the volume.
-func (v *Volume) ReplayClientRecords(records []*wal.ClientRecord) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.replayClientRecordsLocked(records)
 }
 
 func (v *Volume) updateNextInodeFromMetadataLocked(ctx context.Context) {

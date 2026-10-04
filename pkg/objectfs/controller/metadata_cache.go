@@ -18,8 +18,8 @@ package controller
 
 import (
 	"sync"
-	"time"
 
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 )
 
@@ -322,47 +322,14 @@ func (c *LRUCache[K, V]) EvictAll() {
 	}
 }
 
-// DirEntry represents a single directory entry.
-type DirEntry struct {
-	Name    string
-	InodeID uint64
-	IsDir   bool
-	Mode    uint32
-}
-
 // CachedInode represents an inode metadata entry held in memory.
 type CachedInode struct {
-	ID             uint64
-	Mode           uint32
-	Size           int64
-	ModTime        time.Time
-	IsDir          bool
-	Sha256         string
-	ManifestSha256 string
-	ContentSha256  string
-	ChunkSize      uint32
-	Chunks         map[uint32]string
-	InlineData     []byte
-	StagedChunks   map[int][]byte
-	DirtyChunks    map[int][]byte
-	ETag           string
-	RedirectURL    string
-	Data           blob.ByteStream
-	Uid            uint32
-	Gid            uint32
-	Atime          time.Time
-	Ctime          time.Time
-	Nlink          uint32
-	SymlinkTarget  string
-	Rdev           uint32
-	IsDirty        bool
-}
-
-// CachedDir represents a directory metadata entry held in memory.
-type CachedDir struct {
-	ID      uint64
-	Entries map[string]DirEntry
-	Added   map[string]bool
-	Deleted map[string]bool
-	IsDirty bool
+	Row          *pb.Inode
+	Chunks       map[uint32]string
+	InlineData   []byte
+	StagedChunks map[int][]byte
+	DirtyChunks  map[int][]byte
+	RedirectURL  string
+	Data         blob.ByteStream
+	IsDirty      bool
 }
