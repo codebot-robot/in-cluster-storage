@@ -234,6 +234,7 @@ type EntryAttr struct {
 	Ctime          *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=ctime,proto3" json:"ctime,omitempty"`
 	Nlink          uint32                 `protobuf:"varint,15,opt,name=nlink,proto3" json:"nlink,omitempty"`
 	SymlinkTarget  string                 `protobuf:"bytes,16,opt,name=symlink_target,json=symlinkTarget,proto3" json:"symlink_target,omitempty"`
+	Rdev           uint32                 `protobuf:"varint,17,opt,name=rdev,proto3" json:"rdev,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -378,6 +379,13 @@ func (x *EntryAttr) GetSymlinkTarget() string {
 		return x.SymlinkTarget
 	}
 	return ""
+}
+
+func (x *EntryAttr) GetRdev() uint32 {
+	if x != nil {
+		return x.Rdev
+	}
+	return 0
 }
 
 type GetAttrRequest struct {
@@ -1029,6 +1037,7 @@ type CreateFileRequest struct {
 	InitialContent []byte                 `protobuf:"bytes,5,opt,name=initial_content,json=initialContent,proto3" json:"initial_content,omitempty"`
 	Uid            uint32                 `protobuf:"varint,6,opt,name=uid,proto3" json:"uid,omitempty"`
 	Gid            uint32                 `protobuf:"varint,7,opt,name=gid,proto3" json:"gid,omitempty"`
+	Rdev           uint32                 `protobuf:"varint,8,opt,name=rdev,proto3" json:"rdev,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1108,6 +1117,13 @@ func (x *CreateFileRequest) GetUid() uint32 {
 func (x *CreateFileRequest) GetGid() uint32 {
 	if x != nil {
 		return x.Gid
+	}
+	return 0
+}
+
+func (x *CreateFileRequest) GetRdev() uint32 {
+	if x != nil {
+		return x.Rdev
 	}
 	return 0
 }
@@ -3205,6 +3221,7 @@ type MutationRecord struct {
 	SymlinkTarget  string                 `protobuf:"bytes,21,opt,name=symlink_target,json=symlinkTarget,proto3" json:"symlink_target,omitempty"`
 	Nlink          uint32                 `protobuf:"varint,22,opt,name=nlink,proto3" json:"nlink,omitempty"`
 	OldInode       uint64                 `protobuf:"varint,23,opt,name=old_inode,json=oldInode,proto3" json:"old_inode,omitempty"`
+	Rdev           uint32                 `protobuf:"varint,24,opt,name=rdev,proto3" json:"rdev,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -3400,6 +3417,13 @@ func (x *MutationRecord) GetOldInode() uint64 {
 	return 0
 }
 
+func (x *MutationRecord) GetRdev() uint32 {
+	if x != nil {
+		return x.Rdev
+	}
+	return 0
+}
+
 type Inode struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Ino            *uint64                `protobuf:"varint,1,opt,name=ino,proto3,oneof" json:"ino,omitempty"`
@@ -3418,6 +3442,7 @@ type Inode struct {
 	Ctime          *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=ctime,proto3" json:"ctime,omitempty"`
 	Nlink          uint32                 `protobuf:"varint,15,opt,name=nlink,proto3" json:"nlink,omitempty"`
 	SymlinkTarget  string                 `protobuf:"bytes,16,opt,name=symlink_target,json=symlinkTarget,proto3" json:"symlink_target,omitempty"`
+	Rdev           uint32                 `protobuf:"varint,17,opt,name=rdev,proto3" json:"rdev,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -3562,6 +3587,13 @@ func (x *Inode) GetSymlinkTarget() string {
 		return x.SymlinkTarget
 	}
 	return ""
+}
+
+func (x *Inode) GetRdev() uint32 {
+	if x != nil {
+		return x.Rdev
+	}
+	return 0
 }
 
 type DirEntry struct {
@@ -3764,7 +3796,7 @@ var File_proto_objectfs_proto protoreflect.FileDescriptor
 
 const file_proto_objectfs_proto_rawDesc = "" +
 	"\n" +
-	"\x14proto/objectfs.proto\x12\x11objectfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xfb\x03\n" +
+	"\x14proto/objectfs.proto\x12\x11objectfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x8f\x04\n" +
 	"\tEntryAttr\x12\x14\n" +
 	"\x05inode\x18\x01 \x01(\x04R\x05inode\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x15\n" +
@@ -3782,7 +3814,8 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05atime\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\x05atime\x120\n" +
 	"\x05ctime\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\x05ctime\x12\x14\n" +
 	"\x05nlink\x18\x0f \x01(\rR\x05nlink\x12%\n" +
-	"\x0esymlink_target\x18\x10 \x01(\tR\rsymlinkTarget\"C\n" +
+	"\x0esymlink_target\x18\x10 \x01(\tR\rsymlinkTarget\x12\x12\n" +
+	"\x04rdev\x18\x11 \x01(\rR\x04rdev\"C\n" +
 	"\x0eGetAttrRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\"Y\n" +
@@ -3832,7 +3865,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x03gid\x18\x06 \x01(\rR\x03gid\"W\n" +
 	"\rMkdirResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"\xc8\x01\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"\xdc\x01\n" +
 	"\x11CreateFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
@@ -3840,7 +3873,8 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x04mode\x18\x04 \x01(\rR\x04mode\x12'\n" +
 	"\x0finitial_content\x18\x05 \x01(\fR\x0einitialContent\x12\x10\n" +
 	"\x03uid\x18\x06 \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\a \x01(\rR\x03gid\"\\\n" +
+	"\x03gid\x18\a \x01(\rR\x03gid\x12\x12\n" +
+	"\x04rdev\x18\b \x01(\rR\x04rdev\"\\\n" +
 	"\x12CreateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\"p\n" +
@@ -3982,7 +4016,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"z\n" +
 	"\x16CreateSnapshotResponse\x12#\n" +
 	"\rsnapshot_name\x18\x01 \x01(\tR\fsnapshotName\x12;\n" +
-	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\xe8\x05\n" +
+	"\bsnapshot\x18\x02 \x01(\v2\x1f.objectfs.v1alpha1.SnapshotInfoR\bsnapshot\"\xfc\x05\n" +
 	"\x0eMutationRecord\x123\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x1f.objectfs.v1alpha1.MutationTypeR\x04type\x12\x1b\n" +
 	"\tvolume_id\x18\x02 \x01(\tR\bvolumeId\x12\x12\n" +
@@ -4008,7 +4042,8 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05ctime\x18\x14 \x01(\v2\x1a.google.protobuf.TimestampR\x05ctime\x12%\n" +
 	"\x0esymlink_target\x18\x15 \x01(\tR\rsymlinkTarget\x12\x14\n" +
 	"\x05nlink\x18\x16 \x01(\rR\x05nlink\x12\x1b\n" +
-	"\told_inode\x18\x17 \x01(\x04R\boldInode\"\xf7\x03\n" +
+	"\told_inode\x18\x17 \x01(\x04R\boldInode\x12\x12\n" +
+	"\x04rdev\x18\x18 \x01(\rR\x04rdev\"\x8b\x04\n" +
 	"\x05Inode\x12\x15\n" +
 	"\x03ino\x18\x01 \x01(\x04H\x00R\x03ino\x88\x01\x01\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\rR\x04mode\x12\x12\n" +
@@ -4027,7 +4062,8 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05atime\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\x05atime\x120\n" +
 	"\x05ctime\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\x05ctime\x12\x14\n" +
 	"\x05nlink\x18\x0f \x01(\rR\x05nlink\x12%\n" +
-	"\x0esymlink_target\x18\x10 \x01(\tR\rsymlinkTargetB\x06\n" +
+	"\x0esymlink_target\x18\x10 \x01(\tR\rsymlinkTarget\x12\x12\n" +
+	"\x04rdev\x18\x11 \x01(\rR\x04rdevB\x06\n" +
 	"\x04_ino\"\x9c\x01\n" +
 	"\bDirEntry\x12\"\n" +
 	"\n" +
