@@ -21,8 +21,6 @@ import (
 	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
-	"github.com/gke-labs/in-cluster-storage/pkg/sds"
-	"google.golang.org/protobuf/proto"
 )
 
 type cacheElement[K comparable, V any] struct {
@@ -322,27 +320,6 @@ func (c *LRUCache[K, V]) EvictAll() {
 			c.onEvict(oldest.key, oldest.value)
 		}
 	}
-}
-
-// SQLiteCacheKey identifies a decoded row in the SQLite metadata cache by table name and canonical key.
-type SQLiteCacheKey struct {
-	Table string
-	Key   sds.Key
-}
-
-// SQLiteCachedRow holds a decoded protobuf message row or a negative entry marker.
-type SQLiteCachedRow struct {
-	Msg    proto.Message
-	Exists bool
-}
-
-// SQLiteCacheSizeFn calculates the approximate memory footprint of a cached SQLite row without proto.Size overhead.
-func SQLiteCacheSizeFn(k SQLiteCacheKey, v *SQLiteCachedRow) int64 {
-	size := int64(len(k.Table) + len(k.Key.String()) + 96)
-	if v != nil && v.Exists {
-		size += 128
-	}
-	return size
 }
 
 // DirEntry represents a single directory entry.

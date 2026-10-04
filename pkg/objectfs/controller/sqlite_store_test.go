@@ -42,7 +42,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	volID := "vol-sqlite-ops"
 
 	vol := NewVolume(volID, backend, broadcaster,
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
 	defer vol.Close()
@@ -175,7 +175,7 @@ func TestSQLiteMetadataStoreRecoveryFromLocalDB(t *testing.T) {
 
 	// 1. First run: create files
 	vol1 := NewVolume(volID, backend, broadcaster,
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
 	if err := vol1.LoadFromBackend(ctx); err != nil {
@@ -200,7 +200,7 @@ func TestSQLiteMetadataStoreRecoveryFromLocalDB(t *testing.T) {
 
 	// 2. Second run: reopen with same localDir
 	vol2 := NewVolume(volID, backend, broadcaster,
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
 	defer vol2.Close()
@@ -237,7 +237,7 @@ func TestSQLiteMetadataStoreRecoveryFromPublishedSnapshot(t *testing.T) {
 
 	// 1. First run: create files and publish snapshot
 	vol1 := NewVolume(volID, backend, broadcaster,
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir1),
 		WithStreamID(streamID),
 	)
@@ -263,7 +263,7 @@ func TestSQLiteMetadataStoreRecoveryFromPublishedSnapshot(t *testing.T) {
 
 	// 2. Second run: restore into a clean new local directory from published snapshot
 	vol2 := NewVolume(volID, backend, broadcaster,
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir2),
 		WithStreamID(streamID),
 	)
@@ -301,7 +301,7 @@ func TestSQLiteMetadataStoreRecoveryFromErofsSnapshot(t *testing.T) {
 
 	// 1. First run: Legacy mode creates EROFS snapshot
 	vol1 := NewVolume(volID, backend, broadcaster,
-		WithMetadataStore("legacy"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir1),
 		WithStreamID(streamID),
 	)
@@ -332,7 +332,7 @@ func TestSQLiteMetadataStoreRecoveryFromErofsSnapshot(t *testing.T) {
 
 	// 2. Second run: Open in SQLite mode without local db -> imports EROFS snapshot
 	vol2 := NewVolume(volID, backend, broadcaster,
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir2),
 		WithStreamID(streamID),
 	)
@@ -379,7 +379,7 @@ func TestSQLiteMetadataStoreCrashRecoveryWithStream(t *testing.T) {
 	}
 
 	vol1 := NewVolume(volID, backend, broadcaster,
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(stream1),
 	)
@@ -408,7 +408,7 @@ func TestSQLiteMetadataStoreCrashRecoveryWithStream(t *testing.T) {
 	}
 
 	vol2 := NewVolume(volID, backend, broadcaster,
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(stream2),
 	)
@@ -435,7 +435,7 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	volID := "vol-sqlite-cache-test"
 
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
 	defer vol.Close()
@@ -444,14 +444,14 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 		t.Fatalf("LoadFromBackend failed: %v", err)
 	}
 
-	vol.SQLiteCacheResetStats()
+	vol.MetadataCacheResetStats()
 
 	// 1. Point lookup of non-existent file -> miss + negative cache entry created
 	_, err := vol.Lookup(ctx, 1, "does_not_exist.txt")
 	if err == nil {
 		t.Fatalf("expected error looking up non-existent file")
 	}
-	stats := vol.SQLiteCacheStats()
+	stats := vol.MetadataCacheStats()
 	if stats.Misses != 1 || stats.Hits != 0 {
 		t.Fatalf("expected 1 miss and 0 hits on first lookup, got misses=%d hits=%d", stats.Misses, stats.Hits)
 	}
@@ -464,7 +464,7 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error looking up non-existent file")
 	}
-	stats = vol.SQLiteCacheStats()
+	stats = vol.MetadataCacheStats()
 	if stats.Hits != 1 || stats.Misses != 1 {
 		t.Fatalf("expected 1 hit and 1 miss after second lookup, got hits=%d misses=%d", stats.Hits, stats.Misses)
 	}
@@ -489,14 +489,14 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	if lookupAttr.Inode != attr.Inode || lookupAttr.Size != int64(len("now I exist")) {
 		t.Fatalf("unexpected lookup attr: %+v", lookupAttr)
 	}
-	stats = vol.SQLiteCacheStats()
+	stats = vol.MetadataCacheStats()
 	// Lookup checks DirEntry (hit) and toEntryAttr checks Inode (hit)
 	if stats.Hits < 2 {
 		t.Fatalf("expected hits >= 2, got %d", stats.Hits)
 	}
 
 	// 5. Stat the inode -> cache hit!
-	vol.SQLiteCacheResetStats()
+	vol.MetadataCacheResetStats()
 	statAttr, err := vol.GetAttr(ctx, attr.Inode)
 	if err != nil {
 		t.Fatalf("GetAttr failed: %v", err)
@@ -504,7 +504,7 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	if statAttr.Inode != attr.Inode {
 		t.Fatalf("mismatched stat inode: %d vs %d", statAttr.Inode, attr.Inode)
 	}
-	stats = vol.SQLiteCacheStats()
+	stats = vol.MetadataCacheStats()
 	if stats.Hits != 1 || stats.Misses != 0 {
 		t.Fatalf("expected 1 hit 0 misses on GetAttr, got hits=%d misses=%d", stats.Hits, stats.Misses)
 	}
@@ -519,12 +519,12 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	}
 
 	// 7. Lookup after deletion -> immediate negative cache hit (no SQLite query!)
-	vol.SQLiteCacheResetStats()
+	vol.MetadataCacheResetStats()
 	_, err = vol.Lookup(ctx, 1, "does_not_exist.txt")
 	if err == nil {
 		t.Fatalf("expected error looking up unlinked file")
 	}
-	stats = vol.SQLiteCacheStats()
+	stats = vol.MetadataCacheStats()
 	if stats.Hits != 1 || stats.Misses != 0 {
 		t.Fatalf("expected 1 hit (negative cache hit) and 0 misses, got hits=%d misses=%d", stats.Hits, stats.Misses)
 	}
@@ -537,7 +537,7 @@ func TestSQLiteReadCacheCoherence(t *testing.T) {
 	volID := "vol-sqlite-coherence"
 
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
 	defer vol.Close()
@@ -562,18 +562,18 @@ func TestSQLiteReadCacheCoherence(t *testing.T) {
 	}
 
 	// Old name should be negative cache hit
-	vol.SQLiteCacheResetStats()
+	vol.MetadataCacheResetStats()
 	_, err = vol.Lookup(ctx, 1, "initial.txt")
 	if err == nil {
 		t.Fatalf("expected error for old name after rename")
 	}
-	stats := vol.SQLiteCacheStats()
+	stats := vol.MetadataCacheStats()
 	if stats.Hits != 1 || stats.Misses != 0 {
 		t.Fatalf("expected 1 negative hit for old name, got hits=%d misses=%d", stats.Hits, stats.Misses)
 	}
 
 	// New name should be positive cache hit
-	vol.SQLiteCacheResetStats()
+	vol.MetadataCacheResetStats()
 	rAttr, err := vol.Lookup(ctx, 1, "renamed.txt")
 	if err != nil {
 		t.Fatalf("Lookup for renamed file failed: %v", err)
@@ -623,7 +623,7 @@ func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
 
 	// Bounded to 50 entries and 10 KB
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithMetadataCacheLimits(50, 10*1024),
 	)
@@ -642,7 +642,7 @@ func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
 		inodes = append(inodes, attr.Inode)
 	}
 
-	stats := vol.SQLiteCacheStats()
+	stats := vol.MetadataCacheStats()
 	if stats.Entries > 50 {
 		t.Fatalf("expected <= 50 cache entries, got %d", stats.Entries)
 	}
@@ -651,7 +651,7 @@ func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
 	}
 
 	// Lookup an early evicted file -> cache miss, reloads cleanly from SQLite
-	vol.SQLiteCacheResetStats()
+	vol.MetadataCacheResetStats()
 	attr, err := vol.Lookup(ctx, 1, "file_0.txt")
 	if err != nil {
 		t.Fatalf("Lookup for evicted file_0.txt failed: %v", err)
@@ -659,7 +659,7 @@ func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
 	if attr.Inode != inodes[0] {
 		t.Fatalf("mismatched inode for reloaded file_0.txt: %d vs %d", attr.Inode, inodes[0])
 	}
-	stats = vol.SQLiteCacheStats()
+	stats = vol.MetadataCacheStats()
 	if stats.Misses == 0 {
 		t.Fatalf("expected at least 1 cache miss for evicted file_0.txt")
 	}
@@ -672,7 +672,7 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 	volID := "vol-sqlite-concurrent-stress"
 
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
 	defer vol.Close()
@@ -737,7 +737,7 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 	close(done)
 	wg.Wait()
 
-	stats := vol.SQLiteCacheStats()
+	stats := vol.MetadataCacheStats()
 	t.Logf("Concurrent stress test completed: Hits=%d Misses=%d HitRate=%.2f%% Entries=%d Bytes=%d KB",
 		stats.Hits, stats.Misses, stats.HitRate*100, stats.Entries, stats.Bytes/1024)
 }
@@ -752,7 +752,7 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 	faultActive.Store(true)
 
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithApplierFaultHook(func() error {
 			if faultActive.Load() {
@@ -888,7 +888,7 @@ func TestSQLiteApplierCoalescing(t *testing.T) {
 	volID := "vol-sqlite-coalesce"
 
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithApplierBatchSize(100),
 	)
@@ -939,7 +939,7 @@ func TestSQLiteApplierFaultInjectionAndDegradedState(t *testing.T) {
 	faultActive.Store(true)
 
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithApplierFaultHook(func() error {
 			if faultActive.Load() {
@@ -1000,7 +1000,7 @@ func TestSQLiteBackpressureUnderLag(t *testing.T) {
 
 	// Configure a tight bound on unapplied overlay bytes (e.g. 1024 bytes)
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithMaxUnappliedBytes(1024),
 		WithApplierFaultHook(func() error {
@@ -1069,7 +1069,7 @@ func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
 
 	// Start volume with stalled SQLite applier so writes accumulate in stream and overlay
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(stream),
 		WithApplierFaultHook(func() error {
@@ -1110,7 +1110,7 @@ func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
 	}
 
 	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(newStream),
 	)
@@ -1147,7 +1147,7 @@ func TestSQLiteSnapshotFlushesOverlay(t *testing.T) {
 	volID := "vol-sqlite-snap-flush"
 
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
 	defer vol.Close()
@@ -1180,7 +1180,7 @@ func TestSQLiteSnapshotFlushesOverlay(t *testing.T) {
 	// Restore from published snapshot on fresh volume to confirm validity
 	freshDir := t.TempDir()
 	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(freshDir),
 	)
 	defer vol2.Close()
@@ -1213,7 +1213,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 
 	// 1. Start volume with batchSize = 1 (smaller than a rename's change count)
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(stream),
 		WithApplierBatchSize(1),
@@ -1231,7 +1231,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 		t.Fatalf("FlushOverlay failed: %v", err)
 	}
 
-	posBeforeRename := vol.SQLiteAppliedPosition()
+	posBeforeRename := vol.MetadataAppliedPosition()
 
 	// 2. Perform a multi-change Rename (delete old DirEntry, insert new DirEntry, update Inode)
 	// while applier is stalled by fault hook
@@ -1250,7 +1250,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 	}
 
 	// SQLite position must NOT have advanced partially
-	if pos := vol.SQLiteAppliedPosition(); pos != posBeforeRename {
+	if pos := vol.MetadataAppliedPosition(); pos != posBeforeRename {
 		t.Fatalf("SQLiteAppliedPosition advanced unexpectedly before batch apply: %d vs %d", pos, posBeforeRename)
 	}
 
@@ -1264,7 +1264,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 	}
 
 	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(newStream),
 		WithApplierBatchSize(1),
@@ -1305,7 +1305,7 @@ func TestSQLiteSnapshotFlushNoStarvationUnderContinuousWrites(t *testing.T) {
 	volID := "vol-sqlite-continuous-writes"
 
 	vol := NewVolume(volID, backend, NewEventBroadcaster(),
-		WithMetadataStore("sqlite"),
+		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
 	defer vol.Close()
@@ -1473,5 +1473,202 @@ func TestLegacyErofsVolumeMigrationAndReplayToSQLite(t *testing.T) {
 	}
 	if string(sub1Data) != "subfile 1 data" {
 		t.Fatalf("Expected 'subfile 1 data', got %q", string(sub1Data))
+	}
+}
+
+func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	walDir := t.TempDir()
+	streamID := uuid.New()
+	volID := "vol-memory-index-test"
+
+	stream, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("OpenStream failed: %v", err)
+	}
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataIndex("memory"),
+		WithStream(stream),
+		WithDurability(walclient.Local),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// 1. Create directory and files
+	dirAttr, err := vol.Mkdir(ctx, 1, "testdir", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+
+	f1Attr, err := vol.CreateFile(ctx, dirAttr.Inode, "f1.txt", 0644, []byte("memory-index-content"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile f1 failed: %v", err)
+	}
+
+	// 2. Read back
+	data, _, _, err := vol.ReadFile(ctx, f1Attr.Inode, 0, 100)
+	if err != nil || string(data) != "memory-index-content" {
+		t.Fatalf("ReadFile failed: got %q, err %v", string(data), err)
+	}
+
+	// 3. Snapshot creation (publishes memory snapshot pointer)
+	snapName, err := vol.CreateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+	if snapName == "" {
+		t.Fatalf("empty snapshot name")
+	}
+
+	// 4. Add more data after snapshot
+	f2Attr, err := vol.CreateFile(ctx, dirAttr.Inode, "f2.txt", 0644, []byte("f2-content-after-snap"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile f2 failed: %v", err)
+	}
+
+	// 5. Simulate restart with memory index and stream replay
+	stream2, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("OpenStream 2 failed: %v", err)
+	}
+
+	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataIndex("memory"),
+		WithStream(stream2),
+	)
+	defer vol2.Close()
+
+	if err := vol2.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("vol2.LoadFromBackend failed: %v", err)
+	}
+
+	// Verify both f1 and f2 exist
+	entries, err := vol2.ReadDir(ctx, dirAttr.Inode)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("expected 2 entries in dir, got %d (err: %v)", len(entries), err)
+	}
+
+	f2Data, _, _, err := vol2.ReadFile(ctx, f2Attr.Inode, 0, 100)
+	if err != nil || string(f2Data) != "f2-content-after-snap" {
+		t.Fatalf("ReadFile f2 failed: got %q, err %v", string(f2Data), err)
+	}
+}
+
+func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
+	for _, indexMode := range []string{"sqlite", "memory"} {
+		t.Run(indexMode, func(t *testing.T) {
+			ctx := t.Context()
+			backend := inmemorystorage.New()
+			walDir := t.TempDir()
+			streamID := uuid.New()
+			volID := fmt.Sprintf("vol-trunc-down-%s", indexMode)
+
+			stream, err := walclient.Open(ctx, walDir, streamID, "")
+			if err != nil {
+				t.Fatalf("OpenStream failed: %v", err)
+			}
+
+			vol := NewVolume(volID, backend, NewEventBroadcaster(),
+				WithMetadataIndex(indexMode),
+				WithStream(stream),
+				WithDurability(walclient.Local),
+				WithLocalStorageDir(t.TempDir()),
+			)
+			defer vol.Close()
+
+			if err := vol.LoadFromBackend(ctx); err != nil {
+				t.Fatalf("LoadFromBackend failed: %v", err)
+			}
+
+			// 1. Create large chunked file with 20 chunks (64 KiB each = 1,310,720 bytes)
+			chunkSize := 64 * 1024
+			numChunks := 20
+			fullData := make([]byte, numChunks*chunkSize)
+			for c := 0; c < numChunks; c++ {
+				fillByte := byte((c + 1) % 250)
+				for j := 0; j < chunkSize; j++ {
+					fullData[c*chunkSize+j] = fillByte
+				}
+			}
+
+			attr, err := vol.CreateFile(ctx, 1, "large.bin", 0644, fullData, 0, 0)
+			if err != nil {
+				t.Fatalf("CreateFile failed: %v", err)
+			}
+
+			// Verify chunk 10 before truncate
+			c10Data, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(10*chunkSize), int64(chunkSize))
+			if err != nil || len(c10Data) != chunkSize || c10Data[0] != byte(11) {
+				t.Fatalf("Initial read of chunk 10 failed: len=%d, err=%v", len(c10Data), err)
+			}
+
+			// 2. First truncate down: from 20 chunks to 15 chunks (983,040 bytes)
+			t1Size := int64(15 * chunkSize)
+			_, err = vol.TruncateFile(ctx, attr.Inode, t1Size)
+			if err != nil {
+				t.Fatalf("First TruncateFile failed: %v", err)
+			}
+
+			// 3. Second truncate down: from 15 chunks to 11 chunks + 1000 bytes (721,920 bytes)
+			t2Size := int64(11*chunkSize + 1000)
+			_, err = vol.TruncateFile(ctx, attr.Inode, t2Size)
+			if err != nil {
+				t.Fatalf("Second TruncateFile failed: %v", err)
+			}
+
+			// 4. Read untouched chunk 5 (offset = 5 * 64KB) -> must be byte 6
+			c5Data, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(5*chunkSize), int64(chunkSize))
+			if err != nil || len(c5Data) != chunkSize {
+				t.Fatalf("ReadFile chunk 5 failed: len=%d err=%v", len(c5Data), err)
+			}
+			for i, b := range c5Data {
+				if b != byte(6) {
+					t.Fatalf("Chunk 5 byte %d mismatch: got %d, want %d", i, b, byte(6))
+				}
+			}
+
+			// 5. Read untouched chunk 10 (offset = 10 * 64KB) -> must be byte 11
+			c10After, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(10*chunkSize), int64(chunkSize))
+			if err != nil || len(c10After) != chunkSize {
+				t.Fatalf("ReadFile chunk 10 failed: len=%d err=%v", len(c10After), err)
+			}
+			for i, b := range c10After {
+				if b != byte(11) {
+					t.Fatalf("Chunk 10 byte %d mismatch: got %d, want %d", i, b, byte(11))
+				}
+			}
+
+			// 6. Read last partial chunk 11 (offset = 11 * 64KB, length = 1000 bytes)
+			c11Data, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(11*chunkSize), 1000)
+			if err != nil || len(c11Data) != 1000 {
+				t.Fatalf("ReadFile chunk 11 failed: len=%d err=%v", len(c11Data), err)
+			}
+			for i, b := range c11Data {
+				if b != byte(12) {
+					t.Fatalf("Chunk 11 byte %d mismatch: got %d, want %d", i, b, byte(12))
+				}
+			}
+
+			// 7. Read beyond EOF (chunk 13) -> must return 0 bytes
+			pastEOF, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(13*chunkSize), int64(chunkSize))
+			if err != nil || len(pastEOF) != 0 {
+				t.Fatalf("ReadFile past EOF failed: len=%d err=%v", len(pastEOF), err)
+			}
+
+			// 8. Flush overlay to underlying index and verify consistency again
+			if err := vol.FlushOverlay(ctx); err != nil {
+				t.Fatalf("FlushOverlay failed: %v", err)
+			}
+
+			c10Flushed, _, _, err := vol.ReadFile(ctx, attr.Inode, int64(10*chunkSize), int64(chunkSize))
+			if err != nil || len(c10Flushed) != chunkSize || c10Flushed[0] != byte(11) {
+				t.Fatalf("Post-flush ReadFile chunk 10 failed: len=%d err=%v", len(c10Flushed), err)
+			}
+		})
 	}
 }

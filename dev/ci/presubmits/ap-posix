@@ -122,9 +122,9 @@ fsx_exit=\$?
 set -o errexit
 if [[ \${fsx_exit} -ne 0 ]]; then
   echo "fsx failed with exit code \${fsx_exit}"
-  mkdir -p "\${REPO_ROOT}/.artifacts"
-  cp -f fsx-test.bin.fsxops "\${REPO_ROOT}/.artifacts/" 2>/dev/null || true
-  cp -f fsx-test.bin.fsxgood "\${REPO_ROOT}/.artifacts/" 2>/dev/null || true
+  mkdir -p "${REPO_ROOT}/.artifacts"
+  cp -f fsx-test.bin.fsxops "${REPO_ROOT}/.artifacts/" 2>/dev/null || true
+  cp -f fsx-test.bin.fsxgood "${REPO_ROOT}/.artifacts/" 2>/dev/null || true
   exit \${fsx_exit}
 fi
 echo "fsx passed successfully!"
@@ -244,4 +244,4 @@ chmod +x "${RUNNER_SCRIPT}"
 
 # Execute tests against native FUSE mount in sqlite mode
 echo "=== Running POSIX gate (sqlite metadata store) ==="
-GOTOOLCHAIN=auto OBJECTFS_METADATA_STORE=sqlite ./dev/tasks/fuse-start -- "${RUNNER_SCRIPT}"
+GOTOOLCHAIN=auto OBJECTFS_METADATA_INDEX=sqlite ./dev/tasks/fuse-start -- "${RUNNER_SCRIPT}"

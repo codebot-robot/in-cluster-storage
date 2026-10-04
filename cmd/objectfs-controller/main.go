@@ -43,7 +43,7 @@ var (
 	walDir                   = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
 	walTarget                = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer:50051)")
 	walDurability            = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
-	metadataStore            = flag.String("metadata-store", "sqlite", "Metadata store type (deprecated: sqlite is the only supported metadata store)")
+	metadataIndex            = flag.String("metadata-index", "sqlite", "Metadata local index type (sqlite, memory)")
 	metadataCacheEntries     = flag.Int("metadata-cache-entries", 0, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
 	metadataCacheBytes       = flag.Int64("metadata-cache-bytes", 64*1024*1024, "Maximum byte size of metadata read cache")
 	metadataOverlayMaxBytes  = flag.Int64("metadata-overlay-max-bytes", 64*1024*1024, "Maximum byte size of unapplied metadata overlay before applying backpressure")
@@ -78,11 +78,8 @@ func main() {
 	}
 
 	var serverOpts []controller.ServerOption
-	if *metadataStore != "" {
-		if strings.ToLower(*metadataStore) != "sqlite" {
-			klog.Warningf("metadata store %q is no longer supported; using sqlite", *metadataStore)
-		}
-		serverOpts = append(serverOpts, controller.WithServerMetadataStore(*metadataStore))
+	if *metadataIndex != "" {
+		serverOpts = append(serverOpts, controller.WithServerMetadataIndex(*metadataIndex))
 	}
 	if *metadataCacheEntries > 0 || *metadataCacheBytes > 0 {
 		serverOpts = append(serverOpts, controller.WithServerMetadataCacheLimits(*metadataCacheEntries, *metadataCacheBytes))
