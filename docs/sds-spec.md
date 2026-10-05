@@ -76,6 +76,7 @@ message TypeDefinition {
   bytes  fingerprint = 3;                             // 32-byte SHA-256 canonical descriptor digest
   google.protobuf.FileDescriptorSet descriptors = 4;  // Full transitive descriptors
   repeated int32 key_fields = 5;                      // Primary key field numbers in order
+  bool   log_before_images = 6;                       // If true, UPDATE and DELETE emit before_value
 }
 ```
 
@@ -161,10 +162,11 @@ message OpRecord {
     DELETE = 2;
   }
   Op     op = 1;
-  uint32 type_id = 2; // Target table type ID (MUST be >= 16)
-  uint64 tx_id = 3;   // 0 = autocommit; >0 = part of transaction
-  bytes  key = 4;     // Canonical binary proto encoding of key fields
-  bytes  value = 5;   // Binary proto encoding of non-key fields
+  uint32 type_id = 2;      // Target table type ID (MUST be >= 16)
+  uint64 tx_id = 3;        // 0 = autocommit; >0 = part of transaction
+  bytes  key = 4;          // Canonical binary proto encoding of key fields
+  bytes  value = 5;        // Binary proto encoding of non-key fields
+  bytes  before_value = 6; // Binary proto encoding of non-key fields before update/delete (optional)
 }
 ```
 
@@ -178,11 +180,16 @@ The `key` field in `OpRecord` **MUST** be encoded as follows:
 - The key message **MUST** be serialized using deterministic Protobuf serialization (`proto.MarshalOptions{Deterministic: true}`).
 - The resulting byte slice provides an exact, canonical representation of the primary key that is directly comparable for map keys, hash indexing, and lookup operations.
 
-### 5.3 Value Encoding
+### 5.3 Value and Before-Value Encoding
 
-The `value` field in `OpRecord` **MUST** be encoded as follows:
-- For `CREATE` and `UPDATE` operations: `value` contains the serialized binary Protobuf bytes of all **non-key** fields of the target row message.
-- For `DELETE` operations: `value` **MUST** be empty (0 bytes).
+- **`value`:**
+  - For `CREATE` and `UPDATE` operations: `value` contains the serialized binary Protobuf bytes of all **non-key** fields of the target row message.
+  - For `DELETE` operations: `value` **MUST** be empty (0 bytes).
+- **`before_value`:**
+  - When `TypeDefinition.log_before_images` is `true`:
+    - For `UPDATE` and `DELETE` operations: `before_value` contains the serialized binary Protobuf bytes of all **non-key** fields of the previous row state identified by `key`.
+    - For `CREATE` operations: `before_value` **MUST** be empty (0 bytes).
+  - When `TypeDefinition.log_before_images` is `false`: `before_value` **MUST** be empty (0 bytes) for all operations.
 
 ### 5.4 Reconstitution (Merging)
 
@@ -190,13 +197,19 @@ To reconstruct the complete row message from an `OpRecord`:
 1. Instantiate a new empty message of the type identified by `type_id`.
 2. Unmarshal `key` into the message using merge options (`proto.UnmarshalOptions{Merge: true}`).
 3. If `value` is non-empty, unmarshal `value` into the same message using merge options.
-4. The resulting message contains the fully populated row.
+4. The resulting message contains the fully populated row (for `CREATE` and `UPDATE`).
+
+To reconstruct the previous row message (before-image) when `before_value` is present on `UPDATE` or `DELETE`:
+1. Instantiate a new empty message of the type identified by `type_id`.
+2. Unmarshal `key` into the message using merge options (`proto.UnmarshalOptions{Merge: true}`).
+3. If `before_value` is non-empty, unmarshal `before_value` into the message using merge options.
+4. The resulting message contains the fully populated before-image row.
 
 ### 5.5 Operation Semantics
 
-- **`CREATE` (`0`):** Inserts the row into the table. If a row with the same primary key already exists in the projection, `CREATE` replaces it (insert-or-replace semantics for idempotent replay).
-- **`UPDATE` (`1`):** Replaces the non-key attributes of the row identified by `key`. `UPDATE` represents a complete replacement of non-key fields.
-- **`DELETE` (`2`):** Removes the row identified by `key` from the table. `DELETE` payloads omit the `value` field. If the row does not exist, `DELETE` is an idempotent no-op.
+- **`CREATE` (`0`):** Indicates that the row with this primary key did not exist at this stream position. The stream writer **MUST** only emit `CREATE` for new keys. If a row with the same key already exists in a projection during recovery or catch-up, the projection **MAY** apply `CREATE` as insert-or-replace for robustness.
+- **`UPDATE` (`1`):** Replaces the non-key attributes of an existing row identified by `key`. `UPDATE` represents a complete replacement of non-key fields. If `log_before_images` is enabled, `before_value` carries the prior non-key state.
+- **`DELETE` (`2`):** Removes the row identified by `key` from the table. `DELETE` payloads omit the `value` field. If `log_before_images` is enabled, `before_value` carries the deleted non-key state. If the row does not exist in the projection, `DELETE` is an idempotent no-op.
 
 ---
 

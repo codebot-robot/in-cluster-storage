@@ -27,6 +27,7 @@ message TypeDefinition {
   bytes fingerprint = 3;
   google.protobuf.FileDescriptorSet descriptors = 4;
   repeated int32 key_fields = 5;
+  bool log_before_images = 6;
 }
 
 message OpRecord {
@@ -40,6 +41,7 @@ message OpRecord {
   uint64 tx_id = 3; // 0 = autocommit
   bytes  key = 4;
   bytes  value = 5;
+  bytes  before_value = 6;
 }
 
 message TxCommit {

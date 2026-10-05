@@ -87,14 +87,15 @@ func (OpRecord_Op) EnumDescriptor() ([]byte, []int) {
 }
 
 type TypeDefinition struct {
-	state         protoimpl.MessageState          `protogen:"open.v1"`
-	Id            uint32                          `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	Name          string                          `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Fingerprint   []byte                          `protobuf:"bytes,3,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"`
-	Descriptors   *descriptorpb.FileDescriptorSet `protobuf:"bytes,4,opt,name=descriptors,proto3" json:"descriptors,omitempty"`
-	KeyFields     []int32                         `protobuf:"varint,5,rep,packed,name=key_fields,json=keyFields,proto3" json:"key_fields,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState          `protogen:"open.v1"`
+	Id              uint32                          `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Name            string                          `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Fingerprint     []byte                          `protobuf:"bytes,3,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"`
+	Descriptors     *descriptorpb.FileDescriptorSet `protobuf:"bytes,4,opt,name=descriptors,proto3" json:"descriptors,omitempty"`
+	KeyFields       []int32                         `protobuf:"varint,5,rep,packed,name=key_fields,json=keyFields,proto3" json:"key_fields,omitempty"`
+	LogBeforeImages bool                            `protobuf:"varint,6,opt,name=log_before_images,json=logBeforeImages,proto3" json:"log_before_images,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *TypeDefinition) Reset() {
@@ -162,6 +163,13 @@ func (x *TypeDefinition) GetKeyFields() []int32 {
 	return nil
 }
 
+func (x *TypeDefinition) GetLogBeforeImages() bool {
+	if x != nil {
+		return x.LogBeforeImages
+	}
+	return false
+}
+
 type OpRecord struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Op            OpRecord_Op            `protobuf:"varint,1,opt,name=op,proto3,enum=sds.v1.OpRecord_Op" json:"op,omitempty"`
@@ -169,6 +177,7 @@ type OpRecord struct {
 	TxId          uint64                 `protobuf:"varint,3,opt,name=tx_id,json=txId,proto3" json:"tx_id,omitempty"` // 0 = autocommit
 	Key           []byte                 `protobuf:"bytes,4,opt,name=key,proto3" json:"key,omitempty"`
 	Value         []byte                 `protobuf:"bytes,5,opt,name=value,proto3" json:"value,omitempty"`
+	BeforeValue   []byte                 `protobuf:"bytes,6,opt,name=before_value,json=beforeValue,proto3" json:"before_value,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -234,6 +243,13 @@ func (x *OpRecord) GetKey() []byte {
 func (x *OpRecord) GetValue() []byte {
 	if x != nil {
 		return x.Value
+	}
+	return nil
+}
+
+func (x *OpRecord) GetBeforeValue() []byte {
+	if x != nil {
+		return x.BeforeValue
 	}
 	return nil
 }
@@ -406,20 +422,22 @@ var File_proto_sds_proto protoreflect.FileDescriptor
 
 const file_proto_sds_proto_rawDesc = "" +
 	"\n" +
-	"\x0fproto/sds.proto\x12\x06sds.v1\x1a google/protobuf/descriptor.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xbb\x01\n" +
+	"\x0fproto/sds.proto\x12\x06sds.v1\x1a google/protobuf/descriptor.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe7\x01\n" +
 	"\x0eTypeDefinition\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\rR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12 \n" +
 	"\vfingerprint\x18\x03 \x01(\fR\vfingerprint\x12D\n" +
 	"\vdescriptors\x18\x04 \x01(\v2\".google.protobuf.FileDescriptorSetR\vdescriptors\x12\x1d\n" +
 	"\n" +
-	"key_fields\x18\x05 \x03(\x05R\tkeyFields\"\xaf\x01\n" +
+	"key_fields\x18\x05 \x03(\x05R\tkeyFields\x12*\n" +
+	"\x11log_before_images\x18\x06 \x01(\bR\x0flogBeforeImages\"\xd2\x01\n" +
 	"\bOpRecord\x12#\n" +
 	"\x02op\x18\x01 \x01(\x0e2\x13.sds.v1.OpRecord.OpR\x02op\x12\x17\n" +
 	"\atype_id\x18\x02 \x01(\rR\x06typeId\x12\x13\n" +
 	"\x05tx_id\x18\x03 \x01(\x04R\x04txId\x12\x10\n" +
 	"\x03key\x18\x04 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x05 \x01(\fR\x05value\"(\n" +
+	"\x05value\x18\x05 \x01(\fR\x05value\x12!\n" +
+	"\fbefore_value\x18\x06 \x01(\fR\vbeforeValue\"(\n" +
 	"\x02Op\x12\n" +
 	"\n" +
 	"\x06CREATE\x10\x00\x12\n" +
