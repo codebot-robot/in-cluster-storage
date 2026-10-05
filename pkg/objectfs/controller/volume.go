@@ -458,16 +458,16 @@ func (v *Volume) initMetadataStreamLocked() error {
 		appender = &memoryAppender{}
 	}
 	w := sds.NewWriter(appender)
-	if _, err := w.RegisterType(&pb.Inode{}, 1); err != nil {
+	if _, err := w.RegisterTypeWithOptions(&pb.Inode{}, sds.WithKeyFields(1), sds.WithLogBeforeImages(true)); err != nil {
 		return fmt.Errorf("failed to register Inode type: %w", err)
 	}
-	if _, err := w.RegisterType(&pb.DirEntry{}, 1, 2); err != nil {
+	if _, err := w.RegisterTypeWithOptions(&pb.DirEntry{}, sds.WithKeyFields(1, 2)); err != nil {
 		return fmt.Errorf("failed to register DirEntry type: %w", err)
 	}
-	if _, err := w.RegisterType(&pb.FileChunk{}, 1, 2); err != nil {
+	if _, err := w.RegisterTypeWithOptions(&pb.FileChunk{}, sds.WithKeyFields(1, 2), sds.WithLogBeforeImages(true)); err != nil {
 		return fmt.Errorf("failed to register FileChunk type: %w", err)
 	}
-	if _, err := w.RegisterType(&pb.Content{}, 1); err != nil {
+	if _, err := w.RegisterTypeWithOptions(&pb.Content{}, sds.WithKeyFields(1)); err != nil {
 		return fmt.Errorf("failed to register Content type: %w", err)
 	}
 	v.metadataStream = w
@@ -906,19 +906,20 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to scan orphan inodes: %w", err)
 	}
-	var orphanInos []uint64
+	var orphanInodes []*pb.Inode
 	for _, msg := range msgs {
 		node := msg.(*pb.Inode)
 		if !node.GetIsDir() && node.GetNlink() == 0 {
-			orphanInos = append(orphanInos, node.GetIno())
+			orphanInodes = append(orphanInodes, node)
 		}
 	}
-	if len(orphanInos) == 0 {
+	if len(orphanInodes) == 0 {
 		return nil
 	}
 	tx := v.metadataStream.Begin()
-	for _, ino := range orphanInos {
-		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(ino)}); err != nil {
+	for _, node := range orphanInodes {
+		ino := node.GetIno()
+		if _, err := tx.Delete(ctx, node); err != nil {
 			return fmt.Errorf("failed to log orphan inode %d deletion: %w", ino, err)
 		}
 		chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(ino)}, 1)
@@ -931,7 +932,7 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 		}
 		for _, cMsg := range chunkMsgs {
 			c := cMsg.(*pb.FileChunk)
-			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(ino), Index: proto.Uint32(c.GetIndex())}); err != nil {
+			if _, err := tx.Delete(ctx, c); err != nil {
 				return fmt.Errorf("failed to log chunk deletion for orphan inode %d: %w", ino, err)
 			}
 		}
@@ -1099,7 +1100,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 			return attr, nil, err
 		}
 
-		node.mutate(func(row *pb.Inode) {
+		beforeNode, afterNode := node.mutate(func(row *pb.Inode) {
 			if mode != nil {
 				// keep setuid, setgid and sticky (07777), and the file-type bits untouched by chmod
 				row.Mode = (row.GetMode() & ^uint32(07777)) | (*mode & 07777)
@@ -1131,7 +1132,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 		})
 
 		tx := v.metadataStream.Begin()
-		if _, err := tx.Update(ctx, node.Row); err != nil {
+		if _, err := tx.Update(ctx, beforeNode, afterNode); err != nil {
 			return nil, nil, fmt.Errorf("failed to log inode update: %w", err)
 		}
 
@@ -1307,7 +1308,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		now := time.Now()
 		childInodeID := v.allocInode()
 
-		parentInode.mutate(func(row *pb.Inode) {
+		parentBefore, parentAfter := parentInode.mutate(func(row *pb.Inode) {
 			if row.GetNlink() < 2 {
 				row.Nlink = 2
 			}
@@ -1335,7 +1336,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			Nlink:     2,
 			ParentIno: proto.Uint64(parentInodeID),
 		}
-		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
+		if _, err := tx.Create(ctx, childInodeMsg); err != nil {
 			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log child inode creation: %w", err)
 		}
@@ -1347,12 +1348,12 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			IsDir:     true,
 			Mode:      mode,
 		}
-		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
+		if _, err := tx.Create(ctx, dirEntryMsg); err != nil {
 			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
-		if _, err := tx.Update(ctx, parentInode.Row); err != nil {
+		if _, err := tx.Update(ctx, parentBefore, parentAfter); err != nil {
 			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
@@ -1489,7 +1490,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				}
 			}
 
-			childInode.mutate(func(row *pb.Inode) {
+			childBefore, childAfter := childInode.mutate(func(row *pb.Inode) {
 				row.Mode = mode
 				row.Size = int64(len(dataCopy))
 				row.Mtime = timestamppb.New(now)
@@ -1503,7 +1504,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				}
 			})
 
-			parentInode.mutate(func(row *pb.Inode) {
+			parentBefore, parentAfter := parentInode.mutate(func(row *pb.Inode) {
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
 			})
@@ -1520,12 +1521,12 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 				for _, msg := range chunkMsgs {
 					c := msg.(*pb.FileChunk)
-					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(c.GetIndex())}); err != nil {
+					if _, err := tx.Delete(ctx, c); err != nil {
 						return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
 					}
 				}
 				if len(dataCopy) > 0 {
-					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
+					if _, err := tx.Create(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
 						return nil, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 					}
 				}
@@ -1560,25 +1561,36 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 				prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno())}, 1)
 				chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+				oldChunksMap := make(map[uint32]*pb.FileChunk, len(chunkMsgs))
 				for _, msg := range chunkMsgs {
 					c := msg.(*pb.FileChunk)
-					if _, stillPresent := childInode.Chunks[c.GetIndex()]; !stillPresent {
-						if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(c.GetIndex())}); err != nil {
+					oldChunksMap[c.GetIndex()] = c
+				}
+				for idx, oldChunk := range oldChunksMap {
+					if _, stillPresent := childInode.Chunks[idx]; !stillPresent {
+						if _, err := tx.Delete(ctx, oldChunk); err != nil {
 							return nil, nil, fmt.Errorf("failed to delete old FileChunk: %w", err)
 						}
 					}
 				}
 				for i, sha := range childInode.Chunks {
-					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(i), Sha256: sha}); err != nil {
-						return nil, nil, fmt.Errorf("failed to log FileChunk: %w", err)
+					newChunk := &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(i), Sha256: sha}
+					if oldChunk, existed := oldChunksMap[i]; existed {
+						if _, err := tx.Update(ctx, oldChunk, newChunk); err != nil {
+							return nil, nil, fmt.Errorf("failed to update FileChunk: %w", err)
+						}
+					} else {
+						if _, err := tx.Create(ctx, newChunk); err != nil {
+							return nil, nil, fmt.Errorf("failed to log FileChunk: %w", err)
+						}
 					}
 				}
 			}
 
-			if _, err := tx.Update(ctx, childInode.Row); err != nil {
+			if _, err := tx.Update(ctx, childBefore, childAfter); err != nil {
 				return nil, nil, fmt.Errorf("failed to log child inode update: %w", err)
 			}
-			if _, err := tx.Update(ctx, parentInode.Row); err != nil {
+			if _, err := tx.Update(ctx, parentBefore, parentAfter); err != nil {
 				return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 			}
 
@@ -1605,7 +1617,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 		childInodeID := v.allocInode()
 
-		parentInode.mutate(func(row *pb.Inode) {
+		parentBefore, parentAfter := parentInode.mutate(func(row *pb.Inode) {
 			row.Mtime = timestamppb.New(now)
 			row.Ctime = timestamppb.New(now)
 		})
@@ -1640,7 +1652,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				childInode.InlineData = dataCopy
 
 				if len(dataCopy) > 0 {
-					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
+					if _, err := tx.Create(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
 						return nil, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 					}
 				}
@@ -1672,14 +1684,14 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				}
 
 				for i, sha := range childInode.Chunks {
-					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(i), Sha256: sha}); err != nil {
+					if _, err := tx.Create(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(i), Sha256: sha}); err != nil {
 						return nil, nil, fmt.Errorf("failed to log FileChunk: %w", err)
 					}
 				}
 			}
 		}
 
-		if _, err := tx.Insert(ctx, childInode.Row); err != nil {
+		if _, err := tx.Create(ctx, childInode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log child inode creation: %w", err)
 		}
 
@@ -1690,11 +1702,11 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			IsDir:     false,
 			Mode:      mode,
 		}
-		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
+		if _, err := tx.Create(ctx, dirEntryMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
-		if _, err := tx.Update(ctx, parentInode.Row); err != nil {
+		if _, err := tx.Update(ctx, parentBefore, parentAfter); err != nil {
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 		commitSeq, err := tx.Commit(ctx)
@@ -1770,7 +1782,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 
 		now := time.Now()
 		childInodeID := v.allocInode()
-		parentInode.mutate(func(row *pb.Inode) {
+		parentBefore, parentAfter := parentInode.mutate(func(row *pb.Inode) {
 			row.Mtime = timestamppb.New(now)
 			row.Ctime = timestamppb.New(now)
 		})
@@ -1793,7 +1805,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 
 		tx := v.metadataStream.Begin()
 
-		if _, err := tx.Insert(ctx, childInode.Row); err != nil {
+		if _, err := tx.Create(ctx, childInode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log symlink inode creation: %w", err)
 		}
 
@@ -1804,11 +1816,11 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			IsDir:     false,
 			Mode:      mode,
 		}
-		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
+		if _, err := tx.Create(ctx, dirEntryMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
-		if _, err := tx.Update(ctx, parentInode.Row); err != nil {
+		if _, err := tx.Update(ctx, parentBefore, parentAfter); err != nil {
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 
@@ -1903,7 +1915,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 		}
 
 		now := time.Now()
-		oldNode.mutate(func(row *pb.Inode) {
+		oldBefore, oldAfter := oldNode.mutate(func(row *pb.Inode) {
 			if row.GetNlink() == 0 {
 				row.Nlink = 1
 			}
@@ -1911,14 +1923,14 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			row.Ctime = timestamppb.New(now)
 		})
 
-		newParentInode.mutate(func(row *pb.Inode) {
+		newParentBefore, newParentAfter := newParentInode.mutate(func(row *pb.Inode) {
 			row.Mtime = timestamppb.New(now)
 			row.Ctime = timestamppb.New(now)
 		})
 
 		tx := v.metadataStream.Begin()
 
-		if _, err := tx.Update(ctx, oldNode.Row); err != nil {
+		if _, err := tx.Update(ctx, oldBefore, oldAfter); err != nil {
 			return nil, nil, fmt.Errorf("failed to log linked inode update: %w", err)
 		}
 
@@ -1929,11 +1941,11 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			IsDir:     false,
 			Mode:      oldNode.Row.GetMode(),
 		}
-		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
+		if _, err := tx.Create(ctx, dirEntryMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
-		if _, err := tx.Update(ctx, newParentInode.Row); err != nil {
+		if _, err := tx.Update(ctx, newParentBefore, newParentAfter); err != nil {
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 
@@ -2138,6 +2150,13 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 
 		// Tiny file check
 		if calculatedSize <= v.maxInlineLen && len(node.Chunks) == 0 {
+			hadPreviousChunk := (node.Row.GetSize() > 0) || len(node.InlineData) > 0
+			var prevInlineData []byte
+			if len(node.InlineData) > 0 {
+				prevInlineData = make([]byte, len(node.InlineData))
+				copy(prevInlineData, node.InlineData)
+			}
+
 			if node.InlineData == nil {
 				if offset == 0 {
 					node.InlineData = make([]byte, len(data))
@@ -2161,7 +2180,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 				copy(node.InlineData[offset:], data)
 			}
 
-			node.mutate(func(row *pb.Inode) {
+			beforeNode, afterNode := node.mutate(func(row *pb.Inode) {
 				row.ChunkSize = effectiveChunkSize
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
@@ -2175,14 +2194,26 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			})
 
 			tx := v.metadataStream.Begin()
-			if _, err := tx.Insert(ctx, &pb.FileChunk{
-				Ino:        proto.Uint64(node.Row.GetIno()),
+			newChunk := &pb.FileChunk{
+				Ino:        proto.Uint64(afterNode.GetIno()),
 				Index:      proto.Uint32(0),
 				InlineData: node.InlineData,
-			}); err != nil {
-				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 			}
-			if _, err := tx.Update(ctx, node.Row); err != nil {
+			if hadPreviousChunk {
+				oldChunk := &pb.FileChunk{
+					Ino:        proto.Uint64(afterNode.GetIno()),
+					Index:      proto.Uint32(0),
+					InlineData: prevInlineData,
+				}
+				if _, err := tx.Update(ctx, oldChunk, newChunk); err != nil {
+					return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inline FileChunk update: %w", err)
+				}
+			} else {
+				if _, err := tx.Create(ctx, newChunk); err != nil {
+					return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inline FileChunk creation: %w", err)
+				}
+			}
+			if _, err := tx.Update(ctx, beforeNode, afterNode); err != nil {
 				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log node inode update: %w", err)
 			}
 
@@ -2205,6 +2236,13 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		}
 
 		// Chunked file write
+		oldInlineData := node.InlineData
+		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+		oldChunks := make(map[uint32]string, len(node.Chunks))
+		for k, vVal := range node.Chunks {
+			oldChunks[k] = vVal
+		}
+
 		if len(node.InlineData) > 0 {
 			if node.StagedChunks == nil {
 				node.StagedChunks = make(map[int][]byte)
@@ -2220,7 +2258,6 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		if node.StagedChunks == nil {
 			node.StagedChunks = make(map[int][]byte)
 		}
-		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 
 		cs := int64(effectiveChunkSize)
 		startChunk := int(offset / cs)
@@ -2293,7 +2330,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			manifestHex = manifestBlob.SHA256Hex()
 		}
 
-		node.mutate(func(row *pb.Inode) {
+		beforeNode, afterNode := node.mutate(func(row *pb.Inode) {
 			row.ChunkSize = uint32(effectiveChunkSize)
 			row.Mtime = timestamppb.New(now)
 			row.Ctime = timestamppb.New(now)
@@ -2306,22 +2343,43 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 
 		tx := v.metadataStream.Begin()
 		for _, idx := range touchedIndices {
-			cSize := int64(node.Row.GetChunkSize())
+			cSize := int64(afterNode.GetChunkSize())
 			if cSize == 0 {
 				cSize = int64(effectiveChunkSize)
 			}
-			if int64(idx)*cSize < node.Row.GetSize() {
-				if _, err := tx.Insert(ctx, &pb.FileChunk{
-					Ino:    proto.Uint64(node.Row.GetIno()),
+			if int64(idx)*cSize < afterNode.GetSize() {
+				newChunk := &pb.FileChunk{
+					Ino:    proto.Uint64(afterNode.GetIno()),
 					Index:  proto.Uint32(uint32(idx)),
 					Sha256: chunkShas[idx],
-				}); err != nil {
-					return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log FileChunk: %w", err)
+				}
+				if oldSha, existed := oldChunks[uint32(idx)]; existed {
+					oldChunk := &pb.FileChunk{
+						Ino:    proto.Uint64(afterNode.GetIno()),
+						Index:  proto.Uint32(uint32(idx)),
+						Sha256: oldSha,
+					}
+					if _, err := tx.Update(ctx, oldChunk, newChunk); err != nil {
+						return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log FileChunk update: %w", err)
+					}
+				} else if idx == 0 && len(oldInlineData) > 0 {
+					oldChunk := &pb.FileChunk{
+						Ino:        proto.Uint64(afterNode.GetIno()),
+						Index:      proto.Uint32(0),
+						InlineData: oldInlineData,
+					}
+					if _, err := tx.Update(ctx, oldChunk, newChunk); err != nil {
+						return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log FileChunk update from inline: %w", err)
+					}
+				} else {
+					if _, err := tx.Create(ctx, newChunk); err != nil {
+						return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log FileChunk creation: %w", err)
+					}
 				}
 			}
 		}
 
-		if _, err := tx.Update(ctx, node.Row); err != nil {
+		if _, err := tx.Update(ctx, beforeNode, afterNode); err != nil {
 			return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inode update: %w", err)
 		}
 
@@ -2406,12 +2464,17 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 
 		now := time.Now()
 		node.IsDirty = true
-		oldChunks := node.Chunks
+		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+		oldInlineData := node.InlineData
+		oldChunks := make(map[uint32]string, len(node.Chunks))
+		for k, vVal := range node.Chunks {
+			oldChunks[k] = vVal
+		}
 
 		tx := v.metadataStream.Begin()
 
 		if size == 0 {
-			node.mutate(func(row *pb.Inode) {
+			beforeNode, afterNode := node.mutate(func(row *pb.Inode) {
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
 				row.Size = 0
@@ -2428,13 +2491,18 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 				node.Data = nil
 			}
 
-			for i := range oldChunks {
-				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(i)}); err != nil {
+			for i, sha := range oldChunks {
+				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(afterNode.GetIno()), Index: proto.Uint32(i), Sha256: sha}); err != nil {
 					return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
 				}
 			}
-			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(0)}); err != nil {
-				// delete chunk 0 inline if existed
+			if len(oldInlineData) > 0 {
+				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(afterNode.GetIno()), Index: proto.Uint32(0), InlineData: oldInlineData}); err != nil {
+					return nil, nil, fmt.Errorf("failed to delete inline FileChunk row: %w", err)
+				}
+			}
+			if _, err := tx.Update(ctx, beforeNode, afterNode); err != nil {
+				return nil, nil, fmt.Errorf("failed to log node inode update: %w", err)
 			}
 		} else if size <= v.maxInlineLen && len(oldChunks) <= 1 {
 			chunk0, _ := v.readChunkLocked(ctx, node, 0)
@@ -2450,22 +2518,38 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			node.StagedChunks = nil
 			node.DirtyChunks = nil
 
-			node.mutate(func(row *pb.Inode) {
+			beforeNode, afterNode := node.mutate(func(row *pb.Inode) {
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
 				row.Size = size
 				row.ContentSha256 = ""
 			})
 
-			for i := range oldChunks {
+			for i, sha := range oldChunks {
 				if i != 0 {
-					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(i)}); err != nil {
+					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(afterNode.GetIno()), Index: proto.Uint32(i), Sha256: sha}); err != nil {
 						return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
 					}
 				}
 			}
-			if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(0), InlineData: node.InlineData}); err != nil {
-				return nil, nil, fmt.Errorf("failed to update inline FileChunk: %w", err)
+			newChunk := &pb.FileChunk{Ino: proto.Uint64(afterNode.GetIno()), Index: proto.Uint32(0), InlineData: node.InlineData}
+			if oldSha, ok := oldChunks[0]; ok {
+				oldChunk := &pb.FileChunk{Ino: proto.Uint64(afterNode.GetIno()), Index: proto.Uint32(0), Sha256: oldSha}
+				if _, err := tx.Update(ctx, oldChunk, newChunk); err != nil {
+					return nil, nil, fmt.Errorf("failed to update inline FileChunk: %w", err)
+				}
+			} else if len(oldInlineData) > 0 {
+				oldChunk := &pb.FileChunk{Ino: proto.Uint64(afterNode.GetIno()), Index: proto.Uint32(0), InlineData: oldInlineData}
+				if _, err := tx.Update(ctx, oldChunk, newChunk); err != nil {
+					return nil, nil, fmt.Errorf("failed to update inline FileChunk: %w", err)
+				}
+			} else {
+				if _, err := tx.Create(ctx, newChunk); err != nil {
+					return nil, nil, fmt.Errorf("failed to create inline FileChunk: %w", err)
+				}
+			}
+			if _, err := tx.Update(ctx, beforeNode, afterNode); err != nil {
+				return nil, nil, fmt.Errorf("failed to log node inode update: %w", err)
 			}
 		} else {
 			cs := int64(node.Row.GetChunkSize())
@@ -2475,7 +2559,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 					cs = 64 * 1024
 				}
 			}
-			_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 
 			if node.Chunks == nil {
 				node.Chunks = make(map[uint32]string)
@@ -2488,10 +2571,10 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 					delete(node.StagedChunks, k)
 				}
 			}
-			for i := range node.Chunks {
+			for i, oldSha := range oldChunks {
 				if int(i) >= newNumChunks {
 					delete(node.Chunks, i)
-					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(i)}); err != nil {
+					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(i), Sha256: oldSha}); err != nil {
 						return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
 					}
 				}
@@ -2510,12 +2593,24 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 							chunkSha: blob.NewByteStreamFromBytes(chunkData),
 						})
 					}
-					if _, err := tx.Insert(ctx, &pb.FileChunk{
+					newChunk := &pb.FileChunk{
 						Ino:    proto.Uint64(node.Row.GetIno()),
 						Index:  proto.Uint32(uint32(lastIdx)),
 						Sha256: chunkSha,
-					}); err != nil {
-						return nil, nil, fmt.Errorf("failed to log truncated chunk: %w", err)
+					}
+					if oldSha, ok := oldChunks[uint32(lastIdx)]; ok {
+						oldChunk := &pb.FileChunk{
+							Ino:    proto.Uint64(node.Row.GetIno()),
+							Index:  proto.Uint32(uint32(lastIdx)),
+							Sha256: oldSha,
+						}
+						if _, err := tx.Update(ctx, oldChunk, newChunk); err != nil {
+							return nil, nil, fmt.Errorf("failed to update truncated chunk: %w", err)
+						}
+					} else {
+						if _, err := tx.Create(ctx, newChunk); err != nil {
+							return nil, nil, fmt.Errorf("failed to create truncated chunk: %w", err)
+						}
 					}
 				} else if _, exists := node.Chunks[uint32(lastIdx)]; exists {
 					chunkData, _ := v.readChunkLocked(ctx, node, lastIdx)
@@ -2532,28 +2627,39 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 								chunkSha: blob.NewByteStreamFromBytes(chunkData),
 							})
 						}
-						if _, err := tx.Insert(ctx, &pb.FileChunk{
+						newChunk := &pb.FileChunk{
 							Ino:    proto.Uint64(node.Row.GetIno()),
 							Index:  proto.Uint32(uint32(lastIdx)),
 							Sha256: chunkSha,
-						}); err != nil {
-							return nil, nil, fmt.Errorf("failed to log truncated chunk: %w", err)
+						}
+						if oldSha, ok := oldChunks[uint32(lastIdx)]; ok {
+							oldChunk := &pb.FileChunk{
+								Ino:    proto.Uint64(node.Row.GetIno()),
+								Index:  proto.Uint32(uint32(lastIdx)),
+								Sha256: oldSha,
+							}
+							if _, err := tx.Update(ctx, oldChunk, newChunk); err != nil {
+								return nil, nil, fmt.Errorf("failed to update truncated chunk: %w", err)
+							}
+						} else {
+							if _, err := tx.Create(ctx, newChunk); err != nil {
+								return nil, nil, fmt.Errorf("failed to create truncated chunk: %w", err)
+							}
 						}
 					}
 				}
 			}
 
-			node.mutate(func(row *pb.Inode) {
+			beforeNode, afterNode := node.mutate(func(row *pb.Inode) {
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
 				row.ChunkSize = uint32(cs)
 				row.Size = size
 				row.ContentSha256 = ""
 			})
-		}
-
-		if _, err := tx.Update(ctx, node.Row); err != nil {
-			return nil, nil, fmt.Errorf("failed to log node inode update: %w", err)
+			if _, err := tx.Update(ctx, beforeNode, afterNode); err != nil {
+				return nil, nil, fmt.Errorf("failed to log node inode update: %w", err)
+			}
 		}
 
 		commitSeq, err := tx.Commit(ctx)
@@ -2640,7 +2746,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		}
 
 		now := time.Now()
-		childInode.mutate(func(row *pb.Inode) {
+		childBefore, childAfter := childInode.mutate(func(row *pb.Inode) {
 			if row.GetNlink() > 1 {
 				row.Nlink--
 			} else {
@@ -2649,9 +2755,10 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			row.Ctime = timestamppb.New(now)
 		})
 
+		var parentBefore, parentAfter *pb.Inode
 		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
 		if parentInode != nil {
-			parentInode.mutate(func(row *pb.Inode) {
+			parentBefore, parentAfter = parentInode.mutate(func(row *pb.Inode) {
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
 			})
@@ -2659,16 +2766,16 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 
 		var commitSeq uint64
 		tx := v.metadataStream.Begin()
-		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
+		if _, err := tx.Delete(ctx, de); err != nil {
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
 
-		if childInode.Row.GetNlink() > 0 || v.hasOpenHandlesLocked(childInodeID) {
-			if _, err := tx.Update(ctx, childInode.Row); err != nil {
+		if childAfter.GetNlink() > 0 || v.hasOpenHandlesLocked(childInodeID) {
+			if _, err := tx.Update(ctx, childBefore, childAfter); err != nil {
 				return nil, fmt.Errorf("failed to log child inode update: %w", err)
 			}
 		} else {
-			if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInodeID)}); err != nil {
+			if _, err := tx.Delete(ctx, childBefore); err != nil {
 				return nil, fmt.Errorf("failed to log child inode deletion: %w", err)
 			}
 			chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInodeID)}, 1)
@@ -2681,14 +2788,14 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			}
 			for _, cMsg := range chunkMsgs {
 				c := cMsg.(*pb.FileChunk)
-				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
+				if _, err := tx.Delete(ctx, c); err != nil {
 					return nil, fmt.Errorf("failed to log chunk deletion for inode %d: %w", childInodeID, err)
 				}
 			}
 		}
 
 		if parentInode != nil {
-			if _, err := tx.Update(ctx, parentInode.Row); err != nil {
+			if _, err := tx.Update(ctx, parentBefore, parentAfter); err != nil {
 				return nil, fmt.Errorf("failed to log parent inode update: %w", err)
 			}
 		}
@@ -2770,9 +2877,10 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		delete(v.dirParents, childInodeID)
 
 		now := time.Now()
+		var parentBefore, parentAfter *pb.Inode
 		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
 		if parentInode != nil {
-			parentInode.mutate(func(row *pb.Inode) {
+			parentBefore, parentAfter = parentInode.mutate(func(row *pb.Inode) {
 				if row.GetNlink() > 2 {
 					row.Nlink--
 				}
@@ -2783,14 +2891,14 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 
 		var commitSeq uint64
 		tx := v.metadataStream.Begin()
-		if _, err = tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
+		if _, err = tx.Delete(ctx, de); err != nil {
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
-		if _, err = tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInodeID)}); err != nil {
+		if _, err = tx.Delete(ctx, childInode.Row); err != nil {
 			return nil, fmt.Errorf("failed to log inode deletion: %w", err)
 		}
 		if parentInode != nil {
-			if _, err = tx.Update(ctx, parentInode.Row); err != nil {
+			if _, err = tx.Update(ctx, parentBefore, parentAfter); err != nil {
 				return nil, fmt.Errorf("failed to log parent inode update: %w", err)
 			}
 		}
@@ -2922,35 +3030,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 					v.dirParents = make(map[uint64]uint64)
 				}
 				v.dirParents[childInode.Row.GetIno()] = newParentInodeID
-
-				if oldParentInode != nil {
-					oldParentInode.mutate(func(row *pb.Inode) {
-						if row.GetNlink() > 2 {
-							row.Nlink--
-						}
-					})
-				}
-				if !targetExists && newParentInode != nil {
-					newParentInode.mutate(func(row *pb.Inode) {
-						if row.GetNlink() < 2 {
-							row.Nlink = 2
-						}
-						row.Nlink++
-					})
-				}
-			} else if targetExists {
-				// Replaced empty subdirectory within same parent: parent nlink decreases by 1
-				if newParentInode != nil {
-					newParentInode.mutate(func(row *pb.Inode) {
-						if row.GetNlink() > 2 {
-							row.Nlink--
-						}
-					})
-				}
 			}
-			childInode.mutate(func(row *pb.Inode) {
-				row.ParentIno = proto.Uint64(newParentInodeID)
-			})
 		} else {
 			if targetExists {
 				if targetInode.Row.GetIsDir() {
@@ -2960,6 +3040,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		}
 
 		now := time.Now()
+		var targetBefore, targetAfter *pb.Inode
 		if targetExists && targetInode != nil {
 			if targetInode.Data != nil {
 				if err := targetInode.Data.Close(); err != nil {
@@ -2969,8 +3050,9 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			}
 			if targetInode.Row.GetIsDir() {
 				delete(v.dirParents, targetInodeID)
+				targetBefore = targetInode.Row
 			} else {
-				targetInode.mutate(func(row *pb.Inode) {
+				targetBefore, targetAfter = targetInode.mutate(func(row *pb.Inode) {
 					if row.GetNlink() > 1 {
 						row.Nlink--
 					} else {
@@ -2981,18 +3063,40 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			}
 		}
 
-		childInode.mutate(func(row *pb.Inode) {
+		childBefore, childAfter := childInode.mutate(func(row *pb.Inode) {
+			if row.GetIsDir() {
+				row.ParentIno = proto.Uint64(newParentInodeID)
+			}
 			row.Ctime = timestamppb.New(now)
 		})
 
+		var oldParentBefore, oldParentAfter *pb.Inode
 		if oldParentInode != nil {
-			oldParentInode.mutate(func(row *pb.Inode) {
+			oldParentBefore, oldParentAfter = oldParentInode.mutate(func(row *pb.Inode) {
+				if childInode.Row.GetIsDir() && newParentInodeID != oldParentInodeID {
+					if row.GetNlink() > 2 {
+						row.Nlink--
+					}
+				}
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
 			})
 		}
+		var newParentBefore, newParentAfter *pb.Inode
 		if newParentInode != nil {
-			newParentInode.mutate(func(row *pb.Inode) {
+			newParentBefore, newParentAfter = newParentInode.mutate(func(row *pb.Inode) {
+				if childInode.Row.GetIsDir() {
+					if newParentInodeID != oldParentInodeID && !targetExists {
+						if row.GetNlink() < 2 {
+							row.Nlink = 2
+						}
+						row.Nlink++
+					} else if newParentInodeID == oldParentInodeID && targetExists {
+						if row.GetNlink() > 2 {
+							row.Nlink--
+						}
+					}
+				}
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
 			})
@@ -3000,25 +3104,25 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 
 		var commitSeq uint64
 		tx := v.metadataStream.Begin()
-		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(oldParentInodeID), Name: proto.String(oldName)}); err != nil {
+		if _, err := tx.Delete(ctx, oldDe); err != nil {
 			return nil, nil, fmt.Errorf("failed to log old dir entry deletion: %w", err)
 		}
 		if targetExists {
-			if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(newParentInodeID), Name: proto.String(newName)}); err != nil {
+			if _, err := tx.Delete(ctx, targetDe); err != nil {
 				return nil, nil, fmt.Errorf("failed to log target dir entry deletion: %w", err)
 			}
 			if targetInode != nil {
 				if targetInode.Row.GetIsDir() {
-					if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(targetInode.Row.GetIno())}); err != nil {
+					if _, err := tx.Delete(ctx, targetBefore); err != nil {
 						return nil, nil, fmt.Errorf("failed to log target inode deletion: %w", err)
 					}
-				} else if targetInode.Row.GetNlink() == 0 {
+				} else if targetAfter.GetNlink() == 0 {
 					if v.hasOpenHandlesLocked(targetInodeID) {
-						if _, err := tx.Update(ctx, targetInode.Row); err != nil {
+						if _, err := tx.Update(ctx, targetBefore, targetAfter); err != nil {
 							return nil, nil, fmt.Errorf("failed to log target orphan inode update: %w", err)
 						}
 					} else {
-						if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(targetInode.Row.GetIno())}); err != nil {
+						if _, err := tx.Delete(ctx, targetBefore); err != nil {
 							return nil, nil, fmt.Errorf("failed to log target inode deletion: %w", err)
 						}
 						chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(targetInodeID)}, 1)
@@ -3031,19 +3135,19 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 						}
 						for _, cMsg := range chunkMsgs {
 							c := cMsg.(*pb.FileChunk)
-							if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(targetInodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
+							if _, err := tx.Delete(ctx, c); err != nil {
 								return nil, nil, fmt.Errorf("failed to log chunk deletion for target inode %d: %w", targetInodeID, err)
 							}
 						}
 					}
 				} else {
-					if _, err := tx.Update(ctx, targetInode.Row); err != nil {
+					if _, err := tx.Update(ctx, targetBefore, targetAfter); err != nil {
 						return nil, nil, fmt.Errorf("failed to log target inode update: %w", err)
 					}
 				}
 			}
 		}
-		if _, err := tx.Insert(ctx, &pb.DirEntry{
+		if _, err := tx.Create(ctx, &pb.DirEntry{
 			ParentIno: proto.Uint64(newParentInodeID),
 			Name:      proto.String(newName),
 			Ino:       childInode.Row.GetIno(),
@@ -3053,17 +3157,17 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			return nil, nil, fmt.Errorf("failed to log new dir entry insertion: %w", err)
 		}
 		if childInode != nil {
-			if _, err := tx.Update(ctx, childInode.Row); err != nil {
+			if _, err := tx.Update(ctx, childBefore, childAfter); err != nil {
 				return nil, nil, fmt.Errorf("failed to log child inode update: %w", err)
 			}
 		}
 		if oldParentInode != nil {
-			if _, err := tx.Update(ctx, oldParentInode.Row); err != nil {
+			if _, err := tx.Update(ctx, oldParentBefore, oldParentAfter); err != nil {
 				return nil, nil, fmt.Errorf("failed to log old parent inode update: %w", err)
 			}
 		}
 		if newParentInode != nil && newParentInodeID != oldParentInodeID {
-			if _, err := tx.Update(ctx, newParentInode.Row); err != nil {
+			if _, err := tx.Update(ctx, newParentBefore, newParentAfter); err != nil {
 				return nil, nil, fmt.Errorf("failed to log new parent inode update: %w", err)
 			}
 		}
@@ -3198,7 +3302,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 
 	if !node.Row.GetIsDir() && node.Row.GetNlink() == 0 {
 		tx := v.metadataStream.Begin()
-		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(inodeID)}); err != nil {
+		if _, err := tx.Delete(ctx, node.Row); err != nil {
 			return fmt.Errorf("failed to log orphan inode deletion: %w", err)
 		}
 		chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(inodeID)}, 1)
@@ -3211,7 +3315,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 		}
 		for _, cMsg := range chunkMsgs {
 			c := cMsg.(*pb.FileChunk)
-			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(inodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
+			if _, err := tx.Delete(ctx, c); err != nil {
 				return fmt.Errorf("failed to log chunk deletion for inode %d: %w", inodeID, err)
 			}
 		}

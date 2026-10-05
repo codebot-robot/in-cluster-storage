@@ -337,14 +337,16 @@ type CachedInode struct {
 }
 
 // mutate applies fn to a cloned copy of Row and updates Row to the new clone.
-// It returns the newly created row. This ensures rows are never mutated in place.
-func (n *CachedInode) mutate(fn func(*pb.Inode)) *pb.Inode {
+// It returns (before, after), where before is the previous node.Row pointer,
+// which is immutable, and after is the newly created row. This ensures rows are never mutated in place.
+func (n *CachedInode) mutate(fn func(*pb.Inode)) (*pb.Inode, *pb.Inode) {
 	if n == nil {
-		return nil
+		return nil, nil
 	}
+	before := n.Row
 	var newRow *pb.Inode
-	if n.Row != nil {
-		newRow = proto.Clone(n.Row).(*pb.Inode)
+	if before != nil {
+		newRow = proto.Clone(before).(*pb.Inode)
 	} else {
 		newRow = &pb.Inode{}
 	}
@@ -352,5 +354,5 @@ func (n *CachedInode) mutate(fn func(*pb.Inode)) *pb.Inode {
 		fn(newRow)
 	}
 	n.Row = newRow
-	return newRow
+	return before, newRow
 }
