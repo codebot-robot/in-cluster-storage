@@ -101,6 +101,7 @@ type Server struct {
 	metadataCacheBytes       int64
 	metadataOverlayMaxBytes  int64
 	metadataApplierBatchSize int
+	localStorageDir          string
 	streamFactory            func(volumeID string) (walclient.Stream, error)
 
 	flushTicker *time.Ticker
@@ -163,6 +164,13 @@ func WithServerMetadataApplierBatchSize(batchSize int) ServerOption {
 	}
 }
 
+// WithServerLocalStorageDir sets the local directory for metadata storage for all volumes.
+func WithServerLocalStorageDir(dir string) ServerOption {
+	return func(s *Server) {
+		s.localStorageDir = dir
+	}
+}
+
 func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if backend == nil {
 		backend = NewMemoryBackend()
@@ -213,6 +221,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if s.metadataApplierBatchSize > 0 {
 			volOpts = append(volOpts, WithApplierBatchSize(s.metadataApplierBatchSize))
+		}
+		if s.localStorageDir != "" {
+			volOpts = append(volOpts, WithLocalStorageDir(s.localStorageDir))
 		}
 
 		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
@@ -877,5 +888,47 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	return &pb.CreateSnapshotResponse{
 		SnapshotName: snapName,
 		Snapshot:     snapInfo,
+	}, nil
+}
+
+const (
+	defaultNominalCapacityBytes = 4 * 1024 * 1024 * 1024 * 1024 // 4 TiB nominal capacity
+	defaultNominalTotalInodes   = 10000000                      // 10,000,000 nominal inodes
+)
+
+func (s *Server) GetVolumeStats(ctx context.Context, req *pb.GetVolumeStatsRequest) (*pb.GetVolumeStatsResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+
+	st := vol.Stats()
+
+	totalBytes := int64(defaultNominalCapacityBytes)
+	usedBytes := st.Stats.GetLogicalBytes()
+	availBytes := totalBytes - usedBytes
+	if availBytes < 0 {
+		availBytes = 0
+	}
+
+	totalInodes := int64(defaultNominalTotalInodes)
+	usedInodes := st.Stats.GetInodesFile() + st.Stats.GetInodesDir() + st.Stats.GetInodesSymlink() + st.Stats.GetInodesOther()
+	freeInodes := totalInodes - usedInodes
+	if freeInodes < 0 {
+		freeInodes = 0
+	}
+
+	return &pb.GetVolumeStatsResponse{
+		Stats:          st.Stats,
+		TotalBytes:     totalBytes,
+		UsedBytes:      usedBytes,
+		AvailableBytes: availBytes,
+		TotalInodes:    totalInodes,
+		UsedInodes:     usedInodes,
+		FreeInodes:     freeInodes,
+		Error:          0,
 	}, nil
 }

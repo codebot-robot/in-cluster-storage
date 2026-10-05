@@ -46,6 +46,7 @@ service ObjectFSController {
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc GetVolumeStats(GetVolumeStatsRequest) returns (GetVolumeStatsResponse);
 }
 
 enum WriteMode {
@@ -371,6 +372,32 @@ message CreateSnapshotRequest {
 message CreateSnapshotResponse {
   string snapshot_name = 1;
   SnapshotInfo snapshot = 2;
+}
+
+message GetVolumeStatsRequest {
+  string volume_id = 1;
+}
+
+message VolumeStats {
+  string name = 1;
+  uint64 max_ino = 2;
+  int64 inodes_file = 3;
+  int64 inodes_dir = 4;
+  int64 inodes_symlink = 5;
+  int64 inodes_other = 6;
+  int64 logical_bytes = 7;
+  int64 file_chunks = 8;
+}
+
+message GetVolumeStatsResponse {
+  VolumeStats stats = 1;
+  int64 total_bytes = 2;
+  int64 used_bytes = 3;
+  int64 available_bytes = 4;
+  int64 total_inodes = 5;
+  int64 used_inodes = 6;
+  int64 free_inodes = 7;
+  int32 error = 8;
 }
 
 message Inode {

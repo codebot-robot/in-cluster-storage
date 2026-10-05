@@ -32,7 +32,9 @@ import (
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 )
 
@@ -306,4 +308,51 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 
 	klog.Infof("Successfully unpublished ObjectFS volume from %s", targetPath)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+func (d *objectFSDriver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+	volumeID := req.GetVolumeId()
+	volumePath := req.GetVolumePath()
+
+	if volumeID == "" && volumePath != "" {
+		d.mu.Lock()
+		if m, ok := d.mounts[volumePath]; ok {
+			volumeID = m.volumeID
+		}
+		d.mu.Unlock()
+	}
+
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id or volume_path is required")
+	}
+
+	client, err := d.getClient()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get ObjectFS client: %v", err)
+	}
+
+	resp, err := client.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: volumeID})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "GetVolumeStats failed: %v", err)
+	}
+	if resp.GetError() != 0 {
+		return nil, status.Errorf(codes.Internal, "GetVolumeStats returned error code: %d", resp.GetError())
+	}
+
+	return &csi.NodeGetVolumeStatsResponse{
+		Usage: []*csi.VolumeUsage{
+			{
+				Total:     resp.GetTotalBytes(),
+				Used:      resp.GetUsedBytes(),
+				Available: resp.GetAvailableBytes(),
+				Unit:      csi.VolumeUsage_BYTES,
+			},
+			{
+				Total:     resp.GetTotalInodes(),
+				Used:      resp.GetUsedInodes(),
+				Available: resp.GetFreeInodes(),
+				Unit:      csi.VolumeUsage_INODES,
+			},
+		},
+	}, nil
 }

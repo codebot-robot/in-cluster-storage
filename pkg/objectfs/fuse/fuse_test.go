@@ -1783,3 +1783,73 @@ func TestFillAttrOutFromEmbeddedInode(t *testing.T) {
 		t.Errorf("NodeId mismatch: got %d, want 42", entryOut.NodeId)
 	}
 }
+
+func TestObjectFS_StatFs(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-statfs-volume"
+	cache := NewNodeCache(1024 * 1024)
+	fs := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Initial StatFs: root directory exists (1 inode)
+	var out fuse.StatfsOut
+	status := fs.StatFs(nil, &fuse.InHeader{}, &out)
+	if status != fuse.OK {
+		t.Fatalf("StatFs returned %v", status)
+	}
+	if out.Files != 10000000 {
+		t.Errorf("expected 10000000 nominal files, got %d", out.Files)
+	}
+	// Used inodes = 1 (root dir), so free should be 10000000 - 1 = 9999999
+	if out.Ffree != 9999999 {
+		t.Errorf("expected 9999999 free inodes, got %d", out.Ffree)
+	}
+
+	// Create a file and write 8192 bytes (2 blocks of 4096)
+	ctx := t.Context()
+	createResp, err := client.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "testfile.bin",
+		Mode:        0644,
+	})
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := createResp.GetAttr().GetInode().GetIno()
+	writeResp, err := client.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   0,
+		Data:     make([]byte, 8192),
+	})
+	if err != nil || writeResp.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	fsyncResp, err := client.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+	})
+	if err != nil || fsyncResp.GetError() != 0 {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	// StatFs should now reflect 2 inodes used and 2 blocks (8192 bytes) used
+	var out2 fuse.StatfsOut
+	expectedFreeBlocks := uint64(1073741824 - 2)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status = fs.StatFs(nil, &fuse.InHeader{}, &out2)
+		if status != fuse.OK {
+			t.Fatalf("StatFs returned %v", status)
+		}
+		if out2.Ffree == 9999998 && out2.Bfree == expectedFreeBlocks {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for StatFs to reflect write: got Ffree=%d (want 9999998), Bfree=%d (want %d)", out2.Ffree, out2.Bfree, expectedFreeBlocks)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

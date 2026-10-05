@@ -264,14 +264,24 @@ func (v *Volume) initMetadataViewLocked(ctx context.Context, customIndex sds.Loc
 	}
 
 	viewOpts := append([]view.Option{}, v.viewOpts...)
+	initialStats := &pb.VolumeStats{Name: VolumeStatsRowName}
+	viewOpts = append(viewOpts, view.WithStats(initialStats, UpdateVolumeStats))
 	if v.metadataStream != nil {
+		if _, err := v.metadataStream.Registry().RegisterMessage(initialStats, 1); err != nil {
+			return fmt.Errorf("failed to register VolumeStats message: %w", err)
+		}
 		viewOpts = append(viewOpts, view.WithRegistry(v.metadataStream.Registry()))
 	}
 
 	v.metadataView = view.New(index, viewOpts...)
 
 	if v.metadataStream != nil {
-		_ = v.metadataView.SyncRegistry(ctx, v.metadataStream.Registry())
+		if err := v.metadataView.SyncRegistry(ctx, v.metadataStream.Registry()); err != nil {
+			return fmt.Errorf("failed to sync registry with metadata view: %w", err)
+		}
+	}
+	if err := v.metadataView.LoadStats(ctx); err != nil {
+		return fmt.Errorf("failed to load metadata view stats: %w", err)
 	}
 
 	return nil
@@ -726,6 +736,8 @@ type VolumeStats struct {
 	Failures       uint64
 	IsDegraded     bool
 	Cache          view.LRUCacheStats
+
+	Stats *pb.VolumeStats
 }
 
 // Stats returns a snapshot of volume operational and cache metrics.
@@ -735,12 +747,22 @@ func (v *Volume) Stats() VolumeStats {
 	if v.metadataView == nil {
 		return VolumeStats{}
 	}
+	var st *pb.VolumeStats
+	if m := v.metadataView.Stats(); m != nil {
+		if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
+			st = proto.Clone(vs).(*pb.VolumeStats)
+		}
+	}
+	if st == nil {
+		st = &pb.VolumeStats{}
+	}
 	return VolumeStats{
 		Lag:            v.metadataView.Lag(v.lastCommitSeq),
 		UnappliedBytes: v.metadataView.UnappliedBytes(),
 		Failures:       v.metadataView.ApplierFailures(),
 		IsDegraded:     v.metadataView.IsDegraded(),
 		Cache:          v.metadataView.CacheStats(),
+		Stats:          st,
 	}
 }
 
@@ -3735,20 +3757,18 @@ func (v *Volume) ReplaySDSChanges(changes []sds.Change) error {
 	return nil
 }
 
-func (v *Volume) updateNextInodeFromMetadataLocked(ctx context.Context) {
+func (v *Volume) initNextInodeFromStatsLocked(ctx context.Context, highestReplayedIno uint64) error {
 	if v.metadataView == nil {
-		return
+		return nil
 	}
 	var maxIno uint64
-	for msg, err := range v.metadataView.Scan(ctx, "objectfs.v1alpha1.Inode", nil) {
-		if err != nil {
-			return
+	if m := v.metadataView.Stats(); m != nil {
+		if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
+			maxIno = vs.GetMaxIno()
 		}
-		if inode, ok := msg.(*pb.Inode); ok {
-			if inode.GetIno() > maxIno {
-				maxIno = inode.GetIno()
-			}
-		}
+	}
+	if highestReplayedIno > maxIno {
+		maxIno = highestReplayedIno
 	}
 	if maxIno > 0 {
 		next := ((maxIno + erofs.DefaultInodeStride) / erofs.DefaultInodeStride) * erofs.DefaultInodeStride
@@ -3759,7 +3779,7 @@ func (v *Volume) updateNextInodeFromMetadataLocked(ctx context.Context) {
 	if v.nextInode < erofs.DefaultInodeStride {
 		v.nextInode = erofs.DefaultInodeStride
 	}
-	v.rootInodeID = 1
+	return nil
 }
 
 func (v *Volume) importErofsToLocalIndexLocked(ctx context.Context, reader *erofs.Reader, snapPos uint64) error {
@@ -4092,6 +4112,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	}
 
 	// Replay stream from snapPos
+	var highestReplayedIno uint64
 	if v.stream != nil {
 		recovered := v.stream.RecoveredRecords()
 		if len(recovered) > 0 {
@@ -4109,6 +4130,11 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 					if ch.Seq > v.lastCommitSeq {
 						v.lastCommitSeq = ch.Seq
 					}
+					if ch.TypeName == InodeTypeName {
+						if in, ok := ch.Row.(*pb.Inode); ok && in != nil && in.GetIno() > highestReplayedIno {
+							highestReplayedIno = in.GetIno()
+						}
+					}
 				}
 			}
 			sr.ChangeReader().DiscardPending()
@@ -4119,7 +4145,9 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		v.metadataView.ClearCache()
 	}
 
-	v.updateNextInodeFromMetadataLocked(ctx)
+	if err := v.initNextInodeFromStatsLocked(ctx, highestReplayedIno); err != nil {
+		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
+	}
 	return nil
 }
 
@@ -4297,7 +4325,9 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 	if v.metadataView != nil {
 		v.metadataView.ClearCache()
 	}
-	v.updateNextInodeFromMetadataLocked(ctx)
+	if err := v.initNextInodeFromStatsLocked(ctx, 0); err != nil {
+		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
+	}
 
 	return nil
 }

@@ -17,10 +17,16 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"net"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 func TestParseEndpoint(t *testing.T) {
@@ -87,5 +93,51 @@ func TestPluginInfo(t *testing.T) {
 	}
 	if nodeInfo.GetNodeId() != "test-node" {
 		t.Errorf("Expected node ID test-node, got %s", nodeInfo.GetNodeId())
+	}
+}
+
+func TestNodeGetVolumeStats(t *testing.T) {
+	ctx := t.Context()
+	server := controller.NewServer(nil)
+	volumeID := "test-csi-stats-vol"
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	driver := newDriver("test-node", "passthrough://bufnet", 1024*1024)
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient failed: %v", err)
+	}
+	defer conn.Close()
+	driver.client = pb.NewObjectFSControllerClient(conn)
+
+	resp, err := driver.NodeGetVolumeStats(ctx, &csi.NodeGetVolumeStatsRequest{
+		VolumeId: volumeID,
+	})
+	if err != nil {
+		t.Fatalf("NodeGetVolumeStats failed: %v", err)
+	}
+	if len(resp.GetUsage()) != 2 {
+		t.Fatalf("expected 2 usage entries (bytes and inodes), got %d", len(resp.GetUsage()))
+	}
+	bytesUsage := resp.GetUsage()[0]
+	if bytesUsage.GetUnit() != csi.VolumeUsage_BYTES {
+		t.Errorf("expected unit BYTES, got %v", bytesUsage.GetUnit())
+	}
+	inodesUsage := resp.GetUsage()[1]
+	if inodesUsage.GetUnit() != csi.VolumeUsage_INODES {
+		t.Errorf("expected unit INODES, got %v", inodesUsage.GetUnit())
+	}
+	if inodesUsage.GetUsed() != 1 { // root directory inode
+		t.Errorf("expected 1 used inode, got %d", inodesUsage.GetUsed())
 	}
 }
