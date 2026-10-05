@@ -19,6 +19,7 @@ package view
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"iter"
 	"sort"
 	"sync"
@@ -36,8 +37,19 @@ type OverlayEntry struct {
 	Size int64
 }
 
+// StatsUpdateFunc computes updated stats from a transition between before and after.
+type StatsUpdateFunc func(stats, before, after proto.Message) error
+
 // Option configures a View.
 type Option func(*View)
+
+// WithStats configures typed statistics tracking for the View.
+func WithStats(initial proto.Message, update StatsUpdateFunc) Option {
+	return func(v *View) {
+		v.statsRow = proto.Clone(initial)
+		v.statsUpdate = update
+	}
+}
 
 // WithBatchSize sets the maximum batch size for the background applier.
 func WithBatchSize(batchSize int) Option {
@@ -85,9 +97,10 @@ func WithRegistry(reg *record.Registry) Option {
 // View wraps an underlying sds.LocalIndex with an unapplied mutations overlay,
 // an LRU read cache, and an asynchronous write-behind applier.
 type View struct {
-	mu    sync.RWMutex
-	index sds.LocalIndex
-	reg   *record.Registry
+	mu      sync.RWMutex
+	indexMu sync.Mutex
+	index   sds.LocalIndex
+	reg     *record.Registry
 
 	cache           *LRUCache[CacheKey, *CachedRow]
 	cacheDisabled   bool
@@ -103,6 +116,10 @@ type View struct {
 	appliedPos uint64
 	batchSize  int
 	faultHook  func() error
+
+	statsRow    proto.Message
+	statsUpdate StatsUpdateFunc
+	loadErr     error
 
 	backpressureCond *sync.Cond
 	flushCond        *sync.Cond
@@ -135,6 +152,9 @@ func New(index sds.LocalIndex, opts ...Option) *View {
 
 	if index != nil {
 		v.appliedPos = index.Position()
+		if err := v.loadStatsLocked(context.Background()); err != nil {
+			v.loadErr = err
+		}
 	}
 
 	v.applier = newApplier(v, v.batchSize, v.faultHook)
@@ -151,13 +171,221 @@ func (v *View) Index() sds.LocalIndex {
 }
 
 // SetIndex replaces the underlying index (e.g. on restore).
-func (v *View) SetIndex(index sds.LocalIndex) {
+func (v *View) SetIndex(index sds.LocalIndex) error {
+	v.indexMu.Lock()
+	defer v.indexMu.Unlock()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.index = index
+	v.loadErr = nil
 	if index != nil {
 		v.appliedPos = index.Position()
+		if err := v.loadStatsLocked(context.Background()); err != nil {
+			v.loadErr = err
+			return err
+		}
 	}
+	return nil
+}
+
+// LoadStats loads or recomputes index statistics, returning any error encountered.
+func (v *View) LoadStats(ctx context.Context) error {
+	v.indexMu.Lock()
+	defer v.indexMu.Unlock()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.loadErr != nil {
+		return v.loadErr
+	}
+	return v.loadStatsLocked(ctx)
+}
+
+func (v *View) loadStatsLocked(ctx context.Context) error {
+	if v.index == nil || v.statsRow == nil || v.statsUpdate == nil {
+		return nil
+	}
+	statsTypeName := string(v.statsRow.ProtoReflect().Descriptor().FullName())
+	if v.reg == nil {
+		v.reg = record.NewRegistry()
+	}
+	if _, err := v.reg.RegisterMessage(v.statsRow, 1); err != nil {
+		return fmt.Errorf("failed to register stats message %s: %w", statsTypeName, err)
+	}
+	if err := v.index.SyncRegistry(ctx, v.reg); err != nil {
+		return fmt.Errorf("failed to sync registry with index: %w", err)
+	}
+
+	def, _, ok := v.reg.LookupByName(statsTypeName)
+	if !ok {
+		return fmt.Errorf("stats type %s not in registry", statsTypeName)
+	}
+	kBytes, _, err := sds.SplitKeyAndNonKey(v.statsRow, def.GetKeyFields())
+	if err != nil {
+		return fmt.Errorf("failed to extract stats key: %w", err)
+	}
+	statsKey := sds.NewKeyFromBytes(kBytes)
+
+	msg, ok, err := v.index.Get(ctx, statsTypeName, statsKey)
+	if err != nil {
+		return fmt.Errorf("failed to get stats from index: %w", err)
+	}
+	if ok && msg != nil {
+		v.statsRow = proto.Clone(msg)
+		return nil
+	}
+
+	// Stats row missing: recompute via full scan over all registered types
+	newStats := proto.Clone(v.statsRow)
+	hasRows := false
+
+	for _, tdef := range v.reg.Export().GetTypes() {
+		typeName := tdef.GetName()
+		if typeName == statsTypeName {
+			continue
+		}
+		for row, scanErr := range v.index.Scan(ctx, typeName, nil) {
+			if scanErr != nil {
+				return fmt.Errorf("failed to scan %s for stats recomputation: %w", typeName, scanErr)
+			}
+			hasRows = true
+			if err := v.statsUpdate(newStats, nil, row); err != nil {
+				return fmt.Errorf("stats update failed on scan of %s: %w", typeName, err)
+			}
+		}
+	}
+
+	if hasRows || v.index.Position() > 0 {
+		rawKey, rawVal, err := sds.SplitKeyAndNonKey(newStats, def.GetKeyFields())
+		if err != nil {
+			return fmt.Errorf("failed to split stats row: %w", err)
+		}
+		statsChange := sds.Change{
+			Seq:      v.index.Position(),
+			TypeName: statsTypeName,
+			TypeID:   def.GetId(),
+			Op:       sds.OpUpdate,
+			Key:      statsKey,
+			RawKey:   rawKey,
+			RawVal:   rawVal,
+			Row:      newStats,
+		}
+		if err := v.index.ApplyBatch(ctx, []sds.Change{statsChange}); err != nil {
+			return fmt.Errorf("failed to write initial stats row: %w", err)
+		}
+	}
+
+	v.statsRow = newStats
+	return nil
+}
+
+// Stats returns a clone of the current in-memory stats row.
+func (v *View) Stats() proto.Message {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.statsRow == nil {
+		return nil
+	}
+	return proto.Clone(v.statsRow)
+}
+
+func (v *View) computeBatchStats(ctx context.Context, changes []sds.Change, baseStats proto.Message, batchSeq uint64) ([]sds.Change, proto.Message, error) {
+	if v.statsRow == nil || v.statsUpdate == nil || v.index == nil {
+		return changes, baseStats, nil
+	}
+
+	newStats := proto.Clone(baseStats)
+	statsTypeName := string(newStats.ProtoReflect().Descriptor().FullName())
+
+	type coalescedKey struct {
+		typeName string
+		key      sds.Key
+	}
+	latestInBatch := make(map[coalescedKey]proto.Message)
+
+	for _, ch := range changes {
+		typeName := ch.TypeName
+		if typeName == "" && v.reg != nil {
+			if def, _, ok := v.reg.LookupByID(ch.TypeID); ok {
+				typeName = def.GetName()
+			}
+		}
+		if typeName == statsTypeName {
+			continue
+		}
+
+		key := ch.Key
+		if key.IsZero() && len(ch.RawKey) > 0 {
+			key = sds.NewKeyFromBytes(ch.RawKey)
+		}
+
+		ck := coalescedKey{typeName: typeName, key: key}
+		var before proto.Message
+		if prev, exists := latestInBatch[ck]; exists {
+			before = prev
+		} else {
+			existing, ok, err := v.index.Get(ctx, typeName, key)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get previous row for %s: %w", typeName, err)
+			}
+			if ok {
+				before = existing
+			}
+		}
+
+		var after proto.Message
+		switch ch.Op {
+		case sds.OpCreate, sds.OpUpdate:
+			after = ch.Row
+			if after == nil && v.reg != nil && (len(ch.RawKey) > 0 || len(ch.RawVal) > 0) {
+				def, _, ok := v.reg.LookupByName(typeName)
+				if !ok {
+					return nil, nil, fmt.Errorf("type %s not in registry", typeName)
+				}
+				msgType, err := v.reg.ResolveMessageType(def.GetId())
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to resolve message type for %s: %w", typeName, err)
+				}
+				target := msgType.New().Interface()
+				if err := sds.MergeKeyAndNonKey(target, ch.RawKey, ch.RawVal); err != nil {
+					return nil, nil, fmt.Errorf("failed to decode row for %s: %w", typeName, err)
+				}
+				after = target
+			}
+		case sds.OpDelete:
+			after = nil
+		}
+
+		latestInBatch[ck] = after
+
+		if err := v.statsUpdate(newStats, before, after); err != nil {
+			return nil, nil, fmt.Errorf("stats update failed for %s: %w", typeName, err)
+		}
+	}
+
+	def, _, ok := v.reg.LookupByName(statsTypeName)
+	if !ok {
+		return nil, nil, fmt.Errorf("stats type %s not in registry", statsTypeName)
+	}
+	keyBytes, valBytes, err := sds.SplitKeyAndNonKey(newStats, def.GetKeyFields())
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to split stats key and non-key: %w", err)
+	}
+	statsChange := sds.Change{
+		Seq:      batchSeq,
+		TypeName: statsTypeName,
+		TypeID:   def.GetId(),
+		Op:       sds.OpUpdate,
+		Key:      sds.NewKeyFromBytes(keyBytes),
+		RawKey:   keyBytes,
+		RawVal:   valBytes,
+		Row:      newStats,
+	}
+
+	toApply := make([]sds.Change, 0, len(changes)+1)
+	toApply = append(toApply, changes...)
+	toApply = append(toApply, statsChange)
+
+	return toApply, newStats, nil
 }
 
 // Position returns the last applied stream sequence position.
@@ -264,6 +492,7 @@ func (v *View) ApplyChanges(changes []sds.Change) {
 		}
 	}
 
+	v.queue = append(v.queue, normalized...)
 	if v.applier != nil {
 		v.applier.enqueueLocked(normalized)
 	}
@@ -275,16 +504,35 @@ func (v *View) ApplyChangesSync(ctx context.Context, changes []sds.Change) error
 		return nil
 	}
 
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.indexMu.Lock()
+	defer v.indexMu.Unlock()
+
+	var maxSeq uint64
+	v.mu.RLock()
+	maxSeq = v.appliedPos
+	for _, ch := range changes {
+		if ch.Seq > maxSeq {
+			maxSeq = ch.Seq
+		}
+	}
+	currentStats := v.statsRow
+	v.mu.RUnlock()
+
+	toApply, newStats, err := v.computeBatchStats(ctx, changes, currentStats, maxSeq)
+	if err != nil {
+		return err
+	}
 
 	if v.index != nil {
-		if err := v.index.ApplyBatch(ctx, changes); err != nil {
+		if err := v.index.ApplyBatch(ctx, toApply); err != nil {
 			return err
 		}
 	}
 
-	var maxSeq uint64 = v.appliedPos
+	v.mu.Lock()
+	if v.statsUpdate != nil {
+		v.statsRow = newStats
+	}
 	for _, ch := range changes {
 		typeName := ch.TypeName
 		if typeName == "" && v.reg != nil {
@@ -310,14 +558,12 @@ func (v *View) ApplyChangesSync(ctx context.Context, changes []sds.Change) error
 				v.cache.Put(ck, &CachedRow{Exists: false})
 			}
 		}
-		if ch.Seq > maxSeq {
-			maxSeq = ch.Seq
-		}
 	}
 
 	if maxSeq > v.appliedPos {
 		v.appliedPos = maxSeq
 	}
+	v.mu.Unlock()
 	return nil
 }
 

@@ -79,7 +79,9 @@ func protoField(name string, number int32, typeKind descriptorpb.FieldDescriptor
 }
 
 func dynamicDescriptor(t *testing.T, name string, fields []*descriptorpb.FieldDescriptorProto) protoreflect.MessageDescriptor {
-	t.Helper()
+	if t != nil {
+		t.Helper()
+	}
 	msgProto := &descriptorpb.DescriptorProto{
 		Name:  proto.String(name),
 		Field: fields,
@@ -95,11 +97,17 @@ func dynamicDescriptor(t *testing.T, name string, fields []*descriptorpb.FieldDe
 	}
 	files, err := protodesc.NewFiles(fds)
 	if err != nil {
-		t.Fatalf("protodesc.NewFiles failed: %v", err)
+		if t != nil {
+			t.Fatalf("protodesc.NewFiles failed: %v", err)
+		}
+		panic(err)
 	}
 	d, err := files.FindDescriptorByName(protoreflect.FullName("viewtest." + name))
 	if err != nil {
-		t.Fatalf("FindDescriptorByName failed: %v", err)
+		if t != nil {
+			t.Fatalf("FindDescriptorByName failed: %v", err)
+		}
+		panic(err)
 	}
 	return d.(protoreflect.MessageDescriptor)
 }

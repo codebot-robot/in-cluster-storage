@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
+	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 )
 
@@ -112,8 +113,6 @@ func (a *applier) loop() {
 		}
 
 		// Determine batch size: only cut batches at transaction boundaries!
-		// Never split changes that share a Seq. If a single transaction is larger than batchSize,
-		// apply it as one batch anyway.
 		targetSize := a.batchSize
 		if targetSize <= 0 {
 			targetSize = defaultApplierBatchSize
@@ -168,7 +167,7 @@ func (a *applier) loop() {
 			}
 		}
 
-		coalescedChanges := make([]sds.Change, 0, len(coalescedMap))
+		coalescedChanges := make([]sds.Change, 0, len(coalescedMap)+1)
 		for _, ck := range order {
 			cv := coalescedMap[ck]
 			ch := cv.change
@@ -177,13 +176,33 @@ func (a *applier) loop() {
 		}
 		a.v.mu.Unlock()
 
-		// 2. Apply batch to LocalIndex outside view mutex
+		// 2. Apply batch to LocalIndex outside view mutex, serialized under indexMu
 		var applyErr error
 		if a.faultHook != nil {
 			applyErr = a.faultHook()
 		}
 		if applyErr == nil && a.v.index != nil && len(coalescedChanges) > 0 {
-			applyErr = a.v.index.ApplyBatch(context.Background(), coalescedChanges)
+			a.v.indexMu.Lock()
+			a.v.mu.RLock()
+			currentStats := a.v.statsRow
+			a.v.mu.RUnlock()
+
+			var toApply []sds.Change
+			var newStats proto.Message
+			toApply, newStats, applyErr = a.v.computeBatchStats(context.Background(), batch, currentStats, batchMaxSeq)
+			if applyErr == nil {
+				if len(toApply) > len(batch) {
+					statsChange := toApply[len(toApply)-1]
+					coalescedChanges = append(coalescedChanges, statsChange)
+				}
+				applyErr = a.v.index.ApplyBatch(context.Background(), coalescedChanges)
+			}
+			if applyErr == nil && a.v.statsUpdate != nil {
+				a.v.mu.Lock()
+				a.v.statsRow = newStats
+				a.v.mu.Unlock()
+			}
+			a.v.indexMu.Unlock()
 		}
 
 		if applyErr != nil {
