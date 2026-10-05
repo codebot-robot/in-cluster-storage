@@ -67,22 +67,32 @@ func (w *Writer) Registry() *Registry {
 	return w.registry
 }
 
-// RegisterType registers a Go proto.Message type with optional primary key field numbers.
-func (w *Writer) RegisterType(msg proto.Message, keyFields ...int32) (uint32, error) {
-	def, err := w.registry.RegisterMessage(msg, keyFields...)
+// RegisterTypeWithOptions registers a Go proto.Message type with options.
+func (w *Writer) RegisterTypeWithOptions(msg proto.Message, opts ...TypeOption) (uint32, error) {
+	def, err := w.registry.RegisterMessageWithOptions(msg, opts...)
 	if err != nil {
 		return 0, err
 	}
 	return def.GetId(), nil
 }
 
-// RegisterDescriptor registers a MessageDescriptor with optional primary key field numbers.
-func (w *Writer) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFields ...int32) (uint32, error) {
-	def, err := w.registry.RegisterDescriptor(md, keyFields...)
+// RegisterDescriptorWithOptions registers a MessageDescriptor with options.
+func (w *Writer) RegisterDescriptorWithOptions(md protoreflect.MessageDescriptor, opts ...TypeOption) (uint32, error) {
+	def, err := w.registry.RegisterDescriptorWithOptions(md, opts...)
 	if err != nil {
 		return 0, err
 	}
 	return def.GetId(), nil
+}
+
+// RegisterType registers a Go proto.Message type with optional primary key field numbers.
+func (w *Writer) RegisterType(msg proto.Message, keyFields ...int32) (uint32, error) {
+	return w.RegisterTypeWithOptions(msg, WithKeyFields(keyFields...))
+}
+
+// RegisterDescriptor registers a MessageDescriptor with optional primary key field numbers.
+func (w *Writer) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFields ...int32) (uint32, error) {
+	return w.RegisterDescriptorWithOptions(md, WithKeyFields(keyFields...))
 }
 
 // ensureAnnounced ensures that the TypeDefinition for typeID is emitted to the stream

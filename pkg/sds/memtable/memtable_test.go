@@ -161,33 +161,33 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 	c1 := dynamicpb.NewMessage(custMD)
 	c1.Set(custMD.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	c1.Set(custMD.Fields().ByName("name"), protoreflect.ValueOfString("Alice"))
-	writer.Insert(ctx, c1)
+	writer.Create(ctx, c1)
 
 	// Customer 2: Bob
 	c2 := dynamicpb.NewMessage(custMD)
 	c2.Set(custMD.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
 	c2.Set(custMD.Fields().ByName("name"), protoreflect.ValueOfString("Bob"))
-	writer.Insert(ctx, c2)
+	writer.Create(ctx, c2)
 
 	// Customer 3: Charlie
 	c3 := dynamicpb.NewMessage(custMD)
 	c3.Set(custMD.Fields().ByName("id"), protoreflect.ValueOfInt64(3))
 	c3.Set(custMD.Fields().ByName("name"), protoreflect.ValueOfString("Charlie"))
-	writer.Insert(ctx, c3)
+	writer.Create(ctx, c3)
 
 	// Order 101 for Customer 1 ($50.00)
 	o101 := dynamicpb.NewMessage(orderMD)
 	o101.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(101))
 	o101.Set(orderMD.Fields().ByName("customer_id"), protoreflect.ValueOfInt64(1))
 	o101.Set(orderMD.Fields().ByName("total"), protoreflect.ValueOfFloat64(50.00))
-	writer.Insert(ctx, o101)
+	writer.Create(ctx, o101)
 
 	// Order 102 for Customer 2 ($75.50)
 	o102 := dynamicpb.NewMessage(orderMD)
 	o102.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(102))
 	o102.Set(orderMD.Fields().ByName("customer_id"), protoreflect.ValueOfInt64(2))
 	o102.Set(orderMD.Fields().ByName("total"), protoreflect.ValueOfFloat64(75.50))
-	writer.Insert(ctx, o102)
+	writer.Create(ctx, o102)
 
 	// --- Step 2: Multi-row Transaction ---
 	tx := writer.Begin()
@@ -197,23 +197,21 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 	o101Up.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(101))
 	o101Up.Set(orderMD.Fields().ByName("customer_id"), protoreflect.ValueOfInt64(1))
 	o101Up.Set(orderMD.Fields().ByName("total"), protoreflect.ValueOfFloat64(65.00))
-	tx.Update(ctx, o101Up)
+	tx.Update(ctx, o101, o101Up)
 
 	// Insert Order 103 for Customer 1 ($30.00)
 	o103 := dynamicpb.NewMessage(orderMD)
 	o103.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(103))
 	o103.Set(orderMD.Fields().ByName("customer_id"), protoreflect.ValueOfInt64(1))
 	o103.Set(orderMD.Fields().ByName("total"), protoreflect.ValueOfFloat64(30.00))
-	tx.Insert(ctx, o103)
+	tx.Create(ctx, o103)
 
 	// Commit Tx
 	tx.Commit(ctx)
 
 	// --- Step 3: Autocommit Delete ---
 	// Delete Customer 3
-	c3Del := dynamicpb.NewMessage(custMD)
-	c3Del.Set(custMD.Fields().ByName("id"), protoreflect.ValueOfInt64(3))
-	writer.Delete(ctx, c3Del)
+	writer.Delete(ctx, c3)
 
 	// --- Step 4: Uncommitted Transaction at Tail ---
 	txUncommitted := writer.Begin()
@@ -221,7 +219,7 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 	o104.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(104))
 	o104.Set(orderMD.Fields().ByName("customer_id"), protoreflect.ValueOfInt64(2))
 	o104.Set(orderMD.Fields().ByName("total"), protoreflect.ValueOfFloat64(999.00))
-	txUncommitted.Insert(ctx, o104)
+	txUncommitted.Create(ctx, o104)
 
 	// --- Stream Playback into ChangeReader and MemStore ---
 	reader := sds.NewChangeReader()

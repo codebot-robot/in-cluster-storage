@@ -231,13 +231,13 @@ func TestReplayAndCompareWithMemTable(t *testing.T) {
 	u1.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	u1.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString("Alice"))
 	u1.Set(userMD.Fields().ByName("email"), protoreflect.ValueOfString("alice@example.com"))
-	writer.Insert(ctx, u1)
+	writer.Create(ctx, u1)
 
 	u2 := dynamicpb.NewMessage(userMD)
 	u2.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
 	u2.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString("Bob"))
 	u2.Set(userMD.Fields().ByName("email"), protoreflect.ValueOfString("bob@example.com"))
-	writer.Insert(ctx, u2)
+	writer.Create(ctx, u2)
 
 	// Step 2: Multi-record Transaction
 	tx := writer.Begin()
@@ -245,19 +245,17 @@ func TestReplayAndCompareWithMemTable(t *testing.T) {
 	o1.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(101))
 	o1.Set(orderMD.Fields().ByName("user_id"), protoreflect.ValueOfInt64(1))
 	o1.Set(orderMD.Fields().ByName("amount"), protoreflect.ValueOfFloat64(99.50))
-	tx.Insert(ctx, o1)
+	tx.Create(ctx, o1)
 
 	u1Up := dynamicpb.NewMessage(userMD)
 	u1Up.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	u1Up.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString("Alice Wonderland"))
 	u1Up.Set(userMD.Fields().ByName("email"), protoreflect.ValueOfString("alice.w@example.com"))
-	tx.Update(ctx, u1Up)
+	tx.Update(ctx, u1, u1Up)
 	tx.Commit(ctx)
 
 	// Step 3: Autocommit Delete
-	u2Del := dynamicpb.NewMessage(userMD)
-	u2Del.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
-	writer.Delete(ctx, u2Del)
+	writer.Delete(ctx, u2)
 
 	// Feed all payloads to both MemStore and SQLite
 	payloads := appender.Payloads()
@@ -310,7 +308,7 @@ func TestSnapshotRestoreAndTailFollow(t *testing.T) {
 		item := dynamicpb.NewMessage(itemMD)
 		item.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(int64(i)))
 		item.Set(itemMD.Fields().ByName("val"), protoreflect.ValueOfString(fmt.Sprintf("item-%d", i)))
-		writer.Insert(ctx, item)
+		writer.Create(ctx, item)
 	}
 
 	payloadsPart1 := appender.Payloads()
@@ -327,7 +325,7 @@ func TestSnapshotRestoreAndTailFollow(t *testing.T) {
 		item := dynamicpb.NewMessage(itemMD)
 		item.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(int64(i)))
 		item.Set(itemMD.Fields().ByName("val"), protoreflect.ValueOfString(fmt.Sprintf("item-%d", i)))
-		writer.Insert(ctx, item)
+		writer.Create(ctx, item)
 	}
 
 	allPayloads := appender.Payloads()
@@ -395,7 +393,7 @@ func TestCompatibleSchemaEvolution(t *testing.T) {
 	o1 := dynamicpb.NewMessage(mdV1)
 	o1.Set(mdV1.Fields().ByName("id"), protoreflect.ValueOfInt64(101))
 	o1.Set(mdV1.Fields().ByName("customer"), protoreflect.ValueOfString("Alice"))
-	writer.Insert(ctx, o1)
+	writer.Create(ctx, o1)
 
 	// Schema V2: Order evolved with total tag 3, discount tag 4
 	fieldsV2 := []*descriptorpb.FieldDescriptorProto{
@@ -413,7 +411,7 @@ func TestCompatibleSchemaEvolution(t *testing.T) {
 	o2.Set(mdV2.Fields().ByName("customer"), protoreflect.ValueOfString("Bob"))
 	o2.Set(mdV2.Fields().ByName("total"), protoreflect.ValueOfFloat64(150.00))
 	o2.Set(mdV2.Fields().ByName("discount"), protoreflect.ValueOfFloat64(10.00))
-	writer.Insert(ctx, o2)
+	writer.Create(ctx, o2)
 
 	// Update row 101 under V2
 	o1Up := dynamicpb.NewMessage(mdV2)
@@ -421,7 +419,7 @@ func TestCompatibleSchemaEvolution(t *testing.T) {
 	o1Up.Set(mdV2.Fields().ByName("customer"), protoreflect.ValueOfString("Alice"))
 	o1Up.Set(mdV2.Fields().ByName("total"), protoreflect.ValueOfFloat64(75.00))
 	o1Up.Set(mdV2.Fields().ByName("discount"), protoreflect.ValueOfFloat64(5.00))
-	writer.Update(ctx, o1Up)
+	writer.Update(ctx, o1, o1Up)
 
 	// Feed all payloads to SQLite
 	dbPath := filepath.Join(t.TempDir(), "evolved.sqlite")
@@ -484,22 +482,22 @@ func TestIdempotentReapplySuffix(t *testing.T) {
 	writer.RegisterDescriptor(entityMD, 1)
 
 	// Write 5 entities
+	entities := make([]*dynamicpb.Message, 6)
 	for i := 1; i <= 5; i++ {
 		e := dynamicpb.NewMessage(entityMD)
 		e.Set(entityMD.Fields().ByName("id"), protoreflect.ValueOfInt64(int64(i)))
 		e.Set(entityMD.Fields().ByName("data"), protoreflect.ValueOfString(fmt.Sprintf("initial-%d", i)))
-		writer.Insert(ctx, e)
+		writer.Create(ctx, e)
+		entities[i] = e
 	}
 
 	// Update entity 3 and delete entity 4
 	e3Up := dynamicpb.NewMessage(entityMD)
 	e3Up.Set(entityMD.Fields().ByName("id"), protoreflect.ValueOfInt64(3))
 	e3Up.Set(entityMD.Fields().ByName("data"), protoreflect.ValueOfString("updated-3"))
-	writer.Update(ctx, e3Up)
+	writer.Update(ctx, entities[3], e3Up)
 
-	e4Del := dynamicpb.NewMessage(entityMD)
-	e4Del.Set(entityMD.Fields().ByName("id"), protoreflect.ValueOfInt64(4))
-	writer.Delete(ctx, e4Del)
+	writer.Delete(ctx, entities[4])
 
 	payloads := appender.Payloads()
 
@@ -562,21 +560,14 @@ func TestRandomLogReplayConformance(t *testing.T) {
 
 	r := rand.New(rand.NewSource(42))
 	accounts := make(map[int64]bool)
+	accountMsgs := make(map[int64]*dynamicpb.Message)
 
 	// Generate 100 random operations (autocommit & transactions)
 	for opIdx := 0; opIdx < 100; opIdx++ {
 		isTx := r.Float64() < 0.3
-		var activeWriter interface {
-			Insert(ctx context.Context, msg proto.Message) (uint64, error)
-			Update(ctx context.Context, msg proto.Message) (uint64, error)
-			Delete(ctx context.Context, msg proto.Message) (uint64, error)
-		}
 		var tx *sds.Tx
 		if isTx {
 			tx = writer.Begin()
-			activeWriter = tx
-		} else {
-			activeWriter = writer
 		}
 
 		numOpsInGroup := 1
@@ -594,22 +585,37 @@ func TestRandomLogReplayConformance(t *testing.T) {
 				acc.Set(accountMD.Fields().ByName("account_id"), protoreflect.ValueOfInt64(id))
 				acc.Set(accountMD.Fields().ByName("holder"), protoreflect.ValueOfString(fmt.Sprintf("User-%d", id)))
 				acc.Set(accountMD.Fields().ByName("balance"), protoreflect.ValueOfFloat64(float64(r.Intn(1000))))
-				activeWriter.Insert(ctx, acc)
+				if isTx {
+					tx.Create(ctx, acc)
+				} else {
+					writer.Create(ctx, acc)
+				}
 				accounts[id] = true
+				accountMsgs[id] = acc
 			} else {
 				if r.Float64() < 0.7 {
 					// Update
+					oldAcc := accountMsgs[id]
 					acc := dynamicpb.NewMessage(accountMD)
 					acc.Set(accountMD.Fields().ByName("account_id"), protoreflect.ValueOfInt64(id))
 					acc.Set(accountMD.Fields().ByName("holder"), protoreflect.ValueOfString(fmt.Sprintf("User-%d-up", id)))
 					acc.Set(accountMD.Fields().ByName("balance"), protoreflect.ValueOfFloat64(float64(r.Intn(1000))))
-					activeWriter.Update(ctx, acc)
+					if isTx {
+						tx.Update(ctx, oldAcc, acc)
+					} else {
+						writer.Update(ctx, oldAcc, acc)
+					}
+					accountMsgs[id] = acc
 				} else {
 					// Delete
-					acc := dynamicpb.NewMessage(accountMD)
-					acc.Set(accountMD.Fields().ByName("account_id"), protoreflect.ValueOfInt64(id))
-					activeWriter.Delete(ctx, acc)
+					oldAcc := accountMsgs[id]
+					if isTx {
+						tx.Delete(ctx, oldAcc)
+					} else {
+						writer.Delete(ctx, oldAcc)
+					}
 					delete(accounts, id)
+					delete(accountMsgs, id)
 				}
 			}
 		}
@@ -693,7 +699,7 @@ func TestKeyPrefixScan(t *testing.T) {
 		de.Set(dirEntryMD.Fields().ByName("name"), protoreflect.ValueOfString(name))
 		de.Set(dirEntryMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(int64(10+i)))
 		de.Set(dirEntryMD.Fields().ByName("is_dir"), protoreflect.ValueOfBool(false))
-		writer.Insert(ctx, de)
+		writer.Create(ctx, de)
 	}
 
 	// Insert parent 2 entries
@@ -704,7 +710,7 @@ func TestKeyPrefixScan(t *testing.T) {
 		de.Set(dirEntryMD.Fields().ByName("name"), protoreflect.ValueOfString(name))
 		de.Set(dirEntryMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(int64(20+i)))
 		de.Set(dirEntryMD.Fields().ByName("is_dir"), protoreflect.ValueOfBool(true))
-		writer.Insert(ctx, de)
+		writer.Create(ctx, de)
 	}
 
 	// Insert parent 100 entry
@@ -713,7 +719,7 @@ func TestKeyPrefixScan(t *testing.T) {
 	de100.Set(dirEntryMD.Fields().ByName("name"), protoreflect.ValueOfString("zeta"))
 	de100.Set(dirEntryMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(1000))
 	de100.Set(dirEntryMD.Fields().ByName("is_dir"), protoreflect.ValueOfBool(false))
-	writer.Insert(ctx, de100)
+	writer.Create(ctx, de100)
 
 	dbPath := filepath.Join(t.TempDir(), "scan_test.sqlite")
 	db, err := sqlite.Open(ctx, dbPath, sqlite.WithStreamID("stream-scan"))
@@ -807,12 +813,12 @@ func TestTxChangesAndApplyBatch(t *testing.T) {
 	u1 := dynamicpb.NewMessage(userMD)
 	u1.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(10))
 	u1.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString("User 10"))
-	tx.Insert(ctx, u1)
+	tx.Create(ctx, u1)
 
 	u2 := dynamicpb.NewMessage(userMD)
 	u2.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(20))
 	u2.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString("User 20"))
-	tx.Insert(ctx, u2)
+	tx.Create(ctx, u2)
 
 	commitSeq, err := tx.Commit(ctx)
 	if err != nil {

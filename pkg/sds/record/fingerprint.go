@@ -137,7 +137,7 @@ func ComputeMessageFingerprint(md protoreflect.MessageDescriptor) ([]byte, *desc
 }
 
 // BuildTypeDefinition constructs a TypeDefinition proto for a message descriptor.
-func BuildTypeDefinition(typeID uint32, md protoreflect.MessageDescriptor, keyFields []int32) (*sdsv1.TypeDefinition, error) {
+func BuildTypeDefinition(typeID uint32, md protoreflect.MessageDescriptor, keyFields []int32, opts ...TypeOption) (*sdsv1.TypeDefinition, error) {
 	if md == nil {
 		return nil, fmt.Errorf("nil message descriptor")
 	}
@@ -148,11 +148,17 @@ func BuildTypeDefinition(typeID uint32, md protoreflect.MessageDescriptor, keyFi
 	kf := make([]int32, len(keyFields))
 	copy(kf, keyFields)
 
-	return &sdsv1.TypeDefinition{
+	def := &sdsv1.TypeDefinition{
 		Id:          typeID,
 		Name:        string(md.FullName()),
 		Fingerprint: fp,
 		Descriptors: fds,
 		KeyFields:   kf,
-	}, nil
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(def)
+		}
+	}
+	return def, nil
 }

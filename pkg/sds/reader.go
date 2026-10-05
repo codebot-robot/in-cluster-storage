@@ -21,6 +21,7 @@ import (
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
+	"google.golang.org/protobuf/proto"
 )
 
 // ChangeReader decodes stream payloads in order, groups multi-record transactions,
@@ -150,9 +151,20 @@ func (r *ChangeReader) Feed(seq uint64, payload []byte) ([]Change, error) {
 
 		key := NewKeyFromBytes(opRec.GetKey())
 
-		rowMsg := msgType.New().Interface()
-		if err := MergeKeyAndNonKey(rowMsg, opRec.GetKey(), opRec.GetValue()); err != nil {
-			return nil, fmt.Errorf("failed to merge row msg: %w", err)
+		var rowMsg proto.Message
+		if opRec.GetOp() != sdsv1.OpRecord_DELETE {
+			rowMsg = msgType.New().Interface()
+			if err := MergeKeyAndNonKey(rowMsg, opRec.GetKey(), opRec.GetValue()); err != nil {
+				return nil, fmt.Errorf("failed to merge row msg: %w", err)
+			}
+		}
+
+		var beforeMsg proto.Message
+		if def.GetLogBeforeImages() && (opRec.GetOp() == sdsv1.OpRecord_UPDATE || opRec.GetOp() == sdsv1.OpRecord_DELETE) {
+			beforeMsg = msgType.New().Interface()
+			if err := MergeKeyAndNonKey(beforeMsg, opRec.GetKey(), opRec.GetBeforeValue()); err != nil {
+				return nil, fmt.Errorf("failed to merge before row msg: %w", err)
+			}
 		}
 
 		change := Change{
@@ -165,6 +177,7 @@ func (r *ChangeReader) Feed(seq uint64, payload []byte) ([]Change, error) {
 			RawKey:   opRec.GetKey(),
 			RawVal:   opRec.GetValue(),
 			Row:      rowMsg,
+			Before:   beforeMsg,
 		}
 
 		if opRec.GetTxId() == 0 {

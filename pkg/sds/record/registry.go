@@ -36,6 +36,25 @@ var (
 	ErrTypeIDTooLow = errors.New("application type ID must be >= 16")
 )
 
+// TypeOption configures a TypeDefinition during registration.
+type TypeOption func(*sdsv1.TypeDefinition)
+
+// WithKeyFields specifies primary key field numbers.
+func WithKeyFields(keyFields ...int32) TypeOption {
+	return func(def *sdsv1.TypeDefinition) {
+		kf := make([]int32, len(keyFields))
+		copy(kf, keyFields)
+		def.KeyFields = kf
+	}
+}
+
+// WithLogBeforeImages specifies whether UPDATE and DELETE operations emit before_value.
+func WithLogBeforeImages(logBeforeImages bool) TypeOption {
+	return func(def *sdsv1.TypeDefinition) {
+		def.LogBeforeImages = logBeforeImages
+	}
+}
+
 type typeEntry struct {
 	def          *sdsv1.TypeDefinition
 	descriptor   protoreflect.MessageDescriptor
@@ -186,18 +205,16 @@ func resolveMessageDescriptor(def *sdsv1.TypeDefinition) (protoreflect.MessageDe
 	return md, nil
 }
 
-// RegisterMessage registers a proto.Message, allocating a new type ID if not already registered,
-// or updating it if compatibly evolved.
-func (r *Registry) RegisterMessage(msg proto.Message, keyFields ...int32) (*sdsv1.TypeDefinition, error) {
+// RegisterMessageWithOptions registers a proto.Message with options.
+func (r *Registry) RegisterMessageWithOptions(msg proto.Message, opts ...TypeOption) (*sdsv1.TypeDefinition, error) {
 	if msg == nil {
 		return nil, fmt.Errorf("nil message")
 	}
-	return r.RegisterDescriptor(msg.ProtoReflect().Descriptor(), keyFields...)
+	return r.RegisterDescriptorWithOptions(msg.ProtoReflect().Descriptor(), opts...)
 }
 
-// RegisterDescriptor registers a MessageDescriptor, allocating a new type ID if not already registered,
-// or updating it if compatibly evolved.
-func (r *Registry) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFields ...int32) (*sdsv1.TypeDefinition, error) {
+// RegisterDescriptorWithOptions registers a MessageDescriptor with options.
+func (r *Registry) RegisterDescriptorWithOptions(md protoreflect.MessageDescriptor, opts ...TypeOption) (*sdsv1.TypeDefinition, error) {
 	if md == nil {
 		return nil, fmt.Errorf("nil message descriptor")
 	}
@@ -214,7 +231,7 @@ func (r *Registry) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFiel
 		typeID = r.AllocateID()
 	}
 
-	def, err := BuildTypeDefinition(typeID, md, keyFields)
+	def, err := BuildTypeDefinition(typeID, md, nil, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +241,21 @@ func (r *Registry) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFiel
 	}
 
 	return def, nil
+}
+
+// RegisterMessage registers a proto.Message, allocating a new type ID if not already registered,
+// or updating it if compatibly evolved.
+func (r *Registry) RegisterMessage(msg proto.Message, keyFields ...int32) (*sdsv1.TypeDefinition, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("nil message")
+	}
+	return r.RegisterDescriptor(msg.ProtoReflect().Descriptor(), keyFields...)
+}
+
+// RegisterDescriptor registers a MessageDescriptor, allocating a new type ID if not already registered,
+// or updating it if compatibly evolved.
+func (r *Registry) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFields ...int32) (*sdsv1.TypeDefinition, error) {
+	return r.RegisterDescriptorWithOptions(md, WithKeyFields(keyFields...))
 }
 
 // LookupByID returns the TypeDefinition and MessageDescriptor for a registered type ID.

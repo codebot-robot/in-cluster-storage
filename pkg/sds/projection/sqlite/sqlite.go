@@ -843,13 +843,13 @@ func (d *DB) SyncRegistry(ctx context.Context, reg *record.Registry) error {
 	return nil
 }
 
-// RegisterType registers a Go proto.Message type with optional primary key field numbers
+// RegisterTypeWithOptions registers a Go proto.Message type with options
 // and creates its table schema in SQLite.
-func (d *DB) RegisterType(ctx context.Context, msg proto.Message, keyFields ...int32) (*sdsv1.TypeDefinition, error) {
+func (d *DB) RegisterTypeWithOptions(ctx context.Context, msg proto.Message, opts ...record.TypeOption) (*sdsv1.TypeDefinition, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	def, err := d.changeReader.Registry().RegisterMessage(msg, keyFields...)
+	def, err := d.changeReader.Registry().RegisterMessageWithOptions(msg, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -858,6 +858,12 @@ func (d *DB) RegisterType(ctx context.Context, msg proto.Message, keyFields ...i
 		return nil, err
 	}
 	return def, nil
+}
+
+// RegisterType registers a Go proto.Message type with optional primary key field numbers
+// and creates its table schema in SQLite.
+func (d *DB) RegisterType(ctx context.Context, msg proto.Message, keyFields ...int32) (*sdsv1.TypeDefinition, error) {
+	return d.RegisterTypeWithOptions(ctx, msg, record.WithKeyFields(keyFields...))
 }
 
 func prefixLimit(prefix []byte) []byte {

@@ -40,6 +40,7 @@ type Change struct {
 	RawKey   []byte
 	RawVal   []byte
 	Row      proto.Message // Full reconstituted row (nil for Delete)
+	Before   proto.Message // Reconstituted before-image (set only when table logs before-images for Update/Delete)
 }
 
 // IsInsert reports whether this change is an INSERT / CREATE.

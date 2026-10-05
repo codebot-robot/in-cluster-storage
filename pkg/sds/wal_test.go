@@ -127,9 +127,9 @@ func TestWALAppenderAndStreamReader(t *testing.T) {
 	p1.Set(md.Fields().ByName("name"), protoreflect.ValueOfString("Alice"))
 	p1.Set(md.Fields().ByName("score"), protoreflect.ValueOfFloat64(99.5))
 
-	seq1, err := writer.Insert(ctx, p1)
+	seq1, err := writer.Create(ctx, p1)
 	if err != nil {
-		t.Fatalf("Insert failed: %v", err)
+		t.Fatalf("Create failed: %v", err)
 	}
 
 	// 2. Write a multi-row transaction
@@ -138,15 +138,15 @@ func TestWALAppenderAndStreamReader(t *testing.T) {
 	p2.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(102))
 	p2.Set(md.Fields().ByName("name"), protoreflect.ValueOfString("Bob"))
 	p2.Set(md.Fields().ByName("score"), protoreflect.ValueOfFloat64(88.0))
-	if _, err := tx.Insert(ctx, p2); err != nil {
-		t.Fatalf("tx.Insert failed: %v", err)
+	if _, err := tx.Create(ctx, p2); err != nil {
+		t.Fatalf("tx.Create failed: %v", err)
 	}
 
 	p1Updated := dynamicpb.NewMessage(md)
 	p1Updated.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(101))
 	p1Updated.Set(md.Fields().ByName("name"), protoreflect.ValueOfString("Alice M"))
 	p1Updated.Set(md.Fields().ByName("score"), protoreflect.ValueOfFloat64(100.0))
-	if _, err := tx.Update(ctx, p1Updated); err != nil {
+	if _, err := tx.Update(ctx, p1, p1Updated); err != nil {
 		t.Fatalf("tx.Update failed: %v", err)
 	}
 
@@ -253,9 +253,9 @@ func TestStreamReaderWithRecoveredRecords(t *testing.T) {
 	item := dynamicpb.NewMessage(md)
 	item.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	item.Set(md.Fields().ByName("val"), protoreflect.ValueOfString("hello"))
-	_, err = writer.Insert(ctx, item)
+	_, err = writer.Create(ctx, item)
 	if err != nil {
-		t.Fatalf("Insert failed: %v", err)
+		t.Fatalf("Create failed: %v", err)
 	}
 
 	// Close writer stream and re-open to get RecoveredRecords
@@ -318,9 +318,9 @@ func TestWALAppenderPermanentDurability(t *testing.T) {
 	rec := dynamicpb.NewMessage(md)
 	rec.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(42))
 
-	seq, err := writer.Insert(ctx, rec)
+	seq, err := writer.Create(ctx, rec)
 	if err != nil {
-		t.Fatalf("Insert with Permanent durability failed: %v", err)
+		t.Fatalf("Create with Permanent durability failed: %v", err)
 	}
 
 	_, _, permanent := walStream.Watermarks()

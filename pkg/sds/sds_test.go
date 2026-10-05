@@ -192,8 +192,8 @@ func TestAutocommitOperations(t *testing.T) {
 	u1.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	u1.Set(md.Fields().ByName("name"), protoreflect.ValueOfString("Alice"))
 
-	if _, err := writer.Insert(ctx, u1); err != nil {
-		t.Fatalf("Insert error: %v", err)
+	if _, err := writer.Create(ctx, u1); err != nil {
+		t.Fatalf("Create error: %v", err)
 	}
 
 	// 2. Update
@@ -201,15 +201,12 @@ func TestAutocommitOperations(t *testing.T) {
 	u1Updated.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	u1Updated.Set(md.Fields().ByName("name"), protoreflect.ValueOfString("Alice Smith"))
 
-	if _, err := writer.Update(ctx, u1Updated); err != nil {
+	if _, err := writer.Update(ctx, u1, u1Updated); err != nil {
 		t.Fatalf("Update error: %v", err)
 	}
 
 	// 3. Delete
-	u1Delete := dynamicpb.NewMessage(md)
-	u1Delete.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
-
-	if _, err := writer.Delete(ctx, u1Delete); err != nil {
+	if _, err := writer.Delete(ctx, u1Updated); err != nil {
 		t.Fatalf("Delete error: %v", err)
 	}
 
@@ -285,12 +282,12 @@ func TestInterleavedTransactions(t *testing.T) {
 	item1Up.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(101))
 	item1Up.Set(md.Fields().ByName("value"), protoreflect.ValueOfString("val1-updated"))
 
-	// 1. Tx1 insert item 101
-	tx1.Insert(ctx, item1)
-	// 2. Tx2 insert item 201
-	tx2.Insert(ctx, item2)
+	// 1. Tx1 create item 101
+	tx1.Create(ctx, item1)
+	// 2. Tx2 create item 201
+	tx2.Create(ctx, item2)
 	// 3. Tx1 update item 101
-	tx1.Update(ctx, item1Up)
+	tx1.Update(ctx, item1, item1Up)
 
 	// Feed all payloads so far to reader
 	payloads := appender.Payloads()
@@ -374,17 +371,17 @@ func TestUncommittedTailDiscarded(t *testing.T) {
 	// Autocommit record 1
 	e1 := dynamicpb.NewMessage(md)
 	e1.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
-	writer.Insert(ctx, e1)
+	writer.Create(ctx, e1)
 
 	// Begin Tx and write two records
 	tx := writer.Begin()
 	e2 := dynamicpb.NewMessage(md)
 	e2.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
-	tx.Insert(ctx, e2)
+	tx.Create(ctx, e2)
 
 	e3 := dynamicpb.NewMessage(md)
 	e3.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(3))
-	tx.Insert(ctx, e3)
+	tx.Create(ctx, e3)
 
 	// Reader consumes all payloads (no commit frame in stream)
 	reader := NewChangeReader()
@@ -442,10 +439,10 @@ func TestSafePositionNeverInsideTransaction(t *testing.T) {
 
 	reader := NewChangeReader()
 
-	// Step 1: Autocommit insert at seq 1 (TypeDef) & seq 2 (record)
+	// Step 1: Autocommit create at seq 1 (TypeDef) & seq 2 (record)
 	d1 := dynamicpb.NewMessage(md)
 	d1.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
-	writer.Insert(ctx, d1)
+	writer.Create(ctx, d1)
 
 	for i := 0; i < len(appender.Payloads()); i++ {
 		reader.Feed(uint64(i+1), appender.Payloads()[i])
@@ -458,7 +455,7 @@ func TestSafePositionNeverInsideTransaction(t *testing.T) {
 	tx1 := writer.Begin()
 	d2 := dynamicpb.NewMessage(md)
 	d2.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
-	tx1.Insert(ctx, d2)
+	tx1.Create(ctx, d2)
 
 	reader.Feed(3, appender.Payloads()[2])
 	if reader.SafeSnapshotPosition() != 2 {
@@ -469,7 +466,7 @@ func TestSafePositionNeverInsideTransaction(t *testing.T) {
 	tx2 := writer.Begin()
 	d3 := dynamicpb.NewMessage(md)
 	d3.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(3))
-	tx2.Insert(ctx, d3)
+	tx2.Create(ctx, d3)
 
 	reader.Feed(4, appender.Payloads()[3])
 	if reader.SafeSnapshotPosition() != 2 {
@@ -479,7 +476,7 @@ func TestSafePositionNeverInsideTransaction(t *testing.T) {
 	// Step 4: Write another record for Tx1 at seq 5
 	d4 := dynamicpb.NewMessage(md)
 	d4.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(4))
-	tx1.Insert(ctx, d4)
+	tx1.Create(ctx, d4)
 
 	reader.Feed(5, appender.Payloads()[4])
 	if reader.SafeSnapshotPosition() != 2 {
@@ -520,7 +517,7 @@ func TestCompatibleSchemaEvolutionBetweenRecords(t *testing.T) {
 	order1 := dynamicpb.NewMessage(mdV1)
 	order1.Set(mdV1.Fields().ByName("id"), protoreflect.ValueOfInt64(101))
 	order1.Set(mdV1.Fields().ByName("customer"), protoreflect.ValueOfString("Alice"))
-	writer.Insert(ctx, order1)
+	writer.Create(ctx, order1)
 
 	// Schema V2 (evolved: added total tag 3, notes tag 4)
 	fieldsV2 := []*descriptorpb.FieldDescriptorProto{
@@ -538,7 +535,7 @@ func TestCompatibleSchemaEvolutionBetweenRecords(t *testing.T) {
 	order2.Set(mdV2.Fields().ByName("customer"), protoreflect.ValueOfString("Bob"))
 	order2.Set(mdV2.Fields().ByName("total"), protoreflect.ValueOfFloat64(199.95))
 	order2.Set(mdV2.Fields().ByName("notes"), protoreflect.ValueOfString("Priority shipping"))
-	writer.Insert(ctx, order2)
+	writer.Create(ctx, order2)
 
 	// Decode all with ChangeReader
 	reader := NewChangeReader()

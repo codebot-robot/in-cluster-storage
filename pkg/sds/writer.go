@@ -27,6 +27,19 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// TypeOption configures a TypeDefinition during registration.
+type TypeOption = record.TypeOption
+
+// WithKeyFields specifies primary key field numbers.
+func WithKeyFields(keyFields ...int32) TypeOption {
+	return record.WithKeyFields(keyFields...)
+}
+
+// WithLogBeforeImages specifies whether UPDATE and DELETE operations emit before_value.
+func WithLogBeforeImages(logBeforeImages bool) TypeOption {
+	return record.WithLogBeforeImages(logBeforeImages)
+}
+
 // Writer provides Layer 2 relational row-change and transaction writing
 // over a structured data stream using OpRecord framework records.
 type Writer struct {
@@ -49,6 +62,16 @@ func (w *Writer) Registry() *record.Registry {
 // RecordWriter returns the underlying Layer 1 record.Writer.
 func (w *Writer) RecordWriter() *record.Writer {
 	return w.recordWriter
+}
+
+// RegisterTypeWithOptions registers a Go proto.Message type with options.
+func (w *Writer) RegisterTypeWithOptions(msg proto.Message, opts ...record.TypeOption) (uint32, error) {
+	return w.recordWriter.RegisterTypeWithOptions(msg, opts...)
+}
+
+// RegisterDescriptorWithOptions registers a MessageDescriptor with options.
+func (w *Writer) RegisterDescriptorWithOptions(md protoreflect.MessageDescriptor, opts ...record.TypeOption) (uint32, error) {
+	return w.recordWriter.RegisterDescriptorWithOptions(md, opts...)
 }
 
 // RegisterType registers a Go proto.Message type with optional primary key field numbers.
@@ -85,53 +108,97 @@ func (w *Writer) resolveOrRegister(msg proto.Message) (*sdsv1.TypeDefinition, er
 	return def, nil
 }
 
-func (w *Writer) writeOp(ctx context.Context, op sdsv1.OpRecord_Op, txID uint64, msg proto.Message) (uint64, error) {
+// Create writes an autocommit Create row change (tx_id = 0, OpRecord_CREATE).
+func (w *Writer) Create(ctx context.Context, msg proto.Message) (uint64, error) {
 	if msg == nil {
 		return 0, fmt.Errorf("nil message")
 	}
-
 	def, err := w.resolveOrRegister(msg)
 	if err != nil {
 		return 0, err
 	}
-
 	keyBytes, valBytes, err := SplitKeyAndNonKey(msg, def.GetKeyFields())
 	if err != nil {
 		return 0, err
 	}
 
 	opRec := &sdsv1.OpRecord{
-		Op:     op,
+		Op:     sdsv1.OpRecord_CREATE,
 		TypeId: def.GetId(),
-		TxId:   txID,
+		TxId:   0,
 		Key:    keyBytes,
+		Value:  valBytes,
 	}
-	if op != sdsv1.OpRecord_DELETE {
-		opRec.Value = valBytes
-	}
-
 	return w.recordWriter.AppendOp(ctx, opRec)
 }
 
-// Insert writes an autocommit Create row change (tx_id = 0, OpRecord_CREATE).
-func (w *Writer) Insert(ctx context.Context, msg proto.Message) (uint64, error) {
-	return w.writeOp(ctx, sdsv1.OpRecord_CREATE, 0, msg)
-}
-
-// Create writes an autocommit Create row change (tx_id = 0, OpRecord_CREATE).
-func (w *Writer) Create(ctx context.Context, msg proto.Message) (uint64, error) {
-	return w.writeOp(ctx, sdsv1.OpRecord_CREATE, 0, msg)
-}
-
 // Update writes an autocommit Update row change (tx_id = 0, OpRecord_UPDATE).
-func (w *Writer) Update(ctx context.Context, msg proto.Message) (uint64, error) {
-	return w.writeOp(ctx, sdsv1.OpRecord_UPDATE, 0, msg)
+func (w *Writer) Update(ctx context.Context, before, after proto.Message) (uint64, error) {
+	if before == nil || after == nil {
+		return 0, fmt.Errorf("both before and after messages must be provided for Update")
+	}
+	if before.ProtoReflect().Descriptor().FullName() != after.ProtoReflect().Descriptor().FullName() {
+		return 0, fmt.Errorf("before (%s) and after (%s) have different message types",
+			before.ProtoReflect().Descriptor().FullName(), after.ProtoReflect().Descriptor().FullName())
+	}
+
+	def, err := w.resolveOrRegister(after)
+	if err != nil {
+		return 0, err
+	}
+
+	beforeKeyBytes, beforeValBytes, err := SplitKeyAndNonKey(before, def.GetKeyFields())
+	if err != nil {
+		return 0, fmt.Errorf("failed to split before message key/value: %w", err)
+	}
+	afterKeyBytes, afterValBytes, err := SplitKeyAndNonKey(after, def.GetKeyFields())
+	if err != nil {
+		return 0, fmt.Errorf("failed to split after message key/value: %w", err)
+	}
+
+	if !bytes.Equal(beforeKeyBytes, afterKeyBytes) {
+		return 0, fmt.Errorf("before and after primary keys do not match")
+	}
+
+	opRec := &sdsv1.OpRecord{
+		Op:     sdsv1.OpRecord_UPDATE,
+		TypeId: def.GetId(),
+		TxId:   0,
+		Key:    afterKeyBytes,
+		Value:  afterValBytes,
+	}
+	if def.GetLogBeforeImages() {
+		opRec.BeforeValue = beforeValBytes
+	}
+	return w.recordWriter.AppendOp(ctx, opRec)
 }
 
 // Delete writes an autocommit Delete row change (tx_id = 0, OpRecord_DELETE).
-// msg must contain at least the primary key fields.
-func (w *Writer) Delete(ctx context.Context, msg proto.Message) (uint64, error) {
-	return w.writeOp(ctx, sdsv1.OpRecord_DELETE, 0, msg)
+// before must contain the full current row.
+func (w *Writer) Delete(ctx context.Context, before proto.Message) (uint64, error) {
+	if before == nil {
+		return 0, fmt.Errorf("before message must be provided for Delete")
+	}
+	def, err := w.resolveOrRegister(before)
+	if err != nil {
+		return 0, err
+	}
+
+	beforeKeyBytes, beforeValBytes, err := SplitKeyAndNonKey(before, def.GetKeyFields())
+	if err != nil {
+		return 0, fmt.Errorf("failed to split before message key/value: %w", err)
+	}
+
+	opRec := &sdsv1.OpRecord{
+		Op:     sdsv1.OpRecord_DELETE,
+		TypeId: def.GetId(),
+		TxId:   0,
+		Key:    beforeKeyBytes,
+	}
+	if def.GetLogBeforeImages() {
+		opRec.BeforeValue = beforeValBytes
+	}
+	return w.recordWriter.AppendOp(ctx, opRec)
 }
 
 // Begin starts a new multi-record transaction.
@@ -158,12 +225,26 @@ func (w *Writer) AppendPaddingBytes(ctx context.Context, body []byte) (uint64, e
 	return w.recordWriter.AppendPaddingBytes(ctx, body)
 }
 
+type txKeyStatus int
+
+const (
+	txKeyStatusNone txKeyStatus = iota
+	txKeyStatusActive
+	txKeyStatusDeleted
+)
+
+type txKey struct {
+	typeID uint32
+	rawKey string
+}
+
 // Tx represents an in-progress transaction.
 type Tx struct {
 	writer   *Writer
 	txID     uint64
 	finished bool
 	changes  []Change
+	keyState map[txKey]txKeyStatus
 }
 
 // TxID returns the transaction ID.
@@ -171,20 +252,48 @@ func (tx *Tx) TxID() uint64 {
 	return tx.txID
 }
 
-func (tx *Tx) recordChange(seq uint64, op sdsv1.OpRecord_Op, msg proto.Message) error {
+// Create writes an OpRecord_CREATE row change belonging to this transaction.
+func (tx *Tx) Create(ctx context.Context, msg proto.Message) (uint64, error) {
+	if tx.finished {
+		return 0, fmt.Errorf("transaction %d already closed", tx.txID)
+	}
+	if msg == nil {
+		return 0, fmt.Errorf("nil message")
+	}
+
 	def, err := tx.writer.resolveOrRegister(msg)
 	if err != nil {
-		return err
+		return 0, err
 	}
+
 	keyBytes, valBytes, err := SplitKeyAndNonKey(msg, def.GetKeyFields())
 	if err != nil {
-		return err
+		return 0, err
 	}
+
+	k := txKey{typeID: def.GetId(), rawKey: string(keyBytes)}
+	if tx.keyState != nil && tx.keyState[k] == txKeyStatusActive {
+		return 0, fmt.Errorf("key already created or updated in transaction %d", tx.txID)
+	}
+
+	opRec := &sdsv1.OpRecord{
+		Op:     sdsv1.OpRecord_CREATE,
+		TypeId: def.GetId(),
+		TxId:   tx.txID,
+		Key:    keyBytes,
+		Value:  valBytes,
+	}
+
+	seq, err := tx.writer.recordWriter.AppendOp(ctx, opRec)
+	if err != nil {
+		return 0, err
+	}
+
 	ch := Change{
 		Seq:      seq,
 		TypeID:   def.GetId(),
 		TypeName: def.GetName(),
-		Op:       op,
+		Op:       OpCreate,
 		TxID:     tx.txID,
 		Key:      NewKeyFromBytes(keyBytes),
 		RawKey:   keyBytes,
@@ -192,66 +301,148 @@ func (tx *Tx) recordChange(seq uint64, op sdsv1.OpRecord_Op, msg proto.Message) 
 		Row:      msg,
 	}
 	tx.changes = append(tx.changes, ch)
-	return nil
-}
+	if tx.keyState == nil {
+		tx.keyState = make(map[txKey]txKeyStatus)
+	}
+	tx.keyState[k] = txKeyStatusActive
 
-// Insert writes an OpRecord_CREATE row change belonging to this transaction.
-func (tx *Tx) Insert(ctx context.Context, msg proto.Message) (uint64, error) {
-	if tx.finished {
-		return 0, fmt.Errorf("transaction %d already closed", tx.txID)
-	}
-	seq, err := tx.writer.writeOp(ctx, sdsv1.OpRecord_CREATE, tx.txID, msg)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.recordChange(seq, sdsv1.OpRecord_CREATE, msg); err != nil {
-		panic(fmt.Sprintf("sds: failed to record transaction change for create: %v", err))
-	}
-	return seq, nil
-}
-
-// Create writes an OpRecord_CREATE row change belonging to this transaction.
-func (tx *Tx) Create(ctx context.Context, msg proto.Message) (uint64, error) {
-	if tx.finished {
-		return 0, fmt.Errorf("transaction %d already closed", tx.txID)
-	}
-	seq, err := tx.writer.writeOp(ctx, sdsv1.OpRecord_CREATE, tx.txID, msg)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.recordChange(seq, sdsv1.OpRecord_CREATE, msg); err != nil {
-		panic(fmt.Sprintf("sds: failed to record transaction change for create: %v", err))
-	}
 	return seq, nil
 }
 
 // Update writes an OpRecord_UPDATE row change belonging to this transaction.
-func (tx *Tx) Update(ctx context.Context, msg proto.Message) (uint64, error) {
+func (tx *Tx) Update(ctx context.Context, before, after proto.Message) (uint64, error) {
 	if tx.finished {
 		return 0, fmt.Errorf("transaction %d already closed", tx.txID)
 	}
-	seq, err := tx.writer.writeOp(ctx, sdsv1.OpRecord_UPDATE, tx.txID, msg)
+	if before == nil || after == nil {
+		return 0, fmt.Errorf("both before and after messages must be provided for Update")
+	}
+	if before.ProtoReflect().Descriptor().FullName() != after.ProtoReflect().Descriptor().FullName() {
+		return 0, fmt.Errorf("before (%s) and after (%s) have different message types",
+			before.ProtoReflect().Descriptor().FullName(), after.ProtoReflect().Descriptor().FullName())
+	}
+
+	def, err := tx.writer.resolveOrRegister(after)
 	if err != nil {
 		return 0, err
 	}
-	if err := tx.recordChange(seq, sdsv1.OpRecord_UPDATE, msg); err != nil {
-		panic(fmt.Sprintf("sds: failed to record transaction change for update: %v", err))
+
+	beforeKeyBytes, beforeValBytes, err := SplitKeyAndNonKey(before, def.GetKeyFields())
+	if err != nil {
+		return 0, fmt.Errorf("failed to split before message key/value: %w", err)
 	}
+	afterKeyBytes, afterValBytes, err := SplitKeyAndNonKey(after, def.GetKeyFields())
+	if err != nil {
+		return 0, fmt.Errorf("failed to split after message key/value: %w", err)
+	}
+
+	if !bytes.Equal(beforeKeyBytes, afterKeyBytes) {
+		return 0, fmt.Errorf("before and after primary keys do not match")
+	}
+
+	k := txKey{typeID: def.GetId(), rawKey: string(afterKeyBytes)}
+	if tx.keyState != nil && tx.keyState[k] == txKeyStatusDeleted {
+		return 0, fmt.Errorf("cannot update deleted key in transaction %d", tx.txID)
+	}
+
+	opRec := &sdsv1.OpRecord{
+		Op:     sdsv1.OpRecord_UPDATE,
+		TypeId: def.GetId(),
+		TxId:   tx.txID,
+		Key:    afterKeyBytes,
+		Value:  afterValBytes,
+	}
+	if def.GetLogBeforeImages() {
+		opRec.BeforeValue = beforeValBytes
+	}
+
+	seq, err := tx.writer.recordWriter.AppendOp(ctx, opRec)
+	if err != nil {
+		return 0, err
+	}
+
+	ch := Change{
+		Seq:      seq,
+		TypeID:   def.GetId(),
+		TypeName: def.GetName(),
+		Op:       OpUpdate,
+		TxID:     tx.txID,
+		Key:      NewKeyFromBytes(afterKeyBytes),
+		RawKey:   afterKeyBytes,
+		RawVal:   afterValBytes,
+		Row:      after,
+	}
+	if def.GetLogBeforeImages() {
+		ch.Before = before
+	}
+	tx.changes = append(tx.changes, ch)
+	if tx.keyState == nil {
+		tx.keyState = make(map[txKey]txKeyStatus)
+	}
+	tx.keyState[k] = txKeyStatusActive
+
 	return seq, nil
 }
 
 // Delete writes an OpRecord_DELETE row change belonging to this transaction.
-func (tx *Tx) Delete(ctx context.Context, msg proto.Message) (uint64, error) {
+// before must contain the full current row.
+func (tx *Tx) Delete(ctx context.Context, before proto.Message) (uint64, error) {
 	if tx.finished {
 		return 0, fmt.Errorf("transaction %d already closed", tx.txID)
 	}
-	seq, err := tx.writer.writeOp(ctx, sdsv1.OpRecord_DELETE, tx.txID, msg)
+	if before == nil {
+		return 0, fmt.Errorf("before message must be provided for Delete")
+	}
+
+	def, err := tx.writer.resolveOrRegister(before)
 	if err != nil {
 		return 0, err
 	}
-	if err := tx.recordChange(seq, sdsv1.OpRecord_DELETE, msg); err != nil {
-		panic(fmt.Sprintf("sds: failed to record transaction change for delete: %v", err))
+
+	beforeKeyBytes, beforeValBytes, err := SplitKeyAndNonKey(before, def.GetKeyFields())
+	if err != nil {
+		return 0, fmt.Errorf("failed to split before message key/value: %w", err)
 	}
+
+	k := txKey{typeID: def.GetId(), rawKey: string(beforeKeyBytes)}
+	if tx.keyState != nil && tx.keyState[k] == txKeyStatusDeleted {
+		return 0, fmt.Errorf("cannot delete already deleted key in transaction %d", tx.txID)
+	}
+
+	opRec := &sdsv1.OpRecord{
+		Op:     sdsv1.OpRecord_DELETE,
+		TypeId: def.GetId(),
+		TxId:   tx.txID,
+		Key:    beforeKeyBytes,
+	}
+	if def.GetLogBeforeImages() {
+		opRec.BeforeValue = beforeValBytes
+	}
+
+	seq, err := tx.writer.recordWriter.AppendOp(ctx, opRec)
+	if err != nil {
+		return 0, err
+	}
+
+	ch := Change{
+		Seq:      seq,
+		TypeID:   def.GetId(),
+		TypeName: def.GetName(),
+		Op:       OpDelete,
+		TxID:     tx.txID,
+		Key:      NewKeyFromBytes(beforeKeyBytes),
+		RawKey:   beforeKeyBytes,
+		Row:      nil,
+	}
+	if def.GetLogBeforeImages() {
+		ch.Before = before
+	}
+	tx.changes = append(tx.changes, ch)
+	if tx.keyState == nil {
+		tx.keyState = make(map[txKey]txKeyStatus)
+	}
+	tx.keyState[k] = txKeyStatusDeleted
+
 	return seq, nil
 }
 

@@ -174,14 +174,12 @@ func generateAllVectors(ctx context.Context) ([]GoldenVector, error) {
 		msg1Up.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 		msg1Up.Set(md.Fields().ByName("customer"), protoreflect.ValueOfString("Alice Updated"))
 		msg1Up.Set(md.Fields().ByName("total"), protoreflect.ValueOfFloat64(120.0))
-		if _, err := w.Update(ctx, msg1Up); err != nil {
+		if _, err := w.Update(ctx, msg1, msg1Up); err != nil {
 			return nil, err
 		}
 
 		// DELETE id=2
-		msg2Del := dynamicpb.NewMessage(md)
-		msg2Del.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
-		if _, err := w.Delete(ctx, msg2Del); err != nil {
+		if _, err := w.Delete(ctx, msg2); err != nil {
 			return nil, err
 		}
 
@@ -233,14 +231,14 @@ func generateAllVectors(ctx context.Context) ([]GoldenVector, error) {
 		msg1Up := dynamicpb.NewMessage(md)
 		msg1Up.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 		msg1Up.Set(md.Fields().ByName("balance"), protoreflect.ValueOfFloat64(150.0))
-		if _, err := tx.Update(ctx, msg1Up); err != nil {
+		if _, err := tx.Update(ctx, msg1, msg1Up); err != nil {
 			return nil, err
 		}
 
 		msg2Up := dynamicpb.NewMessage(md)
 		msg2Up.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
 		msg2Up.Set(md.Fields().ByName("balance"), protoreflect.ValueOfFloat64(150.0))
-		if _, err := tx.Update(ctx, msg2Up); err != nil {
+		if _, err := tx.Update(ctx, msg2, msg2Up); err != nil {
 			return nil, err
 		}
 

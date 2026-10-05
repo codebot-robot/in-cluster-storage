@@ -172,8 +172,8 @@ func TestSdsCatLiveServer(t *testing.T) {
 	order := dynamicpb.NewMessage(md)
 	order.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(10))
 	order.Set(md.Fields().ByName("customer"), protoreflect.ValueOfString("Alice"))
-	if _, err := writer.Insert(ctx, order); err != nil {
-		t.Fatalf("Insert failed: %v", err)
+	if _, err := writer.Create(ctx, order); err != nil {
+		t.Fatalf("Create failed: %v", err)
 	}
 
 	// Run sds cat with timeout context (since live tail stays open)

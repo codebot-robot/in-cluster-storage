@@ -162,14 +162,14 @@ func TestViewOverlayReadsDuringLag(t *testing.T) {
 			u1 := dynamicpb.NewMessage(userMD)
 			u1.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 			u1.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString("Alice"))
-			seq1, _ := writer.Insert(ctx, u1)
+			seq1, _ := writer.Create(ctx, u1)
 			changes1, _ := reader.Feed(seq1, transport.payloads[len(transport.payloads)-1])
 			v.ApplyChanges(changes1)
 
 			u2 := dynamicpb.NewMessage(userMD)
 			u2.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
 			u2.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString("Bob"))
-			seq2, _ := writer.Insert(ctx, u2)
+			seq2, _ := writer.Create(ctx, u2)
 			changes2, _ := reader.Feed(seq2, transport.payloads[len(transport.payloads)-1])
 			v.ApplyChanges(changes2)
 
@@ -260,14 +260,16 @@ func TestViewCoalescing(t *testing.T) {
 			c := dynamicpb.NewMessage(counterMD)
 			c.Set(counterMD.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 			c.Set(counterMD.Fields().ByName("val"), protoreflect.ValueOfInt64(0))
-			seq, _ := writer.Insert(ctx, c)
+			seq, _ := writer.Create(ctx, c)
 			ch, _ := reader.Feed(seq, transport.payloads[len(transport.payloads)-1])
 			v.ApplyChanges(ch)
 
 			// Rapidly update counter 1 from 1 to 20
 			for i := int64(1); i <= 20; i++ {
+				oldC := dynamicpb.NewMessage(counterMD)
+				proto.Merge(oldC, c)
 				c.Set(counterMD.Fields().ByName("val"), protoreflect.ValueOfInt64(i))
-				seq, _ = writer.Update(ctx, c)
+				seq, _ = writer.Update(ctx, oldC, c)
 				ch, _ = reader.Feed(seq, transport.payloads[len(transport.payloads)-1])
 				v.ApplyChanges(ch)
 			}
@@ -330,7 +332,7 @@ func TestViewFaultInjectionAndDegradedState(t *testing.T) {
 			it := dynamicpb.NewMessage(itemMD)
 			it.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 			it.Set(itemMD.Fields().ByName("name"), protoreflect.ValueOfString("FaultTest"))
-			seq, _ := writer.Insert(ctx, it)
+			seq, _ := writer.Create(ctx, it)
 			ch, _ := reader.Feed(seq, transport.payloads[len(transport.payloads)-1])
 			v.ApplyChanges(ch)
 
@@ -396,7 +398,7 @@ func TestViewBackpressure(t *testing.T) {
 				d := dynamicpb.NewMessage(dataMD)
 				d.Set(dataMD.Fields().ByName("id"), protoreflect.ValueOfInt64(i))
 				d.Set(dataMD.Fields().ByName("payload"), protoreflect.ValueOfBytes(largeBytes))
-				seq, _ := writer.Insert(ctx, d)
+				seq, _ := writer.Create(ctx, d)
 				ch, _ := reader.Feed(seq, transport.payloads[len(transport.payloads)-1])
 				v.ApplyChanges(ch)
 			}
@@ -482,7 +484,7 @@ func TestViewTruncateDeletesAndScanOrder(t *testing.T) {
 				c.Set(chunkMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(ino))
 				c.Set(chunkMD.Fields().ByName("index"), protoreflect.ValueOfInt64(i))
 				c.Set(chunkMD.Fields().ByName("sha256"), protoreflect.ValueOfString(fmt.Sprintf("sha-chunk-%d", i)))
-				_, _ = writer.Insert(ctx, c)
+				_, _ = writer.Create(ctx, c)
 			}
 			consumeNewPayloads()
 

@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -155,6 +156,7 @@ func TestLocalIndexRandomLogsAndReplayConformance(t *testing.T) {
 			rng := rand.New(rand.NewSource(42))
 			numAccounts := 30
 			numOps := 150
+			accountsMap := make(map[int64]*dynamicpb.Message)
 
 			for i := 0; i < numOps; i++ {
 				accID := int64(rng.Intn(numAccounts) + 1)
@@ -165,14 +167,18 @@ func TestLocalIndexRandomLogsAndReplayConformance(t *testing.T) {
 				acc.Set(accountMD.Fields().ByName("owner"), protoreflect.ValueOfString(fmt.Sprintf("User-%d", accID)))
 				acc.Set(accountMD.Fields().ByName("balance"), protoreflect.ValueOfFloat64(bal))
 
-				opType := rng.Intn(3)
-				switch opType {
-				case 0:
-					_, _ = writer.Insert(ctx, acc)
-				case 1:
-					_, _ = writer.Update(ctx, acc)
-				case 2:
-					_, _ = writer.Delete(ctx, acc)
+				oldAcc, exists := accountsMap[accID]
+				if !exists {
+					_, _ = writer.Create(ctx, acc)
+					accountsMap[accID] = acc
+				} else {
+					if rng.Float64() < 0.7 {
+						_, _ = writer.Update(ctx, oldAcc, acc)
+						accountsMap[accID] = acc
+					} else {
+						_, _ = writer.Delete(ctx, oldAcc)
+						delete(accountsMap, accID)
+					}
 				}
 			}
 
@@ -275,7 +281,7 @@ func TestLocalIndexIdempotentSuffixReapply(t *testing.T) {
 				it := dynamicpb.NewMessage(itemMD)
 				it.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(int64(i)))
 				it.Set(itemMD.Fields().ByName("title"), protoreflect.ValueOfString(fmt.Sprintf("Item %d", i)))
-				writer.Insert(ctx, it)
+				writer.Create(ctx, it)
 			}
 
 			idx, cleanup := factory.create(t, ctx, streamID)
@@ -348,7 +354,7 @@ func TestLocalIndexScanOrderAndPrefix(t *testing.T) {
 				de.Set(dirEntryMD.Fields().ByName("parent_id"), protoreflect.ValueOfInt64(1))
 				de.Set(dirEntryMD.Fields().ByName("name"), protoreflect.ValueOfString(name))
 				de.Set(dirEntryMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(10))
-				writer.Insert(ctx, de)
+				writer.Create(ctx, de)
 			}
 
 			p2Names := []string{"foo.txt", "bar.txt"}
@@ -357,7 +363,7 @@ func TestLocalIndexScanOrderAndPrefix(t *testing.T) {
 				de.Set(dirEntryMD.Fields().ByName("parent_id"), protoreflect.ValueOfInt64(2))
 				de.Set(dirEntryMD.Fields().ByName("name"), protoreflect.ValueOfString(name))
 				de.Set(dirEntryMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(20))
-				writer.Insert(ctx, de)
+				writer.Create(ctx, de)
 			}
 
 			idx, cleanup := factory.create(t, ctx, streamID)
@@ -429,7 +435,7 @@ func TestLocalIndexSnapshotPublishRestoreAndReplay(t *testing.T) {
 				u := dynamicpb.NewMessage(userMD)
 				u.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(int64(i)))
 				u.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString(fmt.Sprintf("User-%d", i)))
-				writer.Insert(ctx, u)
+				writer.Create(ctx, u)
 			}
 
 			liveIdx, cleanupLive := factory.create(t, ctx, streamID)
@@ -457,7 +463,7 @@ func TestLocalIndexSnapshotPublishRestoreAndReplay(t *testing.T) {
 				u := dynamicpb.NewMessage(userMD)
 				u.Set(userMD.Fields().ByName("id"), protoreflect.ValueOfInt64(int64(i)))
 				u.Set(userMD.Fields().ByName("name"), protoreflect.ValueOfString(fmt.Sprintf("User-%d", i)))
-				writer.Insert(ctx, u)
+				writer.Create(ctx, u)
 			}
 
 			// Apply to live index
@@ -508,6 +514,198 @@ func TestLocalIndexSnapshotPublishRestoreAndReplay(t *testing.T) {
 
 			if len(liveRows) != 10 || len(restoredRows) != 10 {
 				t.Fatalf("expected 10 rows each, got live=%d restored=%d", len(liveRows), len(restoredRows))
+			}
+		})
+	}
+}
+
+// TestDeltaCompleteFoldingConformance verifies that a consumer can compute
+// row counts and field sums (e.g. sum of Inode.size) solely by folding the log
+// of OpRecords with before-images, matching a full table scan in both MemTable and SQLite projections.
+func TestDeltaCompleteFoldingConformance(t *testing.T) {
+	for _, factory := range localIndexFactories(t) {
+		t.Run(factory.name, func(t *testing.T) {
+			ctx := t.Context()
+			streamID := uuid.New().String()
+
+			transport := &memoryTransport{}
+			writer := sds.NewWriter(transport)
+
+			if _, err := writer.RegisterTypeWithOptions(&pb.Inode{}, sds.WithKeyFields(1), sds.WithLogBeforeImages(true)); err != nil {
+				t.Fatalf("Register Inode failed: %v", err)
+			}
+			if _, err := writer.RegisterTypeWithOptions(&pb.DirEntry{}, sds.WithKeyFields(1, 2)); err != nil {
+				t.Fatalf("Register DirEntry failed: %v", err)
+			}
+			if _, err := writer.RegisterTypeWithOptions(&pb.FileChunk{}, sds.WithKeyFields(1, 2), sds.WithLogBeforeImages(true)); err != nil {
+				t.Fatalf("Register FileChunk failed: %v", err)
+			}
+
+			// Perform an extensive sequence of filesystem lifecycle mutations:
+			// 1. Root dir (ino 1)
+			rootDir := &pb.Inode{Ino: proto.Uint64(1), IsDir: true, Nlink: 2, Mode: 0755}
+			writer.Create(ctx, rootDir)
+
+			// 2. Dir "docs" (ino 2)
+			txMkdir := writer.Begin()
+			docsDir := &pb.Inode{Ino: proto.Uint64(2), IsDir: true, Nlink: 2, Mode: 0755, ParentIno: proto.Uint64(1)}
+			docsEntry := &pb.DirEntry{ParentIno: proto.Uint64(1), Name: proto.String("docs"), Ino: 2, IsDir: true}
+			rootDirUp1 := proto.Clone(rootDir).(*pb.Inode)
+			rootDirUp1.Nlink = 3
+			txMkdir.Create(ctx, docsDir)
+			txMkdir.Create(ctx, docsEntry)
+			txMkdir.Update(ctx, rootDir, rootDirUp1)
+			txMkdir.Commit(ctx)
+			rootDir = rootDirUp1
+
+			// 3. Create file1 (ino 3, size 100) with chunk 0
+			txFile1 := writer.Begin()
+			file1 := &pb.Inode{Ino: proto.Uint64(3), Size: 100, Nlink: 1, Mode: 0644, ParentIno: proto.Uint64(1)}
+			file1Entry := &pb.DirEntry{ParentIno: proto.Uint64(1), Name: proto.String("file1.txt"), Ino: 3}
+			file1Chunk0 := &pb.FileChunk{Ino: proto.Uint64(3), Index: proto.Uint32(0), Sha256: "sha-file1-c0"}
+			txFile1.Create(ctx, file1)
+			txFile1.Create(ctx, file1Entry)
+			txFile1.Create(ctx, file1Chunk0)
+			txFile1.Commit(ctx)
+
+			// 4. Create file2 (ino 4, size 250) with chunks 0, 1
+			txFile2 := writer.Begin()
+			file2 := &pb.Inode{Ino: proto.Uint64(4), Size: 250, Nlink: 1, Mode: 0644, ParentIno: proto.Uint64(1)}
+			file2Entry := &pb.DirEntry{ParentIno: proto.Uint64(1), Name: proto.String("file2.txt"), Ino: 4}
+			file2Chunk0 := &pb.FileChunk{Ino: proto.Uint64(4), Index: proto.Uint32(0), Sha256: "sha-file2-c0"}
+			file2Chunk1 := &pb.FileChunk{Ino: proto.Uint64(4), Index: proto.Uint32(1), Sha256: "sha-file2-c1"}
+			txFile2.Create(ctx, file2)
+			txFile2.Create(ctx, file2Entry)
+			txFile2.Create(ctx, file2Chunk0)
+			txFile2.Create(ctx, file2Chunk1)
+			txFile2.Commit(ctx)
+
+			// 5. Update file1 (setattr / size change: 100 -> 150)
+			file1Up1 := proto.Clone(file1).(*pb.Inode)
+			file1Up1.Size = 150
+			file1Up1.Mode = 0600
+			writer.Update(ctx, file1, file1Up1)
+			file1 = file1Up1
+
+			// 6. Overwrite file1 chunk 0
+			file1Chunk0Up := proto.Clone(file1Chunk0).(*pb.FileChunk)
+			file1Chunk0Up.Sha256 = "sha-file1-c0-modified"
+			writer.Update(ctx, file1Chunk0, file1Chunk0Up)
+			file1Chunk0 = file1Chunk0Up
+
+			// 7. Truncate file2 down to 50 bytes (deletes chunk 1, updates chunk 0 and inode)
+			txTrunc := writer.Begin()
+			file2Up1 := proto.Clone(file2).(*pb.Inode)
+			file2Up1.Size = 50
+			file2Chunk0Up := proto.Clone(file2Chunk0).(*pb.FileChunk)
+			file2Chunk0Up.Sha256 = "sha-file2-c0-truncated"
+			txTrunc.Update(ctx, file2, file2Up1)
+			txTrunc.Update(ctx, file2Chunk0, file2Chunk0Up)
+			txTrunc.Delete(ctx, file2Chunk1)
+			txTrunc.Commit(ctx)
+			file2 = file2Up1
+			file2Chunk0 = file2Chunk0Up
+
+			// 8. Rename file1.txt over existing file2.txt (target replaced)
+			txRename := writer.Begin()
+			txRename.Delete(ctx, file1Entry)  // delete old dir entry file1.txt
+			txRename.Delete(ctx, file2Entry)  // delete target dir entry file2.txt
+			txRename.Delete(ctx, file2)       // target unlinked / deleted
+			txRename.Delete(ctx, file2Chunk0) // target chunks deleted
+			newFile2Entry := &pb.DirEntry{ParentIno: proto.Uint64(1), Name: proto.String("file2.txt"), Ino: 3}
+			txRename.Create(ctx, newFile2Entry)
+			file1Up2 := proto.Clone(file1).(*pb.Inode)
+			file1Up2.ParentIno = proto.Uint64(1)
+			txRename.Update(ctx, file1, file1Up2)
+			txRename.Commit(ctx)
+			file1 = file1Up2
+
+			// 9. Unlink docs dir
+			txRmdir := writer.Begin()
+			txRmdir.Delete(ctx, docsEntry)
+			txRmdir.Delete(ctx, docsDir)
+			rootDirUp2 := proto.Clone(rootDir).(*pb.Inode)
+			rootDirUp2.Nlink = 2
+			txRmdir.Update(ctx, rootDir, rootDirUp2)
+			txRmdir.Commit(ctx)
+			rootDir = rootDirUp2
+
+			// Play the entire log into the projection and simultaneously fold metrics from the log alone
+			idx, cleanup := factory.create(t, ctx, streamID)
+			defer cleanup()
+			if err := idx.SyncRegistry(ctx, writer.Registry()); err != nil {
+				t.Fatalf("SyncRegistry failed: %v", err)
+			}
+
+			logRowCounts := make(map[string]int)
+			var logInodeSizeSum int64
+
+			reader := sds.NewChangeReader()
+			for i, p := range transport.payloads {
+				changes, err := reader.Feed(uint64(i+1), p)
+				if err != nil {
+					t.Fatalf("reader.Feed failed at seq %d: %v", i+1, err)
+				}
+				for _, ch := range changes {
+					// Fold from log alone
+					switch ch.Op {
+					case sds.OpCreate:
+						logRowCounts[ch.TypeName]++
+						if inode, ok := ch.Row.(*pb.Inode); ok {
+							logInodeSizeSum += inode.GetSize()
+						}
+					case sds.OpUpdate:
+						if inodeAfter, ok := ch.Row.(*pb.Inode); ok {
+							inodeBefore, ok := ch.Before.(*pb.Inode)
+							if !ok {
+								t.Fatalf("expected Inode in Before for update change: %v", ch)
+							}
+							logInodeSizeSum += (inodeAfter.GetSize() - inodeBefore.GetSize())
+						}
+					case sds.OpDelete:
+						logRowCounts[ch.TypeName]--
+						if inodeBefore, ok := ch.Before.(*pb.Inode); ok {
+							logInodeSizeSum -= inodeBefore.GetSize()
+						}
+					}
+				}
+				if len(changes) > 0 {
+					if err := idx.ApplyBatch(ctx, changes); err != nil {
+						t.Fatalf("idx.ApplyBatch failed: %v", err)
+					}
+				}
+			}
+
+			// Validate folded aggregates against a full scan of the projection
+			tables := []string{"objectfs.v1alpha1.Inode", "objectfs.v1alpha1.DirEntry", "objectfs.v1alpha1.FileChunk"}
+			for _, tbl := range tables {
+				var scanCount int
+				for msg, err := range idx.Scan(ctx, tbl, nil) {
+					if err != nil {
+						t.Fatalf("Scan %s failed: %v", tbl, err)
+					}
+					if msg != nil {
+						scanCount++
+					}
+				}
+				expectedCount := logRowCounts[tbl]
+				if scanCount != expectedCount {
+					t.Errorf("table %s row count mismatch: folded from log = %d, scan of projection = %d", tbl, expectedCount, scanCount)
+				}
+			}
+
+			// Validate Inode.size sum
+			var scanInodeSizeSum int64
+			for msg, err := range idx.Scan(ctx, "objectfs.v1alpha1.Inode", nil) {
+				if err != nil {
+					t.Fatalf("Scan Inode failed: %v", err)
+				}
+				inode := msg.(*pb.Inode)
+				scanInodeSizeSum += inode.GetSize()
+			}
+
+			if logInodeSizeSum != scanInodeSizeSum {
+				t.Errorf("Inode size sum mismatch: folded from log = %d, scan of projection = %d", logInodeSizeSum, scanInodeSizeSum)
 			}
 		})
 	}
