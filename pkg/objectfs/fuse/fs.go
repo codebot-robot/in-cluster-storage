@@ -890,13 +890,51 @@ func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 }
 
 func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
-	out.Blocks = 1024 * 1024 * 1024
-	out.Bfree = 1024 * 1024 * 1024
-	out.Bavail = 1024 * 1024 * 1024
-	out.Bsize = 4096
-	out.Frsize = 4096
-	out.Files = 1000000
-	out.Ffree = 1000000
+	ctx := context.Background()
+	blockSize := uint64(4096)
+	nominalTotalBytes := uint64(4 * 1024 * 1024 * 1024 * 1024)
+	nominalTotalInodes := uint64(10000000)
+
+	totalBlocks := nominalTotalBytes / blockSize
+	usedBytes := uint64(0)
+	usedInodes := uint64(0)
+
+	if fs.client != nil {
+		resp, err := fs.client.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: fs.volumeID})
+		if err == nil && resp.GetError() == 0 {
+			if resp.GetTotalBytes() > 0 {
+				nominalTotalBytes = uint64(resp.GetTotalBytes())
+				totalBlocks = nominalTotalBytes / blockSize
+			}
+			if resp.GetUsedBytes() > 0 {
+				usedBytes = uint64(resp.GetUsedBytes())
+			}
+			if resp.GetTotalInodes() > 0 {
+				nominalTotalInodes = uint64(resp.GetTotalInodes())
+			}
+			if resp.GetUsedInodes() > 0 {
+				usedInodes = uint64(resp.GetUsedInodes())
+			}
+		}
+	}
+
+	usedBlocks := (usedBytes + blockSize - 1) / blockSize
+	freeBlocks := uint64(0)
+	if totalBlocks > usedBlocks {
+		freeBlocks = totalBlocks - usedBlocks
+	}
+	freeInodes := uint64(0)
+	if nominalTotalInodes > usedInodes {
+		freeInodes = nominalTotalInodes - usedInodes
+	}
+
+	out.Blocks = totalBlocks
+	out.Bfree = freeBlocks
+	out.Bavail = freeBlocks
+	out.Bsize = uint32(blockSize)
+	out.Frsize = uint32(blockSize)
+	out.Files = nominalTotalInodes
+	out.Ffree = freeInodes
 	out.NameLen = MaxNameLength
 	return fuse.OK
 }
