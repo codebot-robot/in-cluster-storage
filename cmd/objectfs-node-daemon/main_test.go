@@ -20,6 +20,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
@@ -76,7 +77,7 @@ func TestParseWriteMode(t *testing.T) {
 }
 
 func TestPluginInfo(t *testing.T) {
-	driver := newDriver("test-node", "localhost:50051", 1024*1024)
+	driver := newDriver("test-node", "localhost:50051", 1024*1024, 30*time.Second, 10*time.Minute)
 	ctx := t.Context()
 
 	info, err := driver.GetPluginInfo(ctx, &csi.GetPluginInfoRequest{})
@@ -107,7 +108,7 @@ func TestNodeGetVolumeStats(t *testing.T) {
 	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
-	driver := newDriver("test-node", "passthrough://bufnet", 1024*1024)
+	driver := newDriver("test-node", "passthrough://bufnet", 1024*1024, 30*time.Second, 10*time.Minute)
 	conn, err := grpc.NewClient("passthrough://bufnet",
 		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
 			return lis.Dial()

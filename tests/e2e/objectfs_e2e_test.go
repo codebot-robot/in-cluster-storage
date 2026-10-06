@@ -936,6 +936,9 @@ spec:
 			if lastErr == nil {
 				return lastOut, nil
 			}
+			if strings.Contains(strings.ToLower(lastOut), "resource busy") || strings.Contains(strings.ToLower(fmt.Sprintf("%v", lastErr)), "resource busy") {
+				return lastOut, fmt.Errorf("unexpected EBUSY / Resource busy error during controller failover: %v (out: %s)", lastErr, lastOut)
+			}
 			time.Sleep(500 * time.Millisecond)
 		}
 		return lastOut, fmt.Errorf("timed out reading %s after 30s: last err=%v out=%s", path, lastErr, lastOut)
@@ -960,8 +963,29 @@ spec:
 	patchNode1JSON := fmt.Sprintf(`{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/hostname":%q}}}}}`, node1)
 	h.RunCommand("kubectl", "patch", "statefulset", "objectfs-controller", "-n", "default", "-p", patchNode1JSON)
 
+	// Repeatedly read file in writer pod while controller is restarting to verify no EBUSY errors
+	readDone := make(chan struct{})
+	readErrors := make(chan error, 100)
+	go func() {
+		defer close(readDone)
+		for i := 0; i < 20; i++ {
+			out, err := h.RunInPod(writerPodName, "default", "cat", "/data/file1.txt")
+			if err != nil {
+				if strings.Contains(strings.ToLower(out), "resource busy") || strings.Contains(strings.ToLower(fmt.Sprintf("%v", err)), "resource busy") {
+					readErrors <- fmt.Errorf("unexpected EBUSY / Resource busy while controller restarting: %v (%s)", err, out)
+				}
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS Controller failed to restart back on %s: %v", node1, err)
+	}
+	<-readDone
+	close(readErrors)
+	for rErr := range readErrors {
+		t.Fatalf("Read during restart failed: %v", rErr)
 	}
 
 	// Step 6: Verify all files (node1 writes + node2 writes) are intact on node1 with retries

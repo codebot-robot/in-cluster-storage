@@ -581,6 +581,18 @@ func (c *NodeCache) InvalidateIfNotDirty(inode uint64) {
 	}
 }
 
+func (c *NodeCache) InvalidateAllClean() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for ino, entry := range c.entries {
+		if !entry.IsDirty && len(entry.DirtyChunks) == 0 {
+			c.curBytes -= entryBytes(entry)
+			delete(c.entries, ino)
+		}
+	}
+}
+
 func (c *NodeCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
