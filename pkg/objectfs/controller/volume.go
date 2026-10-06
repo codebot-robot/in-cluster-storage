@@ -89,6 +89,7 @@ type Volume struct {
 	indexFactory    sds.IndexFactory
 	metadataView    *view.View
 	viewOpts        []view.Option
+	memAppender     *memoryAppender
 
 	snapshotRaw    io.ReaderAt
 	snapshotReader *erofs.Reader
@@ -266,6 +267,7 @@ func (v *Volume) initMetadataViewLocked(ctx context.Context, customIndex sds.Loc
 	viewOpts := append([]view.Option{}, v.viewOpts...)
 	initialStats := &pb.VolumeStats{Name: VolumeStatsRowName}
 	viewOpts = append(viewOpts, view.WithStats(initialStats, UpdateVolumeStats))
+	viewOpts = append(viewOpts, view.WithRebuildFunc(v.rebuildIndex))
 	if v.metadataStream != nil {
 		if _, err := v.metadataStream.Registry().RegisterMessage(initialStats, 1); err != nil {
 			return fmt.Errorf("failed to register VolumeStats message: %w", err)
@@ -449,15 +451,45 @@ func (v *Volume) waitForVolumeUploads(ctx context.Context) error {
 }
 
 type memoryAppender struct {
-	mu       sync.Mutex
-	payloads [][]byte
+	mu          sync.Mutex
+	count       uint64
+	startSeq    uint64
+	payloads    [][]byte
+	maxRetained int
 }
 
 func (m *memoryAppender) Append(_ context.Context, payload []byte) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.count++
+	maxRet := m.maxRetained
+	if maxRet <= 0 {
+		maxRet = 50000
+	}
+	if len(m.payloads) >= maxRet {
+		half := len(m.payloads) / 2
+		m.payloads = m.payloads[half:]
+		m.startSeq = m.count - uint64(len(m.payloads))
+	}
 	m.payloads = append(m.payloads, payload)
-	return uint64(len(m.payloads)), nil
+	return m.count, nil
+}
+
+func (m *memoryAppender) Payloads() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := make([][]byte, len(m.payloads))
+	copy(cp, m.payloads)
+	return cp
+}
+
+func (m *memoryAppender) StartSeq() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.startSeq == 0 {
+		return 1
+	}
+	return m.startSeq
 }
 
 func (v *Volume) initMetadataStreamLocked() error {
@@ -465,7 +497,10 @@ func (v *Volume) initMetadataStreamLocked() error {
 	if v.stream != nil {
 		appender = sds.NewWALAppender(v.stream, walclient.Local)
 	} else {
-		appender = &memoryAppender{}
+		if v.memAppender == nil {
+			v.memAppender = &memoryAppender{}
+		}
+		appender = v.memAppender
 	}
 	w := sds.NewWriter(appender)
 	if _, err := w.RegisterType(&pb.Inode{}, 1); err != nil {
@@ -485,6 +520,9 @@ func (v *Volume) initMetadataStreamLocked() error {
 }
 
 func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *CachedInode) error {
+	if node.Row.GetIsDir() || node.Row.GetSize() == 0 {
+		return nil
+	}
 	if node.Row.GetChunkSize() > 0 && len(node.Chunks) > 0 {
 		return nil
 	}
@@ -3786,6 +3824,13 @@ func (v *Volume) importErofsToLocalIndexLocked(ctx context.Context, reader *erof
 	if v.metadataView == nil || reader == nil {
 		return nil
 	}
+	return v.importErofsToTargetIndex(ctx, v.metadataView.Index(), v.snapshotRaw, reader, snapPos)
+}
+
+func (v *Volume) importErofsToTargetIndex(ctx context.Context, target sds.LocalIndex, raw io.ReaderAt, reader *erofs.Reader, snapPos uint64) error {
+	if target == nil || reader == nil {
+		return nil
+	}
 
 	rootNID := reader.GetRootNID()
 	var changes []sds.Change
@@ -3806,7 +3851,11 @@ func (v *Volume) importErofsToLocalIndexLocked(ctx context.Context, reader *erof
 			ino = 1
 		}
 
-		erofsInode, err := erofs.ReadInode(v.snapshotRaw, reader.Superblock(), nid)
+		rawSource := raw
+		if rawSource == nil {
+			rawSource = v.snapshotRaw
+		}
+		erofsInode, err := erofs.ReadInode(rawSource, reader.Superblock(), nid)
 		if err != nil {
 			return fmt.Errorf("ReadInode failed for nid %d: %w", nid, err)
 		}
@@ -3984,12 +4033,222 @@ func (v *Volume) importErofsToLocalIndexLocked(ctx context.Context, reader *erof
 	}
 
 	if len(changes) > 0 {
-		if err := v.metadataView.ApplyChangesSync(ctx, changes); err != nil {
+		if err := target.ApplyBatch(ctx, changes); err != nil {
 			return fmt.Errorf("failed to import EROFS snapshot into metadata index: %w", err)
 		}
 	}
 	v.lastCommitSeq = snapPos
 	return nil
+}
+
+func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, error) {
+	if v.indexFactory == nil {
+		f, err := sds.GetIndexFactory("sqlite")
+		if err != nil {
+			return nil, 0, err
+		}
+		v.indexFactory = f
+	}
+
+	var (
+		rebuiltIdx sds.LocalIndex
+		snapPos    uint64
+		err        error
+	)
+
+	// 1. Try to restore latest snapshot from object storage
+	if v.backend != nil {
+		snapKey, _, err := v.indexFactory.FindLatestSnapshot(ctx, v.backend, v.streamID.String(), 0)
+		if err == nil && snapKey != "" {
+			restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), snapKey, v.localStorageDir)
+			if err == nil && restoredIdx != nil {
+				rebuiltIdx = restoredIdx
+				snapPos = rPos
+			}
+		}
+	}
+
+	// 2. If no snapshot restored, create new empty local index
+	if rebuiltIdx == nil {
+		rebuiltIdx, err = v.indexFactory.NewEmpty(ctx, v.streamID.String(), v.localStorageDir)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to create new empty index: %w", err)
+		}
+		snapPos = 0
+	}
+
+	// 3. Sync registry
+	if v.metadataStream != nil {
+		if err := rebuiltIdx.SyncRegistry(ctx, v.metadataStream.Registry()); err != nil {
+			_ = rebuiltIdx.Close()
+			return nil, 0, fmt.Errorf("failed to sync registry to rebuilt index: %w", err)
+		}
+	}
+
+	// 4. If starting from scratch (snapPos == 0), initialize root inode or import EROFS snapshot
+	if snapPos == 0 {
+		var imported bool
+		if v.backend != nil {
+			v.mu.RLock()
+			latestSnapshotName, sErr := v.findLatestSnapshotNameLocked(ctx)
+			v.mu.RUnlock()
+			if sErr == nil && latestSnapshotName != "" {
+				snapshotKey := path.Join("volumes", v.volumeID, "meta", latestSnapshotName)
+				var imgBuf bytes.Buffer
+				if err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0, &imgBuf); err == nil && imgBuf.Len() > 0 {
+					readerAt := bytes.NewReader(imgBuf.Bytes())
+					if reader, err := erofs.NewReader(readerAt); err == nil {
+						pos := uint64(0)
+						if rootXattrs, xErr := reader.GetXattrs(reader.GetRootNID()); xErr == nil {
+							if posStr, ok := rootXattrs.Others["trusted.sds.position"]; ok && posStr != "" {
+								if p, pErr := strconv.ParseUint(posStr, 10, 64); pErr == nil {
+									pos = p
+								}
+							}
+						}
+						if pos == 0 {
+							trimmed := strings.TrimSuffix(latestSnapshotName, ".erofs")
+							if p, pErr := strconv.ParseUint(trimmed, 10, 64); pErr == nil {
+								pos = p
+							}
+						}
+						snapPos = pos
+						if err := v.importErofsToTargetIndex(ctx, rebuiltIdx, readerAt, reader, snapPos); err == nil {
+							imported = true
+						}
+					}
+				}
+			}
+		}
+		if !imported {
+			rootInodeMsg := &pb.Inode{
+				Ino:       proto.Uint64(1),
+				Mode:      0755 | syscall.S_IFDIR,
+				Mtime:     timestamppb.Now(),
+				IsDir:     true,
+				Nlink:     2,
+				ParentIno: proto.Uint64(1),
+			}
+			keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+			initChanges := []sds.Change{
+				{
+					Seq:      0,
+					TypeID:   16,
+					TypeName: "objectfs.v1alpha1.Inode",
+					Op:       sds.OpCreate,
+					Key:      sds.NewKeyFromBytes(keyBytes),
+					RawKey:   keyBytes,
+					RawVal:   valBytes,
+					Row:      rootInodeMsg,
+				},
+			}
+			if err := rebuiltIdx.ApplyBatch(ctx, initChanges); err != nil {
+				_ = rebuiltIdx.Close()
+				return nil, 0, fmt.Errorf("failed to init root inode in rebuilt index: %w", err)
+			}
+		}
+	}
+
+	// 5. Replay the stream from snapPos up to current position.
+	// NOTE: Replaying only local recovered records is temporary until #185 implements
+	// cluster-wide remote segment recovery across nodes.
+	if v.stream != nil {
+		recovered := v.stream.RecoveredRecords()
+		if len(recovered) > 0 {
+			cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
+			sr := sds.NewStreamReader("", v.streamID, sds.WithChangeReader(cr), sds.WithRecoveredRecords(recovered))
+			changes, err := sr.FeedRecovered(snapPos)
+			if err != nil {
+				_ = rebuiltIdx.Close()
+				return nil, 0, fmt.Errorf("failed to recover SDS stream records: %w", err)
+			}
+			if len(changes) > 0 {
+				if err := rebuiltIdx.ApplyBatch(ctx, changes); err != nil {
+					_ = rebuiltIdx.Close()
+					return nil, 0, fmt.Errorf("failed to apply replayed changes: %w", err)
+				}
+				for _, ch := range changes {
+					if ch.Seq > snapPos {
+						snapPos = ch.Seq
+					}
+				}
+			}
+		}
+	} else if v.memAppender != nil {
+		payloads := v.memAppender.Payloads()
+		startSeq := v.memAppender.StartSeq()
+		if len(payloads) > 0 {
+			cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
+			var allChanges []sds.Change
+			for seqOffset, p := range payloads {
+				seq := startSeq + uint64(seqOffset)
+				if seq <= snapPos {
+					continue
+				}
+				chs, err := cr.Feed(seq, p)
+				if err != nil {
+					_ = rebuiltIdx.Close()
+					return nil, 0, fmt.Errorf("failed to feed memory record %d: %w", seq, err)
+				}
+				allChanges = append(allChanges, chs...)
+			}
+			if len(allChanges) > 0 {
+				if err := rebuiltIdx.ApplyBatch(ctx, allChanges); err != nil {
+					_ = rebuiltIdx.Close()
+					return nil, 0, fmt.Errorf("failed to apply replayed changes: %w", err)
+				}
+				for _, ch := range allChanges {
+					if ch.Seq > snapPos {
+						snapPos = ch.Seq
+					}
+				}
+			}
+		}
+	}
+
+	// 6. Ensure stats row exists or backfill stats in the rebuilt index
+	statsPK := sds.NewKeyFromBytes([]byte(VolumeStatsRowName))
+	if _, ok, sErr := rebuiltIdx.Get(ctx, VolumeStatsTypeName, statsPK); sErr == nil && !ok {
+		if stats, cErr := v.countStatsFromIndex(ctx, rebuiltIdx); cErr == nil && stats != nil {
+			if def, _, ok := v.metadataStream.Registry().LookupByName(VolumeStatsTypeName); ok {
+				kBytes, vBytes, _ := sds.SplitKeyAndNonKey(stats, def.GetKeyFields())
+				_ = rebuiltIdx.ApplyBatch(ctx, []sds.Change{
+					{
+						Seq:      snapPos,
+						TypeName: VolumeStatsTypeName,
+						TypeID:   def.GetId(),
+						Op:       sds.OpCreate,
+						Key:      sds.NewKeyFromBytes(kBytes),
+						RawKey:   kBytes,
+						RawVal:   vBytes,
+						Row:      stats,
+					},
+				})
+			}
+		}
+	}
+	return rebuiltIdx, snapPos, nil
+}
+
+func (v *Volume) countStatsFromIndex(ctx context.Context, target sds.LocalIndex) (*pb.VolumeStats, error) {
+	st := &pb.VolumeStats{Name: VolumeStatsRowName}
+	for msg, err := range target.Scan(ctx, "objectfs.v1alpha1.Inode", nil) {
+		if err != nil {
+			return nil, err
+		}
+		if inode, ok := msg.(*pb.Inode); ok {
+			UpdateStatsForInodeChange(st, nil, inode)
+		}
+	}
+	for msg, err := range target.Scan(ctx, "objectfs.v1alpha1.FileChunk", nil) {
+		if err != nil {
+			return nil, err
+		}
+		if chunk, ok := msg.(*pb.FileChunk); ok {
+			UpdateStatsForFileChunkChange(st, nil, chunk)
+		}
+	}
+	return st, nil
 }
 
 func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {

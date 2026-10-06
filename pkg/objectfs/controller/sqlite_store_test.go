@@ -1672,3 +1672,197 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 		})
 	}
 }
+
+func TestSQLiteIndexRebuildOnDatabaseCorruption(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-corrupt-rebuild"
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDir),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// 1. Create initial files
+	for i := 1; i <= 10; i++ {
+		name := fmt.Sprintf("initial_%d.txt", i)
+		data := []byte(fmt.Sprintf("initial data content %d", i))
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, err)
+		}
+	}
+
+	// Flush to make sure all records are applied into SQLite DB
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	// 2. Corrupt the SQLite database file on disk with random garbage
+	dbPath := filepath.Join(localDir, "metadata.sqlite")
+	garbage := bytes.Repeat([]byte{0xDE, 0xAD, 0xBE, 0xEF}, 1024)
+	if err := os.WriteFile(dbPath, garbage, 0644); err != nil {
+		t.Fatalf("failed to corrupt sqlite file: %v", err)
+	}
+	_ = os.Remove(dbPath + "-wal")
+	_ = os.Remove(dbPath + "-shm")
+
+	// 3. Write new files while the database is corrupt. Writes succeed on WAL append and overlay!
+	for i := 1; i <= 5; i++ {
+		name := fmt.Sprintf("after_corrupt_%d.txt", i)
+		data := []byte(fmt.Sprintf("new data content after corrupt %d", i))
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile after corrupt %d failed: %v", i, err)
+		}
+	}
+
+	// Reads for both initial and new files must succeed without client-visible errors
+	attrInit, err := vol.Lookup(ctx, 1, "initial_1.txt")
+	if err != nil || attrInit == nil {
+		t.Fatalf("Lookup initial_1.txt failed: %v", err)
+	}
+	attrNew, err := vol.Lookup(ctx, 1, "after_corrupt_1.txt")
+	if err != nil || attrNew == nil {
+		t.Fatalf("Lookup after_corrupt_1.txt failed: %v", err)
+	}
+
+	// 4. Wait for applier to detect unrecoverable corruption, discard, and rebuild the database
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !vol.IsDegraded() && vol.ApplyLag() == 0 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if vol.IsDegraded() {
+		t.Fatalf("expected volume to recover from degraded state after auto-rebuild")
+	}
+
+	// Flush overlay to new rebuilt index
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay after rebuild failed: %v", err)
+	}
+
+	// 5. Verify all 15 files are present and readable
+	entries, err := vol.ReadDir(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 15 {
+		t.Fatalf("expected 15 directory entries after rebuild, got %d", len(entries))
+	}
+
+	for i := 1; i <= 10; i++ {
+		name := fmt.Sprintf("initial_%d.txt", i)
+		attr, err := vol.Lookup(ctx, 1, name)
+		if err != nil || attr == nil {
+			t.Fatalf("verification Lookup %s failed: %v", name, err)
+		}
+	}
+	for i := 1; i <= 5; i++ {
+		name := fmt.Sprintf("after_corrupt_%d.txt", i)
+		attr, err := vol.Lookup(ctx, 1, name)
+		if err != nil || attr == nil {
+			t.Fatalf("verification Lookup %s failed: %v", name, err)
+		}
+	}
+
+	// 6. Verify stats match full recount after rebuild
+	st := vol.Stats()
+	recounted, err := vol.countStatsFromIndex(ctx, vol.metadataView.Index())
+	if err != nil {
+		t.Fatalf("countStatsFromIndex failed after rebuild: %v", err)
+	}
+	if st.Stats.GetInodesDir() != recounted.GetInodesDir() {
+		t.Fatalf("Stats directories mismatch: got %d, recount %d", st.Stats.GetInodesDir(), recounted.GetInodesDir())
+	}
+	if st.Stats.GetInodesFile() != recounted.GetInodesFile() {
+		t.Fatalf("Stats regular files mismatch: got %d, recount %d", st.Stats.GetInodesFile(), recounted.GetInodesFile())
+	}
+	if st.Stats.GetLogicalBytes() != recounted.GetLogicalBytes() {
+		t.Fatalf("Stats logical bytes mismatch: got %d, recount %d", st.Stats.GetLogicalBytes(), recounted.GetLogicalBytes())
+	}
+	if st.Stats.GetMaxIno() != recounted.GetMaxIno() {
+		t.Fatalf("Stats max ino mismatch: got %d, recount %d", st.Stats.GetMaxIno(), recounted.GetMaxIno())
+	}
+}
+
+func TestSQLiteIndexRebuildOnDatabaseDeletion(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-sqlite-delete-rebuild"
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDir),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// 1. Create initial files
+	for i := 1; i <= 10; i++ {
+		name := fmt.Sprintf("file_%d.txt", i)
+		data := []byte(fmt.Sprintf("sample data %d", i))
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, err)
+		}
+	}
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	// 2. Delete the SQLite database files
+	dbPath := filepath.Join(localDir, "metadata.sqlite")
+	_ = os.Remove(dbPath)
+	_ = os.Remove(dbPath + "-wal")
+	_ = os.Remove(dbPath + "-shm")
+
+	// 3. Write additional files
+	for i := 11; i <= 15; i++ {
+		name := fmt.Sprintf("file_%d.txt", i)
+		data := []byte(fmt.Sprintf("sample data %d", i))
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, err)
+		}
+	}
+
+	// 4. Wait for convergence
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !vol.IsDegraded() && vol.ApplyLag() == 0 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if vol.IsDegraded() {
+		t.Fatalf("expected volume to recover from deleted DB state after auto-rebuild")
+	}
+
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	// 5. Verify all entries exist
+	entries, err := vol.ReadDir(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 15 {
+		t.Fatalf("expected 15 directory entries, got %d", len(entries))
+	}
+}
