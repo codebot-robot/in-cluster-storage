@@ -199,6 +199,16 @@ spec:
 
 ---
 
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: objectfs-config
+  namespace: kube-objectfs-system
+data:
+  backend: "" # Required: object storage backend URL (e.g. gs://my-bucket/prefix or s3://my-bucket/prefix)
+
+---
+
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -236,14 +246,31 @@ spec:
             - "--v=5"
             - "--port=50051"
             - "--csi-endpoint=unix:///csi/csi.sock"
+            - "--backend=$(OBJECT_STORAGE_BACKEND)"
+            - "--wal-dir=/var/lib/objectfs/controller/wal"
+            - "--metadata-dir=/var/lib/objectfs/controller/metadata"
+            - "--wal-target=wal-buffer:50051"
+            - "--wal-durability=witness"
+          env:
+            - name: OBJECT_STORAGE_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: objectfs-config
+                  key: backend
           ports:
             - containerPort: 50051
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
+            - name: data-dir
+              mountPath: /var/lib/objectfs/controller
       volumes:
         - name: socket-dir
           emptyDir: {}
+        - name: data-dir
+          hostPath:
+            path: /var/lib/objectfs/controller
+            type: DirectoryOrCreate
 
 ---
 

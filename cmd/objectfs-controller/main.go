@@ -38,7 +38,8 @@ import (
 var (
 	port                     = flag.Int("port", 50051, "The server port")
 	csiEndpoint              = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
-	backendFlag              = flag.String("backend", "memory://", "Object storage backend URL (e.g. memory://, file:///path, s3://bucket/prefix, gs://bucket/prefix)")
+	backendFlag              = flag.String("backend", "", "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
+	metadataDir              = flag.String("metadata-dir", "", "Local directory for persistent metadata indices (e.g. SQLite databases)")
 	flushInterval            = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
 	walDir                   = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
 	walTarget                = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer:50051)")
@@ -66,6 +67,10 @@ func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
 
+	if *backendFlag == "" {
+		klog.Fatalf("missing required flag: --backend (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
+	}
+
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
 		klog.Fatalf("failed to listen: %v", err)
@@ -80,6 +85,9 @@ func main() {
 	var serverOpts []controller.ServerOption
 	if *metadataIndex != "" {
 		serverOpts = append(serverOpts, controller.WithServerMetadataIndex(*metadataIndex))
+	}
+	if *metadataDir != "" {
+		serverOpts = append(serverOpts, controller.WithServerMetadataDir(*metadataDir))
 	}
 	if *metadataCacheEntries > 0 || *metadataCacheBytes > 0 {
 		serverOpts = append(serverOpts, controller.WithServerMetadataCacheLimits(*metadataCacheEntries, *metadataCacheBytes))
