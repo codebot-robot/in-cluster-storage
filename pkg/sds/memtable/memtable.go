@@ -94,6 +94,7 @@ func (t *MemTable) Name() string {
 }
 
 // Get retrieves a row message by primary key.
+// The returned message is shared and must not be modified in place.
 func (t *MemTable) Get(key sds.Key) (proto.Message, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -102,15 +103,16 @@ func (t *MemTable) Get(key sds.Key) (proto.Message, bool) {
 	if !ok {
 		return nil, false
 	}
-	return proto.Clone(msg), true
+	return msg, true
 }
 
 // Put inserts or updates a row message by primary key.
+// The message is stored by pointer and must not be modified after Put.
 func (t *MemTable) Put(key sds.Key, msg proto.Message) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.rows[key] = proto.Clone(msg)
+	t.rows[key] = msg
 }
 
 // Delete removes a row by primary key.
@@ -122,6 +124,7 @@ func (t *MemTable) Delete(key sds.Key) {
 }
 
 // Rows returns a slice of all row messages in the table, sorted in canonical key-byte order.
+// The returned messages are shared and must not be modified in place.
 func (t *MemTable) Rows() []proto.Message {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -136,7 +139,7 @@ func (t *MemTable) Rows() []proto.Message {
 
 	rows := make([]proto.Message, 0, len(keys))
 	for _, k := range keys {
-		rows = append(rows, proto.Clone(t.rows[k]))
+		rows = append(rows, t.rows[k])
 	}
 	return rows
 }
@@ -330,6 +333,7 @@ func (m *MemStore) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 }
 
 // Get retrieves a row message by table name and primary key.
+// The returned message is shared and must not be modified in place.
 func (m *MemStore) Get(ctx context.Context, tableName string, key sds.Key) (proto.Message, bool, error) {
 	table := m.Table(tableName)
 	if table == nil {
@@ -340,6 +344,7 @@ func (m *MemStore) Get(ctx context.Context, tableName string, key sds.Key) (prot
 }
 
 // Scan yields merged proto rows matching keyPrefix in canonical key-byte order.
+// Yielded messages are shared and must not be modified in place.
 func (m *MemStore) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter.Seq2[proto.Message, error] {
 	return func(yield func(proto.Message, error) bool) {
 		table := m.Table(typeName)
@@ -355,7 +360,7 @@ func (m *MemStore) Scan(ctx context.Context, typeName string, keyPrefix []byte) 
 		var entries []keyEntry
 		for k, msg := range table.rows {
 			if len(keyPrefix) == 0 || bytes.HasPrefix(k.Bytes(), keyPrefix) {
-				entries = append(entries, keyEntry{key: k, msg: proto.Clone(msg)})
+				entries = append(entries, keyEntry{key: k, msg: msg})
 			}
 		}
 		table.mu.RUnlock()
