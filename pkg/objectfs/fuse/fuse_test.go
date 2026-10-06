@@ -2036,7 +2036,7 @@ func TestFsyncSlowSyncSucceedsWithinSyncTimeout(t *testing.T) {
 	lis := bufconn.Listen(1024 * 1024)
 	interceptor := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if strings.HasSuffix(info.FullMethod, "/Fsync") {
-			time.Sleep(250 * time.Millisecond)
+			time.Sleep(1500 * time.Millisecond)
 		}
 		return handler(ctx, req)
 	}
@@ -2061,8 +2061,8 @@ func TestFsyncSlowSyncSucceedsWithinSyncTimeout(t *testing.T) {
 	cache := NewNodeCache(1024 * 1024)
 	volumeID := "vol-slow-sync"
 
-	// rpcTimeout is short (100ms), but syncTimeout is longer (2s)
-	fs := NewObjectFSWithTimeouts(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 100*time.Millisecond, 2*time.Second)
+	// rpcTimeout is 1s, but syncTimeout is longer (5s)
+	fs := NewObjectFSWithTimeouts(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 1*time.Second, 5*time.Second)
 
 	// Create a test file
 	var createOut fuse.CreateOut

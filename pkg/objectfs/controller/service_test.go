@@ -884,6 +884,7 @@ func TestOverlayEntryKeepsRowAsOfChange(t *testing.T) {
 	ctx := t.Context()
 	var faultErr atomic.Pointer[error]
 	vol := NewVolume("test-cow-overlay-vol", nil, NewEventBroadcaster(),
+		WithVolumeMutationCheck(),
 		WithApplierBatchSize(100),
 		WithApplierFaultHook(func() error {
 			if ep := faultErr.Load(); ep != nil {
@@ -972,6 +973,46 @@ func TestOverlayEntryKeepsRowAsOfChange(t *testing.T) {
 
 	// Clear fault and verify flush
 	faultErr.Store(nil)
+}
+
+func TestMutationCheckCatchesInPlaceInodeModification(t *testing.T) {
+	ctx := t.Context()
+	vol := NewVolume("test-mutation-check-vol", nil, NewEventBroadcaster(),
+		WithVolumeMutationCheck(),
+	)
+	defer vol.Close()
+
+	attr, err := vol.CreateFile(ctx, 1, "testfile.txt", 0644, []byte("hello"), 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := attr.GetInode().GetIno()
+
+	// Ensure all queued changes are fully flushed to index
+	if err := vol.metadataView.Flush(ctx); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	origMode := attr.GetInode().GetMode()
+
+	// Illegally mutate the returned Inode row in place without mutate()
+	attr.GetInode().Mode = 0777
+
+	didPanic := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				didPanic = true
+			}
+			// Restore original mode so any subsequent reads or Close() succeed
+			attr.GetInode().Mode = origMode
+		}()
+		_, _ = vol.GetAttr(ctx, ino)
+	}()
+
+	if !didPanic {
+		t.Fatalf("expected GetAttr to panic when Inode was mutated in place")
+	}
 }
 
 func TestErofsSnapshotCreationAndRecovery(t *testing.T) {

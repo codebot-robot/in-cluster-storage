@@ -214,6 +214,27 @@ func WithApplierFaultHook(hook func() error) VolumeOption {
 	}
 }
 
+// WithVolumeMutationCheck enables debug mutation checking on the metadata view.
+func WithVolumeMutationCheck() VolumeOption {
+	return func(v *Volume) {
+		v.viewOpts = append(v.viewOpts, view.WithMutationCheck())
+	}
+}
+
+// WithoutVolumeMutationCheck disables debug mutation checking on the metadata view (e.g. for benchmarks).
+func WithoutVolumeMutationCheck() VolumeOption {
+	return func(v *Volume) {
+		v.viewOpts = append(v.viewOpts, view.WithoutMutationCheck())
+	}
+}
+
+// WithVolumeViewOptions appends custom view options to the volume's metadata view.
+func WithVolumeViewOptions(opts ...view.Option) VolumeOption {
+	return func(v *Volume) {
+		v.viewOpts = append(v.viewOpts, opts...)
+	}
+}
+
 // WithLocalStorageDir sets the local directory for metadata storage.
 func WithLocalStorageDir(dir string) VolumeOption {
 	return func(v *Volume) {
@@ -522,12 +543,13 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 	if v.metadataView != nil {
 		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno())}, 1)
 		if pErr == nil {
+			// Rows returned by scanSQLiteRowsLocked are shared/immutable; only read fields here.
 			chunkMsgs, sErr := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 			if sErr == nil {
 				for _, cMsg := range chunkMsgs {
 					chunk := cMsg.(*pb.FileChunk)
 					if chunk.GetIndex() == 0 && len(chunk.GetInlineData()) > 0 {
-						node.InlineData = chunk.GetInlineData()
+						node.InlineData = append([]byte(nil), chunk.GetInlineData()...)
 					} else if chunk.GetSha256() != "" {
 						if node.Chunks == nil {
 							node.Chunks = make(map[uint32]string)
@@ -915,6 +937,8 @@ func (v *Volume) recordOverlayTxChangesLocked(tx *sds.Tx) {
 	v.metadataView.ApplyChanges(changes)
 }
 
+// scanSQLiteRowsLocked queries the view for proto rows matching prefixBytes.
+// The returned messages are shared and immutable; callers must not modify them in place.
 func (v *Volume) scanSQLiteRowsLocked(ctx context.Context, typeName string, prefixBytes []byte) ([]proto.Message, error) {
 	if v.metadataView == nil {
 		return nil, nil
@@ -933,6 +957,8 @@ func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, typeName string,
 	return msgs, nil
 }
 
+// getSQLiteRowLocked retrieves a single proto row from the view.
+// The returned message is shared and immutable; callers must not modify it in place.
 func (v *Volume) getSQLiteRowLocked(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
 	if v.metadataView == nil {
 		return nil, false, nil
@@ -1012,6 +1038,7 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 	if err != nil {
 		return nil, err
 	}
+	// Loaded Inode message is shared/immutable; CachedInode.mutate must be used for any writes.
 	msg, ok, err := v.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.Inode", key)
 	if err != nil {
 		return nil, err
@@ -1046,6 +1073,7 @@ func (v *Volume) getDirEntrySQLiteLocked(ctx context.Context, parentInodeID uint
 	if err != nil {
 		return nil, false, err
 	}
+	// Loaded DirEntry message is shared/immutable.
 	msg, ok, err := v.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.DirEntry", key)
 	if err != nil {
 		return nil, false, err
@@ -1564,7 +1592,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			tx := v.metadataStream.Begin()
 
 			if len(dataCopy) <= int(v.maxInlineLen) {
-				childInode.InlineData = dataCopy
+				childInode.InlineData = append([]byte(nil), dataCopy...)
 				childInode.Chunks = nil
 				childInode.StagedChunks = nil
 				childInode.DirtyChunks = nil
@@ -1578,7 +1606,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 					}
 				}
 				if len(dataCopy) > 0 {
-					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
+					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(0), InlineData: append([]byte(nil), dataCopy...)}); err != nil {
 						return nil, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 					}
 				}
@@ -1690,10 +1718,10 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 		if fileType == syscall.S_IFREG {
 			if len(dataCopy) <= int(v.maxInlineLen) {
-				childInode.InlineData = dataCopy
+				childInode.InlineData = append([]byte(nil), dataCopy...)
 
 				if len(dataCopy) > 0 {
-					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(0), InlineData: dataCopy}); err != nil {
+					if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(0), InlineData: append([]byte(nil), dataCopy...)}); err != nil {
 						return nil, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 					}
 				}
@@ -2191,28 +2219,23 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 
 		// Tiny file check
 		if calculatedSize <= v.maxInlineLen && len(node.Chunks) == 0 {
+			var newInline []byte
 			if node.InlineData == nil {
 				if offset == 0 {
-					node.InlineData = make([]byte, len(data))
-					copy(node.InlineData, data)
+					newInline = make([]byte, len(data))
+					copy(newInline, data)
 				} else {
 					chunk0, _ := v.readChunkLocked(ctx, node, 0)
-					if neededLen > int64(len(chunk0)) {
-						newBuf := make([]byte, neededLen)
-						copy(newBuf, chunk0)
-						chunk0 = newBuf
-					}
-					copy(chunk0[offset:], data)
-					node.InlineData = chunk0
+					newInline = make([]byte, neededLen)
+					copy(newInline, chunk0)
+					copy(newInline[offset:], data)
 				}
 			} else {
-				if neededLen > int64(len(node.InlineData)) {
-					newBuf := make([]byte, neededLen)
-					copy(newBuf, node.InlineData)
-					node.InlineData = newBuf
-				}
-				copy(node.InlineData[offset:], data)
+				newInline = make([]byte, neededLen)
+				copy(newInline, node.InlineData)
+				copy(newInline[offset:], data)
 			}
+			node.InlineData = newInline
 
 			node.mutate(func(row *pb.Inode) {
 				row.ChunkSize = effectiveChunkSize
@@ -2231,7 +2254,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			if _, err := tx.Insert(ctx, &pb.FileChunk{
 				Ino:        proto.Uint64(node.Row.GetIno()),
 				Index:      proto.Uint32(0),
-				InlineData: node.InlineData,
+				InlineData: append([]byte(nil), node.InlineData...),
 			}); err != nil {
 				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
 			}
@@ -2491,14 +2514,9 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			}
 		} else if size <= v.maxInlineLen && len(oldChunks) <= 1 {
 			chunk0, _ := v.readChunkLocked(ctx, node, 0)
-			if int64(len(chunk0)) > size {
-				chunk0 = chunk0[:size]
-			} else if int64(len(chunk0)) < size {
-				newBuf := make([]byte, size)
-				copy(newBuf, chunk0)
-				chunk0 = newBuf
-			}
-			node.InlineData = chunk0
+			newBuf := make([]byte, size)
+			copy(newBuf, chunk0)
+			node.InlineData = newBuf
 			node.Chunks = nil
 			node.StagedChunks = nil
 			node.DirtyChunks = nil
@@ -2517,7 +2535,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 					}
 				}
 			}
-			if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(0), InlineData: node.InlineData}); err != nil {
+			if _, err := tx.Insert(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(0), InlineData: append([]byte(nil), node.InlineData...)}); err != nil {
 				return nil, nil, fmt.Errorf("failed to update inline FileChunk: %w", err)
 			}
 		} else {

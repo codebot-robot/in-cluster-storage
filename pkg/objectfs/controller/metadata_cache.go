@@ -160,6 +160,9 @@ func (c *LRUCache[K, V]) Put(key K, value V) {
 	defer c.mu.Unlock()
 
 	if elem, ok := c.items[key]; ok {
+		if c.onEvict != nil {
+			c.onEvict(elem.key, elem.value)
+		}
 		c.curBytes += sz - elem.size
 		elem.value = value
 		elem.size = sz

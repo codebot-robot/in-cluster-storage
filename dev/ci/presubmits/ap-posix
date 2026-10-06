@@ -262,6 +262,6 @@ EOF
 
 chmod +x "${RUNNER_SCRIPT}"
 
-# Execute tests against native FUSE mount in sqlite mode
-echo "=== Running POSIX gate (sqlite metadata store) ==="
-GOTOOLCHAIN=auto OBJECTFS_METADATA_INDEX=sqlite ./dev/tasks/fuse-start -- "${RUNNER_SCRIPT}"
+# Execute tests against native FUSE mount in sqlite mode with debug mutation checking enabled
+echo "=== Running POSIX gate (sqlite metadata store with debug mutation check) ==="
+GOTOOLCHAIN=auto OBJECTFS_METADATA_INDEX=sqlite OBJECTFS_CONTROLLER_ARGS="--debug-mutation-check" ./dev/tasks/fuse-start -- "${RUNNER_SCRIPT}"
