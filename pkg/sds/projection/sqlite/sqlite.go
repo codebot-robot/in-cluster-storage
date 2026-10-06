@@ -37,17 +37,25 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
-	_ "modernc.org/sqlite" // Pure-Go SQLite driver registration
+	sqlite "modernc.org/sqlite" // Pure-Go SQLite driver
 )
 
 var (
-	_ sds.LocalIndex   = (*DB)(nil)
-	_ sds.Snapshotter  = (*DB)(nil)
-	_ sds.IndexFactory = (*Factory)(nil)
+	_ sds.LocalIndex      = (*DB)(nil)
+	_ sds.Snapshotter     = (*DB)(nil)
+	_ sds.IndexFactory    = (*Factory)(nil)
+	_ sds.ErrorClassifier = (*DB)(nil)
 )
 
 // Factory implements sds.IndexFactory for SQLite local indexes.
-type Factory struct{}
+type Factory struct {
+	opts []Option
+}
+
+// NewFactory creates a new SQLite IndexFactory with custom default options.
+func NewFactory(opts ...Option) *Factory {
+	return &Factory{opts: opts}
+}
 
 func init() {
 	sds.RegisterIndexFactory(&Factory{})
@@ -67,12 +75,13 @@ func (f *Factory) OpenLocal(ctx context.Context, streamID string, dir string) (s
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil, false, nil
 	}
-	db, err := Open(ctx, dbPath,
+	opts := append([]Option{
 		WithStreamID(streamID),
 		WithLockingMode("EXCLUSIVE"),
 		WithJournalMode("WAL"),
 		WithSynchronous("NORMAL"),
-	)
+	}, f.opts...)
+	db, err := Open(ctx, dbPath, opts...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -89,11 +98,12 @@ func (f *Factory) RestoreSnapshot(ctx context.Context, backend objectstore.Backe
 	_ = os.MkdirAll(dir, 0755)
 	dbPath := filepath.Join(dir, "metadata.sqlite")
 	_ = os.Remove(dbPath)
-	return RestoreSnapshotKey(ctx, backend, streamID, key, dbPath,
+	opts := append([]Option{
 		WithLockingMode("EXCLUSIVE"),
 		WithJournalMode("WAL"),
 		WithSynchronous("NORMAL"),
-	)
+	}, f.opts...)
+	return RestoreSnapshotKey(ctx, backend, streamID, key, dbPath, opts...)
 }
 
 // NewEmpty creates a new empty SQLite database in dir.
@@ -103,12 +113,13 @@ func (f *Factory) NewEmpty(ctx context.Context, streamID string, dir string) (sd
 	_ = os.Remove(dbPath)
 	_ = os.Remove(dbPath + "-wal")
 	_ = os.Remove(dbPath + "-shm")
-	return Open(ctx, dbPath,
+	opts := append([]Option{
 		WithStreamID(streamID),
 		WithLockingMode("EXCLUSIVE"),
 		WithJournalMode("WAL"),
 		WithSynchronous("NORMAL"),
-	)
+	}, f.opts...)
+	return Open(ctx, dbPath, opts...)
 }
 
 var (
@@ -130,12 +141,20 @@ func TableName(fullName string) string {
 type Option func(*options)
 
 type options struct {
-	streamID    string
-	lockingMode string
-	journalMode string
-	synchronous string
-	busyTimeout int
-	decoderOpts []record.DecoderOption
+	streamID       string
+	lockingMode    string
+	journalMode    string
+	synchronous    string
+	busyTimeout    int
+	autoCheckpoint *int
+	decoderOpts    []record.DecoderOption
+}
+
+// WithAutoCheckpoint sets the SQLite PRAGMA wal_autocheckpoint.
+func WithAutoCheckpoint(pages int) Option {
+	return func(o *options) {
+		o.autoCheckpoint = &pages
+	}
 }
 
 // WithStreamID sets the stream ID for the projection.
@@ -229,7 +248,8 @@ type DB struct {
 	streamID     string
 	position     uint64
 	changeReader *sds.ChangeReader
-	knownTables  map[string]bool // tableName -> table created
+	knownTables  map[string]bool   // tableName -> table created
+	knownTypes   map[uint32]string // typeID -> fingerprint string
 	stmts        map[string]*tableStmts
 }
 
@@ -250,6 +270,9 @@ func Open(ctx context.Context, path string, opts ...Option) (*DB, error) {
 	}
 	if opt.synchronous != "" {
 		pragmas = append(pragmas, fmt.Sprintf("_pragma=synchronous(%s)", opt.synchronous))
+	}
+	if opt.autoCheckpoint != nil {
+		pragmas = append(pragmas, fmt.Sprintf("_pragma=wal_autocheckpoint(%d)", *opt.autoCheckpoint))
 	}
 	if opt.busyTimeout > 0 {
 		pragmas = append(pragmas, fmt.Sprintf("_pragma=busy_timeout(%d)", opt.busyTimeout))
@@ -277,6 +300,7 @@ func Open(ctx context.Context, path string, opts ...Option) (*DB, error) {
 		streamID:     opt.streamID,
 		changeReader: sds.NewChangeReader(opt.decoderOpts...),
 		knownTables:  make(map[string]bool),
+		knownTypes:   make(map[uint32]string),
 		stmts:        make(map[string]*tableStmts),
 	}
 
@@ -325,6 +349,29 @@ func (d *DB) Registry() *record.Registry {
 // ChangeReader returns the underlying sds.ChangeReader.
 func (d *DB) ChangeReader() *sds.ChangeReader {
 	return d.changeReader
+}
+
+// IsUnrecoverable reports whether an error indicates unrecoverable database corruption,
+// non-database format errors (SQLITE_NOTADB, SQLITE_CORRUPT), or file corruption requiring index rebuild.
+func (d *DB) IsUnrecoverable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqlErr *sqlite.Error
+	if errors.As(err, &sqlErr) {
+		code := sqlErr.Code() & 0xff
+		if code == 11 /* SQLITE_CORRUPT */ || code == 26 /* SQLITE_NOTADB */ {
+			return true
+		}
+	}
+	errStr := strings.ToLower(err.Error())
+	if strings.Contains(errStr, "malformed") ||
+		strings.Contains(errStr, "corrupt") ||
+		strings.Contains(errStr, "not a database") ||
+		strings.Contains(errStr, "file is not a database") {
+		return true
+	}
+	return false
 }
 
 // Close closes the SQLite database connection.
@@ -681,6 +728,10 @@ func (d *DB) ensureTableSchema(ctx context.Context, tx *sql.Tx, def *sdsv1.TypeD
 	cctx := context.WithoutCancel(ctx)
 	tableName := TableName(def.GetName())
 
+	if d.knownTypes != nil && d.knownTypes[def.GetId()] == string(def.GetFingerprint()) && d.knownTables[tableName] && (tx != nil || d.stmts[tableName] != nil) {
+		return nil
+	}
+
 	var execer interface {
 		ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	}
@@ -691,18 +742,24 @@ func (d *DB) ensureTableSchema(ctx context.Context, tx *sql.Tx, def *sdsv1.TypeD
 	}
 
 	// 1. Sync _stream_types table
-	descBytes, err := proto.Marshal(def.GetDescriptors())
-	if err != nil {
-		return fmt.Errorf("failed to marshal descriptors for %d: %w", def.GetId(), err)
-	}
-	kfBytes, err := json.Marshal(def.GetKeyFields())
-	if err != nil {
-		return fmt.Errorf("failed to marshal key_fields for %d: %w", def.GetId(), err)
-	}
+	if d.knownTypes == nil || d.knownTypes[def.GetId()] != string(def.GetFingerprint()) {
+		descBytes, err := proto.Marshal(def.GetDescriptors())
+		if err != nil {
+			return fmt.Errorf("failed to marshal descriptors for %d: %w", def.GetId(), err)
+		}
+		kfBytes, err := json.Marshal(def.GetKeyFields())
+		if err != nil {
+			return fmt.Errorf("failed to marshal key_fields for %d: %w", def.GetId(), err)
+		}
 
-	upsertTypeSQL := `INSERT OR REPLACE INTO _stream_types (id, name, fingerprint, descriptors, key_fields) VALUES (?, ?, ?, ?, ?);`
-	if _, err := execer.ExecContext(cctx, upsertTypeSQL, def.GetId(), def.GetName(), def.GetFingerprint(), descBytes, string(kfBytes)); err != nil {
-		return fmt.Errorf("failed to upsert _stream_types for %d: %w", def.GetId(), err)
+		upsertTypeSQL := `INSERT OR REPLACE INTO _stream_types (id, name, fingerprint, descriptors, key_fields) VALUES (?, ?, ?, ?, ?);`
+		if _, err := execer.ExecContext(cctx, upsertTypeSQL, def.GetId(), def.GetName(), def.GetFingerprint(), descBytes, string(kfBytes)); err != nil {
+			return fmt.Errorf("failed to upsert _stream_types for %d: %w", def.GetId(), err)
+		}
+		if d.knownTypes == nil {
+			d.knownTypes = make(map[uint32]string)
+		}
+		d.knownTypes[def.GetId()] = string(def.GetFingerprint())
 	}
 
 	// 2. Ensure table exists with (keydata BLOB PRIMARY KEY, valuedata BLOB)

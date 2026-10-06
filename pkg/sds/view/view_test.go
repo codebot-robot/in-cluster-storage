@@ -611,3 +611,260 @@ func TestViewTruncateDeletesAndScanOrder(t *testing.T) {
 		})
 	}
 }
+
+type customUnrecoverableError struct {
+	msg string
+}
+
+func (e *customUnrecoverableError) Error() string {
+	return e.msg
+}
+
+func (e *customUnrecoverableError) IsUnrecoverable(_ error) bool {
+	return true
+}
+
+func TestViewRebuildOnUnrecoverableError(t *testing.T) {
+	ctx := t.Context()
+	orderMD := dynamicDescriptor(t, "OrderRebuild", []*descriptorpb.FieldDescriptorProto{
+		protoField("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		protoField("item", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+
+	for _, factory := range testFactories(t) {
+		t.Run(factory.name, func(t *testing.T) {
+			streamID := uuid.New().String()
+			initialIndex, cleanup := factory.create(t, ctx, streamID)
+			defer cleanup()
+
+			transport := &memoryTransport{}
+			writer := sds.NewWriter(transport)
+			_, err := writer.RegisterDescriptor(orderMD, 1)
+			if err != nil {
+				t.Fatalf("RegisterDescriptor failed: %v", err)
+			}
+			reg := writer.Registry()
+			_ = initialIndex.SyncRegistry(ctx, reg)
+
+			var streamRecords [][]sds.Change
+			var streamMu sync.Mutex
+
+			appendStream := func(chs []sds.Change) {
+				streamMu.Lock()
+				defer streamMu.Unlock()
+				cp := make([]sds.Change, len(chs))
+				copy(cp, chs)
+				streamRecords = append(streamRecords, cp)
+			}
+
+			rebuildCount := atomic.Int32{}
+			rebuildFunc := func(rctx context.Context) (sds.LocalIndex, uint64, error) {
+				rebuildCount.Add(1)
+				newIdx, _ := factory.create(t, rctx, streamID)
+				_ = newIdx.SyncRegistry(rctx, reg)
+
+				streamMu.Lock()
+				defer streamMu.Unlock()
+				var maxSeq uint64
+				for _, batch := range streamRecords {
+					_ = newIdx.ApplyBatch(rctx, batch)
+					for _, ch := range batch {
+						if ch.Seq > maxSeq {
+							maxSeq = ch.Seq
+						}
+					}
+				}
+				return newIdx, maxSeq, nil
+			}
+
+			var faultInjected atomic.Bool
+			faultHook := func() error {
+				if faultInjected.Load() {
+					return &customUnrecoverableError{msg: "simulated unrecoverable failure"}
+				}
+				return nil
+			}
+
+			v := view.New(initialIndex,
+				view.WithRegistry(reg),
+				view.WithBatchSize(10),
+				view.WithFaultHook(faultHook),
+				view.WithRebuildFunc(rebuildFunc),
+			)
+			defer v.Close()
+
+			// 1. Apply some changes
+			msg1 := dynamicpb.NewMessage(orderMD)
+			msg1.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(100))
+			msg1.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Item A"))
+			k1, _ := sds.ExtractKey(msg1, []int32{1})
+			k1Bytes, v1Bytes, _ := sds.SplitKeyAndNonKey(msg1, []int32{1})
+
+			ch1 := []sds.Change{
+				{
+					Seq:      1,
+					TypeID:   16,
+					TypeName: "viewtest.OrderRebuild",
+					Op:       sds.OpCreate,
+					Key:      k1,
+					RawKey:   k1Bytes,
+					RawVal:   v1Bytes,
+					Row:      msg1,
+				},
+			}
+			appendStream(ch1)
+			v.ApplyChanges(ch1)
+			if err := v.Flush(ctx); err != nil {
+				t.Fatalf("Flush 1 failed: %v", err)
+			}
+
+			// 2. Inject unrecoverable fault and apply more changes
+			faultInjected.Store(true)
+
+			msg2 := dynamicpb.NewMessage(orderMD)
+			msg2.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(200))
+			msg2.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Item B"))
+			k2, _ := sds.ExtractKey(msg2, []int32{1})
+			k2Bytes, v2Bytes, _ := sds.SplitKeyAndNonKey(msg2, []int32{1})
+
+			ch2 := []sds.Change{
+				{
+					Seq:      2,
+					TypeID:   16,
+					TypeName: "viewtest.OrderRebuild",
+					Op:       sds.OpCreate,
+					Key:      k2,
+					RawKey:   k2Bytes,
+					RawVal:   v2Bytes,
+					Row:      msg2,
+				},
+			}
+			appendStream(ch2)
+			v.ApplyChanges(ch2)
+
+			// Reads for both items must succeed immediately through overlay and read cache
+			row1, ok1, err1 := v.Get(ctx, "viewtest.OrderRebuild", k1)
+			if err1 != nil || !ok1 || row1 == nil {
+				t.Fatalf("Get item 1 failed during fault: ok=%v err=%v", ok1, err1)
+			}
+			row2, ok2, err2 := v.Get(ctx, "viewtest.OrderRebuild", k2)
+			if err2 != nil || !ok2 || row2 == nil {
+				t.Fatalf("Get item 2 failed during fault: ok=%v err=%v", ok2, err2)
+			}
+
+			// 3. Wait for automatic rebuild to trigger
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				if rebuildCount.Load() > 0 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if rebuildCount.Load() == 0 {
+				t.Fatalf("expected index rebuild to have been triggered")
+			}
+
+			// Clear fault and flush
+			faultInjected.Store(false)
+			if err := v.Flush(ctx); err != nil {
+				t.Fatalf("Flush after rebuild failed: %v", err)
+			}
+
+			// 4. Verify converged state
+			finalRow2, finalOk2, _ := v.Get(ctx, "viewtest.OrderRebuild", k2)
+			if !finalOk2 || finalRow2 == nil {
+				t.Fatalf("final Get item 2 failed after rebuild")
+			}
+			dyn2 := finalRow2.(*dynamicpb.Message)
+			if dyn2.Get(dyn2.Descriptor().Fields().ByName("item")).String() != "Item B" {
+				t.Fatalf("unexpected item value: %v", dyn2)
+			}
+		})
+	}
+}
+
+func TestViewRebuildOnDegradedTimeout(t *testing.T) {
+	ctx := t.Context()
+	orderMD := dynamicDescriptor(t, "OrderDegraded", []*descriptorpb.FieldDescriptorProto{
+		protoField("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		protoField("item", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+
+	for _, factory := range testFactories(t) {
+		t.Run(factory.name, func(t *testing.T) {
+			streamID := uuid.New().String()
+			initialIndex, cleanup := factory.create(t, ctx, streamID)
+			defer cleanup()
+
+			transport := &memoryTransport{}
+			writer := sds.NewWriter(transport)
+			_, err := writer.RegisterDescriptor(orderMD, 1)
+			if err != nil {
+				t.Fatalf("RegisterDescriptor failed: %v", err)
+			}
+			reg := writer.Registry()
+			_ = initialIndex.SyncRegistry(ctx, reg)
+
+			rebuildCount := atomic.Int32{}
+			rebuildFunc := func(rctx context.Context) (sds.LocalIndex, uint64, error) {
+				rebuildCount.Add(1)
+				newIdx, _ := factory.create(t, rctx, streamID)
+				_ = newIdx.SyncRegistry(rctx, reg)
+				return newIdx, 0, nil
+			}
+
+			var faultInjected atomic.Bool
+			faultInjected.Store(true)
+			faultHook := func() error {
+				if faultInjected.Load() {
+					return errors.New("transient lock busy error")
+				}
+				return nil
+			}
+
+			v := view.New(initialIndex,
+				view.WithRegistry(reg),
+				view.WithBatchSize(10),
+				view.WithFaultHook(faultHook),
+				view.WithDegradedTimeout(50*time.Millisecond),
+				view.WithRebuildFunc(rebuildFunc),
+			)
+			defer v.Close()
+
+			msg := dynamicpb.NewMessage(orderMD)
+			msg.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(10))
+			msg.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Item X"))
+			k, _ := sds.ExtractKey(msg, []int32{1})
+
+			v.ApplyChanges([]sds.Change{
+				{
+					Seq:      1,
+					TypeID:   16,
+					TypeName: "viewtest.OrderDegraded",
+					Op:       sds.OpCreate,
+					Key:      k,
+					Row:      msg,
+				},
+			})
+
+			// Wait for degraded timeout to elapse and trigger rebuild
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				if rebuildCount.Load() > 0 {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			if rebuildCount.Load() == 0 {
+				t.Fatalf("expected rebuild to trigger after degraded timeout")
+			}
+
+			// Clear fault and flush
+			faultInjected.Store(false)
+			if err := v.Flush(ctx); err != nil {
+				t.Fatalf("Flush failed: %v", err)
+			}
+		})
+	}
+}

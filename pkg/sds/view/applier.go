@@ -44,6 +44,8 @@ type applier struct {
 	failures       atomic.Uint64
 	consecutiveErr atomic.Uint32
 	isDegraded     atomic.Bool
+	degradedSince  time.Time
+	isRebuilding   atomic.Bool
 	faultHook      func() error
 }
 
@@ -210,7 +212,74 @@ func (a *applier) loop() {
 			fails := a.consecutiveErr.Add(1)
 			if fails >= defaultDegradedThreshold && !a.isDegraded.Load() {
 				a.isDegraded.Store(true)
+				a.degradedSince = time.Now()
 				klog.Warningf("View applier marked DEGRADED after %d consecutive failures: %v", fails, applyErr)
+			} else if !a.isDegraded.Load() && a.degradedSince.IsZero() {
+				a.degradedSince = time.Now()
+			}
+
+			// Check if rebuild should be triggered
+			shouldRebuild := false
+			if a.v.rebuildFunc != nil {
+				if a.v.errorClassifier != nil && a.v.errorClassifier(applyErr) {
+					shouldRebuild = true
+				} else if ec, ok := a.v.index.(sds.ErrorClassifier); ok && ec.IsUnrecoverable(applyErr) {
+					shouldRebuild = true
+				} else if sds.IsUnrecoverable(applyErr) {
+					shouldRebuild = true
+				}
+
+				if !shouldRebuild && a.isDegraded.Load() && a.v.degradedTimeout > 0 {
+					if !a.degradedSince.IsZero() && time.Since(a.degradedSince) >= a.v.degradedTimeout {
+						shouldRebuild = true
+					}
+				}
+			}
+
+			if shouldRebuild && !a.isRebuilding.Load() {
+				a.isRebuilding.Store(true)
+				klog.Warningf("View index triggered rebuild due to error: %v", applyErr)
+				newIndex, newPos, err := a.v.rebuildFunc(context.Background())
+				if err != nil {
+					klog.Errorf("View index rebuild failed: %v", err)
+					a.isRebuilding.Store(false)
+				} else {
+					klog.Infof("View index rebuild succeeded at position %d", newPos)
+					a.v.indexMu.Lock()
+					a.v.mu.Lock()
+					oldIndex := a.v.index
+					a.v.index = newIndex
+					a.v.loadErr = nil
+					if newPos > a.v.appliedPos {
+						a.v.appliedPos = newPos
+					}
+					if newIndex != nil {
+						if err := a.v.loadStatsLocked(context.Background()); err != nil {
+							a.v.loadErr = err
+						}
+					}
+					a.v.trimQueueAndOverlayLocked(newPos)
+					if a.v.cache != nil && !a.v.cacheDisabled {
+						a.v.cache.Clear()
+					}
+					a.isDegraded.Store(false)
+					a.consecutiveErr.Store(0)
+					a.degradedSince = time.Time{}
+					a.isRebuilding.Store(false)
+					if a.v.flushCond != nil {
+						a.v.flushCond.Broadcast()
+					}
+					if a.v.backpressureCond != nil {
+						a.v.backpressureCond.Broadcast()
+					}
+					a.v.mu.Unlock()
+					a.v.indexMu.Unlock()
+
+					if oldIndex != nil {
+						_ = oldIndex.Close()
+					}
+					continue
+				}
 			}
 
 			// Exponential backoff with jitter
@@ -247,9 +316,16 @@ func (a *applier) loop() {
 			klog.Infof("View applier recovered from degraded state at seq %d", batchMaxSeq)
 		}
 		a.consecutiveErr.Store(0)
+		a.degradedSince = time.Time{}
 
-		// Dequeue the applied batch
+		// Dequeue the applied batch and zero out discarded references to allow GC
+		for i := 0; i < batchLimit; i++ {
+			a.v.queue[i] = sds.Change{}
+		}
 		a.v.queue = a.v.queue[batchLimit:]
+		if len(a.v.queue) == 0 {
+			a.v.queue = nil
+		}
 
 		// Update overlay and read cache for each coalesced key
 		for ck, cv := range coalescedMap {

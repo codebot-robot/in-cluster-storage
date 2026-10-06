@@ -17,6 +17,7 @@ package memtable
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"sort"
@@ -29,9 +30,10 @@ import (
 )
 
 var (
-	_ sds.LocalIndex   = (*MemStore)(nil)
-	_ sds.Snapshotter  = (*MemStore)(nil)
-	_ sds.IndexFactory = (*Factory)(nil)
+	_ sds.LocalIndex      = (*MemStore)(nil)
+	_ sds.Snapshotter     = (*MemStore)(nil)
+	_ sds.IndexFactory    = (*Factory)(nil)
+	_ sds.ErrorClassifier = (*MemStore)(nil)
 )
 
 // Factory implements sds.IndexFactory for MemStore memory indexes.
@@ -422,6 +424,18 @@ func (m *MemStore) Clear() {
 // PublishSnapshot creates an atomic snapshot of the MemStore and uploads it to object storage.
 func (m *MemStore) PublishSnapshot(ctx context.Context, backend objectstore.Backend) (string, uint64, error) {
 	return PublishSnapshot(ctx, m, backend, "")
+}
+
+// IsUnrecoverable implements sds.ErrorClassifier for MemStore.
+func (m *MemStore) IsUnrecoverable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ec sds.ErrorClassifier
+	if errors.As(err, &ec) {
+		return ec.IsUnrecoverable(err)
+	}
+	return false
 }
 
 // Close closes the MemStore (no-op for memory index).

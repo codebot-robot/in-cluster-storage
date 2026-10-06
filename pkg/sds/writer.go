@@ -15,7 +15,6 @@
 package sds
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"sync/atomic"
@@ -70,19 +69,11 @@ func (w *Writer) resolveOrRegister(msg proto.Message) (*sdsv1.TypeDefinition, er
 
 	reg := w.recordWriter.Registry()
 	def, _, exists := reg.LookupByName(name)
-	if !exists {
-		return reg.RegisterMessage(msg)
+	if exists && def != nil {
+		return def, nil
 	}
 
-	// Check if descriptor evolved
-	currentFP, _, err := record.ComputeMessageFingerprint(md)
-	if err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(currentFP, def.GetFingerprint()) {
-		return reg.RegisterMessage(msg, def.GetKeyFields()...)
-	}
-	return def, nil
+	return reg.RegisterMessage(msg)
 }
 
 func (w *Writer) writeOp(ctx context.Context, op sdsv1.OpRecord_Op, txID uint64, msg proto.Message) (uint64, error) {

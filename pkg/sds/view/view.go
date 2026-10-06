@@ -19,10 +19,12 @@ package view
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
@@ -40,6 +42,11 @@ type OverlayEntry struct {
 // StatsUpdateFunc computes updated stats from a transition between before and after.
 type StatsUpdateFunc func(stats, before, after proto.Message) error
 
+// RebuildFunc is called when the index has suffered a persistent or unrecoverable failure.
+// It creates or restores a new LocalIndex, replays the stream from the restored position
+// up to the current position, and returns the new index and its sequence position.
+type RebuildFunc func(ctx context.Context) (sds.LocalIndex, uint64, error)
+
 // Option configures a View.
 type Option func(*View)
 
@@ -55,6 +62,27 @@ func WithStats(initial proto.Message, update StatsUpdateFunc) Option {
 func WithBatchSize(batchSize int) Option {
 	return func(v *View) {
 		v.batchSize = batchSize
+	}
+}
+
+// WithRebuildFunc configures the index reconstruction function for automatic recovery.
+func WithRebuildFunc(fn RebuildFunc) Option {
+	return func(v *View) {
+		v.rebuildFunc = fn
+	}
+}
+
+// WithDegradedTimeout sets how long the view may remain degraded before triggering an automatic index rebuild.
+func WithDegradedTimeout(d time.Duration) Option {
+	return func(v *View) {
+		v.degradedTimeout = d
+	}
+}
+
+// WithErrorClassifier configures a custom error classifier function for unrecoverable errors.
+func WithErrorClassifier(classifier func(error) bool) Option {
+	return func(v *View) {
+		v.errorClassifier = classifier
 	}
 }
 
@@ -121,6 +149,10 @@ type View struct {
 	statsUpdate StatsUpdateFunc
 	loadErr     error
 
+	rebuildFunc     RebuildFunc
+	degradedTimeout time.Duration
+	errorClassifier func(error) bool
+
 	backpressureCond *sync.Cond
 	flushCond        *sync.Cond
 	closed           bool
@@ -132,6 +164,7 @@ func New(index sds.LocalIndex, opts ...Option) *View {
 		index:           index,
 		overlay:         make(map[CacheKey]OverlayEntry),
 		batchSize:       defaultApplierBatchSize,
+		degradedTimeout: 5 * time.Second,
 		cacheCapacity:   10000,
 		cacheMaxBytes:   64 * 1024 * 1024,
 		maxOverlayBytes: 64 * 1024 * 1024,
@@ -161,6 +194,87 @@ func New(index sds.LocalIndex, opts ...Option) *View {
 	v.applier.start()
 
 	return v
+}
+
+// Rebuild triggers an immediate rebuild of the underlying LocalIndex using the configured RebuildFunc.
+func (v *View) Rebuild(ctx context.Context) error {
+	if v.rebuildFunc == nil {
+		return errors.New("no rebuild function configured")
+	}
+	newIndex, newPos, err := v.rebuildFunc(ctx)
+	if err != nil {
+		return err
+	}
+	v.indexMu.Lock()
+	defer v.indexMu.Unlock()
+	v.mu.Lock()
+	oldIndex := v.index
+	v.index = newIndex
+	v.loadErr = nil
+	if newPos > v.appliedPos {
+		v.appliedPos = newPos
+	}
+	if newIndex != nil {
+		if err := v.loadStatsLocked(ctx); err != nil {
+			v.loadErr = err
+		}
+	}
+	v.trimQueueAndOverlayLocked(newPos)
+	if v.cache != nil && !v.cacheDisabled {
+		v.cache.Clear()
+	}
+	if v.applier != nil {
+		v.applier.isDegraded.Store(false)
+		v.applier.consecutiveErr.Store(0)
+		v.applier.degradedSince = time.Time{}
+		v.applier.isRebuilding.Store(false)
+	}
+	if v.flushCond != nil {
+		v.flushCond.Broadcast()
+	}
+	if v.backpressureCond != nil {
+		v.backpressureCond.Broadcast()
+	}
+	v.mu.Unlock()
+
+	if oldIndex != nil {
+		_ = oldIndex.Close()
+	}
+	return nil
+}
+
+func (v *View) trimQueueAndOverlayLocked(newPos uint64) {
+	idx := 0
+	for idx < len(v.queue) && v.queue[idx].Seq <= newPos {
+		idx++
+	}
+	if idx > 0 {
+		for i := 0; i < idx; i++ {
+			v.queue[i] = sds.Change{}
+		}
+		v.queue = v.queue[idx:]
+		if len(v.queue) == 0 {
+			v.queue = nil
+		}
+	}
+
+	for ck, entry := range v.overlay {
+		if entry.Seq <= newPos {
+			delete(v.overlay, ck)
+			v.unappliedBytes -= entry.Size
+			if v.unappliedBytes < 0 {
+				v.unappliedBytes = 0
+			}
+		}
+	}
+}
+
+// IsRebuilding reports whether the view is currently rebuilding its underlying local index.
+func (v *View) IsRebuilding() bool {
+	if v.applier != nil {
+		return v.applier.isRebuilding.Load()
+	}
+	return false
 }
 
 // Index returns the underlying sds.LocalIndex.
