@@ -4004,38 +4004,50 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	var snapPos uint64
 	var initialized bool
 
-	// 1. Check if local index is already open or existing
+	var remoteSnapKey string
+	var remoteSnapPos uint64
+	if v.backend != nil && v.indexFactory != nil {
+		snapKey, rPos, err := v.indexFactory.FindLatestSnapshot(ctx, v.backend, v.streamID.String(), 0)
+		if err == nil && snapKey != "" {
+			remoteSnapKey = snapKey
+			remoteSnapPos = rPos
+		}
+	}
+
+	// 1. Check if local index is already open or existing, and not stale compared to remote snapshot
 	if v.metadataView != nil {
 		pos := v.metadataView.Position()
-		if pos > 0 {
+		if pos > 0 && pos >= remoteSnapPos {
 			snapPos = pos
 			initialized = true
 		}
 	} else if v.localStorageDir != "" {
 		localIdx, found, err := v.indexFactory.OpenLocal(ctx, v.streamID.String(), v.localStorageDir)
 		if err == nil && found && localIdx != nil {
-			_ = v.initMetadataViewLocked(ctx, localIdx)
-			if localIdx.Position() > 0 {
-				snapPos = localIdx.Position()
-				initialized = true
+			if localIdx.Position() >= remoteSnapPos {
+				_ = v.initMetadataViewLocked(ctx, localIdx)
+				if localIdx.Position() > 0 {
+					snapPos = localIdx.Position()
+					initialized = true
+				}
+			} else {
+				klog.Infof("Volume %s: local SQLite metadata index on disk is stale (local pos %d < remote snapshot pos %d); restoring snapshot %s", v.volumeID, localIdx.Position(), remoteSnapPos, remoteSnapKey)
+				_ = localIdx.Close()
 			}
 		}
 	}
 
 	// 2. Otherwise restore latest published snapshot
-	if !initialized && v.backend != nil {
-		snapKey, _, err := v.indexFactory.FindLatestSnapshot(ctx, v.backend, v.streamID.String(), 0)
-		if err == nil && snapKey != "" {
-			if v.metadataView != nil {
-				_ = v.metadataView.Close()
-				v.metadataView = nil
-			}
-			restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), snapKey, v.localStorageDir)
-			if err == nil && restoredIdx != nil {
-				_ = v.initMetadataViewLocked(ctx, restoredIdx)
-				snapPos = rPos
-				initialized = true
-			}
+	if !initialized && remoteSnapKey != "" && v.backend != nil {
+		if v.metadataView != nil {
+			_ = v.metadataView.Close()
+			v.metadataView = nil
+		}
+		restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), remoteSnapKey, v.localStorageDir)
+		if err == nil && restoredIdx != nil {
+			_ = v.initMetadataViewLocked(ctx, restoredIdx)
+			snapPos = rPos
+			initialized = true
 		}
 	}
 

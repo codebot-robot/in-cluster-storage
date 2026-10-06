@@ -14,6 +14,8 @@ ObjectFS is built around the fundamental architectural principle of **splitting 
 
 Mounting on Kubernetes worker nodes is currently handled via a user-space **FUSE** driver (`go-fuse`) that communicates with a cluster controller service. ObjectFS provides near-instant volume readiness, intelligent local node caching, push-based invalidations, and high-throughput data access without requiring cloud storage credentials to be distributed to worker nodes.
 
+For deployment and installation instructions with real object storage (GCS/S3) and persistent WAL/metadata storage, see the [Installation Guide](install.md).
+
 ---
 
 ## Architectural Design

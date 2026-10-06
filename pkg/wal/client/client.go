@@ -128,6 +128,7 @@ type streamImpl struct {
 	witnessSeq    uint64
 	s3Seq         uint64
 	retainedBytes int64
+	gapErr        error
 
 	// Retained in-memory records queue for network sending & replay
 	retainedMu      sync.RWMutex
@@ -220,6 +221,14 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 	if s.closed.Load() {
 		return 0, errors.New("stream closed")
 	}
+
+	s.mu.RLock()
+	if s.gapErr != nil {
+		err := s.gapErr
+		s.mu.RUnlock()
+		return 0, err
+	}
+	s.mu.RUnlock()
 
 	recordSize := int64(wal.ClientHeaderSize + len(payload))
 
@@ -608,6 +617,11 @@ func (s *streamImpl) runStreamSession() error {
 func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if helloAck.WitnessAckedStreamSeq > s.localSeq {
+		s.gapErr = fmt.Errorf("wal buffer witness watermark (%d) is ahead of local stream head (%d); refusing append to prevent silent write loss (see #185)", helloAck.WitnessAckedStreamSeq, s.localSeq)
+		klog.Errorf("Stream %s: %v", s.streamID, s.gapErr)
+	}
 
 	if helloAck.WitnessAckedStreamSeq < s.witnessSeq {
 		klog.Warningf("Witness watermark dropped on restart from %d to %d (replaying unacknowledged records)", s.witnessSeq, helloAck.WitnessAckedStreamSeq)

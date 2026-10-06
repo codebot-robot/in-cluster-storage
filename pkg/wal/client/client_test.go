@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -991,5 +992,56 @@ func TestTailStreamHelper(t *testing.T) {
 		if seq != expectedRestartSeqs[i] {
 			t.Errorf("after restart index %d: expected seq %d, got %d", i, expectedRestartSeqs[i], seq)
 		}
+	}
+}
+
+// 14. Node move gap check: when buffer's witness watermark > client's local stream head,
+// client must fail fast and refuse appends to avoid silent data loss (issue #185).
+func TestBufferWitnessAheadOfClientLocalHeadRefusesAppend(t *testing.T) {
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir())
+	defer handle.StopGraceful()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	streamID := uuid.New()
+	clientDir1 := t.TempDir()
+
+	// 1. First client appends 5 records
+	stream1, err := Open(ctx, clientDir1, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream1 failed: %v", err)
+	}
+	defer stream1.Close()
+
+	for i := 1; i <= 5; i++ {
+		seq, err := stream1.Append(ctx, []byte(fmt.Sprintf("msg-%d", i)))
+		if err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+		if err := stream1.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("wait %d failed: %v", i, err)
+		}
+	}
+
+	// 2. Second client starts with an empty directory (simulating controller starting on a new node)
+	clientDir2 := t.TempDir()
+	stream2, err := Open(ctx, clientDir2, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream2 failed: %v", err)
+	}
+	defer stream2.Close()
+
+	// Wait briefly for HelloAck background exchange
+	time.Sleep(100 * time.Millisecond)
+
+	// Appending on stream2 must fail fast with the gap error referencing #185
+	_, appendErr := stream2.Append(ctx, []byte("new-node-write"))
+	if appendErr == nil {
+		t.Fatalf("expected Append on stream2 to fail because buffer witness seq (5) > local head (0)")
+	}
+	if !strings.Contains(appendErr.Error(), "#185") {
+		t.Fatalf("expected error message to reference #185, got: %v", appendErr)
 	}
 }

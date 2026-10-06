@@ -13,6 +13,14 @@
 # limitations under the License.
 
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wal-buffer
+  namespace: kube-objectfs-system
+
+---
+
+apiVersion: v1
 kind: Service
 metadata:
   name: wal-buffer
@@ -44,27 +52,32 @@ spec:
       labels:
         app: wal-buffer
     spec:
+      serviceAccountName: wal-buffer
       containers:
         - name: wal-buffer
           image: wal-buffer:latest
           args:
             - "--v=5"
             - "--port=50051"
-            - "--data-dir=/data"
-            - "--backend=file:///store"
+            - "--data-dir=/var/lib/objectfs/wal-buffer"
+            - "--backend=$(OBJECT_STORAGE_BACKEND)"
+          env:
+            - name: OBJECT_STORAGE_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: objectfs-config
+                  key: backend
           ports:
             - containerPort: 50051
               name: grpc
           volumeMounts:
             - name: data-dir
-              mountPath: /data
-            - name: store-dir
-              mountPath: /store
+              mountPath: /var/lib/objectfs/wal-buffer
       volumes:
         - name: data-dir
-          emptyDir: {}
-        - name: store-dir
-          emptyDir: {}
+          hostPath:
+            path: /var/lib/objectfs/wal-buffer
+            type: DirectoryOrCreate
 
 ---
 

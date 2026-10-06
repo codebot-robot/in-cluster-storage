@@ -36,7 +36,7 @@ import (
 var (
 	port           = flag.Int("port", 50051, "gRPC server port")
 	dataDir        = flag.String("data-dir", "/data", "Local directory for caching WAL segments")
-	backendType    = flag.String("backend", "memory://", "Object storage backend URL (e.g. memory://, file:///path, s3://bucket/prefix, gs://bucket/prefix)")
+	backendType    = flag.String("backend", "", "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
 	flushInterval  = flag.Duration("flush-interval", 60*time.Second, "Periodic flush interval to backend object storage")
 	flushBytes     = flag.Int64("flush-bytes", 64*1024*1024, "Unflushed bytes threshold to trigger S3 flush")
 	tailCacheBytes = flag.Int64("tail-cache-bytes", 64*1024*1024, "Retained bytes in local cache for tailing")
@@ -47,6 +47,10 @@ var (
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	if *backendType == "" {
+		klog.Fatalf("missing required flag: --backend (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
+	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {

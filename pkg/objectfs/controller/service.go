@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -85,6 +87,30 @@ func volErrToSyscall(err error) int32 {
 	return int32(syscall.EIO)
 }
 
+// isValidVolumeID validates that volumeID conforms to a safe alphanumeric and separator character set
+// ([A-Za-z0-9._-]) and does not contain path traversal characters (such as . or .. or slashes).
+func isValidVolumeID(volumeID string) bool {
+	if volumeID == "" || volumeID == "." || volumeID == ".." || len(volumeID) > 255 {
+		return false
+	}
+	for _, r := range volumeID {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func volInitError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	return status.Errorf(codes.Internal, "%v", err)
+}
+
 type Server struct {
 	pb.UnimplementedObjectFSControllerServer
 	mu          sync.RWMutex
@@ -97,6 +123,7 @@ type Server struct {
 	walTarget                string
 	defaultDurability        walclient.Level
 	metadataIndex            string
+	metadataDir              string
 	metadataCacheEntries     int
 	metadataCacheBytes       int64
 	metadataOverlayMaxBytes  int64
@@ -116,6 +143,13 @@ type ServerOption func(*Server)
 func WithServerMetadataIndex(index string) ServerOption {
 	return func(s *Server) {
 		s.metadataIndex = index
+	}
+}
+
+// WithServerMetadataDir configures the base directory for persistent local metadata storage (e.g. SQLite databases).
+func WithServerMetadataDir(dir string) ServerOption {
+	return func(s *Server) {
+		s.metadataDir = dir
 	}
 }
 
@@ -189,6 +223,10 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 }
 
 func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
+	if !isValidVolumeID(volumeID) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", volumeID)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -212,6 +250,13 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		volOpts = append(volOpts, WithDurability(s.defaultDurability))
 		if s.metadataIndex != "" {
 			volOpts = append(volOpts, WithMetadataIndex(s.metadataIndex))
+		}
+		if s.metadataDir != "" {
+			volDir := filepath.Join(s.metadataDir, volumeID)
+			if err := os.MkdirAll(volDir, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create metadata dir %s for volume %s: %w", volDir, volumeID, err)
+			}
+			volOpts = append(volOpts, WithLocalStorageDir(volDir))
 		}
 		if s.metadataCacheEntries > 0 || s.metadataCacheBytes > 0 {
 			volOpts = append(volOpts, WithMetadataCacheLimits(s.metadataCacheEntries, s.metadataCacheBytes))
@@ -333,7 +378,7 @@ func (s *Server) GetAttr(ctx context.Context, req *pb.GetAttrRequest) (*pb.GetAt
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	attr, err := vol.GetAttr(ctx, req.GetInode())
 	if err != nil {
@@ -348,7 +393,7 @@ func (s *Server) SetAttr(ctx context.Context, req *pb.SetAttrRequest) (*pb.SetAt
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	if req.Size != nil {
 		if _, err := vol.TruncateFile(ctx, req.GetInode(), req.GetSize()); err != nil {
@@ -383,7 +428,7 @@ func (s *Server) Lookup(ctx context.Context, req *pb.LookupRequest) (*pb.LookupR
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	attr, err := vol.Lookup(ctx, req.GetParentInode(), req.GetName())
 	if err != nil {
@@ -398,7 +443,7 @@ func (s *Server) ReadDir(ctx context.Context, req *pb.ReadDirRequest) (*pb.ReadD
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	entries, err := vol.ReadDir(ctx, req.GetInode())
 	if err != nil {
@@ -413,7 +458,7 @@ func (s *Server) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MkdirResp
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	attr, err := vol.Mkdir(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetUid(), req.GetGid())
 	if err != nil {
@@ -428,7 +473,7 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	attr, err := vol.CreateFile(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetInitialContent(), req.GetUid(), req.GetGid(), req.GetRdev())
 	if err != nil {
@@ -444,7 +489,7 @@ func (s *Server) ReadFile(ctx context.Context, req *pb.ReadFileRequest) (*pb.Rea
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	data, totalSize, redirectURL, err := vol.ReadFile(ctx, req.GetInode(), req.GetOffset(), req.GetSize())
 	if err != nil {
@@ -466,7 +511,7 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	bytesWritten, newSize, modTime, err := vol.WriteFile(ctx, req.GetInode(), req.GetOffset(), req.GetData(), req.GetWriteMode())
 	if err != nil {
@@ -485,7 +530,7 @@ func (s *Server) TruncateFile(ctx context.Context, req *pb.TruncateFileRequest) 
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	attr, err := vol.TruncateFile(ctx, req.GetInode(), req.GetSize())
 	if err != nil {
@@ -500,7 +545,7 @@ func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkR
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	if err := vol.Unlink(ctx, req.GetParentInode(), req.GetName()); err != nil {
 		return &pb.UnlinkResponse{Success: false, Error: volErrToSyscall(err)}, nil
@@ -514,7 +559,7 @@ func (s *Server) Rmdir(ctx context.Context, req *pb.RmdirRequest) (*pb.RmdirResp
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	if err := vol.Rmdir(ctx, req.GetParentInode(), req.GetName()); err != nil {
 		return &pb.RmdirResponse{Success: false, Error: volErrToSyscall(err)}, nil
@@ -528,7 +573,7 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	attr, err := vol.Rename(ctx, req.GetOldParentInode(), req.GetOldName(), req.GetNewParentInode(), req.GetNewName())
 	if err != nil {
@@ -543,7 +588,7 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	if err := vol.Fsync(ctx, req.GetInode()); err != nil {
 		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err)}, nil
@@ -557,7 +602,7 @@ func (s *Server) Symlink(ctx context.Context, req *pb.SymlinkRequest) (*pb.Symli
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	attr, err := vol.Symlink(ctx, req.GetParentInode(), req.GetName(), req.GetTarget(), req.GetUid(), req.GetGid())
 	if err != nil {
@@ -572,7 +617,7 @@ func (s *Server) Readlink(ctx context.Context, req *pb.ReadlinkRequest) (*pb.Rea
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	target, err := vol.Readlink(ctx, req.GetInode())
 	if err != nil {
@@ -587,7 +632,7 @@ func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkRespons
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	attr, err := vol.Link(ctx, req.GetOldInode(), req.GetNewParentInode(), req.GetNewName())
 	if err != nil {
@@ -602,7 +647,7 @@ func (s *Server) Open(ctx context.Context, req *pb.OpenRequest) (*pb.OpenRespons
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	fh, err := vol.Open(ctx, req.GetInode(), req.GetFlags())
 	if err != nil {
@@ -617,7 +662,7 @@ func (s *Server) Release(ctx context.Context, req *pb.ReleaseRequest) (*pb.Relea
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	if err := vol.Release(ctx, req.GetInode(), req.GetFh()); err != nil {
 		return &pb.ReleaseResponse{Error: volErrToSyscall(err)}, nil
@@ -626,8 +671,8 @@ func (s *Server) Release(ctx context.Context, req *pb.ReleaseRequest) (*pb.Relea
 }
 
 func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSController_WatchVolumeServer) error {
-	if req.GetVolumeId() == "" {
-		return status.Error(codes.InvalidArgument, "volume_id is required")
+	if !isValidVolumeID(req.GetVolumeId()) {
+		return status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", req.GetVolumeId())
 	}
 
 	ch := s.broadcaster.Subscribe(req.GetVolumeId())
@@ -805,7 +850,7 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	allSnapshots, err := vol.ListSnapshots(ctx)
 	if err != nil {
@@ -867,7 +912,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	}
 	vol, err := s.getOrCreateVolume(req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, volInitError(err)
 	}
 	snapName, err := vol.CreateSnapshot(ctx)
 	if err != nil {

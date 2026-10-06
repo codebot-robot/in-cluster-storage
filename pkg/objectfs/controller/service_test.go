@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -4245,5 +4246,118 @@ func TestControllerMknodSpecialFiles(t *testing.T) {
 	}
 	if chrAttr.GetAttr().GetInode().GetRdev() != 0x0103 {
 		t.Fatalf("GetAttr CHR Rdev expected 0x0103, got 0x%x", chrAttr.GetAttr().GetInode().GetRdev())
+	}
+}
+
+func TestServerMetadataDirPersistenceAcrossRestart(t *testing.T) {
+	ctx := t.Context()
+	dataDir := t.TempDir()
+	walDir := filepath.Join(dataDir, "wal")
+	metadataDir := filepath.Join(dataDir, "metadata")
+	backend := NewMemoryBackend()
+	volumeID := "test-server-persistence-vol"
+
+	// 1. First server instance writes files
+	server1 := NewServer(backend,
+		WithServerWAL(walDir, "", walclient.Local),
+		WithServerMetadataDir(metadataDir),
+	)
+
+	createResp, err := testCreateFile(ctx, server1, volumeID, "/persist.txt", 0644, []byte("hello persistent disk"), 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed on server1: err=%v, code=%d", err, createResp.GetError())
+	}
+	fileIno := createResp.GetAttr().GetInode().GetIno()
+
+	mkdirResp, err := testMkdir(ctx, server1, volumeID, "/sub", 0755, 0, 0)
+	if err != nil || mkdirResp.GetError() != 0 {
+		t.Fatalf("Mkdir failed on server1: err=%v, code=%d", err, mkdirResp.GetError())
+	}
+
+	// Verify SQLite database exists on disk under metadataDir/volumeID
+	sqlitePath := filepath.Join(metadataDir, volumeID, "metadata.sqlite")
+	if _, err := os.Stat(sqlitePath); err != nil {
+		t.Fatalf("Expected SQLite DB at %s, got error: %v", sqlitePath, err)
+	}
+
+	// Close first server
+	if err := server1.Close(); err != nil {
+		t.Fatalf("server1.Close failed: %v", err)
+	}
+
+	// 2. Second server instance starts with same WAL and metadata dirs
+	server2 := NewServer(backend,
+		WithServerWAL(walDir, "", walclient.Local),
+		WithServerMetadataDir(metadataDir),
+	)
+	defer server2.Close()
+
+	// Read back file
+	readResp, err := server2.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    fileIno,
+		Offset:   0,
+		Size:     100,
+	})
+	if err != nil || readResp.GetError() != 0 {
+		t.Fatalf("ReadFile failed on server2: err=%v, code=%d", err, readResp.GetError())
+	}
+	if string(readResp.GetData()) != "hello persistent disk" {
+		t.Fatalf("Expected content 'hello persistent disk', got %q", string(readResp.GetData()))
+	}
+
+	// Lookup directory
+	lookupResp, err := server2.Lookup(ctx, &pb.LookupRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "sub",
+	})
+	if err != nil || lookupResp.GetError() != 0 {
+		t.Fatalf("Lookup 'sub' failed on server2: err=%v, code=%d", err, lookupResp.GetError())
+	}
+	if !lookupResp.GetAttr().GetInode().GetIsDir() {
+		t.Fatalf("Expected 'sub' to be a directory on server2")
+	}
+}
+
+func TestVolumeIDValidation(t *testing.T) {
+	validIDs := []string{
+		"vol-123",
+		"pvc-a0b1c2d3-e4f5-6789-abcd-ef0123456789",
+		"my_volume.name-123",
+		"vol",
+		"12345",
+	}
+	for _, id := range validIDs {
+		if !isValidVolumeID(id) {
+			t.Errorf("Expected valid volumeID %q to pass validation", id)
+		}
+	}
+
+	invalidIDs := []string{
+		"",
+		".",
+		"..",
+		"../escape",
+		"../../etc/passwd",
+		"vol/sub",
+		"vol$bad",
+		"vol name",
+		"vol\x00bad",
+		strings.Repeat("a", 256),
+	}
+	for _, id := range invalidIDs {
+		if isValidVolumeID(id) {
+			t.Errorf("Expected invalid volumeID %q to fail validation", id)
+		}
+	}
+
+	ctx := t.Context()
+	server := NewServer(NewMemoryBackend())
+	for _, id := range invalidIDs {
+		_, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: id, Inode: 1})
+		if err == nil {
+			t.Errorf("Expected GetAttr with invalid volumeID %q to fail", id)
+		}
 	}
 }
