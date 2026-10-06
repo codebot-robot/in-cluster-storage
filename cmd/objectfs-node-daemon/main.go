@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
@@ -39,10 +40,12 @@ import (
 )
 
 var (
-	endpoint          = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
-	nodeID            = flag.String("nodeid", "", "node id")
-	controllerAddress = flag.String("controller-address", "objectfs-controller:50051", "ObjectFS Controller address")
-	cacheSizeMB       = flag.Int64("cache-size-mb", 128, "Local node cache size in MB")
+	endpoint              = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
+	nodeID                = flag.String("nodeid", "", "node id")
+	controllerAddress     = flag.String("controller-address", "objectfs-controller:50051", "ObjectFS Controller address")
+	cacheSizeMB           = flag.Int64("cache-size-mb", 128, "Local node cache size in MB")
+	controllerRPCTimeout  = flag.Duration("controller-rpc-timeout", 30*time.Second, "Timeout for RPCs to ObjectFS controller")
+	controllerSyncTimeout = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for sync RPCs (fsync, flush, write) to ObjectFS controller")
 )
 
 func main() {
@@ -72,7 +75,7 @@ func main() {
 
 	server := grpc.NewServer()
 
-	driver := newDriver(*nodeID, *controllerAddress, *cacheSizeMB*1024*1024)
+	driver := newDriver(*nodeID, *controllerAddress, *cacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout)
 
 	csi.RegisterIdentityServer(server, driver)
 	csi.RegisterNodeServer(server, driver)
@@ -108,6 +111,8 @@ type objectFSDriver struct {
 	nodeID            string
 	controllerAddress string
 	cacheBytes        int64
+	rpcTimeout        time.Duration
+	syncTimeout       time.Duration
 
 	clientConn *grpc.ClientConn
 	client     pb.ObjectFSControllerClient
@@ -116,11 +121,19 @@ type objectFSDriver struct {
 	mounts map[string]*activeMount
 }
 
-func newDriver(nodeID, controllerAddress string, cacheBytes int64) *objectFSDriver {
+func newDriver(nodeID, controllerAddress string, cacheBytes int64, rpcTimeout, syncTimeout time.Duration) *objectFSDriver {
+	if rpcTimeout <= 0 {
+		rpcTimeout = 30 * time.Second
+	}
+	if syncTimeout <= 0 {
+		syncTimeout = 10 * time.Minute
+	}
 	return &objectFSDriver{
 		nodeID:            nodeID,
 		controllerAddress: controllerAddress,
 		cacheBytes:        cacheBytes,
+		rpcTimeout:        rpcTimeout,
+		syncTimeout:       syncTimeout,
 		mounts:            make(map[string]*activeMount),
 	}
 }
@@ -133,7 +146,10 @@ func (d *objectFSDriver) getClient() (pb.ObjectFSControllerClient, error) {
 		return d.client, nil
 	}
 
-	conn, err := grpc.NewClient(d.controllerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(d.controllerAddress,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to controller at %s: %w", d.controllerAddress, err)
 	}
@@ -226,7 +242,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	}
 
 	nodeCache := objectfuse.NewNodeCache(d.cacheBytes)
-	rawFS := objectfuse.NewObjectFS(client, volumeID, writeMode, nodeCache)
+	rawFS := objectfuse.NewObjectFSWithTimeouts(client, volumeID, writeMode, nodeCache, d.rpcTimeout, d.syncTimeout)
 
 	mountOpts := &gofuse.MountOptions{
 		AllowOther: true,
@@ -283,10 +299,12 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 			return nil, fmt.Errorf("failed to get ObjectFS client to fsync volume: %w", err)
 		}
 		if client != nil {
-			resp, err := client.Fsync(ctx, &pb.FsyncRequest{
+			fsyncCtx, cancel := context.WithTimeout(ctx, d.syncTimeout)
+			resp, err := client.Fsync(fsyncCtx, &pb.FsyncRequest{
 				VolumeId: mountInfo.volumeID,
 				Inode:    1,
 			})
+			cancel()
 			if err != nil {
 				klog.Warningf("Failed to fsync ObjectFS volume %s during unpublish: %v", mountInfo.volumeID, err)
 				return nil, fmt.Errorf("failed to fsync ObjectFS volume %s: %w", mountInfo.volumeID, err)
@@ -331,7 +349,9 @@ func (d *objectFSDriver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGe
 		return nil, status.Errorf(codes.Internal, "failed to get ObjectFS client: %v", err)
 	}
 
-	resp, err := client.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: volumeID})
+	statsCtx, cancel := context.WithTimeout(ctx, d.rpcTimeout)
+	defer cancel()
+	resp, err := client.GetVolumeStats(statsCtx, &pb.GetVolumeStatsRequest{VolumeId: volumeID})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "GetVolumeStats failed: %v", err)
 	}
