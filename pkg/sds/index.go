@@ -16,6 +16,7 @@ package sds
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"sync"
@@ -55,6 +56,35 @@ type Snapshotter interface {
 	// PublishSnapshot creates an atomic snapshot of the local index at its current position
 	// and uploads it to object storage, returning the object key and position.
 	PublishSnapshot(ctx context.Context, backend objectstore.Backend) (key string, position uint64, err error)
+}
+
+// ErrorClassifier is an optional interface implemented by LocalIndex types or errors
+// to classify whether an apply error is unrecoverable (e.g. database corruption or format error)
+// and warrants discarding and rebuilding the local index.
+type ErrorClassifier interface {
+	IsUnrecoverable(err error) bool
+}
+
+// IsUnrecoverable reports whether err represents an unrecoverable index error.
+func IsUnrecoverable(err error) bool {
+	if err == nil {
+		return false
+	}
+	type unrecoverableError interface {
+		IsUnrecoverable() bool
+	}
+	var ue unrecoverableError
+	if errors.As(err, &ue) {
+		return ue.IsUnrecoverable()
+	}
+	type errorClassifier interface {
+		IsUnrecoverable(err error) bool
+	}
+	var ec errorClassifier
+	if errors.As(err, &ec) {
+		return ec.IsUnrecoverable(err)
+	}
+	return false
 }
 
 // IndexFactory is the lifecycle and snapshot management interface for a LocalIndex type.
