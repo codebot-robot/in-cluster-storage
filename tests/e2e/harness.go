@@ -117,7 +117,7 @@ func (h *Harness) getContainerLogs(pod, container, namespace string, previous bo
 	}
 	out, err := exec.Command("kubectl", args...).CombinedOutput()
 	if err != nil {
-		return strings.TrimSpace(string(out))
+		return ""
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -171,7 +171,7 @@ func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 	// Any test pods: describe & logs
 	allPods := h.getPodNames("", "default")
 	for _, pod := range allPods {
-		if strings.HasPrefix(pod, "layers-pod-") || strings.HasPrefix(pod, "test-pod-") || strings.HasPrefix(pod, "dev-vscode") || strings.HasPrefix(pod, "persistent-pod-") {
+		if strings.HasPrefix(pod, "layers-pod-") || strings.HasPrefix(pod, "test-pod-") || strings.HasPrefix(pod, "dev-vscode") || strings.HasPrefix(pod, "persistent-pod-") || strings.HasPrefix(pod, "failover-") || strings.HasPrefix(pod, "crash-") || strings.HasPrefix(pod, "outage-") || strings.HasPrefix(pod, "wal-") {
 			if desc, err := exec.Command("kubectl", "describe", "pod", pod, "-n", "default").CombinedOutput(); err == nil {
 				t.Logf("Pod %s Description:\n%s\n", pod, strings.TrimSpace(string(desc)))
 			}
