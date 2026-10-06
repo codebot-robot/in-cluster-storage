@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,21 +37,45 @@ import (
 // (matching the POSIX NAME_MAX limit of 255 bytes advertised by statfs).
 const MaxNameLength = 255
 
+// DefaultRPCTimeout is the default deadline applied to ObjectFS controller RPCs (metadata, reads).
+const DefaultRPCTimeout = 30 * time.Second
+
+// DefaultSyncTimeout is the default deadline applied to sync operations (Fsync, Flush, Write).
+const DefaultSyncTimeout = 10 * time.Minute
+
 type ObjectFS struct {
 	fuse.RawFileSystem
 
-	client    pb.ObjectFSControllerClient
-	volumeID  string
-	writeMode pb.WriteMode
-	cache     *NodeCache
-	server    *fuse.Server
+	client        pb.ObjectFSControllerClient
+	volumeID      string
+	writeMode     pb.WriteMode
+	cache         *NodeCache
+	server        *fuse.Server
+	rpcTimeout    time.Duration
+	syncTimeout   time.Duration
+	errMu         sync.Mutex
+	lastLoggedErr time.Time
 }
 
 var _ fuse.RawFileSystem = (*ObjectFS)(nil)
 
 func NewObjectFS(client pb.ObjectFSControllerClient, volumeID string, writeMode pb.WriteMode, cache *NodeCache) *ObjectFS {
+	return NewObjectFSWithTimeouts(client, volumeID, writeMode, cache, DefaultRPCTimeout, DefaultSyncTimeout)
+}
+
+func NewObjectFSWithTimeout(client pb.ObjectFSControllerClient, volumeID string, writeMode pb.WriteMode, cache *NodeCache, rpcTimeout time.Duration) *ObjectFS {
+	return NewObjectFSWithTimeouts(client, volumeID, writeMode, cache, rpcTimeout, DefaultSyncTimeout)
+}
+
+func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string, writeMode pb.WriteMode, cache *NodeCache, rpcTimeout, syncTimeout time.Duration) *ObjectFS {
 	if cache == nil {
 		cache = NewNodeCache(128 * 1024 * 1024)
+	}
+	if rpcTimeout <= 0 {
+		rpcTimeout = DefaultRPCTimeout
+	}
+	if syncTimeout <= 0 {
+		syncTimeout = DefaultSyncTimeout
 	}
 	fs := &ObjectFS{
 		RawFileSystem: fuse.NewDefaultRawFileSystem(),
@@ -58,8 +83,24 @@ func NewObjectFS(client pb.ObjectFSControllerClient, volumeID string, writeMode 
 		volumeID:      volumeID,
 		writeMode:     writeMode,
 		cache:         cache,
+		rpcTimeout:    rpcTimeout,
+		syncTimeout:   syncTimeout,
 	}
 	return fs
+}
+
+func (fs *ObjectFS) SetRPCTimeout(d time.Duration) {
+	if d <= 0 {
+		d = DefaultRPCTimeout
+	}
+	fs.rpcTimeout = d
+}
+
+func (fs *ObjectFS) SetSyncTimeout(d time.Duration) {
+	if d <= 0 {
+		d = DefaultSyncTimeout
+	}
+	fs.syncTimeout = d
 }
 
 func (fs *ObjectFS) String() string {
@@ -70,8 +111,19 @@ func (fs *ObjectFS) Init(server *fuse.Server) {
 	fs.server = server
 }
 
-func makeContext(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
-	ctx, cancelFunc := context.WithCancel(context.Background())
+func (fs *ObjectFS) makeContext(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
+	return fs.makeContextWithTimeout(cancel, fs.rpcTimeout, DefaultRPCTimeout)
+}
+
+func (fs *ObjectFS) makeSyncContext(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
+	return fs.makeContextWithTimeout(cancel, fs.syncTimeout, DefaultSyncTimeout)
+}
+
+func (fs *ObjectFS) makeContextWithTimeout(cancel <-chan struct{}, timeout, defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
 	if cancel != nil {
 		go func() {
 			select {
@@ -82,6 +134,27 @@ func makeContext(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
 		}()
 	}
 	return ctx, cancelFunc
+}
+
+func (fs *ObjectFS) logRPCError(op string, err error) {
+	if err == nil {
+		return
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return
+	}
+	if st.Code() == codes.Unavailable || st.Code() == codes.DeadlineExceeded {
+		fs.errMu.Lock()
+		now := time.Now()
+		if now.Sub(fs.lastLoggedErr) >= 1*time.Second {
+			fs.lastLoggedErr = now
+			fs.errMu.Unlock()
+			klog.Warningf("ObjectFS(%s): controller unreachable in %s: %v", fs.volumeID, op, err)
+			return
+		}
+		fs.errMu.Unlock()
+	}
 }
 
 func grpcErrorToStatus(err error) fuse.Status {
@@ -103,17 +176,22 @@ func grpcErrorToStatus(err error) fuse.Status {
 		return fuse.EACCES
 	case codes.Unimplemented:
 		return fuse.ENOSYS
-	case codes.DeadlineExceeded:
-		return fuse.Status(syscall.ETIMEDOUT)
+	case codes.DeadlineExceeded, codes.Unavailable:
+		return fuse.Status(syscall.EIO)
 	case codes.Canceled:
 		return fuse.Status(syscall.EINTR)
 	case codes.ResourceExhausted:
 		return fuse.Status(syscall.ENOSPC)
-	case codes.Aborted, codes.Unavailable:
+	case codes.Aborted:
 		return fuse.Status(syscall.EBUSY)
 	default:
 		return fuse.Status(syscall.EIO)
 	}
+}
+
+func (fs *ObjectFS) grpcErrorToStatus(op string, err error) fuse.Status {
+	fs.logRPCError(op, err)
+	return grpcErrorToStatus(err)
 }
 
 func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
@@ -177,7 +255,7 @@ func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 	if len(name) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Lookup(ctx, &pb.LookupRequest{
@@ -186,7 +264,7 @@ func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 		Name:        name,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Lookup", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -200,7 +278,7 @@ func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 }
 
 func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.GetAttr(ctx, &pb.GetAttrRequest{
@@ -208,7 +286,7 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 		Inode:    input.NodeId,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("GetAttr", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -229,13 +307,15 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 }
 
 func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	var finalAttr *pb.EntryAttr
 
 	if input.Valid&fuse.FATTR_SIZE != 0 {
-		_ = fs.syncFileToService(ctx, input.NodeId)
+		syncCtx, syncCancel := fs.makeSyncContext(cancel)
+		_ = fs.syncFileToService(syncCtx, input.NodeId)
+		syncCancel()
 		fs.cache.Truncate(input.NodeId, int64(input.Size), time.Now())
 		resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
 			VolumeId: fs.volumeID,
@@ -243,7 +323,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 			Size:     int64(input.Size),
 		})
 		if err != nil {
-			return grpcErrorToStatus(err)
+			return fs.grpcErrorToStatus("TruncateFile", err)
 		}
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
@@ -283,7 +363,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 
 		resp, err := fs.client.SetAttr(ctx, req)
 		if err != nil {
-			return grpcErrorToStatus(err)
+			return fs.grpcErrorToStatus("SetAttr", err)
 		}
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
@@ -297,7 +377,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 			Inode:    input.NodeId,
 		})
 		if err != nil {
-			return grpcErrorToStatus(err)
+			return fs.grpcErrorToStatus("GetAttr", err)
 		}
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
@@ -325,7 +405,7 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 	if len(name) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Mkdir(ctx, &pb.MkdirRequest{
@@ -337,7 +417,7 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 		Gid:         input.Gid,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Mkdir", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -354,7 +434,7 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 	if len(name) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.CreateFile(ctx, &pb.CreateFileRequest{
@@ -366,7 +446,7 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 		Gid:         input.Gid,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("CreateFile", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -386,7 +466,7 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 	if len(name) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.CreateFile(ctx, &pb.CreateFileRequest{
@@ -399,7 +479,7 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 		Gid:         input.Gid,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("CreateFile", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -416,7 +496,7 @@ func (fs *ObjectFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name s
 	if len(name) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Unlink(ctx, &pb.UnlinkRequest{
@@ -425,7 +505,7 @@ func (fs *ObjectFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name s
 		Name:        name,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Unlink", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -437,7 +517,7 @@ func (fs *ObjectFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name st
 	if len(name) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Rmdir(ctx, &pb.RmdirRequest{
@@ -446,7 +526,7 @@ func (fs *ObjectFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name st
 		Name:        name,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Rmdir", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -458,7 +538,7 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 	if len(oldName) > MaxNameLength || len(newName) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Rename(ctx, &pb.RenameRequest{
@@ -469,7 +549,7 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 		NewName:        newName,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Rename", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -478,7 +558,7 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 }
 
 func (fs *ObjectFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Open(ctx, &pb.OpenRequest{
@@ -487,7 +567,7 @@ func (fs *ObjectFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.O
 		Flags:    input.Flags,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Open", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -502,7 +582,7 @@ func (fs *ObjectFS) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fus
 }
 
 func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.ReadDir(ctx, &pb.ReadDirRequest{
@@ -510,7 +590,7 @@ func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 		Inode:    input.NodeId,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("ReadDir", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -539,7 +619,7 @@ func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 }
 
 func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.ReadDir(ctx, &pb.ReadDirRequest{
@@ -547,7 +627,7 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 		Inode:    input.NodeId,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("ReadDir", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -581,7 +661,7 @@ func (fs *ObjectFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, point
 	if len(linkName) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Symlink(ctx, &pb.SymlinkRequest{
@@ -593,7 +673,7 @@ func (fs *ObjectFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, point
 		Gid:         header.Gid,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Symlink", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -607,7 +687,7 @@ func (fs *ObjectFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, point
 }
 
 func (fs *ObjectFS) Readlink(cancel <-chan struct{}, header *fuse.InHeader) ([]byte, fuse.Status) {
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Readlink(ctx, &pb.ReadlinkRequest{
@@ -615,7 +695,7 @@ func (fs *ObjectFS) Readlink(cancel <-chan struct{}, header *fuse.InHeader) ([]b
 		Inode:    header.NodeId,
 	})
 	if err != nil {
-		return nil, grpcErrorToStatus(err)
+		return nil, fs.grpcErrorToStatus("Readlink", err)
 	}
 	if resp.GetError() != 0 {
 		return nil, fuse.Status(resp.GetError())
@@ -627,7 +707,7 @@ func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename st
 	if len(filename) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
 	}
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Link(ctx, &pb.LinkRequest{
@@ -637,7 +717,7 @@ func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename st
 		NewName:        filename,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Link", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -662,7 +742,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		return fuse.ReadResultData(cachedBytes), fuse.OK
 	}
 
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	cs := int64(DefaultChunkSize)
@@ -723,7 +803,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 			Size:     cs,
 		})
 		if err != nil {
-			return nil, grpcErrorToStatus(err)
+			return nil, fs.grpcErrorToStatus("ReadFile", err)
 		}
 		if resp.GetError() != 0 {
 			return nil, fuse.Status(resp.GetError())
@@ -786,7 +866,7 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 
 		if wStart > chunkStart || wEnd < chunkEnd {
 			if _, ok := fs.cache.GetChunk(input.NodeId, int(i)); !ok {
-				ctx, cancelFunc := makeContext(cancel)
+				ctx, cancelFunc := fs.makeSyncContext(cancel)
 				resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
 					VolumeId: fs.volumeID,
 					Inode:    input.NodeId,
@@ -794,7 +874,9 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 					Size:     cs,
 				})
 				cancelFunc()
-				if err == nil && resp.GetError() == 0 && len(resp.GetData()) > 0 {
+				if err != nil {
+					fs.logRPCError("Write:ReadFile", err)
+				} else if resp.GetError() == 0 && len(resp.GetData()) > 0 {
 					fs.cache.PutChunk(input.NodeId, int(i), DefaultChunkSize, resp.GetTotalSize(), resp.GetData(), time.Now())
 				}
 			}
@@ -829,6 +911,7 @@ func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
 			WriteMode: fs.writeMode,
 		})
 		if err != nil {
+			fs.logRPCError("WriteFile", err)
 			return err
 		}
 		if resp.GetError() != 0 {
@@ -841,21 +924,21 @@ func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
 }
 
 func (fs *ObjectFS) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeSyncContext(cancel)
 	defer cancelFunc()
 
 	if err := fs.syncFileToService(ctx, input.NodeId); err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Flush", err)
 	}
 	return fuse.OK
 }
 
 func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeSyncContext(cancel)
 	defer cancelFunc()
 
 	if err := fs.syncFileToService(ctx, input.NodeId); err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Fsync", err)
 	}
 
 	resp, err := fs.client.Fsync(ctx, &pb.FsyncRequest{
@@ -863,7 +946,7 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 		Inode:    input.NodeId,
 	})
 	if err != nil {
-		return grpcErrorToStatus(err)
+		return fs.grpcErrorToStatus("Fsync", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -872,7 +955,7 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 }
 
 func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
-	ctx, cancelFunc := makeContext(cancel)
+	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
 	resp, err := fs.client.Release(ctx, &pb.ReleaseRequest{
@@ -881,6 +964,7 @@ func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 		Fh:       input.Fh,
 	})
 	if err != nil {
+		fs.logRPCError("Release", err)
 		klog.Warningf("Release RPC failed for volume %s, inode %d, fh %d: %v", fs.volumeID, input.NodeId, input.Fh, err)
 		return
 	}
@@ -890,7 +974,9 @@ func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 }
 
 func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
-	ctx := context.Background()
+	ctx, cancelFunc := fs.makeContext(cancel)
+	defer cancelFunc()
+
 	blockSize := uint64(4096)
 	nominalTotalBytes := uint64(4 * 1024 * 1024 * 1024 * 1024)
 	nominalTotalInodes := uint64(10000000)
@@ -901,7 +987,9 @@ func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fu
 
 	if fs.client != nil {
 		resp, err := fs.client.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: fs.volumeID})
-		if err == nil && resp.GetError() == 0 {
+		if err != nil {
+			fs.logRPCError("GetVolumeStats", err)
+		} else if resp.GetError() == 0 {
 			if resp.GetTotalBytes() > 0 {
 				nominalTotalBytes = uint64(resp.GetTotalBytes())
 				totalBlocks = nominalTotalBytes / blockSize
@@ -945,6 +1033,10 @@ func (fs *ObjectFS) Access(cancel <-chan struct{}, input *fuse.AccessIn) fuse.St
 
 func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, nodeID string, cache *NodeCache) {
 	go func() {
+		backoff := 100 * time.Millisecond
+		maxBackoff := 5 * time.Second
+		hasDisconnected := false
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -957,20 +1049,40 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				NodeId:   nodeID,
 			})
 			if err != nil {
-				time.Sleep(1 * time.Second)
+				hasDisconnected = true
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
 				continue
 			}
+
+			if hasDisconnected {
+				// Invalidate all clean entries that might have changed on controller while disconnected
+				cache.InvalidateAllClean()
+			}
+			backoff = 100 * time.Millisecond
 
 			for {
 				ev, err := stream.Recv()
 				if err != nil {
+					hasDisconnected = true
 					break
 				}
 				if ev.GetInode() != 0 {
 					cache.InvalidateIfNotDirty(ev.GetInode())
 				}
 			}
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 		}
 	}()
 }

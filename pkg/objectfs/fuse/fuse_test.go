@@ -277,11 +277,11 @@ func TestGrpcErrorToStatus(t *testing.T) {
 		{"permission denied", status.Error(codes.PermissionDenied, "permission denied"), fuse.EACCES},
 		{"unauthenticated", status.Error(codes.Unauthenticated, "unauthenticated"), fuse.EACCES},
 		{"unimplemented", status.Error(codes.Unimplemented, "unimplemented"), fuse.ENOSYS},
-		{"deadline exceeded", status.Error(codes.DeadlineExceeded, "deadline"), fuse.Status(syscall.ETIMEDOUT)},
+		{"deadline exceeded", status.Error(codes.DeadlineExceeded, "deadline"), fuse.Status(syscall.EIO)},
 		{"canceled", status.Error(codes.Canceled, "canceled"), fuse.Status(syscall.EINTR)},
 		{"resource exhausted", status.Error(codes.ResourceExhausted, "out of space"), fuse.Status(syscall.ENOSPC)},
 		{"aborted", status.Error(codes.Aborted, "aborted"), fuse.Status(syscall.EBUSY)},
-		{"unavailable", status.Error(codes.Unavailable, "unavailable"), fuse.Status(syscall.EBUSY)},
+		{"unavailable", status.Error(codes.Unavailable, "unavailable"), fuse.Status(syscall.EIO)},
 		{"internal generic", status.Error(codes.Internal, "internal disk corruption"), fuse.Status(syscall.EIO)},
 	}
 
@@ -1851,5 +1851,241 @@ func TestObjectFS_StatFs(t *testing.T) {
 			t.Fatalf("timed out waiting for StatFs to reflect write: got Ffree=%d (want 9999998), Bfree=%d (want %d)", out2.Ffree, out2.Bfree, expectedFreeBlocks)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestObjectFSWaitForReadyAndRecovery(t *testing.T) {
+	// 1. Create a real TCP listener so we can delay starting the gRPC server
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	addr := lis.Addr().String()
+
+	conn, err := grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	cache := NewNodeCache(1024 * 1024)
+	fs := NewObjectFSWithTimeout(client, "vol-wait-ready", pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 5*time.Second)
+
+	done := make(chan fuse.Status, 1)
+	var attrOut fuse.AttrOut
+
+	// Start FUSE GetAttr while the server is not serving yet
+	go func() {
+		st := fs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, &attrOut)
+		done <- st
+	}()
+
+	// Verify the operation is blocking waiting for ready
+	select {
+	case st := <-done:
+		t.Fatalf("Expected GetAttr to block waiting for server, but it returned immediately with %v", st)
+	case <-time.After(150 * time.Millisecond):
+		// Expected to still be waiting
+	}
+
+	// Now start serving the controller on the listener
+	grpcServer := grpc.NewServer()
+	ctrlServer := controller.NewServer(nil)
+	pb.RegisterObjectFSControllerServer(grpcServer, ctrlServer)
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+	defer grpcServer.Stop()
+
+	// The blocked operation should now unblock and succeed
+	select {
+	case st := <-done:
+		if st != fuse.OK {
+			t.Fatalf("Expected GetAttr to succeed after server came up, got %v", st)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Timed out waiting for GetAttr to complete after server started")
+	}
+
+	if attrOut.Attr.Ino != fuse.FUSE_ROOT_ID {
+		t.Errorf("Expected root inode %d, got %d", fuse.FUSE_ROOT_ID, attrOut.Attr.Ino)
+	}
+}
+
+func TestObjectFSServerDownReturnsEIOOnTimeout(t *testing.T) {
+	// Connect to a closed listener address with a very short deadline
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close() // Close immediately so nothing is listening
+
+	conn, err := grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	cache := NewNodeCache(1024 * 1024)
+	// Short deadline of 200ms
+	fs := NewObjectFSWithTimeout(client, "vol-timeout", pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 200*time.Millisecond)
+
+	var attrOut fuse.AttrOut
+	start := time.Now()
+	st := fs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, &attrOut)
+	elapsed := time.Since(start)
+
+	if st != fuse.Status(syscall.EIO) {
+		t.Fatalf("Expected EIO (not EBUSY) on deadline exceeded, got status %v", st)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("Expected GetAttr to wait for deadline (~200ms), but it returned in %v", elapsed)
+	}
+}
+
+func TestStartWatcherReconnectResync(t *testing.T) {
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	ctrlServer := controller.NewServer(nil)
+	pb.RegisterObjectFSControllerServer(grpcServer, ctrlServer)
+	go func() { _ = grpcServer.Serve(lis) }()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		t.Fatalf("Failed to dial bufnet: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	volumeID := "vol-watcher-test"
+	cache := NewNodeCache(1024 * 1024)
+
+	// Populate clean entry in cache
+	cache.Put(100, []byte("cached-clean-data"), time.Now(), "")
+	// Populate dirty entry in cache
+	cache.WriteAt(200, 0, []byte("dirty-data"), time.Now())
+
+	watchCtx, cancelWatch := context.WithCancel(t.Context())
+	defer cancelWatch()
+
+	StartWatcher(watchCtx, client, volumeID, "node-1", cache)
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop grpc server to simulate controller restart / disconnection
+	grpcServer.Stop()
+	_ = lis.Close()
+
+	// Wait for watcher to detect disconnect
+	time.Sleep(200 * time.Millisecond)
+
+	// Start new server and buffer listener
+	lis2 := bufconn.Listen(1024 * 1024)
+	grpcServer2 := grpc.NewServer()
+	ctrlServer2 := controller.NewServer(nil)
+	pb.RegisterObjectFSControllerServer(grpcServer2, ctrlServer2)
+	go func() { _ = grpcServer2.Serve(lis2) }()
+	defer grpcServer2.Stop()
+
+	// Update dialer connection
+	conn2, err := grpc.NewClient("passthrough://bufnet2",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis2.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		t.Fatalf("Failed to dial bufnet2: %v", err)
+	}
+	defer conn2.Close()
+
+	client2 := pb.NewObjectFSControllerClient(conn2)
+	watchCtx2, cancelWatch2 := context.WithCancel(t.Context())
+	defer cancelWatch2()
+
+	// Reconnect watcher with client2
+	StartWatcher(watchCtx2, client2, volumeID, "node-1", cache)
+	time.Sleep(200 * time.Millisecond)
+
+	// InvalidateAllClean should ensure clean entry 100 was invalidated on reconnect, but dirty entry 200 preserved
+	cache.InvalidateAllClean()
+	if _, ok := cache.Get(100); ok {
+		t.Errorf("Expected clean cached entry 100 to be invalidated after reconnect")
+	}
+	if _, ok := cache.GetDirty(200); !ok {
+		t.Errorf("Expected dirty cached entry 200 to be preserved")
+	}
+}
+
+func TestFsyncSlowSyncSucceedsWithinSyncTimeout(t *testing.T) {
+	lis := bufconn.Listen(1024 * 1024)
+	interceptor := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if strings.HasSuffix(info.FullMethod, "/Fsync") {
+			time.Sleep(250 * time.Millisecond)
+		}
+		return handler(ctx, req)
+	}
+	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(interceptor))
+	ctrlServer := controller.NewServer(nil)
+	pb.RegisterObjectFSControllerServer(grpcServer, ctrlServer)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("Failed to dial bufnet: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	cache := NewNodeCache(1024 * 1024)
+	volumeID := "vol-slow-sync"
+
+	// rpcTimeout is short (100ms), but syncTimeout is longer (2s)
+	fs := NewObjectFSWithTimeouts(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 100*time.Millisecond, 2*time.Second)
+
+	// Create a test file
+	var createOut fuse.CreateOut
+	if st := fs.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, "file.txt", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	ino := createOut.EntryOut.NodeId
+
+	// Write data to cache (dirty)
+	_, st := fs.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: ino}, Offset: 0}, []byte("slow-sync-data"))
+	if st != fuse.OK {
+		t.Fatalf("Write failed: %v", st)
+	}
+
+	// Fsync takes ~250ms, which is slower than rpcTimeout (100ms) but faster than syncTimeout (2s)
+	start := time.Now()
+	st = fs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: ino}})
+	elapsed := time.Since(start)
+
+	if st != fuse.OK {
+		t.Fatalf("Expected Fsync to succeed within syncTimeout (2s), got error: %v", st)
+	}
+	if elapsed < 200*time.Millisecond {
+		t.Errorf("Expected Fsync to take at least 200ms due to delay, took %v", elapsed)
 	}
 }
