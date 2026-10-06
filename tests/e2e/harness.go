@@ -15,7 +15,9 @@
 package e2e
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,12 +27,71 @@ import (
 
 type Harness struct {
 	*e2e.Harness
+	t *testing.T
 }
 
 func NewHarness(t *testing.T, clusterName string) *Harness {
 	return &Harness{
 		Harness: e2e.NewHarness(t, clusterName),
+		t:       t,
 	}
+}
+
+// SetupMultiNode sets up a Kind cluster with a control plane and the requested number of worker nodes.
+func (h *Harness) SetupMultiNode(workerNodes int) {
+	if workerNodes <= 0 {
+		h.Setup()
+		return
+	}
+
+	out, _ := exec.Command("kind", "get", "clusters").Output()
+	clusters := strings.Fields(string(out))
+	exists := false
+	for _, c := range clusters {
+		if c == h.ClusterName {
+			exists = true
+			break
+		}
+	}
+
+	if !exists {
+		var b strings.Builder
+		b.WriteString("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n")
+		for i := 0; i < workerNodes; i++ {
+			b.WriteString("- role: worker\n")
+		}
+		configFile := filepath.Join(h.t.TempDir(), "kind-config.yaml")
+		if err := os.WriteFile(configFile, []byte(b.String()), 0644); err == nil {
+			cmd := exec.Command("kind", "create", "cluster", "--name", h.ClusterName, "--config", configFile)
+			_ = cmd.Run()
+		}
+	}
+
+	h.Setup()
+}
+
+// GetWorkerNodeNames returns the names of all worker Kubernetes nodes in the cluster.
+func (h *Harness) GetWorkerNodeNames() []string {
+	out, err := exec.Command("kubectl", "get", "nodes", "-o", "jsonpath={.items[*].metadata.name}").Output()
+	if err != nil {
+		return nil
+	}
+	var workers []string
+	for _, node := range strings.Fields(string(out)) {
+		if !strings.Contains(node, "control-plane") {
+			workers = append(workers, node)
+		}
+	}
+	return workers
+}
+
+// GetNodeNames returns the names of all Kubernetes nodes in the cluster.
+func (h *Harness) GetNodeNames() []string {
+	out, err := exec.Command("kubectl", "get", "nodes", "-o", "jsonpath={.items[*].metadata.name}").Output()
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(string(out))
 }
 
 func (h *Harness) getPodNames(selector, namespace string) []string {

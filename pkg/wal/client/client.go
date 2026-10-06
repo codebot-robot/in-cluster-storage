@@ -17,6 +17,7 @@ limitations under the License.
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -73,6 +74,8 @@ type Stream interface {
 	RecoveredRecords() []*wal.ClientRecord
 	// ReplicationLevel returns the maximum durability level supported by this stream's replication configuration.
 	ReplicationLevel() Level
+	// Tail returns an iterator yielding (stream_seq, payload) pairs from the remote buffer service starting after fromSeq.
+	Tail(ctx context.Context, fromSeq uint64) (iter.Seq2[uint64, []byte], error)
 	Close() error
 }
 
@@ -128,7 +131,9 @@ type streamImpl struct {
 	witnessSeq    uint64
 	s3Seq         uint64
 	retainedBytes int64
-	gapErr        error
+
+	initialHelloAckDone chan struct{}
+	initialHelloAckOnce sync.Once
 
 	// Retained in-memory records queue for network sending & replay
 	retainedMu      sync.RWMutex
@@ -176,20 +181,21 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 	}
 
 	s := &streamImpl{
-		dir:              dir,
-		streamID:         streamID,
-		target:           target,
-		opts:             opt,
-		store:            store,
-		localSeq:         highestLocalSeq,
-		witnessSeq:       0,
-		s3Seq:            0,
-		retainedBytes:    retainedBytes,
-		retainedRecords:  recovered,
-		newRecordSignal:  make(chan struct{}, 1),
-		cancelCtx:        cancelCtx,
-		cancelFunc:       cancelFunc,
-		replicationLevel: replicationLevel,
+		dir:                 dir,
+		streamID:            streamID,
+		target:              target,
+		opts:                opt,
+		store:               store,
+		localSeq:            highestLocalSeq,
+		witnessSeq:          0,
+		s3Seq:               0,
+		retainedBytes:       retainedBytes,
+		retainedRecords:     recovered,
+		newRecordSignal:     make(chan struct{}, 1),
+		cancelCtx:           cancelCtx,
+		cancelFunc:          cancelFunc,
+		replicationLevel:    replicationLevel,
+		initialHelloAckDone: make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 
@@ -205,12 +211,33 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		}
 		s.grpcConn = conn
 		s.grpcClient = pb.NewWalBufferClient(conn)
+	} else {
+		s.initialHelloAckOnce.Do(func() {
+			close(s.initialHelloAckDone)
+		})
 	}
 
 	// Start background replication loop
 	if s.grpcClient != nil {
 		s.wg.Add(1)
 		go s.backgroundReplicationLoop()
+
+		helloTimeout := 5 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			if d := time.Until(deadline); d < helloTimeout {
+				helloTimeout = d
+			}
+		}
+
+		select {
+		case <-s.initialHelloAckDone:
+		case <-time.After(helloTimeout):
+			_ = s.Close()
+			return nil, fmt.Errorf("timeout waiting for initial HelloAck from WAL buffer target %s", target)
+		case <-ctx.Done():
+			_ = s.Close()
+			return nil, fmt.Errorf("failed to receive initial HelloAck from WAL buffer: %w", ctx.Err())
+		}
 	}
 
 	return s, nil
@@ -222,13 +249,13 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		return 0, errors.New("stream closed")
 	}
 
-	s.mu.RLock()
-	if s.gapErr != nil {
-		err := s.gapErr
-		s.mu.RUnlock()
-		return 0, err
+	select {
+	case <-s.initialHelloAckDone:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-s.cancelCtx.Done():
+		return 0, errors.New("stream closed")
 	}
-	s.mu.RUnlock()
 
 	recordSize := int64(wal.ClientHeaderSize + len(payload))
 
@@ -457,6 +484,9 @@ func (s *streamImpl) Close() error {
 	}
 
 	s.cancelFunc()
+	s.initialHelloAckOnce.Do(func() {
+		close(s.initialHelloAckDone)
+	})
 	s.mu.Lock()
 	s.cond.Broadcast()
 	s.mu.Unlock()
@@ -535,7 +565,9 @@ func (s *streamImpl) runStreamSession() error {
 		return fmt.Errorf("expected HelloAck as first response, got: %+v", resp)
 	}
 
-	s.handleHelloAck(helloAck)
+	if err := s.handleHelloAck(helloAck); err != nil {
+		return fmt.Errorf("handleHelloAck failed: %w", err)
+	}
 
 	// 3. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
 	s.retainedMu.RLock()
@@ -614,19 +646,86 @@ func (s *streamImpl) runStreamSession() error {
 	}
 }
 
-func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) {
+func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if helloAck.WitnessAckedStreamSeq > s.localSeq {
-		s.gapErr = fmt.Errorf("wal buffer witness watermark (%d) is ahead of local stream head (%d); refusing append to prevent silent write loss (see #185)", helloAck.WitnessAckedStreamSeq, s.localSeq)
-		klog.Errorf("Stream %s: %v", s.streamID, s.gapErr)
+	witnessHead := helloAck.WitnessAckedStreamSeq
+	if witnessHead > s.localSeq {
+		klog.Infof("Stream %s: buffer witness watermark (%d) is ahead of local stream head (%d); continuing sequence numbering from buffer head",
+			s.streamID, witnessHead, s.localSeq)
+		s.localSeq = witnessHead
+	} else if witnessHead > 0 && s.localSeq > witnessHead {
+		// Local history has records above the buffer's witness watermark.
+		// Check if local record at witnessHead matches the authoritative buffer record.
+		s.retainedMu.RLock()
+		var localRecAtHead *wal.ClientRecord
+		for _, r := range s.retainedRecords {
+			if r.StreamSeq == witnessHead {
+				localRecAtHead = r
+				break
+			}
+		}
+		s.retainedMu.RUnlock()
+
+		if localRecAtHead != nil {
+			// Query buffer for record at witnessHead.
+			// Release s.mu while tailing buffer to avoid blocking callers/cond.
+			s.mu.Unlock()
+			tailIter, err := s.Tail(s.cancelCtx, witnessHead-1)
+			if err != nil {
+				s.mu.Lock()
+				return fmt.Errorf("failed to tail buffer at witness head %d: %w", witnessHead, err)
+			}
+			var bufferPayload []byte
+			var found bool
+			for seq, payload := range tailIter {
+				if seq == witnessHead {
+					bufferPayload = payload
+					found = true
+					break
+				}
+			}
+			s.mu.Lock()
+			if !found {
+				return fmt.Errorf("record at witness head %d not found in buffer stream tail", witnessHead)
+			}
+
+			// Only discard if buffer returns a record at witnessHead and its content differs
+			if !bytes.Equal(localRecAtHead.Payload, bufferPayload) {
+				s.retainedMu.Lock()
+				var remaining []*wal.ClientRecord
+				var newRetainedBytes int64
+				discarded := 0
+				for _, r := range s.retainedRecords {
+					if r.StreamSeq <= witnessHead {
+						remaining = append(remaining, r)
+						newRetainedBytes += int64(wal.ClientHeaderSize + len(r.Payload))
+					} else {
+						discarded++
+					}
+				}
+				s.retainedRecords = remaining
+				s.retainedMu.Unlock()
+				s.retainedBytes = newRetainedBytes
+				s.localSeq = witnessHead
+
+				if s.store != nil {
+					if err := s.store.TruncateAfter(witnessHead); err != nil {
+						klog.Warningf("Stream %s: failed to truncate local segment store to %d: %v", s.streamID, witnessHead, err)
+					}
+				}
+
+				klog.Warningf("Stream %s: local records above buffer witness watermark (%d) diverged from authoritative buffer history; discarded %d local unacknowledged records",
+					s.streamID, witnessHead, discarded)
+			}
+		}
 	}
 
-	if helloAck.WitnessAckedStreamSeq < s.witnessSeq {
-		klog.Warningf("Witness watermark dropped on restart from %d to %d (replaying unacknowledged records)", s.witnessSeq, helloAck.WitnessAckedStreamSeq)
+	if witnessHead < s.witnessSeq {
+		klog.Warningf("Witness watermark dropped on restart from %d to %d (replaying unacknowledged records)", s.witnessSeq, witnessHead)
 	}
-	s.witnessSeq = helloAck.WitnessAckedStreamSeq
+	s.witnessSeq = witnessHead
 
 	if helloAck.S3AckedStreamSeq > s.s3Seq {
 		s.s3Seq = helloAck.S3AckedStreamSeq
@@ -634,6 +733,10 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) {
 	}
 
 	s.cond.Broadcast()
+	s.initialHelloAckOnce.Do(func() {
+		close(s.initialHelloAckDone)
+	})
+	return nil
 }
 
 func (s *streamImpl) handleAck(ack *pb.Ack) {
@@ -671,6 +774,14 @@ func (s *streamImpl) cleanupS3AckedLocked(s3AckedSeq uint64) {
 	s.retainedMu.Unlock()
 
 	s.retainedBytes = newRetainedBytes
+}
+
+// Tail returns an iterator yielding (stream_seq, payload) pairs from the remote buffer service starting after fromSeq.
+func (s *streamImpl) Tail(ctx context.Context, fromSeq uint64) (iter.Seq2[uint64, []byte], error) {
+	if s.grpcClient == nil && s.target == "" {
+		return func(yield func(uint64, []byte) bool) {}, nil
+	}
+	return TailStream(ctx, s.target, s.streamID, fromSeq, WithGRPCClient(s.grpcClient), WithDialOptions(s.opts.dialOpts...))
 }
 
 // TailStream tails records belonging to a specific stream starting after fromSeq (stream_seq > fromSeq).

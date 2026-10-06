@@ -164,7 +164,7 @@ func New(index sds.LocalIndex, opts ...Option) *View {
 		index:           index,
 		overlay:         make(map[CacheKey]OverlayEntry),
 		batchSize:       defaultApplierBatchSize,
-		degradedTimeout: 5 * time.Second,
+		degradedTimeout: 5 * time.Minute,
 		cacheCapacity:   10000,
 		cacheMaxBytes:   64 * 1024 * 1024,
 		maxOverlayBytes: 64 * 1024 * 1024,

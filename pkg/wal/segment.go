@@ -280,6 +280,79 @@ func (s *ClientSegmentStore) rotateLocked(firstSeq uint64) error {
 	return nil
 }
 
+// TruncateAfter removes all records with StreamSeq > maxSeq from the segment store and disk.
+func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.activeFile != nil {
+		_ = s.activeFile.Sync()
+		_ = s.activeFile.Close()
+		s.activeFile = nil
+		s.activeMeta = nil
+	}
+
+	var remaining []*SegmentMeta
+	for _, seg := range s.segments {
+		if seg.FirstSeq > maxSeq {
+			// Entire segment is after maxSeq -> delete file
+			_ = os.Remove(seg.Path)
+			continue
+		}
+
+		if seg.LastSeq <= maxSeq {
+			// Entire segment is within maxSeq -> keep as is
+			remaining = append(remaining, seg)
+			continue
+		}
+
+		// Partial segment: scan records, find offset where StreamSeq <= maxSeq, truncate file
+		f, err := os.OpenFile(seg.Path, os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open segment file %s for truncate: %w", seg.Path, err)
+		}
+
+		var validOffset int64
+		var validCount int
+		var firstSeq, lastSeq uint64
+
+		for {
+			rec, err := DecodeClientRecord(f)
+			if err != nil || rec.StreamSeq > maxSeq {
+				break
+			}
+			if validCount == 0 {
+				firstSeq = rec.StreamSeq
+			}
+			lastSeq = rec.StreamSeq
+			validCount++
+			validOffset += int64(ClientHeaderSize + len(rec.Payload))
+		}
+
+		if validCount == 0 {
+			_ = f.Close()
+			_ = os.Remove(seg.Path)
+			continue
+		}
+
+		if err := f.Truncate(validOffset); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("failed to truncate segment file %s to %d: %w", seg.Path, validOffset, err)
+		}
+		_ = f.Sync()
+		_ = f.Close()
+
+		seg.Size = validOffset
+		seg.RecordCount = validCount
+		seg.FirstSeq = firstSeq
+		seg.LastSeq = lastSeq
+		remaining = append(remaining, seg)
+	}
+
+	s.segments = remaining
+	return nil
+}
+
 // DeleteSegmentsBeforeS3Ack deletes completed segment files whose records are all <= s3AckedSeq.
 func (s *ClientSegmentStore) DeleteSegmentsBeforeS3Ack(s3AckedSeq uint64) error {
 	s.mu.Lock()

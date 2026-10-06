@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"net"
 	"os"
 	"path"
@@ -1561,9 +1562,13 @@ func TestSnapshotsServicePagination(t *testing.T) {
 }
 
 func startTestWalBufferServer(t *testing.T, dir string) (*walbuffer.Server, string, func()) {
+	return startTestWalBufferServerWithBackend(t, dir, NewMemoryBackend())
+}
+
+func startTestWalBufferServerWithBackend(t *testing.T, dir string, backend ObjectStorageBackend) (*walbuffer.Server, string, func()) {
 	ctx := t.Context()
 	srv, err := walbuffer.NewServer(ctx, walbuffer.ServerConfig{
-		Backend:       NewMemoryBackend(),
+		Backend:       backend,
 		DataDir:       dir,
 		FlushInterval: 10 * time.Second,
 		BatchMaxDelay: 2 * time.Millisecond,
@@ -2144,6 +2149,10 @@ func (s *fakeBlockingStream) RecoveredRecords() []*wal.ClientRecord {
 
 func (s *fakeBlockingStream) ReplicationLevel() walclient.Level {
 	return walclient.Permanent
+}
+
+func (s *fakeBlockingStream) Tail(ctx context.Context, fromSeq uint64) (iter.Seq2[uint64, []byte], error) {
+	return func(yield func(uint64, []byte) bool) {}, nil
 }
 
 func (s *fakeBlockingStream) Close() error {
@@ -4359,5 +4368,179 @@ func TestVolumeIDValidation(t *testing.T) {
 		if err == nil {
 			t.Errorf("Expected GetAttr with invalid volumeID %q to fail", id)
 		}
+	}
+}
+
+// TestAuthoritativeRecoveryOnNewNodeWithoutSnapshot tests that when a controller moves to a new node
+// with an empty local directory, it recovers all writes acknowledged at witness from the wal-buffer,
+// even when no snapshots have been published (issue #185).
+func TestAuthoritativeRecoveryOnNewNodeWithoutSnapshot(t *testing.T) {
+	ctx := t.Context()
+	bufDir := t.TempDir()
+	backend := NewMemoryBackend()
+	_, target, cleanup := startTestWalBufferServerWithBackend(t, bufDir, backend)
+	defer cleanup()
+
+	volumeID := "test-new-node-recovery"
+	const N = 10
+
+	// 1. Controller 1 starts on Node 1 (walDir1, metaDir1) with Witness durability
+	walDir1 := t.TempDir()
+	metaDir1 := t.TempDir()
+	server1 := NewServer(backend,
+		WithServerWAL(walDir1, target, walclient.Witness),
+		WithServerMetadataDir(metaDir1),
+		WithServerMetadataIndex("sqlite"),
+	)
+
+	// Write N files on Server 1 without publishing any snapshot
+	for i := 1; i <= N; i++ {
+		_, err := testCreateFile(ctx, server1, volumeID, fmt.Sprintf("/file_%d.txt", i), 0644, []byte(fmt.Sprintf("content_%d", i)), 0, 0)
+		if err != nil {
+			t.Fatalf("Server 1 failed to create file_%d.txt: %v", i, err)
+		}
+	}
+
+	// Create a subdirectory with a file as well
+	_, err := testMkdir(ctx, server1, volumeID, "/sub", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Server 1 Mkdir failed: %v", err)
+	}
+	_, err = testCreateFile(ctx, server1, volumeID, "/sub/nested.txt", 0644, []byte("nested_content"), 0, 0)
+	if err != nil {
+		t.Fatalf("Server 1 failed to create /sub/nested.txt: %v", err)
+	}
+
+	// Close Server 1 (simulating node crash / controller moving away)
+	_ = server1.Close()
+
+	// 2. Controller 2 starts on Node 2 with EMPTY walDir2 and EMPTY metaDir2 against the same wal-buffer & backend
+	walDir2 := t.TempDir()
+	metaDir2 := t.TempDir()
+	server2 := NewServer(backend,
+		WithServerWAL(walDir2, target, walclient.Witness),
+		WithServerMetadataDir(metaDir2),
+		WithServerMetadataIndex("sqlite"),
+	)
+	defer func() { _ = server2.Close() }()
+
+	// Verify all N files are present and readable on Server 2
+	for i := 1; i <= N; i++ {
+		resp, err := testReadFile(ctx, server2, volumeID, fmt.Sprintf("/file_%d.txt", i), 0, 1024)
+		if err != nil {
+			t.Fatalf("Server 2 failed to read file_%d.txt after node move: %v", i, err)
+		}
+		expected := fmt.Sprintf("content_%d", i)
+		if string(resp.GetData()) != expected {
+			t.Fatalf("file_%d.txt content mismatch: got %q, want %q", i, string(resp.GetData()), expected)
+		}
+	}
+
+	// Verify nested file
+	nestedResp, err := testReadFile(ctx, server2, volumeID, "/sub/nested.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("Server 2 failed to read /sub/nested.txt: %v", err)
+	}
+	if string(nestedResp.GetData()) != "nested_content" {
+		t.Fatalf("nested.txt content mismatch: got %q, want nested_content", string(nestedResp.GetData()))
+	}
+
+	// 3. Write new files on Server 2
+	_, err = testCreateFile(ctx, server2, volumeID, "/after_restart.txt", 0644, []byte("after_restart_data"), 0, 0)
+	if err != nil {
+		t.Fatalf("Server 2 failed to create /after_restart.txt: %v", err)
+	}
+
+	// 4. Controller 3 starts on Node 3 (empty dirs again) and verifies all writes survive
+	walDir3 := t.TempDir()
+	metaDir3 := t.TempDir()
+	server3 := NewServer(backend,
+		WithServerWAL(walDir3, target, walclient.Witness),
+		WithServerMetadataDir(metaDir3),
+		WithServerMetadataIndex("sqlite"),
+	)
+	defer func() { _ = server3.Close() }()
+
+	afterResp, err := testReadFile(ctx, server3, volumeID, "/after_restart.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("Server 3 failed to read /after_restart.txt: %v", err)
+	}
+	if string(afterResp.GetData()) != "after_restart_data" {
+		t.Fatalf("after_restart.txt content mismatch: got %q", string(afterResp.GetData()))
+	}
+
+	resp1, err := testReadFile(ctx, server3, volumeID, "/file_1.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("Server 3 failed to read /file_1.txt: %v", err)
+	}
+	if string(resp1.GetData()) != "content_1" {
+		t.Fatalf("file_1.txt content mismatch: got %q", string(resp1.GetData()))
+	}
+}
+
+// TestAuthoritativeRecoveryIgnoresStaleNodeSegments tests that when a controller moves back
+// to a node with stale local segments, the authoritative records from the buffer are applied
+// and the stale local segments are ignored (issue #185).
+func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
+	ctx := t.Context()
+	bufDir := t.TempDir()
+	backend := NewMemoryBackend()
+	_, target, cleanup := startTestWalBufferServerWithBackend(t, bufDir, backend)
+	defer cleanup()
+
+	volumeID := "test-stale-node-recovery"
+
+	// 1. Controller runs on Node 1 with local-only writes that diverge
+	node1WalDir := t.TempDir()
+	node1MetaDir := t.TempDir()
+	streamID := StreamIDForVolume(volumeID)
+
+	localStream1, err := walclient.Open(ctx, node1WalDir, streamID, "")
+	if err != nil {
+		t.Fatalf("Open localStream1 failed: %v", err)
+	}
+	volStale := NewVolume(volumeID, backend, NewEventBroadcaster(),
+		WithStream(localStream1),
+		WithLocalStorageDir(filepath.Join(node1MetaDir, volumeID)),
+	)
+	_ = volStale.LoadFromBackend(ctx)
+	_, _ = volStale.CreateFile(ctx, 1, "stale_local_file.txt", 0644, []byte("stale-local-data"), 0, 0)
+	_ = volStale.Close()
+
+	// 2. Authoritative controller on Node 2 writes authoritative files to wal-buffer
+	node2WalDir := t.TempDir()
+	node2MetaDir := t.TempDir()
+	server2 := NewServer(backend,
+		WithServerWAL(node2WalDir, target, walclient.Witness),
+		WithServerMetadataDir(node2MetaDir),
+		WithServerMetadataIndex("sqlite"),
+	)
+	_, err = testCreateFile(ctx, server2, volumeID, "/authoritative_file.txt", 0644, []byte("authoritative-data"), 0, 0)
+	if err != nil {
+		t.Fatalf("Server 2 CreateFile failed: %v", err)
+	}
+	_ = server2.Close()
+
+	// 3. Controller moves back to Node 1 with stale local WAL directory and stale SQLite DB
+	server1Restarted := NewServer(backend,
+		WithServerWAL(node1WalDir, target, walclient.Witness),
+		WithServerMetadataDir(node1MetaDir),
+		WithServerMetadataIndex("sqlite"),
+	)
+	defer func() { _ = server1Restarted.Close() }()
+
+	// Authoritative file from wal-buffer must be present
+	authResp, err := testReadFile(ctx, server1Restarted, volumeID, "/authoritative_file.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("Failed to read /authoritative_file.txt on restarted server: %v", err)
+	}
+	if string(authResp.GetData()) != "authoritative-data" {
+		t.Fatalf("authoritative_file.txt mismatch: got %q", string(authResp.GetData()))
+	}
+
+	// Stale local file must NOT be present (should return ENOENT)
+	staleResp, err := testReadFile(ctx, server1Restarted, volumeID, "/stale_local_file.txt", 0, 1024)
+	if err == nil && staleResp.GetError() == 0 {
+		t.Fatalf("expected /stale_local_file.txt to not exist on authoritative volume, but got data: %q", string(staleResp.GetData()))
 	}
 }

@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -549,11 +548,10 @@ func TestTwoClientsInterleaved(t *testing.T) {
 	}
 }
 
-// 5. Service unreachable: Append keeps succeeding until the retained cap, then blocks; unblocks after reconnect.
+// 5. Service unreachable after connect: Append keeps succeeding until the retained cap, then blocks.
 func TestServiceUnreachableBackpressure(t *testing.T) {
 	backend := inmemorystorage.New()
 	handle := startBufferServer(t, backend, t.TempDir())
-	handle.StopGraceful() // Terminate service immediately so service is unreachable
 
 	clientDir := t.TempDir()
 	streamID := uuid.New()
@@ -566,6 +564,9 @@ func TestServiceUnreachableBackpressure(t *testing.T) {
 		t.Fatalf("open failed: %v", err)
 	}
 	defer stream.Close()
+
+	// Stop service so it is unreachable for network replication
+	handle.StopGraceful()
 
 	// Appends should succeed locally up to cap
 	for i := 1; i <= 2; i++ {
@@ -995,9 +996,9 @@ func TestTailStreamHelper(t *testing.T) {
 	}
 }
 
-// 14. Node move gap check: when buffer's witness watermark > client's local stream head,
-// client must fail fast and refuse appends to avoid silent data loss (issue #185).
-func TestBufferWitnessAheadOfClientLocalHeadRefusesAppend(t *testing.T) {
+// 14. Node move: when opening a stream on a new node (empty directory) against a buffer holding seq 1..5,
+// Append immediately without sleep must assign seq 6 and succeed (issue #185 reproduction test).
+func TestNewNodeStreamContinuesFromBufferHeadWithoutSleep(t *testing.T) {
 	backend := inmemorystorage.New()
 	handle := startBufferServer(t, backend, t.TempDir())
 	defer handle.StopGraceful()
@@ -1008,7 +1009,7 @@ func TestBufferWitnessAheadOfClientLocalHeadRefusesAppend(t *testing.T) {
 	streamID := uuid.New()
 	clientDir1 := t.TempDir()
 
-	// 1. First client appends 5 records
+	// 1. First client appends 5 records on node 1
 	stream1, err := Open(ctx, clientDir1, streamID, handle.addr)
 	if err != nil {
 		t.Fatalf("open stream1 failed: %v", err)
@@ -1025,7 +1026,7 @@ func TestBufferWitnessAheadOfClientLocalHeadRefusesAppend(t *testing.T) {
 		}
 	}
 
-	// 2. Second client starts with an empty directory (simulating controller starting on a new node)
+	// 2. Second client starts with an empty directory (simulating controller moving to a new node)
 	clientDir2 := t.TempDir()
 	stream2, err := Open(ctx, clientDir2, streamID, handle.addr)
 	if err != nil {
@@ -1033,15 +1034,300 @@ func TestBufferWitnessAheadOfClientLocalHeadRefusesAppend(t *testing.T) {
 	}
 	defer stream2.Close()
 
-	// Wait briefly for HelloAck background exchange
-	time.Sleep(100 * time.Millisecond)
-
-	// Appending on stream2 must fail fast with the gap error referencing #185
-	_, appendErr := stream2.Append(ctx, []byte("new-node-write"))
-	if appendErr == nil {
-		t.Fatalf("expected Append on stream2 to fail because buffer witness seq (5) > local head (0)")
+	// Append immediately with NO sleep: must get seq 6 and witness ack
+	seq, err := stream2.Append(ctx, []byte("new-node-write"))
+	if err != nil {
+		t.Fatalf("Append on stream2 failed: %v", err)
 	}
-	if !strings.Contains(appendErr.Error(), "#185") {
-		t.Fatalf("expected error message to reference #185, got: %v", appendErr)
+	if seq != 6 {
+		t.Fatalf("expected stream2 first append to get seq 6, got %d", seq)
+	}
+	if err := stream2.Wait(ctx, seq, Witness, false); err != nil {
+		t.Fatalf("wait on stream2 seq %d failed: %v", seq, err)
+	}
+
+	local, witness, _ := stream2.Watermarks()
+	if local != 6 || witness != 6 {
+		t.Fatalf("expected stream2 local=6, witness=6, got local=%d, witness=%d", local, witness)
+	}
+}
+
+// 15. Open a stream on an empty directory against a buffer whose witness watermark is W,
+// append, and check the first new record gets seq W+1 and is stored by the buffer.
+func TestNewNodeAppendsContinueFromWitnessWatermark(t *testing.T) {
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir())
+	defer handle.StopGraceful()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	streamID := uuid.New()
+	clientDir1 := t.TempDir()
+
+	// Client 1 writes W=10 records
+	const W = 10
+	stream1, err := Open(ctx, clientDir1, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream1 failed: %v", err)
+	}
+	for i := 1; i <= W; i++ {
+		seq, err := stream1.Append(ctx, []byte(fmt.Sprintf("w-data-%d", i)))
+		if err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+		if err := stream1.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("wait %d failed: %v", seq, err)
+		}
+	}
+	_ = stream1.Close()
+
+	// Client 2 on new empty directory
+	clientDir2 := t.TempDir()
+	stream2, err := Open(ctx, clientDir2, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream2 failed: %v", err)
+	}
+	defer stream2.Close()
+
+	newSeq, err := stream2.Append(ctx, []byte("w-data-11"))
+	if err != nil {
+		t.Fatalf("stream2 append failed: %v", err)
+	}
+	if newSeq != W+1 {
+		t.Fatalf("expected newSeq to be %d, got %d", W+1, newSeq)
+	}
+	if err := stream2.Wait(ctx, newSeq, Witness, false); err != nil {
+		t.Fatalf("stream2 wait for witness ack on %d failed: %v", newSeq, err)
+	}
+
+	// Verify via Tail that record W+1 is stored by the buffer
+	iter, err := TailStream(ctx, handle.addr, streamID, W)
+	if err != nil {
+		t.Fatalf("TailStream failed: %v", err)
+	}
+	found := false
+	for seq, payload := range iter {
+		if seq == W+1 {
+			if string(payload) != "w-data-11" {
+				t.Fatalf("expected payload w-data-11, got: %s", string(payload))
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("record %d was not found in buffer TailStream", W+1)
+	}
+}
+
+// 16. Stale local segments (local records at seqs the buffer holds with different content)
+// are discarded rather than resent.
+func TestStaleLocalSegmentsDiscardedRatherThanResent(t *testing.T) {
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir())
+	defer handle.StopGraceful()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	streamID := uuid.New()
+	node1Dir := t.TempDir()
+
+	// Node 1 writes records 1..3 locally without remote target
+	localStream1, err := Open(ctx, node1Dir, streamID, "")
+	if err != nil {
+		t.Fatalf("open localStream1 failed: %v", err)
+	}
+	for i := 1; i <= 3; i++ {
+		_, err := localStream1.Append(ctx, []byte(fmt.Sprintf("stale-node1-rec-%d", i)))
+		if err != nil {
+			t.Fatalf("localStream1 append %d failed: %v", i, err)
+		}
+	}
+	_ = localStream1.Close()
+
+	// Node 2 writes authoritative records 1..5 to wal-buffer
+	node2Dir := t.TempDir()
+	stream2, err := Open(ctx, node2Dir, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream2 failed: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		seq, err := stream2.Append(ctx, []byte(fmt.Sprintf("authoritative-rec-%d", i)))
+		if err != nil {
+			t.Fatalf("stream2 append %d failed: %v", i, err)
+		}
+		if err := stream2.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("stream2 wait %d failed: %v", seq, err)
+		}
+	}
+	_ = stream2.Close()
+
+	// Node 1 restarts on node1Dir (which has stale records 1..3) against wal-buffer (which has 1..5)
+	stream1Restarted, err := Open(ctx, node1Dir, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream1Restarted failed: %v", err)
+	}
+	defer stream1Restarted.Close()
+
+	// Next append on Node 1 must continue from buffer head 5 -> seq 6
+	seq6, err := stream1Restarted.Append(ctx, []byte("node1-new-rec-6"))
+	if err != nil {
+		t.Fatalf("stream1Restarted append failed: %v", err)
+	}
+	if seq6 != 6 {
+		t.Fatalf("expected seq 6, got %d", seq6)
+	}
+	if err := stream1Restarted.Wait(ctx, seq6, Witness, false); err != nil {
+		t.Fatalf("wait for seq 6 failed: %v", err)
+	}
+
+	// Tail from buffer: verify records 1..5 have authoritative content, NOT stale content
+	tailIter, err := TailStream(ctx, handle.addr, streamID, 0)
+	if err != nil {
+		t.Fatalf("TailStream failed: %v", err)
+	}
+
+	recordsMap := make(map[uint64]string)
+	for seq, payload := range tailIter {
+		recordsMap[seq] = string(payload)
+		if seq == 6 {
+			break
+		}
+	}
+
+	for i := 1; i <= 5; i++ {
+		expected := fmt.Sprintf("authoritative-rec-%d", i)
+		if recordsMap[uint64(i)] != expected {
+			t.Errorf("seq %d: expected %q, got %q", i, expected, recordsMap[uint64(i)])
+		}
+	}
+	if recordsMap[6] != "node1-new-rec-6" {
+		t.Errorf("seq 6: expected %q, got %q", "node1-new-rec-6", recordsMap[6])
+	}
+}
+
+// 17. Divergent local tail: Node A writes 1..5 locally without witness.
+// Node B writes 1..2 to buffer (head = 2).
+// Controller moves back to Node A (local records 3..5 are above buffer head, but local 2 != buffer 2).
+// Node A must discard divergent local records 3..5, continue sequence numbering from 3,
+// and not corrupt the buffer stream.
+func TestDivergentLocalTailAboveWitnessWatermarkDiscarded(t *testing.T) {
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir())
+	defer handle.StopGraceful()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	streamID := uuid.New()
+	node1Dir := t.TempDir()
+
+	// 1. Node A writes records 1..5 locally (no remote target)
+	localStream1, err := Open(ctx, node1Dir, streamID, "")
+	if err != nil {
+		t.Fatalf("open localStream1 failed: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		_, err := localStream1.Append(ctx, []byte(fmt.Sprintf("nodeA-rec-%d", i)))
+		if err != nil {
+			t.Fatalf("localStream1 append %d failed: %v", i, err)
+		}
+	}
+	_ = localStream1.Close()
+
+	// 2. Node B writes authoritative records 1..2 to wal-buffer (head = 2)
+	node2Dir := t.TempDir()
+	stream2, err := Open(ctx, node2Dir, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream2 failed: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		seq, err := stream2.Append(ctx, []byte(fmt.Sprintf("nodeB-rec-%d", i)))
+		if err != nil {
+			t.Fatalf("stream2 append %d failed: %v", i, err)
+		}
+		if err := stream2.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("stream2 wait %d failed: %v", seq, err)
+		}
+	}
+	_ = stream2.Close()
+
+	// 3. Move back to Node A (node1Dir has local 1..5, buffer head is 2 with nodeB content)
+	stream1Restarted, err := Open(ctx, node1Dir, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream1Restarted failed: %v", err)
+	}
+	defer stream1Restarted.Close()
+
+	// Next append on Node A must continue from buffer head 2 -> seq 3
+	seq3, err := stream1Restarted.Append(ctx, []byte("nodeA-new-rec-3"))
+	if err != nil {
+		t.Fatalf("stream1Restarted append failed: %v", err)
+	}
+	if seq3 != 3 {
+		t.Fatalf("expected next append to get seq 3, got %d", seq3)
+	}
+	if err := stream1Restarted.Wait(ctx, seq3, Witness, false); err != nil {
+		t.Fatalf("wait for seq 3 failed: %v", err)
+	}
+
+	// Tail from buffer: verify records 1..2 are from Node B, record 3 is nodeA-new-rec-3, and old nodeA 3..5 were discarded
+	tailIter, err := TailStream(ctx, handle.addr, streamID, 0)
+	if err != nil {
+		t.Fatalf("TailStream failed: %v", err)
+	}
+
+	recordsMap := make(map[uint64]string)
+	for seq, payload := range tailIter {
+		recordsMap[seq] = string(payload)
+		if seq == 3 {
+			break
+		}
+	}
+
+	if recordsMap[1] != "nodeB-rec-1" {
+		t.Errorf("seq 1: expected 'nodeB-rec-1', got %q", recordsMap[1])
+	}
+	if recordsMap[2] != "nodeB-rec-2" {
+		t.Errorf("seq 2: expected 'nodeB-rec-2', got %q", recordsMap[2])
+	}
+	if recordsMap[3] != "nodeA-new-rec-3" {
+		t.Errorf("seq 3: expected 'nodeA-new-rec-3', got %q", recordsMap[3])
+	}
+
+	// RecoveredRecords on stream1Restarted should have discarded divergent local records 3..5
+	for _, rec := range stream1Restarted.RecoveredRecords() {
+		if rec.StreamSeq > 2 && string(rec.Payload) != "nodeA-new-rec-3" {
+			t.Errorf("unexpected recovered record %d with payload %q", rec.StreamSeq, string(rec.Payload))
+		}
+	}
+	_ = stream1Restarted.Close()
+
+	// 4. Reopen node1Dir once more to verify disk truncation persisted and RecoveredRecords is contiguous without duplicates
+	stream1Reopened, err := Open(ctx, node1Dir, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("open stream1Reopened failed: %v", err)
+	}
+	defer stream1Reopened.Close()
+
+	recovered := stream1Reopened.RecoveredRecords()
+	// Should contain records 1, 2, 3 (where 3 is nodeA-new-rec-3) and NO divergent 4, 5
+	for _, rec := range recovered {
+		if rec.StreamSeq > 3 {
+			t.Errorf("unexpected record %d found on disk after truncation", rec.StreamSeq)
+		}
+	}
+
+	seq4, err := stream1Reopened.Append(ctx, []byte("nodeA-rec-4"))
+	if err != nil {
+		t.Fatalf("stream1Reopened append failed: %v", err)
+	}
+	if seq4 != 4 {
+		t.Fatalf("expected seq 4, got %d", seq4)
+	}
+	if err := stream1Reopened.Wait(ctx, seq4, Witness, false); err != nil {
+		t.Fatalf("wait for seq 4 failed: %v", err)
 	}
 }
