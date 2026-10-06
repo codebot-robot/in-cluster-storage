@@ -1866,3 +1866,66 @@ func TestSQLiteIndexRebuildOnDatabaseDeletion(t *testing.T) {
 		t.Fatalf("expected 15 directory entries, got %d", len(entries))
 	}
 }
+
+// TestRebuildIndexPreservesAllFilesWithoutLoss verifies that an index rebuild
+// replays all records without data loss (issue #185).
+func TestRebuildIndexPreservesAllFilesWithoutLoss(t *testing.T) {
+	ctx := t.Context()
+	localDir := t.TempDir()
+	backend := inmemorystorage.New()
+	volID := "vol-rebuild-preserves-all-files"
+
+	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDir),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Write 30 files
+	const N = 30
+	for i := 1; i <= N; i++ {
+		name := fmt.Sprintf("file_%d.txt", i)
+		data := []byte(fmt.Sprintf("file content %d", i))
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, err)
+		}
+	}
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	// Trigger manual rebuild
+	if err := vol.metadataView.Rebuild(ctx); err != nil {
+		t.Fatalf("Rebuild failed: %v", err)
+	}
+
+	// Verify all 30 entries exist and match content
+	entries, err := vol.ReadDir(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != N {
+		t.Fatalf("expected %d entries after rebuild, got %d", N, len(entries))
+	}
+
+	for i := 1; i <= N; i++ {
+		name := fmt.Sprintf("file_%d.txt", i)
+		attr, err := vol.Lookup(ctx, 1, name)
+		if err != nil {
+			t.Fatalf("Lookup %s failed after rebuild: %v", name, err)
+		}
+		data, _, _, err := vol.ReadFile(ctx, attr.GetInode().GetIno(), 0, 100)
+		if err != nil {
+			t.Fatalf("ReadFile %s failed after rebuild: %v", name, err)
+		}
+		expected := fmt.Sprintf("file content %d", i)
+		if string(data) != expected {
+			t.Fatalf("ReadFile %s mismatch: got %q, want %q", name, string(data), expected)
+		}
+	}
+}

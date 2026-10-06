@@ -451,25 +451,18 @@ func (v *Volume) waitForVolumeUploads(ctx context.Context) error {
 }
 
 type memoryAppender struct {
-	mu          sync.Mutex
-	count       uint64
-	startSeq    uint64
-	payloads    [][]byte
-	maxRetained int
+	mu       sync.Mutex
+	count    uint64
+	startSeq uint64
+	payloads [][]byte
 }
 
 func (m *memoryAppender) Append(_ context.Context, payload []byte) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.count++
-	maxRet := m.maxRetained
-	if maxRet <= 0 {
-		maxRet = 50000
-	}
-	if len(m.payloads) >= maxRet {
-		half := len(m.payloads) / 2
-		m.payloads = m.payloads[half:]
-		m.startSeq = m.count - uint64(len(m.payloads))
+	if m.startSeq == 0 {
+		m.startSeq = 1
 	}
 	m.payloads = append(m.payloads, payload)
 	return m.count, nil
@@ -4150,28 +4143,84 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 	}
 
 	// 5. Replay the stream from snapPos up to current position.
-	// NOTE: Replaying only local recovered records is temporary until #185 implements
-	// cluster-wide remote segment recovery across nodes.
 	if v.stream != nil {
-		recovered := v.stream.RecoveredRecords()
-		if len(recovered) > 0 {
-			cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
-			sr := sds.NewStreamReader("", v.streamID, sds.WithChangeReader(cr), sds.WithRecoveredRecords(recovered))
-			changes, err := sr.FeedRecovered(snapPos)
+		cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
+		seenSeqs := make(map[uint64]bool)
+		expectedSeq := snapPos + 1
+
+		applyChanges := func(changes []sds.Change) error {
+			if len(changes) == 0 {
+				return nil
+			}
+			if err := rebuiltIdx.ApplyBatch(ctx, changes); err != nil {
+				return fmt.Errorf("failed to apply replayed changes: %w", err)
+			}
+			for _, ch := range changes {
+				if ch.Seq > snapPos {
+					snapPos = ch.Seq
+				}
+			}
+			return nil
+		}
+
+		_, witnessHead, _ := v.stream.Watermarks()
+
+		// 5a. Authoritative tail from WAL buffer up to witnessHead
+		if witnessHead > snapPos {
+			tailIter, err := v.stream.Tail(ctx, snapPos)
 			if err != nil {
 				_ = rebuiltIdx.Close()
-				return nil, 0, fmt.Errorf("failed to recover SDS stream records: %w", err)
+				return nil, 0, fmt.Errorf("failed to tail authoritative stream from wal-buffer during rebuild: %w", err)
 			}
-			if len(changes) > 0 {
-				if err := rebuiltIdx.ApplyBatch(ctx, changes); err != nil {
+			for seq, payload := range tailIter {
+				if seq <= snapPos || seenSeqs[seq] {
+					continue
+				}
+				if seq != expectedSeq {
 					_ = rebuiltIdx.Close()
-					return nil, 0, fmt.Errorf("failed to apply replayed changes: %w", err)
+					return nil, 0, fmt.Errorf("stream contiguity violation in wal-buffer tail during rebuild: expected seq %d, got %d", expectedSeq, seq)
 				}
-				for _, ch := range changes {
-					if ch.Seq > snapPos {
-						snapPos = ch.Seq
-					}
+				expectedSeq++
+				seenSeqs[seq] = true
+				changes, err := cr.Feed(seq, payload)
+				if err != nil {
+					_ = rebuiltIdx.Close()
+					return nil, 0, fmt.Errorf("failed to feed authoritative record at seq %d during rebuild: %w", seq, err)
 				}
+				if err := applyChanges(changes); err != nil {
+					_ = rebuiltIdx.Close()
+					return nil, 0, err
+				}
+				if seq >= witnessHead {
+					break
+				}
+			}
+			if expectedSeq-1 < witnessHead {
+				_ = rebuiltIdx.Close()
+				return nil, 0, fmt.Errorf("failed to rebuild authoritative stream from wal-buffer: expected head %d but only reached %d", witnessHead, expectedSeq-1)
+			}
+		}
+
+		// 5b. Local unacknowledged records > witnessHead
+		recovered := v.stream.RecoveredRecords()
+		for _, rec := range recovered {
+			if rec.StreamSeq <= snapPos || rec.StreamSeq <= witnessHead || seenSeqs[rec.StreamSeq] {
+				continue
+			}
+			if rec.StreamSeq != expectedSeq {
+				_ = rebuiltIdx.Close()
+				return nil, 0, fmt.Errorf("stream contiguity violation in local records during rebuild: expected seq %d, got %d", expectedSeq, rec.StreamSeq)
+			}
+			expectedSeq++
+			seenSeqs[rec.StreamSeq] = true
+			changes, err := cr.Feed(rec.StreamSeq, rec.Payload)
+			if err != nil {
+				_ = rebuiltIdx.Close()
+				return nil, 0, fmt.Errorf("failed to feed local record at seq %d during rebuild: %w", rec.StreamSeq, err)
+			}
+			if err := applyChanges(changes); err != nil {
+				_ = rebuiltIdx.Close()
+				return nil, 0, err
 			}
 		}
 	} else if v.memAppender != nil {
@@ -4179,27 +4228,31 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 		startSeq := v.memAppender.StartSeq()
 		if len(payloads) > 0 {
 			cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
-			var allChanges []sds.Change
+			expectedSeq := snapPos + 1
 			for seqOffset, p := range payloads {
 				seq := startSeq + uint64(seqOffset)
 				if seq <= snapPos {
 					continue
 				}
+				if seq != expectedSeq {
+					_ = rebuiltIdx.Close()
+					return nil, 0, fmt.Errorf("stream contiguity violation in memAppender: expected seq %d, got %d", expectedSeq, seq)
+				}
+				expectedSeq++
 				chs, err := cr.Feed(seq, p)
 				if err != nil {
 					_ = rebuiltIdx.Close()
 					return nil, 0, fmt.Errorf("failed to feed memory record %d: %w", seq, err)
 				}
-				allChanges = append(allChanges, chs...)
-			}
-			if len(allChanges) > 0 {
-				if err := rebuiltIdx.ApplyBatch(ctx, allChanges); err != nil {
-					_ = rebuiltIdx.Close()
-					return nil, 0, fmt.Errorf("failed to apply replayed changes: %w", err)
-				}
-				for _, ch := range allChanges {
-					if ch.Seq > snapPos {
-						snapPos = ch.Seq
+				if len(chs) > 0 {
+					if err := rebuiltIdx.ApplyBatch(ctx, chs); err != nil {
+						_ = rebuiltIdx.Close()
+						return nil, 0, fmt.Errorf("failed to apply replayed changes: %w", err)
+					}
+					for _, ch := range chs {
+						if ch.Seq > snapPos {
+							snapPos = ch.Seq
+						}
 					}
 				}
 			}
@@ -4274,24 +4327,27 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	}
 
 	// 1. Check if local index is already open or existing, and not stale compared to remote snapshot
-	if v.metadataView != nil {
-		pos := v.metadataView.Position()
-		if pos > 0 && pos >= remoteSnapPos {
-			snapPos = pos
-			initialized = true
-		}
-	} else if v.localStorageDir != "" {
-		localIdx, found, err := v.indexFactory.OpenLocal(ctx, v.streamID.String(), v.localStorageDir)
-		if err == nil && found && localIdx != nil {
-			if localIdx.Position() >= remoteSnapPos {
-				_ = v.initMetadataViewLocked(ctx, localIdx)
-				if localIdx.Position() > 0 {
-					snapPos = localIdx.Position()
-					initialized = true
+	isRemoteWAL := (v.stream != nil && v.stream.ReplicationLevel() > walclient.Local)
+	if !isRemoteWAL {
+		if v.metadataView != nil {
+			pos := v.metadataView.Position()
+			if pos > 0 && pos >= remoteSnapPos {
+				snapPos = pos
+				initialized = true
+			}
+		} else if v.localStorageDir != "" {
+			localIdx, found, err := v.indexFactory.OpenLocal(ctx, v.streamID.String(), v.localStorageDir)
+			if err == nil && found && localIdx != nil {
+				if localIdx.Position() >= remoteSnapPos {
+					_ = v.initMetadataViewLocked(ctx, localIdx)
+					if localIdx.Position() > 0 {
+						snapPos = localIdx.Position()
+						initialized = true
+					}
+				} else {
+					klog.Infof("Volume %s: local SQLite metadata index on disk is stale (local pos %d < remote snapshot pos %d); restoring snapshot %s", v.volumeID, localIdx.Position(), remoteSnapPos, remoteSnapKey)
+					_ = localIdx.Close()
 				}
-			} else {
-				klog.Infof("Volume %s: local SQLite metadata index on disk is stale (local pos %d < remote snapshot pos %d); restoring snapshot %s", v.volumeID, localIdx.Position(), remoteSnapPos, remoteSnapKey)
-				_ = localIdx.Close()
 			}
 		}
 	}
@@ -4350,6 +4406,20 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	}
 
 	if !initialized {
+		if isRemoteWAL {
+			if v.metadataView != nil {
+				_ = v.metadataView.Close()
+				v.metadataView = nil
+			}
+			if v.localStorageDir != "" {
+				if err := os.RemoveAll(v.localStorageDir); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("failed to clear stale local storage dir %s: %w", v.localStorageDir, err)
+				}
+				if err := os.MkdirAll(v.localStorageDir, 0755); err != nil {
+					return fmt.Errorf("failed to recreate local storage dir %s: %w", v.localStorageDir, err)
+				}
+			}
+		}
 		if v.metadataView == nil {
 			_ = v.initMetadataViewLocked(ctx, nil)
 		}
@@ -4385,31 +4455,84 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	// Replay stream from snapPos
 	var highestReplayedIno uint64
 	if v.stream != nil {
-		recovered := v.stream.RecoveredRecords()
-		if len(recovered) > 0 {
-			cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
-			sr := sds.NewStreamReader("", v.streamID, sds.WithChangeReader(cr), sds.WithRecoveredRecords(recovered))
-			changes, err := sr.FeedRecovered(snapPos)
-			if err != nil {
-				return fmt.Errorf("failed to recover SDS stream records: %w", err)
+		cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
+		seenSeqs := make(map[uint64]bool)
+		expectedSeq := snapPos + 1
+
+		applyChangeList := func(changes []sds.Change) error {
+			if len(changes) == 0 {
+				return nil
 			}
-			if len(changes) > 0 {
-				if err := v.metadataView.ApplyChangesSync(ctx, changes); err != nil {
-					return fmt.Errorf("failed to apply recovered SDS changes: %w", err)
+			if err := v.metadataView.ApplyChangesSync(ctx, changes); err != nil {
+				return fmt.Errorf("failed to apply recovered SDS changes: %w", err)
+			}
+			for _, ch := range changes {
+				if ch.Seq > v.lastCommitSeq {
+					v.lastCommitSeq = ch.Seq
 				}
-				for _, ch := range changes {
-					if ch.Seq > v.lastCommitSeq {
-						v.lastCommitSeq = ch.Seq
-					}
-					if ch.TypeName == InodeTypeName {
-						if in, ok := ch.Row.(*pb.Inode); ok && in != nil && in.GetIno() > highestReplayedIno {
-							highestReplayedIno = in.GetIno()
-						}
+				if ch.TypeName == InodeTypeName {
+					if in, ok := ch.Row.(*pb.Inode); ok && in != nil && in.GetIno() > highestReplayedIno {
+						highestReplayedIno = in.GetIno()
 					}
 				}
 			}
-			sr.ChangeReader().DiscardPending()
+			return nil
 		}
+
+		_, witnessHead, _ := v.stream.Watermarks()
+
+		// 1. Authoritative tail from WAL buffer up to witnessHead
+		if witnessHead > snapPos {
+			tailIter, err := v.stream.Tail(ctx, snapPos)
+			if err != nil {
+				return fmt.Errorf("failed to tail authoritative stream from wal-buffer: %w", err)
+			}
+			for seq, payload := range tailIter {
+				if seq <= snapPos || seenSeqs[seq] {
+					continue
+				}
+				if seq != expectedSeq {
+					return fmt.Errorf("stream contiguity violation in wal-buffer tail: expected seq %d, got %d", expectedSeq, seq)
+				}
+				expectedSeq++
+				seenSeqs[seq] = true
+				changes, err := cr.Feed(seq, payload)
+				if err != nil {
+					return fmt.Errorf("failed to feed authoritative record at seq %d: %w", seq, err)
+				}
+				if err := applyChangeList(changes); err != nil {
+					return err
+				}
+				if seq >= witnessHead {
+					break
+				}
+			}
+			if expectedSeq-1 < witnessHead {
+				return fmt.Errorf("failed to recover authoritative stream from wal-buffer: expected head %d but only reached %d", witnessHead, expectedSeq-1)
+			}
+		}
+
+		// 2. Local records for the part the buffer doesn't have (unacknowledged writes > witnessHead, or local-only stream)
+		recovered := v.stream.RecoveredRecords()
+		for _, rec := range recovered {
+			if rec.StreamSeq <= snapPos || rec.StreamSeq <= witnessHead || seenSeqs[rec.StreamSeq] {
+				continue
+			}
+			if rec.StreamSeq != expectedSeq {
+				return fmt.Errorf("stream contiguity violation in local recovered records: expected seq %d, got %d", expectedSeq, rec.StreamSeq)
+			}
+			expectedSeq++
+			seenSeqs[rec.StreamSeq] = true
+			changes, err := cr.Feed(rec.StreamSeq, rec.Payload)
+			if err != nil {
+				return fmt.Errorf("failed to feed local recovered record at seq %d: %w", rec.StreamSeq, err)
+			}
+			if err := applyChangeList(changes); err != nil {
+				return err
+			}
+		}
+
+		cr.DiscardPending()
 	}
 
 	if v.metadataView != nil {
