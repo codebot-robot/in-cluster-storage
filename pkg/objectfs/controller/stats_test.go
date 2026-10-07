@@ -17,14 +17,20 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
-	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
 )
 
@@ -39,9 +45,6 @@ func TestVolume_StatsTracking(t *testing.T) {
 		t.Fatalf("getOrCreateVolume failed: %v", err)
 	}
 
-	if err := vol.FlushToBackend(ctx); err != nil {
-		t.Fatalf("FlushToBackend failed: %v", err)
-	}
 	st := vol.Stats()
 	if st.Stats.GetInodesDir() != 1 {
 		t.Errorf("initial stats InodesDir: got %d, want 1", st.Stats.GetInodesDir())
@@ -125,13 +128,6 @@ func TestVolume_StatsTracking(t *testing.T) {
 		t.Fatalf("Symlink failed: err=%v, resp=%v", err, symResp)
 	}
 
-	if err := vol.FlushToBackend(ctx); err != nil {
-		t.Fatalf("FlushToBackend failed: %v", err)
-	}
-	if err := vol.View().Flush(ctx); err != nil {
-		t.Fatalf("View.Flush failed: %v", err)
-	}
-
 	st = vol.Stats()
 	if st.Stats.GetInodesDir() != 2 || st.Stats.GetInodesFile() != 2 || st.Stats.GetInodesSymlink() != 1 {
 		t.Errorf("inodes counts mismatch: %v", st.Stats)
@@ -168,16 +164,14 @@ func TestVolume_StatsTracking(t *testing.T) {
 		t.Fatalf("Unlink file1 failed: err=%v, resp=%v", err, unResp)
 	}
 
-	if err := vol.FlushToBackend(ctx); err != nil {
-		t.Fatalf("FlushToBackend after delete failed: %v", err)
-	}
-	if err := vol.View().Flush(ctx); err != nil {
-		t.Fatalf("View.Flush after delete failed: %v", err)
-	}
-
 	st = vol.Stats()
 	if st.Stats.GetInodesFile() != 1 || st.Stats.GetLogicalBytes() != 350 {
 		t.Errorf("stats after delete: %v", st.Stats)
+	}
+
+	// Finally, flush to backend and verify debug check live == durable passes
+	if err := vol.FlushToBackend(ctx); err != nil {
+		t.Fatalf("FlushToBackend at end failed: %v", err)
 	}
 }
 
@@ -355,22 +349,12 @@ func TestVolume_InodeAllocatorRecomputeWhenStatsDeleted(t *testing.T) {
 			}
 		}
 
+		st = vol2.Stats()
+		if st.Stats.GetMaxIno() != newIno {
+			t.Errorf("MaxIno immediate: got %d, want %d", st.Stats.GetMaxIno(), newIno)
+		}
 		if err := vol2.FlushToBackend(ctx); err != nil {
 			t.Fatalf("FlushToBackend run 2 failed: %v", err)
-		}
-		if err := vol2.View().Flush(ctx); err != nil {
-			t.Fatalf("View.Flush run 2 failed: %v", err)
-		}
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			st = vol2.Stats()
-			if st.Stats.GetMaxIno() == newIno || time.Now().After(deadline) {
-				break
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-		if st.Stats.GetMaxIno() != newIno {
-			t.Errorf("MaxIno after flush: got %d, want %d", st.Stats.GetMaxIno(), newIno)
 		}
 	}
 }
@@ -458,5 +442,387 @@ func TestVolume_CrashWithUnappliedBacklogAndRecovery(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
+	ctx := t.Context()
+	storage := inmemorystorage.New()
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+
+	volumeID := "test-recovery-stats-vol"
+
+	// Session 1: Create files with unapplied backlog (large batch size)
+	session1Dir := filepath.Join(dir, "session1")
+	{
+		server1 := NewServer(storage,
+			WithServerWAL(walDir, "", walclient.Local),
+			WithServerLocalStorageDir(session1Dir),
+			WithServerMetadataApplierBatchSize(1000),
+		)
+		vol1, err := server1.getOrCreateVolume(volumeID)
+		if err != nil {
+			t.Fatalf("getOrCreateVolume failed: %v", err)
+		}
+
+		// 1. Create directory
+		_, err = server1.Mkdir(ctx, &pb.MkdirRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        "subdir",
+			Mode:        0755,
+		})
+		if err != nil {
+			t.Fatalf("Mkdir failed: %v", err)
+		}
+
+		// 2. Create small file
+		f1Resp, err := server1.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        "small.txt",
+			Mode:        0644,
+		})
+		if err != nil || f1Resp.GetError() != 0 {
+			t.Fatalf("CreateFile small.txt failed: %v", err)
+		}
+		_, err = server1.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId: volumeID,
+			Inode:    f1Resp.GetAttr().GetInode().GetIno(),
+			Offset:   0,
+			Data:     []byte("hello world"),
+		})
+		if err != nil {
+			t.Fatalf("WriteFile small.txt failed: %v", err)
+		}
+
+		// 3. Create chunked file (>64KB)
+		f2Resp, err := server1.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        "large.bin",
+			Mode:        0644,
+		})
+		if err != nil || f2Resp.GetError() != 0 {
+			t.Fatalf("CreateFile large.bin failed: %v", err)
+		}
+		chunkedData := make([]byte, 128*1024)
+		for i := range chunkedData {
+			chunkedData[i] = byte(i % 251)
+		}
+		_, err = server1.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId: volumeID,
+			Inode:    f2Resp.GetAttr().GetInode().GetIno(),
+			Offset:   0,
+			Data:     chunkedData,
+		})
+		if err != nil {
+			t.Fatalf("WriteFile large.bin failed: %v", err)
+		}
+
+		// 4. Create symlink
+		_, err = server1.Symlink(ctx, &pb.SymlinkRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        "link_to_small",
+			Target:      "small.txt",
+		})
+		if err != nil {
+			t.Fatalf("Symlink failed: %v", err)
+		}
+
+		// Verify live stats reflect the write path immediately
+		live1 := vol1.Stats().Stats
+		if live1.GetInodesDir() != 2 || live1.GetInodesFile() != 2 || live1.GetInodesSymlink() != 1 {
+			t.Fatalf("unexpected live inode counts: %+v", live1)
+		}
+		if live1.GetLogicalBytes() != int64(11+len(chunkedData)) {
+			t.Fatalf("unexpected live logical bytes: %d", live1.GetLogicalBytes())
+		}
+
+		// Simulate crash: close server1 stream, without flushing applier to SQLite
+		_ = server1.Close()
+	}
+
+	// Session 2: Crash restart with SAME local directory
+	{
+		server2 := NewServer(storage,
+			WithServerWAL(walDir, "", walclient.Local),
+			WithServerLocalStorageDir(session1Dir),
+		)
+		vol2, err := server2.getOrCreateVolume(volumeID)
+		if err != nil {
+			t.Fatalf("getOrCreateVolume session 2 failed: %v", err)
+		}
+
+		live2 := vol2.Stats().Stats
+		recount, err := vol2.countStatsFromIndex(ctx, vol2.metadataView.Index())
+		if err != nil {
+			t.Fatalf("countStatsFromIndex failed: %v", err)
+		}
+
+		if !proto.Equal(live2, recount) {
+			t.Fatalf("live stats after crash recovery does not match recount:\n  live:    %+v\n  recount: %+v", live2, recount)
+		}
+		_ = server2.Close()
+	}
+
+	// Session 3: Node move with FRESH local storage directory in WAL mode
+	session3Dir := filepath.Join(dir, "session3-fresh")
+	{
+		server3 := NewServer(storage,
+			WithServerWAL(walDir, "", walclient.Local),
+			WithServerLocalStorageDir(session3Dir),
+		)
+		vol3, err := server3.getOrCreateVolume(volumeID)
+		if err != nil {
+			t.Fatalf("getOrCreateVolume session 3 failed: %v", err)
+		}
+
+		live3 := vol3.Stats().Stats
+		recount, err := vol3.countStatsFromIndex(ctx, vol3.metadataView.Index())
+		if err != nil {
+			t.Fatalf("countStatsFromIndex session 3 failed: %v", err)
+		}
+
+		if !proto.Equal(live3, recount) {
+			t.Fatalf("live stats after node move does not match recount:\n  live:    %+v\n  recount: %+v", live3, recount)
+		}
+		_ = server3.Close()
+	}
+}
+
+func TestVolume_DebugStatsCheckCatchesSkippedUpdate(t *testing.T) {
+	ctx := t.Context()
+	storage := inmemorystorage.New()
+	server := NewServer(storage, WithServerStatsCheck())
+	defer server.Close()
+
+	vol, err := server.getOrCreateVolume("test-debug-check-vol")
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	// Create a file
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    "test-debug-check-vol",
+		ParentInode: 1,
+		Name:        "file.txt",
+		Mode:        0644,
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// Drain everything cleanly first
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	// Deliberately tamper with live stats to simulate a skipped update
+	vol.mu.Lock()
+	vol.liveStats.InodesFile += 10
+	vol.mu.Unlock()
+
+	defer func() {
+		r := recover()
+		vol.mu.Lock()
+		vol.liveStats.InodesFile -= 10
+		vol.mu.Unlock()
+		if r == nil {
+			t.Fatal("expected panic from debug stats check divergence, but did not panic")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "volume stats divergence") {
+			t.Fatalf("unexpected panic message: %v", r)
+		}
+	}()
+
+	// FlushOverlay drains the backlog and triggers assertStatsMatchLocked on the test goroutine.
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+}
+
+type faultyGetIndex struct {
+	sds.LocalIndex
+	getCalls   atomic.Int64
+	failOnCall atomic.Int64
+}
+
+func (f *faultyGetIndex) Get(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
+	call := f.getCalls.Add(1)
+	if target := f.failOnCall.Load(); target > 0 && call == target {
+		return nil, false, errors.New("injected index Get failure")
+	}
+	return f.LocalIndex.Get(ctx, typeName, key)
+}
+
+type faultyGetFactory struct {
+	sds.IndexFactory
+	idx *faultyGetIndex
+}
+
+func (f *faultyGetFactory) NewEmpty(ctx context.Context, streamID string, dir string) (sds.LocalIndex, error) {
+	inner, err := f.IndexFactory.NewEmpty(ctx, streamID, dir)
+	if err != nil {
+		return nil, err
+	}
+	f.idx.LocalIndex = inner
+	return f.idx, nil
+}
+
+func (f *faultyGetFactory) OpenLocal(ctx context.Context, streamID string, dir string) (sds.LocalIndex, bool, error) {
+	inner, found, err := f.IndexFactory.OpenLocal(ctx, streamID, dir)
+	if err != nil || !found {
+		return nil, found, err
+	}
+	f.idx.LocalIndex = inner
+	return f.idx, true, nil
+}
+
+func TestVolume_StatsUpdateGetFailureProductionReseedsAndDebugPanics(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+
+	baseFactory, err := sds.GetIndexFactory("memory")
+	if err != nil {
+		t.Fatalf("GetIndexFactory failed: %v", err)
+	}
+
+	// -------------------------------------------------------------
+	// Part 1: Production mode (WithoutVolumeStatsCheck)
+	// Must keep serving, mark liveStatsStale, keep committed rows visible,
+	// and re-seed from durable once the backlog drains.
+	// -------------------------------------------------------------
+	faultyIdx := &faultyGetIndex{}
+	factory := &faultyGetFactory{IndexFactory: baseFactory, idx: faultyIdx}
+
+	var stallApplier atomic.Bool
+	vol := NewVolume("vol-faulty-get-prod", backend, NewEventBroadcaster(),
+		WithIndexFactory(factory),
+		WithMetadataCacheDisabled(true),
+		WithoutVolumeStatsCheck(),
+		WithApplierFaultHook(func() error {
+			if stallApplier.Load() {
+				return errors.New("stalled applier to hold backlog")
+			}
+			return nil
+		}),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	attr, err := vol.CreateFile(ctx, 1, "test.txt", 0644, []byte("hello"), 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := attr.GetInode().GetIno()
+
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	// Stall applier so backlog is not drained immediately in the background
+	stallApplier.Store(true)
+
+	// Target the fault to trigger during the stats before-lookup Get.
+	// In SetAttr, the 1st Get is the read phase to load the inode, and the 2nd Get
+	// is the before-lookup during applyTxChangesLocked.
+	currentCalls := faultyIdx.getCalls.Load()
+	faultyIdx.failOnCall.Store(currentCalls + 2)
+
+	newMode := uint32(0755)
+	_, err = vol.SetAttr(ctx, ino, &newMode, nil, nil, nil, false, nil, false, nil, false)
+	if err != nil {
+		t.Fatalf("expected SetAttr to succeed despite stats update failure in production, got: %v", err)
+	}
+
+	// Committed rows must be visible through the view immediately
+	gotAttr, err := vol.GetAttr(ctx, ino)
+	if err != nil {
+		t.Fatalf("GetAttr failed after commit: %v", err)
+	}
+	expectedMode := uint32(0755 | syscall.S_IFREG)
+	if gotAttr.GetInode().GetMode() != expectedMode {
+		t.Fatalf("expected updated mode %o visible through view overlay, got %o", expectedMode, gotAttr.GetInode().GetMode())
+	}
+
+	vol.mu.Lock()
+	if !vol.liveStatsStale {
+		vol.mu.Unlock()
+		t.Fatal("expected liveStatsStale to be true after stats update failure")
+	}
+	vol.mu.Unlock()
+
+	// Clear applier stall, then FlushOverlay drains backlog and re-seeds liveStats from durable
+	stallApplier.Store(false)
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	vol.mu.Lock()
+	if vol.liveStatsStale {
+		vol.mu.Unlock()
+		t.Fatal("expected liveStatsStale to be false after backlog drain")
+	}
+	vol.mu.Unlock()
+
+	st := vol.Stats()
+	if st.Stats == nil || st.Stats.GetInodesFile() != 1 {
+		t.Fatalf("expected Stats() to be re-seeded from durable, got: %+v", st.Stats)
+	}
+
+	// -------------------------------------------------------------
+	// Part 2: Debug mode (WithVolumeStatsCheck / testing default)
+	// Must panic loud when a stats update fails.
+	// -------------------------------------------------------------
+	faultyIdxDebug := &faultyGetIndex{}
+	factoryDebug := &faultyGetFactory{IndexFactory: baseFactory, idx: faultyIdxDebug}
+
+	volDebug := NewVolume("vol-faulty-get-debug", backend, NewEventBroadcaster(),
+		WithIndexFactory(factoryDebug),
+		WithMetadataCacheDisabled(true),
+		WithVolumeStatsCheck(),
+	)
+	defer volDebug.Close()
+
+	if err := volDebug.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	attrDebug, err := volDebug.CreateFile(ctx, 1, "test_dbg.txt", 0644, []byte("hello"), 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inoDebug := attrDebug.GetInode().GetIno()
+
+	if err := volDebug.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	currentCallsDebug := faultyIdxDebug.getCalls.Load()
+	faultyIdxDebug.failOnCall.Store(currentCallsDebug + 2)
+
+	didPanic := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				didPanic = true
+				msg, ok := r.(string)
+				if !ok || !strings.Contains(msg, "volume stats update failed") {
+					t.Fatalf("unexpected panic message: %v", r)
+				}
+			}
+		}()
+		_, _ = volDebug.SetAttr(ctx, inoDebug, &newMode, nil, nil, nil, false, nil, false, nil, false)
+	}()
+
+	if !didPanic {
+		t.Fatal("expected debug mode to panic on stats update failure, but did not panic")
 	}
 }

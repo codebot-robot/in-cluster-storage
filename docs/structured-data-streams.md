@@ -261,6 +261,21 @@ A consumer that loses its registry restarts from the latest snapshot at or befor
 
 ---
 
+## Write-Path Consistency and Live Stats Maintenance
+
+When higher-level systems (such as ObjectFS Volume) maintain live aggregations or point-in-time statistics alongside a stream of structured row changes, writes follow a strict three-rule consistency contract:
+
+1. **The lock is the snapshot:** Every mutating operation executes under the volume write lock (`v.mu`). Because there is a single writer for the volume stream and all mutations hold this mutex, reading from the metadata view (which overlays unapplied in-flight batches onto cached/indexed state) observes the linearizable stream head state without requiring multi-version concurrency control (MVCC) snapshot handles.
+2. **Read before write (no read-your-writes needed):** Operations query any necessary pre-state from the view before buffering row mutations in their transaction (`Tx`). Because all needed state is fetched upfront and mutations are staged in the `Tx` buffer, operations never depend on observing their own uncommitted buffered writes from the view during execution.
+3. **View-derived before-images for stats:** At commit time, live aggregations are updated by comparing each changed key's pre-commit state with its post-commit row:
+   - The before-image of each changed key is looked up directly from the view before recording the transaction's changes into the view overlay.
+   - The after-image is the buffered row in the transaction (or `nil` for deletions).
+   - Stats deltas are computed from these (before, after) pairs using the exact same arithmetic function (`UpdateStatsFromChanges`) as the write-behind background applier.
+
+This design guarantees that live statistics updated synchronously on the write path and durable checkpoints materialized asynchronously by the background applier calculate identical deltas by construction, preventing bookkeeping drift and double-counting anomalies.
+
+---
+
 ## Encryption
 
 The client-side encryption proposed for Streams (per-record AEAD, [issue #87](https://github.com/gke-labs/in-cluster-storage/issues/87)) composes cleanly because the type varint lives **inside** the payload: an observer sees neither record types nor their distribution, only sizes and timing. The `Padding` type exists so that sizes can be bucketed under encryption, and the key envelope for a stream and its `TypeDefinition`s are both "stream header" records that a snapshot carries forward.

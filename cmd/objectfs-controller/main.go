@@ -50,6 +50,7 @@ var (
 	metadataOverlayMaxBytes  = flag.Int64("metadata-overlay-max-bytes", 64*1024*1024, "Maximum byte size of unapplied metadata overlay before applying backpressure")
 	metadataApplierBatchSize = flag.Int("metadata-applier-batch-size", 100, "Maximum batch size for SQLite background applier")
 	debugMutationCheck       = flag.Bool("debug-mutation-check", false, "Enable debug mutation checking on metadata view (for test/CI gates)")
+	debugStatsCheck          = flag.Bool("debug-stats-check", false, "Enable debug volume stats checking (for test/CI gates)")
 )
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -100,7 +101,10 @@ func main() {
 		serverOpts = append(serverOpts, controller.WithServerMetadataApplierBatchSize(*metadataApplierBatchSize))
 	}
 	if *debugMutationCheck {
-		serverOpts = append(serverOpts, controller.WithServerMutationCheck())
+		serverOpts = append(serverOpts, controller.WithServerMutationCheck(), controller.WithServerStatsCheck())
+	}
+	if *debugStatsCheck && !*debugMutationCheck {
+		serverOpts = append(serverOpts, controller.WithServerStatsCheck())
 	}
 	// TODO: We always want to assume a WAL, and maybe it would be nice to have a wal-client mode that was local-only e.g. for testing.
 	if *walDir != "" {
