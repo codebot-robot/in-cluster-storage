@@ -143,6 +143,13 @@ func WithFaultHook(hook func() error) Option {
 	}
 }
 
+// WithBatchAppliedHook configures a callback invoked after an applier batch is applied.
+func WithBatchAppliedHook(fn func(appliedPos uint64)) Option {
+	return func(v *View) {
+		v.batchAppliedHook = fn
+	}
+}
+
 // WithRegistry sets the in-band type registry for the View.
 func WithRegistry(reg *record.Registry) Option {
 	return func(v *View) {
@@ -168,10 +175,11 @@ type View struct {
 	overlay map[CacheKey]OverlayEntry
 	queue   []sds.Change
 
-	applier    *applier
-	appliedPos uint64
-	batchSize  int
-	faultHook  func() error
+	applier          *applier
+	appliedPos       uint64
+	batchSize        int
+	faultHook        func() error
+	batchAppliedHook func(appliedPos uint64)
 
 	statsRow    proto.Message
 	statsUpdate StatsUpdateFunc
@@ -452,13 +460,24 @@ func (v *View) Stats() proto.Message {
 	return proto.Clone(v.statsRow)
 }
 
-func (v *View) computeBatchStats(ctx context.Context, changes []sds.Change, baseStats proto.Message, batchSeq uint64) ([]sds.Change, proto.Message, error) {
-	if v.statsRow == nil || v.statsUpdate == nil || v.index == nil {
-		return changes, baseStats, nil
+// BeforeLookupFunc returns the before-image of a row identified by (typeName, key).
+// ok is false if the row did not exist before the changes.
+type BeforeLookupFunc func(typeName string, key sds.Key) (proto.Message, bool, error)
+
+// UpdateStatsFromChanges computes stats updates for a sequence of row changes using
+// beforeLookup to obtain the pre-change state and update to adjust stats in-place.
+func UpdateStatsFromChanges(
+	changes []sds.Change,
+	stats proto.Message,
+	update StatsUpdateFunc,
+	reg *record.Registry,
+	beforeLookup BeforeLookupFunc,
+) error {
+	if stats == nil || update == nil || len(changes) == 0 {
+		return nil
 	}
 
-	newStats := proto.Clone(baseStats)
-	statsTypeName := string(newStats.ProtoReflect().Descriptor().FullName())
+	statsTypeName := string(stats.ProtoReflect().Descriptor().FullName())
 
 	type coalescedKey struct {
 		typeName string
@@ -468,8 +487,8 @@ func (v *View) computeBatchStats(ctx context.Context, changes []sds.Change, base
 
 	for _, ch := range changes {
 		typeName := ch.TypeName
-		if typeName == "" && v.reg != nil {
-			if def, _, ok := v.reg.LookupByID(ch.TypeID); ok {
+		if typeName == "" && reg != nil {
+			if def, _, ok := reg.LookupByID(ch.TypeID); ok {
 				typeName = def.GetName()
 			}
 		}
@@ -486,10 +505,10 @@ func (v *View) computeBatchStats(ctx context.Context, changes []sds.Change, base
 		var before proto.Message
 		if prev, exists := latestInBatch[ck]; exists {
 			before = prev
-		} else {
-			existing, ok, err := v.index.Get(ctx, typeName, key)
+		} else if beforeLookup != nil {
+			existing, ok, err := beforeLookup(typeName, key)
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to get previous row for %s: %w", typeName, err)
+				return fmt.Errorf("failed to get previous row for %s: %w", typeName, err)
 			}
 			if ok {
 				before = existing
@@ -500,18 +519,18 @@ func (v *View) computeBatchStats(ctx context.Context, changes []sds.Change, base
 		switch ch.Op {
 		case sds.OpCreate, sds.OpUpdate:
 			after = ch.Row
-			if after == nil && v.reg != nil && (len(ch.RawKey) > 0 || len(ch.RawVal) > 0) {
-				def, _, ok := v.reg.LookupByName(typeName)
+			if after == nil && reg != nil && (len(ch.RawKey) > 0 || len(ch.RawVal) > 0) {
+				def, _, ok := reg.LookupByName(typeName)
 				if !ok {
-					return nil, nil, fmt.Errorf("type %s not in registry", typeName)
+					return fmt.Errorf("type %s not in registry", typeName)
 				}
-				msgType, err := v.reg.ResolveMessageType(def.GetId())
+				msgType, err := reg.ResolveMessageType(def.GetId())
 				if err != nil {
-					return nil, nil, fmt.Errorf("failed to resolve message type for %s: %w", typeName, err)
+					return fmt.Errorf("failed to resolve message type for %s: %w", typeName, err)
 				}
 				target := msgType.New().Interface()
 				if err := sds.MergeKeyAndNonKey(target, ch.RawKey, ch.RawVal); err != nil {
-					return nil, nil, fmt.Errorf("failed to decode row for %s: %w", typeName, err)
+					return fmt.Errorf("failed to decode row for %s: %w", typeName, err)
 				}
 				after = target
 			}
@@ -521,23 +540,27 @@ func (v *View) computeBatchStats(ctx context.Context, changes []sds.Change, base
 
 		latestInBatch[ck] = after
 
-		if before != nil {
-			v.checkMessage(before)
+		if err := update(stats, before, after); err != nil {
+			return fmt.Errorf("stats update failed for %s: %w", typeName, err)
 		}
-		if after != nil {
-			v.checkMessage(after)
-		}
+	}
+	return nil
+}
 
-		if err := v.statsUpdate(newStats, before, after); err != nil {
-			return nil, nil, fmt.Errorf("stats update failed for %s: %w", typeName, err)
-		}
+func (v *View) computeBatchStats(ctx context.Context, changes []sds.Change, baseStats proto.Message, batchSeq uint64) ([]sds.Change, proto.Message, error) {
+	if v.statsRow == nil || v.statsUpdate == nil || v.index == nil {
+		return changes, baseStats, nil
+	}
 
-		if before != nil {
-			v.checkMessage(before)
-		}
-		if after != nil {
-			v.checkMessage(after)
-		}
+	newStats := proto.Clone(baseStats)
+	statsTypeName := string(newStats.ProtoReflect().Descriptor().FullName())
+
+	beforeLookup := func(typeName string, key sds.Key) (proto.Message, bool, error) {
+		return v.index.Get(ctx, typeName, key)
+	}
+
+	if err := UpdateStatsFromChanges(changes, newStats, v.statsUpdate, v.reg, beforeLookup); err != nil {
+		return nil, nil, err
 	}
 
 	def, _, ok := v.reg.LookupByName(statsTypeName)
