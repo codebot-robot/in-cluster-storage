@@ -31,6 +31,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -129,6 +130,7 @@ type Server struct {
 	metadataOverlayMaxBytes  int64
 	metadataApplierBatchSize int
 	localStorageDir          string
+	viewOpts                 []view.Option
 	streamFactory            func(volumeID string) (walclient.Stream, error)
 
 	flushTicker *time.Ticker
@@ -138,6 +140,20 @@ type Server struct {
 
 // ServerOption configures the controller Server.
 type ServerOption func(*Server)
+
+// WithServerMutationCheck enables debug mutation checking on metadata views created by the server.
+func WithServerMutationCheck() ServerOption {
+	return func(s *Server) {
+		s.viewOpts = append(s.viewOpts, view.WithMutationCheck())
+	}
+}
+
+// WithServerViewOptions appends custom view options for all volumes created by the server.
+func WithServerViewOptions(opts ...view.Option) ServerOption {
+	return func(s *Server) {
+		s.viewOpts = append(s.viewOpts, opts...)
+	}
+}
 
 // WithServerMetadataIndex configures the metadata index engine ("sqlite" or "memory").
 func WithServerMetadataIndex(index string) ServerOption {
@@ -269,6 +285,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if s.localStorageDir != "" {
 			volOpts = append(volOpts, WithLocalStorageDir(s.localStorageDir))
+		}
+		if len(s.viewOpts) > 0 {
+			volOpts = append(volOpts, WithVolumeViewOptions(s.viewOpts...))
 		}
 
 		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)

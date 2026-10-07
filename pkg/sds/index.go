@@ -28,6 +28,13 @@ import (
 
 // LocalIndex defines the contract for a derived, queryable local index of a structured data stream.
 // Implementations maintain a materialization of the stream state at a known stream sequence position.
+//
+// Contract:
+//   - Messages returned by Get and Scan are shared and must not be modified by callers. Callers that
+//     need to change a row must clone it first.
+//   - Messages passed to LocalIndex in changes (Change.Row) must not be modified after they are passed.
+//   - Implementations may return either freshly decoded messages (e.g., SQLite) or stored pointers (e.g., memtable).
+//   - Implementations must never modify rows they store in place.
 type LocalIndex interface {
 	// Position returns the stream sequence position of the last applied change.
 	Position() uint64
@@ -40,10 +47,12 @@ type LocalIndex interface {
 
 	// Get retrieves a merged proto row by table type name and primary key.
 	// Returns (msg, true, nil) if found, or (nil, false, nil) if not found.
+	// The returned message is shared and must not be modified.
 	Get(ctx context.Context, typeName string, key Key) (proto.Message, bool, error)
 
 	// Scan yields merged proto rows matching keyPrefix in canonical key-byte order.
 	// If keyPrefix is empty, all rows in the table are yielded.
+	// Yielded messages are shared and must not be modified.
 	Scan(ctx context.Context, typeName string, keyPrefix []byte) iter.Seq2[proto.Message, error]
 
 	// Close closes any underlying resources associated with the local index.

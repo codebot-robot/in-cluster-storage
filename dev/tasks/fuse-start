@@ -33,16 +33,18 @@
 #             and exit with its exit code.
 #
 # Environment overrides:
-#   OBJECTFS_VOLUME       volume ID to mount (default: dev-vol)
-#   OBJECTFS_WRITE_MODE   fsync | lazy | eager (default: fsync)
-#   OBJECTFS_PORT         controller gRPC port (default: 50051)
-#   OBJECTFS_DEV_DIR      directory for object store, logs and the mount
-#                         (default: a fresh mktemp directory; set this to
-#                         reuse data across runs)
-#   OBJECTFS_MOUNT_ARGS   extra arguments for `objectfsctl mount`, e.g. --debug
-#                         to log every FUSE request
-#   OBJECTFS_DEV_IMAGE    container image for the macOS/Docker path
-#                         (default: debian:bookworm-slim)
+#   OBJECTFS_VOLUME           volume ID to mount (default: dev-vol)
+#   OBJECTFS_WRITE_MODE       fsync | lazy | eager (default: fsync)
+#   OBJECTFS_PORT             controller gRPC port (default: 50051)
+#   OBJECTFS_DEV_DIR          directory for object store, logs and the mount
+#                             (default: a fresh mktemp directory; set this to
+#                             reuse data across runs)
+#   OBJECTFS_MOUNT_ARGS       extra arguments for `objectfsctl mount`, e.g. --debug
+#                             to log every FUSE request
+#   OBJECTFS_CONTROLLER_ARGS  extra arguments for `objectfs-controller`, e.g.
+#                             --debug-mutation-check
+#   OBJECTFS_DEV_IMAGE        container image for the macOS/Docker path
+#                             (default: debian:bookworm-slim)
 
 set -o errexit
 set -o nounset
@@ -120,7 +122,7 @@ if [[ "$(uname -s)" != "Linux" || ! -e /dev/fuse ]]; then
     ${DEV_DIR_MOUNT[@]+"${DEV_DIR_MOUNT[@]}"} \
     -e OBJECTFS_DEV_DIR=/var/lib/objectfs-dev \
     -e OBJECTFS_SKIP_BUILD=1 \
-    -e OBJECTFS_VOLUME -e OBJECTFS_WRITE_MODE -e OBJECTFS_PORT -e OBJECTFS_MOUNT_ARGS \
+    -e OBJECTFS_VOLUME -e OBJECTFS_WRITE_MODE -e OBJECTFS_PORT -e OBJECTFS_MOUNT_ARGS -e OBJECTFS_CONTROLLER_ARGS \
     "${IMAGE}" ./dev/tasks/fuse-start --shell
 fi
 
@@ -215,7 +217,8 @@ echo "Starting objectfs-controller on ${SERVER_ADDR} (backend file://${STORE_DIR
     --port "${OBJECTFS_PORT}" \
     --backend "file://${STORE_DIR}" \
     --metadata-index "${OBJECTFS_METADATA_INDEX:-sqlite}" \
-    --flush-interval 1m
+    --flush-interval 1m \
+    ${OBJECTFS_CONTROLLER_ARGS:-}
 ) >"${CONTROLLER_LOG}" 2>&1 &
 CONTROLLER_PID=$!
 

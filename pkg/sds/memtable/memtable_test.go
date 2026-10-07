@@ -341,3 +341,46 @@ func TestMemTableScriptedLogReplay(t *testing.T) {
 		t.Errorf("store.Position() = %d, SafeSnapshotPosition() = %d", store.Position(), reader.SafeSnapshotPosition())
 	}
 }
+
+func TestMemTableNoCloning(t *testing.T) {
+	ctx := t.Context()
+	md := buildDynamicMD(t, "Product", []*descriptorpb.FieldDescriptorProto{
+		field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("name", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+
+	store := New(WithStreamID("test-memtable-no-clone"))
+	defer store.Close()
+
+	p1 := dynamicpb.NewMessage(md)
+	p1.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(10))
+	p1.Set(md.Fields().ByName("name"), protoreflect.ValueOfString("Gizmo"))
+	k1, _ := sds.ExtractKey(p1, []int32{1})
+
+	table := store.Table("testpkg.Product")
+	if table == nil {
+		table = NewTable("testpkg.Product")
+		store.tables["testpkg.Product"] = table
+	}
+
+	table.Put(k1, p1)
+
+	gotMsg, ok := table.Get(k1)
+	if !ok || gotMsg != p1 {
+		t.Fatalf("MemTable.Get returned different pointer: %p != %p", gotMsg, p1)
+	}
+
+	rows := table.Rows()
+	if len(rows) != 1 || rows[0] != p1 {
+		t.Fatalf("MemTable.Rows returned different pointer: %p != %p", rows[0], p1)
+	}
+
+	for scanned, sErr := range store.Scan(ctx, "testpkg.Product", nil) {
+		if sErr != nil {
+			t.Fatalf("Scan error: %v", sErr)
+		}
+		if scanned != p1 {
+			t.Fatalf("MemStore.Scan returned different pointer: %p != %p", scanned, p1)
+		}
+	}
+}

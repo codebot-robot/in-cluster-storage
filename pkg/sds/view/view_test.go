@@ -34,6 +34,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 )
 
@@ -866,5 +867,330 @@ func TestViewRebuildOnDegradedTimeout(t *testing.T) {
 				t.Fatalf("Flush failed: %v", err)
 			}
 		})
+	}
+}
+
+func TestViewGetAndScanNoCloning(t *testing.T) {
+	ctx := t.Context()
+	orderMD := dynamicDescriptor(t, "OrderNoClone", []*descriptorpb.FieldDescriptorProto{
+		protoField("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_REQUIRED),
+		protoField("item", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+
+	store := memtable.New(memtable.WithStreamID("test-no-clone"))
+	defer store.Close()
+
+	reg := record.NewRegistry()
+	_, _ = reg.RegisterDescriptor(orderMD, 1)
+	_ = store.SyncRegistry(ctx, reg)
+
+	v := view.New(store,
+		view.WithRegistry(reg),
+		view.WithMutationCheck(),
+	)
+	defer v.Close()
+
+	msg1 := dynamicpb.NewMessage(orderMD)
+	msg1.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(100))
+	msg1.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Widget A"))
+	k1, _ := sds.ExtractKey(msg1, []int32{1})
+
+	// 1. Overlay hit (before flush)
+	v.ApplyChanges([]sds.Change{
+		{
+			Seq:      1,
+			TypeID:   1,
+			TypeName: "viewtest.OrderNoClone",
+			Op:       sds.OpCreate,
+			Key:      k1,
+			Row:      msg1,
+		},
+	})
+
+	gotOverlay, ok, err := v.Get(ctx, "viewtest.OrderNoClone", k1)
+	if err != nil || !ok {
+		t.Fatalf("Get failed: %v, ok=%v", err, ok)
+	}
+	if gotOverlay != msg1 {
+		t.Fatalf("expected overlay Get to return identical pointer (%p != %p)", gotOverlay, msg1)
+	}
+
+	// 2. Scan from overlay
+	for scanned, sErr := range v.Scan(ctx, "viewtest.OrderNoClone", nil) {
+		if sErr != nil {
+			t.Fatalf("Scan error: %v", sErr)
+		}
+		if scanned != msg1 {
+			t.Fatalf("expected Scan to yield identical pointer (%p != %p)", scanned, msg1)
+		}
+	}
+
+	// 3. Flush to underlying memtable and verify cache hit / memtable Get returns identical pointer
+	if err := v.Flush(ctx); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	gotCache, ok, err := v.Get(ctx, "viewtest.OrderNoClone", k1)
+	if err != nil || !ok {
+		t.Fatalf("Get failed after flush: %v, ok=%v", err, ok)
+	}
+	if gotCache != msg1 {
+		t.Fatalf("expected read-cache Get to return identical pointer (%p != %p)", gotCache, msg1)
+	}
+
+	// 4. Clear cache and query memtable directly through view
+	v.ClearCache()
+	gotMemStore, ok, err := v.Get(ctx, "viewtest.OrderNoClone", k1)
+	if err != nil || !ok {
+		t.Fatalf("Get after ClearCache failed: %v, ok=%v", err, ok)
+	}
+	if gotMemStore != msg1 {
+		t.Fatalf("expected memstore Get to return identical pointer (%p != %p)", gotMemStore, msg1)
+	}
+
+	// 5. Scan after flush
+	for scanned, sErr := range v.Scan(ctx, "viewtest.OrderNoClone", nil) {
+		if sErr != nil {
+			t.Fatalf("Scan error after flush: %v", sErr)
+		}
+		if scanned != msg1 {
+			t.Fatalf("expected Scan after flush to yield identical pointer (%p != %p)", scanned, msg1)
+		}
+	}
+}
+
+func TestMutationCheck_CallerModifiesReturnedRow(t *testing.T) {
+	ctx := t.Context()
+	orderMD := dynamicDescriptor(t, "OrderModRet", []*descriptorpb.FieldDescriptorProto{
+		protoField("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_REQUIRED),
+		protoField("item", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+
+	store := memtable.New(memtable.WithStreamID("test-mod-ret"))
+	defer store.Close()
+
+	reg := record.NewRegistry()
+	_, _ = reg.RegisterDescriptor(orderMD, 1)
+	_ = store.SyncRegistry(ctx, reg)
+
+	v := view.New(store,
+		view.WithRegistry(reg),
+		view.WithMutationCheck(),
+	)
+
+	msg := dynamicpb.NewMessage(orderMD)
+	msg.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(42))
+	msg.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Original"))
+	k, _ := sds.ExtractKey(msg, []int32{1})
+
+	v.ApplyChanges([]sds.Change{
+		{
+			Seq:      1,
+			TypeID:   1,
+			TypeName: "viewtest.OrderModRet",
+			Op:       sds.OpCreate,
+			Key:      k,
+			Row:      msg,
+		},
+	})
+
+	got, ok, err := v.Get(ctx, "viewtest.OrderModRet", k)
+	if err != nil || !ok {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Caller illegally mutates returned row in place
+	dyn := got.(*dynamicpb.Message)
+	dyn.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Mutated!"))
+
+	// Next Get or Scan must panic
+	didPanic := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				didPanic = true
+			}
+		}()
+		_, _, _ = v.Get(ctx, "viewtest.OrderModRet", k)
+	}()
+
+	if !didPanic {
+		t.Fatalf("expected Get to panic when row was mutated in place")
+	}
+}
+
+func TestMutationCheck_CallerModifiesRowAfterRecording(t *testing.T) {
+	ctx := t.Context()
+	orderMD := dynamicDescriptor(t, "OrderModPost", []*descriptorpb.FieldDescriptorProto{
+		protoField("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_REQUIRED),
+		protoField("item", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+
+	store := memtable.New(memtable.WithStreamID("test-mod-post"))
+	defer store.Close()
+
+	reg := record.NewRegistry()
+	_, _ = reg.RegisterDescriptor(orderMD, 1)
+	_ = store.SyncRegistry(ctx, reg)
+
+	v := view.New(store,
+		view.WithRegistry(reg),
+		view.WithMutationCheck(),
+	)
+
+	msg := dynamicpb.NewMessage(orderMD)
+	msg.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(77))
+	msg.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Recorded"))
+	k, _ := sds.ExtractKey(msg, []int32{1})
+
+	v.ApplyChanges([]sds.Change{
+		{
+			Seq:      1,
+			TypeID:   1,
+			TypeName: "viewtest.OrderModPost",
+			Op:       sds.OpCreate,
+			Key:      k,
+			Row:      msg,
+		},
+	})
+
+	// Caller illegally mutates msg after passing it to ApplyChanges
+	msg.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Mutated After Apply"))
+
+	didPanic := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				didPanic = true
+			}
+		}()
+		_, _, _ = v.Get(ctx, "viewtest.OrderModPost", k)
+	}()
+
+	if !didPanic {
+		t.Fatalf("expected Get to panic when recorded row was mutated in place")
+	}
+}
+
+func TestMutationCheck_DetectedOnClose(t *testing.T) {
+	orderMD := dynamicDescriptor(t, "OrderModClose", []*descriptorpb.FieldDescriptorProto{
+		protoField("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_REQUIRED),
+		protoField("item", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+
+	store := memtable.New(memtable.WithStreamID("test-mod-close"))
+	defer store.Close()
+
+	reg := record.NewRegistry()
+	_, _ = reg.RegisterDescriptor(orderMD, 1)
+	_ = store.SyncRegistry(context.Background(), reg)
+
+	v := view.New(store,
+		view.WithRegistry(reg),
+		view.WithMutationCheck(),
+	)
+
+	msg := dynamicpb.NewMessage(orderMD)
+	msg.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(88))
+	msg.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Before Close"))
+	k, _ := sds.ExtractKey(msg, []int32{1})
+
+	v.ApplyChanges([]sds.Change{
+		{
+			Seq:      1,
+			TypeID:   1,
+			TypeName: "viewtest.OrderModClose",
+			Op:       sds.OpCreate,
+			Key:      k,
+			Row:      msg,
+		},
+	})
+
+	// Mutate before Close
+	msg.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Mutated!"))
+
+	didPanic := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				didPanic = true
+			}
+		}()
+		_ = v.Close()
+	}()
+
+	if !didPanic {
+		t.Fatalf("expected Close to panic when row was mutated in place")
+	}
+}
+
+func TestMutationCheck_DetectedOnEviction(t *testing.T) {
+	ctx := t.Context()
+	orderMD := dynamicDescriptor(t, "OrderModEvict", []*descriptorpb.FieldDescriptorProto{
+		protoField("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_REQUIRED),
+		protoField("item", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+
+	store := memtable.New(memtable.WithStreamID("test-mod-evict"))
+	defer store.Close()
+
+	reg := record.NewRegistry()
+	_, _ = reg.RegisterDescriptor(orderMD, 1)
+	_ = store.SyncRegistry(ctx, reg)
+
+	// Capacity 1 cache
+	v := view.New(store,
+		view.WithRegistry(reg),
+		view.WithCacheLimits(1, 1024*1024),
+		view.WithMutationCheck(),
+	)
+
+	msg1 := dynamicpb.NewMessage(orderMD)
+	msg1.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
+	msg1.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Item 1"))
+	k1, _ := sds.ExtractKey(msg1, []int32{1})
+
+	// Apply and flush so msg1 is in cache
+	_ = v.ApplyChangesSync(ctx, []sds.Change{
+		{
+			Seq:      1,
+			TypeID:   1,
+			TypeName: "viewtest.OrderModEvict",
+			Op:       sds.OpCreate,
+			Key:      k1,
+			Row:      msg1,
+		},
+	})
+
+	// Mutate msg1 in place
+	msg1.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Mutated in Cache!"))
+
+	// Insert msg2 to evict msg1 from cache (capacity 1)
+	msg2 := dynamicpb.NewMessage(orderMD)
+	msg2.Set(orderMD.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
+	msg2.Set(orderMD.Fields().ByName("item"), protoreflect.ValueOfString("Item 2"))
+	k2, _ := sds.ExtractKey(msg2, []int32{1})
+
+	didPanic := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				didPanic = true
+			}
+		}()
+		_ = v.ApplyChangesSync(ctx, []sds.Change{
+			{
+				Seq:      2,
+				TypeID:   1,
+				TypeName: "viewtest.OrderModEvict",
+				Op:       sds.OpCreate,
+				Key:      k2,
+				Row:      msg2,
+			},
+		})
+	}()
+
+	if !didPanic {
+		t.Fatalf("expected cache eviction to panic when cached row was mutated in place")
 	}
 }

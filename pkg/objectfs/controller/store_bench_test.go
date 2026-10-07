@@ -57,6 +57,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
+					WithoutVolumeMutationCheck(),
 				)
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()
@@ -79,6 +80,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
+					WithoutVolumeMutationCheck(),
 				)
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()
@@ -105,6 +107,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
+					WithoutVolumeMutationCheck(),
 				)
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()
@@ -133,6 +136,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
+					WithoutVolumeMutationCheck(),
 				)
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()
@@ -159,6 +163,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
+					WithoutVolumeMutationCheck(),
 				)
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()
@@ -187,6 +192,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
+					WithoutVolumeMutationCheck(),
 				)
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()
@@ -208,6 +214,66 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				}
 			})
 
+			b.Run("ReadDir1k", func(b *testing.B) {
+				ctx := b.Context()
+				backend := inmemorystorage.New()
+				broadcaster := NewEventBroadcaster()
+				vol := NewVolume("bench-readdir1k-"+cfg.name, backend, broadcaster,
+					WithMetadataIndex(cfg.store),
+					WithMetadataCacheDisabled(cfg.cacheDisable),
+					WithLocalStorageDir(b.TempDir()),
+					WithoutVolumeMutationCheck(),
+				)
+				_ = vol.LoadFromBackend(ctx)
+				defer vol.Close()
+
+				dirAttr, err := vol.Mkdir(ctx, 1, "dir1k", 0755, 0, 0)
+				if err != nil {
+					b.Fatalf("Mkdir failed: %v", err)
+				}
+				for j := 0; j < 1000; j++ {
+					_, _ = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), fmt.Sprintf("f%d.txt", j), 0644, []byte("x"), 0, 0)
+				}
+
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					entries, err := vol.ReadDir(ctx, dirAttr.GetInode().GetIno())
+					if err != nil || len(entries) != 1000 {
+						b.Fatalf("ReadDir failed: %v (entries=%d)", err, len(entries))
+					}
+				}
+			})
+
+			b.Run("ReadDir10k", func(b *testing.B) {
+				ctx := b.Context()
+				backend := inmemorystorage.New()
+				broadcaster := NewEventBroadcaster()
+				vol := NewVolume("bench-readdir10k-"+cfg.name, backend, broadcaster,
+					WithMetadataIndex(cfg.store),
+					WithMetadataCacheDisabled(cfg.cacheDisable),
+					WithLocalStorageDir(b.TempDir()),
+					WithoutVolumeMutationCheck(),
+				)
+				_ = vol.LoadFromBackend(ctx)
+				defer vol.Close()
+
+				dirAttr, err := vol.Mkdir(ctx, 1, "dir10k", 0755, 0, 0)
+				if err != nil {
+					b.Fatalf("Mkdir failed: %v", err)
+				}
+				for j := 0; j < 10000; j++ {
+					_, _ = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), fmt.Sprintf("f%d.txt", j), 0644, []byte("x"), 0, 0)
+				}
+
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					entries, err := vol.ReadDir(ctx, dirAttr.GetInode().GetIno())
+					if err != nil || len(entries) != 10000 {
+						b.Fatalf("ReadDir failed: %v (entries=%d)", err, len(entries))
+					}
+				}
+			})
+
 			b.Run("Rename", func(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
@@ -216,6 +282,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
+					WithoutVolumeMutationCheck(),
 				)
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()

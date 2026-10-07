@@ -14,6 +14,14 @@
 
 // Package view provides a generic in-memory caching and write-behind applier layer
 // wrapping any sds.LocalIndex.
+//
+// Contract:
+//   - Messages returned by Get and Scan are shared and must not be modified by callers.
+//     Callers that need to change a message must clone it first (e.g., via CachedInode.mutate in objectfs).
+//   - Messages passed to the view in changes (sds.Change.Row) must not be modified after they are recorded.
+//     The overlay, the read cache, the applier, and LocalIndex implementations may keep and share them.
+//   - LocalIndex implementations may return either freshly decoded messages (e.g., SQLite) or stored pointers (e.g., memtable).
+//   - The before and after messages passed to StatsUpdateFunc are shared and read-only.
 package view
 
 import (
@@ -24,6 +32,7 @@ import (
 	"iter"
 	"sort"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -40,6 +49,7 @@ type OverlayEntry struct {
 }
 
 // StatsUpdateFunc computes updated stats from a transition between before and after.
+// The before and after messages are shared and read-only; stats is modified in place.
 type StatsUpdateFunc func(stats, before, after proto.Message) error
 
 // RebuildFunc is called when the index has suffered a persistent or unrecoverable failure.
@@ -49,6 +59,24 @@ type RebuildFunc func(ctx context.Context) (sds.LocalIndex, uint64, error)
 
 // Option configures a View.
 type Option func(*View)
+
+// WithMutationCheck enables debug assertion checking that proto rows are never mutated in place.
+func WithMutationCheck() Option {
+	return func(v *View) {
+		v.mutationCheck = true
+		if v.checker == nil {
+			v.checker = newMutationChecker()
+		}
+	}
+}
+
+// WithoutMutationCheck explicitly disables debug mutation checking (e.g., for benchmarks).
+func WithoutMutationCheck() Option {
+	return func(v *View) {
+		v.mutationCheck = false
+		v.checker = nil
+	}
+}
 
 // WithStats configures typed statistics tracking for the View.
 func WithStats(initial proto.Message, update StatsUpdateFunc) Option {
@@ -156,6 +184,9 @@ type View struct {
 	backpressureCond *sync.Cond
 	flushCond        *sync.Cond
 	closed           bool
+
+	mutationCheck bool
+	checker       *mutationChecker
 }
 
 // New creates and starts a new View wrapping index.
@@ -168,19 +199,33 @@ func New(index sds.LocalIndex, opts ...Option) *View {
 		cacheCapacity:   10000,
 		cacheMaxBytes:   64 * 1024 * 1024,
 		maxOverlayBytes: 64 * 1024 * 1024,
+		mutationCheck:   testing.Testing(),
 	}
 	for _, opt := range opts {
 		opt(v)
 	}
 
+	if v.mutationCheck && v.checker == nil {
+		v.checker = newMutationChecker()
+	}
+
 	v.backpressureCond = sync.NewCond(&v.mu)
 	v.flushCond = sync.NewCond(&v.mu)
+
+	var onEvict func(key CacheKey, value *CachedRow)
+	if v.mutationCheck {
+		onEvict = func(key CacheKey, value *CachedRow) {
+			if value != nil && value.Msg != nil {
+				v.checkMessage(value.Msg)
+			}
+		}
+	}
 
 	v.cache = NewLRUCacheWithLimits[CacheKey, *CachedRow](
 		v.cacheCapacity,
 		v.cacheMaxBytes,
 		CacheSizeFn,
-		nil,
+		onEvict,
 	)
 
 	if index != nil {
@@ -260,6 +305,9 @@ func (v *View) trimQueueAndOverlayLocked(newPos uint64) {
 
 	for ck, entry := range v.overlay {
 		if entry.Seq <= newPos {
+			if entry.Row != nil {
+				v.checkMessage(entry.Row)
+			}
 			delete(v.overlay, ck)
 			v.unappliedBytes -= entry.Size
 			if v.unappliedBytes < 0 {
@@ -362,9 +410,11 @@ func (v *View) loadStatsLocked(ctx context.Context) error {
 				return fmt.Errorf("failed to scan %s for stats recomputation: %w", typeName, scanErr)
 			}
 			hasRows = true
+			v.recordMessage(row, typeName, nil)
 			if err := v.statsUpdate(newStats, nil, row); err != nil {
 				return fmt.Errorf("stats update failed on scan of %s: %w", typeName, err)
 			}
+			v.checkMessage(row)
 		}
 	}
 
@@ -471,8 +521,22 @@ func (v *View) computeBatchStats(ctx context.Context, changes []sds.Change, base
 
 		latestInBatch[ck] = after
 
+		if before != nil {
+			v.checkMessage(before)
+		}
+		if after != nil {
+			v.checkMessage(after)
+		}
+
 		if err := v.statsUpdate(newStats, before, after); err != nil {
 			return nil, nil, fmt.Errorf("stats update failed for %s: %w", typeName, err)
+		}
+
+		if before != nil {
+			v.checkMessage(before)
+		}
+		if after != nil {
+			v.checkMessage(after)
 		}
 	}
 
@@ -589,8 +653,15 @@ func (v *View) ApplyChanges(changes []sds.Change) {
 
 		ck := CacheKey{Table: typeName, Key: ch.Key}
 
+		if ch.Row != nil {
+			v.recordMessage(ch.Row, typeName, ch.Key)
+		}
+
 		sz := int64(len(ch.RawKey) + len(ch.RawVal) + 64)
 		if old, ok := v.overlay[ck]; ok {
+			if old.Row != nil {
+				v.checkMessage(old.Row)
+			}
 			v.unappliedBytes -= old.Size
 		}
 		v.unappliedBytes += sz
@@ -644,6 +715,8 @@ func (v *View) ApplyChangesSync(ctx context.Context, changes []sds.Change) error
 	}
 
 	v.mu.Lock()
+	defer v.mu.Unlock()
+
 	if v.statsUpdate != nil {
 		v.statsRow = newStats
 	}
@@ -659,6 +732,10 @@ func (v *View) ApplyChangesSync(ctx context.Context, changes []sds.Change) error
 			key = sds.NewKeyFromBytes(ch.RawKey)
 		}
 		ck := CacheKey{Table: typeName, Key: key}
+
+		if ch.Row != nil {
+			v.recordMessage(ch.Row, typeName, key)
+		}
 
 		if v.cache != nil && !v.cacheDisabled {
 			switch ch.Op {
@@ -677,12 +754,12 @@ func (v *View) ApplyChangesSync(ctx context.Context, changes []sds.Change) error
 	if maxSeq > v.appliedPos {
 		v.appliedPos = maxSeq
 	}
-	v.mu.Unlock()
 	return nil
 }
 
 // Get retrieves a merged proto row by table type name and primary key.
 // It checks overlay first, then read cache, and falls back to index.
+// The returned message is shared and must not be modified in place.
 func (v *View) Get(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
 	ck := CacheKey{Table: typeName, Key: key}
 
@@ -693,7 +770,8 @@ func (v *View) Get(ctx context.Context, typeName string, key sds.Key) (proto.Mes
 		if entry.Op == sds.OpDelete || entry.Row == nil {
 			return nil, false, nil
 		}
-		return proto.Clone(entry.Row), true, nil
+		v.checkMessage(entry.Row)
+		return entry.Row, true, nil
 	}
 	v.mu.RUnlock()
 
@@ -703,7 +781,8 @@ func (v *View) Get(ctx context.Context, typeName string, key sds.Key) (proto.Mes
 			if !row.Exists || row.Msg == nil {
 				return nil, false, nil
 			}
-			return proto.Clone(row.Msg), true, nil
+			v.checkMessage(row.Msg)
+			return row.Msg, true, nil
 		}
 	}
 
@@ -721,6 +800,10 @@ func (v *View) Get(ctx context.Context, typeName string, key sds.Key) (proto.Mes
 		return nil, false, err
 	}
 
+	if ok && msg != nil {
+		v.recordMessage(msg, typeName, key)
+	}
+
 	if v.cache != nil && !v.cacheDisabled {
 		if !ok || msg == nil {
 			v.cache.Put(ck, &CachedRow{Exists: false})
@@ -734,6 +817,7 @@ func (v *View) Get(ctx context.Context, typeName string, key sds.Key) (proto.Mes
 
 // Scan yields merged proto rows matching keyPrefix in canonical key-byte order.
 // It overlays unapplied in-memory mutations onto the underlying index scan.
+// Yielded messages are shared and must not be modified in place.
 func (v *View) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter.Seq2[proto.Message, error] {
 	return func(yield func(proto.Message, error) bool) {
 		type rowEntry struct {
@@ -769,6 +853,7 @@ func (v *View) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter
 					}
 				}
 				if !k.IsZero() {
+					v.recordMessage(idxMsg, typeName, k)
 					merged[k.String()] = rowEntry{key: k, msg: idxMsg}
 				}
 			}
@@ -800,7 +885,8 @@ func (v *View) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter
 		})
 
 		for _, re := range rows {
-			if !yield(proto.Clone(re.msg), nil) {
+			v.checkMessage(re.msg)
+			if !yield(re.msg, nil) {
 				return
 			}
 		}
@@ -1016,8 +1102,32 @@ func (v *View) Close() error {
 		v.cache.Clear()
 	}
 
+	if v.checker != nil {
+		v.checker.CheckAll()
+	}
+
 	if idx != nil {
 		return idx.Close()
 	}
 	return nil
+}
+
+func (v *View) recordMessage(msg proto.Message, typeName string, key any) {
+	if v.checker != nil && msg != nil {
+		v.checker.Record(msg, typeName, key)
+	}
+}
+
+func (v *View) checkMessage(msg proto.Message) {
+	if v.checker != nil && msg != nil {
+		v.checker.Check(msg)
+	}
+}
+
+// CheckMutations verifies that no tracked messages have been mutated in place.
+// Panics if any in-place mutation is detected.
+func (v *View) CheckMutations() {
+	if v.checker != nil {
+		v.checker.CheckAll()
+	}
 }
