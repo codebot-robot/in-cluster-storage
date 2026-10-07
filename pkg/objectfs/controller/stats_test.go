@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
@@ -65,11 +66,14 @@ func TestVolume_StatsTracking(t *testing.T) {
 	if err != nil || w1Resp.GetError() != 0 {
 		t.Fatalf("WriteFile file1 failed: err=%v, resp=%v", err, w1Resp)
 	}
-	_, _ = server.Release(ctx, &pb.ReleaseRequest{
+	rel1Resp, err := server.Release(ctx, &pb.ReleaseRequest{
 		VolumeId: volumeID,
 		Inode:    f1Resp.GetAttr().GetInode().GetIno(),
 		Fh:       f1Resp.GetFh(),
 	})
+	if err != nil || rel1Resp.GetError() != 0 {
+		t.Fatalf("Release file1 failed: err=%v, resp=%v", err, rel1Resp)
+	}
 
 	// Create file2 (350 bytes)
 	f2Resp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
@@ -90,11 +94,14 @@ func TestVolume_StatsTracking(t *testing.T) {
 	if err != nil || w2Resp.GetError() != 0 {
 		t.Fatalf("WriteFile file2 failed: err=%v, resp=%v", err, w2Resp)
 	}
-	_, _ = server.Release(ctx, &pb.ReleaseRequest{
+	rel2Resp, err := server.Release(ctx, &pb.ReleaseRequest{
 		VolumeId: volumeID,
 		Inode:    f2Resp.GetAttr().GetInode().GetIno(),
 		Fh:       f2Resp.GetFh(),
 	})
+	if err != nil || rel2Resp.GetError() != 0 {
+		t.Fatalf("Release file2 failed: err=%v, resp=%v", err, rel2Resp)
+	}
 
 	// Create directory
 	d1Resp, err := server.Mkdir(ctx, &pb.MkdirRequest{
@@ -120,6 +127,9 @@ func TestVolume_StatsTracking(t *testing.T) {
 
 	if err := vol.FlushToBackend(ctx); err != nil {
 		t.Fatalf("FlushToBackend failed: %v", err)
+	}
+	if err := vol.View().Flush(ctx); err != nil {
+		t.Fatalf("View.Flush failed: %v", err)
 	}
 
 	st = vol.Stats()
@@ -161,6 +171,9 @@ func TestVolume_StatsTracking(t *testing.T) {
 	if err := vol.FlushToBackend(ctx); err != nil {
 		t.Fatalf("FlushToBackend after delete failed: %v", err)
 	}
+	if err := vol.View().Flush(ctx); err != nil {
+		t.Fatalf("View.Flush after delete failed: %v", err)
+	}
 
 	st = vol.Stats()
 	if st.Stats.GetInodesFile() != 1 || st.Stats.GetLogicalBytes() != 350 {
@@ -195,11 +208,14 @@ func TestVolume_InodeAllocatorNoReuseAcrossRestart(t *testing.T) {
 				t.Fatalf("CreateFile %d failed: err=%v, resp=%v", i, err, resp)
 			}
 			createdInodes = append(createdInodes, resp.GetAttr().GetInode().GetIno())
-			_, _ = server1.Release(ctx, &pb.ReleaseRequest{
+			relResp, err := server1.Release(ctx, &pb.ReleaseRequest{
 				VolumeId: volumeID,
 				Inode:    resp.GetAttr().GetInode().GetIno(),
 				Fh:       resp.GetFh(),
 			})
+			if err != nil || relResp.GetError() != 0 {
+				t.Fatalf("Release %d failed: err=%v, resp=%v", i, err, relResp)
+			}
 		}
 		if err := vol1.FlushToBackend(ctx); err != nil {
 			t.Fatalf("FlushToBackend failed: %v", err)
@@ -268,11 +284,14 @@ func TestVolume_InodeAllocatorRecomputeWhenStatsDeleted(t *testing.T) {
 				t.Fatalf("CreateFile %d failed: err=%v, resp=%v", i, err, resp)
 			}
 			createdInodes = append(createdInodes, resp.GetAttr().GetInode().GetIno())
-			_, _ = server1.Release(ctx, &pb.ReleaseRequest{
+			relResp, err := server1.Release(ctx, &pb.ReleaseRequest{
 				VolumeId: volumeID,
 				Inode:    resp.GetAttr().GetInode().GetIno(),
 				Fh:       resp.GetFh(),
 			})
+			if err != nil || relResp.GetError() != 0 {
+				t.Fatalf("Release %d failed: err=%v, resp=%v", i, err, relResp)
+			}
 		}
 		if err := vol1.FlushToBackend(ctx); err != nil {
 			t.Fatalf("FlushToBackend failed: %v", err)
@@ -291,8 +310,12 @@ func TestVolume_InodeAllocatorRecomputeWhenStatsDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sql.Open failed: %v", err)
 	}
-	_, _ = db.Exec("DELETE FROM objectfs_v1alpha1_VolumeStats;")
-	_ = db.Close()
+	if _, err := db.Exec("DELETE FROM objectfs_v1alpha1_VolumeStats;"); err != nil {
+		t.Fatalf("db.Exec DELETE failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close failed: %v", err)
+	}
 
 	// Session 2: reopen volume with same local directory
 	{
@@ -304,7 +327,11 @@ func TestVolume_InodeAllocatorRecomputeWhenStatsDeleted(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getOrCreateVolume run 2 failed: %v", err)
 		}
-		defer server2.Close()
+		defer func() {
+			if err := server2.Close(); err != nil {
+				t.Errorf("server2.Close failed: %v", err)
+			}
+		}()
 
 		st := vol2.Stats()
 		if st.Stats.GetMaxIno() != 40 {
@@ -328,8 +355,20 @@ func TestVolume_InodeAllocatorRecomputeWhenStatsDeleted(t *testing.T) {
 			}
 		}
 
-		_ = vol2.FlushToBackend(ctx)
-		st = vol2.Stats()
+		if err := vol2.FlushToBackend(ctx); err != nil {
+			t.Fatalf("FlushToBackend run 2 failed: %v", err)
+		}
+		if err := vol2.View().Flush(ctx); err != nil {
+			t.Fatalf("View.Flush run 2 failed: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			st = vol2.Stats()
+			if st.Stats.GetMaxIno() == newIno || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 		if st.Stats.GetMaxIno() != newIno {
 			t.Errorf("MaxIno after flush: got %d, want %d", st.Stats.GetMaxIno(), newIno)
 		}
@@ -357,8 +396,7 @@ func TestVolume_CrashWithUnappliedBacklogAndRecovery(t *testing.T) {
 			t.Fatalf("getOrCreateVolume failed: %v", err)
 		}
 
-		_, err = vol1.CreateSnapshot(ctx)
-		if err != nil {
+		if _, err := vol1.CreateSnapshot(ctx); err != nil {
 			t.Fatalf("CreateSnapshot failed: %v", err)
 		}
 
@@ -373,13 +411,18 @@ func TestVolume_CrashWithUnappliedBacklogAndRecovery(t *testing.T) {
 				t.Fatalf("CreateFile %d failed: err=%v, resp=%v", i, err, resp)
 			}
 			unappliedInodes = append(unappliedInodes, resp.GetAttr().GetInode().GetIno())
-			_, _ = server1.Release(ctx, &pb.ReleaseRequest{
+			relResp, err := server1.Release(ctx, &pb.ReleaseRequest{
 				VolumeId: volumeID,
 				Inode:    resp.GetAttr().GetInode().GetIno(),
 				Fh:       resp.GetFh(),
 			})
+			if err != nil || relResp.GetError() != 0 {
+				t.Fatalf("Release %d failed: err=%v, resp=%v", i, err, relResp)
+			}
 		}
-		_ = server1.Close()
+		if err := server1.Close(); err != nil {
+			t.Fatalf("server1.Close failed: %v", err)
+		}
 	}
 
 	// Session 2: Recover from backend + WAL stream
@@ -392,6 +435,11 @@ func TestVolume_CrashWithUnappliedBacklogAndRecovery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getOrCreateVolume failed: %v", err)
 		}
+		defer func() {
+			if err := server2.Close(); err != nil {
+				t.Errorf("server2.Close failed: %v", err)
+			}
+		}()
 
 		for i := 0; i < 5; i++ {
 			resp, err := server2.CreateFile(ctx, &pb.CreateFileRequest{

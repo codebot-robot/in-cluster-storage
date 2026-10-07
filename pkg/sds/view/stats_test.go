@@ -157,12 +157,18 @@ func TestView_StatsAggregation(t *testing.T) {
 			msg1 := dynamicpb.NewMessage(itemMD)
 			msg1.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(10))
 			msg1.Set(itemMD.Fields().ByName("price"), protoreflect.ValueOfInt64(100))
-			k1, val1, _ := sds.SplitKeyAndNonKey(msg1, []int32{1})
+			k1, val1, err := sds.SplitKeyAndNonKey(msg1, []int32{1})
+			if err != nil {
+				t.Fatalf("SplitKeyAndNonKey msg1 failed: %v", err)
+			}
 
 			msg2 := dynamicpb.NewMessage(itemMD)
 			msg2.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(20))
 			msg2.Set(itemMD.Fields().ByName("price"), protoreflect.ValueOfInt64(250))
-			k2, val2, _ := sds.SplitKeyAndNonKey(msg2, []int32{1})
+			k2, val2, err := sds.SplitKeyAndNonKey(msg2, []int32{1})
+			if err != nil {
+				t.Fatalf("SplitKeyAndNonKey msg2 failed: %v", err)
+			}
 
 			v.ApplyChanges([]sds.Change{
 				{
@@ -206,7 +212,10 @@ func TestView_StatsAggregation(t *testing.T) {
 			msg1Updated := dynamicpb.NewMessage(itemMD)
 			msg1Updated.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(10))
 			msg1Updated.Set(itemMD.Fields().ByName("price"), protoreflect.ValueOfInt64(300))
-			k1u, val1u, _ := sds.SplitKeyAndNonKey(msg1Updated, []int32{1})
+			k1u, val1u, err := sds.SplitKeyAndNonKey(msg1Updated, []int32{1})
+			if err != nil {
+				t.Fatalf("SplitKeyAndNonKey msg1Updated failed: %v", err)
+			}
 
 			v.ApplyChanges([]sds.Change{
 				{
@@ -253,7 +262,10 @@ func TestView_StatsAggregation(t *testing.T) {
 			}
 
 			// Delete stats row and test full-scan recomputation
-			statsKeyBytes, _, _ := sds.SplitKeyAndNonKey(initialStats, []int32{1})
+			statsKeyBytes, _, err := sds.SplitKeyAndNonKey(initialStats, []int32{1})
+			if err != nil {
+				t.Fatalf("SplitKeyAndNonKey stats failed: %v", err)
+			}
 			statsDelChange := sds.Change{
 				Seq:      index.Position(),
 				TypeName: "viewtest.ItemStats",
@@ -285,15 +297,26 @@ func TestView_StatsAggregation(t *testing.T) {
 func TestView_InterleavedSyncAndAsyncApplies(t *testing.T) {
 	ctx := t.Context()
 	store := memtable.New(memtable.WithStreamID("test-interleaved"))
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close failed: %v", err)
+		}
+	}()
 
 	reg := record.NewRegistry()
 	statsMD := statsDescriptor(t)
 	itemMD := itemDescriptor(t)
 
-	_, _ = reg.RegisterDescriptor(statsMD, 1)
-	itemDef, _ := reg.RegisterDescriptor(itemMD, 1)
-	_ = store.SyncRegistry(ctx, reg)
+	if _, err := reg.RegisterDescriptor(statsMD, 1); err != nil {
+		t.Fatalf("RegisterDescriptor stats failed: %v", err)
+	}
+	itemDef, err := reg.RegisterDescriptor(itemMD, 1)
+	if err != nil {
+		t.Fatalf("RegisterDescriptor item failed: %v", err)
+	}
+	if err := store.SyncRegistry(ctx, reg); err != nil {
+		t.Fatalf("SyncRegistry failed: %v", err)
+	}
 
 	initialStats := dynamicpb.NewMessage(statsMD)
 	initialStats.Set(statsMD.Fields().ByName("name"), protoreflect.ValueOfString("stats"))
@@ -303,7 +326,11 @@ func TestView_InterleavedSyncAndAsyncApplies(t *testing.T) {
 		view.WithStats(initialStats, updateTestStats),
 		view.WithBatchSize(5),
 	)
-	defer v.Close()
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Errorf("v.Close failed: %v", err)
+		}
+	}()
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -311,7 +338,10 @@ func TestView_InterleavedSyncAndAsyncApplies(t *testing.T) {
 		msg := dynamicpb.NewMessage(itemMD)
 		msg.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(id))
 		msg.Set(itemMD.Fields().ByName("price"), protoreflect.ValueOfInt64(10))
-		k, val, _ := sds.SplitKeyAndNonKey(msg, []int32{1})
+		k, val, err := sds.SplitKeyAndNonKey(msg, []int32{1})
+		if err != nil {
+			t.Fatalf("SplitKeyAndNonKey failed: %v", err)
+		}
 
 		ch := sds.Change{
 			Seq:      uint64(i + 1),
@@ -330,13 +360,17 @@ func TestView_InterleavedSyncAndAsyncApplies(t *testing.T) {
 			wg.Add(1)
 			go func(c sds.Change) {
 				defer wg.Done()
-				_ = v.ApplyChangesSync(ctx, []sds.Change{c})
+				if err := v.ApplyChangesSync(ctx, []sds.Change{c}); err != nil {
+					t.Errorf("ApplyChangesSync failed: %v", err)
+				}
 			}(ch)
 		}
 	}
 
 	wg.Wait()
-	_ = v.Flush(ctx)
+	if err := v.Flush(ctx); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
 
 	st := v.Stats().ProtoReflect()
 	if st.Get(statsMD.Fields().ByName("item_count")).Int() != 20 {
@@ -397,15 +431,26 @@ func TestView_FailedStatsReadFailsLoad(t *testing.T) {
 func TestView_FailedIndexGetInBatchRetries(t *testing.T) {
 	ctx := t.Context()
 	store := memtable.New(memtable.WithStreamID("test-fail-batch-get"))
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close failed: %v", err)
+		}
+	}()
 
 	reg := record.NewRegistry()
 	statsMD := statsDescriptor(t)
 	itemMD := itemDescriptor(t)
 
-	_, _ = reg.RegisterDescriptor(statsMD, 1)
-	itemDef, _ := reg.RegisterDescriptor(itemMD, 1)
-	_ = store.SyncRegistry(ctx, reg)
+	if _, err := reg.RegisterDescriptor(statsMD, 1); err != nil {
+		t.Fatalf("RegisterDescriptor stats failed: %v", err)
+	}
+	itemDef, err := reg.RegisterDescriptor(itemMD, 1)
+	if err != nil {
+		t.Fatalf("RegisterDescriptor item failed: %v", err)
+	}
+	if err := store.SyncRegistry(ctx, reg); err != nil {
+		t.Fatalf("SyncRegistry failed: %v", err)
+	}
 
 	initialStats := dynamicpb.NewMessage(statsMD)
 	initialStats.Set(statsMD.Fields().ByName("name"), protoreflect.ValueOfString("stats"))
@@ -417,12 +462,19 @@ func TestView_FailedIndexGetInBatchRetries(t *testing.T) {
 		view.WithStats(initialStats, updateTestStats),
 		view.WithBatchSize(10),
 	)
-	defer v.Close()
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Errorf("v.Close failed: %v", err)
+		}
+	}()
 
 	msg1 := dynamicpb.NewMessage(itemMD)
 	msg1.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	msg1.Set(itemMD.Fields().ByName("price"), protoreflect.ValueOfInt64(50))
-	k1, val1, _ := sds.SplitKeyAndNonKey(msg1, []int32{1})
+	k1, val1, err := sds.SplitKeyAndNonKey(msg1, []int32{1})
+	if err != nil {
+		t.Fatalf("SplitKeyAndNonKey msg1 failed: %v", err)
+	}
 
 	v.ApplyChanges([]sds.Change{
 		{
@@ -436,7 +488,9 @@ func TestView_FailedIndexGetInBatchRetries(t *testing.T) {
 			Row:      msg1,
 		},
 	})
-	_ = v.Flush(ctx)
+	if err := v.Flush(ctx); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
 
 	faulty.mu.Lock()
 	faulty.failGetForType = "viewtest.Item"
@@ -447,7 +501,10 @@ func TestView_FailedIndexGetInBatchRetries(t *testing.T) {
 	msg1Updated := dynamicpb.NewMessage(itemMD)
 	msg1Updated.Set(itemMD.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	msg1Updated.Set(itemMD.Fields().ByName("price"), protoreflect.ValueOfInt64(100))
-	k1u, val1u, _ := sds.SplitKeyAndNonKey(msg1Updated, []int32{1})
+	k1u, val1u, err := sds.SplitKeyAndNonKey(msg1Updated, []int32{1})
+	if err != nil {
+		t.Fatalf("SplitKeyAndNonKey msg1Updated failed: %v", err)
+	}
 
 	v.ApplyChanges([]sds.Change{
 		{
