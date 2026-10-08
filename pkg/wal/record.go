@@ -181,29 +181,33 @@ func (r *LogRecord) ComputeCRC32C() uint32 {
 // Encode serializes the LogRecord to on-disk binary format:
 // [4B magic "WALL"][8B position][16B stream_id][8B stream_seq][4B length][4B crc32c][payload]
 func (r *LogRecord) Encode() []byte {
-	r.CRC32C = r.ComputeCRC32C()
+	crc := r.CRC32C
+	if crc == 0 {
+		crc = r.ComputeCRC32C()
+	}
 	buf := make([]byte, LogHeaderSize+len(r.Payload))
 	copy(buf[0:4], LogMagicBytes[:])
 	binary.BigEndian.PutUint64(buf[4:12], r.Position)
 	copy(buf[12:28], r.StreamID[:])
 	binary.BigEndian.PutUint64(buf[28:36], r.StreamSeq)
 	binary.BigEndian.PutUint32(buf[36:40], uint32(len(r.Payload)))
-	binary.BigEndian.PutUint32(buf[40:44], r.CRC32C)
+	binary.BigEndian.PutUint32(buf[40:44], crc)
 	copy(buf[LogHeaderSize:], r.Payload)
 	return buf
 }
 
 // ToProto converts LogRecord to pb.LogRecord.
 func (r *LogRecord) ToProto() *pb.LogRecord {
-	if r.CRC32C == 0 {
-		r.CRC32C = r.ComputeCRC32C()
+	crc := r.CRC32C
+	if crc == 0 {
+		crc = r.ComputeCRC32C()
 	}
 	return &pb.LogRecord{
 		Position:  r.Position,
 		StreamId:  r.StreamID[:],
 		StreamSeq: r.StreamSeq,
 		Payload:   r.Payload,
-		Crc32C:    r.CRC32C,
+		Crc32C:    crc,
 	}
 }
 

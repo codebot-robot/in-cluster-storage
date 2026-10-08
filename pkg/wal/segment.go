@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"k8s.io/klog/v2"
 )
 
@@ -631,4 +632,55 @@ func ParseSegmentPath(p string) (firstPos, lastPos uint64, err error) {
 		return 0, 0, fmt.Errorf("invalid last position in segment filename %s: %w", p, err)
 	}
 	return firstPos, lastPos, nil
+}
+
+// ParseStreamPath parses a per-stream file path or filename into (fromSeq, toSeq, isSealed, err).
+// Sealed format: streams/<stream-id>/from<from>-to<to>.wal
+// Open format: streams/<stream-id>/from<from>.wal
+func ParseStreamPath(p string) (fromSeq, toSeq uint64, isSealed bool, err error) {
+	base := filepath.Base(p)
+	if !strings.HasSuffix(base, ".wal") {
+		return 0, 0, false, fmt.Errorf("invalid stream file extension %s", p)
+	}
+	stem := strings.TrimSuffix(base, ".wal")
+	if idx := strings.Index(stem, "from"); idx != -1 {
+		stem = stem[idx:]
+	}
+	if !strings.HasPrefix(stem, "from") {
+		return 0, 0, false, fmt.Errorf("invalid stream file format %s", p)
+	}
+	stem = strings.TrimPrefix(stem, "from")
+	if strings.Contains(stem, "-to") {
+		parts := strings.Split(stem, "-to")
+		if len(parts) != 2 {
+			return 0, 0, false, fmt.Errorf("invalid sealed stream file format %s", p)
+		}
+		from, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil {
+			return 0, 0, false, fmt.Errorf("invalid from sequence in %s: %w", p, err)
+		}
+		to, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			return 0, 0, false, fmt.Errorf("invalid to sequence in %s: %w", p, err)
+		}
+		return from, to, true, nil
+	}
+	from, err := strconv.ParseUint(stem, 10, 64)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("invalid from sequence in %s: %w", p, err)
+	}
+	return from, 0, false, nil
+}
+
+// FormatStreamFileName formats a per-stream filename.
+func FormatStreamFileName(fromSeq, toSeq uint64, isSealed bool) string {
+	if isSealed {
+		return fmt.Sprintf("from%020d-to%020d.wal", fromSeq, toSeq)
+	}
+	return fmt.Sprintf("from%020d.wal", fromSeq)
+}
+
+// FormatStreamObjectKey formats the object storage key for a sealed per-stream file.
+func FormatStreamObjectKey(streamID uuid.UUID, fromSeq, toSeq uint64) string {
+	return fmt.Sprintf("streams/%s/from%020d-to%020d.wal", streamID.String(), fromSeq, toSeq)
 }
