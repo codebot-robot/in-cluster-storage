@@ -16,6 +16,8 @@ package memtable
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -383,4 +385,79 @@ func TestMemTableNoCloning(t *testing.T) {
 			t.Fatalf("MemStore.Scan returned different pointer: %p != %p", scanned, p1)
 		}
 	}
+}
+
+func TestMemStoreConcurrentApplyBatchAndScan(t *testing.T) {
+	ctx := t.Context()
+	md := buildDynamicMD(t, "Item", []*descriptorpb.FieldDescriptorProto{
+		field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("version", 2, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+
+	store := New(WithStreamID("test-concurrent-apply-scan"))
+	defer store.Close()
+
+	if _, err := store.Registry().RegisterMessage(dynamicpb.NewMessage(md), 1); err != nil {
+		t.Fatalf("RegisterMessage failed: %v", err)
+	}
+
+	numKeys := int64(20)
+	var done atomic.Bool
+	var wg sync.WaitGroup
+
+	// Reader goroutine: continuously scans and verifies that all items have the SAME version
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !done.Load() {
+			var versions []int64
+			for msg, err := range store.Scan(ctx, "testpkg.Item", nil) {
+				if err != nil {
+					t.Errorf("Scan error: %v", err)
+					return
+				}
+				dyn := msg.(*dynamicpb.Message)
+				v := dyn.Get(dyn.Descriptor().Fields().ByName("version")).Int()
+				versions = append(versions, v)
+			}
+			if len(versions) > 0 {
+				if int64(len(versions)) != numKeys {
+					t.Errorf("Expected %d keys, got %d", numKeys, len(versions))
+					return
+				}
+				firstV := versions[0]
+				for _, v := range versions {
+					if v != firstV {
+						t.Errorf("Saw mixed versions in batch: %v vs %v", v, firstV)
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	// Writer goroutine: updates all numKeys in a single atomic batch with incrementing version
+	for ver := int64(1); ver <= 50; ver++ {
+		var changes []sds.Change
+		for i := int64(0); i < numKeys; i++ {
+			msg := dynamicpb.NewMessage(md)
+			msg.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(i))
+			msg.Set(md.Fields().ByName("version"), protoreflect.ValueOfInt64(ver))
+			k, _ := sds.ExtractKey(msg, []int32{1})
+			changes = append(changes, sds.Change{
+				Seq:      uint64(ver),
+				TypeName: "testpkg.Item",
+				TypeID:   1,
+				Op:       sds.OpUpdate,
+				Key:      k,
+				Row:      msg,
+			})
+		}
+		if err := store.ApplyBatch(ctx, changes); err != nil {
+			t.Fatalf("ApplyBatch error: %v", err)
+		}
+	}
+
+	done.Store(true)
+	wg.Wait()
 }
