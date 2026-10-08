@@ -366,6 +366,11 @@ func (a *applier) loop() {
 		if a.v.flushCond != nil {
 			a.v.flushCond.Broadcast()
 		}
+		hook := a.v.batchAppliedHook
 		a.v.mu.Unlock()
+
+		if hook != nil {
+			hook(batchMaxSeq)
+		}
 	}
 }

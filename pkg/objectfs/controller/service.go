@@ -130,6 +130,7 @@ type Server struct {
 	metadataOverlayMaxBytes  int64
 	metadataApplierBatchSize int
 	localStorageDir          string
+	debugStatsCheck          bool
 	viewOpts                 []view.Option
 	streamFactory            func(volumeID string) (walclient.Stream, error)
 
@@ -145,6 +146,21 @@ type ServerOption func(*Server)
 func WithServerMutationCheck() ServerOption {
 	return func(s *Server) {
 		s.viewOpts = append(s.viewOpts, view.WithMutationCheck())
+		s.debugStatsCheck = true
+	}
+}
+
+// WithServerStatsCheck enables debug stats assertions across all volumes.
+func WithServerStatsCheck() ServerOption {
+	return func(s *Server) {
+		s.debugStatsCheck = true
+	}
+}
+
+// WithoutServerStatsCheck disables debug stats assertions.
+func WithoutServerStatsCheck() ServerOption {
+	return func(s *Server) {
+		s.debugStatsCheck = false
 	}
 }
 
@@ -288,6 +304,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if len(s.viewOpts) > 0 {
 			volOpts = append(volOpts, WithVolumeViewOptions(s.viewOpts...))
+		}
+		if s.debugStatsCheck {
+			volOpts = append(volOpts, WithVolumeStatsCheck())
 		}
 
 		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)

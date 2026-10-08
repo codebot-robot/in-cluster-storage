@@ -31,6 +31,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"testing"
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
@@ -84,6 +85,9 @@ type Volume struct {
 	metadataStream   *sds.Writer
 	lastCommitSeq    uint64
 	recoveredContent map[string][]byte
+	liveStats        *pb.VolumeStats
+	liveStatsStale   bool
+	debugStatsCheck  *bool
 
 	localStorageDir string
 	indexFactory    sds.IndexFactory
@@ -97,7 +101,8 @@ type Volume struct {
 	closed   bool
 	closedCh chan struct{}
 
-	snapshotMu sync.Mutex
+	snapshotMu   sync.Mutex
+	batchCheckWg sync.WaitGroup
 
 	dirParents map[uint64]uint64
 
@@ -218,6 +223,10 @@ func WithApplierFaultHook(hook func() error) VolumeOption {
 func WithVolumeMutationCheck() VolumeOption {
 	return func(v *Volume) {
 		v.viewOpts = append(v.viewOpts, view.WithMutationCheck())
+		if v.debugStatsCheck == nil {
+			t := true
+			v.debugStatsCheck = &t
+		}
 	}
 }
 
@@ -225,6 +234,22 @@ func WithVolumeMutationCheck() VolumeOption {
 func WithoutVolumeMutationCheck() VolumeOption {
 	return func(v *Volume) {
 		v.viewOpts = append(v.viewOpts, view.WithoutMutationCheck())
+	}
+}
+
+// WithVolumeStatsCheck enables debug stats assertions comparing live to durable stats.
+func WithVolumeStatsCheck() VolumeOption {
+	return func(v *Volume) {
+		t := true
+		v.debugStatsCheck = &t
+	}
+}
+
+// WithoutVolumeStatsCheck disables debug stats assertions.
+func WithoutVolumeStatsCheck() VolumeOption {
+	return func(v *Volume) {
+		f := false
+		v.debugStatsCheck = &f
 	}
 }
 
@@ -289,6 +314,7 @@ func (v *Volume) initMetadataViewLocked(ctx context.Context, customIndex sds.Loc
 	initialStats := &pb.VolumeStats{Name: VolumeStatsRowName}
 	viewOpts = append(viewOpts, view.WithStats(initialStats, UpdateVolumeStats))
 	viewOpts = append(viewOpts, view.WithRebuildFunc(v.rebuildIndex))
+	viewOpts = append(viewOpts, view.WithBatchAppliedHook(v.checkStatsOnBatchApplied))
 	if v.metadataStream != nil {
 		if _, err := v.metadataStream.Registry().RegisterMessage(initialStats, 1); err != nil {
 			return fmt.Errorf("failed to register VolumeStats message: %w", err)
@@ -306,6 +332,7 @@ func (v *Volume) initMetadataViewLocked(ctx context.Context, customIndex sds.Loc
 	if err := v.metadataView.LoadStats(ctx); err != nil {
 		return fmt.Errorf("failed to load metadata view stats: %w", err)
 	}
+	v.initLiveStatsLocked()
 
 	return nil
 }
@@ -383,6 +410,9 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	v.rootInodeID = 1
 	v.nextInode = erofs.DefaultInodeStride
 	v.dirParents[1] = 1
+
+	v.initLiveStatsLocked()
+	v.assertStatsMatchLocked("after NewVolume")
 
 	return v
 }
@@ -691,8 +721,15 @@ func (v *Volume) Close() error {
 		}
 	}
 
+	v.batchCheckWg.Wait()
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
+
+	if v.liveStatsStale {
+		v.reseedLiveStatsFromDurableLocked()
+	}
+	v.assertStatsMatchLocked("at Close")
 
 	if v.stream != nil {
 		if err := v.stream.Close(); err != nil && firstErr == nil {
@@ -801,13 +838,15 @@ func (v *Volume) Stats() VolumeStats {
 		return VolumeStats{}
 	}
 	var st *pb.VolumeStats
-	if m := v.metadataView.Stats(); m != nil {
+	if !v.liveStatsStale && v.liveStats != nil {
+		st = proto.Clone(v.liveStats).(*pb.VolumeStats)
+	} else if m := v.metadataView.Stats(); m != nil {
 		if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
 			st = proto.Clone(vs).(*pb.VolumeStats)
 		}
 	}
 	if st == nil {
-		st = &pb.VolumeStats{}
+		st = &pb.VolumeStats{Name: VolumeStatsRowName}
 	}
 	return VolumeStats{
 		Lag:            v.metadataView.Lag(v.lastCommitSeq),
@@ -909,14 +948,33 @@ func (v *Volume) FlushOverlay(ctx context.Context) error {
 	if mView == nil {
 		return nil
 	}
-	return mView.FlushTo(ctx, targetSeq)
+	if err := mView.FlushTo(ctx, targetSeq); err != nil {
+		return err
+	}
+	v.batchCheckWg.Wait()
+	func() {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		if v.liveStatsStale {
+			v.reseedLiveStatsFromDurableLocked()
+		}
+		v.assertStatsMatchLocked("after FlushOverlay")
+	}()
+	return nil
 }
 
 func (v *Volume) flushOverlayLocked(ctx context.Context) error {
 	if v.metadataView == nil {
 		return nil
 	}
-	return v.metadataView.FlushTo(ctx, v.lastCommitSeq)
+	if err := v.metadataView.FlushTo(ctx, v.lastCommitSeq); err != nil {
+		return err
+	}
+	if v.liveStatsStale {
+		v.reseedLiveStatsFromDurableLocked()
+	}
+	v.assertStatsMatchLocked("after flushOverlayLocked")
+	return nil
 }
 
 func (v *Volume) checkBackpressureLocked(ctx context.Context) error {
@@ -1334,9 +1392,44 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 	return entries, nil
 }
 
+// applyTxChangesLocked updates live volume stats and records overlay changes for a committed transaction.
+//
+// The write-path consistency contract:
+//  1. Every operation runs under v.mu, so the view it reads is the stream head: the lock is the snapshot.
+//     Because all mutations acquire v.mu, no concurrent commits can interleave. Reading from the
+//     metadata view under v.mu observes the exact stream head state without needing a separate MVCC snapshot.
+//  2. An operation reads before it writes; writes are buffered in the Tx; reads never depend on the
+//     operation's own buffered writes. Because all needed pre-state is read prior to buffering changes in Tx,
+//     operations do not require read-your-writes semantics from the view during transaction construction.
+//  3. At commit, the before-image of each changed key is what the view says; the after-image is the
+//     buffered row; stats deltas come from those pairs with the applier's arithmetic. Calling
+//     UpdateStatsFromChanges prior to recording the transaction into the overlay ensures that the view
+//     lookup yields pre-commit rows, providing identical arithmetic between live and durable stats.
 func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) error {
-	if tx != nil {
-		v.recordOverlayTxChangesLocked(tx)
+	if tx == nil {
+		return nil
+	}
+	var statsErr error
+	if v.liveStats != nil {
+		var reg *record.Registry
+		if v.metadataStream != nil {
+			reg = v.metadataStream.Registry()
+		}
+		beforeLookup := func(typeName string, key sds.Key) (proto.Message, bool, error) {
+			if v.metadataView == nil {
+				return nil, false, nil
+			}
+			return v.metadataView.Get(ctx, typeName, key)
+		}
+		statsErr = view.UpdateStatsFromChanges(tx.Changes(), v.liveStats, UpdateVolumeStats, reg, beforeLookup)
+	}
+	v.recordOverlayTxChangesLocked(tx) // always: the tx is committed
+	if statsErr != nil {
+		if v.shouldDebugCheckStats() {
+			panic(fmt.Sprintf("volume stats update failed [%s]: %v", v.volumeID, statsErr))
+		}
+		klog.Errorf("Volume %s: live stats update failed; marking stats stale until applier drains: %v", v.volumeID, statsErr)
+		v.liveStatsStale = true
 	}
 	return nil
 }
@@ -1590,6 +1683,8 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			})
 
 			tx := v.metadataStream.Begin()
+			prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno())}, 1)
+			chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 
 			if len(dataCopy) <= int(v.maxInlineLen) {
 				childInode.InlineData = append([]byte(nil), dataCopy...)
@@ -1597,8 +1692,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				childInode.StagedChunks = nil
 				childInode.DirtyChunks = nil
 
-				prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno())}, 1)
-				chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 				for _, msg := range chunkMsgs {
 					c := msg.(*pb.FileChunk)
 					if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno()), Index: proto.Uint32(c.GetIndex())}); err != nil {
@@ -1639,8 +1732,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 					}
 				}
 
-				prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno())}, 1)
-				chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 				for _, msg := range chunkMsgs {
 					c := msg.(*pb.FileChunk)
 					if _, stillPresent := childInode.Chunks[c.GetIndex()]; !stillPresent {
@@ -2482,6 +2573,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 
 		now := time.Now()
 		node.IsDirty = true
+		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 		oldChunks := node.Chunks
 
 		tx := v.metadataStream.Begin()
@@ -2509,8 +2601,10 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 					return nil, nil, fmt.Errorf("failed to delete FileChunk row: %w", err)
 				}
 			}
-			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(0)}); err != nil {
-				// delete chunk 0 inline if existed
+			if len(oldChunks) == 0 {
+				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno()), Index: proto.Uint32(0)}); err != nil {
+					// delete chunk 0 inline if existed
+				}
 			}
 		} else if size <= v.maxInlineLen && len(oldChunks) <= 1 {
 			chunk0, _ := v.readChunkLocked(ctx, node, 0)
@@ -2546,7 +2640,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 					cs = 64 * 1024
 				}
 			}
-			_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 
 			if node.Chunks == nil {
 				node.Chunks = make(map[uint32]string)
@@ -3807,13 +3900,14 @@ func (v *Volume) ReplaySDSChanges(changes []sds.Change) error {
 }
 
 func (v *Volume) initNextInodeFromStatsLocked(ctx context.Context, highestReplayedIno uint64) error {
-	if v.metadataView == nil {
-		return nil
-	}
 	var maxIno uint64
-	if m := v.metadataView.Stats(); m != nil {
-		if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
-			maxIno = vs.GetMaxIno()
+	if v.liveStats != nil {
+		maxIno = v.liveStats.GetMaxIno()
+	} else if v.metadataView != nil {
+		if m := v.metadataView.Stats(); m != nil {
+			if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
+				maxIno = vs.GetMaxIno()
+			}
 		}
 	}
 	if highestReplayedIno > maxIno {
@@ -3829,6 +3923,84 @@ func (v *Volume) initNextInodeFromStatsLocked(ctx context.Context, highestReplay
 		v.nextInode = erofs.DefaultInodeStride
 	}
 	return nil
+}
+
+func (v *Volume) shouldDebugCheckStats() bool {
+	if v.debugStatsCheck != nil {
+		return *v.debugStatsCheck
+	}
+	return testing.Testing()
+}
+
+func (v *Volume) assertStatsMatchLocked(reason string) {
+	if !v.shouldDebugCheckStats() || v.liveStats == nil || v.metadataView == nil {
+		return
+	}
+	if v.metadataView.Lag(v.lastCommitSeq) > 0 || v.metadataView.UnappliedBytes() > 0 {
+		return
+	}
+	var durable *pb.VolumeStats
+	if m := v.metadataView.Stats(); m != nil {
+		if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
+			durable = vs
+		}
+	}
+	if durable == nil {
+		durable = &pb.VolumeStats{Name: VolumeStatsRowName}
+	}
+	if !proto.Equal(v.liveStats, durable) {
+		panic(fmt.Sprintf("volume stats divergence [%s] (%s):\n  live:    %+v\n  durable: %+v", v.volumeID, reason, v.liveStats, durable))
+	}
+}
+
+func (v *Volume) reseedLiveStatsFromDurableLocked() {
+	if v.metadataView == nil {
+		return
+	}
+	if m := v.metadataView.Stats(); m != nil {
+		if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
+			v.liveStats = proto.Clone(vs).(*pb.VolumeStats)
+			v.liveStatsStale = false
+			return
+		}
+	}
+	v.liveStats = &pb.VolumeStats{Name: VolumeStatsRowName}
+	v.liveStatsStale = false
+}
+
+// checkStatsOnBatchApplied is called by the view's background applier outside the view lock
+// when a batch is applied. In debug mode, it starts a goroutine per applied batch to check
+// stats consistency without blocking the applier or deadlocking with callers holding v.mu;
+// this is intended and safe for test and debug verification.
+// When the applier catches up to stream head, it also re-seeds liveStats if marked stale.
+func (v *Volume) checkStatsOnBatchApplied(appliedPos uint64) {
+	v.batchCheckWg.Add(1)
+	go func() {
+		defer v.batchCheckWg.Done()
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		if v.closed {
+			return
+		}
+		if appliedPos >= v.lastCommitSeq && v.lastCommitSeq > 0 {
+			if v.liveStatsStale {
+				v.reseedLiveStatsFromDurableLocked()
+			}
+			v.assertStatsMatchLocked("batch brought appliedPos to lastCommitSeq")
+		}
+	}()
+}
+
+func (v *Volume) initLiveStatsLocked() {
+	if v.metadataView != nil {
+		if m := v.metadataView.Stats(); m != nil {
+			if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
+				v.liveStats = proto.Clone(vs).(*pb.VolumeStats)
+				return
+			}
+		}
+	}
+	v.liveStats = &pb.VolumeStats{Name: VolumeStatsRowName}
 }
 
 func (v *Volume) importErofsToLocalIndexLocked(ctx context.Context, reader *erofs.Reader, snapPos uint64) error {
@@ -4557,9 +4729,11 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		v.metadataView.ClearCache()
 	}
 
+	v.initLiveStatsLocked()
 	if err := v.initNextInodeFromStatsLocked(ctx, highestReplayedIno); err != nil {
 		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
 	}
+	v.assertStatsMatchLocked("after loadFromBackendMetadataLocked")
 	return nil
 }
 
@@ -4737,9 +4911,11 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 	if v.metadataView != nil {
 		v.metadataView.ClearCache()
 	}
+	v.initLiveStatsLocked()
 	if err := v.initNextInodeFromStatsLocked(ctx, 0); err != nil {
 		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
 	}
+	v.assertStatsMatchLocked("after RestoreSnapshot")
 
 	return nil
 }
