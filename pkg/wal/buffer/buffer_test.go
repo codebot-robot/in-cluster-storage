@@ -70,6 +70,15 @@ func startTestServer(t *testing.T, backend objectstore.Backend, dataDir string) 
 	return srv, listener.Addr().String(), cleanup
 }
 
+func TestNewServerRequiresDataDir(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	_, err := NewServer(ctx, ServerConfig{Backend: backend})
+	if err == nil {
+		t.Fatalf("expected error when DataDir is empty")
+	}
+}
+
 func TestServerStartupReadOnlyUntilFlush(t *testing.T) {
 	backend := inmemorystorage.New()
 	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
