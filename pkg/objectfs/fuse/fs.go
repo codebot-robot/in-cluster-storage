@@ -314,7 +314,10 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 
 	if input.Valid&fuse.FATTR_SIZE != 0 {
 		syncCtx, syncCancel := fs.makeSyncContext(cancel)
-		_ = fs.syncFileToService(syncCtx, input.NodeId)
+		if err := fs.syncFileToService(syncCtx, input.NodeId); err != nil {
+			syncCancel()
+			return fs.grpcErrorToStatus("Truncate:Sync", err)
+		}
 		syncCancel()
 		fs.cache.Truncate(input.NodeId, int64(input.Size), time.Now())
 		resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
@@ -328,6 +331,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
 		}
+		fs.cache.MarkClean(input.NodeId)
 		finalAttr = resp.GetAttr()
 	}
 
@@ -391,8 +395,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	fs.fillAttrOut(finalAttr, &out.Attr)
 	if input.Valid&fuse.FATTR_SIZE != 0 {
 		out.Attr.Size = input.Size
-	}
-	if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
+	} else if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
 		out.Attr.Size = uint64(entry.Size)
 		out.Attr.Mtime = uint64(entry.ModTime.Unix())
 		out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())

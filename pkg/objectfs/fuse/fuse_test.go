@@ -2089,3 +2089,124 @@ func TestFsyncSlowSyncSucceedsWithinSyncTimeout(t *testing.T) {
 		t.Errorf("Expected Fsync to take at least 200ms due to delay, took %v", elapsed)
 	}
 }
+
+func TestFUSETruncateReportsNewSizeOnFstatAndGetAttr(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, "vol-trunc-stat-test", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "trunc_stat.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Write 250 KiB (4 chunks: 64K, 64K, 64K, 58K)
+	origSize := 250 * 1024
+	data := make([]byte, origSize)
+	for i := range data {
+		data[i] = byte(i%251 + 1)
+	}
+	written, status := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, data)
+	if status != fuse.OK || int(written) != origSize {
+		t.Fatalf("Write failed: status=%v, written=%d", status, written)
+	}
+
+	// Truncate down to 100 KiB (0x19000 bytes)
+	truncSize := uint64(100 * 1024)
+	var setAttrOut fuse.AttrOut
+	if status := rawFS.SetAttr(nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_SIZE,
+			Size:     truncSize,
+		},
+	}, &setAttrOut); status != fuse.OK {
+		t.Fatalf("SetAttr truncate failed: %v", status)
+	}
+
+	// 1. Verify SetAttr return value has the truncated size
+	if setAttrOut.Attr.Size != truncSize {
+		t.Fatalf("SetAttr reported size %d, expected %d", setAttrOut.Attr.Size, truncSize)
+	}
+
+	// 2. Immediately call GetAttr (simulating fstat right after ftruncate)
+	var getAttrOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &getAttrOut); status != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", status)
+	}
+	if getAttrOut.Attr.Size != truncSize {
+		t.Fatalf("GetAttr (fstat) reported size %d, expected %d", getAttrOut.Attr.Size, truncSize)
+	}
+
+	// 3. Verify cache is marked clean after successful truncate sync
+	if _, isDirty := cache.GetDirty(fileID); isDirty {
+		t.Fatalf("Expected cache entry to be clean after Truncate succeeded")
+	}
+
+	// 4. Simulate a stale chunk read returned from before truncate while entry is locally dirty
+	// (e.g. cache.Truncate ran, leaving entry dirty until controller sync completes).
+	cache.Truncate(fileID, int64(truncSize), time.Now())
+	cache.PutChunk(fileID, 3, DefaultChunkSize, int64(origSize), []byte("stale-chunk-data"), time.Now())
+
+	// Verify PutChunk did not resurrect the stale chunk or inflate size on a dirty entry
+	if _, ok := cache.GetChunk(fileID, 3); ok {
+		t.Fatalf("PutChunk should not have cached chunk beyond truncated size on dirty entry")
+	}
+	if entry, ok := cache.Get(fileID); ok && entry.Size != int64(truncSize) {
+		t.Fatalf("Cache entry size inflated to %d on dirty entry, expected %d", entry.Size, truncSize)
+	}
+
+	// 5. For a clean entry, PutChunk trusts the remote totalSize if the file grew on another node
+	cache.MarkClean(fileID)
+	cache.PutChunk(fileID, 3, DefaultChunkSize, int64(origSize), []byte("remote-chunk-data"), time.Now())
+	if entry, ok := cache.Get(fileID); !ok || entry.Size != int64(origSize) {
+		t.Fatalf("Expected clean entry size to adopt remote totalSize %d, got %v", origSize, entry.Size)
+	}
+}
+
+func TestFUSESetAttrTruncateFailsWhenFlushFails(t *testing.T) {
+	// Create client pointing to closed server
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close() // Immediately close so server is unreachable
+
+	conn, err := grpc.NewClient(
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	cache := NewNodeCache(1024 * 1024)
+	fs := NewObjectFSWithTimeouts(client, "vol-fail", pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 50*time.Millisecond, 50*time.Millisecond)
+
+	// Stage a dirty write in cache
+	const fileID = uint64(10)
+	cache.WriteAt(fileID, 0, []byte("dirty-data"), time.Now())
+
+	// SetAttr with FATTR_SIZE must fail because syncFileToService fails
+	var setAttrOut fuse.AttrOut
+	status := fs.SetAttr(nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &setAttrOut)
+
+	if status == fuse.OK {
+		t.Fatalf("Expected SetAttr truncate to fail when syncFileToService fails, but got OK")
+	}
+}
