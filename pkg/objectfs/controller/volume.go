@@ -59,8 +59,9 @@ const (
 )
 
 type InodeUpload struct {
-	wg  sync.WaitGroup
-	err error
+	wg      sync.WaitGroup
+	waiting bool
+	err     error
 }
 
 type Volume struct {
@@ -426,7 +427,7 @@ func (v *Volume) registerPendingUpload(ino uint64) func(error) {
 	}
 
 	upload, exists := v.inodeUploads[ino]
-	if !exists {
+	if !exists || upload.waiting {
 		upload = &InodeUpload{}
 		v.inodeUploads[ino] = upload
 	}
@@ -449,6 +450,9 @@ func (v *Volume) registerPendingUpload(ino uint64) func(error) {
 func (v *Volume) waitForInodeUploads(ctx context.Context, ino uint64) error {
 	v.pendingUploadsMu.Lock()
 	upload := v.inodeUploads[ino]
+	if upload != nil {
+		upload.waiting = true
+	}
 	v.pendingUploadsMu.Unlock()
 
 	if upload != nil {
@@ -466,9 +470,11 @@ func (v *Volume) waitForInodeUploads(ctx context.Context, ino uint64) error {
 
 	v.pendingUploadsMu.Lock()
 	var err error
-	if upload := v.inodeUploads[ino]; upload != nil {
+	if upload != nil {
 		err = upload.err
-		delete(v.inodeUploads, ino)
+		if v.inodeUploads[ino] == upload {
+			delete(v.inodeUploads, ino)
+		}
 	}
 	v.pendingUploadsMu.Unlock()
 
