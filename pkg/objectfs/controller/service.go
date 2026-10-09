@@ -131,6 +131,7 @@ type Server struct {
 	metadataApplierBatchSize int
 	localStorageDir          string
 	debugStatsCheck          bool
+	debugMutationCheck       bool
 	viewOpts                 []view.Option
 	streamFactory            func(volumeID string) (walclient.Stream, error)
 
@@ -145,6 +146,7 @@ type ServerOption func(*Server)
 // WithServerMutationCheck enables debug mutation checking on metadata views created by the server.
 func WithServerMutationCheck() ServerOption {
 	return func(s *Server) {
+		s.debugMutationCheck = true
 		s.viewOpts = append(s.viewOpts, view.WithMutationCheck())
 		s.debugStatsCheck = true
 	}
@@ -304,6 +306,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if len(s.viewOpts) > 0 {
 			volOpts = append(volOpts, WithVolumeViewOptions(s.viewOpts...))
+		}
+		if s.debugMutationCheck {
+			volOpts = append(volOpts, WithVolumeMutationCheck())
 		}
 		if s.debugStatsCheck {
 			volOpts = append(volOpts, WithVolumeStatsCheck())

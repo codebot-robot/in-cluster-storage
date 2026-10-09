@@ -87,8 +87,8 @@ type Volume struct {
 	lastCommitSeq    uint64
 	recoveredContent map[string][]byte
 	liveStats        *pb.VolumeStats
-	liveStatsStale   bool
 	debugStatsCheck  *bool
+	activeTx         *sds.Tx
 
 	localStorageDir string
 	indexFactory    sds.IndexFactory
@@ -570,10 +570,48 @@ func (v *Volume) initMetadataStreamLocked() error {
 }
 
 func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *CachedInode) error {
+	v.checkReadAllowedLocked("objectfs.v1alpha1.FileChunk")
+	ino := node.Row.GetIno()
+	chunkPrefix, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(ino)}, 1)
+	if pErr != nil {
+		panic(fmt.Sprintf("objectfs: failed to encode chunk prefix for inode %d: %v", ino, pErr))
+	}
+	alreadyRecorded := v.activeTx != nil && v.activeTx.HasReadPrefix("objectfs.v1alpha1.FileChunk", chunkPrefix)
+	v.recordReadPrefixLocked("objectfs.v1alpha1.FileChunk", chunkPrefix)
+
+	// Invariant: directories and 0-byte regular files never have chunk rows or inline data
+	// in the database. Recording the prefix as read establishes that any FileChunk key for
+	// this inode is known absent without requiring a physical index scan.
 	if node.Row.GetIsDir() || node.Row.GetSize() == 0 {
 		return nil
 	}
 	if node.Row.GetChunkSize() > 0 && len(node.Chunks) > 0 {
+		if v.activeTx != nil && !alreadyRecorded {
+			for idx, sha := range node.Chunks {
+				chunk := &pb.FileChunk{
+					Ino:    proto.Uint64(ino),
+					Index:  proto.Uint32(idx),
+					Sha256: sha,
+				}
+				k, err := pkFileChunk.Extract(chunk)
+				if err != nil {
+					panic(fmt.Sprintf("objectfs: failed to extract chunk key for inode %d index %d: %v", ino, idx, err))
+				}
+				v.recordReadLocked("objectfs.v1alpha1.FileChunk", k, chunk)
+			}
+			if len(node.InlineData) > 0 {
+				chunk := &pb.FileChunk{
+					Ino:        proto.Uint64(ino),
+					Index:      proto.Uint32(0),
+					InlineData: append([]byte(nil), node.InlineData...),
+				}
+				k, err := pkFileChunk.Extract(chunk)
+				if err != nil {
+					panic(fmt.Sprintf("objectfs: failed to extract inline chunk key for inode %d: %v", ino, err))
+				}
+				v.recordReadLocked("objectfs.v1alpha1.FileChunk", k, chunk)
+			}
+		}
 		return nil
 	}
 	if v.metadataView != nil {
@@ -732,9 +770,6 @@ func (v *Volume) Close() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if v.liveStatsStale {
-		v.reseedLiveStatsFromDurableLocked()
-	}
 	v.assertStatsMatchLocked("at Close")
 
 	if v.stream != nil {
@@ -808,7 +843,23 @@ func (v *Volume) safeSnapshotPositionLocked() uint64 {
 }
 
 func (v *Volume) allocInode() uint64 {
-	return atomic.AddUint64(&v.nextInode, erofs.DefaultInodeStride) - erofs.DefaultInodeStride
+	ino := atomic.AddUint64(&v.nextInode, erofs.DefaultInodeStride) - erofs.DefaultInodeStride
+	if v.activeTx != nil {
+		// Soundness: the allocator assigns strictly monotonic inode numbers and never reuses numbers
+		// (initialized from max(max_ino, replayed) + stride). Therefore, the new inode row and all its
+		// potential FileChunk keys are guaranteed to be absent without needing view/index lookups.
+		key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(ino)})
+		if err != nil {
+			panic(fmt.Sprintf("objectfs: failed to extract inode key for %d: %v", ino, err))
+		}
+		v.recordReadLocked("objectfs.v1alpha1.Inode", key, nil)
+		chunkPrefix, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(ino)}, 1)
+		if pErr != nil {
+			panic(fmt.Sprintf("objectfs: failed to encode chunk prefix for inode %d: %v", ino, pErr))
+		}
+		v.recordReadPrefixLocked("objectfs.v1alpha1.FileChunk", chunkPrefix)
+	}
+	return ino
 }
 
 func cleanPath(p string) string {
@@ -844,7 +895,7 @@ func (v *Volume) Stats() VolumeStats {
 		return VolumeStats{}
 	}
 	var st *pb.VolumeStats
-	if !v.liveStatsStale && v.liveStats != nil {
+	if v.liveStats != nil {
 		st = proto.Clone(v.liveStats).(*pb.VolumeStats)
 	} else if m := v.metadataView.Stats(); m != nil {
 		if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
@@ -961,9 +1012,6 @@ func (v *Volume) FlushOverlay(ctx context.Context) error {
 	func() {
 		v.mu.Lock()
 		defer v.mu.Unlock()
-		if v.liveStatsStale {
-			v.reseedLiveStatsFromDurableLocked()
-		}
 		v.assertStatsMatchLocked("after FlushOverlay")
 	}()
 	return nil
@@ -975,9 +1023,6 @@ func (v *Volume) flushOverlayLocked(ctx context.Context) error {
 	}
 	if err := v.metadataView.FlushTo(ctx, v.lastCommitSeq); err != nil {
 		return err
-	}
-	if v.liveStatsStale {
-		v.reseedLiveStatsFromDurableLocked()
 	}
 	v.assertStatsMatchLocked("after flushOverlayLocked")
 	return nil
@@ -1001,33 +1046,113 @@ func (v *Volume) recordOverlayTxChangesLocked(tx *sds.Tx) {
 	v.metadataView.ApplyChanges(changes)
 }
 
-// scanSQLiteRowsLocked queries the view for proto rows matching prefixBytes.
-// The returned messages are shared and immutable; callers must not modify them in place.
-func (v *Volume) scanSQLiteRowsLocked(ctx context.Context, typeName string, prefixBytes []byte) ([]proto.Message, error) {
+func (v *Volume) beginTxLocked(opName string) *sds.Tx {
+	if v.metadataStream == nil {
+		return nil
+	}
+	tx := v.metadataStream.Begin()
+	tx.SetOpName(opName)
+	v.activeTx = tx
+	return tx
+}
+
+func (v *Volume) endTxLocked() {
+	v.activeTx = nil
+}
+
+func (v *Volume) checkReadAllowedLocked(typeName string) {
+	if v.activeTx == nil {
+		return
+	}
+	if v.activeTx.HasWrites() {
+		op := v.activeTx.OpName()
+		if op == "" {
+			op = "unknown"
+		}
+		panic(fmt.Sprintf("objectfs: operation %q read %q after transaction buffered write %q", op, typeName, v.activeTx.FirstWrite()))
+	}
+}
+
+func (v *Volume) recordReadLocked(typeName string, key sds.Key, msg proto.Message) {
+	if v.activeTx != nil {
+		v.activeTx.RecordRead(typeName, key, msg)
+	}
+}
+
+func (v *Volume) recordReadPrefixLocked(typeName string, prefix []byte) {
+	if v.activeTx != nil {
+		v.activeTx.RecordReadPrefix(typeName, prefix)
+	}
+}
+
+// scanLimitSQLiteRowsLocked queries the view for proto rows matching prefixBytes up to limit (0 for unlimited).
+// It enforces the reads-before-writes assertion, records all returned rows into the read set, and records
+// the prefix as completely read only if the scan was not truncated by the limit.
+func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, typeName string, prefixBytes []byte, limit int) ([]proto.Message, error) {
+	v.checkReadAllowedLocked(typeName)
 	if v.metadataView == nil {
 		return nil, nil
 	}
-	return v.metadataView.ScanSlice(ctx, typeName, prefixBytes)
-}
-
-func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, typeName string, prefixBytes []byte, limit int) ([]proto.Message, error) {
-	msgs, err := v.scanSQLiteRowsLocked(ctx, typeName, prefixBytes)
+	allMsgs, err := v.metadataView.ScanSlice(ctx, typeName, prefixBytes)
 	if err != nil {
 		return nil, err
 	}
+	truncated := false
+	msgs := allMsgs
 	if limit > 0 && len(msgs) > limit {
 		msgs = msgs[:limit]
+		truncated = true
+	}
+	if len(prefixBytes) > 0 && !truncated {
+		v.recordReadPrefixLocked(typeName, prefixBytes)
+	}
+	if v.activeTx != nil {
+		for _, msg := range msgs {
+			var pk *sds.PrimaryKey
+			switch typeName {
+			case "objectfs.v1alpha1.Inode":
+				pk = pkInode
+			case "objectfs.v1alpha1.DirEntry":
+				pk = pkDirEntry
+			case "objectfs.v1alpha1.FileChunk":
+				pk = pkFileChunk
+			}
+			if pk != nil {
+				k, err := pk.Extract(msg)
+				if err != nil {
+					panic(fmt.Sprintf("objectfs: failed to extract primary key for %s: %v", typeName, err))
+				}
+				v.recordReadLocked(typeName, k, msg)
+			}
+		}
 	}
 	return msgs, nil
+}
+
+// scanSQLiteRowsLocked queries the view for all proto rows matching prefixBytes.
+// The returned messages are shared and immutable; callers must not modify them in place.
+func (v *Volume) scanSQLiteRowsLocked(ctx context.Context, typeName string, prefixBytes []byte) ([]proto.Message, error) {
+	return v.scanLimitSQLiteRowsLocked(ctx, typeName, prefixBytes, 0)
 }
 
 // getSQLiteRowLocked retrieves a single proto row from the view.
 // The returned message is shared and immutable; callers must not modify it in place.
 func (v *Volume) getSQLiteRowLocked(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
+	v.checkReadAllowedLocked(typeName)
 	if v.metadataView == nil {
+		v.recordReadLocked(typeName, key, nil)
 		return nil, false, nil
 	}
-	return v.metadataView.Get(ctx, typeName, key)
+	msg, ok, err := v.metadataView.Get(ctx, typeName, key)
+	if err != nil {
+		return nil, false, err
+	}
+	if ok {
+		v.recordReadLocked(typeName, key, msg)
+	} else {
+		v.recordReadLocked(typeName, key, nil)
+	}
+	return msg, ok, nil
 }
 
 func (v *Volume) normalizeInodeID(id uint64) uint64 {
@@ -1041,6 +1166,9 @@ func (v *Volume) normalizeInodeID(id uint64) uint64 {
 }
 
 func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
+	tx := v.beginTxLocked("cleanOrphanInodes")
+	defer v.endTxLocked()
+
 	prefix, err := sds.EncodeKeyPrefix(&pb.Inode{}, 0)
 	if err != nil {
 		return fmt.Errorf("failed to encode inode key prefix: %w", err)
@@ -1059,11 +1187,10 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 	if len(orphanInos) == 0 {
 		return nil
 	}
-	tx := v.metadataStream.Begin()
+
+	// Reads before writes: scan all orphan chunk rows before buffering any deletions into tx.
+	orphanChunks := make(map[uint64][]proto.Message, len(orphanInos))
 	for _, ino := range orphanInos {
-		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(ino)}); err != nil {
-			return fmt.Errorf("failed to log orphan inode %d deletion: %w", ino, err)
-		}
 		chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(ino)}, 1)
 		if err != nil {
 			return fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", ino, err)
@@ -1072,7 +1199,14 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to scan chunk rows for orphan inode %d: %w", ino, err)
 		}
-		for _, cMsg := range chunkMsgs {
+		orphanChunks[ino] = chunkMsgs
+	}
+
+	for _, ino := range orphanInos {
+		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(ino)}); err != nil {
+			return fmt.Errorf("failed to log orphan inode %d deletion: %w", ino, err)
+		}
+		for _, cMsg := range orphanChunks[ino] {
 			c := cMsg.(*pb.FileChunk)
 			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(ino), Index: proto.Uint32(c.GetIndex())}); err != nil {
 				return fmt.Errorf("failed to log chunk deletion for orphan inode %d: %w", ino, err)
@@ -1083,9 +1217,7 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
 	}
-	if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-		return fmt.Errorf("failed to apply orphan deletion changes: %w", err)
-	}
+	v.applyTxChangesLocked(ctx, tx)
 	waitFn := v.makeWaitFn(commitSeq, nil)
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
@@ -1225,6 +1357,9 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
+		tx := v.beginTxLocked("SetAttr")
+		defer v.endTxLocked()
+
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
 		}
@@ -1275,7 +1410,6 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 			}
 		})
 
-		tx := v.metadataStream.Begin()
 		if _, err := tx.Update(ctx, node.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log inode update: %w", err)
 		}
@@ -1284,9 +1418,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to commit setattr transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			return nil, nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -1407,37 +1539,35 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 //  2. An operation reads before it writes; writes are buffered in the Tx; reads never depend on the
 //     operation's own buffered writes. Because all needed pre-state is read prior to buffering changes in Tx,
 //     operations do not require read-your-writes semantics from the view during transaction construction.
-//  3. At commit, the before-image of each changed key is what the view says; the after-image is the
-//     buffered row; stats deltas come from those pairs with the applier's arithmetic. Calling
-//     UpdateStatsFromChanges prior to recording the transaction into the overlay ensures that the view
-//     lookup yields pre-commit rows, providing identical arithmetic between live and durable stats.
-func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) error {
+//  3. At commit, before-images come from the operation's read set; the after-image is the buffered row;
+//     stats deltas come from those pairs with the applier's arithmetic. Because operations read before they
+//     write, the pre-state of every written key was already recorded in the transaction's read set.
+//     Commit performs zero index/SQLite reads, making applyTxChangesLocked infallible. Invariant violations
+//     panic in all modes.
+func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) {
 	if tx == nil {
-		return nil
+		return
 	}
-	var statsErr error
 	if v.liveStats != nil {
 		var reg *record.Registry
 		if v.metadataStream != nil {
 			reg = v.metadataStream.Registry()
 		}
 		beforeLookup := func(typeName string, key sds.Key) (proto.Message, bool, error) {
-			if v.metadataView == nil {
+			msg, ok := tx.LookupRead(typeName, key)
+			if !ok {
+				panic(fmt.Sprintf("objectfs: key written but never read: type=%s key=%s", typeName, key.String()))
+			}
+			if msg == nil {
 				return nil, false, nil
 			}
-			return v.metadataView.Get(ctx, typeName, key)
+			return msg, true, nil
 		}
-		statsErr = view.UpdateStatsFromChanges(tx.Changes(), v.liveStats, UpdateVolumeStats, reg, beforeLookup)
+		if err := view.UpdateStatsFromChanges(tx.Changes(), v.liveStats, UpdateVolumeStats, reg, beforeLookup); err != nil {
+			panic(fmt.Sprintf("objectfs: volume stats update failed [%s]: %v", v.volumeID, err))
+		}
 	}
 	v.recordOverlayTxChangesLocked(tx) // always: the tx is committed
-	if statsErr != nil {
-		if v.shouldDebugCheckStats() {
-			panic(fmt.Sprintf("volume stats update failed [%s]: %v", v.volumeID, statsErr))
-		}
-		klog.Errorf("Volume %s: live stats update failed; marking stats stale until applier drains: %v", v.volumeID, statsErr)
-		v.liveStatsStale = true
-	}
-	return nil
 }
 
 func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, mode uint32, uid, gid uint32) (*pb.EntryAttr, error) {
@@ -1448,6 +1578,9 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
+
+		tx := v.beginTxLocked("Mkdir")
+		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -1501,7 +1634,6 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		}
 		v.dirParents[childInodeID] = parentInodeID
 
-		tx := v.metadataStream.Begin()
 		childInodeMsg := &pb.Inode{
 			Ino:       proto.Uint64(childInodeID),
 			Mode:      mode,
@@ -1542,10 +1674,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to commit mkdir transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			delete(v.dirParents, childInodeID)
-			return nil, nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -1579,6 +1708,9 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
+
+		tx := v.beginTxLocked("CreateFile")
+		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -1688,9 +1820,14 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				row.Ctime = timestamppb.New(now)
 			})
 
-			tx := v.metadataStream.Begin()
-			prefixBytes, _ := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno())}, 1)
-			chunkMsgs, _ := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+			prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInode.Row.GetIno())}, 1)
+			if pErr != nil {
+				return nil, nil, fmt.Errorf("failed to encode chunk prefix for inode %d: %w", childInode.Row.GetIno(), pErr)
+			}
+			chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to scan chunk rows for inode %d: %w", childInode.Row.GetIno(), err)
+			}
 
 			if len(dataCopy) <= int(v.maxInlineLen) {
 				childInode.InlineData = append([]byte(nil), dataCopy...)
@@ -1764,9 +1901,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to commit overwrite file transaction: %w", err)
 			}
-			if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-				return nil, nil, err
-			}
+			v.applyTxChangesLocked(ctx, tx)
 
 			waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -1810,8 +1945,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				ContentSha256: hashStr,
 			},
 		}
-
-		tx := v.metadataStream.Begin()
 
 		if fileType == syscall.S_IFREG {
 			if len(dataCopy) <= int(v.maxInlineLen) {
@@ -1879,9 +2012,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to commit create file transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			return nil, nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -1915,6 +2046,9 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
+
+		tx := v.beginTxLocked("Symlink")
+		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -1969,8 +2103,6 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			},
 		}
 
-		tx := v.metadataStream.Begin()
-
 		if _, err := tx.Insert(ctx, childInode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log symlink inode creation: %w", err)
 		}
@@ -1994,9 +2126,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to commit symlink transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			return nil, nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -2044,6 +2174,9 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
+
+		tx := v.beginTxLocked("Link")
+		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -2094,8 +2227,6 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			row.Ctime = timestamppb.New(now)
 		})
 
-		tx := v.metadataStream.Begin()
-
 		if _, err := tx.Update(ctx, oldNode.Row); err != nil {
 			return nil, nil, fmt.Errorf("failed to log linked inode update: %w", err)
 		}
@@ -2119,9 +2250,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to commit link transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			return nil, nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -2267,6 +2396,9 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
+		tx := v.beginTxLocked("WriteFile")
+		defer v.endTxLocked()
+
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return 0, 0, time.Time{}, nil, err
 		}
@@ -2347,7 +2479,6 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 				}
 			})
 
-			tx := v.metadataStream.Begin()
 			if _, err := tx.Insert(ctx, &pb.FileChunk{
 				Ino:        proto.Uint64(node.Row.GetIno()),
 				Index:      proto.Uint32(0),
@@ -2363,9 +2494,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			if err != nil {
 				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to commit tiny write transaction: %w", err)
 			}
-			if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-				return 0, 0, time.Time{}, nil, err
-			}
+			v.applyTxChangesLocked(ctx, tx)
 			waitFn := v.makeWaitFn(commitSeq, reqLevel)
 
 			attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
@@ -2477,7 +2606,6 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			}
 		})
 
-		tx := v.metadataStream.Begin()
 		for _, idx := range touchedIndices {
 			cSize := int64(node.Row.GetChunkSize())
 			if cSize == 0 {
@@ -2502,9 +2630,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		if err != nil {
 			return 0, 0, time.Time{}, nil, fmt.Errorf("failed to commit chunked write transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			return 0, 0, time.Time{}, nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, reqLevel)
 
@@ -2558,6 +2684,9 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
+		tx := v.beginTxLocked("TruncateFile")
+		defer v.endTxLocked()
+
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
 		}
@@ -2581,8 +2710,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		node.IsDirty = true
 		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 		oldChunks := node.Chunks
-
-		tx := v.metadataStream.Begin()
 
 		if size == 0 {
 			node.mutate(func(row *pb.Inode) {
@@ -2652,6 +2779,22 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			}
 
 			newNumChunks := int((size + cs - 1) / cs)
+
+			// Reads before writes: read the boundary chunk if needed before buffering any deletions into tx.
+			var lastChunkData []byte
+			var hasLastChunkData bool
+			if newNumChunks > 0 && size < node.Row.GetSize() {
+				lastIdx := newNumChunks - 1
+				if chunkData, ok := node.StagedChunks[lastIdx]; ok {
+					lastChunkData = chunkData
+					hasLastChunkData = true
+				} else if _, exists := node.Chunks[uint32(lastIdx)]; exists {
+					chunkData, _ := v.readChunkLocked(ctx, node, lastIdx)
+					lastChunkData = chunkData
+					hasLastChunkData = true
+				}
+			}
+
 			// Remove staged and logged chunks beyond newNumChunks
 			for k := range node.StagedChunks {
 				if k >= newNumChunks {
@@ -2667,17 +2810,20 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 				}
 			}
 
-			if newNumChunks > 0 && size < node.Row.GetSize() {
+			if hasLastChunkData {
 				lastIdx := newNumChunks - 1
 				lastChunkLen := size - int64(lastIdx)*cs
-				if chunkData, ok := node.StagedChunks[lastIdx]; ok && int64(len(chunkData)) > lastChunkLen {
-					chunkData = chunkData[:lastChunkLen]
-					chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
+				if int64(len(lastChunkData)) > lastChunkLen {
+					truncatedData := lastChunkData[:lastChunkLen]
+					chunkSha := fmt.Sprintf("%x", sha256.Sum256(truncatedData))
 					node.Chunks[uint32(lastIdx)] = chunkSha
-					node.StagedChunks[lastIdx] = chunkData
+					if node.StagedChunks == nil {
+						node.StagedChunks = make(map[int][]byte)
+					}
+					node.StagedChunks[lastIdx] = truncatedData
 					if v.blobStore != nil {
 						_ = v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{
-							chunkSha: blob.NewByteStreamFromBytes(chunkData),
+							chunkSha: blob.NewByteStreamFromBytes(truncatedData),
 						})
 					}
 					if _, err := tx.Insert(ctx, &pb.FileChunk{
@@ -2686,29 +2832,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 						Sha256: chunkSha,
 					}); err != nil {
 						return nil, nil, fmt.Errorf("failed to log truncated chunk: %w", err)
-					}
-				} else if _, exists := node.Chunks[uint32(lastIdx)]; exists {
-					chunkData, _ := v.readChunkLocked(ctx, node, lastIdx)
-					if int64(len(chunkData)) > lastChunkLen {
-						chunkData = chunkData[:lastChunkLen]
-						chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
-						node.Chunks[uint32(lastIdx)] = chunkSha
-						if node.StagedChunks == nil {
-							node.StagedChunks = make(map[int][]byte)
-						}
-						node.StagedChunks[lastIdx] = chunkData
-						if v.blobStore != nil {
-							_ = v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{
-								chunkSha: blob.NewByteStreamFromBytes(chunkData),
-							})
-						}
-						if _, err := tx.Insert(ctx, &pb.FileChunk{
-							Ino:    proto.Uint64(node.Row.GetIno()),
-							Index:  proto.Uint32(uint32(lastIdx)),
-							Sha256: chunkSha,
-						}); err != nil {
-							return nil, nil, fmt.Errorf("failed to log truncated chunk: %w", err)
-						}
 					}
 				}
 			}
@@ -2730,9 +2853,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to commit truncate file transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			return nil, nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -2793,8 +2914,19 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
+		tx := v.beginTxLocked("Unlink")
+		defer v.endTxLocked()
+
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, err
+		}
+
+		_, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 		}
 
 		childInode, err := v.getOrLoadInodeLocked(ctx, childInodeID)
@@ -2827,8 +2959,20 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			})
 		}
 
+		// Reads before writes: scan chunk rows before buffering any deletions into tx.
+		var chunkMsgs []proto.Message
+		if childInode.Row.GetNlink() == 0 && !v.hasOpenHandlesLocked(childInodeID) {
+			chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInodeID)}, 1)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", childInodeID, err)
+			}
+			chunkMsgs, err = v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
+			if err != nil {
+				return nil, fmt.Errorf("failed to scan chunk rows for inode %d: %w", childInodeID, err)
+			}
+		}
+
 		var commitSeq uint64
-		tx := v.metadataStream.Begin()
 		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
@@ -2840,14 +2984,6 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		} else {
 			if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInodeID)}); err != nil {
 				return nil, fmt.Errorf("failed to log child inode deletion: %w", err)
-			}
-			chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInodeID)}, 1)
-			if err != nil {
-				return nil, fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", childInodeID, err)
-			}
-			chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
-			if err != nil {
-				return nil, fmt.Errorf("failed to scan chunk rows for inode %d: %w", childInodeID, err)
 			}
 			for _, cMsg := range chunkMsgs {
 				c := cMsg.(*pb.FileChunk)
@@ -2866,9 +3002,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to commit transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			return nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -2900,6 +3034,9 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 	waitFn, err := func() (func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
+
+		tx := v.beginTxLocked("Rmdir")
+		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, err
@@ -2952,7 +3089,6 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		}
 
 		var commitSeq uint64
-		tx := v.metadataStream.Begin()
 		if _, err = tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
 			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
@@ -2968,9 +3104,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		if err != nil {
 			return nil, fmt.Errorf("failed to commit transaction: %w", err)
 		}
-		if err = v.applyTxChangesLocked(ctx, tx); err != nil {
-			return nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -3002,6 +3136,9 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
+
+		tx := v.beginTxLocked("Rename")
+		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -3050,10 +3187,22 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		oldParentInode, _ := v.getOrLoadInodeLocked(ctx, oldParentInodeID)
 
 		var targetInode *CachedInode
+		var targetChunkMsgs []proto.Message
 		if targetExists {
 			targetInode, err = v.getOrLoadInodeLocked(ctx, targetInodeID)
 			if err != nil {
 				return nil, nil, err
+			}
+			if !targetInode.Row.GetIsDir() && targetInode.Row.GetNlink() <= 1 && !v.hasOpenHandlesLocked(targetInodeID) {
+				chunkPrefix, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(targetInodeID)}, 1)
+				if pErr != nil {
+					return nil, nil, pErr
+				}
+				var sErr error
+				targetChunkMsgs, sErr = v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
+				if sErr != nil {
+					return nil, nil, sErr
+				}
 			}
 		}
 
@@ -3169,7 +3318,6 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		}
 
 		var commitSeq uint64
-		tx := v.metadataStream.Begin()
 		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(oldParentInodeID), Name: proto.String(oldName)}); err != nil {
 			return nil, nil, fmt.Errorf("failed to log old dir entry deletion: %w", err)
 		}
@@ -3191,15 +3339,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 						if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(targetInode.Row.GetIno())}); err != nil {
 							return nil, nil, fmt.Errorf("failed to log target inode deletion: %w", err)
 						}
-						chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(targetInodeID)}, 1)
-						if err != nil {
-							return nil, nil, fmt.Errorf("failed to encode chunk key prefix for target inode %d: %w", targetInodeID, err)
-						}
-						chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
-						if err != nil {
-							return nil, nil, fmt.Errorf("failed to scan chunk rows for target inode %d: %w", targetInodeID, err)
-						}
-						for _, cMsg := range chunkMsgs {
+						for _, cMsg := range targetChunkMsgs {
 							c := cMsg.(*pb.FileChunk)
 							if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(targetInodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
 								return nil, nil, fmt.Errorf("failed to log chunk deletion for target inode %d: %w", targetInodeID, err)
@@ -3241,9 +3381,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to commit rename transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			return nil, nil, err
-		}
+		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
@@ -3342,6 +3480,9 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	tx := v.beginTxLocked("Release")
+	defer v.endTxLocked()
+
 	inodeID = v.normalizeInodeID(inodeID)
 
 	v.handlesMu.Lock()
@@ -3367,10 +3508,6 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 	}
 
 	if !node.Row.GetIsDir() && node.Row.GetNlink() == 0 {
-		tx := v.metadataStream.Begin()
-		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(inodeID)}); err != nil {
-			return fmt.Errorf("failed to log orphan inode deletion: %w", err)
-		}
 		chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(inodeID)}, 1)
 		if err != nil {
 			return fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", inodeID, err)
@@ -3378,6 +3515,10 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 		chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
 		if err != nil {
 			return fmt.Errorf("failed to scan chunk rows for inode %d: %w", inodeID, err)
+		}
+
+		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(inodeID)}); err != nil {
+			return fmt.Errorf("failed to log orphan inode deletion: %w", err)
 		}
 		for _, cMsg := range chunkMsgs {
 			c := cMsg.(*pb.FileChunk)
@@ -3389,9 +3530,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 		if err != nil {
 			return fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
 		}
-		if err := v.applyTxChangesLocked(ctx, tx); err != nil {
-			return fmt.Errorf("failed to apply orphan deletion changes: %w", err)
-		}
+		v.applyTxChangesLocked(ctx, tx)
 		waitFn := v.makeWaitFn(commitSeq, nil)
 		if waitFn != nil {
 			if err := waitFn(ctx); err != nil {
@@ -3521,10 +3660,73 @@ type snapshotResolver struct {
 }
 
 func (r *snapshotResolver) getOrLoadInode(ctx context.Context, inodeID uint64) (*CachedInode, error) {
-	if r.vol != nil {
-		return r.vol.getOrLoadInodeLocked(ctx, inodeID)
+	if r.vol == nil || r.vol.metadataView == nil {
+		return nil, fmt.Errorf("no metadata view attached")
 	}
-	return nil, fmt.Errorf("no volume attached")
+	inodeID = r.vol.normalizeInodeID(inodeID)
+	key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(inodeID)})
+	if err != nil {
+		return nil, err
+	}
+	msg, ok, err := r.vol.metadataView.Get(ctx, "objectfs.v1alpha1.Inode", key)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("inode %d: %w", inodeID, syscall.ENOENT)
+	}
+	inode := msg.(*pb.Inode)
+	node := &CachedInode{
+		Row: inode,
+	}
+	if !inode.GetIsDir() && inode.GetSize() > 0 {
+		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(inode.GetIno())}, 1)
+		if pErr != nil {
+			return nil, fmt.Errorf("failed to encode chunk prefix for inode %d: %w", inode.GetIno(), pErr)
+		}
+		chunkMsgs, sErr := r.vol.metadataView.ScanSlice(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+		if sErr != nil {
+			return nil, fmt.Errorf("failed to scan chunk rows for inode %d: %w", inode.GetIno(), sErr)
+		}
+		for _, cMsg := range chunkMsgs {
+			chunk := cMsg.(*pb.FileChunk)
+			if chunk.GetIndex() == 0 && len(chunk.GetInlineData()) > 0 {
+				node.InlineData = append([]byte(nil), chunk.GetInlineData()...)
+			} else if chunk.GetSha256() != "" {
+				if node.Chunks == nil {
+					node.Chunks = make(map[uint32]string)
+				}
+				node.Chunks[chunk.GetIndex()] = chunk.GetSha256()
+			}
+		}
+	}
+	return node, nil
+}
+
+func (r *snapshotResolver) readChunk(ctx context.Context, node *CachedInode, chunkIdx int) ([]byte, error) {
+	if chunkIdx == 0 && len(node.InlineData) > 0 {
+		res := make([]byte, len(node.InlineData))
+		copy(res, node.InlineData)
+		return res, nil
+	}
+	if chunkSha, ok := node.Chunks[uint32(chunkIdx)]; ok && chunkSha != "" {
+		if r.vol != nil && r.vol.recoveredContent != nil {
+			if data, ok := r.vol.recoveredContent[chunkSha]; ok {
+				res := make([]byte, len(data))
+				copy(res, data)
+				return res, nil
+			}
+		}
+		if r.vol != nil && r.vol.blobStore != nil {
+			stream, err := r.vol.blobStore.GetBlob(ctx, chunkSha)
+			if err == nil {
+				defer stream.Close()
+				return io.ReadAll(stream)
+			}
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("chunk %d not found", chunkIdx)
 }
 
 func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64, dirName, currentPath string, dirtyBlobs map[string]blob.ByteStream) (erofs.Node, error) {
@@ -3537,7 +3739,7 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 	if pErr != nil {
 		return nil, pErr
 	}
-	entryMsgs, err := r.vol.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
+	entryMsgs, err := r.vol.metadataView.ScanSlice(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -3569,7 +3771,6 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 			}
 
 			if childInode.Row.GetChunkSize() > 0 && len(childInode.Chunks) > 0 {
-				_ = r.vol.ensureInodeChunksLoadedLocked(ctx, childInode)
 				cs := int64(childInode.Row.GetChunkSize())
 				numChunks := int((childInode.Row.GetSize() + cs - 1) / cs)
 				manifestChunks := make([][32]byte, numChunks)
@@ -3598,14 +3799,13 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 			if childInode.Row.GetContentSha256() == "" && childInode.Row.GetSize() > 0 {
 				hasher := sha256.New()
 				if childInode.Row.GetManifestSha256() != "" || childInode.Row.GetChunkSize() > 0 {
-					_ = r.vol.ensureInodeChunksLoadedLocked(ctx, childInode)
 					cs := int64(childInode.Row.GetChunkSize())
 					if cs == 0 {
 						cs = 64 * 1024
 					}
 					numChunks := int((childInode.Row.GetSize() + cs - 1) / cs)
 					for i := 0; i < numChunks; i++ {
-						chunkBytes, err := r.vol.readChunkLocked(ctx, childInode, i)
+						chunkBytes, err := r.readChunk(ctx, childInode, i)
 						if err == nil && len(chunkBytes) > 0 {
 							hasher.Write(chunkBytes)
 						} else {
@@ -3632,24 +3832,6 @@ func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64
 				childInode.mutate(func(row *pb.Inode) {
 					row.ContentSha256 = contentSha
 				})
-				if r.vol != nil {
-					r.vol.mu.Lock()
-					if r.vol.metadataView != nil {
-						nodeMsg := childInode.Row
-						kBytes, vBytes, _ := sds.SplitKeyAndNonKey(nodeMsg, []int32{1})
-						ch := sds.Change{
-							TypeID:   16,
-							TypeName: "objectfs.v1alpha1.Inode",
-							Op:       sds.OpUpdate,
-							Key:      sds.NewKeyFromBytes(kBytes),
-							RawKey:   kBytes,
-							RawVal:   vBytes,
-							Row:      nodeMsg,
-						}
-						_ = r.vol.metadataView.ApplyChangesSync(ctx, []sds.Change{ch})
-					}
-					r.vol.mu.Unlock()
-				}
 			}
 
 			// Collect dirty / unpersisted blobs for flush
@@ -3753,7 +3935,9 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		},
 	}
 
-	// Release v.mu during snapshot compilation and cloud storage upload to avoid stopping the world
+	// Release v.mu during snapshot compilation and cloud storage upload to avoid stopping the world.
+	// Note: The tree build runs unlocked (#218 tracks snapshotting from a consistent view)
+	// and must NOT touch operation state (activeTx, operation read helpers, or assertion checks).
 	v.mu.Unlock()
 
 	var erofsBuf bufferWriterAt
@@ -3959,26 +4143,10 @@ func (v *Volume) assertStatsMatchLocked(reason string) {
 	}
 }
 
-func (v *Volume) reseedLiveStatsFromDurableLocked() {
-	if v.metadataView == nil {
-		return
-	}
-	if m := v.metadataView.Stats(); m != nil {
-		if vs, ok := m.(*pb.VolumeStats); ok && vs != nil {
-			v.liveStats = proto.Clone(vs).(*pb.VolumeStats)
-			v.liveStatsStale = false
-			return
-		}
-	}
-	v.liveStats = &pb.VolumeStats{Name: VolumeStatsRowName}
-	v.liveStatsStale = false
-}
-
 // checkStatsOnBatchApplied is called by the view's background applier outside the view lock
 // when a batch is applied. In debug mode, it starts a goroutine per applied batch to check
 // stats consistency without blocking the applier or deadlocking with callers holding v.mu;
 // this is intended and safe for test and debug verification.
-// When the applier catches up to stream head, it also re-seeds liveStats if marked stale.
 func (v *Volume) checkStatsOnBatchApplied(appliedPos uint64) {
 	v.batchCheckWg.Add(1)
 	go func() {
@@ -3989,9 +4157,6 @@ func (v *Volume) checkStatsOnBatchApplied(appliedPos uint64) {
 			return
 		}
 		if appliedPos >= v.lastCommitSeq && v.lastCommitSeq > 0 {
-			if v.liveStatsStale {
-				v.reseedLiveStatsFromDurableLocked()
-			}
 			v.assertStatsMatchLocked("batch brought appliedPos to lastCommitSeq")
 		}
 	}()
