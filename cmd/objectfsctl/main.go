@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -304,20 +303,16 @@ type snapshotsListOptions struct {
 }
 
 func parseTimeFlag(val string) (time.Time, bool) {
-	if val == "" {
-		return time.Time{}, false
-	}
 	formats := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05.000000Z",
+		"2006-01-02T15:04:05Z",
 		"2006-01-02 15:04:05",
 		"2006-01-02",
 		"20060102T150405.000000Z",
 		"20060102T150405Z",
 	}
 	for _, f := range formats {
-		if t, err := time.Parse(f, strings.TrimSuffix(val, ".erofs")); err == nil {
+		if t, err := time.Parse(f, val); err == nil {
 			return t, true
 		}
 	}
@@ -360,11 +355,7 @@ func newSnapshotsListCommand(opts *options) *cobra.Command {
 			}
 
 			if listOpts.from != "" {
-				if strings.HasSuffix(listOpts.from, ".erofs") {
-					fromSnapshot = listOpts.from
-				} else if pos, err := strconv.ParseUint(listOpts.from, 10, 64); err == nil {
-					fromSnapshot = fmt.Sprintf("%020d.erofs", pos)
-				} else if t, ok := parseTimeFlag(listOpts.from); ok && listOpts.fromTime == "" {
+				if t, ok := parseTimeFlag(listOpts.from); ok && listOpts.fromTime == "" {
 					fromTimePb = timestamppb.New(t)
 				} else {
 					fromSnapshot = listOpts.from
@@ -427,15 +418,16 @@ func newSnapshotsListCommand(opts *options) *cobra.Command {
 type snapshotCreateOptions struct {
 	*options
 	volumeID string
+	name     string
 }
 
 func newSnapshotCreateCommand(opts *options) *cobra.Command {
 	createOpts := &snapshotCreateOptions{options: opts}
 	cmd := &cobra.Command{
-		Use:     "create <volume_id>",
+		Use:     "create <volume_id> [name]",
 		Aliases: []string{"new", "add"},
 		Short:   "Create a new snapshot for a volume",
-		Args:    cobra.MaximumNArgs(1),
+		Args:    cobra.RangeArgs(0, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if createOpts.serverAddr == "" {
 				return fmt.Errorf("--server is required")
@@ -449,6 +441,11 @@ func newSnapshotCreateCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("volume_id is required")
 			}
 
+			snapName := createOpts.name
+			if len(args) > 1 && args[1] != "" {
+				snapName = args[1]
+			}
+
 			client, closeConn, err := dialServer(createOpts.serverAddr)
 			if err != nil {
 				return err
@@ -457,6 +454,7 @@ func newSnapshotCreateCommand(opts *options) *cobra.Command {
 
 			resp, err := client.CreateSnapshot(cmd.Context(), &pb.CreateSnapshotRequest{
 				VolumeId: volID,
+				Name:     snapName,
 			})
 			if err != nil {
 				return fmt.Errorf("failed to create snapshot: %w", err)
@@ -468,6 +466,7 @@ func newSnapshotCreateCommand(opts *options) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&createOpts.volumeID, "volume", "", "Volume ID")
+	cmd.Flags().StringVar(&createOpts.name, "name", "", "Snapshot name (optional)")
 	return cmd
 }
 

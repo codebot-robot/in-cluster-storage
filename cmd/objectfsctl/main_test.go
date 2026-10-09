@@ -121,8 +121,8 @@ func TestBlobsListAndGet(t *testing.T) {
 
 	// 3. Create files in a volume and flush to generate blobs
 	volumeID := "vol-test-ctl"
-	content1 := []byte("Hello World from ObjectFS Blobs!")
-	content2 := []byte("Second blob data for verifying multiple blobs in listing")
+	content1 := bytes.Repeat([]byte("Hello World from ObjectFS Blobs!"), 200)
+	content2 := bytes.Repeat([]byte("Second blob data for verifying multiple blobs in listing"), 100)
 
 	h1 := sha256.Sum256(content1)
 	sha1 := fmt.Sprintf("%x", h1)
@@ -254,7 +254,7 @@ func TestBlobsOverUnixSocket(t *testing.T) {
 	defer cleanup()
 
 	volumeID := "unix-vol"
-	content := []byte("Testing objectfsctl over Unix domain socket")
+	content := bytes.Repeat([]byte("Testing objectfsctl over Unix domain socket "), 100)
 	h := sha256.Sum256(content)
 	sha := fmt.Sprintf("%x", h)
 
@@ -417,8 +417,8 @@ func TestSnapshotsListAndCreate(t *testing.T) {
 		t.Fatalf("snapshot create failed: %v", err)
 	}
 	snap1 := strings.TrimSpace(snap1Out)
-	if snap1 == "" || !strings.HasSuffix(snap1, ".erofs") {
-		t.Fatalf("expected .erofs snapshot output, got: %q", snap1Out)
+	if snap1 == "" || (!strings.HasSuffix(snap1, ".sqlite") && !strings.HasSuffix(snap1, ".snap")) {
+		t.Fatalf("expected .sqlite snapshot output, got: %q", snap1Out)
 	}
 
 	time.Sleep(15 * time.Millisecond)
@@ -439,8 +439,8 @@ func TestSnapshotsListAndCreate(t *testing.T) {
 		t.Fatalf("snapshots create with --volume flag failed: %v", err)
 	}
 	snap2 := strings.TrimSpace(snap2Out)
-	if snap2 == "" || !strings.HasSuffix(snap2, ".erofs") {
-		t.Fatalf("expected .erofs snapshot output, got: %q", snap2Out)
+	if snap2 == "" || (!strings.HasSuffix(snap2, ".sqlite") && !strings.HasSuffix(snap2, ".snap")) {
+		t.Fatalf("expected .sqlite snapshot output, got: %q", snap2Out)
 	}
 
 	time.Sleep(15 * time.Millisecond)
@@ -536,8 +536,8 @@ func TestVolumesAndSnapshotsOverUnixSocket(t *testing.T) {
 		t.Fatalf("snapshot create failed over unix socket: %v", err)
 	}
 	snapName := strings.TrimSpace(snapOut)
-	if !strings.HasSuffix(snapName, ".erofs") {
-		t.Fatalf("expected .erofs snapshot, got: %q", snapName)
+	if snapName == "" || (!strings.HasSuffix(snapName, ".sqlite") && !strings.HasSuffix(snapName, ".snap")) {
+		t.Fatalf("expected .sqlite snapshot, got: %q", snapName)
 	}
 
 	// Test snapshots list over unix socket
