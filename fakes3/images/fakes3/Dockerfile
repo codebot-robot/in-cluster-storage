@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Build context is the fakes3/ module directory.
-FROM golang:1.27.1 AS builder
+FROM golang:1.27.2 AS builder
 
 WORKDIR /app
 COPY . .
