@@ -20,8 +20,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -2151,8 +2154,9 @@ func TestFUSETruncateReportsNewSizeOnFstatAndGetAttr(t *testing.T) {
 
 	// 4. Simulate a stale chunk read returned from before truncate while entry is locally dirty
 	// (e.g. cache.Truncate ran, leaving entry dirty until controller sync completes).
-	cache.Truncate(fileID, int64(truncSize), time.Now())
-	cache.PutChunk(fileID, 3, DefaultChunkSize, int64(origSize), []byte("stale-chunk-data"), time.Now())
+	genBefore := cache.GetGeneration(fileID)
+	truncGen := cache.Truncate(fileID, int64(truncSize), time.Now())
+	cache.PutChunk(fileID, 3, DefaultChunkSize, int64(origSize), []byte("stale-chunk-data"), time.Now(), genBefore)
 
 	// Verify PutChunk did not resurrect the stale chunk or inflate size on a dirty entry
 	if _, ok := cache.GetChunk(fileID, 3); ok {
@@ -2163,8 +2167,9 @@ func TestFUSETruncateReportsNewSizeOnFstatAndGetAttr(t *testing.T) {
 	}
 
 	// 5. For a clean entry, PutChunk trusts the remote totalSize if the file grew on another node
-	cache.MarkClean(fileID)
-	cache.PutChunk(fileID, 3, DefaultChunkSize, int64(origSize), []byte("remote-chunk-data"), time.Now())
+	cache.MarkSizeClean(fileID, truncGen)
+	cleanGen := cache.GetGeneration(fileID)
+	cache.PutChunk(fileID, 3, DefaultChunkSize, int64(origSize), []byte("remote-chunk-data"), time.Now(), cleanGen)
 	if entry, ok := cache.Get(fileID); !ok || entry.Size != int64(origSize) {
 		t.Fatalf("Expected clean entry size to adopt remote totalSize %d, got %v", origSize, entry.Size)
 	}
@@ -2208,5 +2213,240 @@ func TestFUSESetAttrTruncateFailsWhenFlushFails(t *testing.T) {
 
 	if status == fuse.OK {
 		t.Fatalf("Expected SetAttr truncate to fail when syncFileToService fails, but got OK")
+	}
+}
+
+func TestFUSEConcurrentOperationsRace(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-concurrent-race"
+	cache := NewNodeCache(4 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "concurrent_race.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Note: writers and truncaters synchronize via modelMu to maintain a deterministic
+	// ground-truth oracle; background flushers (syncFileToService) and readers race
+	// concurrently against those mutations without holding modelMu.
+	var modelMu sync.Mutex
+	model := make([]byte, 0)
+
+	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Flusher running concurrently
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+				_ = rawFS.syncFileToService(ctx, fileID)
+				cancel()
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	// Reader running concurrently
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		buf := make([]byte, 8192)
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+				off := r.Int63n(128 * 1024)
+				_, _ = rawFS.Read(nil, &fuse.ReadIn{
+					InHeader: fuse.InHeader{NodeId: fileID},
+					Offset:   uint64(off),
+					Size:     uint32(len(buf)),
+				}, buf)
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	// Writers
+	var mutatorsWg sync.WaitGroup
+	const numWriters = 2
+	const writesPerWorker = 30
+
+	for w := 0; w < numWriters; w++ {
+		mutatorsWg.Add(1)
+		go func(workerID int) {
+			defer mutatorsWg.Done()
+			r := rand.New(rand.NewSource(int64(workerID*1000 + 42)))
+			for i := 0; i < writesPerWorker; i++ {
+				// Offset up to 160KB (spans multiple 64KB chunks)
+				off := int(r.Int31n(160 * 1024))
+				sz := int(r.Int31n(8192)) + 512
+				data := make([]byte, sz)
+				for b := range data {
+					data[b] = byte((workerID*37 + i*13 + b) & 0xFF)
+				}
+
+				modelMu.Lock()
+				written, status := rawFS.Write(nil, &fuse.WriteIn{
+					InHeader: fuse.InHeader{NodeId: fileID},
+					Offset:   uint64(off),
+				}, data)
+				if status != fuse.OK || int(written) != sz {
+					t.Errorf("Write failed: status=%v written=%d want=%d", status, written, sz)
+				}
+				end := off + sz
+				if end > len(model) {
+					newModel := make([]byte, end)
+					copy(newModel, model)
+					model = newModel
+				}
+				copy(model[off:end], data)
+				modelMu.Unlock()
+
+				runtime.Gosched()
+			}
+		}(w)
+	}
+
+	// Truncater
+	mutatorsWg.Add(1)
+	go func() {
+		defer mutatorsWg.Done()
+		r := rand.New(rand.NewSource(999))
+		for i := 0; i < 15; i++ {
+			newSize := int(r.Int31n(160 * 1024))
+			modelMu.Lock()
+			var setAttrOut fuse.AttrOut
+			status := rawFS.SetAttr(nil, &fuse.SetAttrIn{
+				SetAttrInCommon: fuse.SetAttrInCommon{
+					InHeader: fuse.InHeader{NodeId: fileID},
+					Valid:    fuse.FATTR_SIZE,
+					Size:     uint64(newSize),
+				},
+			}, &setAttrOut)
+			if status != fuse.OK {
+				t.Errorf("SetAttr truncate failed: %v", status)
+			}
+			if newSize < len(model) {
+				model = model[:newSize]
+			} else if newSize > len(model) {
+				newModel := make([]byte, newSize)
+				copy(newModel, model)
+				model = newModel
+			}
+			modelMu.Unlock()
+
+			runtime.Gosched()
+		}
+	}()
+
+	// Wait for all writes and truncates to finish
+	mutatorsWg.Wait()
+
+	// Stop background flushers and readers
+	close(stopCh)
+	wg.Wait()
+
+	// Final flush to ensure all acknowledged writes are flushed
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := rawFS.syncFileToService(ctx, fileID); err != nil {
+		t.Fatalf("Final syncFileToService failed: %v", err)
+	}
+
+	modelMu.Lock()
+	expected := make([]byte, len(model))
+	copy(expected, model)
+	expectedSize := uint64(len(model))
+	modelMu.Unlock()
+
+	// 1. Verify cache has no remaining dirty state
+	if _, isDirty := cache.GetDirty(fileID); isDirty {
+		t.Fatalf("Cache entry is still marked dirty after final sync")
+	}
+
+	// 2. Verify reported size via GetAttr
+	var getAttrOut fuse.AttrOut
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &getAttrOut); status != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", status)
+	}
+	if getAttrOut.Attr.Size != expectedSize {
+		t.Fatalf("Final reported size mismatch: got %d, want %d", getAttrOut.Attr.Size, expectedSize)
+	}
+
+	// 3. Verify content on controller matches expected model byte-for-byte
+	var controllerData []byte
+	const chunkSize = 64 * 1024
+	numChunks := int((int64(expectedSize) + chunkSize - 1) / chunkSize)
+	if expectedSize == 0 {
+		numChunks = 0
+	}
+	for cIdx := 0; cIdx < numChunks; cIdx++ {
+		cStart := int64(cIdx) * chunkSize
+		cLen := int64(chunkSize)
+		if cStart+cLen > int64(expectedSize) {
+			cLen = int64(expectedSize) - cStart
+		}
+		resp, err := client.ReadFile(ctx, &pb.ReadFileRequest{
+			VolumeId: volumeID,
+			Inode:    fileID,
+			Offset:   cStart,
+			Size:     cLen,
+		})
+		if err != nil {
+			t.Fatalf("Controller ReadFile chunk %d failed: %v", cIdx, err)
+		}
+		if resp.GetError() != 0 {
+			t.Fatalf("Controller ReadFile chunk %d returned error: %d", cIdx, resp.GetError())
+		}
+		data := resp.GetData()
+		if int64(len(data)) < cLen {
+			padded := make([]byte, cLen)
+			copy(padded, data)
+			data = padded
+		}
+		controllerData = append(controllerData, data[:cLen]...)
+	}
+
+	if !bytes.Equal(controllerData, expected) {
+		for i := 0; i < len(expected) && i < len(controllerData); i++ {
+			if controllerData[i] != expected[i] {
+				t.Fatalf("Controller data mismatch at byte %d (chunk %d): got 0x%02x want 0x%02x (len got=%d want=%d)",
+					i, i/(64*1024), controllerData[i], expected[i], len(controllerData), len(expected))
+			}
+		}
+		t.Fatalf("Controller data mismatch: len(got)=%d len(want)=%d", len(controllerData), len(expected))
+	}
+
+	// 4. Verify read through FUSE after clearing cache matches
+	cache.Clear()
+	fuseData := make([]byte, expectedSize)
+	if expectedSize > 0 {
+		readRes, status := rawFS.Read(nil, &fuse.ReadIn{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Offset:   0,
+			Size:     uint32(expectedSize),
+		}, fuseData)
+		if status != fuse.OK {
+			t.Fatalf("rawFS.Read failed: %v", status)
+		}
+		readBytes, _ := readRes.Bytes(fuseData)
+		if !bytes.Equal(readBytes, expected) {
+			t.Fatalf("FUSE read data mismatch: len(got)=%d len(want)=%d", len(readBytes), len(expected))
+		}
 	}
 }

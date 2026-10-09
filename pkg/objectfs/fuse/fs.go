@@ -319,7 +319,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 			return fs.grpcErrorToStatus("Truncate:Sync", err)
 		}
 		syncCancel()
-		fs.cache.Truncate(input.NodeId, int64(input.Size), time.Now())
+		truncGen := fs.cache.Truncate(input.NodeId, int64(input.Size), time.Now())
 		resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
 			VolumeId: fs.volumeID,
 			Inode:    input.NodeId,
@@ -331,7 +331,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
 		}
-		fs.cache.MarkClean(input.NodeId)
+		fs.cache.MarkSizeClean(input.NodeId, truncGen)
 		finalAttr = resp.GetAttr()
 	}
 
@@ -799,6 +799,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		}
 
 		// 2. Not in cache: fetch chunk from controller
+		readGen := fs.cache.GetGeneration(input.NodeId)
 		resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
 			VolumeId: fs.volumeID,
 			Inode:    input.NodeId,
@@ -819,7 +820,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		fetchedData := resp.GetData()
 		// Cache full clean chunk if complete
 		if (int64(len(fetchedData)) == cs || resp.GetEof()) && len(fetchedData) > 0 {
-			fs.cache.PutChunk(input.NodeId, i, uint32(cs), resp.GetTotalSize(), fetchedData, time.Now())
+			fs.cache.PutChunk(input.NodeId, i, uint32(cs), resp.GetTotalSize(), fetchedData, time.Now(), readGen)
 		}
 
 		// If chunk has fewer bytes than expected by totalSize (e.g. hole or unflushed write), zero pad
@@ -868,8 +869,13 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 		}
 
 		if wStart > chunkStart || wEnd < chunkEnd {
+			clientSize, hasSize := fs.cache.GetSize(input.NodeId)
+			if hasSize && chunkStart >= clientSize {
+				continue
+			}
 			if _, ok := fs.cache.GetChunk(input.NodeId, int(i)); !ok {
 				ctx, cancelFunc := fs.makeSyncContext(cancel)
+				readGen := fs.cache.GetGeneration(input.NodeId)
 				resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
 					VolumeId: fs.volumeID,
 					Inode:    input.NodeId,
@@ -880,7 +886,7 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 				if err != nil {
 					fs.logRPCError("Write:ReadFile", err)
 				} else if resp.GetError() == 0 && len(resp.GetData()) > 0 {
-					fs.cache.PutChunk(input.NodeId, int(i), DefaultChunkSize, resp.GetTotalSize(), resp.GetData(), time.Now())
+					fs.cache.PutChunk(input.NodeId, int(i), DefaultChunkSize, resp.GetTotalSize(), resp.GetData(), time.Now(), readGen)
 				}
 			}
 		}
@@ -892,7 +898,7 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 }
 
 func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
-	dirtyChunks, chunkSize, _, isDirty := fs.cache.GetDirtyChunks(inode)
+	dirtyChunks, chunkGens, chunkSize, _, isDirty := fs.cache.GetDirtyChunks(inode)
 	if !isDirty || len(dirtyChunks) == 0 {
 		return nil
 	}
@@ -905,6 +911,7 @@ func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
 
 	for _, idx := range indices {
 		chunkData := dirtyChunks[idx]
+		chunkGen := chunkGens[idx]
 		chunkOffset := int64(idx) * int64(chunkSize)
 		resp, err := fs.client.WriteFile(ctx, &pb.WriteFileRequest{
 			VolumeId:  fs.volumeID,
@@ -920,7 +927,7 @@ func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
 		if resp.GetError() != 0 {
 			return syscall.Errno(resp.GetError())
 		}
-		fs.cache.MarkChunkClean(inode, idx)
+		fs.cache.MarkChunkClean(inode, idx, chunkGen)
 	}
 
 	return nil
