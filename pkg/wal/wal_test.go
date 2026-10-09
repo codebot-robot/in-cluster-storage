@@ -342,3 +342,49 @@ func TestLogSegmentStoreDeleteSegmentsThrough(t *testing.T) {
 	}
 	store.mu.RUnlock()
 }
+
+func TestParseAndFormatStreamPath(t *testing.T) {
+	streamID := uuid.MustParse("12345678-1234-1234-1234-123456789abc")
+
+	// Open file format
+	openName := FormatStreamFileName(1, 0, false)
+	if openName != "from00000000000000000001.wal" {
+		t.Fatalf("unexpected openName: %s", openName)
+	}
+	from, to, sealed, err := ParseStreamPath(openName)
+	if err != nil || from != 1 || to != 0 || sealed {
+		t.Fatalf("unexpected ParseStreamPath result: from=%d, to=%d, sealed=%v, err=%v", from, to, sealed, err)
+	}
+
+	// Sealed file format
+	sealedName := FormatStreamFileName(1, 100, true)
+	if sealedName != "from00000000000000000001-to00000000000000000100.wal" {
+		t.Fatalf("unexpected sealedName: %s", sealedName)
+	}
+	from, to, sealed, err = ParseStreamPath(sealedName)
+	if err != nil || from != 1 || to != 100 || !sealed {
+		t.Fatalf("unexpected ParseStreamPath result: from=%d, to=%d, sealed=%v, err=%v", from, to, sealed, err)
+	}
+
+	// Object storage key format
+	key := FormatStreamObjectKey(streamID, 1, 100)
+	expectedKey := "streams/12345678-1234-1234-1234-123456789abc/from00000000000000000001-to00000000000000000100.wal"
+	if key != expectedKey {
+		t.Fatalf("unexpected key: got %s, want %s", key, expectedKey)
+	}
+	from, to, sealed, err = ParseStreamPath(key)
+	if err != nil || from != 1 || to != 100 || !sealed {
+		t.Fatalf("unexpected ParseStreamPath result on key: from=%d, to=%d, sealed=%v, err=%v", from, to, sealed, err)
+	}
+
+	// Prefixed format
+	from, to, sealed, err = ParseStreamPath("stream1234-from00000000000000000005-to00000000000000000020.wal")
+	if err != nil || from != 5 || to != 20 || !sealed {
+		t.Fatalf("unexpected ParseStreamPath result on prefixed: from=%d, to=%d, sealed=%v, err=%v", from, to, sealed, err)
+	}
+
+	// Invalid format
+	if _, _, _, err := ParseStreamPath("invalid.wal"); err == nil {
+		t.Fatalf("expected error on invalid.wal")
+	}
+}

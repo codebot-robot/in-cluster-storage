@@ -22,7 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -46,13 +46,15 @@ const (
 
 // ServerConfig configures the WAL Buffer service.
 type ServerConfig struct {
-	Backend        objectstore.Backend
-	DataDir        string
-	FlushInterval  time.Duration
-	FlushBytes     int64
-	TailCacheBytes int64
-	BatchMaxDelay  time.Duration
-	BatchMaxSize   int64
+	Backend            objectstore.Backend
+	DataDir            string
+	FlushInterval      time.Duration
+	FlushBytes         int64
+	TailCacheBytes     int64
+	BatchMaxDelay      time.Duration
+	BatchMaxSize       int64
+	StreamSealInterval time.Duration
+	StreamSealBytes    int64
 }
 
 type incomingItem struct {
@@ -96,9 +98,9 @@ type Server struct {
 	lastFlushedPosition uint64
 	flushedSegments     []string
 	streams             map[string]*streamState // streamID string -> streamState
+	streamStore         *StreamStore
 
 	localStore *wal.LogSegmentStore
-	tempDir    string
 
 	incomingChan chan incomingItem
 
@@ -124,6 +126,9 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	if cfg.Backend == nil {
 		return nil, errors.New("backend cannot be nil")
 	}
+	if cfg.DataDir == "" {
+		return nil, errors.New("DataDir is required")
+	}
 	if cfg.FlushInterval <= 0 {
 		cfg.FlushInterval = DefaultFlushInterval
 	}
@@ -139,6 +144,15 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	if cfg.BatchMaxSize <= 0 {
 		cfg.BatchMaxSize = DefaultBatchSize
 	}
+	if cfg.StreamSealInterval <= 0 {
+		cfg.StreamSealInterval = DefaultStreamSealInterval
+	}
+	if cfg.StreamSealBytes <= 0 {
+		cfg.StreamSealBytes = DefaultStreamSealBytes
+	}
+
+	dataDir := cfg.DataDir
+	streamStore := NewStreamStore(dataDir, cfg.Backend, cfg.StreamSealInterval, cfg.StreamSealBytes)
 
 	// 1. Discover existing segments from backend
 	discoveredSegments, lastFlushedPos, err := ListSegmentsFromBackend(ctx, cfg.Backend)
@@ -146,12 +160,15 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to list segments from backend: %w", err)
 	}
 
+	var allDiscoveredRecords []*wal.LogRecord
 	streamWatermarks := make(map[string]uint64)
 	for _, segPath := range discoveredSegments {
 		records, err := ReadSegmentFromBackend(ctx, cfg.Backend, segPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to recover stream watermarks from segment %s: %w", segPath, err)
 		}
+		streamStore.TrackSegmentCoverage(segPath, records)
+		allDiscoveredRecords = append(allDiscoveredRecords, records...)
 		for _, rec := range records {
 			sid := rec.StreamID.String()
 			if rec.StreamSeq > streamWatermarks[sid] {
@@ -159,28 +176,17 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 			}
 		}
 	}
+	if err := streamStore.Recover(ctx, allDiscoveredRecords); err != nil {
+		klog.Warningf("Error during stream store recovery: %v", err)
+	}
 
 	nextPosition := lastFlushedPos + 1
 
 	klog.Infof("WAL Buffer initializing: assigning positions starting at %d (last_flushed_position=%d, segments=%d, streams=%d)", nextPosition, lastFlushedPos, len(discoveredSegments), len(streamWatermarks))
 
 	// 2. Setup local segment store with a fixed prefix
-	dataDir := cfg.DataDir
-	var tempDir string
-	if dataDir == "" {
-		td, err := os.MkdirTemp("", "wal-buffer-data-*")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create temp data dir: %w", err)
-		}
-		dataDir = td
-		tempDir = td
-	}
-
 	localStore, err := wal.NewLogSegmentStore(dataDir, "log", cfg.FlushBytes)
 	if err != nil {
-		if tempDir != "" {
-			_ = os.RemoveAll(tempDir)
-		}
 		return nil, fmt.Errorf("failed to initialize local segment store: %w", err)
 	}
 
@@ -191,8 +197,8 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		lastFlushedPosition: lastFlushedPos,
 		flushedSegments:     discoveredSegments,
 		streams:             make(map[string]*streamState),
+		streamStore:         streamStore,
 		localStore:          localStore,
-		tempDir:             tempDir,
 		incomingChan:        make(chan incomingItem, 1024),
 		tailWaiters:         make(map[chan struct{}]struct{}),
 		stopChan:            make(chan struct{}),
@@ -203,6 +209,8 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	for sid, seq := range streamWatermarks {
 		s.streams[sid] = newStreamState(seq, seq)
 	}
+
+	s.checkAggregatedSegmentGC(ctx)
 
 	// Start background group commit worker
 	s.wg.Add(1)
@@ -241,14 +249,16 @@ func (s *Server) Close() error {
 		errs = append(errs, err)
 	}
 
+	if err := s.streamStore.Close(ctx); err != nil {
+		klog.Warningf("Error closing stream store: %v", err)
+		errs = append(errs, err)
+	}
+
 	if s.localStore != nil {
 		if err := s.localStore.Close(); err != nil {
 			klog.Warningf("Error closing local store: %v", err)
 			errs = append(errs, err)
 		}
-	}
-	if s.tempDir != "" {
-		_ = os.RemoveAll(s.tempDir)
 	}
 	return errors.Join(errs...)
 }
@@ -555,6 +565,8 @@ func (s *Server) commitItems(items []incomingItem) {
 		return
 	}
 
+	s.streamStore.AppendRecords(recordsToStore)
+
 	// 2. Add to unflushed queue and notify tail waiters
 	s.unflushedMu.Lock()
 	for _, rec := range recordsToStore {
@@ -747,6 +759,9 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 	}
 	s.mu.Unlock()
 
+	s.streamStore.TrackSegmentCoverage(segPath, records)
+	s.checkAggregatedSegmentGC(ctx)
+
 	// 4. Clean up local segment files that have been flushed to permanent storage
 	if err := s.localStore.DeleteSegmentsThrough(s.lastFlushedPosition, s.cfg.TailCacheBytes); err != nil {
 		klog.Warningf("Error cleaning local segment files: %v", err)
@@ -762,26 +777,20 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 }
 
 // Tail streams merged records in position order from object storage, local disk, and live incoming commits.
-// When stream_id is set in req, Tail filters records to only return those matching stream_id with
-// stream_seq > from_stream_seq.
-// Positions are strictly increasing within a witness incarnation; positions above the last flushed position
-// are provisional and may be reassigned after a restart.
-// Tail clamps from_position to last_flushed_position + 1 when it exceeds that, returning the effective start
-// in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq) and must
-// tolerate re-delivery from the last flushed position after reconnecting.
-//
-// TODO: Add a per-segment index of per-stream sequence ranges to avoid scanning
-// unneeded segments when filtering by stream_id and from_stream_seq.
+// When stream_id is set in req, Tail delegates directly to tailPerStream, streaming only that stream's
+// records from per-stream files.
+// When stream_id is unset, Tail serves as an unfiltered, position-ordered tooling and debug path
+// streaming across all aggregated segments.
 func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
 	ctx := stream.Context()
 
-	var filterStreamID uuid.UUID
-	hasStreamFilter := len(req.StreamId) > 0
-	if hasStreamFilter {
+	if len(req.StreamId) > 0 {
 		if len(req.StreamId) != 16 {
 			return status.Errorf(codes.InvalidArgument, "stream_id must be exactly 16 bytes")
 		}
+		var filterStreamID uuid.UUID
 		copy(filterStreamID[:], req.StreamId)
+		return s.tailPerStream(ctx, filterStreamID, req, stream)
 	}
 
 	fromPos := req.FromPosition
@@ -802,11 +811,6 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 	firstSent := false
 
 	sendRecord := func(rec *wal.LogRecord) error {
-		if hasStreamFilter {
-			if rec.StreamID != filterStreamID || rec.StreamSeq <= req.FromStreamSeq {
-				return nil
-			}
-		}
 		resp := &pb.TailResponse{Record: rec.ToProto()}
 		if !firstSent {
 			resp.ResumedFrom = fromPos
@@ -895,6 +899,191 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 		}
 
 		// 5. Block on new commits, cancellation, or shutdown
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.stopChan:
+			return nil
+		case <-waitChan:
+		}
+	}
+}
+
+func (s *Server) checkAggregatedSegmentGC(ctx context.Context) {
+	deleted, err := s.streamStore.CheckSegmentGC(ctx)
+	if err != nil {
+		klog.Warningf("Aggregated segment GC error: %v", err)
+	}
+	if len(deleted) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deletedMap := make(map[string]bool)
+	for _, d := range deleted {
+		deletedMap[d] = true
+	}
+	var remaining []string
+	for _, seg := range s.flushedSegments {
+		if !deletedMap[seg] {
+			remaining = append(remaining, seg)
+		}
+	}
+	s.flushedSegments = remaining
+}
+
+// SealStreams flushes, seals, and uploads all active streams with records.
+func (s *Server) SealStreams(ctx context.Context) error {
+	_, err := s.streamStore.SealAll(ctx)
+	s.checkAggregatedSegmentGC(ctx)
+	return err
+}
+
+// SealStream seals and uploads a specific stream with records.
+func (s *Server) SealStream(ctx context.Context, streamID uuid.UUID) error {
+	_, err := s.streamStore.SealStream(ctx, streamID)
+	s.checkAggregatedSegmentGC(ctx)
+	return err
+}
+
+// TrimStreamHistory deletes sealed per-stream files in object storage <= trimSeq, guarded strictly by snapshotSeq.
+func (s *Server) TrimStreamHistory(ctx context.Context, streamID uuid.UUID, trimSeq, snapshotSeq uint64) ([]string, error) {
+	return s.streamStore.TrimStreamHistory(ctx, streamID, trimSeq, snapshotSeq)
+}
+
+func (s *Server) tailPerStream(ctx context.Context, streamID uuid.UUID, req *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
+	fromSeq := req.FromStreamSeq
+	fromPos := req.FromPosition
+	firstSent := false
+
+	resumedFrom := fromPos
+	if resumedFrom == 0 {
+		resumedFrom = 1
+	}
+
+	sendRecord := func(rec *wal.LogRecord) error {
+		if rec.StreamID != streamID || rec.StreamSeq <= fromSeq {
+			return nil
+		}
+		if fromPos > 0 && rec.Position < fromPos {
+			return nil
+		}
+		resp := &pb.TailResponse{Record: rec.ToProto()}
+		if !firstSent {
+			resp.ResumedFrom = resumedFrom
+			firstSent = true
+		}
+		if err := stream.Send(resp); err != nil {
+			return err
+		}
+		fromSeq = rec.StreamSeq
+		return nil
+	}
+
+	w := s.streamStore.getOrCreateStream(streamID)
+	if err := w.flushPending(); err != nil {
+		return fmt.Errorf("failed to flush pending stream records for tail: %w", err)
+	}
+
+	// 1. Stream records from sealed files
+	sealedList := w.getSealedMetas(ctx, s.backend)
+	for _, sm := range sealedList {
+		if sm.ToSeq <= fromSeq {
+			continue
+		}
+		var records []*wal.LogRecord
+		if sm.Path != "" {
+			if recs, _, err := ReadRecordsFromOffset(sm.Path, 0); err == nil && len(recs) > 0 {
+				records = recs
+			}
+		}
+		if records == nil && sm.Key != "" && s.backend != nil {
+			if recs, err := ReadSegmentFromBackend(ctx, s.backend, sm.Key); err == nil {
+				records = recs
+			}
+		}
+		for _, rec := range records {
+			if err := sendRecord(rec); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 2. Track open file state and offset
+	w.mu.Lock()
+	curOpenFrom := w.openFrom
+	openDir := w.dir
+	w.mu.Unlock()
+
+	var openOffset int64
+	if curOpenFrom > 0 {
+		openPath := filepath.Join(openDir, wal.FormatStreamFileName(curOpenFrom, 0, false))
+		recs, nextOffset, err := ReadRecordsFromOffset(openPath, 0)
+		if err != nil {
+			return fmt.Errorf("failed to read open stream file %s: %w", openPath, err)
+		}
+		openOffset = nextOffset
+		for _, rec := range recs {
+			if err := sendRecord(rec); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 3. Live streaming loop: reads only newly appended bytes starting at openOffset
+	waitChan := make(chan struct{}, 10)
+	s.tailMu.Lock()
+	s.tailWaiters[waitChan] = struct{}{}
+	s.tailMu.Unlock()
+	defer func() {
+		s.tailMu.Lock()
+		delete(s.tailWaiters, waitChan)
+		s.tailMu.Unlock()
+	}()
+
+	for {
+		if err := w.flushPending(); err != nil {
+			return fmt.Errorf("failed to flush pending stream records for tail: %w", err)
+		}
+
+		w.mu.Lock()
+		latestOpenFrom := w.openFrom
+		w.mu.Unlock()
+
+		if latestOpenFrom != curOpenFrom && curOpenFrom > 0 {
+			sealedList = w.getSealedMetas(ctx, s.backend)
+			for _, sm := range sealedList {
+				if sm.FromSeq == curOpenFrom && sm.Path != "" {
+					recs, _, err := ReadRecordsFromOffset(sm.Path, openOffset)
+					if err != nil {
+						return fmt.Errorf("failed to read sealed stream file %s: %w", sm.Path, err)
+					}
+					for _, rec := range recs {
+						if err := sendRecord(rec); err != nil {
+							return err
+						}
+					}
+					break
+				}
+			}
+			curOpenFrom = latestOpenFrom
+			openOffset = 0
+		}
+
+		if curOpenFrom > 0 {
+			openPath := filepath.Join(openDir, wal.FormatStreamFileName(curOpenFrom, 0, false))
+			recs, nextOffset, err := ReadRecordsFromOffset(openPath, openOffset)
+			if err != nil {
+				return fmt.Errorf("failed to read open stream file %s: %w", openPath, err)
+			}
+			openOffset = nextOffset
+			for _, rec := range recs {
+				if err := sendRecord(rec); err != nil {
+					return err
+				}
+			}
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
