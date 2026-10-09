@@ -92,19 +92,29 @@ func TestNodeCacheWriteAndDirtyTracking(t *testing.T) {
 	}
 
 	// Mark clean
-	cache.MarkClean(100)
+	dirty, gens, _, _, ok := cache.GetDirtyChunks(100)
+	if !ok || len(dirty) == 0 {
+		t.Fatalf("Expected dirty chunks for inode 100")
+	}
+	for idx, g := range gens {
+		cache.MarkChunkClean(100, idx, g)
+	}
 	if _, isDirty := cache.GetDirty(100); isDirty {
-		t.Fatalf("Expected inode 100 to be clean after MarkClean")
+		t.Fatalf("Expected inode 100 to be clean after MarkChunkClean")
 	}
 	if len(cache.GetDirtyEntries()) != 0 {
-		t.Fatalf("Expected 0 dirty entries after MarkClean")
+		t.Fatalf("Expected 0 dirty entries after MarkChunkClean")
 	}
 
 	// Truncate
-	cache.Truncate(100, 5, time.Now())
+	truncGen := cache.Truncate(100, 5, time.Now())
 	entryTrunc, ok := cache.Get(100)
 	if !ok || !entryTrunc.IsDirty || string(entryTrunc.Data) != "hello" {
 		t.Fatalf("Expected dirty truncated entry 'hello', got %q (dirty=%v)", string(entryTrunc.Data), entryTrunc.IsDirty)
+	}
+	cache.MarkSizeClean(100, truncGen)
+	if _, isDirty := cache.GetDirty(100); isDirty {
+		t.Fatalf("Expected inode 100 to be clean after MarkSizeClean")
 	}
 }
 
@@ -117,9 +127,9 @@ func TestNodeCacheChunkOperations(t *testing.T) {
 	c1 := []byte("ghijklmnopqrstuv")
 	c2 := []byte("wxyz0123456789AB")
 
-	cache.PutChunk(200, 0, chunkSize, totalSize, c0, time.Now())
-	cache.PutChunk(200, 1, chunkSize, totalSize, c1, time.Now())
-	cache.PutChunk(200, 2, chunkSize, totalSize, c2, time.Now())
+	cache.PutChunk(200, 0, chunkSize, totalSize, c0, time.Now(), cache.GetGeneration(200))
+	cache.PutChunk(200, 1, chunkSize, totalSize, c1, time.Now(), cache.GetGeneration(200))
+	cache.PutChunk(200, 2, chunkSize, totalSize, c2, time.Now(), cache.GetGeneration(200))
 
 	// Get individual chunk
 	readC1, ok := cache.GetChunk(200, 1)
@@ -136,7 +146,7 @@ func TestNodeCacheChunkOperations(t *testing.T) {
 
 	// Range with missing chunk should return false (cache miss)
 	cache.Invalidate(200)
-	cache.PutChunk(200, 0, chunkSize, totalSize, c0, time.Now())
+	cache.PutChunk(200, 0, chunkSize, totalSize, c0, time.Now(), cache.GetGeneration(200))
 	// Chunk 1 is missing
 	_, ok = cache.GetRange(200, 10, 10)
 	if ok {
@@ -163,5 +173,150 @@ func TestNodeCacheSparseGetRangeAndWriteAt(t *testing.T) {
 	}
 	if string(data[10:]) != "world" {
 		t.Fatalf("Expected 'world' at offset 10, got %q", string(data[10:]))
+	}
+}
+
+func TestNodeCacheFlushRaceWriteGeneration(t *testing.T) {
+	c := NewNodeCache(1024 * 1024)
+	ino := uint64(10)
+	now := time.Now()
+
+	c.WriteAt(ino, 0, []byte("version-1"), now)
+	dirty, gens, _, _, ok := c.GetDirtyChunks(ino)
+	if !ok || len(dirty) != 1 {
+		t.Fatalf("Expected 1 dirty chunk for version-1")
+	}
+
+	// Concurrent write arrives while flusher is uploading version-1
+	c.WriteAt(ino, 0, []byte("version-2"), now)
+
+	// Flusher finishes uploading version-1 and calls MarkChunkClean with version-1 generation
+	for idx := range dirty {
+		c.MarkChunkClean(ino, idx, gens[idx])
+	}
+
+	// Cached chunk 0 must still be dirty with "version-2" (not lost!)
+	dirtyAfter, gensAfter, _, _, isDirty := c.GetDirtyChunks(ino)
+	if !isDirty {
+		t.Fatalf("Expected entry to remain dirty after concurrent write during flush")
+	}
+	if len(dirtyAfter) != 1 || string(dirtyAfter[0]) != "version-2" {
+		t.Fatalf("Expected dirty chunk 0 to be 'version-2', got %v", dirtyAfter)
+	}
+
+	// Subsequent flush of version-2 should successfully clear dirty state
+	c.MarkChunkClean(ino, 0, gensAfter[0])
+	if _, _, _, _, isDirty := c.GetDirtyChunks(ino); isDirty {
+		t.Fatalf("Expected entry to be clean after flushing version-2")
+	}
+}
+
+func TestNodeCacheStaleReadSizeAfterTruncate(t *testing.T) {
+	c := NewNodeCache(1 << 30)
+	now := time.Now()
+	ino := uint64(20)
+
+	// Op 108: file at size 0x8110df
+	cs := int64(DefaultChunkSize)
+	c.PutChunk(ino, 0x5a, DefaultChunkSize, 0x8110df, make([]byte, cs), now, c.GetGeneration(ino))
+
+	// Op 111: mapread issues an RPC, capturing generation
+	readGen := c.GetGeneration(ino)
+
+	// Op 112: truncate down to 0x71046a and mark clean
+	truncGen := c.Truncate(ino, 0x71046a, now)
+	c.MarkSizeClean(ino, truncGen)
+
+	// Late readahead completes with older generation
+	c.PutChunk(ino, 0x81, DefaultChunkSize, 0x8110df, make([]byte, 0x10df), now, readGen)
+
+	// Op 114: in-place write well inside file
+	c.WriteAt(ino, 0x1e7c27, make([]byte, 0xcdf4), now)
+
+	entry, ok := c.GetDirty(ino)
+	if !ok {
+		t.Fatalf("Expected dirty entry after write")
+	}
+	if entry.Size != 0x71046a {
+		t.Fatalf("Size error: got 0x%x, want 0x71046a (stale read resurrected old size)", entry.Size)
+	}
+}
+
+func TestNodeCacheReadRacingTruncateRPC(t *testing.T) {
+	c := NewNodeCache(1 << 30)
+	ino := uint64(30)
+	now := time.Now()
+	cs := int64(DefaultChunkSize)
+
+	// File on remote has 3 chunks (size 3*cs)
+	c.PutChunk(ino, 0, DefaultChunkSize, 3*cs, make([]byte, cs), now, c.GetGeneration(ino))
+
+	// Local truncate down to cs/2; TruncateFile RPC in flight
+	truncGen := c.Truncate(ino, cs/2, now)
+
+	// Concurrent reader issues ReadFile carrying the current generation
+	readGen := c.GetGeneration(ino)
+
+	// Controller answers with pre-truncate size (3*cs) and chunk 2
+	c.PutChunk(ino, 2, DefaultChunkSize, 3*cs, make([]byte, cs), now, readGen)
+
+	// TruncateFile RPC finishes and acknowledges size
+	c.MarkSizeClean(ino, truncGen)
+
+	// Subsequent in-place write
+	c.WriteAt(ino, 0, []byte("x"), now)
+
+	entry, ok := c.GetDirty(ino)
+	if !ok {
+		t.Fatalf("Expected dirty entry after write")
+	}
+	if entry.Size != cs/2 {
+		t.Fatalf("Size error: got %d, want %d (stale remote size resurrected after truncate)", entry.Size, cs/2)
+	}
+	if _, ok := c.GetChunk(ino, 2); ok {
+		t.Fatalf("Chunk 2 should have been dropped by PutChunk past local EOF")
+	}
+}
+
+func TestNodeCacheGenerationsSurviveEviction(t *testing.T) {
+	c := NewNodeCache(1 << 30)
+	ino := uint64(40)
+	now := time.Now()
+	cs := int64(DefaultChunkSize)
+
+	// Writes advance generation
+	c.WriteAt(ino, 0, []byte("initial-data"), now)
+	readGen := c.GetGeneration(ino)
+
+	// Truncate and mark size clean
+	truncGen := c.Truncate(ino, 3, now)
+	c.MarkSizeClean(ino, truncGen)
+	// Clear any dirty chunks from initial write so entry is fully clean
+	_, gens, _, _, _ := c.GetDirtyChunks(ino)
+	for idx, g := range gens {
+		c.MarkChunkClean(ino, idx, g)
+	}
+
+	// Evict the clean entry
+	c.InvalidateIfNotDirty(ino)
+	if _, ok := c.Get(ino); ok {
+		t.Fatalf("Expected entry to be evicted")
+	}
+
+	// Inode is recreated by a new write (advancing cache-wide generation)
+	c.WriteAt(ino, 0, []byte("new"), now)
+
+	// Stale PutChunk from before eviction arrives carrying readGen
+	c.PutChunk(ino, 1, DefaultChunkSize, 2*cs, make([]byte, cs), now, readGen)
+
+	entry, ok := c.GetDirty(ino)
+	if !ok {
+		t.Fatalf("Expected dirty entry")
+	}
+	if entry.Size != 3 {
+		t.Fatalf("Expected entry size 3, got %d (stale completion survived eviction)", entry.Size)
+	}
+	if _, ok := c.GetChunk(ino, 1); ok {
+		t.Fatalf("Chunk 1 should have been dropped due to stale generation")
 	}
 }

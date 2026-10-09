@@ -23,6 +23,20 @@ import (
 
 const DefaultChunkSize uint32 = 64 * 1024
 
+// Generation represents a monotonically increasing cache-wide sequence number
+// used to order local file mutations and asynchronous completions.
+//
+// The node cache has to support concurrent reads, writes and truncates on one
+// file, plus asynchronous completions (read replies, flush acknowledgements,
+// truncate acknowledgements, watch invalidations) whose arrival order does not
+// match the order in which the operations took effect. We therefore linearise
+// on a cache-wide monotonic Generation: every local mutation takes the next value,
+// every in-flight operation records the generation it was issued against, and a
+// completion is applied only if nothing newer has happened to the state it touches.
+// Locally-mutated state that has not yet been acknowledged by the controller is
+// authoritative over anything the controller reports in the meantime.
+type Generation uint64
+
 type CachedEntry struct {
 	Inode       uint64
 	Path        string
@@ -34,7 +48,9 @@ type CachedEntry struct {
 	Sha256      string
 	ChunkSize   uint32
 	Chunks      map[int][]byte
-	DirtyChunks map[int]bool
+	DirtyChunks map[int]Generation
+	Generation  Generation
+	SizeGen     Generation
 }
 
 type NodeCache struct {
@@ -42,6 +58,7 @@ type NodeCache struct {
 	entries  map[uint64]*CachedEntry
 	maxBytes int64
 	curBytes int64
+	curGen   Generation
 }
 
 func NewNodeCache(maxBytes int64) *NodeCache {
@@ -153,7 +170,17 @@ func (c *NodeCache) GetRange(inode uint64, offset, length int64) ([]byte, bool) 
 	return res, true
 }
 
-func (c *NodeCache) PutChunk(inode uint64, chunkIdx int, chunkSize uint32, totalSize int64, data []byte, modTime time.Time) {
+func (c *NodeCache) GetGeneration(inode uint64) Generation {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if entry, ok := c.entries[inode]; ok {
+		return entry.Generation
+	}
+	return c.curGen
+}
+
+func (c *NodeCache) PutChunk(inode uint64, chunkIdx int, chunkSize uint32, totalSize int64, data []byte, modTime time.Time, gen Generation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -162,6 +189,14 @@ func (c *NodeCache) PutChunk(inode uint64, chunkIdx int, chunkSize uint32, total
 	}
 
 	entry, ok := c.entries[inode]
+	currentGen := c.curGen
+	if ok {
+		currentGen = entry.Generation
+	}
+	if gen < currentGen {
+		return
+	}
+
 	if !ok {
 		entry = &CachedEntry{
 			Inode:       inode,
@@ -170,7 +205,8 @@ func (c *NodeCache) PutChunk(inode uint64, chunkIdx int, chunkSize uint32, total
 			LastRead:    time.Now(),
 			ChunkSize:   chunkSize,
 			Chunks:      make(map[int][]byte),
-			DirtyChunks: make(map[int]bool),
+			DirtyChunks: make(map[int]Generation),
+			Generation:  gen,
 		}
 		c.entries[inode] = entry
 	}
@@ -178,19 +214,19 @@ func (c *NodeCache) PutChunk(inode uint64, chunkIdx int, chunkSize uint32, total
 		entry.Chunks = make(map[int][]byte)
 	}
 	if entry.DirtyChunks == nil {
-		entry.DirtyChunks = make(map[int]bool)
+		entry.DirtyChunks = make(map[int]Generation)
 	}
 
-	// Don't overwrite dirty chunk with stale data from remote
-	if entry.DirtyChunks[chunkIdx] {
+	// Don't overwrite dirty chunk with data from remote
+	if _, isDirty := entry.DirtyChunks[chunkIdx]; isDirty {
 		return
 	}
 
-	isLocalDirty := ok && (entry.IsDirty || len(entry.DirtyChunks) > 0)
+	isLocalDirty := ok && (entry.IsDirty || len(entry.DirtyChunks) > 0 || entry.SizeGen != 0)
 	chunkStart := int64(chunkIdx) * int64(chunkSize)
 
 	// If entry has uncommitted local modifications (e.g. locally dirty or truncated),
-	// do not let a stale read racing from before a truncate resurrect chunks past EOF
+	// do not let a read racing before controller sync resurrect chunks past local EOF
 	// or expand the entry size. For clean entries, trust remote totalSize.
 	if isLocalDirty && chunkStart >= entry.Size {
 		return
@@ -271,13 +307,13 @@ func (c *NodeCache) GetDirty(inode uint64) (*CachedEntry, bool) {
 	return &copyEntry, true
 }
 
-func (c *NodeCache) GetDirtyChunks(inode uint64) (map[int][]byte, uint32, int64, bool) {
+func (c *NodeCache) GetDirtyChunks(inode uint64) (map[int][]byte, map[int]Generation, uint32, int64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	entry, ok := c.entries[inode]
 	if !ok || !entry.IsDirty || len(entry.DirtyChunks) == 0 {
-		return nil, 0, 0, false
+		return nil, nil, 0, 0, false
 	}
 
 	chunkSize := entry.ChunkSize
@@ -286,25 +322,29 @@ func (c *NodeCache) GetDirtyChunks(inode uint64) (map[int][]byte, uint32, int64,
 	}
 
 	res := make(map[int][]byte, len(entry.DirtyChunks))
-	for idx := range entry.DirtyChunks {
+	gens := make(map[int]Generation, len(entry.DirtyChunks))
+	for idx, gen := range entry.DirtyChunks {
 		if chunk, ok := entry.Chunks[idx]; ok {
 			cCopy := make([]byte, len(chunk))
 			copy(cCopy, chunk)
 			res[idx] = cCopy
+			gens[idx] = gen
 		}
 	}
-	return res, chunkSize, entry.Size, true
+	return res, gens, chunkSize, entry.Size, true
 }
 
-func (c *NodeCache) MarkChunkClean(inode uint64, chunkIdx int) {
+func (c *NodeCache) MarkChunkClean(inode uint64, chunkIdx int, gen Generation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if entry, ok := c.entries[inode]; ok {
 		if entry.DirtyChunks != nil {
-			delete(entry.DirtyChunks, chunkIdx)
+			if dirtyGen, ok := entry.DirtyChunks[chunkIdx]; ok && dirtyGen <= gen {
+				delete(entry.DirtyChunks, chunkIdx)
+			}
 		}
-		if len(entry.DirtyChunks) == 0 {
+		if len(entry.DirtyChunks) == 0 && entry.SizeGen == 0 {
 			entry.IsDirty = false
 		}
 	}
@@ -324,13 +364,17 @@ func (c *NodeCache) GetDirtyEntries() []*CachedEntry {
 	return dirty
 }
 
-func (c *NodeCache) MarkClean(inode uint64) {
+func (c *NodeCache) MarkSizeClean(inode uint64, gen Generation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if entry, ok := c.entries[inode]; ok {
-		entry.IsDirty = false
-		entry.DirtyChunks = make(map[int]bool)
+		if entry.SizeGen <= gen {
+			entry.SizeGen = 0
+		}
+		if len(entry.DirtyChunks) == 0 && entry.SizeGen == 0 {
+			entry.IsDirty = false
+		}
 	}
 }
 
@@ -377,7 +421,8 @@ func (c *NodeCache) Put(inode uint64, data []byte, modTime time.Time, sha256 str
 		IsDirty:     false,
 		ChunkSize:   DefaultChunkSize,
 		Chunks:      make(map[int][]byte),
-		DirtyChunks: make(map[int]bool),
+		DirtyChunks: make(map[int]Generation),
+		Generation:  c.curGen,
 	}
 
 	cs := int64(DefaultChunkSize)
@@ -412,6 +457,9 @@ func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime tim
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.curGen++
+	gen := c.curGen
+
 	entry, ok := c.entries[inode]
 	if !ok {
 		entry = &CachedEntry{
@@ -422,7 +470,7 @@ func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime tim
 			IsDirty:     true,
 			ChunkSize:   DefaultChunkSize,
 			Chunks:      make(map[int][]byte),
-			DirtyChunks: make(map[int]bool),
+			DirtyChunks: make(map[int]Generation),
 		}
 		c.entries[inode] = entry
 	}
@@ -430,11 +478,13 @@ func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime tim
 		entry.Chunks = make(map[int][]byte)
 	}
 	if entry.DirtyChunks == nil {
-		entry.DirtyChunks = make(map[int]bool)
+		entry.DirtyChunks = make(map[int]Generation)
 	}
 	if entry.ChunkSize == 0 {
 		entry.ChunkSize = DefaultChunkSize
 	}
+
+	entry.Generation = gen
 
 	cs := int64(entry.ChunkSize)
 	newSize := offset + int64(len(data))
@@ -481,7 +531,7 @@ func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime tim
 
 		copy(chunkBuf[wStart:wEnd], data[dataStart:dataEnd])
 		entry.Chunks[i] = chunkBuf
-		entry.DirtyChunks[i] = true
+		entry.DirtyChunks[i] = gen
 	}
 
 	entry.Size = newSize
@@ -494,9 +544,12 @@ func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime tim
 	return entry.Size
 }
 
-func (c *NodeCache) Truncate(inode uint64, size int64, modTime time.Time) {
+func (c *NodeCache) Truncate(inode uint64, size int64, modTime time.Time) Generation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	c.curGen++
+	gen := c.curGen
 
 	entry, ok := c.entries[inode]
 	if !ok {
@@ -508,11 +561,16 @@ func (c *NodeCache) Truncate(inode uint64, size int64, modTime time.Time) {
 			IsDirty:     true,
 			ChunkSize:   DefaultChunkSize,
 			Chunks:      make(map[int][]byte),
-			DirtyChunks: make(map[int]bool),
+			DirtyChunks: make(map[int]Generation),
+			Generation:  gen,
+			SizeGen:     gen,
 		}
 		c.entries[inode] = entry
-		return
+		return gen
 	}
+
+	entry.Generation = gen
+	entry.SizeGen = gen
 
 	cs := int64(entry.ChunkSize)
 	if cs == 0 {
@@ -545,6 +603,7 @@ func (c *NodeCache) Truncate(inode uint64, size int64, modTime time.Time) {
 	entry.ModTime = modTime
 	entry.LastRead = time.Now()
 	entry.IsDirty = true
+	return gen
 }
 
 func (c *NodeCache) evictIfNeededLocked(neededBytes int64) {
@@ -555,7 +614,7 @@ func (c *NodeCache) evictIfNeededLocked(neededBytes int64) {
 
 		// Prefer evicting non-dirty entries first
 		for ino, e := range c.entries {
-			if !e.IsDirty && len(e.DirtyChunks) == 0 {
+			if !e.IsDirty && len(e.DirtyChunks) == 0 && e.SizeGen == 0 {
 				if !foundClean || e.LastRead.Before(oldestTime) {
 					oldestInode = ino
 					oldestTime = e.LastRead
@@ -588,11 +647,14 @@ func (c *NodeCache) Invalidate(inode uint64) {
 	}
 }
 
+// InvalidateIfNotDirty evicts inode from cache if it has no uncommitted local mutations.
+// Watch events from the controller do not carry client generations; we drop clean cached
+// state so subsequent reads will refetch authoritative state from the controller.
 func (c *NodeCache) InvalidateIfNotDirty(inode uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if old, ok := c.entries[inode]; ok && !old.IsDirty && len(old.DirtyChunks) == 0 {
+	if old, ok := c.entries[inode]; ok && !old.IsDirty && len(old.DirtyChunks) == 0 && old.SizeGen == 0 {
 		c.curBytes -= entryBytes(old)
 		delete(c.entries, inode)
 	}
@@ -603,7 +665,7 @@ func (c *NodeCache) InvalidateAllClean() {
 	defer c.mu.Unlock()
 
 	for ino, entry := range c.entries {
-		if !entry.IsDirty && len(entry.DirtyChunks) == 0 {
+		if !entry.IsDirty && len(entry.DirtyChunks) == 0 && entry.SizeGen == 0 {
 			c.curBytes -= entryBytes(entry)
 			delete(c.entries, ino)
 		}
