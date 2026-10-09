@@ -613,6 +613,163 @@ func TestViewTruncateDeletesAndScanOrder(t *testing.T) {
 	}
 }
 
+// TestViewConcurrentScanAndDeletes verifies that continuous Scan calls never return rows that
+// were deleted at or before the scan's start, even while writer commits deletes and the background
+// applier asynchronously moves changes from the overlay to the underlying index.
+func TestViewConcurrentScanAndDeletes(t *testing.T) {
+	for _, factory := range testFactories(t) {
+		t.Run(factory.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+
+			streamID := uuid.New().String()
+			idx, cleanup := factory.create(t, ctx, streamID)
+			defer cleanup()
+
+			transport := &memoryTransport{}
+			writer := sds.NewWriter(transport)
+
+			chunkMD := dynamicDescriptor(t, "FileChunk", []*descriptorpb.FieldDescriptorProto{
+				protoField("ino", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+				protoField("index", 2, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+				protoField("sha256", 3, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+			})
+			if _, err := writer.RegisterDescriptor(chunkMD, 1, 2); err != nil {
+				t.Fatalf("RegisterDescriptor failed: %v", err)
+			}
+
+			// Use small batch size so the applier processes batches frequently.
+			v := view.New(idx,
+				view.WithBatchSize(5),
+				view.WithRegistry(writer.Registry()),
+			)
+			defer v.Close()
+			if err := v.SyncRegistry(ctx, writer.Registry()); err != nil {
+				t.Fatalf("SyncRegistry failed: %v", err)
+			}
+
+			reader := sds.NewChangeReader()
+			if err := reader.Registry().Import(writer.Registry().Export()); err != nil {
+				t.Fatalf("Import failed: %v", err)
+			}
+
+			var feedMu sync.Mutex
+			readOffset := 0
+			consumeNewPayloadsLocked := func() {
+				for readOffset < len(transport.payloads) {
+					seq := uint64(readOffset + 1)
+					ch, err := reader.Feed(seq, transport.payloads[readOffset])
+					if err != nil {
+						t.Errorf("reader.Feed failed at seq %d: %v", seq, err)
+						return
+					}
+					if len(ch) > 0 {
+						v.ApplyChanges(ch)
+					}
+					readOffset++
+				}
+			}
+
+			// Pre-populate 100 chunks and flush to index
+			ino := int64(42)
+			totalChunks := int64(100)
+			for i := int64(0); i < totalChunks; i++ {
+				c := dynamicpb.NewMessage(chunkMD)
+				c.Set(chunkMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(ino))
+				c.Set(chunkMD.Fields().ByName("index"), protoreflect.ValueOfInt64(i))
+				c.Set(chunkMD.Fields().ByName("sha256"), protoreflect.ValueOfString(fmt.Sprintf("sha-%d", i)))
+				if _, err := writer.Insert(ctx, c); err != nil {
+					t.Fatalf("Insert failed: %v", err)
+				}
+			}
+			consumeNewPayloadsLocked()
+			if err := v.Flush(ctx); err != nil {
+				t.Fatalf("Flush failed: %v", err)
+			}
+
+			prefixMsg := dynamicpb.NewMessage(chunkMD)
+			prefixMsg.Set(chunkMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(ino))
+			prefixBytes, err := sds.EncodeKeyPrefix(prefixMsg, 1)
+			if err != nil {
+				t.Fatalf("EncodeKeyPrefix failed: %v", err)
+			}
+
+			var deletedMu sync.RWMutex
+			deletedKeys := make(map[int64]bool)
+
+			var wg sync.WaitGroup
+			var done atomic.Bool
+			var scanCount atomic.Int64
+
+			// Reader goroutine: scans continuously while writer deletes and applier applies
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for !done.Load() {
+					// Snapshot the keys committed as deleted prior to starting this scan
+					deletedMu.RLock()
+					deletedAtStart := make(map[int64]bool, len(deletedKeys))
+					for k, val := range deletedKeys {
+						deletedAtStart[k] = val
+					}
+					deletedMu.RUnlock()
+
+					// Execute Scan
+					for msg, scanErr := range v.Scan(ctx, "viewtest.FileChunk", prefixBytes) {
+						if scanErr != nil {
+							t.Errorf("Scan error: %v", scanErr)
+							return
+						}
+						dyn := msg.(*dynamicpb.Message)
+						chunkIdx := dyn.Get(dyn.Descriptor().Fields().ByName("index")).Int()
+						if deletedAtStart[chunkIdx] {
+							t.Errorf("Scan returned chunk %d which was committed-deleted before scan started", chunkIdx)
+							return
+						}
+					}
+					scanCount.Add(1)
+				}
+			}()
+
+			// Writer goroutine: deletes chunks in batches of 5
+			batchSize := int64(5)
+			for startIdx := int64(0); startIdx < totalChunks; startIdx += batchSize {
+				tx := writer.Begin()
+				var batchDeleted []int64
+				for i := startIdx; i < startIdx+batchSize && i < totalChunks; i++ {
+					c := dynamicpb.NewMessage(chunkMD)
+					c.Set(chunkMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(ino))
+					c.Set(chunkMD.Fields().ByName("index"), protoreflect.ValueOfInt64(i))
+					if _, err := tx.Delete(ctx, c); err != nil {
+						t.Fatalf("Delete failed for chunk %d: %v", i, err)
+					}
+					batchDeleted = append(batchDeleted, i)
+				}
+				if _, err := tx.Commit(ctx); err != nil {
+					t.Fatalf("Commit failed: %v", err)
+				}
+
+				feedMu.Lock()
+				consumeNewPayloadsLocked()
+				feedMu.Unlock()
+
+				deletedMu.Lock()
+				for _, idxVal := range batchDeleted {
+					deletedKeys[idxVal] = true
+				}
+				deletedMu.Unlock()
+
+				time.Sleep(2 * time.Millisecond)
+			}
+
+			done.Store(true)
+			wg.Wait()
+
+			t.Logf("[%s] Completed %d scans during concurrent deletion and background apply", factory.name, scanCount.Load())
+		})
+	}
+}
+
 type customUnrecoverableError struct {
 	msg string
 }
@@ -1083,7 +1240,7 @@ func TestMutationCheck_DetectedOnClose(t *testing.T) {
 
 	reg := record.NewRegistry()
 	_, _ = reg.RegisterDescriptor(orderMD, 1)
-	_ = store.SyncRegistry(context.Background(), reg)
+	_ = store.SyncRegistry(t.Context(), reg)
 
 	v := view.New(store,
 		view.WithRegistry(reg),

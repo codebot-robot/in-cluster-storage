@@ -275,6 +275,17 @@ func (m *MemStore) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	type resolvedChange struct {
+		table *MemTable
+		op    sds.Op
+		key   sds.Key
+		row   proto.Message
+		seq   uint64
+	}
+
+	resolved := make([]resolvedChange, 0, len(changes))
+	tableSet := make(map[string]*MemTable)
+
 	for _, change := range changes {
 		tableName := change.TypeName
 		if tableName == "" && m.registry != nil {
@@ -291,15 +302,17 @@ func (m *MemStore) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 			table = NewTable(tableName)
 			m.tables[tableName] = table
 		}
+		tableSet[tableName] = table
 
 		key := change.Key
 		if key.IsZero() && len(change.RawKey) > 0 {
 			key = sds.NewKeyFromBytes(change.RawKey)
 		}
 
+		var row proto.Message
 		switch change.Op {
 		case sds.OpCreate, sds.OpUpdate:
-			row := change.Row
+			row = change.Row
 			if row == nil && m.registry != nil && (len(change.RawKey) > 0 || len(change.RawVal) > 0) {
 				def, _, ok := m.registry.LookupByName(tableName)
 				if !ok {
@@ -318,15 +331,46 @@ func (m *MemStore) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 			if row == nil {
 				return fmt.Errorf("missing row message for %v", change.Op)
 			}
-			table.Put(key, row)
 		case sds.OpDelete:
-			table.Delete(key)
 		default:
 			return fmt.Errorf("unsupported op %v", change.Op)
 		}
 
-		if change.Seq > m.lastPosition {
-			m.lastPosition = change.Seq
+		resolved = append(resolved, resolvedChange{
+			table: table,
+			op:    change.Op,
+			key:   key,
+			row:   row,
+			seq:   change.Seq,
+		})
+	}
+
+	// Sort table names to lock in deterministic order to prevent deadlocks.
+	tableNames := make([]string, 0, len(tableSet))
+	for name := range tableSet {
+		tableNames = append(tableNames, name)
+	}
+	sort.Strings(tableNames)
+
+	for _, name := range tableNames {
+		tableSet[name].mu.Lock()
+	}
+	defer func() {
+		for i := len(tableNames) - 1; i >= 0; i-- {
+			tableSet[tableNames[i]].mu.Unlock()
+		}
+	}()
+
+	for _, rc := range resolved {
+		switch rc.op {
+		case sds.OpCreate, sds.OpUpdate:
+			rc.table.rows[rc.key] = rc.row
+		case sds.OpDelete:
+			delete(rc.table.rows, rc.key)
+		}
+
+		if rc.seq > m.lastPosition {
+			m.lastPosition = rc.seq
 		}
 	}
 	return nil
@@ -335,7 +379,10 @@ func (m *MemStore) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 // Get retrieves a row message by table name and primary key.
 // The returned message is shared and must not be modified in place.
 func (m *MemStore) Get(ctx context.Context, tableName string, key sds.Key) (proto.Message, bool, error) {
-	table := m.Table(tableName)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	table := m.tables[tableName]
 	if table == nil {
 		return nil, false, nil
 	}
@@ -347,8 +394,10 @@ func (m *MemStore) Get(ctx context.Context, tableName string, key sds.Key) (prot
 // Yielded messages are shared and must not be modified in place.
 func (m *MemStore) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter.Seq2[proto.Message, error] {
 	return func(yield func(proto.Message, error) bool) {
-		table := m.Table(typeName)
+		m.mu.RLock()
+		table := m.tables[typeName]
 		if table == nil {
+			m.mu.RUnlock()
 			return
 		}
 
@@ -364,6 +413,7 @@ func (m *MemStore) Scan(ctx context.Context, typeName string, keyPrefix []byte) 
 			}
 		}
 		table.mu.RUnlock()
+		m.mu.RUnlock()
 
 		sort.Slice(entries, func(i, j int) bool {
 			return bytes.Compare(entries[i].key.Bytes(), entries[j].key.Bytes()) < 0
@@ -397,7 +447,10 @@ func (m *MemStore) Rows(tableName string) []proto.Message {
 
 // Count returns the number of rows in the specified table.
 func (m *MemStore) Count(tableName string) int {
-	table := m.Table(tableName)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	table := m.tables[tableName]
 	if table == nil {
 		return 0
 	}

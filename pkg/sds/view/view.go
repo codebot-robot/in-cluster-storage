@@ -849,6 +849,12 @@ func (v *View) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter
 		}
 		merged := make(map[string]rowEntry)
 
+		type overlayRow struct {
+			key   sds.Key
+			entry OverlayEntry
+		}
+		overlaySnapshot := make(map[string]overlayRow)
+
 		var keyFields []int32
 		v.mu.RLock()
 		if v.reg != nil {
@@ -857,6 +863,15 @@ func (v *View) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter
 			}
 		}
 		idx := v.index
+		for ck, entry := range v.overlay {
+			if ck.Table != typeName {
+				continue
+			}
+			if len(keyPrefix) > 0 && !bytes.HasPrefix(ck.Key.Bytes(), keyPrefix) {
+				continue
+			}
+			overlaySnapshot[ck.Key.String()] = overlayRow{key: ck.Key, entry: entry}
+		}
 		v.mu.RUnlock()
 
 		if idx != nil {
@@ -876,28 +891,23 @@ func (v *View) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter
 					}
 				}
 				if !k.IsZero() {
+					kStr := k.String()
+					if _, inOverlay := overlaySnapshot[kStr]; inOverlay {
+						// Overlay mutation was captured at scan start and wins over index state.
+						continue
+					}
 					v.recordMessage(idxMsg, typeName, k)
-					merged[k.String()] = rowEntry{key: k, msg: idxMsg}
+					merged[kStr] = rowEntry{key: k, msg: idxMsg}
 				}
 			}
 		}
 
-		v.mu.RLock()
-		for ck, entry := range v.overlay {
-			if ck.Table != typeName {
-				continue
-			}
-			if len(keyPrefix) > 0 && !bytes.HasPrefix(ck.Key.Bytes(), keyPrefix) {
-				continue
-			}
-			kStr := ck.Key.String()
-			if entry.Op == sds.OpDelete || entry.Row == nil {
-				delete(merged, kStr)
-			} else {
-				merged[kStr] = rowEntry{key: ck.Key, msg: entry.Row}
+		for _, or := range overlaySnapshot {
+			if or.entry.Op != sds.OpDelete && or.entry.Row != nil {
+				kStr := or.key.String()
+				merged[kStr] = rowEntry{key: or.key, msg: or.entry.Row}
 			}
 		}
-		v.mu.RUnlock()
 
 		rows := make([]rowEntry, 0, len(merged))
 		for _, re := range merged {
