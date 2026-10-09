@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -406,7 +407,10 @@ func (s *Server) GetVolume(volumeID string) *Volume {
 	return vol
 }
 
-// RestoreSnapshot restores the volume filesystem state to a specific EROFS snapshot.
+// RestoreSnapshot restores the volume filesystem state to a specific snapshot.
+// Note: Snapshot restore is currently local to the running controller instance; a controller restart
+// replays subsequent stream records against the latest published snapshot. Durable restore across restarts
+// is tracked in issue #225.
 func (s *Server) RestoreSnapshot(ctx context.Context, volumeID, snapshotName string) error {
 	vol, err := s.getOrCreateVolume(volumeID)
 	if err != nil {
@@ -910,16 +914,21 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 	fromSnapshot := req.GetFromSnapshot()
 
 	var snapInfos []*pb.SnapshotInfo
-	for _, snap := range allSnapshots {
-		if fromSnapshot != "" && snap <= fromSnapshot {
+	for _, ptr := range allSnapshots {
+		name := ptr.GetName()
+		if name == "" {
+			name = path.Base(ptr.GetLocation())
+		}
+		if fromSnapshot != "" && (name <= fromSnapshot || ptr.GetLocation() <= fromSnapshot) {
 			continue
 		}
-		info, err := vol.GetSnapshotInfo(ctx, snap)
-		if err != nil {
-			info = &pb.SnapshotInfo{
-				Name: snap,
-			}
-			t := parseSnapshotTime(snap)
+		info := &pb.SnapshotInfo{
+			Name:      name,
+			Position:  ptr.GetPosition(),
+			CreatedAt: ptr.GetCreatedAt(),
+		}
+		if info.CreatedAt == nil {
+			t := parseSnapshotTime(name)
 			if !t.IsZero() {
 				info.CreatedAt = timestamppb.New(t)
 			}
@@ -957,7 +966,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	snapName, err := vol.CreateSnapshot(ctx)
+	snapName, err := vol.CreateSnapshot(ctx, req.GetName())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create snapshot: %v", err)
 	}
@@ -965,11 +974,8 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	snapInfo, err := vol.GetSnapshotInfo(ctx, snapName)
 	if err != nil {
 		snapInfo = &pb.SnapshotInfo{
-			Name: snapName,
-		}
-		t := parseSnapshotTime(snapName)
-		if !t.IsZero() {
-			snapInfo.CreatedAt = timestamppb.New(t)
+			Name:      snapName,
+			CreatedAt: timestamppb.Now(),
 		}
 	}
 
