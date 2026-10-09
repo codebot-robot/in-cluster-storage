@@ -25,6 +25,7 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"k8s.io/klog/v2"
 )
 
 // Client represents a client for the CAS UDS server.
@@ -53,7 +54,9 @@ func NewClient(socketPath string) (*Client, error) {
 
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			klog.Warningf("Failed to close connection: %v", err)
+		}
 		return nil, fmt.Errorf("connection to %s is not a unix connection", socketPath)
 	}
 
