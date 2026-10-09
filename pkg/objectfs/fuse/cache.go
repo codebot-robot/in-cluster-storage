@@ -186,18 +186,35 @@ func (c *NodeCache) PutChunk(inode uint64, chunkIdx int, chunkSize uint32, total
 		return
 	}
 
+	isLocalDirty := ok && (entry.IsDirty || len(entry.DirtyChunks) > 0)
+	chunkStart := int64(chunkIdx) * int64(chunkSize)
+
+	// If entry has uncommitted local modifications (e.g. locally dirty or truncated),
+	// do not let a stale read racing from before a truncate resurrect chunks past EOF
+	// or expand the entry size. For clean entries, trust remote totalSize.
+	if isLocalDirty && chunkStart >= entry.Size {
+		return
+	}
+
 	if oldChunk, exists := entry.Chunks[chunkIdx]; exists {
 		c.curBytes -= int64(len(oldChunk))
 	}
 
 	dataLen := int64(len(data))
+	if isLocalDirty && chunkStart+dataLen > entry.Size {
+		dataLen = entry.Size - chunkStart
+		if dataLen < 0 {
+			dataLen = 0
+		}
+		data = data[:dataLen]
+	}
 	c.evictIfNeededLocked(dataLen)
 
 	buf := make([]byte, len(data))
 	copy(buf, data)
 	entry.Chunks[chunkIdx] = buf
 	c.curBytes += dataLen
-	if totalSize > entry.Size {
+	if !isLocalDirty && totalSize > entry.Size {
 		entry.Size = totalSize
 	}
 	entry.ChunkSize = chunkSize
