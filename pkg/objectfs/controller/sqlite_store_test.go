@@ -642,6 +642,10 @@ func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
 		inodes = append(inodes, attr.GetInode().GetIno())
 	}
 
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
 	stats := vol.MetadataCacheStats()
 	if stats.Entries > 50 {
 		t.Fatalf("expected <= 50 cache entries, got %d", stats.Entries)
