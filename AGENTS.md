@@ -55,6 +55,10 @@ The E2E suite will:
 5. Create and run test pods verifying normal OverlayFS operations, incremental snapshitting, whiteouts, and (if active) hybrid lazy-loading.
 6. Automatically clean up and teardown the cluster.
 
+### Race Detection Gate (`ap-test-race`)
+
+`dev/ci/presubmits/ap-test-race` is the race gate that runs unit and integration tests with the Go race detector enabled (`-race -count=1`). Packages are added to it as they become race-clean (currently `pkg/sds/...`, `pkg/wal/...`, `pkg/objectfs/fuse/...`, and `pkg/objectfs/blob/...`). Always run `ap-test-race` locally (e.g., `GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-test-race`) before pushing changes to those packages.
+
 ---
 
 ## 3. Troubleshooting & Diagnostics
