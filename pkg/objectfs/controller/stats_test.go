@@ -23,7 +23,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
@@ -682,7 +681,7 @@ func (f *faultyGetFactory) OpenLocal(ctx context.Context, streamID string, dir s
 	return f.idx, true, nil
 }
 
-func TestVolume_StatsUpdateGetFailureProductionReseedsAndDebugPanics(t *testing.T) {
+func TestVolume_CommitStepInfallibleFaultInjectedIndexGetCannotAffectCommit(t *testing.T) {
 	ctx := t.Context()
 	backend := inmemorystorage.New()
 
@@ -691,25 +690,13 @@ func TestVolume_StatsUpdateGetFailureProductionReseedsAndDebugPanics(t *testing.
 		t.Fatalf("GetIndexFactory failed: %v", err)
 	}
 
-	// -------------------------------------------------------------
-	// Part 1: Production mode (WithoutVolumeStatsCheck)
-	// Must keep serving, mark liveStatsStale, keep committed rows visible,
-	// and re-seed from durable once the backlog drains.
-	// -------------------------------------------------------------
 	faultyIdx := &faultyGetIndex{}
 	factory := &faultyGetFactory{IndexFactory: baseFactory, idx: faultyIdx}
 
-	var stallApplier atomic.Bool
-	vol := NewVolume("vol-faulty-get-prod", backend, NewEventBroadcaster(),
+	vol := NewVolume("vol-faulty-get-commit", backend, NewEventBroadcaster(),
 		WithIndexFactory(factory),
 		WithMetadataCacheDisabled(true),
-		WithoutVolumeStatsCheck(),
-		WithApplierFaultHook(func() error {
-			if stallApplier.Load() {
-				return errors.New("stalled applier to hold backlog")
-			}
-			return nil
-		}),
+		WithVolumeStatsCheck(),
 	)
 	defer vol.Close()
 
@@ -727,86 +714,61 @@ func TestVolume_StatsUpdateGetFailureProductionReseedsAndDebugPanics(t *testing.
 		t.Fatalf("FlushOverlay failed: %v", err)
 	}
 
-	// Stall applier so backlog is not drained immediately in the background
-	stallApplier.Store(true)
-
-	// Target the fault to trigger during the stats before-lookup Get.
-	// In SetAttr, the 1st Get is the read phase to load the inode, and the 2nd Get
-	// is the before-lookup during applyTxChangesLocked.
+	// Case 1: Injected fault during read phase fails operation BEFORE stream append.
 	currentCalls := faultyIdx.getCalls.Load()
-	faultyIdx.failOnCall.Store(currentCalls + 2)
+	faultyIdx.failOnCall.Store(currentCalls + 1) // next Get is SetAttr's read phase
 
 	newMode := uint32(0755)
 	_, err = vol.SetAttr(ctx, ino, &newMode, nil, nil, nil, false, nil, false, nil, false)
+	if err == nil {
+		t.Fatal("expected SetAttr to fail during read phase when index Get fails, got nil")
+	}
+
+	// Case 2: Fault injected on call currentCalls + 2 (which in #198 was commit-time lookup).
+	// Because commit step takes before-images from the read set, zero index Get calls
+	// happen during commit. SetAttr must succeed without encountering any index Get.
+	currentCalls = faultyIdx.getCalls.Load()
+	faultyIdx.failOnCall.Store(currentCalls + 2) // Will not be reached during SetAttr!
+
+	_, err = vol.SetAttr(ctx, ino, &newMode, nil, nil, nil, false, nil, false, nil, false)
 	if err != nil {
-		t.Fatalf("expected SetAttr to succeed despite stats update failure in production, got: %v", err)
+		t.Fatalf("expected SetAttr to succeed because commit performs zero index Get lookups, got: %v", err)
 	}
 
-	// Committed rows must be visible through the view immediately
-	gotAttr, err := vol.GetAttr(ctx, ino)
-	if err != nil {
-		t.Fatalf("GetAttr failed after commit: %v", err)
-	}
-	expectedMode := uint32(0755 | syscall.S_IFREG)
-	if gotAttr.GetInode().GetMode() != expectedMode {
-		t.Fatalf("expected updated mode %o visible through view overlay, got %o", expectedMode, gotAttr.GetInode().GetMode())
-	}
-
-	vol.mu.Lock()
-	if !vol.liveStatsStale {
-		vol.mu.Unlock()
-		t.Fatal("expected liveStatsStale to be true after stats update failure")
-	}
-	vol.mu.Unlock()
-
-	// Clear applier stall, then FlushOverlay drains backlog and re-seeds liveStats from durable
-	stallApplier.Store(false)
+	// Verify the commit step was infallible and live stats match durable on flush
 	if err := vol.FlushOverlay(ctx); err != nil {
 		t.Fatalf("FlushOverlay failed: %v", err)
 	}
+}
 
-	vol.mu.Lock()
-	if vol.liveStatsStale {
-		vol.mu.Unlock()
-		t.Fatal("expected liveStatsStale to be false after backlog drain")
-	}
-	vol.mu.Unlock()
-
-	st := vol.Stats()
-	if st.Stats == nil || st.Stats.GetInodesFile() != 1 {
-		t.Fatalf("expected Stats() to be re-seeded from durable, got: %+v", st.Stats)
-	}
-
-	// -------------------------------------------------------------
-	// Part 2: Debug mode (WithVolumeStatsCheck / testing default)
-	// Must panic loud when a stats update fails.
-	// -------------------------------------------------------------
-	faultyIdxDebug := &faultyGetIndex{}
-	factoryDebug := &faultyGetFactory{IndexFactory: baseFactory, idx: faultyIdxDebug}
-
-	volDebug := NewVolume("vol-faulty-get-debug", backend, NewEventBroadcaster(),
-		WithIndexFactory(factoryDebug),
-		WithMetadataCacheDisabled(true),
-		WithVolumeStatsCheck(),
+func TestVolume_WritingKeyNotReadPanics(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	vol := NewVolume("vol-not-read-panic", backend, NewEventBroadcaster(),
+		WithMetadataIndex("memory"),
 	)
-	defer volDebug.Close()
-
-	if err := volDebug.LoadFromBackend(ctx); err != nil {
+	defer vol.Close()
+	if err := vol.LoadFromBackend(ctx); err != nil {
 		t.Fatalf("LoadFromBackend failed: %v", err)
 	}
 
-	attrDebug, err := volDebug.CreateFile(ctx, 1, "test_dbg.txt", 0644, []byte("hello"), 1000, 1000)
+	vol.mu.Lock()
+	defer vol.mu.Unlock()
+
+	// Deliberately bypass any read helper: begin a tx and write an unread inode.
+	tx := vol.metadataStream.Begin()
+	_, err := tx.Update(ctx, &pb.Inode{
+		Ino:   proto.Uint64(99999),
+		Mode:  0644,
+		Nlink: 1,
+	})
 	if err != nil {
-		t.Fatalf("CreateFile failed: %v", err)
+		t.Fatalf("tx.Update failed: %v", err)
 	}
-	inoDebug := attrDebug.GetInode().GetIno()
-
-	if err := volDebug.FlushOverlay(ctx); err != nil {
-		t.Fatalf("FlushOverlay failed: %v", err)
+	_, err = tx.Commit(ctx)
+	if err != nil {
+		t.Fatalf("tx.Commit failed: %v", err)
 	}
-
-	currentCallsDebug := faultyIdxDebug.getCalls.Load()
-	faultyIdxDebug.failOnCall.Store(currentCallsDebug + 2)
 
 	didPanic := false
 	func() {
@@ -814,15 +776,83 @@ func TestVolume_StatsUpdateGetFailureProductionReseedsAndDebugPanics(t *testing.
 			if r := recover(); r != nil {
 				didPanic = true
 				msg, ok := r.(string)
-				if !ok || !strings.Contains(msg, "volume stats update failed") {
+				if !ok || !strings.Contains(msg, "key written but never read") {
 					t.Fatalf("unexpected panic message: %v", r)
 				}
 			}
 		}()
-		_, _ = volDebug.SetAttr(ctx, inoDebug, &newMode, nil, nil, nil, false, nil, false, nil, false)
+		vol.applyTxChangesLocked(ctx, tx)
 	}()
 
 	if !didPanic {
-		t.Fatal("expected debug mode to panic on stats update failure, but did not panic")
+		t.Fatal("expected panic on writing key that was never read, but did not panic")
+	}
+}
+
+func TestVolume_ReadsBeforeWritesAssertionPanicsInAllModes(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	vol := NewVolume("vol-reads-before-writes-panic", backend, NewEventBroadcaster(),
+		WithMetadataIndex("memory"),
+		WithoutVolumeMutationCheck(),
+		WithoutVolumeStatsCheck(),
+	)
+	defer vol.Close()
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	vol.mu.Lock()
+	defer vol.mu.Unlock()
+
+	tx := vol.beginTxLocked("TestOp")
+	defer vol.endTxLocked()
+
+	// Buffer a write first
+	key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1234)})
+	if err != nil {
+		t.Fatalf("pkInode.Extract failed: %v", err)
+	}
+	vol.recordReadLocked("objectfs.v1alpha1.Inode", key, nil)
+	if _, err := tx.Insert(ctx, &pb.Inode{Ino: proto.Uint64(1234), Mode: 0644}); err != nil {
+		t.Fatalf("tx.Insert failed: %v", err)
+	}
+
+	// Now attempt a read after write has been buffered
+	didPanic := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				didPanic = true
+				msg, ok := r.(string)
+				if !ok || !strings.Contains(msg, "read") || !strings.Contains(msg, "after transaction buffered write") {
+					t.Fatalf("unexpected panic message: %v", r)
+				}
+			}
+		}()
+		_, _, _ = vol.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.Inode", key)
+	}()
+
+	if !didPanic {
+		t.Fatal("expected panic on reading after transaction buffered write in all modes, but did not panic")
+	}
+
+	// Also verify that scanLimitSQLiteRowsLocked enforces the reads-before-writes assertion
+	didPanicLimit := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				didPanicLimit = true
+				msg, ok := r.(string)
+				if !ok || !strings.Contains(msg, "read") || !strings.Contains(msg, "after transaction buffered write") {
+					t.Fatalf("unexpected panic message: %v", r)
+				}
+			}
+		}()
+		_, _ = vol.scanLimitSQLiteRowsLocked(ctx, "objectfs.v1alpha1.Inode", nil, 1)
+	}()
+
+	if !didPanicLimit {
+		t.Fatal("expected panic on scanLimitSQLiteRowsLocked after transaction buffered write in all modes, but did not panic")
 	}
 }

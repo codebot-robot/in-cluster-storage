@@ -17,6 +17,7 @@ package sds
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
@@ -149,17 +150,94 @@ func (w *Writer) AppendPaddingBytes(ctx context.Context, body []byte) (uint64, e
 	return w.recordWriter.AppendPaddingBytes(ctx, body)
 }
 
+type readSetKey struct {
+	typeName string
+	key      Key
+}
+
+type readPrefixKey struct {
+	typeName string
+	prefix   string
+}
+
 // Tx represents an in-progress transaction.
 type Tx struct {
-	writer   *Writer
-	txID     uint64
-	finished bool
-	changes  []Change
+	writer       *Writer
+	txID         uint64
+	finished     bool
+	changes      []Change
+	firstWriteOp string
+	opName       string
+	readSet      map[readSetKey]proto.Message
+	readPrefixes map[readPrefixKey]bool
 }
 
 // TxID returns the transaction ID.
 func (tx *Tx) TxID() uint64 {
 	return tx.txID
+}
+
+// SetOpName sets the logical operation name for debug reporting.
+func (tx *Tx) SetOpName(name string) {
+	tx.opName = name
+}
+
+// OpName returns the logical operation name, or "" if unset.
+func (tx *Tx) OpName() string {
+	return tx.opName
+}
+
+// FirstWrite returns the description of the first write buffered in this transaction, or "" if none.
+func (tx *Tx) FirstWrite() string {
+	return tx.firstWriteOp
+}
+
+// HasWrites returns true if this transaction has buffered at least one write.
+func (tx *Tx) HasWrites() bool {
+	return tx.firstWriteOp != ""
+}
+
+// RecordRead records a row read by this transaction. A nil msg indicates the row was absent.
+func (tx *Tx) RecordRead(typeName string, key Key, msg proto.Message) {
+	if tx.readSet == nil {
+		tx.readSet = make(map[readSetKey]proto.Message)
+	}
+	tx.readSet[readSetKey{typeName: typeName, key: key}] = msg
+}
+
+// RecordReadPrefix records that all rows matching prefix were scanned for typeName.
+func (tx *Tx) RecordReadPrefix(typeName string, prefix []byte) {
+	if tx.readPrefixes == nil {
+		tx.readPrefixes = make(map[readPrefixKey]bool)
+	}
+	tx.readPrefixes[readPrefixKey{typeName: typeName, prefix: string(prefix)}] = true
+}
+
+// HasReadPrefix returns true if prefix was already recorded as read for typeName.
+func (tx *Tx) HasReadPrefix(typeName string, prefix []byte) bool {
+	if tx.readPrefixes == nil {
+		return false
+	}
+	return tx.readPrefixes[readPrefixKey{typeName: typeName, prefix: string(prefix)}]
+}
+
+// LookupRead returns the before-image of a row from the transaction's read set.
+// ok is true if the key was recorded in the read set directly or as part of a scanned prefix.
+// If ok is true, msg is the row message, or nil if the row was absent.
+func (tx *Tx) LookupRead(typeName string, key Key) (proto.Message, bool) {
+	if tx.readSet != nil {
+		if msg, ok := tx.readSet[readSetKey{typeName: typeName, key: key}]; ok {
+			return msg, true
+		}
+	}
+	if tx.readPrefixes != nil {
+		for pk := range tx.readPrefixes {
+			if pk.typeName == typeName && strings.HasPrefix(key.String(), pk.prefix) {
+				return nil, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func (tx *Tx) recordChange(seq uint64, op sdsv1.OpRecord_Op, msg proto.Message) error {
@@ -183,6 +261,13 @@ func (tx *Tx) recordChange(seq uint64, op sdsv1.OpRecord_Op, msg proto.Message) 
 		Row:      msg,
 	}
 	tx.changes = append(tx.changes, ch)
+	if tx.firstWriteOp == "" {
+		opName := sdsv1.OpRecord_Op_name[int32(op)]
+		if opName == "" {
+			opName = op.String()
+		}
+		tx.firstWriteOp = fmt.Sprintf("%s %s", opName, def.GetName())
+	}
 	return nil
 }
 

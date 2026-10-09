@@ -612,6 +612,24 @@ func TestPeriodicFlusherLifecycle(t *testing.T) {
 	}
 }
 
+func TestConcurrentFlusherAndMutationsRace(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-flusher-race-vol"
+
+	server.StartPeriodicFlush(ctx, 5*time.Millisecond)
+	defer server.StopPeriodicFlush()
+
+	for i := 0; i < 50; i++ {
+		fileName := fmt.Sprintf("/file_%d.txt", i)
+		_, err := testCreateFile(ctx, server, volumeID, fileName, 0644, []byte("data"), 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, err)
+		}
+	}
+}
+
 func TestControllerPushNotifications(t *testing.T) {
 	ctx := t.Context()
 	server := NewServer(nil)
@@ -2580,12 +2598,29 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	}
 
 	newLargeSha := fmt.Sprintf("%x", sha256.Sum256(largeData))
-	postSnapAttr, err := volGetAttr(ctx, vol, "/large.bin")
-	if err != nil {
-		t.Fatalf("GetAttr post-snapshot failed: %v", err)
+	if vol.snapshotReader == nil {
+		t.Fatalf("expected snapshotReader to be initialized post-snapshot")
 	}
-	if postSnapAttr.GetInode().GetContentSha256() != newLargeSha {
-		t.Fatalf("expected recomputed ContentSha256 %s post-snapshot, got %s", newLargeSha, postSnapAttr.GetInode().GetContentSha256())
+	entries, err := vol.snapshotReader.ListDirectory(vol.snapshotReader.GetRootNID())
+	if err != nil {
+		t.Fatalf("ListDirectory on root failed: %v", err)
+	}
+	var largeNID uint64
+	for _, entry := range entries {
+		if entry.Name == "large.bin" {
+			largeNID = entry.NID
+			break
+		}
+	}
+	if largeNID == 0 {
+		t.Fatalf("large.bin not found in snapshot")
+	}
+	xattrs, err := vol.snapshotReader.GetXattrs(largeNID)
+	if err != nil {
+		t.Fatalf("GetXattrs on large.bin failed: %v", err)
+	}
+	if xattrs.UserDigest != newLargeSha {
+		t.Fatalf("expected recomputed ContentSha256 %s in EROFS snapshot xattrs, got %s", newLargeSha, xattrs.UserDigest)
 	}
 
 	// 6. Test migration: writing to an unchunked file that grows > chunkSize turns into chunked
