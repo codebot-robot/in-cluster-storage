@@ -46,7 +46,32 @@ cleanup() {
     mkdir -p "${ARTIFACTS_DIR}"
     cp -f "${DEV_DIR}/controller.log" "${ARTIFACTS_DIR}/" 2>/dev/null || true
     cp -f "${DEV_DIR}/mount.log" "${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f "${DEV_DIR}/mnt/fsx-test.bin.fsxops" "${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f "${DEV_DIR}/mnt/fsx-test.bin.fsxgood" "${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f fsx-test.bin.fsxops "${ARTIFACTS_DIR}/" 2>/dev/null || true
+    cp -f fsx-test.bin.fsxgood "${ARTIFACTS_DIR}/" 2>/dev/null || true
     cp -f core* "${ARTIFACTS_DIR}/" 2>/dev/null || true
+
+    echo "======= DUMPING CONTROLLER LOG (last 5000 lines) ======="
+    if [[ -f "${DEV_DIR}/controller.log" ]]; then
+      tail -n 5000 "${DEV_DIR}/controller.log"
+    elif [[ -f "${ARTIFACTS_DIR}/controller.log" ]]; then
+      tail -n 5000 "${ARTIFACTS_DIR}/controller.log"
+    fi
+    echo "======= DUMPING NODE DAEMON / MOUNT LOG (last 5000 lines) ======="
+    if [[ -f "${DEV_DIR}/mount.log" ]]; then
+      tail -n 5000 "${DEV_DIR}/mount.log"
+    elif [[ -f "${ARTIFACTS_DIR}/mount.log" ]]; then
+      tail -n 5000 "${ARTIFACTS_DIR}/mount.log"
+    fi
+    if [[ -f "${ARTIFACTS_DIR}/fsx-test.bin.fsxops" ]]; then
+      echo "======= DUMPING FSX OPS LOG (last 5000 lines) ======="
+      tail -n 5000 "${ARTIFACTS_DIR}/fsx-test.bin.fsxops"
+    elif [[ -f "${DEV_DIR}/mnt/fsx-test.bin.fsxops" ]]; then
+      echo "======= DUMPING FSX OPS LOG (last 5000 lines) ======="
+      tail -n 5000 "${DEV_DIR}/mnt/fsx-test.bin.fsxops"
+    fi
+    echo "==============================================="
   fi
   rm -rf "${WORK_DIR}" "${DEV_DIR}"
 }
