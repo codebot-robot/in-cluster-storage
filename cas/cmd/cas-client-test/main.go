@@ -39,14 +39,22 @@ func main() {
 		fmt.Printf("Error creating CAS client: %v\n", err)
 		os.Exit(1)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			fmt.Printf("Error closing CAS client: %v\n", err)
+		}
+	}()
 
 	file, size, err := client.RequestBlob(sha)
 	if err != nil {
 		fmt.Printf("Error requesting blob: %v\n", err)
 		os.Exit(1)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			fmt.Printf("Error closing file: %v\n", err)
+		}
+	}()
 
 	hasher := sha256.New()
 	tee := io.TeeReader(file, hasher)

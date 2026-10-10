@@ -136,7 +136,9 @@ func (s *Server) serve() {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	defer func() {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			klog.V(4).Infof("CAS server: failed to close connection: %v", err)
+		}
 		s.connsMu.Lock()
 		delete(s.conns, conn)
 		s.connsMu.Unlock()
@@ -213,7 +215,11 @@ func (s *Server) handleGet(conn *net.UnixConn, blobID BlobID) {
 			return
 		}
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			klog.Warningf("CAS server: failed to close blob file: %v", err)
+		}
+	}()
 
 	fi, err := file.Stat()
 	if err != nil {
@@ -234,22 +240,30 @@ func (s *Server) handleGet(conn *net.UnixConn, blobID BlobID) {
 
 func (s *Server) sendError(conn *net.UnixConn, errMsg string) {
 	resp := fmt.Sprintf("ERR %s\n", errMsg)
-	_, _ = conn.Write([]byte(resp))
+	if _, err := conn.Write([]byte(resp)); err != nil {
+		klog.Warningf("CAS server: failed to send error message: %v", err)
+	}
 }
 
 // Stop closes the listener, aborts active connections, and cleans up the socket file.
 func (s *Server) Stop() {
 	close(s.stopCh)
-	s.listener.Close()
+	if err := s.listener.Close(); err != nil {
+		klog.Warningf("CAS server: failed to close listener: %v", err)
+	}
 
 	s.connsMu.Lock()
 	for conn := range s.conns {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			klog.V(4).Infof("CAS server: failed to close connection: %v", err)
+		}
 	}
 	s.connsMu.Unlock()
 
 	s.wg.Wait()
-	_ = os.Remove(s.socketPath)
+	if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
+		klog.Warningf("CAS server: failed to remove socket file %s: %v", s.socketPath, err)
+	}
 }
 
 // BlobID represents a validated, normalized (lowercase) 64-char hex SHA-256 blob identifier.

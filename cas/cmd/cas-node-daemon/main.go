@@ -145,7 +145,9 @@ func (d *controllerDownloader) DownloadBlob(ctx context.Context, sha string, des
 	success := false
 	defer func() {
 		if !success {
-			_ = os.Remove(tempPath)
+			if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) {
+				klog.Warningf("Failed to remove temporary file %s: %v", tempPath, err)
+			}
 		}
 	}()
 
@@ -155,11 +157,15 @@ func (d *controllerDownloader) DownloadBlob(ctx context.Context, sha string, des
 			break
 		}
 		if err != nil {
-			_ = tempFile.Close()
+			if closeErr := tempFile.Close(); closeErr != nil {
+				klog.Warningf("Failed to close temporary file: %v", closeErr)
+			}
 			return fmt.Errorf("error receiving chunk: %v", err)
 		}
 		if _, err := tempFile.Write(resp.Content); err != nil {
-			_ = tempFile.Close()
+			if closeErr := tempFile.Close(); closeErr != nil {
+				klog.Warningf("Failed to close temporary file: %v", closeErr)
+			}
 			return fmt.Errorf("error writing to temporary file: %v", err)
 		}
 	}
