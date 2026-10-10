@@ -296,6 +296,8 @@ type SnapshotPointer struct {
 	Format              string                 `protobuf:"bytes,2,opt,name=format,proto3" json:"format,omitempty"`
 	Location            string                 `protobuf:"bytes,3,opt,name=location,proto3" json:"location,omitempty"`
 	RegistryFingerprint []byte                 `protobuf:"bytes,4,opt,name=registry_fingerprint,json=registryFingerprint,proto3" json:"registry_fingerprint,omitempty"`
+	Name                string                 `protobuf:"bytes,5,opt,name=name,proto3" json:"name,omitempty"`
+	CreatedAt           *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
@@ -354,6 +356,20 @@ func (x *SnapshotPointer) GetLocation() string {
 func (x *SnapshotPointer) GetRegistryFingerprint() []byte {
 	if x != nil {
 		return x.RegistryFingerprint
+	}
+	return nil
+}
+
+func (x *SnapshotPointer) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *SnapshotPointer) GetCreatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreatedAt
 	}
 	return nil
 }
@@ -430,12 +446,15 @@ const file_proto_sds_proto_rawDesc = "" +
 	"\bTxCommit\x12\x13\n" +
 	"\x05tx_id\x18\x01 \x01(\x04R\x04txId\x12;\n" +
 	"\vcommit_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"commitTime\"\x94\x01\n" +
+	"commitTime\"\xe3\x01\n" +
 	"\x0fSnapshotPointer\x12\x1a\n" +
 	"\bposition\x18\x01 \x01(\x04R\bposition\x12\x16\n" +
 	"\x06format\x18\x02 \x01(\tR\x06format\x12\x1a\n" +
 	"\blocation\x18\x03 \x01(\tR\blocation\x121\n" +
-	"\x14registry_fingerprint\x18\x04 \x01(\fR\x13registryFingerprint\"8\n" +
+	"\x14registry_fingerprint\x18\x04 \x01(\fR\x13registryFingerprint\x12\x12\n" +
+	"\x04name\x18\x05 \x01(\tR\x04name\x129\n" +
+	"\n" +
+	"created_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"8\n" +
 	"\bRegistry\x12,\n" +
 	"\x05types\x18\x01 \x03(\v2\x16.sds.v1.TypeDefinitionR\x05typesB:Z8github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1;v1b\x06proto3"
 
@@ -467,12 +486,13 @@ var file_proto_sds_proto_depIdxs = []int32{
 	6, // 0: sds.v1.TypeDefinition.descriptors:type_name -> google.protobuf.FileDescriptorSet
 	0, // 1: sds.v1.OpRecord.op:type_name -> sds.v1.OpRecord.Op
 	7, // 2: sds.v1.TxCommit.commit_time:type_name -> google.protobuf.Timestamp
-	1, // 3: sds.v1.Registry.types:type_name -> sds.v1.TypeDefinition
-	4, // [4:4] is the sub-list for method output_type
-	4, // [4:4] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	7, // 3: sds.v1.SnapshotPointer.created_at:type_name -> google.protobuf.Timestamp
+	1, // 4: sds.v1.Registry.types:type_name -> sds.v1.TypeDefinition
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_proto_sds_proto_init() }

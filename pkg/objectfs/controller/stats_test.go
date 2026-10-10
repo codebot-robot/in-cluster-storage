@@ -379,7 +379,7 @@ func TestVolume_CrashWithUnappliedBacklogAndRecovery(t *testing.T) {
 			t.Fatalf("getOrCreateVolume failed: %v", err)
 		}
 
-		if _, err := vol1.CreateSnapshot(ctx); err != nil {
+		if _, err := vol1.CreateSnapshot(ctx, ""); err != nil {
 			t.Fatalf("CreateSnapshot failed: %v", err)
 		}
 

@@ -26,7 +26,6 @@ import (
 	"os"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,8 +38,8 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
-	_ "github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
-	_ "github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -85,7 +84,7 @@ type Volume struct {
 
 	metadataStream   *sds.Writer
 	lastCommitSeq    uint64
-	recoveredContent map[string][]byte
+	snapshotPointers []*sdsv1.SnapshotPointer
 	liveStats        *pb.VolumeStats
 	debugStatsCheck  *bool
 	activeTx         *sds.Tx
@@ -95,9 +94,6 @@ type Volume struct {
 	metadataView    *view.View
 	viewOpts        []view.Option
 	memAppender     *memoryAppender
-
-	snapshotRaw    io.ReaderAt
-	snapshotReader *erofs.Reader
 
 	closed   bool
 	closedCh chan struct{}
@@ -347,23 +343,22 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	f, _ := sds.GetIndexFactory("sqlite")
 
 	v := &Volume{
-		volumeID:         volumeID,
-		rootInodeID:      1,
-		nextInode:        erofs.DefaultInodeStride,
-		backend:          backend,
-		blobStore:        blobStore,
-		broadcaster:      broadcaster,
-		maxInlineLen:     4096,      // 4KB default inline threshold for tiny files
-		chunkSize:        64 * 1024, // 64KB default chunk size
-		durability:       walclient.Local,
-		indexFactory:     f,
-		streamID:         StreamIDForVolume(volumeID),
-		closedCh:         make(chan struct{}),
-		recoveredContent: make(map[string][]byte),
-		dirParents:       make(map[uint64]uint64),
-		handles:          make(map[uint64]uint64),
-		openInodes:       make(map[uint64]int),
-		inodeUploads:     make(map[uint64]*InodeUpload),
+		volumeID:     volumeID,
+		rootInodeID:  1,
+		nextInode:    erofs.DefaultInodeStride,
+		backend:      backend,
+		blobStore:    blobStore,
+		broadcaster:  broadcaster,
+		maxInlineLen: 4096,      // 4KB default inline threshold for tiny files
+		chunkSize:    64 * 1024, // 64KB default chunk size
+		durability:   walclient.Local,
+		indexFactory: f,
+		streamID:     StreamIDForVolume(volumeID),
+		closedCh:     make(chan struct{}),
+		dirParents:   make(map[uint64]uint64),
+		handles:      make(map[uint64]uint64),
+		openInodes:   make(map[uint64]int),
+		inodeUploads: make(map[uint64]*InodeUpload),
 	}
 
 	for _, opt := range opts {
@@ -664,13 +659,6 @@ func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkId
 	_ = v.ensureInodeChunksLoadedLocked(ctx, node)
 
 	if chunkSha, ok := node.Chunks[uint32(chunkIdx)]; ok && chunkSha != "" {
-		if v.recoveredContent != nil {
-			if data, ok := v.recoveredContent[chunkSha]; ok {
-				res := make([]byte, len(data))
-				copy(res, data)
-				return res, nil
-			}
-		}
 		if v.blobStore != nil {
 			stream, err := v.blobStore.GetBlob(ctx, chunkSha)
 			if err == nil {
@@ -684,13 +672,6 @@ func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkId
 		sha := node.Row.GetSha256()
 		if sha == "" {
 			sha = node.Row.GetContentSha256()
-		}
-		if v.recoveredContent != nil {
-			if data, ok := v.recoveredContent[sha]; ok {
-				res := make([]byte, len(data))
-				copy(res, data)
-				return res, nil
-			}
 		}
 		if v.blobStore != nil {
 			stream, err := v.blobStore.GetBlob(ctx, sha)
@@ -3548,343 +3529,6 @@ func (v *Volume) ResolvePath(ctx context.Context, p string) (uint64, error) {
 	return inodeID, err
 }
 
-type bufferWriterAt struct {
-	buf []byte
-}
-
-func (b *bufferWriterAt) WriteAt(p []byte, off int64) (int, error) {
-	end := off + int64(len(p))
-	if end > int64(len(b.buf)) {
-		newBuf := make([]byte, end)
-		copy(newBuf, b.buf)
-		b.buf = newBuf
-	}
-	copy(b.buf[off:end], p)
-	return len(p), nil
-}
-
-func inodeToErofsNode(row *pb.Inode, name string, inlineData []byte, children []erofs.Node, rootXattrs *erofs.Xattrs, isRoot bool) erofs.Node {
-	var xattrs erofs.Xattrs
-	if row.GetContentSha256() != "" {
-		xattrs.UserDigest = row.GetContentSha256()
-	} else if row.GetSha256() != "" {
-		xattrs.UserDigest = row.GetSha256()
-	}
-	if row.GetManifestSha256() != "" {
-		xattrs.UserManifest = row.GetManifestSha256()
-	}
-
-	var mtimeUnix uint64
-	if row.GetMtime() != nil {
-		mtimeUnix = uint64(row.GetMtime().AsTime().Unix())
-	}
-
-	if row.GetIsDir() {
-		dirNodeName := name
-		if dirNodeName == "/" || isRoot {
-			dirNodeName = ""
-		}
-		var dirOpts []erofs.MemoryNodeOption
-		dirOpts = append(dirOpts,
-			erofs.WithIno(row.GetIno()),
-			erofs.WithMtime(mtimeUnix),
-			erofs.WithUID(row.GetUid()),
-			erofs.WithGID(row.GetGid()),
-		)
-		if rootXattrs != nil && isRoot {
-			dirOpts = append(dirOpts, erofs.WithXattrs(*rootXattrs))
-		}
-		return erofs.NewMemoryNode(
-			dirNodeName,
-			true,
-			uint16(row.GetMode()),
-			nil,
-			children,
-			dirOpts...,
-		)
-	}
-
-	if row.GetSymlinkTarget() != "" || (row.GetMode()&syscall.S_IFMT) == syscall.S_IFLNK {
-		return erofs.NewMemoryNode(
-			name,
-			false,
-			uint16(row.GetMode()),
-			[]byte(row.GetSymlinkTarget()),
-			nil,
-			erofs.WithIno(row.GetIno()),
-			erofs.WithSize(uint64(len(row.GetSymlinkTarget()))),
-			erofs.WithMtime(mtimeUnix),
-			erofs.WithUID(row.GetUid()),
-			erofs.WithGID(row.GetGid()),
-			erofs.WithXattrs(xattrs),
-		)
-	}
-
-	if len(inlineData) > 0 {
-		return erofs.NewMemoryNode(
-			name,
-			false,
-			uint16(row.GetMode()),
-			inlineData,
-			nil,
-			erofs.WithIno(row.GetIno()),
-			erofs.WithSize(uint64(row.GetSize())),
-			erofs.WithMtime(mtimeUnix),
-			erofs.WithUID(row.GetUid()),
-			erofs.WithGID(row.GetGid()),
-			erofs.WithRdev(row.GetRdev()),
-			erofs.WithXattrs(xattrs),
-		)
-	}
-
-	return erofs.NewMemoryNode(
-		name,
-		false,
-		uint16(row.GetMode()),
-		nil,
-		nil,
-		erofs.WithIno(row.GetIno()),
-		erofs.WithMetadataOnly(true),
-		erofs.WithSize(uint64(row.GetSize())),
-		erofs.WithMtime(mtimeUnix),
-		erofs.WithUID(row.GetUid()),
-		erofs.WithGID(row.GetGid()),
-		erofs.WithRdev(row.GetRdev()),
-		erofs.WithXattrs(xattrs),
-	)
-}
-
-type snapshotResolver struct {
-	vol        *Volume
-	rootXattrs *erofs.Xattrs
-}
-
-func (r *snapshotResolver) getOrLoadInode(ctx context.Context, inodeID uint64) (*CachedInode, error) {
-	if r.vol == nil || r.vol.metadataView == nil {
-		return nil, fmt.Errorf("no metadata view attached")
-	}
-	inodeID = r.vol.normalizeInodeID(inodeID)
-	key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(inodeID)})
-	if err != nil {
-		return nil, err
-	}
-	msg, ok, err := r.vol.metadataView.Get(ctx, "objectfs.v1alpha1.Inode", key)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("inode %d: %w", inodeID, syscall.ENOENT)
-	}
-	inode := msg.(*pb.Inode)
-	node := &CachedInode{
-		Row: inode,
-	}
-	if !inode.GetIsDir() && inode.GetSize() > 0 {
-		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(inode.GetIno())}, 1)
-		if pErr != nil {
-			return nil, fmt.Errorf("failed to encode chunk prefix for inode %d: %w", inode.GetIno(), pErr)
-		}
-		chunkMsgs, sErr := r.vol.metadataView.ScanSlice(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
-		if sErr != nil {
-			return nil, fmt.Errorf("failed to scan chunk rows for inode %d: %w", inode.GetIno(), sErr)
-		}
-		for _, cMsg := range chunkMsgs {
-			chunk := cMsg.(*pb.FileChunk)
-			if chunk.GetIndex() == 0 && len(chunk.GetInlineData()) > 0 {
-				node.InlineData = append([]byte(nil), chunk.GetInlineData()...)
-			} else if chunk.GetSha256() != "" {
-				if node.Chunks == nil {
-					node.Chunks = make(map[uint32]string)
-				}
-				node.Chunks[chunk.GetIndex()] = chunk.GetSha256()
-			}
-		}
-	}
-	return node, nil
-}
-
-func (r *snapshotResolver) readChunk(ctx context.Context, node *CachedInode, chunkIdx int) ([]byte, error) {
-	if chunkIdx == 0 && len(node.InlineData) > 0 {
-		res := make([]byte, len(node.InlineData))
-		copy(res, node.InlineData)
-		return res, nil
-	}
-	if chunkSha, ok := node.Chunks[uint32(chunkIdx)]; ok && chunkSha != "" {
-		if r.vol != nil && r.vol.recoveredContent != nil {
-			if data, ok := r.vol.recoveredContent[chunkSha]; ok {
-				res := make([]byte, len(data))
-				copy(res, data)
-				return res, nil
-			}
-		}
-		if r.vol != nil && r.vol.blobStore != nil {
-			stream, err := r.vol.blobStore.GetBlob(ctx, chunkSha)
-			if err == nil {
-				defer stream.Close()
-				return io.ReadAll(stream)
-			}
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("chunk %d not found", chunkIdx)
-}
-
-func (r *snapshotResolver) buildErofsTree(ctx context.Context, dirInodeID uint64, dirName, currentPath string, dirtyBlobs map[string]blob.ByteStream) (erofs.Node, error) {
-	dirInode, err := r.getOrLoadInode(ctx, dirInodeID)
-	if err != nil {
-		return nil, err
-	}
-
-	prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(dirInodeID)}, 1)
-	if pErr != nil {
-		return nil, pErr
-	}
-	entryMsgs, err := r.vol.metadataView.ScanSlice(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	names := make([]string, 0, len(entryMsgs))
-	entriesMap := make(map[string]*pb.DirEntry, len(entryMsgs))
-	for _, msg := range entryMsgs {
-		de := msg.(*pb.DirEntry)
-		name := de.GetName()
-		names = append(names, name)
-		entriesMap[name] = de
-	}
-	sort.Strings(names)
-
-	var children []erofs.Node
-	for _, name := range names {
-		de := entriesMap[name]
-		childPath := path.Join(currentPath, name)
-		if de.GetIsDir() {
-			childDirNode, err := r.buildErofsTree(ctx, de.GetIno(), name, childPath, dirtyBlobs)
-			if err != nil {
-				return nil, err
-			}
-			children = append(children, childDirNode)
-		} else {
-			childInode, err := r.getOrLoadInode(ctx, de.GetIno())
-			if err != nil {
-				return nil, err
-			}
-
-			if childInode.Row.GetChunkSize() > 0 && len(childInode.Chunks) > 0 {
-				cs := int64(childInode.Row.GetChunkSize())
-				numChunks := int((childInode.Row.GetSize() + cs - 1) / cs)
-				manifestChunks := make([][32]byte, numChunks)
-				for i := 0; i < numChunks; i++ {
-					if c, ok := childInode.Chunks[uint32(i)]; ok && c != "" {
-						raw, _ := hex.DecodeString(c)
-						if len(raw) == 32 {
-							copy(manifestChunks[i][:], raw)
-						}
-					}
-				}
-				manifest := &blob.Manifest{
-					ChunkSize:   childInode.Row.GetChunkSize(),
-					TotalLength: uint64(childInode.Row.GetSize()),
-					Chunks:      manifestChunks,
-				}
-				manifestBlob, err := blob.EncodeManifest(manifest)
-				if err == nil {
-					childInode.mutate(func(row *pb.Inode) {
-						row.ManifestSha256 = manifestBlob.SHA256Hex()
-					})
-					dirtyBlobs[manifestBlob.SHA256Hex()] = manifestBlob.Stream
-				}
-			}
-
-			if childInode.Row.GetContentSha256() == "" && childInode.Row.GetSize() > 0 {
-				hasher := sha256.New()
-				if childInode.Row.GetManifestSha256() != "" || childInode.Row.GetChunkSize() > 0 {
-					cs := int64(childInode.Row.GetChunkSize())
-					if cs == 0 {
-						cs = 64 * 1024
-					}
-					numChunks := int((childInode.Row.GetSize() + cs - 1) / cs)
-					for i := 0; i < numChunks; i++ {
-						chunkBytes, err := r.readChunk(ctx, childInode, i)
-						if err == nil && len(chunkBytes) > 0 {
-							hasher.Write(chunkBytes)
-						} else {
-							chunkLen := cs
-							if int64(i+1)*cs > childInode.Row.GetSize() {
-								chunkLen = childInode.Row.GetSize() - int64(i)*cs
-							}
-							if chunkLen > 0 {
-								hasher.Write(make([]byte, chunkLen))
-							}
-						}
-					}
-				} else if childInode.Data != nil {
-					_ = childInode.Data.Rewind()
-					_, _ = io.Copy(hasher, childInode.Data)
-				} else if childInode.Row.GetSha256() != "" && r.vol.blobStore != nil {
-					stream, err := r.vol.blobStore.GetBlob(ctx, childInode.Row.GetSha256())
-					if err == nil {
-						_, _ = io.Copy(hasher, stream)
-						_ = stream.Close()
-					}
-				}
-				contentSha := fmt.Sprintf("%x", hasher.Sum(nil))
-				childInode.mutate(func(row *pb.Inode) {
-					row.ContentSha256 = contentSha
-				})
-			}
-
-			// Collect dirty / unpersisted blobs for flush
-			if len(childInode.InlineData) > 0 {
-				childInode.mutate(func(row *pb.Inode) {
-					if row.GetContentSha256() == "" {
-						row.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256(childInode.InlineData))
-					}
-					if row.GetSha256() == "" {
-						row.Sha256 = row.GetContentSha256()
-					}
-				})
-				dirtyBlobs[childInode.Row.GetSha256()] = blob.NewByteStreamFromBytes(childInode.InlineData)
-			}
-			if childInode.Row.GetSha256() != "" {
-				if cData, ok := r.vol.recoveredContent[childInode.Row.GetSha256()]; ok {
-					dirtyBlobs[childInode.Row.GetSha256()] = blob.NewByteStreamFromBytes(cData)
-				} else if childInode.Data != nil {
-					_ = childInode.Data.Rewind()
-					dataBytes, _ := io.ReadAll(childInode.Data)
-					_ = childInode.Data.Rewind()
-					dirtyBlobs[childInode.Row.GetSha256()] = blob.NewByteStreamFromBytes(dataBytes)
-				}
-			}
-			if childInode.Row.GetManifestSha256() != "" {
-				if mData, ok := r.vol.recoveredContent[childInode.Row.GetManifestSha256()]; ok {
-					dirtyBlobs[childInode.Row.GetManifestSha256()] = blob.NewByteStreamFromBytes(mData)
-				}
-			}
-			for _, chunkSha := range childInode.Chunks {
-				if chunkData, ok := r.vol.recoveredContent[chunkSha]; ok {
-					dirtyBlobs[chunkSha] = blob.NewByteStreamFromBytes(chunkData)
-				}
-			}
-			for i, cBytes := range childInode.StagedChunks {
-				if sha, ok := childInode.Chunks[uint32(i)]; ok && sha != "" {
-					dirtyBlobs[sha] = blob.NewByteStreamFromBytes(cBytes)
-				}
-			}
-			for i, cBytes := range childInode.DirtyChunks {
-				if sha, ok := childInode.Chunks[uint32(i)]; ok && sha != "" {
-					dirtyBlobs[sha] = blob.NewByteStreamFromBytes(cBytes)
-				}
-			}
-
-			leafNode := inodeToErofsNode(childInode.Row, name, childInode.InlineData, nil, nil, false)
-			children = append(children, leafNode)
-		}
-	}
-
-	return inodeToErofsNode(dirInode.Row, dirName, nil, children, r.rootXattrs, currentPath == "/"), nil
-}
-
 func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 	if v.backend == nil {
 		return nil
@@ -3896,118 +3540,40 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		}
 	}
 
-	snapPos := v.safeSnapshotPositionLocked()
-
 	if snap, ok := v.metadataView.Index().(sds.Snapshotter); ok && v.backend != nil {
 		if err := v.flushOverlayLocked(ctx); err != nil {
 			return err
 		}
 		snapKey, actualPos, err := snap.PublishSnapshot(ctx, v.backend)
-		if err == nil && v.metadataStream != nil && snapKey != "" {
+		if err != nil {
+			return fmt.Errorf("failed to publish index snapshot: %w", err)
+		}
+		if v.metadataStream != nil && snapKey != "" {
 			format := ""
 			if v.indexFactory != nil {
 				format = v.indexFactory.Format()
 			}
 			ptr := &sdsv1.SnapshotPointer{
-				Position: actualPos,
-				Format:   format,
-				Location: snapKey,
-			}
-			_, _ = v.metadataStream.AppendSnapshotPointer(ctx, ptr)
-		}
-	}
-
-	var regBytes []byte
-	if v.metadataStream != nil {
-		regProto := v.metadataStream.Registry().Export()
-		var err error
-		regBytes, err = proto.Marshal(regProto)
-		if err != nil {
-			return fmt.Errorf("failed to marshal registry: %w", err)
-		}
-	}
-	snapTime := time.Now().UTC()
-	rootXattrs := erofs.Xattrs{
-		Others: map[string]string{
-			"trusted.sds.position":      strconv.FormatUint(snapPos, 10),
-			"trusted.sds.registry":      string(regBytes),
-			"trusted.sds.snapshot_time": snapTime.Format(time.RFC3339Nano),
-		},
-	}
-
-	// Release v.mu during snapshot compilation and cloud storage upload to avoid stopping the world.
-	// Note: The tree build runs unlocked (#218 tracks snapshotting from a consistent view)
-	// and must NOT touch operation state (activeTx, operation read helpers, or assertion checks).
-	v.mu.Unlock()
-
-	var erofsBuf bufferWriterAt
-	snapshotName := fmt.Sprintf("%020d.erofs", snapPos)
-	snapshotKey := path.Join("volumes", v.volumeID, "meta", snapshotName)
-
-	snapErr := func() error {
-		dirtyBlobs := make(map[string]blob.ByteStream)
-
-		resolver := &snapshotResolver{
-			vol:        v,
-			rootXattrs: &rootXattrs,
-		}
-
-		erofsTree, err := resolver.buildErofsTree(ctx, v.rootInodeID, "/", "/", dirtyBlobs)
-		if err != nil {
-			return fmt.Errorf("failed to build hierarchy for snapshot: %w", err)
-		}
-
-		if len(dirtyBlobs) > 0 && v.blobStore != nil {
-			if err := v.blobStore.PutBlobs(ctx, dirtyBlobs); err != nil {
-				return fmt.Errorf("failed to persist blobs: %w", err)
-			}
-		}
-
-		if err := erofs.WriteImage(&erofsBuf, erofsTree); err != nil {
-			return fmt.Errorf("failed to compile EROFS snapshot: %w", err)
-		}
-
-		readerAt := bytes.NewReader(erofsBuf.buf)
-		if err := erofs.Fsck(readerAt); err != nil {
-			return fmt.Errorf("Fsck failed on generated EROFS snapshot: %w", err)
-		}
-
-		erofsStream := blob.NewByteStreamFromBytes(erofsBuf.buf)
-		if _, err := v.backend.PutObject(ctx, "", snapshotKey, erofsStream); err != nil {
-			_ = erofsStream.Close()
-			return fmt.Errorf("failed to save EROFS snapshot %s: %w", snapshotKey, err)
-		}
-		_ = erofsStream.Close()
-
-		if v.metadataStream != nil {
-			regFP := sha256.Sum256(regBytes)
-			ptr := &sdsv1.SnapshotPointer{
-				Position:            snapPos,
-				Format:              "erofs",
-				Location:            snapshotKey,
-				RegistryFingerprint: regFP[:],
+				Position:  actualPos,
+				Format:    format,
+				Location:  snapKey,
+				Name:      path.Base(snapKey),
+				CreatedAt: timestamppb.Now(),
 			}
 			if _, err := v.metadataStream.AppendSnapshotPointer(ctx, ptr); err != nil {
-				return fmt.Errorf("failed to append SnapshotPointer: %w", err)
+				return fmt.Errorf("failed to append snapshot pointer: %w", err)
 			}
+			v.snapshotPointers = append(v.snapshotPointers, ptr)
 		}
 
-		return nil
-	}()
-
-	// Re-acquire v.mu.Lock()
-	v.mu.Lock()
-
-	if snapErr != nil {
-		return snapErr
+		volKey := fmt.Sprintf("volumes/%s/stream.id", v.volumeID)
+		streamObj := blob.NewByteStreamFromBytes([]byte(v.streamID.String()))
+		if _, err := v.backend.PutObject(ctx, "", volKey, streamObj); err != nil {
+			_ = streamObj.Close()
+			return fmt.Errorf("failed to save volume marker: %w", err)
+		}
+		_ = streamObj.Close()
 	}
-
-	v.snapshotRaw = bytes.NewReader(erofsBuf.buf)
-	if r, err := erofs.NewReader(v.snapshotRaw); err == nil {
-		v.snapshotReader = r
-		v.rootInodeID = r.GetRootNID()
-	}
-	v.recoveredContent = make(map[string][]byte)
 
 	return nil
 }
@@ -4021,38 +3587,6 @@ func (v *Volume) FlushToBackend(ctx context.Context) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.flushToBackendLocked(ctx)
-}
-
-func (v *Volume) findLatestSnapshotNameLocked(ctx context.Context) (string, error) {
-	metaPrefix := path.Join("volumes", v.volumeID, "meta") + "/"
-	objects, err := v.backend.ListObjects(ctx, "", metaPrefix)
-	if err != nil {
-		return "", err
-	}
-
-	type snapItem struct {
-		name string
-		pos  uint64
-	}
-	var snapshots []snapItem
-	for _, obj := range objects {
-		if strings.HasSuffix(obj, ".erofs") {
-			base := path.Base(obj)
-			trimmed := strings.TrimSuffix(base, ".erofs")
-			pos, _ := strconv.ParseUint(trimmed, 10, 64)
-			snapshots = append(snapshots, snapItem{name: base, pos: pos})
-		}
-	}
-	if len(snapshots) == 0 {
-		return "", fmt.Errorf("no snapshots found for volume %s", v.volumeID)
-	}
-	sort.Slice(snapshots, func(i, j int) bool {
-		if snapshots[i].pos != snapshots[j].pos {
-			return snapshots[i].pos < snapshots[j].pos
-		}
-		return snapshots[i].name < snapshots[j].name
-	})
-	return snapshots[len(snapshots)-1].name, nil
 }
 
 // ApplySDSChangeLocked applies a single committed SDS change to the metadata index.
@@ -4174,227 +3708,6 @@ func (v *Volume) initLiveStatsLocked() {
 	v.liveStats = &pb.VolumeStats{Name: VolumeStatsRowName}
 }
 
-func (v *Volume) importErofsToLocalIndexLocked(ctx context.Context, reader *erofs.Reader, snapPos uint64) error {
-	if v.metadataView == nil || reader == nil {
-		return nil
-	}
-	return v.importErofsToTargetIndex(ctx, v.metadataView.Index(), v.snapshotRaw, reader, snapPos)
-}
-
-func (v *Volume) importErofsToTargetIndex(ctx context.Context, target sds.LocalIndex, raw io.ReaderAt, reader *erofs.Reader, snapPos uint64) error {
-	if target == nil || reader == nil {
-		return nil
-	}
-
-	rootNID := reader.GetRootNID()
-	var changes []sds.Change
-
-	queue := []uint64{rootNID}
-	visited := make(map[uint64]bool)
-
-	for len(queue) > 0 {
-		nid := queue[0]
-		queue = queue[1:]
-		if visited[nid] {
-			continue
-		}
-		visited[nid] = true
-
-		ino := nid
-		if nid == rootNID || nid == 0 {
-			ino = 1
-		}
-
-		rawSource := raw
-		if rawSource == nil {
-			rawSource = v.snapshotRaw
-		}
-		erofsInode, err := erofs.ReadInode(rawSource, reader.Superblock(), nid)
-		if err != nil {
-			return fmt.Errorf("ReadInode failed for nid %d: %w", nid, err)
-		}
-
-		isDir := (erofsInode.Mode & erofs.S_IFMT) == erofs.S_IFDIR
-		isSymlink := (erofsInode.Mode & erofs.S_IFMT) == erofs.S_IFLNK
-		mode := uint32(erofsInode.Mode)
-		if isDir {
-			mode |= syscall.S_IFDIR
-		} else if isSymlink {
-			mode |= syscall.S_IFLNK
-		} else if (mode & syscall.S_IFMT) == 0 {
-			mode |= syscall.S_IFREG
-		}
-		mtime := time.Unix(int64(erofsInode.Mtime), int64(erofsInode.MtimeNsec))
-		if erofsInode.Mtime == 0 {
-			mtime = time.Now()
-		}
-
-		var symlinkTarget string
-		if isSymlink {
-			if r, err := reader.ReadFileContent(nid); err == nil {
-				data, _ := io.ReadAll(r)
-				symlinkTarget = string(data)
-			}
-		}
-
-		nlink := erofsInode.Nlink
-		if nlink == 0 {
-			if isDir {
-				nlink = 2
-			} else {
-				nlink = 1
-			}
-		}
-
-		var shaStr, manifestSha, contentSha string
-		var chunkSize uint32
-		xattrs, _ := reader.GetXattrs(nid)
-		if !xattrs.IsEmpty() {
-			if xattrs.UserDigest != "" {
-				shaStr = xattrs.UserDigest
-				contentSha = xattrs.UserDigest
-			} else if xattrs.UserSHA256 != "" {
-				shaStr = xattrs.UserSHA256
-				contentSha = xattrs.UserSHA256
-			}
-			if xattrs.UserManifest != "" {
-				manifestSha = xattrs.UserManifest
-				shaStr = manifestSha
-			}
-		}
-		if manifestSha == "" && contentSha == "" {
-			contentSha = shaStr
-		}
-
-		inoMsg := &pb.Inode{
-			Ino:            proto.Uint64(ino),
-			Mode:           mode,
-			Size:           int64(erofsInode.Size),
-			Mtime:          timestamppb.New(mtime),
-			IsDir:          isDir,
-			Sha256:         shaStr,
-			ManifestSha256: manifestSha,
-			ContentSha256:  contentSha,
-			ChunkSize:      chunkSize,
-			Uid:            erofsInode.UID,
-			Gid:            erofsInode.GID,
-			Nlink:          nlink,
-			SymlinkTarget:  symlinkTarget,
-			Rdev:           erofsInode.Rdev,
-		}
-
-		keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(inoMsg, []int32{1})
-		changes = append(changes, sds.Change{
-			Seq:      snapPos,
-			TypeID:   16,
-			TypeName: "objectfs.v1alpha1.Inode",
-			Op:       sds.OpCreate,
-			Key:      sds.NewKeyFromBytes(keyBytes),
-			RawKey:   keyBytes,
-			RawVal:   valBytes,
-			Row:      inoMsg,
-		})
-
-		if isDir {
-			dirents, err := reader.ListDirectory(nid)
-			if err == nil {
-				for _, de := range dirents {
-					if de.Name == "." || de.Name == ".." {
-						continue
-					}
-					childName := de.Name
-					childNID := de.NID
-					childIno := de.NID
-					if childNID == rootNID || childNID == 0 {
-						childIno = 1
-					}
-					childIsDir := de.FileType == erofs.FTDir
-					childMode := uint32(0644 | syscall.S_IFREG)
-					if childIsDir {
-						childMode = uint32(0755 | syscall.S_IFDIR)
-					} else {
-						switch de.FileType {
-						case erofs.FTChrDev:
-							childMode = uint32(0600 | syscall.S_IFCHR)
-						case erofs.FTBlkDev:
-							childMode = uint32(0600 | syscall.S_IFBLK)
-						case erofs.FTFifo:
-							childMode = uint32(0600 | syscall.S_IFIFO)
-						case erofs.FTSock:
-							childMode = uint32(0600 | syscall.S_IFSOCK)
-						case erofs.FTSymlink:
-							childMode = uint32(0777 | syscall.S_IFLNK)
-						}
-					}
-
-					dirEntryMsg := &pb.DirEntry{
-						ParentIno: proto.Uint64(ino),
-						Name:      proto.String(childName),
-						Ino:       childIno,
-						IsDir:     childIsDir,
-						Mode:      childMode,
-					}
-					deKeyBytes, deValBytes, _ := sds.SplitKeyAndNonKey(dirEntryMsg, []int32{1, 2})
-					changes = append(changes, sds.Change{
-						Seq:      snapPos,
-						TypeID:   17,
-						TypeName: "objectfs.v1alpha1.DirEntry",
-						Op:       sds.OpCreate,
-						Key:      sds.NewKeyFromBytes(deKeyBytes),
-						RawKey:   deKeyBytes,
-						RawVal:   deValBytes,
-						Row:      dirEntryMsg,
-					})
-					if v.dirParents == nil {
-						v.dirParents = make(map[uint64]uint64)
-					}
-					v.dirParents[childIno] = ino
-					queue = append(queue, childNID)
-				}
-			}
-		} else {
-			if erofsInode.Size <= 4096 && erofsInode.Size > 0 {
-				var data []byte
-				if r, err := reader.ReadFileContent(nid); err == nil {
-					data, _ = io.ReadAll(r)
-				}
-				if (len(data) == 0 || bytes.Equal(data, make([]byte, len(data)))) && inoMsg.GetContentSha256() != "" && v.blobStore != nil {
-					if bs, err := v.blobStore.GetBlob(ctx, inoMsg.GetContentSha256()); err == nil {
-						data, _ = io.ReadAll(bs)
-						_ = bs.Close()
-					}
-				}
-				if len(data) > 0 {
-					chunkMsg := &pb.FileChunk{
-						Ino:        proto.Uint64(ino),
-						Index:      proto.Uint32(0),
-						InlineData: data,
-					}
-					cKeyBytes, cValBytes, _ := sds.SplitKeyAndNonKey(chunkMsg, []int32{1, 2})
-					changes = append(changes, sds.Change{
-						Seq:      snapPos,
-						TypeID:   18,
-						TypeName: "objectfs.v1alpha1.FileChunk",
-						Op:       sds.OpCreate,
-						Key:      sds.NewKeyFromBytes(cKeyBytes),
-						RawKey:   cKeyBytes,
-						RawVal:   cValBytes,
-						Row:      chunkMsg,
-					})
-				}
-			}
-		}
-	}
-
-	if len(changes) > 0 {
-		if err := target.ApplyBatch(ctx, changes); err != nil {
-			return fmt.Errorf("failed to import EROFS snapshot into metadata index: %w", err)
-		}
-	}
-	v.lastCommitSeq = snapPos
-	return nil
-}
-
 func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, error) {
 	if v.indexFactory == nil {
 		f, err := sds.GetIndexFactory("sqlite")
@@ -4439,67 +3752,32 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 		}
 	}
 
-	// 4. If starting from scratch (snapPos == 0), initialize root inode or import EROFS snapshot
+	// 4. If starting from scratch (snapPos == 0), initialize root inode
 	if snapPos == 0 {
-		var imported bool
-		if v.backend != nil {
-			v.mu.RLock()
-			latestSnapshotName, sErr := v.findLatestSnapshotNameLocked(ctx)
-			v.mu.RUnlock()
-			if sErr == nil && latestSnapshotName != "" {
-				snapshotKey := path.Join("volumes", v.volumeID, "meta", latestSnapshotName)
-				var imgBuf bytes.Buffer
-				if err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0, &imgBuf); err == nil && imgBuf.Len() > 0 {
-					readerAt := bytes.NewReader(imgBuf.Bytes())
-					if reader, err := erofs.NewReader(readerAt); err == nil {
-						pos := uint64(0)
-						if rootXattrs, xErr := reader.GetXattrs(reader.GetRootNID()); xErr == nil {
-							if posStr, ok := rootXattrs.Others["trusted.sds.position"]; ok && posStr != "" {
-								if p, pErr := strconv.ParseUint(posStr, 10, 64); pErr == nil {
-									pos = p
-								}
-							}
-						}
-						if pos == 0 {
-							trimmed := strings.TrimSuffix(latestSnapshotName, ".erofs")
-							if p, pErr := strconv.ParseUint(trimmed, 10, 64); pErr == nil {
-								pos = p
-							}
-						}
-						snapPos = pos
-						if err := v.importErofsToTargetIndex(ctx, rebuiltIdx, readerAt, reader, snapPos); err == nil {
-							imported = true
-						}
-					}
-				}
-			}
+		rootInodeMsg := &pb.Inode{
+			Ino:       proto.Uint64(1),
+			Mode:      0755 | syscall.S_IFDIR,
+			Mtime:     timestamppb.Now(),
+			IsDir:     true,
+			Nlink:     2,
+			ParentIno: proto.Uint64(1),
 		}
-		if !imported {
-			rootInodeMsg := &pb.Inode{
-				Ino:       proto.Uint64(1),
-				Mode:      0755 | syscall.S_IFDIR,
-				Mtime:     timestamppb.Now(),
-				IsDir:     true,
-				Nlink:     2,
-				ParentIno: proto.Uint64(1),
-			}
-			keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
-			initChanges := []sds.Change{
-				{
-					Seq:      0,
-					TypeID:   16,
-					TypeName: "objectfs.v1alpha1.Inode",
-					Op:       sds.OpCreate,
-					Key:      sds.NewKeyFromBytes(keyBytes),
-					RawKey:   keyBytes,
-					RawVal:   valBytes,
-					Row:      rootInodeMsg,
-				},
-			}
-			if err := rebuiltIdx.ApplyBatch(ctx, initChanges); err != nil {
-				_ = rebuiltIdx.Close()
-				return nil, 0, fmt.Errorf("failed to init root inode in rebuilt index: %w", err)
-			}
+		keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+		initChanges := []sds.Change{
+			{
+				Seq:      0,
+				TypeID:   16,
+				TypeName: "objectfs.v1alpha1.Inode",
+				Op:       sds.OpCreate,
+				Key:      sds.NewKeyFromBytes(keyBytes),
+				RawKey:   keyBytes,
+				RawVal:   valBytes,
+				Row:      rootInodeMsg,
+			},
+		}
+		if err := rebuiltIdx.ApplyBatch(ctx, initChanges); err != nil {
+			_ = rebuiltIdx.Close()
+			return nil, 0, fmt.Errorf("failed to init root inode in rebuilt index: %w", err)
 		}
 	}
 
@@ -4700,7 +3978,9 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			localIdx, found, err := v.indexFactory.OpenLocal(ctx, v.streamID.String(), v.localStorageDir)
 			if err == nil && found && localIdx != nil {
 				if localIdx.Position() >= remoteSnapPos {
-					_ = v.initMetadataViewLocked(ctx, localIdx)
+					if err := v.initMetadataViewLocked(ctx, localIdx); err != nil {
+						return fmt.Errorf("failed to init metadata view from local index: %w", err)
+					}
 					if localIdx.Position() > 0 {
 						snapPos = localIdx.Position()
 						initialized = true
@@ -4721,48 +4001,11 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		}
 		restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), remoteSnapKey, v.localStorageDir)
 		if err == nil && restoredIdx != nil {
-			_ = v.initMetadataViewLocked(ctx, restoredIdx)
+			if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
+				return fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
+			}
 			snapPos = rPos
 			initialized = true
-		}
-	}
-
-	// 3. Otherwise, for volumes that only have EROFS snapshots (or initial startup)
-	if !initialized && v.backend != nil {
-		latestSnapshotName, err := v.findLatestSnapshotNameLocked(ctx)
-		if err == nil && latestSnapshotName != "" {
-			snapshotKey := path.Join("volumes", v.volumeID, "meta", latestSnapshotName)
-			var imgBuf bytes.Buffer
-			if err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0, &imgBuf); err == nil && imgBuf.Len() > 0 {
-				snapBytes := imgBuf.Bytes()
-				readerAt := bytes.NewReader(snapBytes)
-				if reader, err := erofs.NewReader(readerAt); err == nil {
-					v.snapshotRaw = readerAt
-					v.snapshotReader = reader
-					pos := uint64(0)
-					if rootXattrs, xErr := reader.GetXattrs(reader.GetRootNID()); xErr == nil {
-						if posStr, ok := rootXattrs.Others["trusted.sds.position"]; ok && posStr != "" {
-							if p, pErr := strconv.ParseUint(posStr, 10, 64); pErr == nil {
-								pos = p
-							}
-						}
-					}
-					if pos == 0 {
-						trimmed := strings.TrimSuffix(latestSnapshotName, ".erofs")
-						if p, pErr := strconv.ParseUint(trimmed, 10, 64); pErr == nil {
-							pos = p
-						}
-					}
-					snapPos = pos
-					if v.metadataView == nil {
-						_ = v.initMetadataViewLocked(ctx, nil)
-					}
-					if err := v.importErofsToLocalIndexLocked(ctx, reader, snapPos); err != nil {
-						return fmt.Errorf("importErofsToLocalIndexLocked failed: %w", err)
-					}
-					initialized = true
-				}
-			}
 		}
 	}
 
@@ -4782,7 +4025,9 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			}
 		}
 		if v.metadataView == nil {
-			_ = v.initMetadataViewLocked(ctx, nil)
+			if err := v.initMetadataViewLocked(ctx, nil); err != nil {
+				return fmt.Errorf("failed to init empty metadata view: %w", err)
+			}
 		}
 		rootKey, _ := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
 		msg, ok, _ := v.metadataView.Get(ctx, "objectfs.v1alpha1.Inode", rootKey)
@@ -4841,6 +4086,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		}
 
 		_, witnessHead, _ := v.stream.Watermarks()
+		dec := record.NewDecoder(record.WithDecoderRegistry(v.metadataStream.Registry()))
 
 		// 1. Authoritative tail from WAL buffer up to witnessHead
 		if witnessHead > snapPos {
@@ -4857,6 +4103,14 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				}
 				expectedSeq++
 				seenSeqs[seq] = true
+				rec, decErr := dec.Decode(payload)
+				if decErr != nil {
+					klog.Warningf("volume %s: failed to decode authoritative record at seq %d: %v", v.volumeID, seq, decErr)
+				} else if rec.TypeID == record.TypeIDSnapshotPointer {
+					if ptr, ok := rec.Message.(*sdsv1.SnapshotPointer); ok && ptr != nil {
+						v.snapshotPointers = append(v.snapshotPointers, ptr)
+					}
+				}
 				changes, err := cr.Feed(seq, payload)
 				if err != nil {
 					return fmt.Errorf("failed to feed authoritative record at seq %d: %w", seq, err)
@@ -4884,6 +4138,14 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			}
 			expectedSeq++
 			seenSeqs[rec.StreamSeq] = true
+			r, decErr := dec.Decode(rec.Payload)
+			if decErr != nil {
+				klog.Warningf("volume %s: failed to decode local recovered record at seq %d: %v", v.volumeID, rec.StreamSeq, decErr)
+			} else if r.TypeID == record.TypeIDSnapshotPointer {
+				if ptr, ok := r.Message.(*sdsv1.SnapshotPointer); ok && ptr != nil {
+					v.snapshotPointers = append(v.snapshotPointers, ptr)
+				}
+			}
 			changes, err := cr.Feed(rec.StreamSeq, rec.Payload)
 			if err != nil {
 				return fmt.Errorf("failed to feed local recovered record at seq %d: %w", rec.StreamSeq, err)
@@ -4915,55 +4177,117 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 	return v.loadFromBackendMetadataLocked(ctx)
 }
 
-// CreateSnapshot creates and returns a new EROFS snapshot of the current volume state.
-func (v *Volume) CreateSnapshot(ctx context.Context) (string, error) {
-	if err := v.FlushToBackend(ctx); err != nil {
-		return "", err
+// CreateSnapshot creates and returns a new index snapshot of the current volume state.
+func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error) {
+	v.snapshotMu.Lock()
+	defer v.snapshotMu.Unlock()
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.backend == nil {
+		return "", fmt.Errorf("no backend configured")
 	}
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.findLatestSnapshotNameLocked(ctx)
+
+	snap, ok := v.metadataView.Index().(sds.Snapshotter)
+	if !ok {
+		return "", fmt.Errorf("volume metadata index does not support snapshots")
+	}
+
+	if err := v.flushOverlayLocked(ctx); err != nil {
+		return "", fmt.Errorf("failed to flush overlay before snapshot: %w", err)
+	}
+
+	snapKey, actualPos, err := snap.PublishSnapshot(ctx, v.backend)
+	if err != nil {
+		return "", fmt.Errorf("failed to publish index snapshot: %w", err)
+	}
+
+	format := ""
+	if v.indexFactory != nil {
+		format = v.indexFactory.Format()
+	}
+
+	snapName := name
+	if snapName == "" {
+		snapName = path.Base(snapKey)
+	}
+
+	ptr := &sdsv1.SnapshotPointer{
+		Position:  actualPos,
+		Format:    format,
+		Location:  snapKey,
+		Name:      snapName,
+		CreatedAt: timestamppb.Now(),
+	}
+
+	if v.metadataStream != nil && snapKey != "" {
+		if _, err := v.metadataStream.AppendSnapshotPointer(ctx, ptr); err != nil {
+			return "", fmt.Errorf("failed to append snapshot pointer: %w", err)
+		}
+	}
+	v.snapshotPointers = append(v.snapshotPointers, ptr)
+
+	return snapName, nil
 }
 
-// ListSnapshots returns all EROFS snapshot filenames for this volume sorted chronologically / by position.
-func (v *Volume) ListSnapshots(ctx context.Context) ([]string, error) {
+// ListSnapshots returns all snapshot pointers for this volume sorted chronologically / by position.
+func (v *Volume) ListSnapshots(ctx context.Context) ([]*sdsv1.SnapshotPointer, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	return v.listSnapshotsLocked(ctx)
+}
 
-	metaPrefix := path.Join("volumes", v.volumeID, "meta") + "/"
-	objects, err := v.backend.ListObjects(ctx, "", metaPrefix)
-	if err != nil {
-		return nil, err
+func (v *Volume) listSnapshotsLocked(ctx context.Context) ([]*sdsv1.SnapshotPointer, error) {
+	pointersByLoc := make(map[string]*sdsv1.SnapshotPointer)
+	for _, ptr := range v.snapshotPointers {
+		pointersByLoc[ptr.GetLocation()] = ptr
 	}
 
-	type snapItem struct {
-		name string
-		pos  uint64
-	}
-	var snapshots []snapItem
-	for _, obj := range objects {
-		if strings.HasSuffix(obj, ".erofs") {
-			base := path.Base(obj)
-			trimmed := strings.TrimSuffix(base, ".erofs")
-			pos, _ := strconv.ParseUint(trimmed, 10, 64)
-			snapshots = append(snapshots, snapItem{name: base, pos: pos})
+	if v.backend != nil && v.indexFactory != nil {
+		format := v.indexFactory.Format()
+		prefix := fmt.Sprintf("streams/%s/snapshots/%s/", v.streamID.String(), format)
+		keys, err := v.backend.ListObjects(ctx, "", prefix)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list snapshot objects from backend: %w", err)
+		}
+		for _, key := range keys {
+			if _, ok := pointersByLoc[key]; !ok {
+				var pos uint64
+				var parseErr error
+				if format == "sqlite" {
+					_, pos, parseErr = sqlite.ParseSnapshotKey(key)
+				} else if format == "memory" {
+					_, pos, parseErr = memtable.ParseSnapshotKey(key)
+				}
+				if parseErr != nil {
+					return nil, fmt.Errorf("failed to parse snapshot key %q: %w", key, parseErr)
+				}
+				ptr := &sdsv1.SnapshotPointer{
+					Position: pos,
+					Format:   format,
+					Location: key,
+					Name:     path.Base(key),
+				}
+				pointersByLoc[key] = ptr
+			}
 		}
 	}
-	sort.Slice(snapshots, func(i, j int) bool {
-		if snapshots[i].pos != snapshots[j].pos {
-			return snapshots[i].pos < snapshots[j].pos
+
+	var res []*sdsv1.SnapshotPointer
+	for _, ptr := range pointersByLoc {
+		res = append(res, ptr)
+	}
+	sort.Slice(res, func(i, j int) bool {
+		if res[i].GetPosition() != res[j].GetPosition() {
+			return res[i].GetPosition() < res[j].GetPosition()
 		}
-		return snapshots[i].name < snapshots[j].name
+		return res[i].GetName() < res[j].GetName()
 	})
-
-	var res []string
-	for _, s := range snapshots {
-		res = append(res, s.name)
-	}
 	return res, nil
 }
 
-// GetSnapshotInfo returns metadata (position, created_at timestamp, size) for a snapshot.
+// GetSnapshotInfo returns metadata (position, created_at timestamp) for a snapshot.
 func (v *Volume) GetSnapshotInfo(ctx context.Context, snapshotName string) (*pb.SnapshotInfo, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -4971,48 +4295,27 @@ func (v *Volume) GetSnapshotInfo(ctx context.Context, snapshotName string) (*pb.
 }
 
 func (v *Volume) getSnapshotInfoLocked(ctx context.Context, snapshotName string) (*pb.SnapshotInfo, error) {
-	if v.backend == nil {
-		return nil, fmt.Errorf("no backend configured")
+	pointers, err := v.listSnapshotsLocked(ctx)
+	if err != nil {
+		return nil, err
 	}
-
-	trimmed := strings.TrimSuffix(snapshotName, ".erofs")
-	pos, _ := strconv.ParseUint(trimmed, 10, 64)
-
-	snapshotKey := path.Join("volumes", v.volumeID, "meta", snapshotName)
-	var imgBuf bytes.Buffer
-	if err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0, &imgBuf); err != nil {
-		return nil, fmt.Errorf("failed to get snapshot %s: %w", snapshotKey, err)
-	}
-
-	snapBytes := imgBuf.Bytes()
-	info := &pb.SnapshotInfo{
-		Name:     snapshotName,
-		Position: pos,
-		Size:     int64(len(snapBytes)),
-	}
-
-	readerAt := bytes.NewReader(snapBytes)
-	if reader, err := erofs.NewReader(readerAt); err == nil {
-		if rootXattrs, xErr := reader.GetXattrs(reader.GetRootNID()); xErr == nil {
-			if posStr, ok := rootXattrs.Others["trusted.sds.position"]; ok && posStr != "" {
-				if p, pErr := strconv.ParseUint(posStr, 10, 64); pErr == nil {
-					info.Position = p
-				}
+	for _, p := range pointers {
+		if p.GetName() == snapshotName || p.GetLocation() == snapshotName || path.Base(p.GetLocation()) == snapshotName {
+			info := &pb.SnapshotInfo{
+				Name:      p.GetName(),
+				Position:  p.GetPosition(),
+				CreatedAt: p.GetCreatedAt(),
 			}
-			if timeStr, ok := rootXattrs.Others["trusted.sds.snapshot_time"]; ok && timeStr != "" {
-				if t, tErr := time.Parse(time.RFC3339Nano, timeStr); tErr == nil {
-					info.CreatedAt = timestamppb.New(t)
-				} else if t, tErr := time.Parse(time.RFC3339, timeStr); tErr == nil {
-					info.CreatedAt = timestamppb.New(t)
-				}
-			}
+			return info, nil
 		}
 	}
-
-	return info, nil
+	return nil, fmt.Errorf("snapshot %q not found", snapshotName)
 }
 
-// RestoreSnapshot restores the volume filesystem state to a specific EROFS snapshot.
+// RestoreSnapshot restores the volume filesystem state to a specific snapshot using indexFactory.RestoreSnapshot.
+// Note: Snapshot restore is currently local to the running controller instance; a controller restart
+// replays subsequent stream records against the latest published snapshot. Durable restore across restarts
+// is tracked in issue #225.
 func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error {
 	v.snapshotMu.Lock()
 	defer v.snapshotMu.Unlock()
@@ -5023,65 +4326,48 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 	if v.backend == nil {
 		return fmt.Errorf("no backend configured")
 	}
-
-	snapshotKey := path.Join("volumes", v.volumeID, "meta", snapshotName)
-	var imgBuf bytes.Buffer
-	if err := v.backend.GetObject(ctx, "", snapshotKey, 0, 0, &imgBuf); err != nil {
-		return fmt.Errorf("failed to fetch snapshot %s: %w", snapshotKey, err)
-	}
-
-	snapBytes := imgBuf.Bytes()
-	readerAt := bytes.NewReader(snapBytes)
-	reader, err := erofs.NewReader(readerAt)
-	if err != nil {
-		return fmt.Errorf("failed to parse snapshot %s: %w", snapshotName, err)
-	}
-
-	v.snapshotRaw = readerAt
-	v.snapshotReader = reader
-	v.rootInodeID = 1
-
-	var snapPos uint64
-	if rootXattrs, xErr := reader.GetXattrs(reader.GetRootNID()); xErr == nil {
-		if posStr, ok := rootXattrs.Others["trusted.sds.position"]; ok && posStr != "" {
-			if p, pErr := strconv.ParseUint(posStr, 10, 64); pErr == nil {
-				snapPos = p
-			}
-		}
-		if regStr, ok := rootXattrs.Others["trusted.sds.registry"]; ok && regStr != "" {
-			var reg sdsv1.Registry
-			if uErr := proto.Unmarshal([]byte(regStr), &reg); uErr == nil {
-				if v.metadataStream != nil {
-					_ = v.metadataStream.Registry().Import(&reg)
-				}
-			}
-		}
-	}
-	if snapPos == 0 {
-		trimmed := strings.TrimSuffix(snapshotName, ".erofs")
-		if p, pErr := strconv.ParseUint(trimmed, 10, 64); pErr == nil {
-			snapPos = p
-		}
-	}
-	v.lastCommitSeq = snapPos
-
-	// Reset index for restored snapshot
 	if v.indexFactory == nil {
-		f, err := sds.GetIndexFactory("sqlite")
-		if err != nil {
-			return err
-		}
-		v.indexFactory = f
+		return fmt.Errorf("no index factory configured")
 	}
-	_ = v.initMetadataViewLocked(ctx, nil)
 
-	if err := v.importErofsToLocalIndexLocked(ctx, reader, snapPos); err != nil {
-		return fmt.Errorf("failed to import restored EROFS snapshot into metadata index: %w", err)
+	pointers, err := v.listSnapshotsLocked(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list snapshots: %w", err)
+	}
+
+	var targetPtr *sdsv1.SnapshotPointer
+	for _, p := range pointers {
+		if p.GetName() == snapshotName || p.GetLocation() == snapshotName || path.Base(p.GetLocation()) == snapshotName {
+			targetPtr = p
+			break
+		}
+	}
+	if targetPtr == nil {
+		return fmt.Errorf("snapshot %q not found", snapshotName)
 	}
 
 	if v.metadataView != nil {
-		v.metadataView.ClearCache()
+		if err := v.metadataView.Close(); err != nil {
+			return fmt.Errorf("failed to close metadata view: %w", err)
+		}
+		v.metadataView = nil
 	}
+
+	restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), targetPtr.GetLocation(), v.localStorageDir)
+	if err != nil {
+		return fmt.Errorf("failed to restore snapshot %q: %w", snapshotName, err)
+	}
+
+	if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
+		return fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
+	}
+	v.lastCommitSeq = rPos
+
+	v.metadataView.ClearCache()
+	v.dirParents = make(map[uint64]uint64)
+	v.dirParents[1] = 1
+	// Active file handles (v.handles) and open inode refcounts (v.openInodes)
+	// are retained across snapshot restore because they refer to the running clients.
 	v.initLiveStatsLocked()
 	if err := v.initNextInodeFromStatsLocked(ctx, 0); err != nil {
 		return fmt.Errorf("failed to initialize next inode from stats: %w", err)

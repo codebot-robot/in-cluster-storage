@@ -576,34 +576,8 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		snapColdStartDur := time.Since(start)
 		_ = volSnap.Close()
 
-		// C. Restart from EROFS snapshot
-		erofsBackend := inmemorystorage.New()
-		volErofsInit := NewVolume("erofs-cold-vol", erofsBackend, NewEventBroadcaster(),
-			WithMetadataIndex("sqlite"),
-			WithLocalStorageDir(t.TempDir()),
-			WithStreamID(streamID),
-		)
-		_ = volErofsInit.LoadFromBackend(ctx)
-		for i := 0; i < 500; i++ {
-			_, _ = volErofsInit.CreateFile(ctx, 1, fmt.Sprintf("init_%d.txt", i), 0644, []byte("data"), 0, 0)
-		}
-		_ = volErofsInit.FlushToBackend(ctx)
-		_ = volErofsInit.Close()
-
-		start = time.Now()
-		volErofsImport := NewVolume("erofs-cold-vol", erofsBackend, NewEventBroadcaster(),
-			WithMetadataIndex("sqlite"),
-			WithLocalStorageDir(t.TempDir()),
-			WithStreamID(streamID),
-		)
-		_ = volErofsImport.LoadFromBackend(ctx)
-		_, _ = volErofsImport.Lookup(ctx, 1, "init_0.txt")
-		erofsColdStartDur := time.Since(start)
-		_ = volErofsImport.Close()
-
 		t.Logf("Cold start from local SQLite file:        %v", localColdStartDur)
 		t.Logf("Cold start from published SQLite snapshot:  %v", snapColdStartDur)
-		t.Logf("Cold start from EROFS snapshot:            %v", erofsColdStartDur)
 	}
 
 	// 5. Memory Consumption Comparison
