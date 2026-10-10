@@ -17,6 +17,7 @@ package record
 import (
 	"bytes"
 	"errors"
+	"sync"
 	"testing"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
@@ -204,4 +205,74 @@ func TestRegistryGoTypeResolution(t *testing.T) {
 	if _, ok := instance.(*sdsv1.TxCommit); !ok {
 		t.Errorf("instance type = %T, want *sdsv1.TxCommit", instance)
 	}
+}
+
+func TestRegistryConcurrentUse(t *testing.T) {
+	reg := NewRegistry()
+
+	// Pre-populate one type so lookups immediately find something
+	initialDef, err := reg.RegisterMessage(&sdsv1.TxCommit{}, 1)
+	if err != nil {
+		t.Fatalf("RegisterMessage error: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	const (
+		numGoroutines = 8
+		iterations    = 100
+	)
+
+	// Goroutines registering messages concurrently
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				switch (gid + i) % 4 {
+				case 0:
+					_, _ = reg.RegisterMessage(&sdsv1.SnapshotPointer{}, 1)
+				case 1:
+					_, _ = reg.RegisterMessage(&sdsv1.TxCommit{}, 1)
+				case 2:
+					_ = reg.AllocateID()
+				case 3:
+					def := makeTestTypeDef("DynamicMsg", []*descriptorpb.FieldDescriptorProto{
+						field("f1", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+					}, nil, nil, []int32{1}, nil)
+					def.Id = uint32(100 + (gid % 5))
+					_ = reg.Register(def)
+				}
+			}
+		}(g)
+	}
+
+	// Goroutines reading concurrently: LookupByID, LookupByName, ResolveMessageType
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_, _, _ = reg.LookupByID(initialDef.GetId())
+				_, _, _ = reg.LookupByName(initialDef.GetName())
+				_, _ = reg.ResolveMessageType(initialDef.GetId())
+			}
+		}(g)
+	}
+
+	// Goroutines exporting and importing concurrently
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				exp := reg.Export()
+				if exp != nil && len(exp.GetTypes()) > 0 {
+					other := NewRegistry()
+					_ = other.Import(exp)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }

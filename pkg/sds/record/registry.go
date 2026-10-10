@@ -43,7 +43,7 @@ type typeEntry struct {
 }
 
 // Registry maintains the in-band type definitions for a structured stream.
-// It is thread-safe.
+// It is safe for concurrent use by multiple goroutines.
 type Registry struct {
 	mu     sync.RWMutex
 	types  map[uint32]*typeEntry
@@ -64,6 +64,10 @@ func NewRegistry() *Registry {
 func (r *Registry) AllocateID() uint32 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.allocateIDLocked()
+}
+
+func (r *Registry) allocateIDLocked() uint32 {
 	id := r.nextID
 	r.nextID++
 	return id
@@ -90,7 +94,10 @@ func (r *Registry) Register(def *sdsv1.TypeDefinition) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.registerLocked(def)
+}
 
+func (r *Registry) registerLocked(def *sdsv1.TypeDefinition) error {
 	existing, ok := r.types[def.GetId()]
 	if ok {
 		// Idempotency check: same fingerprint is a no-op (rule 4).
@@ -204,14 +211,14 @@ func (r *Registry) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFiel
 
 	name := string(md.FullName())
 	r.mu.Lock()
-	existingID, exists := r.byName[name]
-	r.mu.Unlock()
+	defer r.mu.Unlock()
 
+	existingID, exists := r.byName[name]
 	var typeID uint32
 	if exists {
 		typeID = existingID
 	} else {
-		typeID = r.AllocateID()
+		typeID = r.allocateIDLocked()
 	}
 
 	def, err := BuildTypeDefinition(typeID, md, keyFields)
@@ -219,7 +226,7 @@ func (r *Registry) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFiel
 		return nil, err
 	}
 
-	if err := r.Register(def); err != nil {
+	if err := r.registerLocked(def); err != nil {
 		return nil, err
 	}
 
@@ -323,8 +330,10 @@ func (r *Registry) Import(reg *sdsv1.Registry) error {
 	if reg == nil {
 		return nil
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, def := range reg.GetTypes() {
-		if err := r.Register(def); err != nil {
+		if err := r.registerLocked(def); err != nil {
 			return err
 		}
 	}
