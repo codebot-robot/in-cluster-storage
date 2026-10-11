@@ -1229,6 +1229,7 @@ type WriteFileResponse struct {
 	NewSize       int64                  `protobuf:"varint,2,opt,name=new_size,json=newSize,proto3" json:"new_size,omitempty"`
 	ModTime       *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
 	Error         int32                  `protobuf:"varint,4,opt,name=error,proto3" json:"error,omitempty"`
+	StagingEpoch  uint64                 `protobuf:"varint,5,opt,name=staging_epoch,json=stagingEpoch,proto3" json:"staging_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1287,6 +1288,13 @@ func (x *WriteFileResponse) GetModTime() *timestamppb.Timestamp {
 func (x *WriteFileResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *WriteFileResponse) GetStagingEpoch() uint64 {
+	if x != nil {
+		return x.StagingEpoch
 	}
 	return 0
 }
@@ -1759,6 +1767,8 @@ type FsyncRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
 	Inode         uint64                 `protobuf:"varint,2,opt,name=inode,proto3" json:"inode,omitempty"`
+	Blocking      *bool                  `protobuf:"varint,3,opt,name=blocking,proto3,oneof" json:"blocking,omitempty"`
+	StagingEpoch  uint64                 `protobuf:"varint,4,opt,name=staging_epoch,json=stagingEpoch,proto3" json:"staging_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1807,10 +1817,25 @@ func (x *FsyncRequest) GetInode() uint64 {
 	return 0
 }
 
+func (x *FsyncRequest) GetBlocking() bool {
+	if x != nil && x.Blocking != nil {
+		return *x.Blocking
+	}
+	return false
+}
+
+func (x *FsyncRequest) GetStagingEpoch() uint64 {
+	if x != nil {
+		return x.StagingEpoch
+	}
+	return 0
+}
+
 type FsyncResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
 	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StagingEpoch  uint64                 `protobuf:"varint,3,opt,name=staging_epoch,json=stagingEpoch,proto3" json:"staging_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1855,6 +1880,13 @@ func (x *FsyncResponse) GetSuccess() bool {
 func (x *FsyncResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *FsyncResponse) GetStagingEpoch() uint64 {
+	if x != nil {
+		return x.StagingEpoch
 	}
 	return 0
 }
@@ -3953,12 +3985,13 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x12\n" +
 	"\x04data\x18\x04 \x01(\fR\x04data\x12;\n" +
 	"\n" +
-	"write_mode\x18\x05 \x01(\x0e2\x1c.objectfs.v1alpha1.WriteModeR\twriteMode\"\xa0\x01\n" +
+	"write_mode\x18\x05 \x01(\x0e2\x1c.objectfs.v1alpha1.WriteModeR\twriteMode\"\xc5\x01\n" +
 	"\x11WriteFileResponse\x12#\n" +
 	"\rbytes_written\x18\x01 \x01(\x03R\fbytesWritten\x12\x19\n" +
 	"\bnew_size\x18\x02 \x01(\x03R\anewSize\x125\n" +
 	"\bmod_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\amodTime\x12\x14\n" +
-	"\x05error\x18\x04 \x01(\x05R\x05error\"\\\n" +
+	"\x05error\x18\x04 \x01(\x05R\x05error\x12#\n" +
+	"\rstaging_epoch\x18\x05 \x01(\x04R\fstagingEpoch\"\\\n" +
 	"\x13TruncateFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x12\n" +
@@ -3988,13 +4021,17 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\bnew_name\x18\x05 \x01(\tR\anewName\"X\n" +
 	"\x0eRenameResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"A\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"\x94\x01\n" +
 	"\fFsyncRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
-	"\x05inode\x18\x02 \x01(\x04R\x05inode\"?\n" +
+	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x1f\n" +
+	"\bblocking\x18\x03 \x01(\bH\x00R\bblocking\x88\x01\x01\x12#\n" +
+	"\rstaging_epoch\x18\x04 \x01(\x04R\fstagingEpochB\v\n" +
+	"\t_blocking\"d\n" +
 	"\rFsyncResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"J\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12#\n" +
+	"\rstaging_epoch\x18\x03 \x01(\x04R\fstagingEpoch\"J\n" +
 	"\x12WatchVolumeRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"\x9b\x02\n" +
@@ -4369,6 +4406,7 @@ func file_proto_objectfs_proto_init() {
 		return
 	}
 	file_proto_objectfs_proto_msgTypes[3].OneofWrappers = []any{}
+	file_proto_objectfs_proto_msgTypes[25].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[54].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[55].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[56].OneofWrappers = []any{}
