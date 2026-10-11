@@ -419,7 +419,32 @@ spec:
 		t.Fatalf("Expected content 'hello from vscode statefulset' after recreation, got: %s", outAfterRestart)
 	}
 
-	t.Logf("Successfully verified ObjectFS dynamic provisioning with StatefulSet!")
+	// Step 3: Delete StatefulSet, pod, and PVC, and verify that the PV is deleted by csi-provisioner
+	t.Logf("Verifying PV cleanup upon PVC deletion")
+	pvcName := "dev-vscode-data-" + podName
+	pvName, err := h.GetPVForPVC(pvcName, "default")
+	if err != nil {
+		t.Fatalf("Failed to get PV for PVC %s: %v", pvcName, err)
+	}
+	t.Logf("Discovered bound PV %s for PVC %s", pvName, pvcName)
+
+	t.Logf("Deleting StatefulSet dev-vscode")
+	h.DeleteStatefulSet("dev-vscode", "default")
+
+	t.Logf("Deleting Pod %s", podName)
+	h.DeletePod(podName, "default")
+
+	t.Logf("Deleting PVC %s", pvcName)
+	h.DeletePVC(pvcName, "default")
+
+	t.Logf("Waiting for PV %s to disappear", pvName)
+	if err := h.WaitForPVDeleted(pvName, 60*time.Second); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		t.Fatalf("PersistentVolume %s failed to be deleted: %v", pvName, err)
+	}
+
+	t.Logf("Successfully verified ObjectFS dynamic provisioning with StatefulSet and PV cleanup!")
 }
 
 func TestObjectFSPersistentE2E(t *testing.T) {
