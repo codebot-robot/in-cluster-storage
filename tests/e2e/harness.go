@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -146,11 +147,25 @@ func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 	if prevLogs := h.getContainerLogs("objectfs-controller-0", "objectfs-controller", "default", true); prevLogs != "" {
 		t.Logf("ObjectFS Controller Previous Logs:\n%s\n", prevLogs)
 	}
+	if logs := h.getContainerLogs("objectfs-controller-0", "csi-provisioner", "default", false); logs != "" {
+		t.Logf("ObjectFS CSI Provisioner Logs:\n%s\n", logs)
+	}
+	if prevLogs := h.getContainerLogs("objectfs-controller-0", "csi-provisioner", "default", true); prevLogs != "" {
+		t.Logf("ObjectFS CSI Provisioner Previous Logs:\n%s\n", prevLogs)
+	}
 	if logs := h.getContainerLogs("wal-buffer-0", "wal-buffer", "default", false); logs != "" {
 		t.Logf("WAL Buffer Logs:\n%s\n", logs)
 	}
 	if prevLogs := h.getContainerLogs("wal-buffer-0", "wal-buffer", "default", true); prevLogs != "" {
 		t.Logf("WAL Buffer Previous Logs:\n%s\n", prevLogs)
+	}
+
+	// PersistentVolumes overview
+	out, err := exec.Command("kubectl", "get", "pv").CombinedOutput()
+	if err != nil {
+		t.Logf("Warning: failed to get persistentvolumes: %v (out: %s)", err, strings.TrimSpace(string(out)))
+	} else {
+		t.Logf("PersistentVolumes:\n%s\n", strings.TrimSpace(string(out)))
 	}
 
 	// Node Daemon Logs (current & previous, both node-daemon & node-driver-registrar containers)
@@ -200,5 +215,59 @@ func (h *Harness) DeletePodWithTimeout(t *testing.T, name, namespace string, tim
 		t.Errorf("TIMED OUT waiting for Pod %s to be deleted (timeout: %v)", name, timeout)
 		h.DumpDiagnosticLogs(t)
 		t.FailNow()
+	}
+}
+
+// GetPVForPVC returns the volume name (PV name) bound to the given PVC.
+func (h *Harness) GetPVForPVC(pvcName, namespace string) (string, error) {
+	h.t.Helper()
+	out, err := exec.Command("kubectl", "get", "pvc", pvcName, "-n", namespace, "-o", "jsonpath={.spec.volumeName}").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to get PV for PVC %s/%s: %w (output: %s)", namespace, pvcName, err, string(out))
+	}
+	pvName := strings.TrimSpace(string(out))
+	if pvName == "" {
+		return "", fmt.Errorf("PV for PVC %s/%s is empty", namespace, pvcName)
+	}
+	return pvName, nil
+}
+
+// DeletePVC deletes a PersistentVolumeClaim by name in the specified namespace.
+func (h *Harness) DeletePVC(name, namespace string) {
+	h.t.Helper()
+	if err := exec.Command("kubectl", "delete", "pvc", name, "-n", namespace, "--ignore-not-found").Run(); err != nil {
+		h.t.Logf("Warning: failed to delete pvc %s in namespace %s: %v", name, namespace, err)
+	}
+}
+
+// WaitForPVDeleted waits until a PersistentVolume is completely deleted from the cluster.
+func (h *Harness) WaitForPVDeleted(name string, timeout time.Duration) error {
+	h.t.Helper()
+	h.t.Logf("Waiting for persistentvolume %s to be deleted", name)
+	start := time.Now()
+	for {
+		if time.Since(start) > timeout {
+			desc, err := exec.Command("kubectl", "get", "persistentvolume", name, "-o", "yaml").CombinedOutput()
+			if err != nil {
+				h.t.Logf("Warning: failed to get persistentvolume %s yaml: %v (out: %s)", name, err, strings.TrimSpace(string(desc)))
+			} else {
+				h.t.Logf("Stuck PersistentVolume %s:\n%s\n", name, strings.TrimSpace(string(desc)))
+			}
+			return fmt.Errorf("timed out waiting for persistentvolume %s to be deleted after %s", name, timeout)
+		}
+		cmd := exec.Command("kubectl", "get", "persistentvolume", name, "--ignore-not-found", "-o", "jsonpath={.metadata.name}")
+		out, err := cmd.CombinedOutput()
+		outputStr := strings.TrimSpace(string(out))
+		if err != nil {
+			if strings.Contains(outputStr, "NotFound") || strings.Contains(outputStr, "not found") {
+				h.t.Logf("PersistentVolume %s successfully deleted", name)
+				return nil
+			}
+			h.t.Logf("Warning: error querying persistentvolume %s: %v (output: %s)", name, err, outputStr)
+		} else if outputStr == "" {
+			h.t.Logf("PersistentVolume %s successfully deleted", name)
+			return nil
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
