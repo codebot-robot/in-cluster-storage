@@ -69,7 +69,7 @@ For deployment and installation instructions with real object storage (GCS/S3) a
 |                                                                                         |
 |  Metadata (Snapshots & WAL):                                                            |
 |    volumes/<volID>/meta/<stream_seq, 20 digits>.erofs (Immutable EROFS snapshot projection) |
-|    wal/segments/<first_pos>-<last_pos>.wal            (Streams WAL segment logs)             |
+|    streams/wal/segments/<first_pos>-<last_pos>.wal    (Streams WAL segment logs)             |
 |                                                                                         |
 |  Data Blobs:                                                                            |
 |    blobs/<sha256>                                (Standalone loose blob for > 64MB)     |

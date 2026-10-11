@@ -730,7 +730,7 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 		}
 	}
 
-	segPath := fmt.Sprintf("wal/segments/%012d-%012d.wal", firstPos, lastPos)
+	segPath := fmt.Sprintf("%s%012d-%012d.wal", SegmentsPrefix, firstPos, lastPos)
 	segStream := blob.NewByteStreamFromBytes(segBuf.Bytes())
 	defer segStream.Close()
 

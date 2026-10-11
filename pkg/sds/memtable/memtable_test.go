@@ -461,3 +461,26 @@ func TestMemStoreConcurrentApplyBatchAndScan(t *testing.T) {
 	done.Store(true)
 	wg.Wait()
 }
+
+func TestMemtableSnapshotKeyParsing(t *testing.T) {
+	// Valid key
+	sid, pos, err := ParseSnapshotKey("streams/stream-1/snapshots/memory/00000000000000000042.snap")
+	if err != nil || sid != "stream-1" || pos != 42 {
+		t.Fatalf("unexpected ParseSnapshotKey result: sid=%s, pos=%d, err=%v", sid, pos, err)
+	}
+
+	// Reserved wal name must be rejected
+	if _, _, err := ParseSnapshotKey("streams/wal/snapshots/memory/00000000000000000042.snap"); err == nil {
+		t.Fatalf("expected error for reserved stream ID 'wal'")
+	}
+
+	// Aggregated WAL segment under streams/wal/ must be rejected
+	if _, _, err := ParseSnapshotKey("streams/wal/segments/000000000001-000000000010.wal"); err == nil {
+		t.Fatalf("expected error for aggregated WAL segment path")
+	}
+
+	// Invalid format
+	if _, _, err := ParseSnapshotKey("invalid"); err == nil {
+		t.Fatalf("expected error for invalid key")
+	}
+}
