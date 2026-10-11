@@ -614,7 +614,7 @@ func (s *LogSegmentStore) Close() error {
 }
 
 // ParseSegmentPath parses a segment object path into (firstPosition, lastPosition).
-// Format: wal/segments/<first_position>-<last_position>.wal
+// Format: streams/wal/segments/<first_position>-<last_position>.wal
 func ParseSegmentPath(p string) (firstPos, lastPos uint64, err error) {
 	base := filepath.Base(p)
 	base = strings.TrimSuffix(base, ".wal")
@@ -638,6 +638,11 @@ func ParseSegmentPath(p string) (firstPos, lastPos uint64, err error) {
 // Sealed format: streams/<stream-id>/from<from>-to<to>.wal
 // Open format: streams/<stream-id>/from<from>.wal
 func ParseStreamPath(p string) (fromSeq, toSeq uint64, isSealed bool, err error) {
+	clean := strings.TrimPrefix(filepath.ToSlash(p), "./")
+	clean = strings.TrimPrefix(clean, "/")
+	if strings.HasPrefix(clean, "streams/wal/") || clean == "streams/wal" {
+		return 0, 0, false, fmt.Errorf("reserved prefix streams/wal: %s", p)
+	}
 	base := filepath.Base(p)
 	if !strings.HasSuffix(base, ".wal") {
 		return 0, 0, false, fmt.Errorf("invalid stream file extension %s", p)

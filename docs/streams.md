@@ -56,10 +56,26 @@ Streams enables workloads to achieve:
 +---------------------------------------------------------------------------------+
 |                             Permanent Object Storage                            |
 |                                                                                 |
-|  wal/segments/000000000001-000000000500.wal                                     |
-|  wal/segments/000000000501-000000001000.wal                                     |
+|  streams/wal/segments/000000000001-000000000500.wal                             |
+|  streams/wal/segments/000000000501-000000001000.wal                             |
 +---------------------------------------------------------------------------------+
 ```
+
+### Top-Level Object Storage Layout
+
+An object storage bucket is divided into top-level prefixes by subsystem:
+
+```
+streams/<uuid>/...            per-stream files and snapshots
+streams/wal/segments/...      the aggregated log all per-stream files derive from
+blobs/                        content-addressed file data
+volumes/<pvc>/stream.id       PVC to stream pointers
+```
+
+- `streams/<uuid>/`: Per-stream WAL files (`from<from>-to<to>.wal`) and projection snapshots (`snapshots/<format>/...`).
+- `streams/wal/segments/`: Aggregated WAL segment files (`<first_pos>-<last_pos>.wal`) committed across all streams.
+- `blobs/`: Content-addressed data chunks and packfiles managed by the blob store.
+- `volumes/`: Metadata mapping PVCs / volume IDs to stream IDs.
 
 ### Key Components
 
@@ -74,7 +90,7 @@ Streams enables workloads to achieve:
    - Deployed as a Kubernetes `StatefulSet` or Service (`wal-buffer`).
    - Merges concurrent appends from multiple independent client streams into a single globally ordered sequence of log records identified by a monotonic 64-bit `position`.
    - Uses a micro-batched **group commit loop** (`batchMaxDelay`, `batchMaxSize`) to fsync batches to local disk (`LogSegmentStore`).
-   - Periodically packages committed records into immutable, self-describing segment objects in cloud storage (`wal/segments/<first_pos>-<last_pos>.wal`).
+   - Periodically packages committed records into immutable, self-describing segment objects in cloud storage (`streams/wal/segments/<first_pos>-<last_pos>.wal`).
 
 3. **Unified Tail Reader (`WalBuffer.Tail`):**
    - Provides a continuous stream of merged records ordered by `position`.
@@ -145,7 +161,7 @@ Stored in client node segment files (`stream-<uuid>-<firstSeq>.wal`):
 
 ### 2. Witness & Segment Log Record Format (`WALL`)
 
-Stored in buffer service local cache segments and permanent object store segments (`wal/segments/<first>-<last>.wal`):
+Stored in buffer service local cache segments and permanent object store segments (`streams/wal/segments/<first>-<last>.wal`):
 
 ```
 +---------------+--------------------+-------------------+--------------------+------------------+------------------+-------------------------+
@@ -157,18 +173,18 @@ Stored in buffer service local cache segments and permanent object store segment
 
 - **Position:** 64-bit monotonically increasing sequence number assigned globally by the buffer service.
 
-### 3. Permanent Segment Storage & Discovery (`wal/segments/`)
+### 3. Permanent Segment Storage & Discovery (`streams/wal/segments/`)
 
 Segments stored in permanent object storage are immutable, self-describing sealed files named by their position ranges:
 
 ```
-wal/segments/000000000001-000000000500.wal
-wal/segments/000000000501-000000001000.wal
+streams/wal/segments/000000000001-000000000500.wal
+streams/wal/segments/000000000501-000000001000.wal
 ```
 
 - **Self-Describing Range:** Segment file keys use fixed-width, 12-digit zero-padded integers (`%012d-%012d.wal`). This guarantees that lexicographical key ordering matches numeric sequence position ordering across all object stores (GCS, S3, filesystem).
-- **Manifest-Free Discovery:** The buffer service and tail readers discover existing segments and calculate the current durable watermarks (`last_flushed_position` and per-stream `s3_acked_stream_seq`) via object storage prefix listing (`wal/segments/`) and segment record recovery.
-- **Skew Prevention & Contention Free:** Eliminating the separate central manifest file (`wal/manifest.json`) avoids dual-write consistency skew (where one file succeeds but the other fails) and removes single-object write contention/bottlenecks in cloud object storage.
+- **Manifest-Free Discovery:** The buffer service and tail readers discover existing segments and calculate the current durable watermarks (`last_flushed_position` and per-stream `s3_acked_stream_seq`) via object storage prefix listing (`streams/wal/segments/`) and segment record recovery.
+- **Skew Prevention & Contention Free:** Eliminating the separate central manifest file (`streams/wal/manifest.json`) avoids dual-write consistency skew (where one file succeeds but the other fails) and removes single-object write contention/bottlenecks in cloud object storage.
 
 ---
 
@@ -199,7 +215,7 @@ The `wal-buffer` daemon exposes the following flags to tune archiving and cache 
 ### Archival Lifecycle
 
 1. **Micro-batched Group Commit:** Incoming client records are validated, assigned global monotonic sequence numbers (`position`), and appended to the local `LogSegmentStore` with `fsync`.
-2. **Segment Packaging:** When `flushBytes` accumulates or `flushInterval` elapses (or an explicit client `Flush` RPC is received), all unflushed `WALL` records are serialized into a sealed segment file: `wal/segments/<first_pos>-<last_pos>.wal`.
+2. **Segment Packaging:** When `flushBytes` accumulates or `flushInterval` elapses (or an explicit client `Flush` RPC is received), all unflushed `WALL` records are serialized into a sealed segment file: `streams/wal/segments/<first_pos>-<last_pos>.wal`.
 3. **Atomic Object Put:** The sealed segment is uploaded via `Backend.PutObject` to cloud object storage as a single atomic transaction. No secondary manifest file is written.
 4. **Watermark Advancement & Local Cleanup:** The buffer service advances its in-memory flushed position and stream watermarks, and cleans up local segment files that are fully flushed.
 5. **Client Notification & GC:** Stream clients receive `Ack(s3Seq)` updates, permitting them to safely garbage-collect local client segment files (`stream-<id>-*.wal`) whose records have been durably committed to permanent object storage.
@@ -255,7 +271,7 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 ## Roadmap & TODO List
 
 - [ ] **Package & Name Refactoring:** Rename `wal` package, proto services, CLI binaries, Docker images, and Kubernetes manifests to `streams` (e.g. `streams-buffer`, `streams-client`, `proto/streams.proto`).
-- [x] **Eliminate Manifest File:** Remove central `wal/manifest.json` from object storage to avoid atomic single-object contention, race conditions, dual-write skew, and consistency bottlenecks; use self-describing segment files and object prefix listing instead.
+- [x] **Eliminate Manifest File:** Remove central `streams/wal/manifest.json` from object storage to avoid atomic single-object contention, race conditions, dual-write skew, and consistency bottlenecks; use self-describing segment files and object prefix listing instead.
 - [ ] **Opaque Stream Offsets (Hide Global Monotonic Positions):** Hide global buffer monotonic positions from individual stream clients. Clients should only reason about their own `stream_id` and `stream_seq`. Expose global positions only as opaque resumption tokens/cookies for consumers.
 - [ ] **Stress & Chaos Testing:**
   - High-concurrency randomized multi-client benchmark tests to stress group commits and tail subscribers.

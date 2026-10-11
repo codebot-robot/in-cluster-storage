@@ -48,7 +48,7 @@ func SnapshotKey(streamID string, position uint64) string {
 func ParseSnapshotKey(key string) (streamID string, position uint64, err error) {
 	// Expected format: streams/<stream-uuid>/snapshots/memory/<20-digits>.snap
 	parts := strings.Split(key, "/")
-	if len(parts) != 5 || parts[0] != "streams" || parts[2] != "snapshots" || parts[3] != "memory" {
+	if len(parts) != 5 || parts[0] != "streams" || parts[1] == "wal" || parts[2] != "snapshots" || parts[3] != "memory" {
 		return "", 0, fmt.Errorf("%w: %q", ErrInvalidSnapshotKey, key)
 	}
 
@@ -75,6 +75,9 @@ func ParseSnapshotKey(key string) (streamID string, position uint64, err error) 
 func FindLatestSnapshot(ctx context.Context, backend objectstore.Backend, streamID string, maxPosition uint64) (key string, position uint64, err error) {
 	if backend == nil {
 		return "", 0, errors.New("nil backend")
+	}
+	if streamID == "wal" {
+		return "", 0, fmt.Errorf("invalid stream ID: wal is reserved")
 	}
 
 	prefix := fmt.Sprintf("streams/%s/snapshots/memory/", streamID)

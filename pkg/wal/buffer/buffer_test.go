@@ -133,6 +133,9 @@ func TestServerStartupReadOnlyUntilFlush(t *testing.T) {
 
 	// Verify manifest file does NOT exist
 	var buf bytes.Buffer
+	if err := backend.GetObject(t.Context(), "", "streams/wal/manifest.json", 0, 0, &buf); err == nil {
+		t.Fatalf("expected manifest file to NOT exist, but GetObject succeeded")
+	}
 	if err := backend.GetObject(t.Context(), "", "wal/manifest.json", 0, 0, &buf); err == nil {
 		t.Fatalf("expected manifest file to NOT exist, but GetObject succeeded")
 	}

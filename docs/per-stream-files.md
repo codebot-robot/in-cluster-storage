@@ -6,7 +6,7 @@ This document describes the design and lifecycle for periodic per-stream WAL fil
 
 ## Background & Problem
 
-The `wal-buffer` aggregates incoming records across all active streams into a unified write-ahead log. It commits batches with `fsync` locally and flushes aggregated segments to object storage under `wal/segments/<first_pos>-<last_pos>.wal`.
+The `wal-buffer` aggregates incoming records across all active streams into a unified write-ahead log. It commits batches with `fsync` locally and flushes aggregated segments to object storage under `streams/wal/segments/<first_pos>-<last_pos>.wal`.
 
 While aggregating all streams maximizes write throughput via group commits, reading historical records for a single stream (e.g. controller recovery after failover (#185), stream replay, or `sds cat`) previously required listing and scanning every aggregated segment since position $P$. The scan cost was proportional to the total cluster traffic across all streams rather than the specific stream being read.
 
@@ -33,7 +33,7 @@ Instead of splitting aggregated segments asynchronously after flushing, the only
 |         |                 streams/<uuid>/from<from>-to<to>.wal (Sealed)           |
 |         |                        |                                                |
 |         v (Flush)                v (Upload)                                       |
-|  wal/segments/*.wal       streams/<uuid>/from<from>-to<to>.wal                    |
+|  streams/wal/segments/*.wal streams/<uuid>/from<from>-to<to>.wal                 |
 |  (Object Storage)         (Object Storage)                                        |
 +-----------------------------------------------------------------------------------+
 ```
@@ -53,6 +53,15 @@ Instead of splitting aggregated segments asynchronously after flushing, the only
    - Appending is off the latency-critical path, so witness ACKs do not wait on per-stream disk operations.
 
 ### 2. Object Layout & Naming Convention
+
+An object storage bucket is divided into top-level prefixes by subsystem:
+
+```
+streams/<uuid>/...            per-stream files and snapshots
+streams/wal/segments/...      the aggregated log all per-stream files derive from
+blobs/                        content-addressed file data
+volumes/<pvc>/stream.id       PVC to stream pointers
+```
 
 Directories are kept small by partitioning per stream:
 
@@ -103,7 +112,7 @@ This eliminates the full-WAL scan overhead on controller failover and stream rep
 
 ### 6. Retention and Garbage Collection
 
-- **Aggregated Segments:** An aggregated segment `wal/segments/<first>-<last>.wal` becomes safe to delete once every stream that contributed records to that segment has a sealed per-stream file covering at least up to its highest sequence in that segment.
+- **Aggregated Segments:** An aggregated segment `streams/wal/segments/<first>-<last>.wal` becomes safe to delete once every stream that contributed records to that segment has a sealed per-stream file covering at least up to its highest sequence in that segment.
 - **Local Per-Stream Files:** Once uploaded to object storage, local sealed files can be evicted under an LRU disk space budget and re-downloaded on demand if needed.
 - **Object Storage Retention ("Snapshot-Then-Trim"):**
   - **Default:** Retain all history indefinitely. No records are deleted automatically.

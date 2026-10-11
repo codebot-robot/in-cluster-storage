@@ -387,4 +387,15 @@ func TestParseAndFormatStreamPath(t *testing.T) {
 	if _, _, _, err := ParseStreamPath("invalid.wal"); err == nil {
 		t.Fatalf("expected error on invalid.wal")
 	}
+
+	// Reserved streams/wal prefix
+	if _, _, _, err := ParseStreamPath("streams/wal/segments/000000000001-000000000010.wal"); err == nil {
+		t.Fatalf("expected error on streams/wal segment path")
+	}
+	if _, _, _, err := ParseStreamPath("streams/wal/from00000000000000000001.wal"); err == nil {
+		t.Fatalf("expected error on streams/wal open stream path")
+	}
+	if _, _, _, err := ParseStreamPath("streams/wal/from00000000000000000001-to00000000000000000100.wal"); err == nil {
+		t.Fatalf("expected error on streams/wal sealed stream path")
+	}
 }

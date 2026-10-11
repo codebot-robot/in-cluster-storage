@@ -30,10 +30,10 @@ import (
 
 const (
 	// SegmentsPrefix is the object storage key prefix where segment files are stored.
-	SegmentsPrefix = "wal/segments/"
+	SegmentsPrefix = "streams/wal/segments/"
 )
 
-// ListSegmentsFromBackend lists all segment objects in permanent storage under wal/segments/,
+// ListSegmentsFromBackend lists all segment objects in permanent storage under streams/wal/segments/,
 // sorted in ascending order by start position. It returns the list of segment object keys
 // and the highest last_position across all discovered segments (0 if no segments exist).
 func ListSegmentsFromBackend(ctx context.Context, backend objectstore.Backend) ([]string, uint64, error) {

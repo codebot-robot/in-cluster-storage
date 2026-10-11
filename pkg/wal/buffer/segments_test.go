@@ -52,11 +52,11 @@ func TestListSegmentsFromBackend(t *testing.T) {
 	}
 
 	// 2. Put segments out of order along with non-segment / invalid files
-	seg2 := "wal/segments/000000000501-000000001000.wal"
-	seg1 := "wal/segments/000000000001-000000000500.wal"
-	seg3 := "wal/segments/000000001001-000000001500.wal"
-	invalid1 := "wal/segments/not-a-segment.txt"
-	invalid2 := "wal/other/000000000001-000000000500.wal"
+	seg2 := "streams/wal/segments/000000000501-000000001000.wal"
+	seg1 := "streams/wal/segments/000000000001-000000000500.wal"
+	seg3 := "streams/wal/segments/000000001001-000000001500.wal"
+	invalid1 := "streams/wal/segments/not-a-segment.txt"
+	invalid2 := "streams/wal/other/000000000001-000000000500.wal"
 
 	dummyData := []byte("dummy")
 	for _, k := range []string{seg2, invalid1, seg1, invalid2, seg3} {
@@ -108,7 +108,7 @@ func TestReadSegmentFromBackend(t *testing.T) {
 		segBuf.Write(r.Encode())
 	}
 
-	segPath := "wal/segments/000000000001-000000000002.wal"
+	segPath := "streams/wal/segments/000000000001-000000000002.wal"
 	if _, err := backend.PutObject(ctx, "", segPath, blob.NewByteStreamFromBytes(segBuf.Bytes())); err != nil {
 		t.Fatalf("PutObject failed: %v", err)
 	}
@@ -213,13 +213,13 @@ func TestArchivingToFilesystemStorage(t *testing.T) {
 	}
 
 	// Verify no manifest file is created
-	manifestPath := filepath.Join(storeDir, "wal", "manifest.json")
+	manifestPath := filepath.Join(storeDir, "streams", "wal", "manifest.json")
 	if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
 		t.Fatalf("expected manifest file to NOT exist at %s, but stat returned: %v", manifestPath, err)
 	}
 
 	// Verify segment file exists in storeDir
-	segPath := filepath.Join(storeDir, "wal", "segments", "000000000001-000000000005.wal")
+	segPath := filepath.Join(storeDir, "streams", "wal", "segments", "000000000001-000000000005.wal")
 	if _, err := os.Stat(segPath); err != nil {
 		t.Fatalf("segment file does not exist at %s: %v", segPath, err)
 	}

@@ -184,7 +184,7 @@ func TestAggregatedSegmentGCWhenCovered(t *testing.T) {
 		t.Fatalf("flush failed: resp=%+v, err=%v", resp, err)
 	}
 
-	segPath := fmt.Sprintf("wal/segments/%012d-%012d.wal", 1, 10)
+	segPath := fmt.Sprintf("%s%012d-%012d.wal", SegmentsPrefix, 1, 10)
 	var segBuf bytes.Buffer
 	if err := backend.GetObject(ctx, "", segPath, 0, 0, &segBuf); err != nil {
 		t.Fatalf("expected aggregated segment %s in object storage, err: %v", segPath, err)
@@ -568,7 +568,7 @@ type faultyBackend struct {
 }
 
 func (f *faultyBackend) PutObject(ctx context.Context, bucket, key string, stream blob.ByteStream) (string, error) {
-	if f.failStreamPut && strings.Contains(key, "streams/") {
+	if f.failStreamPut && strings.Contains(key, "streams/") && !strings.Contains(key, "wal/segments/") {
 		return "", errors.New("injected stream upload failure")
 	}
 	return f.Backend.PutObject(ctx, bucket, key, stream)
@@ -732,7 +732,7 @@ func TestAggregatedSegmentGCPreservedDuringUploadFailure(t *testing.T) {
 	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
 		t.Fatalf("flush failed: %v", err)
 	}
-	segPath := fmt.Sprintf("wal/segments/%012d-%012d.wal", 1, 5)
+	segPath := fmt.Sprintf("%s%012d-%012d.wal", SegmentsPrefix, 1, 5)
 
 	// Per-stream upload fails
 	if err := srv.SealStream(ctx, streamID); err == nil {

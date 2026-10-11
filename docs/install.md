@@ -39,7 +39,7 @@ ObjectFS is self-contained: because it acts as the cluster's storage provider, i
 |                       Cloud Object Storage (GCS / S3 / MinIO)                           |
 |  - Content-addressable data blobs: blobs/<sha256>, blobs/<packID>-<count>.pack          |
 |  - Metadata snapshots: volumes/<volID>/meta/<stream_seq>.erofs                          |
-|  - Durable WAL segment logs: wal/segments/<first_pos>-<last_pos>.wal                    |
+|  - Durable WAL segment logs: streams/wal/segments/<first_pos>-<last_pos>.wal            |
 +-----------------------------------------------------------------------------------------+
 ```
 
