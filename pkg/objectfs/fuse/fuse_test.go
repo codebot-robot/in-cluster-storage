@@ -2846,3 +2846,175 @@ func TestFUSETruncateZeroThenGrowReadsZeros(t *testing.T) {
 		t.Fatalf("Read returned non-zero bytes for extended hole")
 	}
 }
+
+type faultReadFileClient struct {
+	pb.ObjectFSControllerClient
+	mu      sync.Mutex
+	failRPC bool
+	respErr int32
+}
+
+func (c *faultReadFileClient) ReadFile(ctx context.Context, in *pb.ReadFileRequest, opts ...grpc.CallOption) (*pb.ReadFileResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failRPC {
+		return nil, status.Errorf(codes.Unavailable, "injected ReadFile RPC error")
+	}
+	if c.respErr != 0 {
+		return &pb.ReadFileResponse{Error: c.respErr}, nil
+	}
+	return c.ObjectFSControllerClient.ReadFile(ctx, in, opts...)
+}
+
+func TestWritePartialChunkReadFileFailureReturnsEIO(t *testing.T) {
+	tests := []struct {
+		name     string
+		setFault func(fc *faultReadFileClient)
+	}{
+		{
+			name: "RPCError",
+			setFault: func(fc *faultReadFileClient) {
+				fc.mu.Lock()
+				fc.failRPC = true
+				fc.mu.Unlock()
+			},
+		},
+		{
+			name: "ControllerError",
+			setFault: func(fc *faultReadFileClient) {
+				fc.mu.Lock()
+				fc.respErr = int32(syscall.EIO)
+				fc.mu.Unlock()
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			baseClient, cleanup := createTestClient(t)
+			defer cleanup()
+
+			faultClient := &faultReadFileClient{ObjectFSControllerClient: baseClient}
+			cache := NewNodeCache(8 * 1024 * 1024)
+			volumeID := "test-write-fill-" + tc.name
+			rawFS := NewObjectFS(faultClient, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+
+			var createOut fuse.CreateOut
+			if status := rawFS.Create(nil, &fuse.CreateIn{
+				InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+				Mode:     0644,
+			}, "testfile.bin", &createOut); status != fuse.OK {
+				t.Fatalf("Create failed: %v", status)
+			}
+			fileID := createOut.EntryOut.NodeId
+
+			// Initialize file with known non-zero bytes across a full chunk
+			const cs = int(DefaultChunkSize)
+			origContent := make([]byte, cs)
+			for i := range origContent {
+				origContent[i] = byte(i%251 + 1)
+			}
+
+			n, status := rawFS.Write(nil, &fuse.WriteIn{
+				InHeader: fuse.InHeader{NodeId: fileID},
+				Offset:   0,
+			}, origContent)
+			if status != fuse.OK || n != uint32(len(origContent)) {
+				t.Fatalf("Initial write failed: status=%v, n=%d", status, n)
+			}
+
+			// Sync file to service so controller has the initial content
+			if status := rawFS.Flush(nil, &fuse.FlushIn{
+				InHeader: fuse.InHeader{NodeId: fileID},
+			}); status != fuse.OK {
+				t.Fatalf("Flush failed: %v", status)
+			}
+
+			// Invalidate client cache to ensure the subsequent partial write must fill chunk from controller
+			cache.Clear()
+
+			// Inject ReadFile failure
+			tc.setFault(faultClient)
+
+			// Perform a partial-chunk write (bytes 100..109 in chunk 0)
+			patch := []byte("0123456789")
+			n, status = rawFS.Write(nil, &fuse.WriteIn{
+				InHeader: fuse.InHeader{NodeId: fileID},
+				Offset:   100,
+			}, patch)
+
+			if status != fuse.EIO {
+				t.Fatalf("expected Write to fail with EIO (%v), got status %v", fuse.EIO, status)
+			}
+			if n != 0 {
+				t.Fatalf("expected 0 bytes written on failure, got %d", n)
+			}
+
+			// Verify the cache has no dirty chunk for this file
+			if _, _, _, _, isDirty := cache.GetDirtyChunks(fileID); isDirty {
+				t.Fatalf("cache should not have any dirty chunks after failed write")
+			}
+			if entry, isDirty := cache.GetDirty(fileID); isDirty {
+				t.Fatalf("cache entry should not be marked dirty after failed write: %+v", entry)
+			}
+
+			// Clear fault
+			faultClient.mu.Lock()
+			faultClient.failRPC = false
+			faultClient.respErr = 0
+			faultClient.mu.Unlock()
+
+			// Retry the partial write; it must succeed now
+			n, status = rawFS.Write(nil, &fuse.WriteIn{
+				InHeader: fuse.InHeader{NodeId: fileID},
+				Offset:   100,
+			}, patch)
+			if status != fuse.OK {
+				t.Fatalf("retry Write failed: %v", status)
+			}
+			if n != uint32(len(patch)) {
+				t.Fatalf("retry Write returned %d, want %d", n, len(patch))
+			}
+
+			// Verify that untouched bytes remain intact (not replaced by zeros)
+			expected := make([]byte, cs)
+			copy(expected, origContent)
+			copy(expected[100:], patch)
+
+			readBuf := make([]byte, cs)
+			readRes, status := rawFS.Read(nil, &fuse.ReadIn{
+				InHeader: fuse.InHeader{NodeId: fileID},
+				Offset:   0,
+				Size:     uint32(cs),
+			}, readBuf)
+			if status != fuse.OK {
+				t.Fatalf("Read failed: %v", status)
+			}
+			readData, _ := readRes.Bytes(readBuf)
+			if !bytes.Equal(readData, expected) {
+				t.Fatalf("Data mismatch after retry write: untouched bytes corrupted with zeros")
+			}
+
+			// Flush to controller, clear cache, and verify controller also has intact content
+			if status := rawFS.Flush(nil, &fuse.FlushIn{
+				InHeader: fuse.InHeader{NodeId: fileID},
+			}); status != fuse.OK {
+				t.Fatalf("Flush after retry failed: %v", status)
+			}
+			cache.Clear()
+
+			readRes2, status2 := rawFS.Read(nil, &fuse.ReadIn{
+				InHeader: fuse.InHeader{NodeId: fileID},
+				Offset:   0,
+				Size:     uint32(cs),
+			}, readBuf)
+			if status2 != fuse.OK {
+				t.Fatalf("Read after Flush failed: %v", status2)
+			}
+			readData2, _ := readRes2.Bytes(readBuf)
+			if !bytes.Equal(readData2, expected) {
+				t.Fatalf("Data mismatch on controller after flush: untouched bytes corrupted")
+			}
+		})
+	}
+}

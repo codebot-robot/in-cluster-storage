@@ -884,8 +884,12 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 				})
 				cancelFunc()
 				if err != nil {
-					fs.logRPCError("Write:ReadFile", err)
-				} else if resp.GetError() == 0 && len(resp.GetData()) > 0 {
+					return 0, fs.grpcErrorToStatus("Write:ReadFile", err)
+				}
+				if resp.GetError() != 0 {
+					return 0, fuse.Status(resp.GetError())
+				}
+				if len(resp.GetData()) > 0 {
 					fs.cache.PutChunk(input.NodeId, int(i), DefaultChunkSize, resp.GetTotalSize(), resp.GetData(), time.Now(), readGen)
 				}
 			}
