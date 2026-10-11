@@ -2785,3 +2785,64 @@ func (h *hookClient) WriteFile(ctx context.Context, in *pb.WriteFileRequest, opt
 	}
 	return h.ObjectFSControllerClient.WriteFile(ctx, in, opts...)
 }
+
+func TestFUSETruncateZeroThenGrowReadsZeros(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-fuse-trunc-zero-grow"
+	cache := NewNodeCache(64 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "testfile.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Truncate to 0
+	var setAttrOut fuse.AttrOut
+	if status := rawFS.SetAttr(nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &setAttrOut); status != fuse.OK {
+		t.Fatalf("SetAttr truncate to 0 failed: %v", status)
+	}
+
+	// Truncate to 100000
+	if status := rawFS.SetAttr(nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_SIZE,
+			Size:     100000,
+		},
+	}, &setAttrOut); status != fuse.OK {
+		t.Fatalf("SetAttr truncate to 100000 failed: %v", status)
+	}
+
+	// Clear local cache to force read from controller
+	cache.Clear()
+
+	buf := make([]byte, 65536)
+	readRes, status := rawFS.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     65536,
+	}, buf)
+	if status != fuse.OK {
+		t.Fatalf("Read failed: %v", status)
+	}
+	data, _ := readRes.Bytes(buf)
+	if len(data) != 65536 {
+		t.Fatalf("Read returned %d bytes, want 65536", len(data))
+	}
+	if !bytes.Equal(data, make([]byte, 65536)) {
+		t.Fatalf("Read returned non-zero bytes for extended hole")
+	}
+}
