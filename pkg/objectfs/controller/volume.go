@@ -2478,15 +2478,6 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		}
 
 		// Chunked file write
-		if len(node.InlineData) > 0 {
-			if node.StagedChunks == nil {
-				node.StagedChunks = make(map[int][]byte)
-			}
-			node.StagedChunks[0] = node.InlineData
-			cSha := fmt.Sprintf("%x", sha256.Sum256(node.InlineData))
-			node.Chunks = map[uint32]string{0: cSha}
-			node.InlineData = nil
-		}
 		if node.Chunks == nil {
 			node.Chunks = make(map[uint32]string)
 		}
@@ -2495,13 +2486,29 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		}
 		_ = v.ensureInodeChunksLoadedLocked(ctx, tx, node)
 
+		var inlineBytes []byte
+		var inlineSha string
+		if len(node.InlineData) > 0 {
+			inlineBytes = node.InlineData
+			inlineSha = fmt.Sprintf("%x", sha256.Sum256(inlineBytes))
+			node.Chunks[0] = inlineSha
+			node.StagedChunks[0] = inlineBytes
+			node.InlineData = nil
+		}
+
 		cs := int64(effectiveChunkSize)
 		startChunk := int(offset / cs)
 		endChunk := int((offset + int64(len(data)) - 1) / cs)
 
-		touchedIndices := make([]int, 0, endChunk-startChunk+1)
+		touchedIndices := make([]int, 0, endChunk-startChunk+2)
 		chunkBlobs := make(map[int][]byte)
 		chunkShas := make(map[int]string)
+
+		if inlineBytes != nil && startChunk > 0 {
+			touchedIndices = append(touchedIndices, 0)
+			chunkBlobs[0] = inlineBytes
+			chunkShas[0] = inlineSha
+		}
 
 		for i := startChunk; i <= endChunk; i++ {
 			chunkStart := int64(i) * cs

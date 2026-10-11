@@ -4309,3 +4309,65 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 		t.Fatalf("expected /stale_local_file.txt to not exist on authoritative volume, but got data: %q", string(staleResp.GetData()))
 	}
 }
+
+func TestInlineToChunkedTransitionUploadsChunk0OnRestart(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-inline-chunk-restart"
+
+	server1 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	inlineData := []byte("hello-inline-world")
+	createResp, err := testCreateFile(ctx, server1, volumeID, "/file.txt", 0644, inlineData, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v, err=%d", err, createResp.GetError())
+	}
+	ino := createResp.GetAttr().GetInode().GetIno()
+
+	// Write at chunk 2 (offset 128 KiB), making the file chunked while leaving chunk 0 untouched.
+	chunk2Offset := int64(2 * 64 * 1024)
+	chunk2Data := []byte("chunk-2-data")
+	writeResp, err := server1.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     ino,
+		Offset:    chunk2Offset,
+		Data:      chunk2Data,
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || writeResp.GetError() != 0 {
+		var code int32
+		if writeResp != nil {
+			code = writeResp.GetError()
+		}
+		t.Fatalf("WriteFile at chunk 2 failed: %v, err=%d", err, code)
+	}
+
+	vol1, err := server1.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	if err := vol1.FlushToBackend(ctx); err != nil {
+		t.Fatalf("FlushToBackend failed: %v", err)
+	}
+	_ = server1.Close()
+
+	// Restart server from the same backend & WAL
+	server2 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	defer func() { _ = server2.Close() }()
+
+	readResp, err := server2.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   0,
+		Size:     int64(len(inlineData)),
+	})
+	if err != nil {
+		t.Fatalf("ReadFile chunk 0 after restart failed: %v", err)
+	}
+	if readResp.GetError() != 0 {
+		t.Fatalf("ReadFile chunk 0 after restart returned errno %d", readResp.GetError())
+	}
+	if !bytes.Equal(readResp.GetData(), inlineData) {
+		t.Fatalf("ReadFile chunk 0 content mismatch: got %q, want %q", string(readResp.GetData()), string(inlineData))
+	}
+}
