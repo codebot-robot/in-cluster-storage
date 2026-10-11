@@ -340,9 +340,33 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 		t.Fatalf("Expected controller to have 0 bytes before sync, got: %q", string(ctrlResp.GetData()))
 	}
 
-	// Now call Flush / Fsync on the FUSE layer
+	// Now call Flush on the FUSE layer to stage writes on controller
 	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
 		t.Fatalf("Flush failed: %v", status)
+	}
+
+	// Before Fsync, controller ReadFile must NOT see staged content
+	ctrlRespPreSync, err := client.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: "vol-buffering",
+		Inode:    fileID,
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil {
+		t.Fatalf("Controller read failed: %v", err)
+	}
+	if len(ctrlRespPreSync.GetData()) != 0 {
+		t.Fatalf("Expected controller to have 0 bytes before Fsync, got: %q", string(ctrlRespPreSync.GetData()))
+	}
+
+	// Cache entry must remain dirty until covering sync
+	if _, isDirty := cache.GetDirty(fileID); !isDirty {
+		t.Fatalf("Expected cache entry to remain dirty before covering sync")
+	}
+
+	// Now call Fsync to commit staged writes and pack them
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
 	}
 
 	// Controller should now have the synced data
@@ -353,7 +377,7 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 		Size:     1024,
 	})
 	if err != nil {
-		t.Fatalf("Controller read after flush failed: %v", err)
+		t.Fatalf("Controller read after fsync failed: %v", err)
 	}
 	if string(ctrlResp2.GetData()) != string(localData) {
 		t.Fatalf("Expected controller to have %q, got %q", string(localData), string(ctrlResp2.GetData()))
@@ -361,7 +385,7 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 
 	// Cache entry should no longer be dirty
 	if _, isDirty := cache.GetDirty(fileID); isDirty {
-		t.Fatalf("Expected cache entry to be marked clean after flush")
+		t.Fatalf("Expected cache entry to be marked clean after fsync")
 	}
 }
 
@@ -1418,8 +1442,8 @@ func TestFUSEUnflushedHoleAndDirtyWriteRead(t *testing.T) {
 	if status != fuse.OK || int(written) != len(chunk0Data) {
 		t.Fatalf("Write chunk 0 failed: status=%v, written=%d", status, written)
 	}
-	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
-		t.Fatalf("Flush failed: %v", status)
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
 	}
 
 	// Dirty write extending past controller size (e.g. at 200 KiB)
@@ -2147,9 +2171,12 @@ func TestFUSETruncateReportsNewSizeOnFstatAndGetAttr(t *testing.T) {
 		t.Fatalf("GetAttr (fstat) reported size %d, expected %d", getAttrOut.Attr.Size, truncSize)
 	}
 
-	// 3. Verify cache is marked clean after successful truncate sync
+	// 3. Verify cache is marked clean after covering sync
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
 	if _, isDirty := cache.GetDirty(fileID); isDirty {
-		t.Fatalf("Expected cache entry to be clean after Truncate succeeded")
+		t.Fatalf("Expected cache entry to be clean after Truncate and Fsync succeeded")
 	}
 
 	// 4. Simulate a stale chunk read returned from before truncate while entry is locally dirty
@@ -2361,11 +2388,9 @@ func TestFUSEConcurrentOperationsRace(t *testing.T) {
 	close(stopCh)
 	wg.Wait()
 
-	// Final flush to ensure all acknowledged writes are flushed
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	if err := rawFS.syncFileToService(ctx, fileID); err != nil {
-		t.Fatalf("Final syncFileToService failed: %v", err)
+	// Final sync to ensure all acknowledged writes are durable and clean
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Final Fsync failed: %v", status)
 	}
 
 	modelMu.Lock()
@@ -2389,6 +2414,7 @@ func TestFUSEConcurrentOperationsRace(t *testing.T) {
 	}
 
 	// 3. Verify content on controller matches expected model byte-for-byte
+	ctx := t.Context()
 	var controllerData []byte
 	const chunkSize = 64 * 1024
 	numChunks := int((int64(expectedSize) + chunkSize - 1) / chunkSize)
@@ -2515,8 +2541,16 @@ func TestSyncFileToServiceCoalescesContiguousChunks(t *testing.T) {
 		t.Errorf("Concatenated data content mismatch")
 	}
 
+	if _, isDirty := cache.GetDirty(fileID); !isDirty {
+		t.Errorf("Expected cache to remain dirty before covering sync")
+	}
+
+	if status := fs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
 	if _, isDirty := cache.GetDirty(fileID); isDirty {
-		t.Errorf("Expected cache to be clean after sync")
+		t.Errorf("Expected cache to be clean after covering sync")
 	}
 }
 
@@ -2572,8 +2606,16 @@ func TestSyncFileToServiceNonContiguousRuns(t *testing.T) {
 		t.Errorf("Run 3 mismatch: offset=%d len=%d want offset=%d len=%d", reqs[2].Offset, len(reqs[2].Data), 7*cs, 2*cs)
 	}
 
+	if _, isDirty := cache.GetDirty(fileID); !isDirty {
+		t.Errorf("Expected cache to remain dirty before covering sync")
+	}
+
+	if status := fs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
 	if _, isDirty := cache.GetDirty(fileID); isDirty {
-		t.Errorf("Expected cache to be clean after sync")
+		t.Errorf("Expected cache to be clean after covering sync")
 	}
 }
 
@@ -2623,8 +2665,16 @@ func TestSyncFileToServiceSplitsAt32ChunksAnd2MiB(t *testing.T) {
 		t.Errorf("Run 2 mismatch: offset=%d len=%d want offset=%d len=%d", reqs[1].Offset, len(reqs[1].Data), 32*cs, 3*cs)
 	}
 
+	if _, isDirty := cache.GetDirty(fileID); !isDirty {
+		t.Errorf("Expected cache to remain dirty before covering sync")
+	}
+
+	if status := fs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
 	if _, isDirty := cache.GetDirty(fileID); isDirty {
-		t.Errorf("Expected cache to be clean after sync")
+		t.Errorf("Expected cache to be clean after covering sync")
 	}
 }
 
@@ -2756,7 +2806,12 @@ func TestSyncFileToServiceConcurrentWritePreservesDirtyGeneration(t *testing.T) 
 		t.Fatalf("syncFileToService failed: %v", err)
 	}
 
-	// Chunk 0 was clean and should be cleared.
+	// Chunks remain dirty until covering sync acks. Invoke executeFsync to ack the sync covering chunk 0 and chunk 1 v1.
+	if err := fs.executeFsync(ctx, fileID, true); err != nil {
+		t.Fatalf("executeFsync failed: %v", err)
+	}
+
+	// Chunk 0 was covered and should be cleared.
 	// Chunk 1 was mutated concurrently, so it must still be dirty with c1v2!
 	dirty, _, _, _, isDirty := cache.GetDirtyChunks(fileID)
 	if !isDirty {
@@ -2924,10 +2979,10 @@ func TestWritePartialChunkReadFileFailureReturnsEIO(t *testing.T) {
 			}
 
 			// Sync file to service so controller has the initial content
-			if status := rawFS.Flush(nil, &fuse.FlushIn{
+			if status := rawFS.Fsync(nil, &fuse.FsyncIn{
 				InHeader: fuse.InHeader{NodeId: fileID},
 			}); status != fuse.OK {
-				t.Fatalf("Flush failed: %v", status)
+				t.Fatalf("Fsync failed: %v", status)
 			}
 
 			// Invalidate client cache to ensure the subsequent partial write must fill chunk from controller
@@ -2995,11 +3050,11 @@ func TestWritePartialChunkReadFileFailureReturnsEIO(t *testing.T) {
 				t.Fatalf("Data mismatch after retry write: untouched bytes corrupted with zeros")
 			}
 
-			// Flush to controller, clear cache, and verify controller also has intact content
-			if status := rawFS.Flush(nil, &fuse.FlushIn{
+			// Fsync to controller, clear cache, and verify controller also has intact content
+			if status := rawFS.Fsync(nil, &fuse.FsyncIn{
 				InHeader: fuse.InHeader{NodeId: fileID},
 			}); status != fuse.OK {
-				t.Fatalf("Flush after retry failed: %v", status)
+				t.Fatalf("Fsync after retry failed: %v", status)
 			}
 			cache.Clear()
 

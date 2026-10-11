@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
@@ -32,12 +33,14 @@ import (
 
 type mountOptions struct {
 	*options
-	volumeID    string
-	writeMode   string
-	cacheSizeMB int64
-	nodeID      string
-	allowOther  bool
-	debug       bool
+	volumeID               string
+	writeMode              string
+	cacheSizeMB            int64
+	nodeID                 string
+	allowOther             bool
+	debug                  bool
+	syncOnClose            bool
+	backgroundSyncInterval time.Duration
 }
 
 func parseWriteMode(val string) (pb.WriteMode, error) {
@@ -71,6 +74,8 @@ func newMountCommand(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&mountOpts.nodeID, "node-id", "", "Node ID reported to the controller (defaults to the hostname)")
 	cmd.Flags().BoolVar(&mountOpts.allowOther, "allow-other", false, "Allow other users to access the mount (requires user_allow_other in /etc/fuse.conf when not root)")
 	cmd.Flags().BoolVar(&mountOpts.debug, "debug", false, "Log every FUSE request")
+	cmd.Flags().BoolVar(&mountOpts.syncOnClose, "sync-on-close", true, "Schedule non-blocking sync on close of written files")
+	cmd.Flags().DurationVar(&mountOpts.backgroundSyncInterval, "background-sync-interval", 30*time.Second, "Background sync interval per volume")
 	return cmd
 }
 
@@ -112,6 +117,8 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 
 	nodeCache := objectfuse.NewNodeCache(opts.cacheSizeMB * 1024 * 1024)
 	rawFS := objectfuse.NewObjectFS(client, opts.volumeID, writeMode, nodeCache)
+	rawFS.SetSyncOnClose(opts.syncOnClose)
+	rawFS.SetBackgroundSyncInterval(opts.backgroundSyncInterval)
 
 	fuseOpts := &gofuse.MountOptions{
 		FsName:     "objectfs",

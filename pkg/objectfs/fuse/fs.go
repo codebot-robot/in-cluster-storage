@@ -55,6 +55,16 @@ type ObjectFS struct {
 	syncTimeout   time.Duration
 	errMu         sync.Mutex
 	lastLoggedErr time.Time
+
+	pushedMu               sync.Mutex
+	pushedGens             map[uint64]map[int]Generation
+	stagingEpoch           uint64
+	syncOnClose            bool
+	backgroundSyncInterval time.Duration
+	syncCh                 chan uint64
+	stopSyncCh             chan struct{}
+	syncWg                 sync.WaitGroup
+	syncInProgress         sync.Mutex
 }
 
 var _ fuse.RawFileSystem = (*ObjectFS)(nil)
@@ -78,14 +88,20 @@ func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string
 		syncTimeout = DefaultSyncTimeout
 	}
 	fs := &ObjectFS{
-		RawFileSystem: fuse.NewDefaultRawFileSystem(),
-		client:        client,
-		volumeID:      volumeID,
-		writeMode:     writeMode,
-		cache:         cache,
-		rpcTimeout:    rpcTimeout,
-		syncTimeout:   syncTimeout,
+		RawFileSystem:          fuse.NewDefaultRawFileSystem(),
+		client:                 client,
+		volumeID:               volumeID,
+		writeMode:              writeMode,
+		cache:                  cache,
+		rpcTimeout:             rpcTimeout,
+		syncTimeout:            syncTimeout,
+		pushedGens:             make(map[uint64]map[int]Generation),
+		syncOnClose:            true,
+		backgroundSyncInterval: 30 * time.Second,
+		syncCh:                 make(chan uint64, 1024),
+		stopSyncCh:             make(chan struct{}),
 	}
+	fs.startBackgroundSyncer()
 	return fs
 }
 
@@ -101,6 +117,78 @@ func (fs *ObjectFS) SetSyncTimeout(d time.Duration) {
 		d = DefaultSyncTimeout
 	}
 	fs.syncTimeout = d
+}
+
+func (fs *ObjectFS) SetSyncOnClose(enabled bool) {
+	fs.syncOnClose = enabled
+}
+
+func (fs *ObjectFS) SetBackgroundSyncInterval(d time.Duration) {
+	fs.backgroundSyncInterval = d
+}
+
+func (fs *ObjectFS) Destroy() {
+	fs.stopBackgroundSyncer()
+}
+
+func (fs *ObjectFS) Close() error {
+	fs.stopBackgroundSyncer()
+	return nil
+}
+
+func (fs *ObjectFS) startBackgroundSyncer() {
+	fs.syncWg.Add(1)
+	go func() {
+		defer fs.syncWg.Done()
+		var ticker *time.Ticker
+		var tickerCh <-chan time.Time
+		if fs.backgroundSyncInterval > 0 {
+			ticker = time.NewTicker(fs.backgroundSyncInterval)
+			defer ticker.Stop()
+			tickerCh = ticker.C
+		}
+
+		for {
+			select {
+			case <-fs.stopSyncCh:
+				return
+			case ino, ok := <-fs.syncCh:
+				if !ok {
+					return
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), fs.syncTimeout)
+				if ino != 0 {
+					if err := fs.syncFileToService(ctx, ino); err != nil {
+						klog.V(2).Infof("background syncFileToService inode %d: %v", ino, err)
+					}
+					if err := fs.executeFsync(ctx, ino, false); err != nil {
+						klog.V(2).Infof("background executeFsync inode %d: %v", ino, err)
+					}
+				} else {
+					if err := fs.syncAndFlushVolume(ctx, false); err != nil {
+						klog.V(2).Infof("background syncAndFlushVolume: %v", err)
+					}
+				}
+				cancel()
+			case <-tickerCh:
+				ctx, cancel := context.WithTimeout(context.Background(), fs.syncTimeout)
+				if err := fs.syncAndFlushVolume(ctx, false); err != nil {
+					klog.V(2).Infof("background timer syncAndFlushVolume: %v", err)
+				}
+				cancel()
+			}
+		}
+	}()
+}
+
+func (fs *ObjectFS) stopBackgroundSyncer() {
+	select {
+	case <-fs.stopSyncCh:
+		return
+	default:
+		close(fs.stopSyncCh)
+	}
+	fs.syncWg.Wait()
 }
 
 func (fs *ObjectFS) String() string {
@@ -274,6 +362,18 @@ func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 		return fuse.ENOENT
 	}
 	fs.fillEntryOut(attr, out)
+
+	if entry, ok := fs.cache.Get(out.NodeId); ok {
+		if entry.IsDirty || uint64(entry.Size) > out.Attr.Size {
+			out.Attr.Size = uint64(entry.Size)
+			out.Attr.Mtime = uint64(entry.ModTime.Unix())
+			out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
+		}
+	} else if entry, isDirty := fs.cache.GetDirty(out.NodeId); isDirty {
+		out.Attr.Size = uint64(entry.Size)
+		out.Attr.Mtime = uint64(entry.ModTime.Unix())
+		out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
+	}
 	return fuse.OK
 }
 
@@ -297,7 +397,13 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 	}
 	fs.fillAttrOut(attr, &out.Attr)
 
-	if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
+	if entry, ok := fs.cache.Get(input.NodeId); ok {
+		if entry.IsDirty || uint64(entry.Size) > out.Attr.Size {
+			out.Attr.Size = uint64(entry.Size)
+			out.Attr.Mtime = uint64(entry.ModTime.Unix())
+			out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
+		}
+	} else if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
 		out.Attr.Size = uint64(entry.Size)
 		out.Attr.Mtime = uint64(entry.ModTime.Unix())
 		out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
@@ -332,6 +438,17 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 			return fuse.Status(resp.GetError())
 		}
 		fs.cache.MarkSizeClean(input.NodeId, truncGen)
+		fs.pushedMu.Lock()
+		if chunks, ok := fs.pushedGens[input.NodeId]; ok {
+			cs := int64(DefaultChunkSize)
+			newNumChunks := int((int64(input.Size) + cs - 1) / cs)
+			for idx := range chunks {
+				if idx >= newNumChunks {
+					delete(chunks, idx)
+				}
+			}
+		}
+		fs.pushedMu.Unlock()
 		finalAttr = resp.GetAttr()
 	}
 
@@ -395,6 +512,12 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	fs.fillAttrOut(finalAttr, &out.Attr)
 	if input.Valid&fuse.FATTR_SIZE != 0 {
 		out.Attr.Size = input.Size
+	} else if entry, ok := fs.cache.Get(input.NodeId); ok {
+		if entry.IsDirty || uint64(entry.Size) > out.Attr.Size {
+			out.Attr.Size = uint64(entry.Size)
+			out.Attr.Mtime = uint64(entry.ModTime.Unix())
+			out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
+		}
 	} else if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
 		out.Attr.Size = uint64(entry.Size)
 		out.Attr.Mtime = uint64(entry.ModTime.Unix())
@@ -896,6 +1019,17 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 		}
 	}
 
+	// Client budget overflow: write waits while cache flushes dirty bytes
+	neededBytes := int64(len(data))
+	for fs.cache.WouldDirtyOverflow(neededBytes) {
+		ctx, cancelFunc := fs.makeSyncContext(cancel)
+		err := fs.syncAndFlushVolume(ctx, true)
+		cancelFunc()
+		if err != nil {
+			return 0, fs.grpcErrorToStatus("Write:OverflowSync", err)
+		}
+	}
+
 	// Buffer write locally and mark dirty per chunk
 	fs.cache.WriteAt(input.NodeId, int64(input.Offset), data, time.Now())
 	return uint32(len(data)), fuse.OK
@@ -984,12 +1118,99 @@ func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
 		if resp.GetError() != 0 {
 			return syscall.Errno(resp.GetError())
 		}
-		for _, idx := range run {
-			fs.cache.MarkChunkClean(inode, idx, chunkGens[idx])
+		fs.pushedMu.Lock()
+		if resp.GetStagingEpoch() != 0 {
+			fs.stagingEpoch = resp.GetStagingEpoch()
 		}
+		if fs.pushedGens[inode] == nil {
+			fs.pushedGens[inode] = make(map[int]Generation)
+		}
+		for _, idx := range run {
+			fs.pushedGens[inode][idx] = chunkGens[idx]
+		}
+		fs.pushedMu.Unlock()
 	}
 
 	return nil
+}
+
+func (fs *ObjectFS) executeFsync(ctx context.Context, inode uint64, blocking bool) error {
+	fs.pushedMu.Lock()
+	currentEpoch := fs.stagingEpoch
+	fs.pushedMu.Unlock()
+
+	resp, err := fs.client.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId:     fs.volumeID,
+		Inode:        inode,
+		Blocking:     proto.Bool(blocking),
+		StagingEpoch: currentEpoch,
+	})
+	if err != nil {
+		fs.logRPCError("Fsync", err)
+		return err
+	}
+	if resp.GetError() == int32(syscall.ESTALE) {
+		// Controller crash before sync: re-push dirty chunks and retry
+		fs.pushedMu.Lock()
+		if resp.GetStagingEpoch() != 0 {
+			fs.stagingEpoch = resp.GetStagingEpoch()
+		}
+		delete(fs.pushedGens, inode)
+		fs.pushedMu.Unlock()
+
+		if inode == 0 {
+			entries := fs.cache.GetDirtyEntries()
+			for _, e := range entries {
+				if err := fs.syncFileToService(ctx, e.Inode); err != nil {
+					return err
+				}
+			}
+		} else {
+			if err := fs.syncFileToService(ctx, inode); err != nil {
+				return err
+			}
+		}
+		return fs.executeFsync(ctx, inode, blocking)
+	}
+	if resp.GetError() != 0 {
+		return syscall.Errno(resp.GetError())
+	}
+
+	fs.pushedMu.Lock()
+	if resp.GetStagingEpoch() != 0 {
+		fs.stagingEpoch = resp.GetStagingEpoch()
+	}
+	if inode == 0 {
+		for ino, chunks := range fs.pushedGens {
+			for idx, gen := range chunks {
+				fs.cache.MarkChunkClean(ino, idx, gen)
+			}
+		}
+		fs.pushedGens = make(map[uint64]map[int]Generation)
+	} else {
+		if chunks, ok := fs.pushedGens[inode]; ok {
+			for idx, gen := range chunks {
+				fs.cache.MarkChunkClean(inode, idx, gen)
+			}
+			delete(fs.pushedGens, inode)
+		}
+	}
+	fs.pushedMu.Unlock()
+
+	return nil
+}
+
+func (fs *ObjectFS) syncAndFlushVolume(ctx context.Context, blocking bool) error {
+	fs.syncInProgress.Lock()
+	defer fs.syncInProgress.Unlock()
+
+	entries := fs.cache.GetDirtyEntries()
+	for _, e := range entries {
+		if err := fs.syncFileToService(ctx, e.Inode); err != nil {
+			return err
+		}
+	}
+	return fs.executeFsync(ctx, 0, blocking)
 }
 
 func (fs *ObjectFS) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
@@ -1010,15 +1231,8 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 		return fs.grpcErrorToStatus("Fsync", err)
 	}
 
-	resp, err := fs.client.Fsync(ctx, &pb.FsyncRequest{
-		VolumeId: fs.volumeID,
-		Inode:    input.NodeId,
-	})
-	if err != nil {
+	if err := fs.executeFsync(ctx, input.NodeId, true); err != nil {
 		return fs.grpcErrorToStatus("Fsync", err)
-	}
-	if resp.GetError() != 0 {
-		return fuse.Status(resp.GetError())
 	}
 	return fuse.OK
 }
@@ -1026,6 +1240,23 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
+
+	if fs.syncOnClose {
+		select {
+		case fs.syncCh <- input.NodeId:
+		default:
+			go func(ino uint64) {
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), fs.syncTimeout)
+				defer bgCancel()
+				if err := fs.syncFileToService(bgCtx, ino); err != nil {
+					klog.V(2).Infof("release syncFileToService: %v", err)
+				}
+				if err := fs.executeFsync(bgCtx, ino, false); err != nil {
+					klog.V(2).Infof("release executeFsync: %v", err)
+				}
+			}(input.NodeId)
+		}
+	}
 
 	resp, err := fs.client.Release(ctx, &pb.ReleaseRequest{
 		VolumeId: fs.volumeID,

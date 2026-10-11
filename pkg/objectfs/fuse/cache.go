@@ -364,6 +364,40 @@ func (c *NodeCache) GetDirtyEntries() []*CachedEntry {
 	return dirty
 }
 
+func (c *NodeCache) DirtyBytes() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var total int64
+	for _, entry := range c.entries {
+		if entry.DirtyChunks != nil {
+			for idx := range entry.DirtyChunks {
+				if chunk, ok := entry.Chunks[idx]; ok {
+					total += int64(len(chunk))
+				}
+			}
+		}
+	}
+	return total
+}
+
+func (c *NodeCache) WouldDirtyOverflow(additionalBytes int64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var total int64
+	for _, entry := range c.entries {
+		if entry.DirtyChunks != nil {
+			for idx := range entry.DirtyChunks {
+				if chunk, ok := entry.Chunks[idx]; ok {
+					total += int64(len(chunk))
+				}
+			}
+		}
+	}
+	return (total + additionalBytes) > c.maxBytes
+}
+
 func (c *NodeCache) MarkSizeClean(inode uint64, gen Generation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
