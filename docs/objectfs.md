@@ -285,6 +285,20 @@ ObjectFS supports three distinct write synchronization modes:
 2. `LAZY_WRITE`: Writes are buffered asynchronously and flushed in background batches, maximizing write throughput for scratch and temporary workloads.
 3. `EAGER_REPLICATION`: Writes are streamed immediately to the central controller memory and change-log, providing cross-node visibility and crash resilience without waiting for object store commits.
 
+### 5. Write Staging, Sync Packing & Cross-Node Visibility
+
+ObjectFS uses a write-buffering and server-side packing model:
+- **Client as Write Buffer, Controller as Packer:** The node daemon caches dirty chunks locally in `NodeCache`. When pushed via `WriteFile`, chunk bytes are staged in memory on the controller without writing to object storage, committing WAL transactions, or updating inode rows. Pushed chunks remain dirty in the node daemon cache until their covering sync acknowledges.
+- **Pack Creation on Sync:** When a sync is triggered, all staged chunks across all inodes in the volume are consolidated into one pack object and uploaded to the object store with a single `PutBlobs` call (split only if total size exceeds a 64 MiB cap).
+- **Durability Invariant:** No logged WAL row may ever reference a blob that is not durable. A single WAL transaction containing all `FileChunk` rows and updated inode sizes/timestamps is committed strictly after `PutBlobs` successfully completes.
+- **Visibility Across Nodes:** Nothing is visible or durable before fsync; close and time make it likely:
+  - `fsync`/`fdatasync` (blocking): executes immediately, uploads the pack, commits the WAL transaction, and waits for durability before returning. Writes become visible across nodes immediately after `fsync`.
+  - Close of a written file (`Release`): schedules a non-blocking sync in the background without blocking the caller (enabled by default via `--sync-on-close`).
+  - Coalescing Window: Non-blocking syncs are coalesced over `--sync-coalesce-window=1s`. A blocking `fsync` arriving during an active window flushes it immediately, including all staged writes in the window.
+  - Background Volume Timer: A periodic volume timer (`--background-sync-interval=30s`) synchronizes outstanding dirty data.
+  - Client Cache Budget Throttling: If dirty bytes in `NodeCache` would exceed the cache budget (`--cache-size-mb`), the overflowing write blocks until a sync flushes dirty bytes and frees memory.
+- **Controller Crash Recovery:** If the controller crashes before sync, in-memory staged bytes disappear cleanly without leaving dangling rows or I/O errors. When the client next contacts the controller, a staging epoch mismatch signals that the staged set was lost. The client transparently re-pushes its still-dirty chunks and retries sync.
+
 ---
 
 ## Protocol Specification
