@@ -329,14 +329,13 @@ func (c *LRUCache[K, V]) EvictAll() {
 
 // CachedInode represents an inode metadata entry held in memory.
 type CachedInode struct {
-	Row          *pb.Inode
-	Chunks       map[uint32]string
-	InlineData   []byte
-	StagedChunks map[int][]byte
-	DirtyChunks  map[int][]byte
-	RedirectURL  string
-	Data         blob.ByteStream
-	IsDirty      bool
+	Row         *pb.Inode
+	Chunks      map[uint32]string
+	InlineData  []byte
+	DirtyChunks map[int][]byte
+	RedirectURL string
+	Data        blob.ByteStream
+	IsDirty     bool
 }
 
 // mutate applies fn to a cloned copy of Row and updates Row to the new clone.

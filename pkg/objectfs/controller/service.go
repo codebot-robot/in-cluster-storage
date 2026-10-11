@@ -135,6 +135,8 @@ type Server struct {
 	debugMutationCheck       bool
 	viewOpts                 []view.Option
 	streamFactory            func(volumeID string) (walclient.Stream, error)
+	stagingCap               int64
+	syncCoalesceWindow       time.Duration
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -240,6 +242,20 @@ func WithServerLocalStorageDir(dir string) ServerOption {
 	}
 }
 
+// WithServerStagingCap sets the maximum byte bound for staged chunks across volumes.
+func WithServerStagingCap(capBytes int64) ServerOption {
+	return func(s *Server) {
+		s.stagingCap = capBytes
+	}
+}
+
+// WithServerSyncCoalesceWindow sets the coalescing window for non-blocking syncs.
+func WithServerSyncCoalesceWindow(d time.Duration) ServerOption {
+	return func(s *Server) {
+		s.syncCoalesceWindow = d
+	}
+}
+
 func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if backend == nil {
 		backend = NewMemoryBackend()
@@ -313,6 +329,12 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if s.debugStatsCheck {
 			volOpts = append(volOpts, WithVolumeStatsCheck())
+		}
+		if s.stagingCap > 0 {
+			volOpts = append(volOpts, WithStagingCap(s.stagingCap))
+		}
+		if s.syncCoalesceWindow > 0 {
+			volOpts = append(volOpts, WithSyncCoalesceWindow(s.syncCoalesceWindow))
 		}
 
 		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
@@ -562,12 +584,16 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 	}
 	bytesWritten, newSize, modTime, err := vol.WriteFile(ctx, req.GetInode(), req.GetOffset(), req.GetData(), req.GetWriteMode())
 	if err != nil {
-		return &pb.WriteFileResponse{Error: volErrToSyscall(err)}, nil
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, status.FromContextError(err).Err()
+		}
+		return &pb.WriteFileResponse{Error: volErrToSyscall(err), StagingEpoch: vol.StagingEpoch()}, nil
 	}
 	return &pb.WriteFileResponse{
 		BytesWritten: bytesWritten,
 		NewSize:      newSize,
 		ModTime:      timestamppb.New(modTime),
+		StagingEpoch: vol.StagingEpoch(),
 	}, nil
 }
 
@@ -637,10 +663,17 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	if err := vol.Fsync(ctx, req.GetInode()); err != nil {
-		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err)}, nil
+	blocking := true
+	if req.Blocking != nil {
+		blocking = *req.Blocking
 	}
-	return &pb.FsyncResponse{Success: true}, nil
+	if err := vol.Fsync(ctx, req.GetInode(), blocking, req.GetStagingEpoch()); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, status.FromContextError(err).Err()
+		}
+		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err), StagingEpoch: vol.StagingEpoch()}, nil
+	}
+	return &pb.FsyncResponse{Success: true, StagingEpoch: vol.StagingEpoch()}, nil
 }
 
 func (s *Server) Symlink(ctx context.Context, req *pb.SymlinkRequest) (*pb.SymlinkResponse, error) {

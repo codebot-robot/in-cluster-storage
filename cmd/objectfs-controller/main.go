@@ -51,6 +51,8 @@ var (
 	metadataApplierBatchSize = flag.Int("metadata-applier-batch-size", 100, "Maximum batch size for SQLite background applier")
 	debugMutationCheck       = flag.Bool("debug-mutation-check", false, "Enable debug mutation checking on metadata view (for test/CI gates)")
 	debugStatsCheck          = flag.Bool("debug-stats-check", false, "Enable debug volume stats checking (for test/CI gates)")
+	syncCoalesceWindow       = flag.Duration("sync-coalesce-window", 1*time.Second, "Coalescing window for non-blocking sync requests")
+	stagingCap               = flag.Int64("staging-cap", 512*1024*1024, "Maximum byte size of staged writes across volumes before backpressuring WriteFile")
 )
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -105,6 +107,12 @@ func main() {
 	}
 	if *debugStatsCheck && !*debugMutationCheck {
 		serverOpts = append(serverOpts, controller.WithServerStatsCheck())
+	}
+	if *stagingCap > 0 {
+		serverOpts = append(serverOpts, controller.WithServerStagingCap(*stagingCap))
+	}
+	if *syncCoalesceWindow > 0 {
+		serverOpts = append(serverOpts, controller.WithServerSyncCoalesceWindow(*syncCoalesceWindow))
 	}
 	// TODO: We always want to assume a WAL, and maybe it would be nice to have a wal-client mode that was local-only e.g. for testing.
 	if *walDir != "" {

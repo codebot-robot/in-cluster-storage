@@ -94,6 +94,14 @@ func testTruncateFile(ctx context.Context, server *Server, volumeID, p string, s
 	return server.TruncateFile(ctx, &pb.TruncateFileRequest{VolumeId: volumeID, Inode: ino, Size: size})
 }
 
+func testFsync(ctx context.Context, server *Server, volumeID, p string) (*pb.FsyncResponse, error) {
+	ino, err := resolvePath(ctx, server, volumeID, p)
+	if err != nil {
+		return &pb.FsyncResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino})
+}
+
 func testReadDir(ctx context.Context, server *Server, volumeID, p string) (*pb.ReadDirResponse, error) {
 	ino, err := resolvePath(ctx, server, volumeID, p)
 	if err != nil {
@@ -336,6 +344,11 @@ func TestControllerServiceOperations(t *testing.T) {
 	}
 	if writeResp.NewSize != int64(len("initial objectfs!")) {
 		t.Fatalf("Unexpected new size: %d", writeResp.NewSize)
+	}
+
+	// Sync to commit staged writes and make durable
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: fileIno}); err != nil {
+		t.Fatalf("Failed to fsync: %v", err)
 	}
 
 	// Read back modified
@@ -659,6 +672,9 @@ func TestControllerPushNotifications(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to write file: %v", err)
 	}
+	if _, err := testFsync(ctx, server, volumeID, "/event-test.txt"); err != nil {
+		t.Fatalf("Failed to fsync file: %v", err)
+	}
 
 	select {
 	case ev := <-ch:
@@ -957,6 +973,9 @@ func TestOverlayEntryKeepsRowAsOfChange(t *testing.T) {
 	_, newSize, _, err := vol.WriteFile(ctx, ino, int64(len(initialContent)), appendData, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if err := vol.Fsync(ctx, ino); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
 	}
 
 	attr3, err := vol.GetAttr(ctx, ino)
@@ -1879,12 +1898,7 @@ func TestStreamsDurabilityModes(t *testing.T) {
 		t.Fatalf("WriteFile with WRITE_THROUGH_FSYNC failed: %v", err)
 	}
 
-	_, _, permanent := vol.Stream().Watermarks()
-	if permanent < 1 {
-		t.Fatalf("Expected permanent watermark >= 1 after WRITE_THROUGH_FSYNC, got %d", permanent)
-	}
-
-	// 3. Fsync RPC flushes stream
+	// 3. Fsync RPC flushes stream to permanent storage
 	ino, _ := resolvePath(ctx, server, volumeID, "/witness_dir/file.bin")
 	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{
 		VolumeId: volumeID,
@@ -1892,6 +1906,11 @@ func TestStreamsDurabilityModes(t *testing.T) {
 	})
 	if err != nil || !fsyncResp.GetSuccess() {
 		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	_, _, permanent := vol.Stream().Watermarks()
+	if permanent < 1 {
+		t.Fatalf("Expected permanent watermark >= 1 after Fsync, got %d", permanent)
 	}
 }
 
@@ -2448,16 +2467,20 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 		}
 	})
 
-	// 2. WriteFile
-	runMutationTest("WriteFile", func() {
-		_, err := testWriteFile(ctx, server, volumeID, "/test_file.txt", 7, []byte("-appended"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	// 2. Fsync (covering staged WriteFile)
+	_, writeErr := testWriteFile(ctx, server, volumeID, "/test_file.txt", 7, []byte("-appended"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	if writeErr != nil {
+		t.Errorf("WriteFile failed: %v", writeErr)
+	}
+	runMutationTest("Fsync", func() {
+		_, err := testFsync(ctx, server, volumeID, "/test_file.txt")
 		if err != nil {
-			t.Errorf("WriteFile failed: %v", err)
+			t.Errorf("Fsync failed: %v", err)
 		}
 	}, func() {
 		resp, err := testReadFile(ctx, server, volumeID, "/test_file.txt", 0, 1024)
 		if err != nil || string(resp.Data) != "initial-appended" {
-			t.Errorf("ReadFile during WriteFile durability wait failed: %v, data=%q", err, string(resp.Data))
+			t.Errorf("ReadFile during Fsync durability wait failed: %v, data=%q", err, string(resp.Data))
 		}
 	})
 
@@ -2589,6 +2612,11 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 		t.Fatalf("expected size %d, got %d", len(largeData), newSize)
 	}
 
+	ino, _ := vol.ResolvePath(ctx, "/large.bin")
+	if err := vol.Fsync(ctx, ino); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
 	updatedAttr, err := volGetAttr(ctx, vol, "/large.bin")
 	if err != nil {
 		t.Fatalf("GetAttr after random write failed: %v", err)
@@ -2617,6 +2645,11 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	_, _, _, err = volWriteFile(ctx, vol, "/small.txt", 100, growData, pb.WriteMode_LAZY_WRITE)
 	if err != nil {
 		t.Fatalf("WriteFile growing small file failed: %v", err)
+	}
+
+	inoSmall, _ := vol.ResolvePath(ctx, "/small.txt")
+	if err := vol.Fsync(ctx, inoSmall); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
 	}
 
 	growAttr, err := volGetAttr(ctx, vol, "/small.txt")
@@ -3121,6 +3154,11 @@ func TestWriteThenTruncateAndUnlinkOrdering(t *testing.T) {
 	truncResp, err := testTruncateFile(ctx, server, volumeID, "/truncate-test.bin", 32*1024)
 	if err != nil || truncResp.GetError() != 0 {
 		t.Fatalf("TruncateFile failed: %v", err)
+	}
+
+	// Sync to commit the staged truncated chunks
+	if _, err := testFsync(ctx, server, volumeID, "/truncate-test.bin"); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
 	}
 
 	// Read back and verify size is 32 KiB and content matches

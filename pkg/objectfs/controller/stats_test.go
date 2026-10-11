@@ -105,6 +105,10 @@ func TestVolume_StatsTracking(t *testing.T) {
 		t.Fatalf("Release file2 failed: err=%v, resp=%v", err, rel2Resp)
 	}
 
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: 0}); err != nil {
+		t.Fatalf("Fsync volume failed: %v", err)
+	}
+
 	// Create directory
 	d1Resp, err := server.Mkdir(ctx, &pb.MkdirRequest{
 		VolumeId:    volumeID,
@@ -529,6 +533,10 @@ func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatalf("Symlink failed: %v", err)
+		}
+
+		if _, err := server1.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: 0}); err != nil {
+			t.Fatalf("Fsync failed: %v", err)
 		}
 
 		// Verify live stats reflect the write path immediately

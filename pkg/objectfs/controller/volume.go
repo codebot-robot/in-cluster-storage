@@ -57,10 +57,10 @@ const (
 	MaxNameLength = 255
 )
 
-type InodeUpload struct {
-	wg      sync.WaitGroup
-	waiting bool
-	err     error
+type stagedInodeWrite struct {
+	chunks map[uint32][]byte // chunkIndex -> staged chunk bytes
+	size   int64
+	mtime  time.Time
 }
 
 type Volume struct {
@@ -74,10 +74,17 @@ type Volume struct {
 	maxInlineLen int64
 	chunkSize    uint32
 
-	pendingUploadsMu sync.Mutex
-	pendingUploadsWg sync.WaitGroup
-	inodeUploads     map[uint64]*InodeUpload
-	stagedUploads    map[uint64]map[int][]byte
+	stagingMu          sync.Mutex
+	stagingCond        *sync.Cond
+	stagedInodes       map[uint64]*stagedInodeWrite
+	stagedBytes        int64
+	stagingCap         int64
+	stagingEpoch       uint64
+	syncCoalesceWindow time.Duration
+	coalesceTimer      *time.Timer
+	coalesceWaiters    []chan error
+	syncInProgress     bool
+	lastNonblockErr    map[uint64]error
 
 	stream     walclient.Stream
 	durability walclient.Level
@@ -211,6 +218,22 @@ func WithApplierBatchSize(batchSize int) VolumeOption {
 	}
 }
 
+// WithStagingCap sets the maximum byte bound for staged chunks on this volume before backpressuring writes.
+func WithStagingCap(capBytes int64) VolumeOption {
+	return func(v *Volume) {
+		if capBytes > 0 {
+			v.stagingCap = capBytes
+		}
+	}
+}
+
+// WithSyncCoalesceWindow sets the coalescing window for non-blocking syncs.
+func WithSyncCoalesceWindow(d time.Duration) VolumeOption {
+	return func(v *Volume) {
+		v.syncCoalesceWindow = d
+	}
+}
+
 // WithApplierFaultHook configures a fault injection callback for the background applier (testing only).
 func WithApplierFaultHook(hook func() error) VolumeOption {
 	return func(v *Volume) {
@@ -337,32 +360,36 @@ func (v *Volume) initMetadataViewLocked(ctx context.Context, customIndex sds.Loc
 }
 
 func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *EventBroadcaster, opts ...VolumeOption) *Volume {
-	var blobStore *blob.Store
-	if backend != nil {
-		blobStore = blob.NewStore(backend, 0)
+	if backend == nil {
+		backend = NewMemoryBackend()
 	}
+	blobStore := blob.NewStore(backend, 0)
 
 	f, _ := sds.GetIndexFactory("sqlite")
 
 	v := &Volume{
-		volumeID:      volumeID,
-		rootInodeID:   1,
-		nextInode:     erofs.DefaultInodeStride,
-		backend:       backend,
-		blobStore:     blobStore,
-		broadcaster:   broadcaster,
-		maxInlineLen:  4096,      // 4KB default inline threshold for tiny files
-		chunkSize:     64 * 1024, // 64KB default chunk size
-		durability:    walclient.Local,
-		indexFactory:  f,
-		streamID:      StreamIDForVolume(volumeID),
-		closedCh:      make(chan struct{}),
-		dirParents:    make(map[uint64]uint64),
-		handles:       make(map[uint64]uint64),
-		openInodes:    make(map[uint64]int),
-		inodeUploads:  make(map[uint64]*InodeUpload),
-		stagedUploads: make(map[uint64]map[int][]byte),
+		volumeID:           volumeID,
+		rootInodeID:        1,
+		nextInode:          erofs.DefaultInodeStride,
+		backend:            backend,
+		blobStore:          blobStore,
+		broadcaster:        broadcaster,
+		maxInlineLen:       4096,      // 4KB default inline threshold for tiny files
+		chunkSize:          64 * 1024, // 64KB default chunk size
+		durability:         walclient.Local,
+		indexFactory:       f,
+		streamID:           StreamIDForVolume(volumeID),
+		closedCh:           make(chan struct{}),
+		dirParents:         make(map[uint64]uint64),
+		handles:            make(map[uint64]uint64),
+		openInodes:         make(map[uint64]int),
+		stagedInodes:       make(map[uint64]*stagedInodeWrite),
+		stagingEpoch:       uint64(time.Now().UnixNano()),
+		lastNonblockErr:    make(map[uint64]error),
+		syncCoalesceWindow: 1 * time.Second,
+		stagingCap:         512 * 1024 * 1024,
 	}
+	v.stagingCond = sync.NewCond(&v.stagingMu)
 	v.batchCheckCond = sync.NewCond(&v.batchCheckMu)
 
 	for _, opt := range opts {
@@ -417,115 +444,228 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	return v
 }
 
-func (v *Volume) registerPendingUpload(ino uint64, chunks map[int][]byte) func(error) {
-	v.pendingUploadsMu.Lock()
-	defer v.pendingUploadsMu.Unlock()
+const MaxPackBytes = 64 * 1024 * 1024
 
-	if v.inodeUploads == nil {
-		v.inodeUploads = make(map[uint64]*InodeUpload)
-	}
-
-	upload, exists := v.inodeUploads[ino]
-	if !exists || upload.waiting {
-		upload = &InodeUpload{}
-		v.inodeUploads[ino] = upload
-	}
-
-	v.pendingUploadsWg.Add(1)
-	upload.wg.Add(1)
-
-	if len(chunks) > 0 {
-		if v.stagedUploads == nil {
-			v.stagedUploads = make(map[uint64]map[int][]byte)
-		}
-		if v.stagedUploads[ino] == nil {
-			v.stagedUploads[ino] = make(map[int][]byte)
-		}
-		for idx, data := range chunks {
-			v.stagedUploads[ino][idx] = data
-		}
-	}
-
-	return func(err error) {
-		v.pendingUploadsMu.Lock()
-		defer v.pendingUploadsMu.Unlock()
-
-		if err != nil {
-			upload.err = err
-		}
-		if len(chunks) > 0 && v.stagedUploads != nil && v.stagedUploads[ino] != nil {
-			for idx, data := range chunks {
-				if cur, ok := v.stagedUploads[ino][idx]; ok && bytes.Equal(cur, data) {
-					delete(v.stagedUploads[ino], idx)
-				}
-			}
-			if len(v.stagedUploads[ino]) == 0 {
-				delete(v.stagedUploads, ino)
-			}
-		}
-		upload.wg.Done()
-		v.pendingUploadsWg.Done()
-	}
+func (v *Volume) StagingEpoch() uint64 {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+	return v.stagingEpoch
 }
 
-func (v *Volume) waitForInodeUploads(ctx context.Context, ino uint64) error {
-	v.pendingUploadsMu.Lock()
-	upload := v.inodeUploads[ino]
-	if upload != nil {
-		upload.waiting = true
+func (v *Volume) flushStagedPacks(ctx context.Context) error {
+	v.stagingMu.Lock()
+	for v.syncInProgress {
+		v.stagingCond.Wait()
 	}
-	v.pendingUploadsMu.Unlock()
+	if len(v.stagedInodes) == 0 {
+		v.stagingMu.Unlock()
+		return nil
+	}
+	v.syncInProgress = true
+	syncing := v.stagedInodes
+	v.stagedInodes = make(map[uint64]*stagedInodeWrite)
+	v.stagingMu.Unlock()
 
-	if upload != nil {
-		done := make(chan struct{})
-		go func() {
-			upload.wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return ctx.Err()
+	err := v.executeSync(ctx, syncing)
+
+	v.stagingMu.Lock()
+	v.syncInProgress = false
+	if err != nil {
+		for ino, st := range syncing {
+			if existing, ok := v.stagedInodes[ino]; ok {
+				for idx, chunk := range st.chunks {
+					if _, hasNew := existing.chunks[idx]; !hasNew {
+						existing.chunks[idx] = chunk
+					}
+				}
+				if st.size > existing.size {
+					existing.size = st.size
+				}
+			} else {
+				v.stagedInodes[ino] = st
+			}
+			v.lastNonblockErr[ino] = err
+		}
+	} else {
+		for _, st := range syncing {
+			for _, chunk := range st.chunks {
+				v.stagedBytes -= int64(len(chunk))
+			}
+		}
+		if v.stagedBytes < 0 {
+			v.stagedBytes = 0
 		}
 	}
-
-	v.pendingUploadsMu.Lock()
-	var err error
-	if upload != nil {
-		err = upload.err
-		if v.inodeUploads[ino] == upload {
-			delete(v.inodeUploads, ino)
-		}
-	}
-	v.pendingUploadsMu.Unlock()
+	v.stagingCond.Broadcast()
+	v.stagingMu.Unlock()
 
 	return err
 }
 
-func (v *Volume) waitForVolumeUploads(ctx context.Context) error {
-	done := make(chan struct{})
-	go func() {
-		v.pendingUploadsWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
+func (v *Volume) executeSync(ctx context.Context, syncing map[uint64]*stagedInodeWrite) error {
+	type chunkRef struct {
+		ino      uint64
+		chunkIdx uint32
+		data     []byte
+		sha      string
 	}
-
-	v.pendingUploadsMu.Lock()
-	var firstErr error
-	for ino, upload := range v.inodeUploads {
-		if upload != nil && upload.err != nil && firstErr == nil {
-			firstErr = upload.err
+	var allChunks []chunkRef
+	for ino, st := range syncing {
+		for idx, data := range st.chunks {
+			sha := fmt.Sprintf("%x", sha256.Sum256(data))
+			allChunks = append(allChunks, chunkRef{
+				ino:      ino,
+				chunkIdx: idx,
+				data:     data,
+				sha:      sha,
+			})
 		}
-		delete(v.inodeUploads, ino)
 	}
-	v.pendingUploadsMu.Unlock()
 
-	return firstErr
+	if len(allChunks) > 0 && v.blobStore != nil {
+		var curBatch map[string]blob.ByteStream
+		var curBatchSize int64
+		for _, c := range allChunks {
+			if curBatch == nil {
+				curBatch = make(map[string]blob.ByteStream)
+			}
+			cLen := int64(len(c.data))
+			if curBatchSize+cLen > MaxPackBytes && len(curBatch) > 0 {
+				if err := v.blobStore.PutBlobs(ctx, curBatch); err != nil {
+					return fmt.Errorf("failed to upload pack of staged blobs: %w", err)
+				}
+				curBatch = make(map[string]blob.ByteStream)
+				curBatchSize = 0
+			}
+			curBatch[c.sha] = blob.NewByteStreamFromBytes(c.data)
+			curBatchSize += cLen
+		}
+		if len(curBatch) > 0 {
+			if err := v.blobStore.PutBlobs(ctx, curBatch); err != nil {
+				return fmt.Errorf("failed to upload pack of staged blobs: %w", err)
+			}
+		}
+	}
+
+	v.mu.Lock()
+	tx := v.beginTxLocked("Sync")
+	now := time.Now()
+
+	type inodeToSync struct {
+		node *CachedInode
+		st   *stagedInodeWrite
+	}
+	var nodesToSync []inodeToSync
+	for ino, st := range syncing {
+		node, err := v.getOrLoadInodeLocked(ctx, tx, ino)
+		if err != nil || node == nil || node.Row == nil {
+			continue
+		}
+		if node.Chunks == nil {
+			node.Chunks = make(map[uint32]string)
+		}
+		nodesToSync = append(nodesToSync, inodeToSync{node: node, st: st})
+	}
+
+	for _, item := range nodesToSync {
+		node := item.node
+		st := item.st
+		ino := node.Row.GetIno()
+
+		for idx, data := range st.chunks {
+			sha := fmt.Sprintf("%x", sha256.Sum256(data))
+			node.Chunks[idx] = sha
+			if _, err := tx.Insert(ctx, &pb.FileChunk{
+				Ino:    proto.Uint64(ino),
+				Index:  proto.Uint32(idx),
+				Sha256: sha,
+			}); err != nil {
+				v.mu.Unlock()
+				return fmt.Errorf("failed to insert FileChunk row for inode %d, chunk %d: %w", ino, idx, err)
+			}
+		}
+
+		cs := int64(node.Row.GetChunkSize())
+		if cs == 0 {
+			cs = int64(v.chunkSize)
+			if cs == 0 {
+				cs = 64 * 1024
+			}
+		}
+		newSize := node.Row.GetSize()
+		if st.size > newSize {
+			newSize = st.size
+		}
+		numChunks := int((newSize + cs - 1) / cs)
+		var manifestHex string
+		if numChunks > 0 {
+			manifestChunks := make([][32]byte, numChunks)
+			for i := 0; i < numChunks; i++ {
+				if cSha, ok := node.Chunks[uint32(i)]; ok && cSha != "" {
+					raw, err := hex.DecodeString(cSha)
+					if err != nil {
+						v.mu.Unlock()
+						return fmt.Errorf("failed to decode chunk sha %s: %w", cSha, err)
+					}
+					if len(raw) == 32 {
+						copy(manifestChunks[i][:], raw)
+					}
+				}
+			}
+			manifest := &blob.Manifest{
+				ChunkSize:   uint32(cs),
+				TotalLength: uint64(newSize),
+				Chunks:      manifestChunks,
+			}
+			manifestBlob, mErr := blob.EncodeManifest(manifest)
+			if mErr != nil {
+				v.mu.Unlock()
+				return fmt.Errorf("failed to encode manifest: %w", mErr)
+			}
+			manifestHex = manifestBlob.SHA256Hex()
+		}
+
+		node.mutate(func(row *pb.Inode) {
+			row.Size = newSize
+			row.ChunkSize = uint32(cs)
+			row.Mtime = timestamppb.New(st.mtime)
+			row.Ctime = timestamppb.New(now)
+			row.Sha256 = ""
+			row.ContentSha256 = ""
+			if manifestHex != "" {
+				row.ManifestSha256 = manifestHex
+			}
+		})
+		if _, err := tx.Update(ctx, node.Row); err != nil {
+			v.mu.Unlock()
+			return fmt.Errorf("failed to update Inode row for inode %d: %w", ino, err)
+		}
+
+		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_MODIFIED,
+			Attr:      attr,
+			Inode:     ino,
+		})
+	}
+
+	commitSeq, err := tx.Commit(ctx)
+	if err != nil {
+		v.mu.Unlock()
+		return fmt.Errorf("failed to commit sync transaction: %w", err)
+	}
+	v.applyTxChangesLocked(ctx, tx)
+
+	waitFn := v.makeWaitFn(commitSeq, nil)
+	v.mu.Unlock()
+
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return fmt.Errorf("failed waiting for sync durability: %w", err)
+		}
+	}
+
+	return nil
 }
 
 type memoryAppender struct {
@@ -666,25 +806,6 @@ func (v *Volume) readChunkLocked(ctx context.Context, tx *sds.Tx, node *CachedIn
 		return res, nil
 	}
 
-	if node.StagedChunks != nil {
-		if data, ok := node.StagedChunks[chunkIdx]; ok {
-			res := make([]byte, len(data))
-			copy(res, data)
-			return res, nil
-		}
-	}
-
-	v.pendingUploadsMu.Lock()
-	if v.stagedUploads != nil && v.stagedUploads[node.Row.GetIno()] != nil {
-		if data, ok := v.stagedUploads[node.Row.GetIno()][chunkIdx]; ok {
-			v.pendingUploadsMu.Unlock()
-			res := make([]byte, len(data))
-			copy(res, data)
-			return res, nil
-		}
-	}
-	v.pendingUploadsMu.Unlock()
-
 	if node.DirtyChunks != nil {
 		if data, ok := node.DirtyChunks[chunkIdx]; ok {
 			res := make([]byte, len(data))
@@ -784,6 +905,18 @@ func (v *Volume) Durability() walclient.Level {
 
 // Close closes the volume, local storage, and any underlying WAL streams.
 func (v *Volume) Close() error {
+	v.stagingMu.Lock()
+	if v.coalesceTimer != nil {
+		v.coalesceTimer.Stop()
+		v.coalesceTimer = nil
+	}
+	v.stagingMu.Unlock()
+
+	var firstErr error
+	if err := v.flushCoalescedWindow(context.Background()); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
 	v.mu.Lock()
 	v.closed = true
 	if v.closedCh != nil {
@@ -796,7 +929,6 @@ func (v *Volume) Close() error {
 	mView := v.metadataView
 	v.mu.Unlock()
 
-	var firstErr error
 	if mView != nil {
 		if err := mView.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -1285,16 +1417,9 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, tx *sds.Tx, inodeID u
 		Row: inode,
 	}
 
-	v.pendingUploadsMu.Lock()
-	if v.stagedUploads != nil && v.stagedUploads[inode.GetIno()] != nil {
-		node.StagedChunks = make(map[int][]byte)
-		for k, val := range v.stagedUploads[inode.GetIno()] {
-			node.StagedChunks[k] = val
-		}
+	if err := v.ensureInodeChunksLoadedLocked(ctx, tx, node); err != nil {
+		return nil, err
 	}
-	v.pendingUploadsMu.Unlock()
-
-	_ = v.ensureInodeChunksLoadedLocked(ctx, tx, node)
 
 	return node, nil
 }
@@ -1871,7 +1996,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			if len(dataCopy) <= int(v.maxInlineLen) {
 				childInode.InlineData = append([]byte(nil), dataCopy...)
 				childInode.Chunks = nil
-				childInode.StagedChunks = nil
 				childInode.DirtyChunks = nil
 
 				for _, msg := range chunkMsgs {
@@ -1888,7 +2012,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			} else {
 				childInode.InlineData = nil
 				childInode.Chunks = make(map[uint32]string)
-				childInode.StagedChunks = make(map[int][]byte)
 				childInode.DirtyChunks = nil
 
 				blobsMap := make(map[string]blob.ByteStream)
@@ -1904,7 +2027,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 					copy(cBytes, dataCopy[start:end])
 					cSha := fmt.Sprintf("%x", sha256.Sum256(cBytes))
 					childInode.Chunks[uint32(i)] = cSha
-					childInode.StagedChunks[i] = cBytes
 					blobsMap[cSha] = blob.NewByteStreamFromBytes(cBytes)
 				}
 
@@ -1996,7 +2118,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				}
 			} else {
 				childInode.Chunks = make(map[uint32]string)
-				childInode.StagedChunks = make(map[int][]byte)
 
 				blobsMap := make(map[string]blob.ByteStream)
 				cs := int(effectiveChunkSize)
@@ -2011,7 +2132,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 					copy(cBytes, dataCopy[start:end])
 					cSha := fmt.Sprintf("%x", sha256.Sum256(cBytes))
 					childInode.Chunks[uint32(i)] = cSha
-					childInode.StagedChunks[i] = cBytes
 					blobsMap[cSha] = blob.NewByteStreamFromBytes(cBytes)
 				}
 
@@ -2318,7 +2438,6 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 		inodeID = v.rootInodeID
 		v.mu.RUnlock()
 	}
-	_ = v.waitForInodeUploads(ctx, inodeID)
 
 	v.mu.RLock()
 	node, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
@@ -2361,7 +2480,7 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 		return res, total, "", nil
 	}
 
-	if node.Row.GetManifestSha256() != "" || node.Row.GetChunkSize() > 0 || len(node.Chunks) > 0 || len(node.StagedChunks) > 0 {
+	if node.Row.GetManifestSha256() != "" || node.Row.GetChunkSize() > 0 || len(node.Chunks) > 0 {
 		if err := v.ensureInodeChunksLoadedLocked(ctx, nil, node); err != nil {
 			return nil, 0, "", fmt.Errorf("read inode %d chunks load: %w", node.Row.GetIno(), err)
 		}
@@ -2434,303 +2553,204 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 }
 
 func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, data []byte, writeMode pb.WriteMode) (int64, int64, time.Time, error) {
-	nWritten, newSize, modTime, waitFn, err := func() (int64, int64, time.Time, func(context.Context) error, error) {
-		v.mu.Lock()
-		defer v.mu.Unlock()
+	if offset < 0 {
+		return 0, 0, time.Time{}, fmt.Errorf("invalid offset %d: %w", offset, syscall.EINVAL)
+	}
 
-		tx := v.beginTxLocked("WriteFile")
+	var reqLevel *walclient.Level
+	switch writeMode {
+	case pb.WriteMode_WRITE_THROUGH_FSYNC:
+		l := walclient.Permanent
+		reqLevel = &l
+	case pb.WriteMode_EAGER_REPLICATION:
+		l := walclient.Witness
+		reqLevel = &l
+	case pb.WriteMode_LAZY_WRITE:
+		l := walclient.Local
+		reqLevel = &l
+	}
+	if reqLevel != nil && *reqLevel > walclient.Local && v.stream != nil && v.stream.ReplicationLevel() < *reqLevel {
+		return 0, 0, time.Time{}, fmt.Errorf("durability level %v requested but WAL has no remote target: %w", strings.ToLower(reqLevel.String()), syscall.ENOTSUP)
+	}
 
-		if err := v.checkBackpressureLocked(ctx); err != nil {
-			return 0, 0, time.Time{}, nil, err
-		}
+	if inodeID == 0 {
+		v.mu.RLock()
+		inodeID = v.rootInodeID
+		v.mu.RUnlock()
+	}
 
-		if inodeID == 0 {
-			inodeID = v.rootInodeID
-		}
-
-		node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
-		if err != nil {
-			return 0, 0, time.Time{}, nil, err
-		}
-
+	v.mu.RLock()
+	inodeID = v.normalizeInodeID(inodeID)
+	node, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
+	if err != nil {
+		v.mu.RUnlock()
+		return 0, 0, time.Time{}, err
+	}
+	var baseSize int64
+	var cs int64 = int64(v.chunkSize)
+	if node != nil && node.Row != nil {
 		if node.Row.GetIsDir() {
-			return 0, 0, time.Time{}, nil, fmt.Errorf("cannot write to directory: %w", syscall.EISDIR)
+			v.mu.RUnlock()
+			return 0, 0, time.Time{}, fmt.Errorf("cannot write to directory: %w", syscall.EISDIR)
 		}
-
-		effectiveChunkSize := v.chunkSize
-		if effectiveChunkSize == 0 {
-			effectiveChunkSize = 64 * 1024
-		}
+		baseSize = node.Row.GetSize()
 		if node.Row.GetChunkSize() > 0 {
-			effectiveChunkSize = node.Row.GetChunkSize()
+			cs = int64(node.Row.GetChunkSize())
 		}
+	}
+	v.mu.RUnlock()
+	if cs <= 0 {
+		cs = 64 * 1024
+	}
 
-		neededLen := offset + int64(len(data))
-		calculatedSize := neededLen
-		if calculatedSize < node.Row.GetSize() {
-			calculatedSize = node.Row.GetSize()
+	if len(data) == 0 {
+		v.stagingMu.Lock()
+		staged, ok := v.stagedInodes[inodeID]
+		curSize := baseSize
+		var curMtime time.Time
+		if ok {
+			curSize = staged.size
+			curMtime = staged.mtime
+		} else if node != nil && node.Row != nil && node.Row.GetMtime() != nil {
+			curMtime = node.Row.GetMtime().AsTime()
 		}
+		v.stagingMu.Unlock()
+		return 0, curSize, curMtime, nil
+	}
 
-		now := time.Now()
+	dataLen := int64(len(data))
+	startChunk := int(offset / cs)
+	endChunk := int((offset + dataLen - 1) / cs)
 
-		var reqLevel *walclient.Level
-		switch writeMode {
-		case pb.WriteMode_WRITE_THROUGH_FSYNC:
-			l := walclient.Permanent
-			reqLevel = &l
-		case pb.WriteMode_EAGER_REPLICATION:
-			l := walclient.Witness
-			reqLevel = &l
-		case pb.WriteMode_LAZY_WRITE:
-			l := walclient.Local
-			reqLevel = &l
-		}
-
-		// Tiny file check
-		if calculatedSize <= v.maxInlineLen && len(node.Chunks) == 0 {
-			var newInline []byte
-			if node.InlineData == nil {
-				if offset == 0 {
-					newInline = make([]byte, len(data))
-					copy(newInline, data)
-				} else {
-					chunk0, err := v.readChunkLocked(ctx, tx, node, 0)
-					if err != nil {
-						return 0, 0, time.Time{}, nil, err
-					}
-					newInline = make([]byte, neededLen)
-					copy(newInline, chunk0)
-					copy(newInline[offset:], data)
-				}
-			} else {
-				newInline = make([]byte, neededLen)
-				copy(newInline, node.InlineData)
-				copy(newInline[offset:], data)
-			}
-			node.IsDirty = true
-			node.InlineData = newInline
-
-			node.mutate(func(row *pb.Inode) {
-				row.ChunkSize = effectiveChunkSize
-				row.Mtime = timestamppb.New(now)
-				row.Ctime = timestamppb.New(now)
-				row.Size = int64(len(node.InlineData))
-				row.Sha256 = ""
-				if offset == 0 && int64(len(data)) == row.GetSize() {
-					h := sha256.Sum256(data)
-					row.ContentSha256 = fmt.Sprintf("%x", h)
-				} else {
-					row.ContentSha256 = ""
-				}
-			})
-
-			if _, err := tx.Insert(ctx, &pb.FileChunk{
-				Ino:        proto.Uint64(node.Row.GetIno()),
-				Index:      proto.Uint32(0),
-				InlineData: append([]byte(nil), node.InlineData...),
-			}); err != nil {
-				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inline FileChunk: %w", err)
-			}
-			if _, err := tx.Update(ctx, node.Row); err != nil {
-				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log node inode update: %w", err)
-			}
-
-			commitSeq, err := tx.Commit(ctx)
-			if err != nil {
-				return 0, 0, time.Time{}, nil, fmt.Errorf("failed to commit tiny write transaction: %w", err)
-			}
-			v.applyTxChangesLocked(ctx, tx)
-			waitFn := v.makeWaitFn(commitSeq, reqLevel)
-
-			attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
-			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-				EventType: pb.WatchEventType_EVENT_MODIFIED,
-				Attr:      attr,
-				Inode:     node.Row.GetIno(),
-			})
-			return int64(len(data)), node.Row.GetSize(), now, waitFn, nil
-		}
-
-		// Chunked file write
-		if node.Chunks == nil {
-			node.Chunks = make(map[uint32]string)
-		}
-		if node.StagedChunks == nil {
-			node.StagedChunks = make(map[int][]byte)
-		}
-		if err := v.ensureInodeChunksLoadedLocked(ctx, tx, node); err != nil {
-			return 0, 0, time.Time{}, nil, fmt.Errorf("ensure inode chunks loaded: %w", err)
-		}
-
-		var inlineBytes []byte
-		var inlineSha string
-		if len(node.InlineData) > 0 {
-			inlineBytes = node.InlineData
-			inlineSha = fmt.Sprintf("%x", sha256.Sum256(inlineBytes))
-			node.Chunks[0] = inlineSha
-			node.StagedChunks[0] = inlineBytes
-			node.InlineData = nil
-		}
-
-		cs := int64(effectiveChunkSize)
-		startChunk := int(offset / cs)
-		endChunk := int((offset + int64(len(data)) - 1) / cs)
-
-		touchedIndices := make([]int, 0, endChunk-startChunk+2)
-		chunkBlobs := make(map[int][]byte)
-		chunkShas := make(map[int]string)
-
-		if inlineBytes != nil && startChunk > 0 {
-			touchedIndices = append(touchedIndices, 0)
-			chunkBlobs[0] = inlineBytes
-			chunkShas[0] = inlineSha
-		}
-
-		for i := startChunk; i <= endChunk; i++ {
-			chunkStart := int64(i) * cs
-			chunkEnd := chunkStart + cs
-			wStart := offset - chunkStart
-			if wStart < 0 {
-				wStart = 0
-			}
-			wEnd := offset + int64(len(data)) - chunkStart
-			if wEnd > cs {
-				wEnd = cs
-			}
-			dataStart := chunkStart - offset
-			if dataStart < 0 {
-				dataStart = 0
-			}
-			dataEnd := chunkEnd - offset
-			if dataEnd > int64(len(data)) {
-				dataEnd = int64(len(data))
-			}
-
-			chunkData, err := v.readChunkLocked(ctx, tx, node, i)
-			if err != nil {
-				return 0, 0, time.Time{}, nil, err
-			}
-			expectedChunkLen := cs
-			if int64(i+1)*cs > calculatedSize {
-				expectedChunkLen = calculatedSize - int64(i)*cs
-			}
-			if int64(len(chunkData)) < expectedChunkLen {
-				newBuf := make([]byte, expectedChunkLen)
-				copy(newBuf, chunkData)
-				chunkData = newBuf
-			}
-			copy(chunkData[wStart:wEnd], data[dataStart:dataEnd])
-			chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
-
-			touchedIndices = append(touchedIndices, i)
-			cCopy := make([]byte, len(chunkData))
-			copy(cCopy, chunkData)
-			chunkBlobs[i] = cCopy
-			chunkShas[i] = chunkSha
-		}
-
-		for _, i := range touchedIndices {
-			node.Chunks[uint32(i)] = chunkShas[i]
-			node.StagedChunks[i] = chunkBlobs[i]
-		}
-		node.IsDirty = true
-
-		numChunks := int((calculatedSize + cs - 1) / cs)
-		manifestChunks := make([][32]byte, numChunks)
-		for i := 0; i < numChunks; i++ {
-			if cSha, ok := node.Chunks[uint32(i)]; ok && cSha != "" {
-				raw, _ := hex.DecodeString(cSha)
-				if len(raw) == 32 {
-					copy(manifestChunks[i][:], raw)
-				}
-			}
-		}
-		var manifestHex string
-		manifest := &blob.Manifest{
-			ChunkSize:   uint32(cs),
-			TotalLength: uint64(calculatedSize),
-			Chunks:      manifestChunks,
-		}
-		manifestBlob, mErr := blob.EncodeManifest(manifest)
-		if mErr == nil {
-			manifestHex = manifestBlob.SHA256Hex()
-		}
-
-		node.mutate(func(row *pb.Inode) {
-			row.ChunkSize = uint32(effectiveChunkSize)
-			row.Mtime = timestamppb.New(now)
-			row.Ctime = timestamppb.New(now)
-			row.Size = calculatedSize
-			row.ContentSha256 = ""
-			row.Sha256 = ""
-			if manifestHex != "" {
-				row.ManifestSha256 = manifestHex
-			}
-		})
-
-		for _, idx := range touchedIndices {
-			cSize := int64(node.Row.GetChunkSize())
-			if cSize == 0 {
-				cSize = int64(effectiveChunkSize)
-			}
-			if int64(idx)*cSize < node.Row.GetSize() {
-				if _, err := tx.Insert(ctx, &pb.FileChunk{
-					Ino:    proto.Uint64(node.Row.GetIno()),
-					Index:  proto.Uint32(uint32(idx)),
-					Sha256: chunkShas[idx],
-				}); err != nil {
-					return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log FileChunk: %w", err)
-				}
-			}
-		}
-
-		if _, err := tx.Update(ctx, node.Row); err != nil {
-			return 0, 0, time.Time{}, nil, fmt.Errorf("failed to log inode update: %w", err)
-		}
-
-		commitSeq, err := tx.Commit(ctx)
-		if err != nil {
-			return 0, 0, time.Time{}, nil, fmt.Errorf("failed to commit chunked write transaction: %w", err)
-		}
-		v.applyTxChangesLocked(ctx, tx)
-
-		waitFn := v.makeWaitFn(commitSeq, reqLevel)
-
-		done := v.registerPendingUpload(node.Row.GetIno(), chunkBlobs)
+	// Backpressure: wait under stagingMu if stagedBytes + dataLen exceeds stagingCap
+	v.stagingMu.Lock()
+	if v.stagingCap > 0 && v.stagedBytes+dataLen > v.stagingCap {
+		stopDone := make(chan struct{})
+		defer close(stopDone)
 		go func() {
-			var uploadErr error
-			defer func() { done(uploadErr) }()
-
-			if v.blobStore != nil && len(chunkBlobs) > 0 {
-				blobsMap := make(map[string]blob.ByteStream, len(chunkBlobs))
-				for idx, cBytes := range chunkBlobs {
-					blobsMap[chunkShas[idx]] = blob.NewByteStreamFromBytes(cBytes)
-				}
-				if err := v.blobStore.PutBlobs(context.Background(), blobsMap); err != nil {
-					uploadErr = err
-					return
-				}
+			select {
+			case <-ctx.Done():
+				v.stagingMu.Lock()
+				v.stagingCond.Broadcast()
+				v.stagingMu.Unlock()
+			case <-stopDone:
 			}
 		}()
 
-		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
-		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_MODIFIED,
-			Attr:      attr,
-			Inode:     node.Row.GetIno(),
-		})
-
-		return int64(len(data)), node.Row.GetSize(), now, waitFn, nil
-	}()
-	if err != nil {
-		return 0, 0, time.Time{}, err
-	}
-	if waitFn != nil {
-		if err := waitFn(ctx); err != nil {
-			return 0, 0, time.Time{}, err
+		for v.stagingCap > 0 && v.stagedBytes+dataLen > v.stagingCap {
+			if ctx.Err() != nil {
+				v.stagingMu.Unlock()
+				return 0, 0, time.Time{}, ctx.Err()
+			}
+			v.stagingCond.Wait()
 		}
 	}
-	return nWritten, newSize, modTime, nil
+
+	staged, exists := v.stagedInodes[inodeID]
+	if !exists {
+		staged = &stagedInodeWrite{
+			chunks: make(map[uint32][]byte),
+			size:   baseSize,
+			mtime:  time.Now(),
+		}
+		v.stagedInodes[inodeID] = staged
+	}
+
+	now := time.Now()
+	newCalculatedSize := offset + dataLen
+	if newCalculatedSize > staged.size {
+		staged.size = newCalculatedSize
+	}
+	staged.mtime = now
+
+	for i := startChunk; i <= endChunk; i++ {
+		chunkStart := int64(i) * cs
+		chunkEnd := chunkStart + cs
+		wStart := offset - chunkStart
+		if wStart < 0 {
+			wStart = 0
+		}
+		wEnd := offset + dataLen - chunkStart
+		if wEnd > cs {
+			wEnd = cs
+		}
+		dataStart := chunkStart - offset
+		if dataStart < 0 {
+			dataStart = 0
+		}
+		dataEnd := chunkEnd - offset
+		if dataEnd > dataLen {
+			dataEnd = dataLen
+		}
+
+		expectedChunkLen := cs
+		if int64(i+1)*cs > staged.size {
+			expectedChunkLen = staged.size - int64(i)*cs
+		}
+
+		chunkBuf, alreadyStaged := staged.chunks[uint32(i)]
+		if !alreadyStaged {
+			// Read base chunk from committed storage if partial write
+			if (wStart > 0 || wEnd < expectedChunkLen) && baseSize > chunkStart {
+				v.stagingMu.Unlock()
+				v.mu.RLock()
+				curNode, getErr := v.getOrLoadInodeLocked(ctx, nil, inodeID)
+				if getErr != nil {
+					v.mu.RUnlock()
+					v.stagingMu.Lock()
+					if !exists || len(staged.chunks) == 0 {
+						delete(v.stagedInodes, inodeID)
+					}
+					v.stagingMu.Unlock()
+					return 0, 0, time.Time{}, getErr
+				}
+				var baseData []byte
+				var readErr error
+				if curNode != nil {
+					baseData, readErr = v.readChunkLocked(ctx, nil, curNode, i)
+				}
+				v.mu.RUnlock()
+				if readErr != nil {
+					v.stagingMu.Lock()
+					if !exists || len(staged.chunks) == 0 {
+						delete(v.stagedInodes, inodeID)
+					}
+					v.stagingMu.Unlock()
+					return 0, 0, time.Time{}, readErr
+				}
+				v.stagingMu.Lock()
+				staged = v.stagedInodes[inodeID]
+				if staged == nil {
+					staged = &stagedInodeWrite{chunks: make(map[uint32][]byte), size: newCalculatedSize, mtime: now}
+					v.stagedInodes[inodeID] = staged
+				}
+				if curStaged, ok := staged.chunks[uint32(i)]; ok {
+					chunkBuf = curStaged
+				} else if len(baseData) > 0 {
+					chunkBuf = make([]byte, len(baseData))
+					copy(chunkBuf, baseData)
+				}
+			}
+		}
+
+		oldLen := int64(len(chunkBuf))
+		if int64(len(chunkBuf)) < expectedChunkLen {
+			newBuf := make([]byte, expectedChunkLen)
+			copy(newBuf, chunkBuf)
+			chunkBuf = newBuf
+		}
+		copy(chunkBuf[wStart:wEnd], data[dataStart:dataEnd])
+		staged.chunks[uint32(i)] = chunkBuf
+
+		addedBytes := int64(len(chunkBuf)) - oldLen
+		v.stagedBytes += addedBytes
+	}
+
+	finalSize := staged.size
+	finalMtime := staged.mtime
+	v.stagingMu.Unlock()
+
+	return dataLen, finalSize, finalMtime, nil
 }
 
 func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (*pb.EntryAttr, error) {
@@ -2738,9 +2758,35 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 	inodeID = v.normalizeInodeID(inodeID)
 	v.mu.RUnlock()
 
-	if err := v.waitForInodeUploads(ctx, inodeID); err != nil {
-		return nil, err
+	// Drop staged chunks beyond new size
+	v.stagingMu.Lock()
+	if staged, ok := v.stagedInodes[inodeID]; ok {
+		cs := int64(v.chunkSize)
+		if cs <= 0 {
+			cs = 64 * 1024
+		}
+		newNumChunks := int((size + cs - 1) / cs)
+		for idx, cData := range staged.chunks {
+			if int(idx) >= newNumChunks {
+				v.stagedBytes -= int64(len(cData))
+				delete(staged.chunks, idx)
+			} else if int(idx) == newNumChunks-1 && newNumChunks > 0 {
+				lastLen := size - int64(idx)*cs
+				if int64(len(cData)) > lastLen {
+					v.stagedBytes -= (int64(len(cData)) - lastLen)
+					staged.chunks[idx] = cData[:lastLen]
+				}
+			}
+		}
+		if size < staged.size {
+			staged.size = size
+		}
+		if len(staged.chunks) == 0 {
+			delete(v.stagedInodes, inodeID)
+		}
+		v.stagingCond.Broadcast()
 	}
+	v.stagingMu.Unlock()
 
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		v.mu.Lock()
@@ -2775,11 +2821,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 
 		if size == 0 {
 			node.IsDirty = true
-			v.pendingUploadsMu.Lock()
-			if v.stagedUploads != nil {
-				delete(v.stagedUploads, node.Row.GetIno())
-			}
-			v.pendingUploadsMu.Unlock()
 			node.mutate(func(row *pb.Inode) {
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
@@ -2789,7 +2830,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 				row.Sha256 = ""
 			})
 			node.Chunks = nil
-			node.StagedChunks = nil
 			node.DirtyChunks = nil
 			node.InlineData = nil
 			if node.Data != nil {
@@ -2813,16 +2853,10 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 				return nil, nil, err
 			}
 			node.IsDirty = true
-			v.pendingUploadsMu.Lock()
-			if v.stagedUploads != nil {
-				delete(v.stagedUploads, node.Row.GetIno())
-			}
-			v.pendingUploadsMu.Unlock()
 			newBuf := make([]byte, size)
 			copy(newBuf, chunk0)
 			node.InlineData = newBuf
 			node.Chunks = nil
-			node.StagedChunks = nil
 			node.DirtyChunks = nil
 
 			node.mutate(func(row *pb.Inode) {
@@ -2863,10 +2897,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			var hasLastChunkData bool
 			if newNumChunks > 0 && size < node.Row.GetSize() {
 				lastIdx := newNumChunks - 1
-				if chunkData, ok := node.StagedChunks[lastIdx]; ok {
-					lastChunkData = chunkData
-					hasLastChunkData = true
-				} else if _, exists := node.Chunks[uint32(lastIdx)]; exists {
+				if _, exists := node.Chunks[uint32(lastIdx)]; exists {
 					chunkData, err := v.readChunkLocked(ctx, tx, node, lastIdx)
 					if err != nil {
 						return nil, nil, err
@@ -2876,24 +2907,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 				}
 			}
 
-			// Remove staged and logged chunks beyond newNumChunks
-			v.pendingUploadsMu.Lock()
-			if v.stagedUploads != nil && v.stagedUploads[node.Row.GetIno()] != nil {
-				for k := range v.stagedUploads[node.Row.GetIno()] {
-					if k >= newNumChunks {
-						delete(v.stagedUploads[node.Row.GetIno()], k)
-					}
-				}
-				if len(v.stagedUploads[node.Row.GetIno()]) == 0 {
-					delete(v.stagedUploads, node.Row.GetIno())
-				}
-			}
-			v.pendingUploadsMu.Unlock()
-			for k := range node.StagedChunks {
-				if k >= newNumChunks {
-					delete(node.StagedChunks, k)
-				}
-			}
 			for i := range node.Chunks {
 				if int(i) >= newNumChunks {
 					delete(node.Chunks, i)
@@ -2910,10 +2923,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 					truncatedData := lastChunkData[:lastChunkLen]
 					chunkSha := fmt.Sprintf("%x", sha256.Sum256(truncatedData))
 					node.Chunks[uint32(lastIdx)] = chunkSha
-					if node.StagedChunks == nil {
-						node.StagedChunks = make(map[int][]byte)
-					}
-					node.StagedChunks[lastIdx] = truncatedData
 					if v.blobStore != nil {
 						_ = v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{
 							chunkSha: blob.NewByteStreamFromBytes(truncatedData),
@@ -3000,9 +3009,18 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	childInodeID = childInode.Row.GetIno()
 	v.mu.Unlock()
 
-	if err := v.waitForInodeUploads(ctx, childInodeID); err != nil {
-		return err
+	v.stagingMu.Lock()
+	if staged, ok := v.stagedInodes[childInodeID]; ok {
+		for _, cData := range staged.chunks {
+			v.stagedBytes -= int64(len(cData))
+		}
+		if v.stagedBytes < 0 {
+			v.stagedBytes = 0
+		}
+		delete(v.stagedInodes, childInodeID)
+		v.stagingCond.Broadcast()
 	}
+	v.stagingMu.Unlock()
 
 	waitFn, err := func() (func(context.Context) error, error) {
 		v.mu.Lock()
@@ -3500,26 +3518,76 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 	return attr, nil
 }
 
-func (v *Volume) Fsync(ctx context.Context, inodeID uint64) error {
-	v.mu.RLock()
-	if inodeID == 0 {
-		inodeID = v.rootInodeID
+func (v *Volume) Fsync(ctx context.Context, inodeID uint64, blockingAndEpoch ...any) error {
+	blocking := true
+	var clientEpoch uint64
+	if len(blockingAndEpoch) > 0 {
+		if b, ok := blockingAndEpoch[0].(bool); ok {
+			blocking = b
+		}
 	}
-	_, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
-	isRoot := (inodeID == v.rootInodeID)
-	v.mu.RUnlock()
-	if err != nil {
-		return err
+	if len(blockingAndEpoch) > 1 {
+		if e, ok := blockingAndEpoch[1].(uint64); ok {
+			clientEpoch = e
+		}
 	}
 
-	if isRoot {
-		if err := v.waitForVolumeUploads(ctx); err != nil {
+	v.stagingMu.Lock()
+	if clientEpoch != 0 && clientEpoch != v.stagingEpoch {
+		v.stagingMu.Unlock()
+		return syscall.ESTALE
+	}
+
+	// Surface any prior non-blocking error for this inode
+	if blocking && inodeID != 0 {
+		if err, ok := v.lastNonblockErr[inodeID]; ok {
+			delete(v.lastNonblockErr, inodeID)
+			v.stagingMu.Unlock()
 			return err
 		}
-	} else {
-		if err := v.waitForInodeUploads(ctx, inodeID); err != nil {
-			return err
+	}
+
+	if !blocking {
+		if len(v.stagedInodes) == 0 && !v.syncInProgress {
+			v.stagingMu.Unlock()
+			return nil
 		}
+		window := v.syncCoalesceWindow
+		if window <= 0 {
+			v.stagingMu.Unlock()
+			return v.flushStagedPacks(ctx)
+		}
+
+		waitCh := make(chan error, 1)
+		v.coalesceWaiters = append(v.coalesceWaiters, waitCh)
+
+		if v.coalesceTimer == nil {
+			v.coalesceTimer = time.AfterFunc(window, func() {
+				if err := v.flushCoalescedWindow(context.Background()); err != nil {
+					klog.V(2).Infof("background coalesce sync failed for volume %s: %v", v.volumeID, err)
+				}
+			})
+		}
+		v.stagingMu.Unlock()
+
+		select {
+		case err := <-waitCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	// Blocking sync flushes immediately and includes window's other writes
+	if v.coalesceTimer != nil {
+		v.coalesceTimer.Stop()
+		v.coalesceTimer = nil
+	}
+	v.stagingMu.Unlock()
+
+	err := v.flushCoalescedWindow(ctx)
+	if err != nil {
+		return err
 	}
 
 	if v.stream != nil {
@@ -3528,6 +3596,24 @@ func (v *Volume) Fsync(ctx context.Context, inodeID uint64) error {
 		}
 	}
 	return nil
+}
+
+func (v *Volume) flushCoalescedWindow(ctx context.Context) error {
+	v.stagingMu.Lock()
+	if v.coalesceTimer != nil {
+		v.coalesceTimer.Stop()
+		v.coalesceTimer = nil
+	}
+	waiters := v.coalesceWaiters
+	v.coalesceWaiters = nil
+	v.stagingMu.Unlock()
+
+	err := v.flushStagedPacks(ctx)
+
+	for _, ch := range waiters {
+		ch <- err
+	}
+	return err
 }
 
 func (v *Volume) AllocFh(inodeID uint64) uint64 {
@@ -3688,7 +3774,9 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 }
 
 func (v *Volume) FlushToBackend(ctx context.Context) error {
-	_ = v.waitForVolumeUploads(ctx)
+	if err := v.flushStagedPacks(ctx); err != nil {
+		return err
+	}
 
 	v.snapshotMu.Lock()
 	defer v.snapshotMu.Unlock()
@@ -4306,6 +4394,10 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 
 // CreateSnapshot creates and returns a new index snapshot of the current volume state.
 func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error) {
+	if err := v.flushStagedPacks(ctx); err != nil {
+		return "", err
+	}
+
 	v.snapshotMu.Lock()
 	defer v.snapshotMu.Unlock()
 
