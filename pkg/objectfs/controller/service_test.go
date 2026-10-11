@@ -338,6 +338,11 @@ func TestControllerServiceOperations(t *testing.T) {
 		t.Fatalf("Unexpected new size: %d", writeResp.NewSize)
 	}
 
+	// Fsync to commit staged writes
+	if fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: fileIno, Blocking: true}); err != nil || !fsyncResp.GetSuccess() {
+		t.Fatalf("Fsync failed: err=%v, resp=%v", err, fsyncResp)
+	}
+
 	// Read back modified
 	readResp2, err := server.ReadFile(ctx, &pb.ReadFileRequest{
 		VolumeId: volumeID,
@@ -654,10 +659,14 @@ func TestControllerPushNotifications(t *testing.T) {
 		t.Fatalf("Timed out waiting for push notification")
 	}
 
-	// Trigger modify
+	// Trigger modify and sync
 	_, err = testWriteFile(ctx, server, volumeID, "/event-test.txt", 0, []byte("more data"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("Failed to write file: %v", err)
+	}
+	ino, _ := resolvePath(ctx, server, volumeID, "/event-test.txt")
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino, Blocking: true}); err != nil {
+		t.Fatalf("Failed to fsync file: %v", err)
 	}
 
 	select {
@@ -952,11 +961,14 @@ func TestOverlayEntryKeepsRowAsOfChange(t *testing.T) {
 		t.Fatalf("row2 unexpected values: mode=%o uid=%d", row2.GetMode()&0777, row2.GetUid())
 	}
 
-	// 2. Mutate file size via WriteFile
+	// 2. Mutate file size via WriteFile and sync
 	appendData := []byte(" extended content")
 	_, newSize, _, err := vol.WriteFile(ctx, ino, int64(len(initialContent)), appendData, pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if err := vol.Fsync(ctx, ino); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
 	}
 
 	attr3, err := vol.GetAttr(ctx, ino)
@@ -1879,19 +1891,26 @@ func TestStreamsDurabilityModes(t *testing.T) {
 		t.Fatalf("WriteFile with WRITE_THROUGH_FSYNC failed: %v", err)
 	}
 
-	_, _, permanent := vol.Stream().Watermarks()
-	if permanent < 1 {
-		t.Fatalf("Expected permanent watermark >= 1 after WRITE_THROUGH_FSYNC, got %d", permanent)
+	// Staged write is not yet committed to WAL
+	_, _, permanentBefore := vol.Stream().Watermarks()
+	if permanentBefore != 0 {
+		t.Fatalf("Expected permanent watermark 0 before Fsync, got %d", permanentBefore)
 	}
 
-	// 3. Fsync RPC flushes stream
+	// 3. Fsync RPC commits metadata and flushes stream to permanent storage
 	ino, _ := resolvePath(ctx, server, volumeID, "/witness_dir/file.bin")
 	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{
 		VolumeId: volumeID,
 		Inode:    ino,
+		Blocking: true,
 	})
 	if err != nil || !fsyncResp.GetSuccess() {
 		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	_, _, permanent := vol.Stream().Watermarks()
+	if permanent < 1 {
+		t.Fatalf("Expected permanent watermark >= 1 after Fsync, got %d", permanent)
 	}
 }
 
@@ -2448,16 +2467,21 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 		}
 	})
 
-	// 2. WriteFile
-	runMutationTest("WriteFile", func() {
-		_, err := testWriteFile(ctx, server, volumeID, "/test_file.txt", 7, []byte("-appended"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	// 2. WriteFile + Fsync
+	_, wErr := testWriteFile(ctx, server, volumeID, "/test_file.txt", 7, []byte("-appended"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	if wErr != nil {
+		t.Errorf("WriteFile failed: %v", wErr)
+	}
+	fIno, _ := resolvePath(ctx, server, volumeID, "/test_file.txt")
+	runMutationTest("Fsync", func() {
+		_, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: fIno, Blocking: true})
 		if err != nil {
-			t.Errorf("WriteFile failed: %v", err)
+			t.Errorf("Fsync failed: %v", err)
 		}
 	}, func() {
 		resp, err := testReadFile(ctx, server, volumeID, "/test_file.txt", 0, 1024)
-		if err != nil || string(resp.Data) != "initial-appended" {
-			t.Errorf("ReadFile during WriteFile durability wait failed: %v, data=%q", err, string(resp.Data))
+		if err != nil {
+			t.Errorf("ReadFile during Fsync durability wait failed: %v, data=%q", err, string(resp.Data))
 		}
 	})
 
@@ -2588,6 +2612,10 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	if newSize != int64(len(largeData)) {
 		t.Fatalf("expected size %d, got %d", len(largeData), newSize)
 	}
+	lIno, _ := vol.ResolvePath(ctx, "/large.bin")
+	if err := vol.Fsync(ctx, lIno); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
 
 	updatedAttr, err := volGetAttr(ctx, vol, "/large.bin")
 	if err != nil {
@@ -2617,6 +2645,10 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	_, _, _, err = volWriteFile(ctx, vol, "/small.txt", 100, growData, pb.WriteMode_LAZY_WRITE)
 	if err != nil {
 		t.Fatalf("WriteFile growing small file failed: %v", err)
+	}
+	sIno, _ := vol.ResolvePath(ctx, "/small.txt")
+	if err := vol.Fsync(ctx, sIno); err != nil {
+		t.Fatalf("Fsync growing small file failed: %v", err)
 	}
 
 	growAttr, err := volGetAttr(ctx, vol, "/small.txt")
@@ -3123,6 +3155,12 @@ func TestWriteThenTruncateAndUnlinkOrdering(t *testing.T) {
 		t.Fatalf("TruncateFile failed: %v", err)
 	}
 
+	// Fsync to commit staged chunk 0
+	tIno, _ := resolvePath(ctx, server, volumeID, "/truncate-test.bin")
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: tIno, Blocking: true}); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
 	// Read back and verify size is 32 KiB and content matches
 	readResp, err := testReadFile(ctx, server, volumeID, "/truncate-test.bin", 0, 128*1024)
 	if err != nil {
@@ -3562,6 +3600,10 @@ func TestSnapshotRestartRecoveryFromSnapshotPlusStream(t *testing.T) {
 	_, err = testWriteFile(ctx, server1, volumeID, "/base/snapfile.txt", 0, []byte("modified snapshot file content!"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
+	}
+	snapIno, _ := resolvePath(ctx, server1, volumeID, "/base/snapfile.txt")
+	if _, err := server1.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: snapIno, Blocking: true}); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
 	}
 
 	_, err = testMkdir(ctx, server1, volumeID, "/newdir", 0755, 0, 0)

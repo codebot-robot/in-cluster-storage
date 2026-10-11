@@ -114,6 +114,10 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 		t.Errorf("WriteFile result mismatch: nWritten=%d, newSize=%d", nWritten, newSize)
 	}
 
+	if err := vol.Fsync(ctx, chunkAttr.GetInode().GetIno()); err != nil {
+		t.Fatalf("Fsync large.bin failed: %v", err)
+	}
+
 	readChunk, _, _, err := vol.ReadFile(ctx, chunkAttr.GetInode().GetIno(), 0, int64(len(largeData)))
 	if err != nil {
 		t.Fatalf("ReadFile large.bin failed: %v", err)
@@ -532,6 +536,9 @@ func TestSQLiteReadCacheCoherence(t *testing.T) {
 	if newSize != 109 {
 		t.Fatalf("expected size 109 after write, got %d", newSize)
 	}
+	if err := vol.Fsync(ctx, fAttr.GetInode().GetIno()); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
 	wAttr, err := vol.GetAttr(ctx, fAttr.GetInode().GetIno())
 	if err != nil {
 		t.Fatalf("GetAttr failed: %v", err)
@@ -841,6 +848,10 @@ func TestSQLiteApplierCoalescing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("WriteFile iter %d failed: %v", i, err)
 		}
+	}
+
+	if err := vol.Fsync(ctx, attr.GetInode().GetIno()); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
 	}
 
 	// Flush overlay to SQLite

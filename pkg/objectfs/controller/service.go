@@ -135,6 +135,9 @@ type Server struct {
 	debugMutationCheck       bool
 	viewOpts                 []view.Option
 	streamFactory            func(volumeID string) (walclient.Stream, error)
+	syncCoalesceWindow       time.Duration
+	maxStagingBytes          int64
+	syncTimeout              time.Duration
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -240,6 +243,29 @@ func WithServerLocalStorageDir(dir string) ServerOption {
 	}
 }
 
+// WithServerSyncCoalesceWindow sets the window duration for coalescing non-blocking sync requests across all volumes.
+func WithServerSyncCoalesceWindow(d time.Duration) ServerOption {
+	return func(s *Server) {
+		s.syncCoalesceWindow = d
+	}
+}
+
+// WithServerMaxStagingBytes sets the maximum byte bound for in-memory staged writes across all volumes.
+func WithServerMaxStagingBytes(b int64) ServerOption {
+	return func(s *Server) {
+		s.maxStagingBytes = b
+	}
+}
+
+// WithServerSyncTimeout sets the timeout duration for coalesced background sync operations.
+func WithServerSyncTimeout(d time.Duration) ServerOption {
+	return func(s *Server) {
+		if d > 0 {
+			s.syncTimeout = d
+		}
+	}
+}
+
 func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if backend == nil {
 		backend = NewMemoryBackend()
@@ -249,6 +275,7 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		backend:           backend,
 		blobStore:         blob.NewStore(backend, 0),
 		broadcaster:       NewEventBroadcaster(),
+		syncTimeout:       10 * time.Minute,
 		defaultDurability: walclient.Local,
 	}
 	for _, opt := range opts {
@@ -313,6 +340,15 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if s.debugStatsCheck {
 			volOpts = append(volOpts, WithVolumeStatsCheck())
+		}
+		if s.syncCoalesceWindow > 0 {
+			volOpts = append(volOpts, WithSyncCoalesceWindow(s.syncCoalesceWindow))
+		}
+		if s.maxStagingBytes > 0 {
+			volOpts = append(volOpts, WithMaxStagingBytes(s.maxStagingBytes))
+		}
+		if s.syncTimeout > 0 {
+			volOpts = append(volOpts, WithSyncTimeout(s.syncTimeout))
 		}
 
 		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
@@ -560,7 +596,7 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	bytesWritten, newSize, modTime, err := vol.WriteFile(ctx, req.GetInode(), req.GetOffset(), req.GetData(), req.GetWriteMode())
+	bytesWritten, newSize, modTime, stagingEpoch, err := vol.WriteFileWithEpoch(ctx, req.GetInode(), req.GetOffset(), req.GetData(), req.GetWriteMode())
 	if err != nil {
 		return &pb.WriteFileResponse{Error: volErrToSyscall(err)}, nil
 	}
@@ -568,6 +604,7 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 		BytesWritten: bytesWritten,
 		NewSize:      newSize,
 		ModTime:      timestamppb.New(modTime),
+		StagingEpoch: stagingEpoch,
 	}, nil
 }
 
@@ -637,10 +674,11 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	if err := vol.Fsync(ctx, req.GetInode()); err != nil {
-		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err)}, nil
+	stagingEpoch, err := vol.FsyncWithEpoch(ctx, req.GetInode(), req.GetBlocking(), req.GetStagingEpoch())
+	if err != nil {
+		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err), StagingEpoch: stagingEpoch}, nil
 	}
-	return &pb.FsyncResponse{Success: true}, nil
+	return &pb.FsyncResponse{Success: true, StagingEpoch: stagingEpoch}, nil
 }
 
 func (s *Server) Symlink(ctx context.Context, req *pb.SymlinkRequest) (*pb.SymlinkResponse, error) {
