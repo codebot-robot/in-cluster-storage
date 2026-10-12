@@ -979,39 +979,31 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, tx *sds.Tx, 
 	return nil
 }
 
-func (v *Volume) readChunkLocked(ctx context.Context, tx *sds.Tx, node *CachedInode, chunkIdx int) ([]byte, error) {
+// resolveChunkSourceLocked: called with v.mu held; never does backend I/O.
+// Returns in-memory bytes (inline/dirty/node.Data) OR a sha to fetch, OR neither (hole).
+// Staged (unsynced) chunks in v.stagedChunks are deliberately not consulted:
+// uncommitted staged data is only visible to the writing client's local cache until fsync (#245 contract).
+func (v *Volume) resolveChunkSourceLocked(ctx context.Context, tx *sds.Tx, node *CachedInode, chunkIdx int) ([]byte, string, error) {
 	if chunkIdx == 0 && len(node.InlineData) > 0 {
 		res := make([]byte, len(node.InlineData))
 		copy(res, node.InlineData)
-		return res, nil
+		return res, "", nil
 	}
 
 	if node.DirtyChunks != nil {
 		if data, ok := node.DirtyChunks[chunkIdx]; ok {
 			res := make([]byte, len(data))
 			copy(res, data)
-			return res, nil
+			return res, "", nil
 		}
 	}
 
 	if err := v.ensureInodeChunksLoadedLocked(ctx, tx, node); err != nil {
-		return nil, fmt.Errorf("read chunk: inode %d chunks load: %w", node.Row.GetIno(), err)
+		return nil, "", fmt.Errorf("read chunk: inode %d chunks load: %w", node.Row.GetIno(), err)
 	}
 
 	if chunkSha, ok := node.Chunks[uint32(chunkIdx)]; ok && chunkSha != "" {
-		if v.blobStore == nil {
-			return nil, fmt.Errorf("read chunk: inode %d chunk %d: blob store not configured", node.Row.GetIno(), chunkIdx)
-		}
-		stream, err := v.blobStore.GetBlob(ctx, chunkSha)
-		if err != nil {
-			return nil, fmt.Errorf("read chunk: inode %d chunk %d sha %s: %w", node.Row.GetIno(), chunkIdx, chunkSha, err)
-		}
-		defer stream.Close()
-		data, err := io.ReadAll(stream)
-		if err != nil {
-			return nil, fmt.Errorf("read chunk: inode %d chunk %d sha %s read: %w", node.Row.GetIno(), chunkIdx, chunkSha, err)
-		}
-		return data, nil
+		return nil, chunkSha, nil
 	}
 
 	if chunkIdx == 0 && (node.Row.GetSha256() != "" || node.Row.GetContentSha256() != "") && len(node.Chunks) == 0 {
@@ -1019,19 +1011,7 @@ func (v *Volume) readChunkLocked(ctx context.Context, tx *sds.Tx, node *CachedIn
 		if sha == "" {
 			sha = node.Row.GetContentSha256()
 		}
-		if v.blobStore == nil {
-			return nil, fmt.Errorf("read chunk: inode %d chunk 0: blob store not configured", node.Row.GetIno())
-		}
-		stream, err := v.blobStore.GetBlob(ctx, sha)
-		if err != nil {
-			return nil, fmt.Errorf("read chunk: inode %d chunk 0 sha %s: %w", node.Row.GetIno(), sha, err)
-		}
-		defer stream.Close()
-		data, err := io.ReadAll(stream)
-		if err != nil {
-			return nil, fmt.Errorf("read chunk: inode %d chunk 0 sha %s read: %w", node.Row.GetIno(), sha, err)
-		}
-		return data, nil
+		return nil, sha, nil
 	}
 
 	if node.Data != nil && node.Row.GetChunkSize() > 0 {
@@ -1043,20 +1023,44 @@ func (v *Volume) readChunkLocked(ctx context.Context, tx *sds.Tx, node *CachedIn
 			}
 			buf := make([]byte, readLen)
 			if err := node.Data.Rewind(); err != nil {
-				return nil, fmt.Errorf("read chunk: inode %d chunk %d rewind: %w", node.Row.GetIno(), chunkIdx, err)
+				return nil, "", fmt.Errorf("read chunk: inode %d chunk %d rewind: %w", node.Row.GetIno(), chunkIdx, err)
 			}
 			if _, err := node.Data.Seek(off, io.SeekStart); err != nil {
-				return nil, fmt.Errorf("read chunk: inode %d chunk %d seek: %w", node.Row.GetIno(), chunkIdx, err)
+				return nil, "", fmt.Errorf("read chunk: inode %d chunk %d seek: %w", node.Row.GetIno(), chunkIdx, err)
 			}
 			n, err := io.ReadFull(node.Data, buf)
 			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-				return nil, fmt.Errorf("read chunk: inode %d chunk %d read: %w", node.Row.GetIno(), chunkIdx, err)
+				return nil, "", fmt.Errorf("read chunk: inode %d chunk %d read: %w", node.Row.GetIno(), chunkIdx, err)
 			}
-			return buf[:n], nil
+			return buf[:n], "", nil
 		}
 	}
 
-	return nil, nil
+	return nil, "", nil
+}
+
+func (v *Volume) readChunkLocked(ctx context.Context, tx *sds.Tx, node *CachedInode, chunkIdx int) ([]byte, error) {
+	data, sha, err := v.resolveChunkSourceLocked(ctx, tx, node, chunkIdx)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 0 || sha == "" {
+		return data, nil
+	}
+
+	if v.blobStore == nil {
+		return nil, fmt.Errorf("read chunk: inode %d chunk %d: blob store not configured", node.Row.GetIno(), chunkIdx)
+	}
+	stream, err := v.blobStore.GetBlob(ctx, sha)
+	if err != nil {
+		return nil, fmt.Errorf("read chunk: inode %d chunk %d sha %s: %w", node.Row.GetIno(), chunkIdx, sha, err)
+	}
+	defer stream.Close()
+	bData, err := io.ReadAll(stream)
+	if err != nil {
+		return nil, fmt.Errorf("read chunk: inode %d chunk %d sha %s read: %w", node.Row.GetIno(), chunkIdx, sha, err)
+	}
+	return bData, nil
 }
 
 // VolumeID returns the volume identifier.
@@ -2614,6 +2618,37 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 	return attr, nil
 }
 
+func (v *Volume) readBaseChunk(ctx context.Context, node *CachedInode, chunkIdx int) ([]byte, error) {
+	v.mu.Lock()
+	data, sha, err := v.resolveChunkSourceLocked(ctx, nil, node, chunkIdx)
+	ino := node.Row.GetIno()
+	blobStore := v.blobStore
+	v.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 0 || sha == "" {
+		return data, nil
+	}
+
+	if blobStore == nil {
+		return nil, fmt.Errorf("read chunk: inode %d chunk %d: blob store not configured", ino, chunkIdx)
+	}
+	stream, err := blobStore.GetBlob(ctx, sha)
+	if err != nil {
+		return nil, fmt.Errorf("read chunk: inode %d chunk %d sha %s: %w", ino, chunkIdx, sha, err)
+	}
+	bData, err := io.ReadAll(stream)
+	if cErr := stream.Close(); cErr != nil && err == nil {
+		err = fmt.Errorf("read chunk: inode %d chunk %d sha %s close: %w", ino, chunkIdx, sha, cErr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read chunk: inode %d chunk %d sha %s read: %w", ino, chunkIdx, sha, err)
+	}
+	return bData, nil
+}
+
 func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length int64) ([]byte, int64, string, error) {
 	if inodeID == 0 {
 		v.mu.RLock()
@@ -2648,7 +2683,6 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 	readLen := end - offset
 
 	v.mu.Lock()
-	defer v.mu.Unlock()
 
 	if len(node.InlineData) > 0 {
 		res := make([]byte, readLen)
@@ -2659,11 +2693,13 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 			}
 			copy(res, node.InlineData[offset:copyEnd])
 		}
+		v.mu.Unlock()
 		return res, total, "", nil
 	}
 
 	if node.Row.GetManifestSha256() != "" || node.Row.GetChunkSize() > 0 || len(node.Chunks) > 0 {
 		if err := v.ensureInodeChunksLoadedLocked(ctx, nil, node); err != nil {
+			v.mu.Unlock()
 			return nil, 0, "", fmt.Errorf("read inode %d chunks load: %w", node.Row.GetIno(), err)
 		}
 		cs := int64(node.Row.GetChunkSize())
@@ -2675,13 +2711,115 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 		}
 		startChunk := int(offset / cs)
 		endChunk := int((end - 1) / cs)
+		numChunks := endChunk - startChunk + 1
 
-		var res bytes.Buffer
+		type chunkPlan struct {
+			idx  int
+			data []byte
+			sha  string
+		}
+		plans := make([]chunkPlan, numChunks)
+
+		// Staged (unsynced) chunks in v.stagedChunks are deliberately not consulted by ReadFile:
+		// uncommitted staged data is only visible to the writing client's local cache until fsync (#245 contract).
 		for i := startChunk; i <= endChunk; i++ {
-			chunkData, err := v.readChunkLocked(ctx, nil, node, i)
+			pIdx := i - startChunk
+			plans[pIdx].idx = i
+
+			data, sha, err := v.resolveChunkSourceLocked(ctx, nil, node, i)
 			if err != nil {
+				v.mu.Unlock()
 				return nil, 0, "", err
 			}
+			plans[pIdx].data = data
+			plans[pIdx].sha = sha
+		}
+
+		ino := node.Row.GetIno()
+		blobStore := v.blobStore
+		v.mu.Unlock()
+
+		for _, p := range plans {
+			if p.sha != "" && blobStore == nil {
+				return nil, 0, "", fmt.Errorf("read chunk: inode %d chunk %d: blob store not configured", ino, p.idx)
+			}
+		}
+
+		var missingCount int
+		for _, p := range plans {
+			if p.sha != "" && p.data == nil {
+				missingCount++
+			}
+		}
+
+		if missingCount > 0 {
+			var wg sync.WaitGroup
+			sem := make(chan struct{}, 16)
+			var firstErr error
+			var errOnce sync.Once
+
+			fetchCtx, fetchCancel := context.WithCancel(ctx)
+			defer fetchCancel()
+
+			// Goroutines write to disjoint indices (plan.data) and plans is read only after wg.Wait(); safe without a mutex.
+			for pIdx := range plans {
+				plan := &plans[pIdx]
+				if plan.sha == "" || plan.data != nil {
+					continue
+				}
+
+				if fetchCtx.Err() != nil {
+					break
+				}
+
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(p *chunkPlan) {
+					defer func() {
+						<-sem
+						wg.Done()
+					}()
+
+					if fetchCtx.Err() != nil {
+						return
+					}
+
+					stream, err := blobStore.GetBlob(fetchCtx, p.sha)
+					if err != nil {
+						errOnce.Do(func() {
+							firstErr = fmt.Errorf("read chunk: inode %d chunk %d sha %s: %w", ino, p.idx, p.sha, err)
+							fetchCancel()
+						})
+						return
+					}
+
+					data, err := io.ReadAll(stream)
+					if cErr := stream.Close(); cErr != nil && err == nil {
+						err = cErr
+					}
+					if err != nil {
+						errOnce.Do(func() {
+							firstErr = fmt.Errorf("read chunk: inode %d chunk %d sha %s read: %w", ino, p.idx, p.sha, err)
+							fetchCancel()
+						})
+						return
+					}
+					p.data = data
+				}(plan)
+			}
+			wg.Wait()
+
+			if firstErr != nil {
+				return nil, 0, "", firstErr
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, 0, "", err
+			}
+		}
+
+		res := make([]byte, readLen)
+		for i := startChunk; i <= endChunk; i++ {
+			chunkData := plans[i-startChunk].data
 			chunkLen := cs
 			if int64(i+1)*cs > total {
 				chunkLen = total - int64(i)*cs
@@ -2696,38 +2834,53 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 				rEnd = chunkLen
 			}
 			if rEnd > rStart {
-				for b := rStart; b < rEnd; b++ {
-					if b < int64(len(chunkData)) {
-						res.WriteByte(chunkData[b])
-					} else {
-						res.WriteByte(0)
-					}
+				outOffset := chunkStart + rStart - offset
+				validEnd := rEnd
+				if validEnd > int64(len(chunkData)) {
+					validEnd = int64(len(chunkData))
+				}
+				if validEnd > rStart {
+					copy(res[outOffset:outOffset+(validEnd-rStart)], chunkData[rStart:validEnd])
 				}
 			}
 		}
-		return res.Bytes(), total, "", nil
+		return res, total, "", nil
 	}
 
 	// Lazy load data from blob store if not currently in memory
 	if node.Data == nil && node.Row.GetSize() > 0 {
-		if node.Row.GetSha256() != "" && v.blobStore != nil {
-			stream, err := v.blobStore.GetBlob(ctx, node.Row.GetSha256())
+		sha := node.Row.GetSha256()
+		if sha != "" && v.blobStore != nil {
+			blobStore := v.blobStore
+			ino := node.Row.GetIno()
+			v.mu.Unlock()
+			stream, err := blobStore.GetBlob(ctx, sha)
 			if err != nil {
-				return nil, 0, "", fmt.Errorf("read inode %d blob %s: %w", node.Row.GetIno(), node.Row.GetSha256(), err)
+				return nil, 0, "", fmt.Errorf("read inode %d blob %s: %w", ino, sha, err)
 			}
-			node.Data = stream
+			v.mu.Lock()
+			if node.Data == nil {
+				node.Data = stream
+			} else {
+				if cErr := stream.Close(); cErr != nil {
+					klog.V(4).Infof("failed to close redundant stream: %v", cErr)
+				}
+			}
 		}
 	}
 
 	if node.Data == nil {
+		v.mu.Unlock()
 		return make([]byte, readLen), total, "", nil
 	}
 
 	if _, err := node.Data.Seek(offset, io.SeekStart); err != nil {
+		v.mu.Unlock()
 		return nil, 0, "", fmt.Errorf("seek inode %d data at %d: %w", node.Row.GetIno(), offset, err)
 	}
 	res := make([]byte, readLen)
 	n, err := io.ReadFull(node.Data, res)
+	v.mu.Unlock()
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return nil, 0, "", fmt.Errorf("failed to read node data: %w", err)
 	}
@@ -2760,14 +2913,6 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		return 0, 0, time.Time{}, 0, fmt.Errorf("durability level %s requested but %w", reqLevel.String(), walclient.ErrDurabilityUnavailable)
 	}
 
-	v.stagingMu.Lock()
-	defer v.stagingMu.Unlock()
-
-	dataLen := int64(len(data))
-	if v.stagedBytes+dataLen > v.maxStagingBytes {
-		return 0, 0, time.Time{}, 0, syscall.ENOSPC
-	}
-
 	v.mu.RLock()
 	node, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
 	v.mu.RUnlock()
@@ -2779,6 +2924,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		return 0, 0, time.Time{}, 0, fmt.Errorf("cannot write to directory: %w", syscall.EISDIR)
 	}
 
+	dataLen := int64(len(data))
 	now := time.Now()
 	cs := int64(v.chunkSize)
 	if cs == 0 {
@@ -2786,6 +2932,18 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	}
 	if node.Row.GetChunkSize() > 0 {
 		cs = int64(node.Row.GetChunkSize())
+	}
+
+	startChunk := int(offset / cs)
+	endChunk := int((offset + dataLen - 1) / cs)
+
+	// Identify which chunks require base chunk reads (partial chunk writes not yet staged).
+	// To avoid holding stagingMu across backend GetBlob, check staged chunks under stagingMu,
+	// fetch missing base chunks outside stagingMu (and outside v.mu), then reacquire stagingMu.
+	v.stagingMu.Lock()
+	if v.stagedBytes+dataLen > v.maxStagingBytes {
+		v.stagingMu.Unlock()
+		return 0, 0, time.Time{}, 0, syscall.ENOSPC
 	}
 
 	currSize := node.Row.GetSize()
@@ -2797,8 +2955,56 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		calculatedSize = currSize
 	}
 
-	startChunk := int(offset / cs)
-	endChunk := int((offset + dataLen - 1) / cs)
+	var neededBaseChunks []int
+	for i := startChunk; i <= endChunk; i++ {
+		if _, ok := v.stagedChunks[inodeID][i]; ok {
+			continue
+		}
+		chunkStart := int64(i) * cs
+		wStart := offset - chunkStart
+		if wStart < 0 {
+			wStart = 0
+		}
+		wEnd := offset + dataLen - chunkStart
+		if wEnd > cs {
+			wEnd = cs
+		}
+		expectedChunkLen := cs
+		if int64(i+1)*cs > calculatedSize {
+			expectedChunkLen = calculatedSize - int64(i)*cs
+		}
+		if wStart > 0 || wEnd < expectedChunkLen {
+			neededBaseChunks = append(neededBaseChunks, i)
+		}
+	}
+	v.stagingMu.Unlock()
+
+	baseChunks := make(map[int][]byte, len(neededBaseChunks))
+	for _, idx := range neededBaseChunks {
+		bData, bErr := v.readBaseChunk(ctx, node, idx)
+		if bErr != nil {
+			return 0, 0, time.Time{}, 0, bErr
+		}
+		if len(bData) > 0 {
+			baseChunks[idx] = bData
+		}
+	}
+
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+
+	if v.stagedBytes+dataLen > v.maxStagingBytes {
+		return 0, 0, time.Time{}, 0, syscall.ENOSPC
+	}
+
+	currSize = node.Row.GetSize()
+	if s, ok := v.stagedSizes[inodeID]; ok && s > currSize {
+		currSize = s
+	}
+	calculatedSize = offset + dataLen
+	if calculatedSize < currSize {
+		calculatedSize = currSize
+	}
 
 	if v.stagedChunks[inodeID] == nil {
 		v.stagedChunks[inodeID] = make(map[int][]byte)
@@ -2843,18 +3049,9 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 			chunkData = make([]byte, len(existing))
 			copy(chunkData, existing)
 			v.stagedBytes -= int64(len(existing))
-		} else {
-			// Read base chunk if available
-			v.mu.RLock()
-			baseData, bErr := v.readChunkLocked(ctx, nil, node, i)
-			v.mu.RUnlock()
-			if bErr != nil {
-				return 0, 0, time.Time{}, 0, bErr
-			}
-			if len(baseData) > 0 {
-				chunkData = make([]byte, len(baseData))
-				copy(chunkData, baseData)
-			}
+		} else if bData, ok := baseChunks[i]; ok && len(bData) > 0 {
+			chunkData = make([]byte, len(bData))
+			copy(chunkData, bData)
 		}
 
 		if int64(len(chunkData)) < expectedChunkLen {
@@ -2871,11 +3068,6 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	v.stagedSizes[inodeID] = calculatedSize
 	v.stagedMtimes[inodeID] = now
 	v.stagingSeq++
-
-	// Note: stagingMu is currently held across readChunkLocked when filling
-	// partial-chunk writes from the base blob store. The FUSE client fills
-	// partial chunks locally before pushing, so this GET only occurs on unaligned
-	// direct RPC callers. Lock-free blob reads during staging are deferred to #234.
 
 	if v.syncInProgress && v.coalesceTimer == nil {
 		v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
