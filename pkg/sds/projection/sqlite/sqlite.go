@@ -341,6 +341,19 @@ func (d *DB) Position() uint64 {
 	return d.position
 }
 
+// SetPosition updates the stream sequence position in the database.
+func (d *DB) SetPosition(pos uint64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	nowMicros := time.Now().UnixMicro()
+	sqlStr := `INSERT OR REPLACE INTO _stream_position (stream_id, position, snapshot_time) VALUES (?, ?, ?);`
+	if _, err := d.sqlDB.ExecContext(context.Background(), sqlStr, d.streamID, pos, nowMicros); err != nil {
+		return fmt.Errorf("failed to set stream position: %w", err)
+	}
+	d.position = pos
+	return nil
+}
+
 // Registry returns the in-band type registry.
 func (d *DB) Registry() *record.Registry {
 	return d.changeReader.Registry()

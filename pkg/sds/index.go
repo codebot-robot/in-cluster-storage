@@ -39,6 +39,9 @@ type LocalIndex interface {
 	// Position returns the stream sequence position of the last applied change.
 	Position() uint64
 
+	// SetPosition updates the stream sequence position of the local index.
+	SetPosition(pos uint64) error
+
 	// SyncRegistry registers type definitions in force with the local index.
 	SyncRegistry(ctx context.Context, reg *record.Registry) error
 

@@ -308,6 +308,7 @@ A **Local Index** (`LocalIndex`) is the normative interface for a derived, local
 ```go
 type LocalIndex interface {
     Position() uint64                                                            // last applied stream sequence position
+    SetPosition(pos uint64) error                                                // update stream sequence position
     SyncRegistry(ctx context.Context, reg *record.Registry) error                // type definitions in force
     ApplyBatch(ctx context.Context, changes []Change) error                      // atomic, advancing Position in the same commit
     Get(ctx context.Context, typeName string, key Key) (proto.Message, bool, error)
