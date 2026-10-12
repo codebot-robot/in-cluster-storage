@@ -40,12 +40,14 @@ import (
 )
 
 var (
-	endpoint              = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
-	nodeID                = flag.String("nodeid", "", "node id")
-	controllerAddress     = flag.String("controller-address", "objectfs-controller:50051", "ObjectFS Controller address")
-	cacheSizeMB           = flag.Int64("cache-size-mb", 128, "Local node cache size in MB")
-	controllerRPCTimeout  = flag.Duration("controller-rpc-timeout", 30*time.Second, "Timeout for RPCs to ObjectFS controller")
-	controllerSyncTimeout = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for sync RPCs (fsync, flush, write) to ObjectFS controller")
+	endpoint               = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
+	nodeID                 = flag.String("nodeid", "", "node id")
+	controllerAddress      = flag.String("controller-address", "objectfs-controller:50051", "ObjectFS Controller address")
+	cacheSizeMB            = flag.Int64("cache-size-mb", 128, "Local node cache size in MB")
+	controllerRPCTimeout   = flag.Duration("controller-rpc-timeout", 30*time.Second, "Timeout for RPCs to ObjectFS controller")
+	controllerSyncTimeout  = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for sync RPCs (fsync, flush, write) to ObjectFS controller")
+	syncOnClose            = flag.Bool("sync-on-close", true, "Schedule non-blocking sync on file release")
+	backgroundSyncInterval = flag.Duration("background-sync-interval", 30*time.Second, "Background sync interval for dirty volumes")
 )
 
 func main() {
@@ -75,7 +77,7 @@ func main() {
 
 	server := grpc.NewServer()
 
-	driver := newDriver(*nodeID, *controllerAddress, *cacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout)
+	driver := newDriver(*nodeID, *controllerAddress, *cacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval)
 
 	csi.RegisterIdentityServer(server, driver)
 	csi.RegisterNodeServer(server, driver)
@@ -108,11 +110,13 @@ type objectFSDriver struct {
 	csi.UnimplementedIdentityServer
 	csi.UnimplementedNodeServer
 
-	nodeID            string
-	controllerAddress string
-	cacheBytes        int64
-	rpcTimeout        time.Duration
-	syncTimeout       time.Duration
+	nodeID                 string
+	controllerAddress      string
+	cacheBytes             int64
+	rpcTimeout             time.Duration
+	syncTimeout            time.Duration
+	syncOnClose            bool
+	backgroundSyncInterval time.Duration
 
 	clientConn *grpc.ClientConn
 	client     pb.ObjectFSControllerClient
@@ -121,7 +125,7 @@ type objectFSDriver struct {
 	mounts map[string]*activeMount
 }
 
-func newDriver(nodeID, controllerAddress string, cacheBytes int64, rpcTimeout, syncTimeout time.Duration) *objectFSDriver {
+func newDriver(nodeID, controllerAddress string, cacheBytes int64, rpcTimeout, syncTimeout time.Duration, syncOnClose bool, backgroundSyncInterval time.Duration) *objectFSDriver {
 	if rpcTimeout <= 0 {
 		rpcTimeout = 30 * time.Second
 	}
@@ -129,12 +133,14 @@ func newDriver(nodeID, controllerAddress string, cacheBytes int64, rpcTimeout, s
 		syncTimeout = 10 * time.Minute
 	}
 	return &objectFSDriver{
-		nodeID:            nodeID,
-		controllerAddress: controllerAddress,
-		cacheBytes:        cacheBytes,
-		rpcTimeout:        rpcTimeout,
-		syncTimeout:       syncTimeout,
-		mounts:            make(map[string]*activeMount),
+		nodeID:                 nodeID,
+		controllerAddress:      controllerAddress,
+		cacheBytes:             cacheBytes,
+		rpcTimeout:             rpcTimeout,
+		syncTimeout:            syncTimeout,
+		syncOnClose:            syncOnClose,
+		backgroundSyncInterval: backgroundSyncInterval,
+		mounts:                 make(map[string]*activeMount),
 	}
 }
 
@@ -243,6 +249,8 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 
 	nodeCache := objectfuse.NewNodeCache(d.cacheBytes)
 	rawFS := objectfuse.NewObjectFSWithTimeouts(client, volumeID, writeMode, nodeCache, d.rpcTimeout, d.syncTimeout)
+	rawFS.SetSyncOnClose(d.syncOnClose)
+	rawFS.SetBackgroundSyncInterval(d.backgroundSyncInterval)
 
 	mountOpts := &gofuse.MountOptions{
 		AllowOther: true,
@@ -263,6 +271,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 
 	watchCtx, cancel := context.WithCancel(context.Background())
 	objectfuse.StartWatcher(watchCtx, client, volumeID, d.nodeID, nodeCache)
+	rawFS.StartBackgroundSync(watchCtx)
 
 	d.mu.Lock()
 	// Clean up any previous mount at this targetPath if any

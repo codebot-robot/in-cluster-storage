@@ -172,6 +172,7 @@ message WriteFileResponse {
   int64 new_size = 2;
   google.protobuf.Timestamp mod_time = 3;
   int32 error = 4;
+  int64 staging_epoch = 5;
 }
 
 message TruncateFileRequest {
@@ -223,11 +224,14 @@ message RenameResponse {
 message FsyncRequest {
   string volume_id = 1;
   uint64 inode = 2;
+  bool blocking = 3;
+  int64 staging_epoch = 4;
 }
 
 message FsyncResponse {
   bool success = 1;
   int32 error = 2;
+  int64 staging_epoch = 3;
 }
 
 message WatchVolumeRequest {

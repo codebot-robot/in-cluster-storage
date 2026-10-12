@@ -340,9 +340,26 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 		t.Fatalf("Expected controller to have 0 bytes before sync, got: %q", string(ctrlResp.GetData()))
 	}
 
-	// Now call Flush / Fsync on the FUSE layer
+	// Flush to staging: controller view does not change until Fsync
 	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
 		t.Fatalf("Flush failed: %v", status)
+	}
+	ctrlRespStaged, err := client.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: "vol-buffering",
+		Inode:    fileID,
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil {
+		t.Fatalf("Controller read after flush failed: %v", err)
+	}
+	if len(ctrlRespStaged.GetData()) != 0 {
+		t.Fatalf("Expected controller to still have 0 bytes after flush before fsync, got: %q", string(ctrlRespStaged.GetData()))
+	}
+
+	// Now call Fsync on the FUSE layer
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
 	}
 
 	// Controller should now have the synced data
@@ -1411,15 +1428,15 @@ func TestFUSEUnflushedHoleAndDirtyWriteRead(t *testing.T) {
 		t.Fatalf("Read data mismatch for unflushed hole read")
 	}
 
-	// 3. Variant: flush 64 KiB clean data at offset 0, write 4 KiB at offset 200 KiB without flushing,
+	// 3. Variant: sync 64 KiB clean data at offset 0, write 4 KiB at offset 200 KiB without flushing,
 	// evict/clear chunk 0 from cache, and read [0, 204 KiB).
 	chunk0Data := bytes.Repeat([]byte{0x77}, 64*1024)
 	written, status = rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, chunk0Data)
 	if status != fuse.OK || int(written) != len(chunk0Data) {
 		t.Fatalf("Write chunk 0 failed: status=%v, written=%d", status, written)
 	}
-	if status := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
-		t.Fatalf("Flush failed: %v", status)
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
 	}
 
 	// Dirty write extending past controller size (e.g. at 200 KiB)
@@ -2924,10 +2941,10 @@ func TestWritePartialChunkReadFileFailureReturnsEIO(t *testing.T) {
 			}
 
 			// Sync file to service so controller has the initial content
-			if status := rawFS.Flush(nil, &fuse.FlushIn{
+			if status := rawFS.Fsync(nil, &fuse.FsyncIn{
 				InHeader: fuse.InHeader{NodeId: fileID},
 			}); status != fuse.OK {
-				t.Fatalf("Flush failed: %v", status)
+				t.Fatalf("Fsync failed: %v", status)
 			}
 
 			// Invalidate client cache to ensure the subsequent partial write must fill chunk from controller
@@ -2995,11 +3012,11 @@ func TestWritePartialChunkReadFileFailureReturnsEIO(t *testing.T) {
 				t.Fatalf("Data mismatch after retry write: untouched bytes corrupted with zeros")
 			}
 
-			// Flush to controller, clear cache, and verify controller also has intact content
-			if status := rawFS.Flush(nil, &fuse.FlushIn{
+			// Sync to controller, clear cache, and verify controller also has intact content
+			if status := rawFS.Fsync(nil, &fuse.FsyncIn{
 				InHeader: fuse.InHeader{NodeId: fileID},
 			}); status != fuse.OK {
-				t.Fatalf("Flush after retry failed: %v", status)
+				t.Fatalf("Fsync after retry failed: %v", status)
 			}
 			cache.Clear()
 
@@ -3016,5 +3033,111 @@ func TestWritePartialChunkReadFileFailureReturnsEIO(t *testing.T) {
 				t.Fatalf("Data mismatch on controller after flush: untouched bytes corrupted")
 			}
 		})
+	}
+}
+
+func TestLargeSequentialWriteCrossesStagingCapAndSucceeds(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-large-seq-200mb"
+	// Client cache 128 MiB (default), controller staging cap 64 MiB (default)
+	cache := NewNodeCache(128 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "large200mb.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const writeSize = 128 * 1024
+	const totalSize = 200 * 1024 * 1024 // 200 MiB
+	chunk := make([]byte, writeSize)
+	for i := range chunk {
+		chunk[i] = byte(i % 251)
+	}
+
+	for off := int64(0); off < totalSize; off += writeSize {
+		n, status := rawFS.Write(nil, &fuse.WriteIn{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Offset:   uint64(off),
+		}, chunk)
+		if status != fuse.OK || int(n) != len(chunk) {
+			t.Fatalf("write at %d failed: status=%v, n=%d", off, status, n)
+		}
+	}
+
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
+	// Verify total size on controller
+	attrResp, err := client.GetAttr(t.Context(), &pb.GetAttrRequest{
+		VolumeId: volumeID,
+		Inode:    fileID,
+	})
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if attrResp.GetAttr().GetInode().GetSize() != totalSize {
+		t.Fatalf("expected size %d, got %d", totalSize, attrResp.GetAttr().GetInode().GetSize())
+	}
+}
+
+func TestBudgetTriggeredSyncFlushesAcrossMultipleDirtyFiles(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-multi-file-budget"
+	// Client cache 128 MiB
+	cache := NewNodeCache(128 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+
+	const numFiles = 3
+	const fileSize = 50 * 1024 * 1024 // 50 MiB each -> total 150 MiB > 128 MiB cache
+	const writeSize = 128 * 1024
+	chunk := make([]byte, writeSize)
+	for i := range chunk {
+		chunk[i] = byte(i % 241)
+	}
+
+	var fileIDs []uint64
+	for f := 0; f < numFiles; f++ {
+		var createOut fuse.CreateOut
+		name := fmt.Sprintf("file_%d.bin", f)
+		if status := rawFS.Create(nil, &fuse.CreateIn{
+			InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+			Mode:     0644,
+		}, name, &createOut); status != fuse.OK {
+			t.Fatalf("Create %s failed: %v", name, status)
+		}
+		fileIDs = append(fileIDs, createOut.EntryOut.NodeId)
+	}
+
+	for f, fID := range fileIDs {
+		for off := int64(0); off < fileSize; off += writeSize {
+			n, status := rawFS.Write(nil, &fuse.WriteIn{
+				InHeader: fuse.InHeader{NodeId: fID},
+				Offset:   uint64(off),
+			}, chunk)
+			if status != fuse.OK || int(n) != len(chunk) {
+				t.Fatalf("file %d write at %d failed: status=%v", f, off, status)
+			}
+		}
+	}
+
+	// Final fsync on all files
+	for _, fID := range fileIDs {
+		if status := rawFS.Fsync(nil, &fuse.FsyncIn{
+			InHeader: fuse.InHeader{NodeId: fID},
+		}); status != fuse.OK {
+			t.Fatalf("Fsync failed for file %d: %v", fID, status)
+		}
 	}
 }

@@ -54,11 +54,12 @@ type CachedEntry struct {
 }
 
 type NodeCache struct {
-	mu       sync.RWMutex
-	entries  map[uint64]*CachedEntry
-	maxBytes int64
-	curBytes int64
-	curGen   Generation
+	mu         sync.RWMutex
+	entries    map[uint64]*CachedEntry
+	maxBytes   int64
+	curBytes   int64
+	dirtyBytes int64
+	curGen     Generation
 }
 
 func NewNodeCache(maxBytes int64) *NodeCache {
@@ -342,6 +343,9 @@ func (c *NodeCache) MarkChunkClean(inode uint64, chunkIdx int, gen Generation) {
 		if entry.DirtyChunks != nil {
 			if dirtyGen, ok := entry.DirtyChunks[chunkIdx]; ok && dirtyGen <= gen {
 				delete(entry.DirtyChunks, chunkIdx)
+				if chunk, ok := entry.Chunks[chunkIdx]; ok {
+					c.dirtyBytes -= int64(len(chunk))
+				}
 			}
 		}
 		if len(entry.DirtyChunks) == 0 && entry.SizeGen == 0 {
@@ -362,6 +366,24 @@ func (c *NodeCache) GetDirtyEntries() []*CachedEntry {
 		}
 	}
 	return dirty
+}
+
+func (c *NodeCache) GetDirtyBytes() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.dirtyBytes
+}
+
+func (c *NodeCache) WouldDirtyOverflow(addedBytes int64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.dirtyBytes+addedBytes > c.maxBytes
+}
+
+func (c *NodeCache) MaxBytes() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.maxBytes
 }
 
 func (c *NodeCache) MarkSizeClean(inode uint64, gen Generation) {
@@ -522,6 +544,11 @@ func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime tim
 
 		chunkBuf := entry.Chunks[i]
 		oldChunkLen := int64(len(chunkBuf))
+		var oldDirtyLen int64
+		if _, wasDirty := entry.DirtyChunks[i]; wasDirty {
+			oldDirtyLen = oldChunkLen
+		}
+
 		if int64(len(chunkBuf)) < expectedChunkLen {
 			newBuf := make([]byte, expectedChunkLen)
 			copy(newBuf, chunkBuf)
@@ -532,6 +559,8 @@ func (c *NodeCache) WriteAt(inode uint64, offset int64, data []byte, modTime tim
 		copy(chunkBuf[wStart:wEnd], data[dataStart:dataEnd])
 		entry.Chunks[i] = chunkBuf
 		entry.DirtyChunks[i] = gen
+		newChunkLen := int64(len(chunkBuf))
+		c.dirtyBytes += (newChunkLen - oldDirtyLen)
 	}
 
 	entry.Size = newSize
@@ -582,11 +611,18 @@ func (c *NodeCache) Truncate(inode uint64, size int64, modTime time.Time) Genera
 		if idx >= numChunks {
 			c.curBytes -= int64(len(chunk))
 			delete(entry.Chunks, idx)
-			delete(entry.DirtyChunks, idx)
+			if _, wasDirty := entry.DirtyChunks[idx]; wasDirty {
+				c.dirtyBytes -= int64(len(chunk))
+				delete(entry.DirtyChunks, idx)
+			}
 		} else if idx == numChunks-1 && numChunks > 0 {
 			lastChunkLen := size - int64(idx)*cs
 			if int64(len(chunk)) > lastChunkLen {
-				c.curBytes -= (int64(len(chunk)) - lastChunkLen)
+				delta := int64(len(chunk)) - lastChunkLen
+				c.curBytes -= delta
+				if _, wasDirty := entry.DirtyChunks[idx]; wasDirty {
+					c.dirtyBytes -= delta
+				}
 				entry.Chunks[idx] = chunk[:lastChunkLen]
 			}
 		}
@@ -643,6 +679,11 @@ func (c *NodeCache) Invalidate(inode uint64) {
 
 	if old, ok := c.entries[inode]; ok {
 		c.curBytes -= entryBytes(old)
+		for idx := range old.DirtyChunks {
+			if chunk, ok := old.Chunks[idx]; ok {
+				c.dirtyBytes -= int64(len(chunk))
+			}
+		}
 		delete(c.entries, inode)
 	}
 }
@@ -678,4 +719,5 @@ func (c *NodeCache) Clear() {
 
 	c.entries = make(map[uint64]*CachedEntry)
 	c.curBytes = 0
+	c.dirtyBytes = 0
 }

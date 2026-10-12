@@ -51,6 +51,9 @@ var (
 	metadataApplierBatchSize = flag.Int("metadata-applier-batch-size", 100, "Maximum batch size for SQLite background applier")
 	debugMutationCheck       = flag.Bool("debug-mutation-check", false, "Enable debug mutation checking on metadata view (for test/CI gates)")
 	debugStatsCheck          = flag.Bool("debug-stats-check", false, "Enable debug volume stats checking (for test/CI gates)")
+	syncCoalesceWindow       = flag.Duration("sync-coalesce-window", 1*time.Second, "Coalescing window for non-blocking sync requests")
+	maxStagingBytes          = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
+	controllerSyncTimeout    = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
 )
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -105,6 +108,15 @@ func main() {
 	}
 	if *debugStatsCheck && !*debugMutationCheck {
 		serverOpts = append(serverOpts, controller.WithServerStatsCheck())
+	}
+	if *syncCoalesceWindow > 0 {
+		serverOpts = append(serverOpts, controller.WithServerSyncCoalesceWindow(*syncCoalesceWindow))
+	}
+	if *maxStagingBytes > 0 {
+		serverOpts = append(serverOpts, controller.WithServerMaxStagingBytes(*maxStagingBytes))
+	}
+	if *controllerSyncTimeout > 0 {
+		serverOpts = append(serverOpts, controller.WithServerSyncTimeout(*controllerSyncTimeout))
 	}
 	// TODO: We always want to assume a WAL, and maybe it would be nice to have a wal-client mode that was local-only e.g. for testing.
 	if *walDir != "" {

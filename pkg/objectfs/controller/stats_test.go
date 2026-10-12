@@ -105,6 +105,10 @@ func TestVolume_StatsTracking(t *testing.T) {
 		t.Fatalf("Release file2 failed: err=%v, resp=%v", err, rel2Resp)
 	}
 
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: 1, Blocking: true}); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
 	// Create directory
 	d1Resp, err := server.Mkdir(ctx, &pb.MkdirRequest{
 		VolumeId:    volumeID,
@@ -518,6 +522,10 @@ func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatalf("WriteFile large.bin failed: %v", err)
+		}
+
+		if _, err := server1.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: f2Resp.GetAttr().GetInode().GetIno(), Blocking: true}); err != nil {
+			t.Fatalf("Fsync large.bin failed: %v", err)
 		}
 
 		// 4. Create symlink

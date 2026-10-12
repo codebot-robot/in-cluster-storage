@@ -279,9 +279,47 @@ Each node daemon and controller maintains a local cache backed by memory and ded
 
 `dev/tasks/fuse-start` runs the whole stack on one machine with no cloud credentials: it starts `objectfs-controller` against a `file://` object store in a temp directory and mounts a volume there with `objectfsctl mount`. On Linux it runs natively; on macOS it cross-compiles Linux binaries and runs them in a Docker container with `/dev/fuse`, opening a shell inside the container where the mount is visible. See the header of the script for the environment variables it accepts (volume ID, write mode, data directory, extra `objectfsctl mount` flags such as `--debug`).
 
-### 4. Configurable Write-Through Modes
+### 4. Write Staging, Pack Consolidation & Durability Contract
+
+To achieve both high write throughput and optimal packing in cloud object storage, ObjectFS employs a **stage-and-sync** architecture:
+
+1. **Client as Write Buffer, Controller as Packer:**
+   - The node daemon buffers writes in its local `NodeCache` and pushes runs of contiguous dirty chunks to the controller via `WriteFile`.
+   - `WriteFile` stages chunk bytes in controller memory and acknowledges immediately without writing to cloud object storage or committing metadata.
+   - Chunks remain **dirty** in the node daemon's cache until an `Fsync` RPC acknowledges durability.
+
+2. **Sync and Pack Consolidation:**
+   - A sync (`Fsync` RPC) takes **every staged chunk across all files on the volume** and uploads them as consolidated packfiles using `PutBlobs` (capped at 64 MiB per pack).
+   - Only after `PutBlobs` returns successfully does the controller commit all `FileChunk` records and updated inode sizes/mtimes in a single atomic transaction and wait for WAL durability.
+   - This ensures **no logged row ever references a blob that is not durable** in cloud storage, preventing dangling references and read I/O errors after crashes.
+
+3. **Consistency Contract ("Nothing is visible or durable before fsync"):**
+   - **On the writer's own node:** Visibility is immediate through its local cache (`NodeCache`).
+   - **Across remote nodes:** Writes become visible only after a sync occurs. Staged writes are not served by `ReadFile` on the controller until synced.
+   - **Close-to-open across nodes:** Close returns immediately without blocking. Changes become visible to other nodes once synced (within the coalesce window).
+
+4. **Sync Triggers:**
+
+| Trigger | Who | Blocks Caller? | Default |
+| :--- | :--- | :--- | :--- |
+| `fsync` / `fdatasync` | Application via `Fsync` RPC (`blocking=true`) | Yes, until pack uploaded + rows logged at WAL level | Always |
+| Close of written file (`Release`) | Node daemon schedules a sync (`blocking=false`) | No (close returns immediately, like a local fs) | On (`--sync-on-close=true`) |
+| Background timer | Node daemon, per volume | No | On (`--background-sync-interval=30s`) |
+| Client cache budget | Node daemon, when dirty bytes exceed cache | The write that overflows waits | Always (`--cache-size-mb=128`) |
+
+5. **Controller Coalescing Mechanism:**
+   - Non-blocking syncs are coalesced within a configurable window (`--sync-coalesce-window=1s`, default 1s). The controller gathers staged writes and non-blocking sync requests across the volume, then commits them in a single pack and transaction.
+   - A blocking `fsync` arriving during an active coalesce window preempts the window and flushes immediately, including all writes in the window.
+   - Non-blocking sync failures are retained by the controller and surfaced on the next blocking `fsync` for any affected inode.
+   - Controller staging memory is bounded via `--max-staging-bytes=64MB` per volume; writes that exceed this limit are rejected until an `Fsync` commits staged data.
+
+6. **Crash Recovery & Client Re-Push:**
+   - If the controller restarts before an `Fsync` completes, un-synced staged writes are dropped cleanly.
+   - When the client next contacts the restarted controller for `Fsync`, it detects a staging epoch change (`ESTALE`) and automatically re-pushes its still-dirty chunks, ensuring no data loss.
+
+### 5. Configurable Write-Through Modes
 ObjectFS supports three distinct write synchronization modes:
-1. `WRITE_THROUGH_FSYNC`: Writes are buffered locally in node memory and synchronously flushed to the controller upon `fsync(2)` or `close(2)`.
+1. `WRITE_THROUGH_FSYNC`: Default mode. Writes are staged on the controller and committed to durable pack storage upon `fsync(2)` or background coalesce window sync.
 2. `LAZY_WRITE`: Writes are buffered asynchronously and flushed in background batches, maximizing write throughput for scratch and temporary workloads.
 3. `EAGER_REPLICATION`: Writes are streamed immediately to the central controller memory and change-log, providing cross-node visibility and crash resilience without waiting for object store commits.
 
