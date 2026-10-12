@@ -3527,3 +3527,592 @@ func TestPushDirtyChunksToStaging_DrainAndRetryOnInitialENOSPC(t *testing.T) {
 		t.Fatalf("Fsync B failed: %v", status)
 	}
 }
+
+func TestDiskBlobCacheColdAndWarmRead(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-disk-cache-warm"
+	cacheDir := t.TempDir()
+
+	diskCache, err := NewDiskBlobCache(cacheDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskBlobCache failed: %v", err)
+	}
+	defer diskCache.Close()
+
+	memCache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache)
+	rawFS.SetDiskBlobCache(diskCache)
+
+	// Create and write 5 chunks (320 KiB)
+	chunkSize := 64 * 1024
+	totalSize := 5 * chunkSize
+	content := bytes.Repeat([]byte("CACHE_TEST_CONTENT_"), totalSize/19+1)[:totalSize]
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "cached_file.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	written, status := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+	}, content)
+	if status != fuse.OK || int(written) != totalSize {
+		t.Fatalf("Write failed: status=%v, written=%d", status, written)
+	}
+
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+	res, status := rawFS.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     uint32(totalSize),
+	}, nil)
+	if status != fuse.OK {
+		t.Fatalf("Cold read failed: %v", status)
+	}
+	coldData, _ := res.Bytes(nil)
+	if !bytes.Equal(coldData, content) {
+		t.Fatalf("Cold read data mismatch: len %d != %d", len(coldData), len(content))
+	}
+
+	// Verify chunks are stored in diskCache
+	if diskCache.CurrentBytes() == 0 {
+		t.Fatalf("Expected diskCache.CurrentBytes() > 0 after cold read, got 0")
+	}
+
+	// Invalidate in-memory cache again
+	memCache.Clear()
+
+	// 2. Warm read: served directly from diskCache
+	resWarm, status := rawFS.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     uint32(totalSize),
+	}, nil)
+	if status != fuse.OK {
+		t.Fatalf("Warm read failed: %v", status)
+	}
+	warmData, _ := resWarm.Bytes(nil)
+	if !bytes.Equal(warmData, content) {
+		t.Fatalf("Warm read data mismatch: len %d != %d", len(warmData), len(content))
+	}
+}
+
+func TestDiskBlobCachePrefetchOnOpen(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-prefetch-open"
+	cacheDir := t.TempDir()
+
+	diskCache, err := NewDiskBlobCache(cacheDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskBlobCache failed: %v", err)
+	}
+	defer diskCache.Close()
+
+	memCache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache)
+	rawFS.SetDiskBlobCache(diskCache)
+
+	// Create and write 4 chunks (256 KiB)
+	chunkSize := 64 * 1024
+	totalSize := 4 * chunkSize
+	content := bytes.Repeat([]byte("PREFETCH_TEST_DATA!"), totalSize/19+1)[:totalSize]
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "prefetch_file.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	written, status := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+	}, content)
+	if status != fuse.OK || int(written) != totalSize {
+		t.Fatalf("Write failed: status=%v, written=%d", status, written)
+	}
+
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
+	// Close and recreate a fresh disk cache (empty) on same or new dir to test prefetch on open
+	emptyCacheDir := t.TempDir()
+	emptyDiskCache, err := NewDiskBlobCache(emptyCacheDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskBlobCache failed: %v", err)
+	}
+	defer emptyDiskCache.Close()
+
+	rawFS.SetDiskBlobCache(emptyDiskCache)
+	memCache.Clear()
+
+	// Calling Open must trigger background prefetch
+	var openOut fuse.OpenOut
+	if status := rawFS.Open(nil, &fuse.OpenIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Flags:    0,
+	}, &openOut); status != fuse.OK {
+		t.Fatalf("Open failed: %v", status)
+	}
+
+	// Wait briefly for background prefetch to complete
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if emptyDiskCache.CurrentBytes() >= int64(totalSize) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if emptyDiskCache.CurrentBytes() < int64(totalSize) {
+		t.Fatalf("Expected prefetch to fetch all %d bytes, got %d", totalSize, emptyDiskCache.CurrentBytes())
+	}
+
+	// Release handle
+	rawFS.Release(nil, &fuse.ReleaseIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Fh:       openOut.Fh,
+	})
+}
+
+func TestDiskBlobCacheSequentialReadPrefetchExtension(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-prefetch-seq"
+	cacheDir := t.TempDir()
+
+	diskCache, err := NewDiskBlobCache(cacheDir, 20*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskBlobCache failed: %v", err)
+	}
+	defer diskCache.Close()
+
+	memCache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache)
+	rawFS.SetDiskBlobCache(diskCache)
+
+	// Create 40 chunks (40 * 64KB = 2560 KB > 32 chunks default window)
+	chunkSize := 64 * 1024
+	totalChunks := 40
+	totalSize := totalChunks * chunkSize
+	content := bytes.Repeat([]byte("SEQUENTIAL_PREFETCH_CHUNK_DATA_"), totalSize/31+1)[:totalSize]
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "large_seq.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	for i := 0; i < totalChunks; i++ {
+		start := i * chunkSize
+		n, status := rawFS.Write(nil, &fuse.WriteIn{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Offset:   uint64(start),
+		}, content[start:start+chunkSize])
+		if status != fuse.OK || int(n) != chunkSize {
+			t.Fatalf("Write chunk %d failed: status=%v, n=%d", i, status, n)
+		}
+	}
+
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
+	freshCacheDir := t.TempDir()
+	freshDiskCache, err := NewDiskBlobCache(freshCacheDir, 20*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskBlobCache failed: %v", err)
+	}
+	defer freshDiskCache.Close()
+
+	rawFS.SetDiskBlobCache(freshDiskCache)
+	memCache.Clear()
+
+	// Open triggers initial prefetch window (up to DefaultPrefetchWindow = 32 chunks)
+	var openOut fuse.OpenOut
+	if status := rawFS.Open(nil, &fuse.OpenIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+	}, &openOut); status != fuse.OK {
+		t.Fatalf("Open failed: %v", status)
+	}
+
+	// Read sequentially up through chunk 33, which should extend prefetch window to chunk 40
+	for i := 0; i < totalChunks; i++ {
+		start := int64(i * chunkSize)
+		res, status := rawFS.Read(nil, &fuse.ReadIn{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Fh:       openOut.Fh,
+			Offset:   uint64(start),
+			Size:     uint32(chunkSize),
+		}, nil)
+		if status != fuse.OK {
+			t.Fatalf("Read chunk %d failed: %v", i, status)
+		}
+		data, _ := res.Bytes(nil)
+		if !bytes.Equal(data, content[start:start+int64(chunkSize)]) {
+			t.Fatalf("Chunk %d content mismatch", i)
+		}
+	}
+
+	// Clean up
+	rawFS.Release(nil, &fuse.ReleaseIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Fh:       openOut.Fh,
+	})
+}
+
+func TestDiskBlobCacheRemountThroughput(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-remount-benchmark"
+	sharedCacheDir := t.TempDir()
+
+	// Create and write a 2 MiB file (32 chunks)
+	chunkSize := 64 * 1024
+	totalChunks := 32
+	totalSize := totalChunks * chunkSize
+	content := make([]byte, totalSize)
+	for i := range content {
+		content[i] = byte(i % 251)
+	}
+
+	memCache1 := NewNodeCache(1024 * 1024)
+	fs1 := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache1)
+
+	var createOut fuse.CreateOut
+	if status := fs1.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "bench.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	for i := 0; i < totalChunks; i++ {
+		start := i * chunkSize
+		n, status := fs1.Write(nil, &fuse.WriteIn{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Offset:   uint64(start),
+		}, content[start:start+chunkSize])
+		if status != fuse.OK || int(n) != chunkSize {
+			t.Fatalf("Write chunk %d failed: status=%v", i, status)
+		}
+	}
+	if status := fs1.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
+	// Mount 1 (Cold Read into shared disk cache)
+	diskCache1, err := NewDiskBlobCache(sharedCacheDir, 50*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskBlobCache 1 failed: %v", err)
+	}
+	fs1.SetDiskBlobCache(diskCache1)
+	memCache1.Clear()
+
+	tColdStart := time.Now()
+	resCold, status := fs1.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     uint32(totalSize),
+	}, nil)
+	coldDuration := time.Since(tColdStart)
+	if status != fuse.OK {
+		t.Fatalf("Cold read failed: %v", status)
+	}
+	coldBytes, _ := resCold.Bytes(nil)
+	if len(coldBytes) != totalSize {
+		t.Fatalf("Cold read size mismatch: %d != %d", len(coldBytes), totalSize)
+	}
+	coldMBs := (float64(totalSize) / (1024 * 1024)) / coldDuration.Seconds()
+	_ = diskCache1.Close()
+
+	// Mount 2 (Remount with same cache directory - Warm Read from persistent disk cache)
+	diskCache2, err := NewDiskBlobCache(sharedCacheDir, 50*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskBlobCache 2 (remount) failed: %v", err)
+	}
+	defer diskCache2.Close()
+
+	memCache2 := NewNodeCache(1024 * 1024)
+	fs2 := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache2)
+	fs2.SetDiskBlobCache(diskCache2)
+
+	tWarmStart := time.Now()
+	resWarm, status := fs2.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     uint32(totalSize),
+	}, nil)
+	warmDuration := time.Since(tWarmStart)
+	if status != fuse.OK {
+		t.Fatalf("Warm read on remount failed: %v", status)
+	}
+	warmBytes, _ := resWarm.Bytes(nil)
+	if len(warmBytes) != totalSize {
+		t.Fatalf("Warm read size mismatch: %d != %d", len(warmBytes), totalSize)
+	}
+	warmMBs := (float64(totalSize) / (1024 * 1024)) / warmDuration.Seconds()
+
+	t.Logf("Cold read (%d bytes): %v (%.2f MB/s)", totalSize, coldDuration, coldMBs)
+	t.Logf("Warm remount read (%d bytes): %v (%.2f MB/s)", totalSize, warmDuration, warmMBs)
+	t.Logf("Throughput improvement: %.2fx faster", warmMBs/coldMBs)
+
+	if warmDuration >= coldDuration {
+		t.Logf("Note: warm remount read duration (%v) compared to cold (%v)", warmDuration, coldDuration)
+	}
+}
+
+func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
+	clientA, cleanup := createTestClient(t)
+	defer cleanup()
+	clientB := clientA
+
+	volumeID := "vol-cross-node-watch"
+	cacheA := NewNodeCache(1024 * 1024)
+	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheA)
+	diskCacheA, err := NewDiskBlobCache(t.TempDir(), 10*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskBlobCache failed: %v", err)
+	}
+	defer diskCacheA.Close()
+	fsA.SetDiskBlobCache(diskCacheA)
+
+	// Start watcher on fsA for node-A
+	watchCtx, cancelWatch := context.WithCancel(t.Context())
+	defer cancelWatch()
+	StartWatcher(watchCtx, clientA, volumeID, "node-A", cacheA, fsA)
+
+	// Client A creates and writes initial version
+	var createOut fuse.CreateOut
+	if status := fsA.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "shared.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	inode := createOut.EntryOut.NodeId
+
+	dataV1 := []byte("version-1-initial-content")
+	written, status := fsA.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: inode},
+		Offset:   0,
+	}, dataV1)
+	if status != fuse.OK || int(written) != len(dataV1) {
+		t.Fatalf("Write v1 failed: %v", status)
+	}
+	if status := fsA.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: inode},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync v1 failed: %v", status)
+	}
+
+	// Client A reads and populates its manifest and disk blob cache
+	resA, status := fsA.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: inode},
+		Offset:   0,
+		Size:     uint32(len(dataV1)),
+	}, nil)
+	if status != fuse.OK {
+		t.Fatalf("Client A read v1 failed: %v", status)
+	}
+	v1Read, _ := resA.Bytes(nil)
+	if !bytes.Equal(v1Read, dataV1) {
+		t.Fatalf("Expected v1 data %q, got %q", string(dataV1), string(v1Read))
+	}
+
+	// Verify manifest is cached on client A
+	fsA.manifestMu.RLock()
+	hasManifest := fsA.manifests[inode] != nil
+	fsA.manifestMu.RUnlock()
+	if !hasManifest {
+		t.Fatalf("Expected manifest to be cached on client A")
+	}
+
+	// Client B (simulating another node) writes and fsyncs version 2 directly to controller
+	dataV2 := []byte("version-2-updated-content-from-client-B")
+	wResp, err := clientB.WriteFile(t.Context(), &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     inode,
+		Offset:    0,
+		Data:      dataV2,
+		WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
+	})
+	if err != nil || wResp.GetError() != 0 {
+		t.Fatalf("Client B WriteFile failed: %v, code=%d", err, wResp.GetError())
+	}
+
+	fResp, err := clientB.Fsync(t.Context(), &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    inode,
+		Blocking: true,
+	})
+	if err != nil || fResp.GetError() != 0 {
+		t.Fatalf("Client B Fsync failed: %v, code=%d", err, fResp.GetError())
+	}
+
+	// Wait for the watcher event to arrive and invalidate client A's manifest
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		fsA.manifestMu.RLock()
+		invalidated := fsA.manifests[inode] == nil
+		fsA.manifestMu.RUnlock()
+		if invalidated {
+			break
+		}
+		runtime.Gosched()
+	}
+
+	fsA.manifestMu.RLock()
+	stillCached := fsA.manifests[inode] != nil
+	fsA.manifestMu.RUnlock()
+	if stillCached {
+		t.Fatalf("Expected watcher to invalidate manifest on client A after remote write")
+	}
+
+	// Client A reads again: must observe version 2 without waiting for the 5-minute TTL!
+	resA2, status := fsA.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: inode},
+		Offset:   0,
+		Size:     uint32(len(dataV2)),
+	}, nil)
+	if status != fuse.OK {
+		t.Fatalf("Client A read v2 failed: %v", status)
+	}
+	v2Read, _ := resA2.Bytes(nil)
+	if !bytes.Equal(v2Read, dataV2) {
+		t.Fatalf("Client A read stale data: got %q, want %q", string(v2Read), string(dataV2))
+	}
+}
+
+func TestSharedDiskBlobCacheAcrossMounts(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	sharedDir := t.TempDir()
+	// Shared budget of 500 bytes
+	sharedCache, err := NewDiskBlobCache(sharedDir, 500)
+	if err != nil {
+		t.Fatalf("NewDiskBlobCache failed: %v", err)
+	}
+	defer sharedCache.Close()
+
+	vol1 := "vol-mount-1"
+	vol2 := "vol-mount-2"
+
+	cache1 := NewNodeCache(1024 * 1024)
+	fs1 := NewObjectFS(client, vol1, pb.WriteMode_WRITE_THROUGH_FSYNC, cache1)
+	fs1.SetDiskBlobCache(sharedCache)
+
+	cache2 := NewNodeCache(1024 * 1024)
+	fs2 := NewObjectFS(client, vol2, pb.WriteMode_WRITE_THROUGH_FSYNC, cache2)
+	fs2.SetDiskBlobCache(sharedCache)
+
+	// Create and write file in vol1 with specific content (100 bytes)
+	data := bytes.Repeat([]byte("A"), 100)
+	sha := shaString(data)
+
+	var create1 fuse.CreateOut
+	if status := fs1.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "f1.bin", &create1); status != fuse.OK {
+		t.Fatalf("fs1 Create failed: %v", status)
+	}
+	f1ID := create1.EntryOut.NodeId
+
+	if n, status := fs1.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: f1ID},
+		Offset:   0,
+	}, data); status != fuse.OK || int(n) != len(data) {
+		t.Fatalf("fs1 Write failed: %v", status)
+	}
+	if status := fs1.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: f1ID},
+	}); status != fuse.OK {
+		t.Fatalf("fs1 Fsync failed: %v", status)
+	}
+
+	// Cold read from vol1 puts the blob into sharedCache
+	cache1.Clear()
+	if _, status := fs1.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: f1ID},
+		Offset:   0,
+		Size:     uint32(len(data)),
+	}, nil); status != fuse.OK {
+		t.Fatalf("fs1 Read failed: %v", status)
+	}
+
+	if !sharedCache.HasBlob(sha) {
+		t.Fatalf("Expected sharedCache to have blob %s after vol1 read", sha)
+	}
+
+	// Create identical file in vol2
+	var create2 fuse.CreateOut
+	if status := fs2.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "f2.bin", &create2); status != fuse.OK {
+		t.Fatalf("fs2 Create failed: %v", status)
+	}
+	f2ID := create2.EntryOut.NodeId
+
+	if n, status := fs2.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: f2ID},
+		Offset:   0,
+	}, data); status != fuse.OK || int(n) != len(data) {
+		t.Fatalf("fs2 Write failed: %v", status)
+	}
+	if status := fs2.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: f2ID},
+	}); status != fuse.OK {
+		t.Fatalf("fs2 Fsync failed: %v", status)
+	}
+
+	// Read in vol2: served from shared disk cache (already present from vol1)
+	cache2.Clear()
+	res2, status := fs2.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: f2ID},
+		Offset:   0,
+		Size:     uint32(len(data)),
+	}, nil)
+	if status != fuse.OK {
+		t.Fatalf("fs2 Read failed: %v", status)
+	}
+	d2, _ := res2.Bytes(nil)
+	if !bytes.Equal(d2, data) {
+		t.Fatalf("fs2 read mismatch: got %q, want %q", string(d2), string(data))
+	}
+
+	// Both mounts share one budget (500 bytes)
+	if sharedCache.CurrentBytes() > sharedCache.MaxBytes() {
+		t.Fatalf("Shared cache exceeded budget: %d > %d", sharedCache.CurrentBytes(), sharedCache.MaxBytes())
+	}
+}

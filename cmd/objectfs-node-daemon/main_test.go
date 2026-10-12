@@ -77,7 +77,11 @@ func TestParseWriteMode(t *testing.T) {
 }
 
 func TestPluginInfo(t *testing.T) {
-	driver := newDriver("test-node", "localhost:50051", 1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second)
+	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second)
+	if err != nil {
+		t.Fatalf("newDriver failed: %v", err)
+	}
+	defer func() { _ = driver.Close() }()
 	ctx := t.Context()
 
 	info, err := driver.GetPluginInfo(ctx, &csi.GetPluginInfoRequest{})
@@ -108,7 +112,11 @@ func TestNodeGetVolumeStats(t *testing.T) {
 	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
-	driver := newDriver("test-node", "passthrough://bufnet", 1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second)
+	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second)
+	if err != nil {
+		t.Fatalf("newDriver failed: %v", err)
+	}
+	defer func() { _ = driver.Close() }()
 	conn, err := grpc.NewClient("passthrough://bufnet",
 		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
 			return lis.Dial()

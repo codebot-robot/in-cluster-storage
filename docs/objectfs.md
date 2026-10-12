@@ -268,12 +268,12 @@ The node daemon mounts ObjectFS volumes into container pod paths using `go-fuse`
 - `Write` / `Truncate` -> Buffers changes locally and transmits modifications to the controller.
 - `Fsync` / `Flush` -> Forces synchronization of dirty buffers to the cluster service.
 
-### 2. Local Caching & Scratch Storage (`NodeCache`)
+### 2. Local Caching & Scratch Storage (`NodeCache` & `DiskBlobCache`)
 Each node daemon and controller maintains a local cache backed by memory and dedicated scratch disk storage:
-- **Scratch Disk LRU Blob Caching (TODO):** Blobs and packfile byte ranges are cached in an allocated local scratch directory on disk. Eviction runs on an LRU basis to remain within fixed disk capacity limits. The controller similarly caches frequently requested blobs locally to reduce cloud storage egress.
-- **Read Caching:** Small files and frequently accessed blocks are held in memory to satisfy repeated reads locally with zero network round-trips.
-- **Dirty Write Buffering:** Writes are aggregated in memory to support high-throughput sequential and random modifications.
-- **Cache Invalidation:** Subscribes to the controller's `WatchVolume` gRPC push notification stream. When another node modifies, renames, or deletes a file, the node daemon invalidates its local cache entries.
+- **Persistent On-Disk Blob Cache (`DiskBlobCache`):** Verified content-addressed blobs are stored in a node-local scratch disk directory (`--cache-dir`, default `/var/cache/objectfs`, sized via `--disk-cache-size-mb`, default 10 GiB) backed by a local SQLite index (`index.db`) in WAL mode. In Kubernetes deployments, `--cache-dir` must be mounted from a node-local `hostPath` volume so cached blobs persist across daemon restarts and pod reschedules. Eviction runs on an LRU basis to enforce the disk budget. On file `Open`, chunks are prefetched in parallel in offset order ahead of reads.
+- **Read Caching:** Clean chunks are served directly from the persistent on-disk blob cache and the kernel page cache without duplicating memory.
+- **Dirty Write Buffering (`NodeCache`):** The in-memory cache holds only uncommitted dirty write buffers (`--cache-size-mb`, default 128 MB) until acknowledged by an `Fsync` RPC (#222/#245 generation protocol).
+- **Cache Invalidation:** Subscribes to the controller's `WatchVolume` gRPC push notification stream. When another node modifies, renames, or deletes a file, the node daemon invalidates its local cache entries and file manifests. Reconnects invalidate all clean state and manifests.
 
 ### 3. Trying It Locally
 

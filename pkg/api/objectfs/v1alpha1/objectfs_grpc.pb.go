@@ -54,6 +54,7 @@ const (
 	ObjectFSController_Release_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/Release"
 	ObjectFSController_ListBlobs_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/ListBlobs"
 	ObjectFSController_GetBlob_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/GetBlob"
+	ObjectFSController_GetManifest_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/GetManifest"
 	ObjectFSController_ListVolumes_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/ListVolumes"
 	ObjectFSController_ListSnapshots_FullMethodName  = "/objectfs.v1alpha1.ObjectFSController/ListSnapshots"
 	ObjectFSController_CreateSnapshot_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/CreateSnapshot"
@@ -85,6 +86,7 @@ type ObjectFSControllerClient interface {
 	Release(ctx context.Context, in *ReleaseRequest, opts ...grpc.CallOption) (*ReleaseResponse, error)
 	ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error)
 	GetBlob(ctx context.Context, in *GetBlobRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetBlobResponse], error)
+	GetManifest(ctx context.Context, in *GetManifestRequest, opts ...grpc.CallOption) (*GetManifestResponse, error)
 	ListVolumes(ctx context.Context, in *ListVolumesRequest, opts ...grpc.CallOption) (*ListVolumesResponse, error)
 	ListSnapshots(ctx context.Context, in *ListSnapshotsRequest, opts ...grpc.CallOption) (*ListSnapshotsResponse, error)
 	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
@@ -327,6 +329,16 @@ func (c *objectFSControllerClient) GetBlob(ctx context.Context, in *GetBlobReque
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ObjectFSController_GetBlobClient = grpc.ServerStreamingClient[GetBlobResponse]
 
+func (c *objectFSControllerClient) GetManifest(ctx context.Context, in *GetManifestRequest, opts ...grpc.CallOption) (*GetManifestResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetManifestResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_GetManifest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *objectFSControllerClient) ListVolumes(ctx context.Context, in *ListVolumesRequest, opts ...grpc.CallOption) (*ListVolumesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListVolumesResponse)
@@ -392,6 +404,7 @@ type ObjectFSControllerServer interface {
 	Release(context.Context, *ReleaseRequest) (*ReleaseResponse, error)
 	ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error)
 	GetBlob(*GetBlobRequest, grpc.ServerStreamingServer[GetBlobResponse]) error
+	GetManifest(context.Context, *GetManifestRequest) (*GetManifestResponse, error)
 	ListVolumes(context.Context, *ListVolumesRequest) (*ListVolumesResponse, error)
 	ListSnapshots(context.Context, *ListSnapshotsRequest) (*ListSnapshotsResponse, error)
 	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
@@ -468,6 +481,9 @@ func (UnimplementedObjectFSControllerServer) ListBlobs(context.Context, *ListBlo
 }
 func (UnimplementedObjectFSControllerServer) GetBlob(*GetBlobRequest, grpc.ServerStreamingServer[GetBlobResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method GetBlob not implemented")
+}
+func (UnimplementedObjectFSControllerServer) GetManifest(context.Context, *GetManifestRequest) (*GetManifestResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetManifest not implemented")
 }
 func (UnimplementedObjectFSControllerServer) ListVolumes(context.Context, *ListVolumesRequest) (*ListVolumesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListVolumes not implemented")
@@ -866,6 +882,24 @@ func _ObjectFSController_GetBlob_Handler(srv interface{}, stream grpc.ServerStre
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ObjectFSController_GetBlobServer = grpc.ServerStreamingServer[GetBlobResponse]
 
+func _ObjectFSController_GetManifest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetManifestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).GetManifest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_GetManifest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).GetManifest(ctx, req.(*GetManifestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ObjectFSController_ListVolumes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListVolumesRequest)
 	if err := dec(in); err != nil {
@@ -1020,6 +1054,10 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListBlobs",
 			Handler:    _ObjectFSController_ListBlobs_Handler,
+		},
+		{
+			MethodName: "GetManifest",
+			Handler:    _ObjectFSController_GetManifest_Handler,
 		},
 		{
 			MethodName: "ListVolumes",
