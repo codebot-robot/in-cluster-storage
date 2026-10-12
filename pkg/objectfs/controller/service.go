@@ -351,7 +351,11 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 			volOpts = append(volOpts, WithSyncTimeout(s.syncTimeout))
 		}
 
-		vol = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
+		var err error
+		vol, err = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create volume %s: %w", volumeID, err)
+		}
 		if err := vol.LoadFromBackend(context.Background()); err != nil {
 			return nil, fmt.Errorf("failed to load volume %s from backend: %w", volumeID, err)
 		}

@@ -701,7 +701,7 @@ func TestVolume_CommitStepInfallibleFaultInjectedIndexGetCannotAffectCommit(t *t
 	faultyIdx := &faultyGetIndex{}
 	factory := &faultyGetFactory{IndexFactory: baseFactory, idx: faultyIdx}
 
-	vol := NewVolume("vol-faulty-get-commit", backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, "vol-faulty-get-commit", backend, NewEventBroadcaster(),
 		WithIndexFactory(factory),
 		WithMetadataCacheDisabled(true),
 		WithVolumeStatsCheck(),
@@ -752,7 +752,7 @@ func TestVolume_CommitStepInfallibleFaultInjectedIndexGetCannotAffectCommit(t *t
 func TestVolume_WritingKeyNotReadPanics(t *testing.T) {
 	ctx := t.Context()
 	backend := inmemorystorage.New()
-	vol := NewVolume("vol-not-read-panic", backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, "vol-not-read-panic", backend, NewEventBroadcaster(),
 		WithMetadataIndex("memory"),
 	)
 	defer vol.Close()
@@ -800,7 +800,7 @@ func TestVolume_WritingKeyNotReadPanics(t *testing.T) {
 func TestVolume_ReadsBeforeWritesAssertionPanicsInAllModes(t *testing.T) {
 	ctx := t.Context()
 	backend := inmemorystorage.New()
-	vol := NewVolume("vol-reads-before-writes-panic", backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, "vol-reads-before-writes-panic", backend, NewEventBroadcaster(),
 		WithMetadataIndex("memory"),
 		WithoutVolumeMutationCheck(),
 		WithoutVolumeStatsCheck(),

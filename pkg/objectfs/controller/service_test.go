@@ -234,6 +234,17 @@ func volCreateFile(ctx context.Context, vol *Volume, p string, mode uint32, init
 	return vol.CreateFile(ctx, parentIno, path.Base(p), mode, initialContent, uid, gid)
 }
 
+// MustNewVolume creates a new Volume or fails the test if volume initialization fails.
+// It is intended for tests and benchmarks.
+func MustNewVolume(t testing.TB, volumeID string, backend ObjectStorageBackend, broadcaster *EventBroadcaster, opts ...VolumeOption) *Volume {
+	t.Helper()
+	v, err := NewVolume(volumeID, backend, broadcaster, opts...)
+	if err != nil {
+		t.Fatalf("failed to create volume %s: %v", volumeID, err)
+	}
+	return v
+}
+
 func TestControllerServiceOperations(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
@@ -911,7 +922,7 @@ func TestConcurrentAttributeMutationAndReadRace(t *testing.T) {
 func TestOverlayEntryKeepsRowAsOfChange(t *testing.T) {
 	ctx := t.Context()
 	var faultErr atomic.Pointer[error]
-	vol := NewVolume("test-cow-overlay-vol", nil, NewEventBroadcaster(),
+	vol := MustNewVolume(t, "test-cow-overlay-vol", nil, NewEventBroadcaster(),
 		WithVolumeMutationCheck(),
 		WithApplierBatchSize(100),
 		WithApplierFaultHook(func() error {
@@ -1008,7 +1019,7 @@ func TestOverlayEntryKeepsRowAsOfChange(t *testing.T) {
 
 func TestMutationCheckCatchesInPlaceInodeModification(t *testing.T) {
 	ctx := t.Context()
-	vol := NewVolume("test-mutation-check-vol", nil, NewEventBroadcaster(),
+	vol := MustNewVolume(t, "test-mutation-check-vol", nil, NewEventBroadcaster(),
 		WithVolumeMutationCheck(),
 	)
 	defer vol.Close()
@@ -2239,7 +2250,7 @@ func TestStreamsDurabilityModes(t *testing.T) {
 func TestApplyRecordDirect(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	vol := NewVolume("apply-test", backend, NewEventBroadcaster())
+	vol := MustNewVolume(t, "apply-test", backend, NewEventBroadcaster())
 
 	// Direct Mkdir
 	dirAttr, err := vol.Mkdir(ctx, 1, "c", 0755, 0, 0)
@@ -2331,7 +2342,7 @@ func TestApplyRecordDirect(t *testing.T) {
 func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	vol := NewVolume("symlink-test", backend, NewEventBroadcaster())
+	vol := MustNewVolume(t, "symlink-test", backend, NewEventBroadcaster())
 
 	// 1. Create a regular file
 	fileAttr, err := vol.CreateFile(ctx, 1, "orig.txt", 0644, []byte("contents"), 100, 200)
@@ -2877,7 +2888,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	chunkSize := uint32(16 * 1024) // 16 KiB chunk size for testing
-	vol := NewVolume("chunk-test-vol", backend, NewEventBroadcaster(), WithChunkSize(chunkSize))
+	vol := MustNewVolume(t, "chunk-test-vol", backend, NewEventBroadcaster(), WithChunkSize(chunkSize))
 
 	// 1. Small file <= 1 chunk (e.g. 100 bytes)
 	smallData := []byte("small file content unchunked")
@@ -3186,7 +3197,7 @@ func TestSDSStepReplayScratch(t *testing.T) {
 
 	// 3. Create fresh volume and replay SDS stream from scratch
 	streamID := StreamIDForVolume(volumeID)
-	replayedVol := NewVolume(volumeID, backend, NewEventBroadcaster())
+	replayedVol := MustNewVolume(t, volumeID, backend, NewEventBroadcaster())
 	legStream, err := walclient.Open(ctx, walDir, streamID, "")
 	if err != nil {
 		t.Fatalf("Failed to open WAL stream for replay: %v", err)
@@ -4629,7 +4640,7 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open localStream1 failed: %v", err)
 	}
-	volStale := NewVolume(volumeID, backend, NewEventBroadcaster(),
+	volStale := MustNewVolume(t, volumeID, backend, NewEventBroadcaster(),
 		WithStream(localStream1),
 		WithLocalStorageDir(filepath.Join(node1MetaDir, volumeID)),
 	)
@@ -4738,7 +4749,7 @@ func TestChunkFetchFailurePropagated(t *testing.T) {
 	backend := newChunkFaultBackend(rawBackend)
 	chunkSize := uint32(16 * 1024)
 
-	vol := NewVolume(volumeID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volumeID, backend, NewEventBroadcaster(),
 		WithStream(stream),
 		WithChunkSize(chunkSize),
 		WithDurability(walclient.Local),

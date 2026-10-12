@@ -53,7 +53,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-create-"+cfg.name, backend, broadcaster,
+				vol := MustNewVolume(b, "bench-create-"+cfg.name, backend, broadcaster,
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
@@ -76,7 +76,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-stat-"+cfg.name, backend, broadcaster,
+				vol := MustNewVolume(b, "bench-stat-"+cfg.name, backend, broadcaster,
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
@@ -103,7 +103,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-stat-par-"+cfg.name, backend, broadcaster,
+				vol := MustNewVolume(b, "bench-stat-par-"+cfg.name, backend, broadcaster,
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
@@ -132,7 +132,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-lookup-"+cfg.name, backend, broadcaster,
+				vol := MustNewVolume(b, "bench-lookup-"+cfg.name, backend, broadcaster,
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
@@ -159,7 +159,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-lookup-par-"+cfg.name, backend, broadcaster,
+				vol := MustNewVolume(b, "bench-lookup-par-"+cfg.name, backend, broadcaster,
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
@@ -188,7 +188,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-readdir-"+cfg.name, backend, broadcaster,
+				vol := MustNewVolume(b, "bench-readdir-"+cfg.name, backend, broadcaster,
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
@@ -218,7 +218,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-readdir1k-"+cfg.name, backend, broadcaster,
+				vol := MustNewVolume(b, "bench-readdir1k-"+cfg.name, backend, broadcaster,
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
@@ -248,7 +248,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-readdir10k-"+cfg.name, backend, broadcaster,
+				vol := MustNewVolume(b, "bench-readdir10k-"+cfg.name, backend, broadcaster,
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
@@ -278,7 +278,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				ctx := b.Context()
 				backend := inmemorystorage.New()
 				broadcaster := NewEventBroadcaster()
-				vol := NewVolume("bench-rename-"+cfg.name, backend, broadcaster,
+				vol := MustNewVolume(b, "bench-rename-"+cfg.name, backend, broadcaster,
 					WithMetadataIndex(cfg.store),
 					WithMetadataCacheDisabled(cfg.cacheDisable),
 					WithLocalStorageDir(b.TempDir()),
@@ -321,7 +321,7 @@ func Benchmark64KiBFsyncedWrite(b *testing.B) {
 	ctx := b.Context()
 	backend := inmemorystorage.New()
 	broadcaster := NewEventBroadcaster()
-	vol := NewVolume("bench-fsync-sqlite", backend, broadcaster,
+	vol := MustNewVolume(b, "bench-fsync-sqlite", backend, broadcaster,
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(b.TempDir()),
 	)
@@ -402,7 +402,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 	t.Log("\n--- 1. Directory Entry Addition Scaling ---")
 	for _, mode := range []string{"memory", "sqlite"} {
 		backend := inmemorystorage.New()
-		vol := NewVolume("scale-"+mode, backend, NewEventBroadcaster(),
+		vol := MustNewVolume(t, "scale-"+mode, backend, NewEventBroadcaster(),
 			WithMetadataIndex(mode),
 			WithLocalStorageDir(t.TempDir()),
 		)
@@ -441,7 +441,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		{name: "sqlite (cache OFF)", store: "sqlite", cacheDisable: true},
 	} {
 		backend := inmemorystorage.New()
-		vol := NewVolume("cachemiss-"+cfg.name, backend, NewEventBroadcaster(),
+		vol := MustNewVolume(t, "cachemiss-"+cfg.name, backend, NewEventBroadcaster(),
 			WithMetadataIndex(cfg.store),
 			WithMetadataCacheDisabled(cfg.cacheDisable),
 			WithLocalStorageDir(t.TempDir()),
@@ -483,7 +483,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 	for _, numFiles := range []int{10000, 50000} {
 		for _, cacheOn := range []bool{true, false} {
 			backend := inmemorystorage.New()
-			vol := NewVolume(fmt.Sprintf("hitrate-scale-%d", numFiles), backend, NewEventBroadcaster(),
+			vol := MustNewVolume(t, fmt.Sprintf("hitrate-scale-%d", numFiles), backend, NewEventBroadcaster(),
 				WithMetadataIndex("sqlite"),
 				WithMetadataCacheDisabled(!cacheOn),
 				WithMetadataCacheLimits(0, 64*1024*1024),
@@ -540,7 +540,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		localDir := t.TempDir()
 
 		// Setup populated volume
-		vol1 := NewVolume("cold-start-vol", backend, NewEventBroadcaster(),
+		vol1 := MustNewVolume(t, "cold-start-vol", backend, NewEventBroadcaster(),
 			WithMetadataIndex("sqlite"),
 			WithLocalStorageDir(localDir),
 			WithStreamID(streamID),
@@ -554,7 +554,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 		// A. Restart from local SQLite file
 		start := time.Now()
-		volLocal := NewVolume("cold-start-vol", backend, NewEventBroadcaster(),
+		volLocal := MustNewVolume(t, "cold-start-vol", backend, NewEventBroadcaster(),
 			WithMetadataIndex("sqlite"),
 			WithLocalStorageDir(localDir),
 			WithStreamID(streamID),
@@ -566,7 +566,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 		// B. Restart from published SQLite snapshot (new local dir)
 		start = time.Now()
-		volSnap := NewVolume("cold-start-vol", backend, NewEventBroadcaster(),
+		volSnap := MustNewVolume(t, "cold-start-vol", backend, NewEventBroadcaster(),
 			WithMetadataIndex("sqlite"),
 			WithLocalStorageDir(t.TempDir()),
 			WithStreamID(streamID),
@@ -588,7 +588,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		runtime.ReadMemStats(&m1)
 
 		backend := inmemorystorage.New()
-		vol := NewVolume("mem-"+mode, backend, NewEventBroadcaster(),
+		vol := MustNewVolume(t, "mem-"+mode, backend, NewEventBroadcaster(),
 			WithMetadataIndex(mode),
 			WithLocalStorageDir(t.TempDir()),
 		)
@@ -623,7 +623,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		localDir := t.TempDir()
 		// Open with wal_autocheckpoint=0 to accurately capture WAL frames written without reuse/truncation
 		sqliteFactory := sqlite.NewFactory(sqlite.WithAutoCheckpoint(0))
-		vol := NewVolume("batch-wa-bench", inmemorystorage.New(), NewEventBroadcaster(),
+		vol := MustNewVolume(t, "batch-wa-bench", inmemorystorage.New(), NewEventBroadcaster(),
 			WithIndexFactory(sqliteFactory),
 			WithLocalStorageDir(localDir),
 			WithApplierBatchSize(batchSize),
@@ -741,7 +741,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 	t.Log("\n--- 7. Read Latency During Concurrent Write Bursts (Cache Misses) ---")
 	for _, batchSize := range []int{1, 10, 100} {
 		localDir := t.TempDir()
-		vol := NewVolume("burst-read-bench", inmemorystorage.New(), NewEventBroadcaster(),
+		vol := MustNewVolume(t, "burst-read-bench", inmemorystorage.New(), NewEventBroadcaster(),
 			WithMetadataIndex("sqlite"),
 			WithMetadataCacheDisabled(true), // Ensure all reads are SQLite cache misses
 			WithLocalStorageDir(localDir),
@@ -806,7 +806,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 	t.Log("\n--- 8. Benchmark Gate: 10,000 Files End-to-End Latency (stat, create, readdir, rename, 64 KiB fsynced write) ---")
 	for _, mode := range []string{"sqlite", "memory"} {
 		localDir := t.TempDir()
-		vol := NewVolume("gate-10k-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
+		vol := MustNewVolume(t, "gate-10k-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
 			WithMetadataIndex(mode),
 			WithLocalStorageDir(localDir),
 		)
@@ -890,7 +890,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 		for _, mode := range []string{"sqlite", "memory"} {
 			localDir := t.TempDir()
-			vol := NewVolume("gate-smoke-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
+			vol := MustNewVolume(t, "gate-smoke-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
 				WithMetadataIndex(mode),
 				WithLocalStorageDir(localDir),
 			)
@@ -928,7 +928,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		runtime.ReadMemStats(&m1)
 
 		localDir := t.TempDir()
-		vol := NewVolume("gate-scale-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
+		vol := MustNewVolume(t, "gate-scale-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
 			WithMetadataIndex(mode),
 			WithLocalStorageDir(localDir),
 		)
@@ -995,7 +995,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		runtime.ReadMemStats(&m1)
 
 		localDir := t.TempDir()
-		vol := NewVolume("gate-1m-single-dir-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
+		vol := MustNewVolume(t, "gate-1m-single-dir-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
 			WithMetadataIndex(mode),
 			WithLocalStorageDir(localDir),
 		)

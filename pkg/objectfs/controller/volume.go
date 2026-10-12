@@ -36,6 +36,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
@@ -374,7 +375,7 @@ func (v *Volume) initMetadataViewLocked(ctx context.Context, customIndex sds.Loc
 	return nil
 }
 
-func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *EventBroadcaster, opts ...VolumeOption) *Volume {
+func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *EventBroadcaster, opts ...VolumeOption) (*Volume, error) {
 	var blobStore *blob.Store
 	if backend != nil {
 		blobStore = blob.NewStore(backend, 0)
@@ -415,11 +416,11 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 
 	if err := v.initMetadataStreamLocked(); err != nil {
-		panic(fmt.Sprintf("failed to init metadata stream: %v", err))
+		return nil, fmt.Errorf("failed to init metadata stream: %w", err)
 	}
 
 	if err := v.initMetadataViewLocked(context.Background(), nil); err != nil {
-		panic(fmt.Sprintf("failed to init metadata view: %v", err))
+		return nil, fmt.Errorf("failed to init metadata view: %w", err)
 	}
 
 	rootKey, _ := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
@@ -432,7 +433,10 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 			IsDir: true,
 			Nlink: 2,
 		}
-		keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+		keyBytes, valBytes, err := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+		if err != nil {
+			return nil, fmt.Errorf("failed to split key for root inode: %w", err)
+		}
 		initChanges := []sds.Change{
 			{
 				Seq:      0,
@@ -445,7 +449,9 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 				Row:      rootInodeMsg,
 			},
 		}
-		_ = v.metadataView.ApplyChangesSync(context.Background(), initChanges)
+		if err := v.metadataView.ApplyChangesSync(context.Background(), initChanges); err != nil {
+			return nil, fmt.Errorf("failed to apply root inode change: %w", err)
+		}
 	}
 
 	if err := v.cleanOrphanInodesLocked(context.Background()); err != nil {
@@ -459,7 +465,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	v.initLiveStatsLocked()
 	v.assertStatsMatchLocked("after NewVolume")
 
-	return v
+	return v, nil
 }
 
 func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int][]byte) error {
@@ -957,21 +963,23 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, tx *sds.Tx, 
 	}
 	if v.metadataView != nil {
 		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno())}, 1)
-		if pErr == nil {
-			// Rows returned by scanSQLiteRowsLocked are shared/immutable; only read fields here.
-			chunkMsgs, sErr := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", prefixBytes)
-			if sErr == nil {
-				for _, cMsg := range chunkMsgs {
-					chunk := cMsg.(*pb.FileChunk)
-					if chunk.GetIndex() == 0 && len(chunk.GetInlineData()) > 0 {
-						node.InlineData = append([]byte(nil), chunk.GetInlineData()...)
-					} else if chunk.GetSha256() != "" {
-						if node.Chunks == nil {
-							node.Chunks = make(map[uint32]string)
-						}
-						node.Chunks[chunk.GetIndex()] = chunk.GetSha256()
-					}
+		if pErr != nil {
+			return fmt.Errorf("encode chunk prefix: %w", pErr)
+		}
+		// Rows returned by scanSQLiteRowsLocked are shared/immutable; only read fields here.
+		chunkMsgs, sErr := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+		if sErr != nil {
+			return fmt.Errorf("scan chunk rows: %w", sErr)
+		}
+		for _, cMsg := range chunkMsgs {
+			chunk := cMsg.(*pb.FileChunk)
+			if chunk.GetIndex() == 0 && len(chunk.GetInlineData()) > 0 {
+				node.InlineData = append([]byte(nil), chunk.GetInlineData()...)
+			} else if chunk.GetSha256() != "" {
+				if node.Chunks == nil {
+					node.Chunks = make(map[uint32]string)
 				}
+				node.Chunks[chunk.GetIndex()] = chunk.GetSha256()
 			}
 		}
 		return nil
@@ -1055,7 +1063,7 @@ func (v *Volume) readChunkLocked(ctx context.Context, tx *sds.Tx, node *CachedIn
 	if err != nil {
 		return nil, fmt.Errorf("read chunk: inode %d chunk %d sha %s: %w", node.Row.GetIno(), chunkIdx, sha, err)
 	}
-	defer stream.Close()
+	defer errutil.CloseAndLog(stream, "blob stream")
 	bData, err := io.ReadAll(stream)
 	if err != nil {
 		return nil, fmt.Errorf("read chunk: inode %d chunk %d sha %s read: %w", node.Row.GetIno(), chunkIdx, sha, err)
@@ -4369,7 +4377,13 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 			Nlink:     2,
 			ParentIno: proto.Uint64(1),
 		}
-		keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+		keyBytes, valBytes, err := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+		if err != nil {
+			if closeErr := rebuiltIdx.Close(); closeErr != nil {
+				return nil, 0, fmt.Errorf("failed to split key for root inode in rebuilt index (%v) and close failed: %w", err, closeErr)
+			}
+			return nil, 0, fmt.Errorf("failed to split key for root inode in rebuilt index: %w", err)
+		}
 		initChanges := []sds.Change{
 			{
 				Seq:      0,
@@ -4742,7 +4756,10 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				Mtime: timestamppb.Now(),
 				IsDir: true,
 			}
-			keyBytes, valBytes, _ := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+			keyBytes, valBytes, err := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+			if err != nil {
+				return fmt.Errorf("failed to split key for root inode: %w", err)
+			}
 			initChanges := []sds.Change{
 				{
 					Seq:      0,
@@ -4755,7 +4772,9 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 					Row:      rootInodeMsg,
 				},
 			}
-			_ = v.metadataView.ApplyChangesSync(ctx, initChanges)
+			if err := v.metadataView.ApplyChangesSync(ctx, initChanges); err != nil {
+				return fmt.Errorf("failed to apply root inode change: %w", err)
+			}
 		}
 		v.rootInodeID = 1
 		v.nextInode = erofs.DefaultInodeStride

@@ -41,7 +41,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	broadcaster := NewEventBroadcaster()
 	volID := "vol-sqlite-ops"
 
-	vol := NewVolume(volID, backend, broadcaster,
+	vol := MustNewVolume(t, volID, backend, broadcaster,
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -178,7 +178,7 @@ func TestSQLiteMetadataStoreRecoveryFromLocalDB(t *testing.T) {
 	volID := "vol-local-rec"
 
 	// 1. First run: create files
-	vol1 := NewVolume(volID, backend, broadcaster,
+	vol1 := MustNewVolume(t, volID, backend, broadcaster,
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -203,7 +203,7 @@ func TestSQLiteMetadataStoreRecoveryFromLocalDB(t *testing.T) {
 	}
 
 	// 2. Second run: reopen with same localDir
-	vol2 := NewVolume(volID, backend, broadcaster,
+	vol2 := MustNewVolume(t, volID, backend, broadcaster,
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -240,7 +240,7 @@ func TestSQLiteMetadataStoreRecoveryFromPublishedSnapshot(t *testing.T) {
 	streamID := uuid.New()
 
 	// 1. First run: create files and publish snapshot
-	vol1 := NewVolume(volID, backend, broadcaster,
+	vol1 := MustNewVolume(t, volID, backend, broadcaster,
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir1),
 		WithStreamID(streamID),
@@ -266,7 +266,7 @@ func TestSQLiteMetadataStoreRecoveryFromPublishedSnapshot(t *testing.T) {
 	_ = vol1.Close()
 
 	// 2. Second run: restore into a clean new local directory from published snapshot
-	vol2 := NewVolume(volID, backend, broadcaster,
+	vol2 := MustNewVolume(t, volID, backend, broadcaster,
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir2),
 		WithStreamID(streamID),
@@ -308,7 +308,7 @@ func TestSQLiteMetadataStoreCrashRecoveryWithStream(t *testing.T) {
 		t.Fatalf("walclient.Open failed: %v", err)
 	}
 
-	vol1 := NewVolume(volID, backend, broadcaster,
+	vol1 := MustNewVolume(t, volID, backend, broadcaster,
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(stream1),
@@ -337,7 +337,7 @@ func TestSQLiteMetadataStoreCrashRecoveryWithStream(t *testing.T) {
 		t.Fatalf("walclient.Open run 2 failed: %v", err)
 	}
 
-	vol2 := NewVolume(volID, backend, broadcaster,
+	vol2 := MustNewVolume(t, volID, backend, broadcaster,
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(stream2),
@@ -364,7 +364,7 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	backend := inmemorystorage.New()
 	volID := "vol-sqlite-cache-test"
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -466,7 +466,7 @@ func TestSQLiteReadCacheCoherence(t *testing.T) {
 	backend := inmemorystorage.New()
 	volID := "vol-sqlite-coherence"
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -555,7 +555,7 @@ func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
 	volID := "vol-sqlite-limits"
 
 	// Bounded to 50 entries and 10 KB
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithMetadataCacheLimits(50, 10*1024),
@@ -608,7 +608,7 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 	backend := inmemorystorage.New()
 	volID := "vol-sqlite-concurrent-stress"
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -688,7 +688,7 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 	var faultActive atomic.Bool
 	faultActive.Store(true)
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithApplierFaultHook(func() error {
@@ -824,7 +824,7 @@ func TestSQLiteApplierCoalescing(t *testing.T) {
 	backend := inmemorystorage.New()
 	volID := "vol-sqlite-coalesce"
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithApplierBatchSize(100),
@@ -879,7 +879,7 @@ func TestSQLiteApplierFaultInjectionAndDegradedState(t *testing.T) {
 	var faultActive atomic.Bool
 	faultActive.Store(true)
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithApplierFaultHook(func() error {
@@ -940,7 +940,7 @@ func TestSQLiteBackpressureUnderLag(t *testing.T) {
 	faultActive.Store(true)
 
 	// Configure a tight bound on unapplied overlay bytes (e.g. 1024 bytes)
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithMaxUnappliedBytes(1024),
@@ -1009,7 +1009,7 @@ func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
 	stallApplier.Store(true)
 
 	// Start volume with stalled SQLite applier so writes accumulate in stream and overlay
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(stream),
@@ -1050,7 +1050,7 @@ func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
 		t.Fatalf("Reopen WAL stream failed: %v", err)
 	}
 
-	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol2 := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(newStream),
@@ -1087,7 +1087,7 @@ func TestSQLiteSnapshotFlushesOverlay(t *testing.T) {
 	backend := inmemorystorage.New()
 	volID := "vol-sqlite-snap-flush"
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -1120,7 +1120,7 @@ func TestSQLiteSnapshotFlushesOverlay(t *testing.T) {
 
 	// Restore from published snapshot on fresh volume to confirm validity
 	freshDir := t.TempDir()
-	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol2 := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(freshDir),
 	)
@@ -1153,7 +1153,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 	}
 
 	// 1. Start volume with batchSize = 1 (smaller than a rename's change count)
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(stream),
@@ -1204,7 +1204,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 		t.Fatalf("Reopen WAL stream failed: %v", err)
 	}
 
-	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol2 := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 		WithStream(newStream),
@@ -1245,7 +1245,7 @@ func TestSQLiteSnapshotFlushNoStarvationUnderContinuousWrites(t *testing.T) {
 	backend := inmemorystorage.New()
 	volID := "vol-sqlite-continuous-writes"
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -1319,7 +1319,7 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 		t.Fatalf("OpenStream failed: %v", err)
 	}
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("memory"),
 		WithStream(stream),
 		WithDurability(walclient.Local),
@@ -1368,7 +1368,7 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 		t.Fatalf("OpenStream 2 failed: %v", err)
 	}
 
-	vol2 := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol2 := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("memory"),
 		WithStream(stream2),
 	)
@@ -1404,7 +1404,7 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 				t.Fatalf("OpenStream failed: %v", err)
 			}
 
-			vol := NewVolume(volID, backend, NewEventBroadcaster(),
+			vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 				WithMetadataIndex(indexMode),
 				WithStream(stream),
 				WithDurability(walclient.Local),
@@ -1510,7 +1510,7 @@ func TestSQLiteIndexRebuildOnDatabaseCorruption(t *testing.T) {
 	backend := inmemorystorage.New()
 	volID := "vol-sqlite-corrupt-rebuild"
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -1632,7 +1632,7 @@ func TestSQLiteIndexRebuildOnDatabaseDeletion(t *testing.T) {
 	backend := inmemorystorage.New()
 	volID := "vol-sqlite-delete-rebuild"
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
@@ -1706,7 +1706,7 @@ func TestRebuildIndexPreservesAllFilesWithoutLoss(t *testing.T) {
 	backend := inmemorystorage.New()
 	volID := "vol-rebuild-preserves-all-files"
 
-	vol := NewVolume(volID, backend, NewEventBroadcaster(),
+	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
 		WithLocalStorageDir(localDir),
 	)
