@@ -18,6 +18,8 @@ package fuse
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"sync"
@@ -43,13 +45,30 @@ const DefaultRPCTimeout = 30 * time.Second
 // DefaultSyncTimeout is the default deadline applied to sync operations (Fsync, Flush, Write).
 const DefaultSyncTimeout = 10 * time.Minute
 
+// DefaultPrefetchWindow is the number of chunks to prefetch ahead (32 chunks * 64KB = 2 MiB).
+const DefaultPrefetchWindow = 32
+
+type fileManifest struct {
+	inode      uint64
+	chunkSize  uint32
+	totalSize  int64
+	chunkSHAs  []string
+	inlineData []byte
+	loadedAt   time.Time
+}
+
+type prefetchHandle struct {
+	cancel context.CancelFunc
+	inode  uint64
+}
+
 type ObjectFS struct {
 	fuse.RawFileSystem
-
 	client                 pb.ObjectFSControllerClient
 	volumeID               string
 	writeMode              pb.WriteMode
 	cache                  *NodeCache
+	diskCache              *DiskBlobCache
 	server                 *fuse.Server
 	rpcTimeout             time.Duration
 	syncTimeout            time.Duration
@@ -58,6 +77,13 @@ type ObjectFS struct {
 	syncTrigger            chan struct{}
 	errMu                  sync.Mutex
 	lastLoggedErr          time.Time
+
+	manifestMu         sync.RWMutex
+	manifests          map[uint64]*fileManifest
+	prefetchMu         sync.Mutex
+	activePrefetches   map[uint64]*prefetchHandle
+	lastReadChunk      map[uint64]int
+	furthestPrefetched map[uint64]int
 }
 
 var _ fuse.RawFileSystem = (*ObjectFS)(nil)
@@ -91,8 +117,161 @@ func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string
 		syncOnClose:            true,
 		backgroundSyncInterval: 30 * time.Second,
 		syncTrigger:            make(chan struct{}, 1),
+		manifests:              make(map[uint64]*fileManifest),
+		activePrefetches:       make(map[uint64]*prefetchHandle),
+		lastReadChunk:          make(map[uint64]int),
+		furthestPrefetched:     make(map[uint64]int),
 	}
 	return fs
+}
+
+func (fs *ObjectFS) SetDiskBlobCache(dc *DiskBlobCache) {
+	fs.diskCache = dc
+}
+
+func (fs *ObjectFS) DiskBlobCache() *DiskBlobCache {
+	return fs.diskCache
+}
+
+func (fs *ObjectFS) invalidateManifest(inode uint64) {
+	fs.manifestMu.Lock()
+	delete(fs.manifests, inode)
+	fs.manifestMu.Unlock()
+}
+
+func (fs *ObjectFS) invalidateAllManifests() {
+	fs.manifestMu.Lock()
+	fs.manifests = make(map[uint64]*fileManifest)
+	fs.manifestMu.Unlock()
+}
+
+func (fs *ObjectFS) getOrLoadManifest(ctx context.Context, inode uint64) (*fileManifest, error) {
+	fs.manifestMu.RLock()
+	m, ok := fs.manifests[inode]
+	fs.manifestMu.RUnlock()
+	if ok && m != nil && time.Since(m.loadedAt) < 5*time.Minute {
+		return m, nil
+	}
+
+	resp, err := fs.client.GetManifest(ctx, &pb.GetManifestRequest{
+		VolumeId: fs.volumeID,
+		Inode:    inode,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.GetError() != 0 {
+		return nil, syscall.Errno(resp.GetError())
+	}
+
+	cs := resp.GetChunkSize()
+	if cs == 0 {
+		cs = DefaultChunkSize
+	}
+
+	m = &fileManifest{
+		inode:      resp.GetInode(),
+		chunkSize:  cs,
+		totalSize:  resp.GetTotalSize(),
+		chunkSHAs:  resp.GetChunkSha256(),
+		inlineData: resp.GetInlineData(),
+		loadedAt:   time.Now(),
+	}
+
+	fs.manifestMu.Lock()
+	if fs.manifests == nil {
+		fs.manifests = make(map[uint64]*fileManifest)
+	}
+	fs.manifests[inode] = m
+	fs.manifestMu.Unlock()
+
+	return m, nil
+}
+
+func (fs *ObjectFS) startPrefetchOnOpen(inode, fh uint64) {
+	if fs.diskCache == nil {
+		return
+	}
+
+	manifest, err := fs.getOrLoadManifest(context.Background(), inode)
+	if err != nil || manifest == nil || len(manifest.chunkSHAs) == 0 {
+		return
+	}
+
+	fs.diskCache.RecordKnownBlobs(manifest.chunkSHAs)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fs.prefetchMu.Lock()
+	if fs.activePrefetches == nil {
+		fs.activePrefetches = make(map[uint64]*prefetchHandle)
+	}
+	fs.activePrefetches[fh] = &prefetchHandle{
+		cancel: cancel,
+		inode:  inode,
+	}
+	if fs.lastReadChunk == nil {
+		fs.lastReadChunk = make(map[uint64]int)
+	}
+	fs.lastReadChunk[fh] = -1
+	if fs.furthestPrefetched == nil {
+		fs.furthestPrefetched = make(map[uint64]int)
+	}
+
+	limit := len(manifest.chunkSHAs)
+	if limit > DefaultPrefetchWindow {
+		limit = DefaultPrefetchWindow
+	}
+	fs.furthestPrefetched[fh] = limit
+	fs.prefetchMu.Unlock()
+
+	go fs.prefetchChunks(ctx, manifest, 0, limit)
+}
+
+func (fs *ObjectFS) prefetchChunks(ctx context.Context, manifest *fileManifest, start, end int) {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(manifest.chunkSHAs) {
+		end = len(manifest.chunkSHAs)
+	}
+	if start >= end {
+		return
+	}
+
+	concurrency := 4
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for i := start; i < end; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		sha := manifest.chunkSHAs[i]
+		if sha == "" || fs.diskCache.HasBlob(sha) {
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case sem <- struct{}{}:
+		}
+
+		wg.Add(1)
+		go func(chunkSHA string) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			if err := fs.diskCache.EnsureBlob(ctx, fs.client, chunkSHA); err != nil {
+				klog.V(4).Infof("prefetch EnsureBlob failed for %s: %v", chunkSHA, err)
+			}
+		}(sha)
+	}
+	wg.Wait()
 }
 
 func (fs *ObjectFS) SetSyncOnClose(enabled bool) {
@@ -375,6 +554,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 			return fuse.Status(resp.GetError())
 		}
 		fs.cache.MarkSizeClean(input.NodeId, truncGen)
+		fs.invalidateManifest(input.NodeId)
 		finalAttr = resp.GetAttr()
 	}
 
@@ -619,6 +799,11 @@ func (fs *ObjectFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.O
 		return fuse.Status(resp.GetError())
 	}
 	out.Fh = resp.GetFh()
+
+	if fs.diskCache != nil {
+		fs.startPrefetchOnOpen(input.NodeId, out.Fh)
+	}
+
 	return fuse.OK
 }
 
@@ -777,6 +962,11 @@ func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename st
 }
 
 func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
+	// Read serves data through four source tiers:
+	// Tier 1: In-memory NodeCache (unflushed dirty writes must win so local updates are immediately visible).
+	// Tier 2: File manifest inline data (small files stored directly within the metadata store).
+	// Tier 3: Persistent on-disk blob cache (verified content-addressed blobs read from disk without network I/O).
+	// Tier 4: Controller ReadFile RPC (fallback if not yet cached or manifest unavailable; fetched chunks are saved to disk cache).
 	offset := int64(input.Offset)
 	size := int64(input.Size)
 
@@ -791,14 +981,51 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
+	var manifest *fileManifest
+	if fs.diskCache != nil {
+		var mErr error
+		manifest, mErr = fs.getOrLoadManifest(ctx, input.NodeId)
+		if mErr != nil {
+			klog.V(4).Infof("getOrLoadManifest failed for inode %d: %v", input.NodeId, mErr)
+		}
+	}
+
 	cs := int64(DefaultChunkSize)
+	if manifest != nil && manifest.chunkSize > 0 {
+		cs = int64(manifest.chunkSize)
+	}
+
 	startChunk := int(offset / cs)
 	endChunk := int((offset + size - 1) / cs)
+
+	// Sequential read detection & prefetch extension
+	if fs.diskCache != nil && manifest != nil {
+		fs.prefetchMu.Lock()
+		lastRead := fs.lastReadChunk[input.Fh]
+		furthest := fs.furthestPrefetched[input.Fh]
+		fs.lastReadChunk[input.Fh] = endChunk
+		if startChunk >= lastRead && endChunk+DefaultPrefetchWindow > furthest {
+			newEnd := endChunk + DefaultPrefetchWindow
+			if newEnd > len(manifest.chunkSHAs) {
+				newEnd = len(manifest.chunkSHAs)
+			}
+			fs.furthestPrefetched[input.Fh] = newEnd
+			pHandle := fs.activePrefetches[input.Fh]
+			fs.prefetchMu.Unlock()
+			if pHandle != nil {
+				go fs.prefetchChunks(ctx, manifest, furthest, newEnd)
+			}
+		} else {
+			fs.prefetchMu.Unlock()
+		}
+	}
 
 	clientSize, hasClientEntry := fs.cache.GetSize(input.NodeId)
 	var totalSize int64
 	if hasClientEntry {
 		totalSize = clientSize
+	} else if manifest != nil {
+		totalSize = manifest.totalSize
 	}
 
 	numChunks := endChunk - startChunk + 1
@@ -812,23 +1039,58 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		pIdx       int
 		chunkIdx   int
 		chunkStart int64
+		sha        string
 	}
 	var uncached []uncachedChunk
 
 	for i := startChunk; i <= endChunk; i++ {
 		pIdx := i - startChunk
+
+		// Tier 1: Check in-memory dirty cache (or memory cache)
 		if cachedChunk, ok := fs.cache.GetChunk(input.NodeId, i); ok {
 			slots[pIdx].data = cachedChunk
-		} else {
-			uncached = append(uncached, uncachedChunk{
-				pIdx:       pIdx,
-				chunkIdx:   i,
-				chunkStart: int64(i) * cs,
-			})
+			continue
 		}
+
+		// Tier 2: Check inline data from manifest
+		if manifest != nil && len(manifest.inlineData) > 0 && i == 0 {
+			slots[pIdx].data = manifest.inlineData
+			continue
+		}
+
+		// Tier 3: Check on-disk blob cache by SHA
+		var chunkSHA string
+		if manifest != nil && i < len(manifest.chunkSHAs) {
+			chunkSHA = manifest.chunkSHAs[i]
+		}
+		if fs.diskCache != nil && chunkSHA != "" && fs.diskCache.HasBlob(chunkSHA) {
+			data, err := fs.diskCache.ReadBlob(chunkSHA)
+			if err == nil {
+				slots[pIdx].data = data
+				continue
+			}
+			klog.V(4).Infof("ReadBlob failed for cached sha %s: %v", chunkSHA, err)
+		}
+
+		uncached = append(uncached, uncachedChunk{
+			pIdx:       pIdx,
+			chunkIdx:   i,
+			chunkStart: int64(i) * cs,
+			sha:        chunkSHA,
+		})
 	}
 
 	fetchChunk := func(fCtx context.Context, uc uncachedChunk) ([]byte, int64, fuse.Status, error) {
+		// Tier 3 (disk fetch): fetch into disk cache if SHA is available
+		if fs.diskCache != nil && uc.sha != "" {
+			data, err := fs.diskCache.FetchBlob(fCtx, fs.client, uc.sha)
+			if err == nil {
+				return data, totalSize, fuse.OK, nil
+			}
+			klog.V(4).Infof("FetchBlob failed for sha %s, falling back to ReadFile: %v", uc.sha, err)
+		}
+
+		// Tier 4: Fallback to controller ReadFile RPC
 		readGen := fs.cache.GetGeneration(input.NodeId)
 		resp, err := fs.client.ReadFile(fCtx, &pb.ReadFileRequest{
 			VolumeId: fs.volumeID,
@@ -844,7 +1106,17 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		}
 		fetchedData := resp.GetData()
 		if (int64(len(fetchedData)) == cs || resp.GetEof()) && len(fetchedData) > 0 {
-			fs.cache.PutChunk(input.NodeId, uc.chunkIdx, uint32(cs), resp.GetTotalSize(), fetchedData, time.Now(), readGen)
+			// When disk cache is configured, clean chunks live ONLY on disk (and kernel page cache)
+			// to avoid duplicating memory. In-memory NodeCache is only updated when disk cache is absent.
+			if fs.diskCache != nil {
+				sum := sha256.Sum256(fetchedData)
+				sha := hex.EncodeToString(sum[:])
+				if pErr := fs.diskCache.PutBlob(sha, fetchedData); pErr != nil {
+					klog.V(4).Infof("cache PutBlob failed: %v", pErr)
+				}
+			} else {
+				fs.cache.PutChunk(input.NodeId, uc.chunkIdx, uint32(cs), resp.GetTotalSize(), fetchedData, time.Now(), readGen)
+			}
 		}
 		return fetchedData, resp.GetTotalSize(), fuse.OK, nil
 	}
@@ -1169,6 +1441,16 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 		}
 		lastEpoch = resp.GetStagingEpoch()
 		uncleanedRuns = append(uncleanedRuns, run)
+		if fs.diskCache != nil {
+			for _, idx := range run {
+				cData := dirtyChunks[idx]
+				sum := sha256.Sum256(cData)
+				sha := hex.EncodeToString(sum[:])
+				if pErr := fs.diskCache.PutBlob(sha, cData); pErr != nil {
+					klog.V(4).Infof("stage PutBlob failed: %v", pErr)
+				}
+			}
+		}
 	}
 
 	return lastEpoch, uncleanedRuns, chunkGens, nil
@@ -1231,6 +1513,10 @@ func (fs *ObjectFS) syncVolumeBlocking(ctx context.Context) error {
 				fs.cache.MarkChunkClean(item.inode, idx, item.gens[idx])
 			}
 		}
+		fs.invalidateManifest(item.inode)
+	}
+	if fs.diskCache != nil {
+		fs.cache.InvalidateAllClean()
 	}
 	return nil
 }
@@ -1286,6 +1572,10 @@ func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context) error {
 				fs.cache.MarkChunkClean(item.inode, idx, item.gens[idx])
 			}
 		}
+		fs.invalidateManifest(item.inode)
+	}
+	if fs.diskCache != nil {
+		fs.cache.InvalidateAllClean()
 	}
 	return nil
 }
@@ -1330,6 +1620,10 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 				fs.cache.MarkChunkClean(inode, idx, newGens[idx])
 			}
 		}
+		fs.invalidateManifest(inode)
+		if fs.diskCache != nil {
+			fs.cache.InvalidateAllClean()
+		}
 		return nil
 	}
 	if resp.GetError() != 0 {
@@ -1340,6 +1634,10 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 		for _, idx := range run {
 			fs.cache.MarkChunkClean(inode, idx, chunkGens[idx])
 		}
+	}
+	fs.invalidateManifest(inode)
+	if fs.diskCache != nil {
+		fs.cache.InvalidateAllClean()
 	}
 	return nil
 }
@@ -1370,6 +1668,16 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 }
 
 func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
+	fh := input.Fh
+	fs.prefetchMu.Lock()
+	if handle, ok := fs.activePrefetches[fh]; ok {
+		handle.cancel()
+		delete(fs.activePrefetches, fh)
+	}
+	delete(fs.lastReadChunk, fh)
+	delete(fs.furthestPrefetched, fh)
+	fs.prefetchMu.Unlock()
+
 	if fs.syncOnClose {
 		if fs.cache.IsInodeDirty(input.NodeId) {
 			select {
@@ -1455,7 +1763,7 @@ func (fs *ObjectFS) Access(cancel <-chan struct{}, input *fuse.AccessIn) fuse.St
 	return fuse.OK
 }
 
-func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, nodeID string, cache *NodeCache) {
+func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, nodeID string, cache *NodeCache, fs ...*ObjectFS) {
 	go func() {
 		backoff := 100 * time.Millisecond
 		maxBackoff := 5 * time.Second
@@ -1489,6 +1797,11 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 			if hasDisconnected {
 				// Invalidate all clean entries that might have changed on controller while disconnected
 				cache.InvalidateAllClean()
+				for _, f := range fs {
+					if f != nil {
+						f.invalidateAllManifests()
+					}
+				}
 			}
 			backoff = 100 * time.Millisecond
 
@@ -1500,6 +1813,11 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				}
 				if ev.GetInode() != 0 {
 					cache.InvalidateIfNotDirty(ev.GetInode())
+					for _, f := range fs {
+						if f != nil {
+							f.invalidateManifest(ev.GetInode())
+						}
+					}
 				}
 			}
 			select {

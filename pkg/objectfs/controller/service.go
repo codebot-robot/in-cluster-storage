@@ -850,6 +850,21 @@ func (s *Server) GetBlob(req *pb.GetBlobRequest, stream pb.ObjectFSController_Ge
 	return nil
 }
 
+func (s *Server) GetManifest(ctx context.Context, req *pb.GetManifestRequest) (*pb.GetManifestResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, volInitError(err)
+	}
+	resp, err := vol.GetManifest(ctx, req.GetInode())
+	if err != nil {
+		return &pb.GetManifestResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return resp, nil
+}
+
 func parseSnapshotTime(name string) time.Time {
 	trimmed := strings.TrimSuffix(name, ".erofs")
 	formats := []string{

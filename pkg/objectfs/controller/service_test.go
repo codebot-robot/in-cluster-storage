@@ -5145,3 +5145,76 @@ func TestInlineToChunkedTransitionUploadsChunk0OnRestart(t *testing.T) {
 		t.Fatalf("ReadFile chunk 0 content mismatch: got %q, want %q", string(readResp.GetData()), string(inlineData))
 	}
 }
+
+func TestGetManifest(t *testing.T) {
+	ctx := t.Context()
+	server := NewServer(nil)
+	volumeID := "test-manifest-vol"
+
+	// 1. Create small inline file
+	contentSmall := []byte("small file inline data")
+	cfResp, err := testCreateFile(ctx, server, volumeID, "/small.txt", 0644, contentSmall, 0, 0)
+	if err != nil || cfResp.GetError() != 0 {
+		t.Fatalf("testCreateFile small.txt failed: err=%v, resp=%v", err, cfResp)
+	}
+	inoSmall := cfResp.GetAttr().GetInode().GetIno()
+
+	mSmall, err := server.GetManifest(ctx, &pb.GetManifestRequest{
+		VolumeId: volumeID,
+		Inode:    inoSmall,
+	})
+	if err != nil || mSmall.GetError() != 0 {
+		t.Fatalf("GetManifest small.txt failed: err=%v, resp=%v", err, mSmall)
+	}
+	if mSmall.GetTotalSize() != int64(len(contentSmall)) {
+		t.Errorf("GetManifest small.txt total_size = %d, want %d", mSmall.GetTotalSize(), len(contentSmall))
+	}
+	if !bytes.Equal(mSmall.GetInlineData(), contentSmall) {
+		t.Errorf("GetManifest small.txt inline_data = %q, want %q", mSmall.GetInlineData(), contentSmall)
+	}
+
+	// 2. Create multi-chunk file and sync it
+	chunkSize := 64 * 1024
+	totalSize := 3 * chunkSize
+	contentMulti := bytes.Repeat([]byte("M"), totalSize)
+	cfMulti, err := testCreateFile(ctx, server, volumeID, "/multi.bin", 0644, nil, 0, 0)
+	if err != nil || cfMulti.GetError() != 0 {
+		t.Fatalf("testCreateFile multi.bin failed: err=%v, resp=%v", err, cfMulti)
+	}
+	inoMulti := cfMulti.GetAttr().GetInode().GetIno()
+
+	for i := 0; i < 3; i++ {
+		wResp, err := testWriteFile(ctx, server, volumeID, "/multi.bin", int64(i*chunkSize), contentMulti[i*chunkSize:(i+1)*chunkSize], pb.WriteMode_WRITE_THROUGH_FSYNC)
+		if err != nil || wResp.GetError() != 0 {
+			t.Fatalf("testWriteFile chunk %d failed: %v", i, err)
+		}
+	}
+	// Fsync to pack and commit chunks into SDS
+	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    inoMulti,
+		Blocking: true,
+	})
+	if err != nil || fsyncResp.GetError() != 0 {
+		t.Fatalf("Fsync multi.bin failed: %v", err)
+	}
+
+	mMulti, err := server.GetManifest(ctx, &pb.GetManifestRequest{
+		VolumeId: volumeID,
+		Inode:    inoMulti,
+	})
+	if err != nil || mMulti.GetError() != 0 {
+		t.Fatalf("GetManifest multi.bin failed: err=%v, resp=%v", err, mMulti)
+	}
+	if mMulti.GetTotalSize() != int64(totalSize) {
+		t.Errorf("GetManifest multi.bin total_size = %d, want %d", mMulti.GetTotalSize(), totalSize)
+	}
+	if len(mMulti.GetChunkSha256()) != 3 {
+		t.Fatalf("GetManifest multi.bin chunk count = %d, want 3", len(mMulti.GetChunkSha256()))
+	}
+	for i, sha := range mMulti.GetChunkSha256() {
+		if sha == "" {
+			t.Errorf("chunk %d has empty sha", i)
+		}
+	}
+}

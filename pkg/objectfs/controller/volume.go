@@ -2887,6 +2887,72 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 	return res[:n], total, "", nil
 }
 
+func (v *Volume) GetManifest(ctx context.Context, inodeID uint64) (*pb.GetManifestResponse, error) {
+	if inodeID == 0 {
+		v.mu.RLock()
+		inodeID = v.rootInodeID
+		v.mu.RUnlock()
+	}
+
+	v.mu.RLock()
+	node, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
+	v.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+
+	if node.Row.GetIsDir() {
+		return nil, fmt.Errorf("cannot get manifest for directory: %w", syscall.EISDIR)
+	}
+
+	total := node.Row.GetSize()
+	cs := uint32(node.Row.GetChunkSize())
+	if cs == 0 {
+		cs = uint32(v.chunkSize)
+		if cs == 0 {
+			cs = 64 * 1024
+		}
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	var inlineData []byte
+	if len(node.InlineData) > 0 {
+		inlineData = make([]byte, len(node.InlineData))
+		copy(inlineData, node.InlineData)
+	}
+
+	if err := v.ensureInodeChunksLoadedLocked(ctx, nil, node); err != nil {
+		return nil, fmt.Errorf("manifest inode %d chunks load: %w", node.Row.GetIno(), err)
+	}
+
+	var chunkSHAs []string
+	if total > 0 {
+		numChunks := int((total + int64(cs) - 1) / int64(cs))
+		chunkSHAs = make([]string, numChunks)
+		for i := 0; i < numChunks; i++ {
+			if sha, ok := node.Chunks[uint32(i)]; ok && sha != "" {
+				chunkSHAs[i] = sha
+			} else if i == 0 && numChunks == 1 && len(node.Chunks) == 0 {
+				sha := node.Row.GetSha256()
+				if sha == "" {
+					sha = node.Row.GetContentSha256()
+				}
+				chunkSHAs[0] = sha
+			}
+		}
+	}
+
+	return &pb.GetManifestResponse{
+		Inode:       node.Row.GetIno(),
+		ChunkSize:   cs,
+		TotalSize:   total,
+		ChunkSha256: chunkSHAs,
+		InlineData:  inlineData,
+	}, nil
+}
+
 func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, data []byte, writeMode pb.WriteMode) (int64, int64, time.Time, error) {
 	nWritten, newSize, modTime, _, err := v.WriteFileWithEpoch(ctx, inodeID, offset, data, writeMode)
 	return nWritten, newSize, modTime, err

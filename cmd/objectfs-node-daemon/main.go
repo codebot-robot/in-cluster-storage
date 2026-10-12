@@ -43,7 +43,9 @@ var (
 	endpoint               = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
 	nodeID                 = flag.String("nodeid", "", "node id")
 	controllerAddress      = flag.String("controller-address", "objectfs-controller:50051", "ObjectFS Controller address")
-	cacheSizeMB            = flag.Int64("cache-size-mb", 128, "Local node cache size in MB")
+	cacheSizeMB            = flag.Int64("cache-size-mb", 128, "Local node in-memory cache size in MB (for dirty write buffers)")
+	diskCacheSizeMB        = flag.Int64("disk-cache-size-mb", 10240, "Local node on-disk blob cache size in MB (default 10 GiB)")
+	cacheDir               = flag.String("cache-dir", "/var/cache/objectfs", "Path to node-local on-disk blob cache directory")
 	controllerRPCTimeout   = flag.Duration("controller-rpc-timeout", 30*time.Second, "Timeout for RPCs to ObjectFS controller")
 	controllerSyncTimeout  = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for sync RPCs (fsync, flush, write) to ObjectFS controller")
 	syncOnClose            = flag.Bool("sync-on-close", true, "Schedule non-blocking sync on file release")
@@ -77,7 +79,15 @@ func main() {
 
 	server := grpc.NewServer()
 
-	driver := newDriver(*nodeID, *controllerAddress, *cacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval)
+	driver, err := newDriver(*nodeID, *controllerAddress, *cacheDir, *cacheSizeMB*1024*1024, *diskCacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval)
+	if err != nil {
+		klog.Fatalf("failed to initialize driver: %v", err)
+	}
+	defer func() {
+		if closeErr := driver.Close(); closeErr != nil {
+			klog.V(4).Infof("driver close error: %v", closeErr)
+		}
+	}()
 
 	csi.RegisterIdentityServer(server, driver)
 	csi.RegisterNodeServer(server, driver)
@@ -112,7 +122,10 @@ type objectFSDriver struct {
 
 	nodeID                 string
 	controllerAddress      string
+	cacheDir               string
 	cacheBytes             int64
+	diskCacheBytes         int64
+	diskCache              *objectfuse.DiskBlobCache
 	rpcTimeout             time.Duration
 	syncTimeout            time.Duration
 	syncOnClose            bool
@@ -125,23 +138,45 @@ type objectFSDriver struct {
 	mounts map[string]*activeMount
 }
 
-func newDriver(nodeID, controllerAddress string, cacheBytes int64, rpcTimeout, syncTimeout time.Duration, syncOnClose bool, backgroundSyncInterval time.Duration) *objectFSDriver {
+func newDriver(nodeID, controllerAddress, cacheDir string, cacheBytes, diskCacheBytes int64, rpcTimeout, syncTimeout time.Duration, syncOnClose bool, backgroundSyncInterval time.Duration) (*objectFSDriver, error) {
 	if rpcTimeout <= 0 {
 		rpcTimeout = 30 * time.Second
 	}
 	if syncTimeout <= 0 {
 		syncTimeout = 10 * time.Minute
 	}
+	if cacheDir == "" {
+		cacheDir = "/var/cache/objectfs"
+	}
+	if diskCacheBytes <= 0 {
+		diskCacheBytes = 10 * 1024 * 1024 * 1024 // 10 GiB
+	}
+	diskCache, err := objectfuse.NewDiskBlobCache(cacheDir, diskCacheBytes)
+	if err != nil {
+		klog.Warningf("Failed to initialize DiskBlobCache at %s: %v", cacheDir, err)
+	}
 	return &objectFSDriver{
 		nodeID:                 nodeID,
 		controllerAddress:      controllerAddress,
+		cacheDir:               cacheDir,
 		cacheBytes:             cacheBytes,
+		diskCacheBytes:         diskCacheBytes,
+		diskCache:              diskCache,
 		rpcTimeout:             rpcTimeout,
 		syncTimeout:            syncTimeout,
 		syncOnClose:            syncOnClose,
 		backgroundSyncInterval: backgroundSyncInterval,
 		mounts:                 make(map[string]*activeMount),
+	}, nil
+}
+
+func (d *objectFSDriver) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.diskCache != nil {
+		return d.diskCache.Close()
 	}
+	return nil
 }
 
 func (d *objectFSDriver) getClient() (pb.ObjectFSControllerClient, error) {
@@ -252,6 +287,10 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	rawFS.SetSyncOnClose(d.syncOnClose)
 	rawFS.SetBackgroundSyncInterval(d.backgroundSyncInterval)
 
+	if d.diskCache != nil {
+		rawFS.SetDiskBlobCache(d.diskCache)
+	}
+
 	mountOpts := &gofuse.MountOptions{
 		AllowOther: true,
 		FsName:     "objectfs",
@@ -270,7 +309,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	}
 
 	watchCtx, cancel := context.WithCancel(context.Background())
-	objectfuse.StartWatcher(watchCtx, client, volumeID, d.nodeID, nodeCache)
+	objectfuse.StartWatcher(watchCtx, client, volumeID, d.nodeID, nodeCache, rawFS)
 	rawFS.StartBackgroundSync(watchCtx)
 
 	d.mu.Lock()
