@@ -135,6 +135,8 @@ func main() {
 			klog.Fatalf("invalid configuration: wal-durability %s requires --wal-target", *walDurability)
 		}
 		serverOpts = append(serverOpts, controller.WithServerWAL(*walDir, *walTarget, durability))
+	} else {
+		klog.Warningf("objectfs-controller: no WAL stream configured (--wal-dir unset): fsync is NOT durable across controller restarts; volumes behave as ephemeral shared disks and metadata is persisted only by the periodic flush (--flush-interval=%s) and on shutdown", *flushInterval)
 	}
 
 	grpcServer := grpc.NewServer()

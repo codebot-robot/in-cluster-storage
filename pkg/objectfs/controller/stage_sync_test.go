@@ -785,3 +785,148 @@ func TestStageAndSync_NonBlockingSyncWaiterNotAcknowledgedByEarlierSync(t *testi
 		t.Fatalf("sync 2 timed out waiting for follow-up sync")
 	}
 }
+
+// TestFsyncDurability_NoWAL_NonDurableAcrossRestart reproduces and asserts the behavior described in #246:
+// When a volume has no WAL stream (e.g. in-process test servers or memory backend without a WAL),
+// committed transactions live only in the local metadata index until FlushToBackend publishes an index snapshot.
+// A blocking Fsync returns success (packs uploaded to blob store), but a controller restart loses all metadata
+// mutations made since the last snapshot, so /f appears with its pre-write size (0) and empty content "".
+func TestFsyncDurability_NoWAL_NonDurableAcrossRestart(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	volumeID := "test-durability-no-wal-repro"
+	server1 := NewServer(backend)
+
+	// 1. Create /f (empty file) and publish an initial snapshot so /f exists in object storage.
+	createResp, err := testCreateFile(ctx, server1, volumeID, "/f", 0644, nil, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile /f failed: %v", err)
+	}
+	fIno := createResp.GetAttr().GetInode().GetIno()
+
+	if err := server1.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+
+	// 2. Write "hello" to /f and issue a blocking Fsync.
+	wResp, err := server1.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     fIno,
+		Offset:    0,
+		Data:      []byte("hello"),
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || wResp.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	syncResp, err := server1.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    fIno,
+		Blocking: true,
+	})
+	if err != nil || syncResp.GetError() != 0 {
+		t.Fatalf("Fsync(blocking) failed: %v", err)
+	}
+
+	// In-process read sees "hello" with size 5
+	readResp1, err := server1.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    fIno,
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil || string(readResp1.GetData()) != "hello" {
+		t.Fatalf("Expected in-process read on server1 to see 'hello', got err=%v, data=%q", err, string(readResp1.GetData()))
+	}
+
+	// 3. Simulate controller crash/restart without a periodic flush: close server1 without FlushAll
+	_ = server1.Close()
+
+	// 4. Start NewServer with sameBackend (no WAL stream)
+	server2 := NewServer(backend)
+	defer func() { _ = server2.Close() }()
+
+	// Read /f on recovered server:
+	// Because no WAL was configured and no periodic snapshot was published after the write,
+	// fsync was NOT durable across controller restart: size is 0 and content is empty "".
+	readResp2, err := testReadFile(ctx, server2, volumeID, "/f", 0, 1024)
+	if err != nil || readResp2.GetError() != 0 {
+		t.Fatalf("ReadFile on server2 failed: %v", err)
+	}
+	attrResp2, err := testGetAttr(ctx, server2, volumeID, "/f")
+	if err != nil || attrResp2.GetError() != 0 {
+		t.Fatalf("GetAttr on server2 failed: %v", err)
+	}
+	if len(readResp2.GetData()) != 0 || attrResp2.GetAttr().GetInode().GetSize() != 0 {
+		t.Fatalf("Expected size 0 and empty content due to non-durable fsync without WAL, got size %d and content %q",
+			attrResp2.GetAttr().GetInode().GetSize(), string(readResp2.GetData()))
+	}
+}
+
+// TestFsyncDurability_WithWAL_DurableAcrossRestart verifies that when a WAL stream is configured,
+// a blocking Fsync persists metadata to the WAL, surviving controller restart even without a periodic flush.
+func TestFsyncDurability_WithWAL_DurableAcrossRestart(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	bufDir := t.TempDir()
+	_, target, cleanup := startTestWalBufferServer(t, bufDir)
+	defer cleanup()
+
+	clientDir1 := t.TempDir()
+	volumeID := "test-durability-with-wal"
+	server1 := NewServer(backend, WithServerWAL(clientDir1, target, walclient.Witness))
+
+	// 1. Create /f and snapshot initial state
+	createResp, err := testCreateFile(ctx, server1, volumeID, "/f", 0644, nil, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile /f failed: %v", err)
+	}
+	fIno := createResp.GetAttr().GetInode().GetIno()
+
+	if err := server1.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+
+	// 2. Write "hello" and blocking Fsync
+	wResp, err := server1.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     fIno,
+		Offset:    0,
+		Data:      []byte("hello"),
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || wResp.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	syncResp, err := server1.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    fIno,
+		Blocking: true,
+	})
+	if err != nil || syncResp.GetError() != 0 {
+		t.Fatalf("Fsync(blocking) failed: %v, errno=%d", err, syncResp.GetError())
+	}
+
+	// 3. Crash restart: close server1 without FlushAll
+	_ = server1.Close()
+
+	// 4. Recover on server2 from backend + WAL
+	clientDir2 := t.TempDir()
+	server2 := NewServer(backend, WithServerWAL(clientDir2, target, walclient.Witness))
+	defer func() { _ = server2.Close() }()
+
+	readResp2, err := testReadFile(ctx, server2, volumeID, "/f", 0, 1024)
+	if err != nil || readResp2.GetError() != 0 {
+		t.Fatalf("ReadFile on server2 failed: %v", err)
+	}
+	attrResp2, err := testGetAttr(ctx, server2, volumeID, "/f")
+	if err != nil || attrResp2.GetError() != 0 {
+		t.Fatalf("GetAttr on server2 failed: %v", err)
+	}
+	if string(readResp2.GetData()) != "hello" || attrResp2.GetAttr().GetInode().GetSize() != 5 {
+		t.Fatalf("Expected size 5 and 'hello' on recovered server with WAL, got size %d and content %q",
+			attrResp2.GetAttr().GetInode().GetSize(), string(readResp2.GetData()))
+	}
+}
