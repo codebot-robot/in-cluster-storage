@@ -54,6 +54,7 @@ message SnapshotPointer {
   bytes registry_fingerprint = 4;
   string name = 5;
   google.protobuf.Timestamp created_at = 6;
+  string restored_from = 7;
 }
 
 message Registry {

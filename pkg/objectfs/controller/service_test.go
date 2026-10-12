@@ -1237,6 +1237,328 @@ func TestSnapshotRollback(t *testing.T) {
 	}
 }
 
+func TestSnapshotRestoreDurableAcrossRestart(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server1 := NewServer(backend)
+	volumeID := "test-restore-durable-restart"
+
+	// create /doc.txt "version 1 data"; CreateSnapshot s1
+	_, err := testCreateFile(ctx, server1, volumeID, "/doc.txt", 0644, []byte("version 1 data"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	snapResp1, err := server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot s1 failed: %v", err)
+	}
+	s1 := snapResp1.GetSnapshotName()
+
+	// write /doc.txt "version 2 data overwritten"; CreateSnapshot s2
+	_, err = testWriteFile(ctx, server1, volumeID, "/doc.txt", 0, []byte("version 2 data overwritten"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	_, err = server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot s2 failed: %v", err)
+	}
+
+	// RestoreSnapshot s1
+	if err := server1.RestoreSnapshot(ctx, volumeID, s1); err != nil {
+		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
+	}
+
+	// in-process read: "version 1 data"
+	readResp1, err := testReadFile(ctx, server1, volumeID, "/doc.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("in-process ReadFile failed: %v", err)
+	}
+	if string(readResp1.Data) != "version 1 data" {
+		t.Fatalf("in-process read got %q, want %q", string(readResp1.Data), "version 1 data")
+	}
+
+	// NewServer(backend) read: "version 1 data" (not "version 2 data overwritten")
+	server2 := NewServer(backend)
+	readResp2, err := testReadFile(ctx, server2, volumeID, "/doc.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("recovered server ReadFile failed: %v", err)
+	}
+	if string(readResp2.Data) != "version 1 data" {
+		t.Fatalf("recovered server read got %q, want %q", string(readResp2.Data), "version 1 data")
+	}
+}
+
+func TestSnapshotRestoreWriteThenRestart(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-restore-write-restart"
+
+	server1 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+
+	// Create v1
+	_, err := testCreateFile(ctx, server1, volumeID, "/doc.txt", 0644, []byte("version 1 data"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	s1Resp, err := server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot s1 failed: %v", err)
+	}
+	s1 := s1Resp.GetSnapshotName()
+
+	// Write pre-restore overwrite & create second doc
+	_, err = testWriteFile(ctx, server1, volumeID, "/doc.txt", 0, []byte("version 2 data overwritten"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	_, err = testCreateFile(ctx, server1, volumeID, "/pre_restore.txt", 0644, []byte("pre-restore only"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile pre_restore failed: %v", err)
+	}
+	_, err = server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot s2 failed: %v", err)
+	}
+
+	// RestoreSnapshot s1
+	if err := server1.RestoreSnapshot(ctx, volumeID, s1); err != nil {
+		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
+	}
+
+	// Post-restore write: modify doc.txt and create post_restore.txt
+	_, err = testWriteFile(ctx, server1, volumeID, "/doc.txt", 0, []byte("version 3 data post-restore"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("WriteFile post-restore failed: %v", err)
+	}
+	_, err = testCreateFile(ctx, server1, volumeID, "/post_restore.txt", 0644, []byte("post-restore created"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile post_restore failed: %v", err)
+	}
+
+	if err := server1.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+	_ = server1.Close()
+
+	// Restart controller from backend + WAL
+	server2 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	defer func() { _ = server2.Close() }()
+
+	// Read /doc.txt -> should be post-restore write ("version 3 data post-restore")
+	readDoc, err := testReadFile(ctx, server2, volumeID, "/doc.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("ReadFile /doc.txt on recovered server failed: %v", err)
+	}
+	if string(readDoc.Data) != "version 3 data post-restore" {
+		t.Fatalf("Expected 'version 3 data post-restore', got %q", string(readDoc.Data))
+	}
+
+	// /post_restore.txt MUST be present
+	readPost, err := testReadFile(ctx, server2, volumeID, "/post_restore.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("ReadFile /post_restore.txt failed: %v", err)
+	}
+	if string(readPost.Data) != "post-restore created" {
+		t.Fatalf("Expected 'post-restore created', got %q", string(readPost.Data))
+	}
+
+	// /pre_restore.txt MUST NOT be present (pre-restore write was rolled back)
+	preAttr, err := testGetAttr(ctx, server2, volumeID, "/pre_restore.txt")
+	if err != nil {
+		t.Fatalf("GetAttr /pre_restore.txt failed: %v", err)
+	}
+	if preAttr.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("Expected /pre_restore.txt to not exist after restart, got error %d", preAttr.GetError())
+	}
+}
+
+func TestSnapshotRestoreRebuildFromLog(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-restore-rebuild-log"
+
+	server1 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+
+	// 1. Create file & snapshot s1
+	_, err := testCreateFile(ctx, server1, volumeID, "/file1.txt", 0644, []byte("file 1 initial"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	s1Resp, err := server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot s1 failed: %v", err)
+	}
+	s1 := s1Resp.GetSnapshotName()
+
+	// 2. Pre-restore write & snapshot s2
+	_, err = testWriteFile(ctx, server1, volumeID, "/file1.txt", 0, []byte("file 1 overwritten in s2"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	_, err = testCreateFile(ctx, server1, volumeID, "/temp.txt", 0644, []byte("temporary"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile temp failed: %v", err)
+	}
+	_, err = server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot s2 failed: %v", err)
+	}
+
+	// 3. Restore to s1
+	if err := server1.RestoreSnapshot(ctx, volumeID, s1); err != nil {
+		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
+	}
+
+	// 4. Post-restore writes
+	_, err = testWriteFile(ctx, server1, volumeID, "/file1.txt", 0, []byte("file 1 post-restore write"), pb.WriteMode_WRITE_MODE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("WriteFile post-restore failed: %v", err)
+	}
+	_, err = testCreateFile(ctx, server1, volumeID, "/final.txt", 0644, []byte("final file"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile final failed: %v", err)
+	}
+
+	if err := server1.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+	vol1 := server1.GetVolume(volumeID)
+	if err := vol1.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+
+	// 5. Trigger Rebuild on volume index directly from log
+	// We force a rebuild of the index (which tails the stream records, encounters the restore record,
+	// replaces index with snapshot s1, and replays post-restore changes).
+	rebuiltIdx, rebuildPos, err := vol1.rebuildIndex(ctx)
+	if err != nil {
+		t.Fatalf("rebuildIndex failed: %v", err)
+	}
+	defer func() { _ = rebuiltIdx.Close() }()
+
+	if rebuildPos != vol1.Position() {
+		t.Fatalf("Rebuilt index position %d does not match volume position %d", rebuildPos, vol1.Position())
+	}
+
+	// 6. Verify rebuilt index content matches recovery state
+	entryKeyFinal, err := pkDirEntry.Extract(&pb.DirEntry{ParentIno: proto.Uint64(1), Name: proto.String("final.txt")})
+	if err != nil {
+		t.Fatalf("Extract final.txt key failed: %v", err)
+	}
+	msgFinal, okFinal, err := rebuiltIdx.Get(ctx, "objectfs.v1alpha1.DirEntry", entryKeyFinal)
+	if err != nil || !okFinal || msgFinal == nil {
+		t.Fatalf("final.txt not found in rebuilt index: ok=%v err=%v", okFinal, err)
+	}
+
+	entryKeyTemp, err := pkDirEntry.Extract(&pb.DirEntry{ParentIno: proto.Uint64(1), Name: proto.String("temp.txt")})
+	if err != nil {
+		t.Fatalf("Extract temp.txt key failed: %v", err)
+	}
+	_, okTemp, err := rebuiltIdx.Get(ctx, "objectfs.v1alpha1.DirEntry", entryKeyTemp)
+	if err != nil {
+		t.Fatalf("Get temp.txt failed: %v", err)
+	}
+	if okTemp {
+		t.Fatalf("temp.txt unexpectedly found in rebuilt index; restore record was not honoured!")
+	}
+
+	_ = server1.Close()
+
+	// Compare with fresh recovered server
+	server2 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	defer func() { _ = server2.Close() }()
+
+	read1, err := testReadFile(ctx, server2, volumeID, "/file1.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("ReadFile /file1.txt failed: %v", err)
+	}
+	if string(read1.Data) != "file 1 post-restore write" {
+		t.Fatalf("Recovered file1 content mismatch: got %q", string(read1.Data))
+	}
+	readFinal, err := testReadFile(ctx, server2, volumeID, "/final.txt", 0, 1024)
+	if err != nil {
+		t.Fatalf("ReadFile /final.txt failed: %v", err)
+	}
+	if string(readFinal.Data) != "final file" {
+		t.Fatalf("Recovered final content mismatch: got %q", string(readFinal.Data))
+	}
+}
+
+func TestSnapshotRestoreInodeMonotonicity(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-restore-inode-monotonic"
+
+	server1 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+
+	// 1. Create file 1 and take snapshot s1
+	f1Attr, err := testCreateFile(ctx, server1, volumeID, "/file1.txt", 0644, []byte("f1"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile 1 failed: %v", err)
+	}
+	ino1 := f1Attr.GetAttr().GetInode().GetIno()
+
+	s1Resp, err := server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot s1 failed: %v", err)
+	}
+	s1 := s1Resp.GetSnapshotName()
+
+	// 2. Create file 2 and file 3 (allocates higher inode numbers)
+	f2Attr, err := testCreateFile(ctx, server1, volumeID, "/file2.txt", 0644, []byte("f2"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile 2 failed: %v", err)
+	}
+	ino2 := f2Attr.GetAttr().GetInode().GetIno()
+
+	f3Attr, err := testCreateFile(ctx, server1, volumeID, "/file3.txt", 0644, []byte("f3"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile 3 failed: %v", err)
+	}
+	ino3 := f3Attr.GetAttr().GetInode().GetIno()
+
+	if ino2 <= ino1 || ino3 <= ino2 {
+		t.Fatalf("Expected strictly increasing inode numbers: ino1=%d, ino2=%d, ino3=%d", ino1, ino2, ino3)
+	}
+
+	// 3. Restore to snapshot s1 (file2 and file3 are rolled back)
+	if err := server1.RestoreSnapshot(ctx, volumeID, s1); err != nil {
+		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
+	}
+
+	// 4. Create a new file post-restore in the same running process
+	fPostAttr, err := testCreateFile(ctx, server1, volumeID, "/file_post.txt", 0644, []byte("fpost"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile post failed: %v", err)
+	}
+	inoPost := fPostAttr.GetAttr().GetInode().GetIno()
+
+	// Inode numbers must NOT collide with ino2 or ino3!
+	if inoPost <= ino3 {
+		t.Fatalf("Inode collision in running process: inoPost=%d <= ino3=%d (ino1=%d, ino2=%d)", inoPost, ino3, ino1, ino2)
+	}
+
+	_ = server1.Close()
+
+	// 5. Restart controller and create another file after recovery
+	server2 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	defer func() { _ = server2.Close() }()
+
+	fRestartAttr, err := testCreateFile(ctx, server2, volumeID, "/file_restart.txt", 0644, []byte("frestart"), 0, 0)
+	if err != nil {
+		t.Fatalf("CreateFile restart failed: %v", err)
+	}
+	inoRestart := fRestartAttr.GetAttr().GetInode().GetIno()
+
+	if inoRestart <= inoPost {
+		t.Fatalf("Inode collision after restart: inoRestart=%d <= inoPost=%d", inoRestart, inoPost)
+	}
+}
+
 func TestCSIControllerOperations(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()

@@ -218,7 +218,9 @@ func RestoreSnapshotKey(ctx context.Context, backend objectstore.Backend, stream
 
 	allOpts := append([]Option{WithStreamID(streamID)}, opts...)
 	store := New(allOpts...)
-	store.SetPosition(data.Position)
+	if err := store.SetPosition(data.Position); err != nil {
+		return nil, 0, fmt.Errorf("failed to set position: %w", err)
+	}
 
 	if len(data.Registry) > 0 {
 		var regProto sdsv1.Registry

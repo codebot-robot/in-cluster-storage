@@ -123,7 +123,6 @@ pkg/objectfs/controller/volume.go:(*Volume).loadFromBackendMetadataLocked:(githu
 pkg/objectfs/controller/volume.go:(*Volume).loadFromBackendMetadataLocked:github.com/gke-labs/in-cluster-storage/pkg/sds.SplitKeyAndNonKey
 pkg/objectfs/controller/volume.go:(*Volume).readChunkLocked:(io.Closer).Close
 pkg/objectfs/controller/volume.go:(*Volume).readChunkLocked:(io.Closer).Close
-pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).ApplyBatch
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
@@ -137,7 +136,6 @@ pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
-pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:github.com/gke-labs/in-cluster-storage/pkg/sds.SplitKeyAndNonKey
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:github.com/gke-labs/in-cluster-storage/pkg/sds.SplitKeyAndNonKey
 pkg/objectfs/controller/volume.go:NewVolume:(*github.com/gke-labs/in-cluster-storage/pkg/sds.PrimaryKey).Extract
 pkg/objectfs/controller/volume.go:NewVolume:(*github.com/gke-labs/in-cluster-storage/pkg/sds/view.View).ApplyChangesSync

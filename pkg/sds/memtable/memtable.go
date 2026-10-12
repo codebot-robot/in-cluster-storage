@@ -214,10 +214,11 @@ func (m *MemStore) Position() uint64 {
 }
 
 // SetPosition sets the current stream sequence position.
-func (m *MemStore) SetPosition(pos uint64) {
+func (m *MemStore) SetPosition(pos uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastPosition = pos
+	return nil
 }
 
 // Registry returns the in-band type registry.

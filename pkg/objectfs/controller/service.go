@@ -444,9 +444,8 @@ func (s *Server) GetVolume(volumeID string) *Volume {
 }
 
 // RestoreSnapshot restores the volume filesystem state to a specific snapshot.
-// Note: Snapshot restore is currently local to the running controller instance; a controller restart
-// replays subsequent stream records against the latest published snapshot. Durable restore across restarts
-// is tracked in issue #225.
+// The restore operation is logged to the stream and published as a fresh snapshot,
+// making it durable across controller restarts and rebuilds.
 func (s *Server) RestoreSnapshot(ctx context.Context, volumeID, snapshotName string) error {
 	vol, err := s.getOrCreateVolume(volumeID)
 	if err != nil {

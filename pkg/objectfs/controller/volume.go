@@ -3961,6 +3961,102 @@ func (v *Volume) initLiveStatsLocked() {
 	v.liveStats = &pb.VolumeStats{Name: VolumeStatsRowName}
 }
 
+func (v *Volume) rebuildRestoreSnapshot(ctx context.Context, oldIdx sds.LocalIndex, ptr *sdsv1.SnapshotPointer, seq uint64, highestReplayedIno uint64) (sds.LocalIndex, error) {
+	if oldIdx != nil {
+		statsPK := sds.NewKeyFromBytes([]byte(VolumeStatsRowName))
+		if msg, ok, sErr := oldIdx.Get(ctx, VolumeStatsTypeName, statsPK); sErr == nil && ok && msg != nil {
+			if vs, ok := msg.(*pb.VolumeStats); ok && vs != nil && vs.GetMaxIno() > highestReplayedIno {
+				highestReplayedIno = vs.GetMaxIno()
+			}
+		}
+		if err := oldIdx.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close previous index during rebuild: %w", err)
+		}
+	}
+	restoredIdx, _, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), ptr.GetRestoredFrom(), v.localStorageDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to restore snapshot %q during rebuild: %w", ptr.GetRestoredFrom(), err)
+	}
+	if err := restoredIdx.SetPosition(seq); err != nil {
+		if closeErr := restoredIdx.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to set position (%v) and close failed: %w", err, closeErr)
+		}
+		return nil, fmt.Errorf("failed to set position on restored index during rebuild: %w", err)
+	}
+	if highestReplayedIno > 0 {
+		statsPK := sds.NewKeyFromBytes([]byte(VolumeStatsRowName))
+		if msg, ok, sErr := restoredIdx.Get(ctx, VolumeStatsTypeName, statsPK); sErr == nil && ok && msg != nil {
+			if vs, ok := msg.(*pb.VolumeStats); ok && vs != nil && highestReplayedIno > vs.GetMaxIno() {
+				updatedStats := proto.Clone(vs).(*pb.VolumeStats)
+				updatedStats.MaxIno = highestReplayedIno
+				if v.metadataStream != nil {
+					if def, _, ok := v.metadataStream.Registry().LookupByName(VolumeStatsTypeName); ok {
+						kBytes, vBytes, err := sds.SplitKeyAndNonKey(updatedStats, def.GetKeyFields())
+						if err != nil {
+							if closeErr := restoredIdx.Close(); closeErr != nil {
+								return nil, fmt.Errorf("failed to split stats row (%v) and close failed: %w", err, closeErr)
+							}
+							return nil, fmt.Errorf("failed to split stats row: %w", err)
+						}
+						if err := restoredIdx.ApplyBatch(ctx, []sds.Change{
+							{
+								Seq:      seq,
+								TypeName: VolumeStatsTypeName,
+								TypeID:   def.GetId(),
+								Op:       sds.OpUpdate,
+								Key:      sds.NewKeyFromBytes(kBytes),
+								RawKey:   kBytes,
+								RawVal:   vBytes,
+								Row:      updatedStats,
+							},
+						}); err != nil {
+							if closeErr := restoredIdx.Close(); closeErr != nil {
+								return nil, fmt.Errorf("failed to update stats (%v) and close failed: %w", err, closeErr)
+							}
+							return nil, fmt.Errorf("failed to update stats in restored index: %w", err)
+						}
+					}
+				}
+			}
+		}
+	}
+	if v.metadataStream != nil {
+		if err := restoredIdx.SyncRegistry(ctx, v.metadataStream.Registry()); err != nil {
+			if closeErr := restoredIdx.Close(); closeErr != nil {
+				return nil, fmt.Errorf("failed to sync registry (%v) and close failed: %w", err, closeErr)
+			}
+			return nil, fmt.Errorf("failed to sync registry to rebuilt index: %w", err)
+		}
+	}
+	return restoredIdx, nil
+}
+
+func (v *Volume) applyRestoreRecordLocked(ctx context.Context, ptr *sdsv1.SnapshotPointer, seq uint64, highestReplayedIno *uint64) error {
+	var curHigh uint64
+	if highestReplayedIno != nil {
+		curHigh = *highestReplayedIno
+	}
+	var oldIdx sds.LocalIndex
+	if v.metadataView != nil {
+		oldIdx = v.metadataView.Index()
+		if err := v.metadataView.Close(); err != nil {
+			return fmt.Errorf("failed to close metadata view during replay restore: %w", err)
+		}
+		v.metadataView = nil
+	}
+	restoredIdx, err := v.rebuildRestoreSnapshot(ctx, oldIdx, ptr, seq, curHigh)
+	if err != nil {
+		return err
+	}
+	if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
+		return fmt.Errorf("failed to init metadata view from replay restored snapshot: %w", err)
+	}
+	v.lastCommitSeq = seq
+	v.dirParents = make(map[uint64]uint64)
+	v.dirParents[1] = 1
+	return nil
+}
+
 func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, error) {
 	if v.indexFactory == nil {
 		f, err := sds.GetIndexFactory("sqlite")
@@ -4035,8 +4131,10 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 	}
 
 	// 5. Replay the stream from snapPos up to current position.
+	var highestReplayedIno uint64
 	if v.stream != nil {
 		cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
+		dec := record.NewDecoder(record.WithDecoderRegistry(v.metadataStream.Registry()))
 		seenSeqs := make(map[uint64]bool)
 		expectedSeq := snapPos + 1
 
@@ -4050,6 +4148,11 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 			for _, ch := range changes {
 				if ch.Seq > snapPos {
 					snapPos = ch.Seq
+				}
+				if ch.TypeName == InodeTypeName {
+					if in, ok := ch.Row.(*pb.Inode); ok && in != nil && in.GetIno() > highestReplayedIno {
+						highestReplayedIno = in.GetIno()
+					}
 				}
 			}
 			return nil
@@ -4074,6 +4177,22 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 				}
 				expectedSeq++
 				seenSeqs[seq] = true
+				rec, decErr := dec.Decode(payload)
+				if decErr == nil && rec.TypeID == record.TypeIDSnapshotPointer {
+					if ptr, ok := rec.Message.(*sdsv1.SnapshotPointer); ok && ptr != nil && ptr.GetRestoredFrom() != "" {
+						newIdx, err := v.rebuildRestoreSnapshot(ctx, rebuiltIdx, ptr, seq, highestReplayedIno)
+						if err != nil {
+							return nil, 0, err
+						}
+						rebuiltIdx = newIdx
+						snapPos = seq
+						cr.DiscardPending()
+						if seq >= witnessHead {
+							break
+						}
+						continue
+					}
+				}
 				changes, err := cr.Feed(seq, payload)
 				if err != nil {
 					_ = rebuiltIdx.Close()
@@ -4105,6 +4224,19 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 			}
 			expectedSeq++
 			seenSeqs[rec.StreamSeq] = true
+			r, decErr := dec.Decode(rec.Payload)
+			if decErr == nil && r.TypeID == record.TypeIDSnapshotPointer {
+				if ptr, ok := r.Message.(*sdsv1.SnapshotPointer); ok && ptr != nil && ptr.GetRestoredFrom() != "" {
+					newIdx, err := v.rebuildRestoreSnapshot(ctx, rebuiltIdx, ptr, rec.StreamSeq, highestReplayedIno)
+					if err != nil {
+						return nil, 0, err
+					}
+					rebuiltIdx = newIdx
+					snapPos = rec.StreamSeq
+					cr.DiscardPending()
+					continue
+				}
+			}
 			changes, err := cr.Feed(rec.StreamSeq, rec.Payload)
 			if err != nil {
 				_ = rebuiltIdx.Close()
@@ -4120,6 +4252,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 		startSeq := v.memAppender.StartSeq()
 		if len(payloads) > 0 {
 			cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
+			dec := record.NewDecoder(record.WithDecoderRegistry(v.metadataStream.Registry()))
 			expectedSeq := snapPos + 1
 			for seqOffset, p := range payloads {
 				seq := startSeq + uint64(seqOffset)
@@ -4131,6 +4264,19 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 					return nil, 0, fmt.Errorf("stream contiguity violation in memAppender: expected seq %d, got %d", expectedSeq, seq)
 				}
 				expectedSeq++
+				rec, decErr := dec.Decode(p)
+				if decErr == nil && rec.TypeID == record.TypeIDSnapshotPointer {
+					if ptr, ok := rec.Message.(*sdsv1.SnapshotPointer); ok && ptr != nil && ptr.GetRestoredFrom() != "" {
+						newIdx, err := v.rebuildRestoreSnapshot(ctx, rebuiltIdx, ptr, seq, highestReplayedIno)
+						if err != nil {
+							return nil, 0, err
+						}
+						rebuiltIdx = newIdx
+						snapPos = seq
+						cr.DiscardPending()
+						continue
+					}
+				}
 				chs, err := cr.Feed(seq, p)
 				if err != nil {
 					_ = rebuiltIdx.Close()
@@ -4145,6 +4291,11 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 						if ch.Seq > snapPos {
 							snapPos = ch.Seq
 						}
+						if ch.TypeName == InodeTypeName {
+							if in, ok := ch.Row.(*pb.Inode); ok && in != nil && in.GetIno() > highestReplayedIno {
+								highestReplayedIno = in.GetIno()
+							}
+						}
 					}
 				}
 			}
@@ -4153,11 +4304,48 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 
 	// 6. Ensure stats row exists or backfill stats in the rebuilt index
 	statsPK := sds.NewKeyFromBytes([]byte(VolumeStatsRowName))
-	if _, ok, sErr := rebuiltIdx.Get(ctx, VolumeStatsTypeName, statsPK); sErr == nil && !ok {
+	if msg, ok, sErr := rebuiltIdx.Get(ctx, VolumeStatsTypeName, statsPK); sErr == nil && ok && msg != nil {
+		if vs, ok := msg.(*pb.VolumeStats); ok && vs != nil && highestReplayedIno > vs.GetMaxIno() {
+			updatedStats := proto.Clone(vs).(*pb.VolumeStats)
+			updatedStats.MaxIno = highestReplayedIno
+			if def, _, ok := v.metadataStream.Registry().LookupByName(VolumeStatsTypeName); ok {
+				kBytes, vBytes, err := sds.SplitKeyAndNonKey(updatedStats, def.GetKeyFields())
+				if err != nil {
+					if closeErr := rebuiltIdx.Close(); closeErr != nil {
+						return nil, 0, fmt.Errorf("failed to split updated stats row (%v) and close failed: %w", err, closeErr)
+					}
+					return nil, 0, fmt.Errorf("failed to split updated stats row: %w", err)
+				}
+				if err := rebuiltIdx.ApplyBatch(ctx, []sds.Change{
+					{
+						Seq:      snapPos,
+						TypeName: VolumeStatsTypeName,
+						TypeID:   def.GetId(),
+						Op:       sds.OpUpdate,
+						Key:      sds.NewKeyFromBytes(kBytes),
+						RawKey:   kBytes,
+						RawVal:   vBytes,
+						Row:      updatedStats,
+					},
+				}); err != nil {
+					if closeErr := rebuiltIdx.Close(); closeErr != nil {
+						return nil, 0, fmt.Errorf("failed to update stats in rebuilt index (%v) and close failed: %w", err, closeErr)
+					}
+					return nil, 0, fmt.Errorf("failed to update stats in rebuilt index: %w", err)
+				}
+			}
+		}
+	} else if sErr == nil && !ok {
 		if stats, cErr := v.countStatsFromIndex(ctx, rebuiltIdx); cErr == nil && stats != nil {
 			if def, _, ok := v.metadataStream.Registry().LookupByName(VolumeStatsTypeName); ok {
-				kBytes, vBytes, _ := sds.SplitKeyAndNonKey(stats, def.GetKeyFields())
-				_ = rebuiltIdx.ApplyBatch(ctx, []sds.Change{
+				kBytes, vBytes, err := sds.SplitKeyAndNonKey(stats, def.GetKeyFields())
+				if err != nil {
+					if closeErr := rebuiltIdx.Close(); closeErr != nil {
+						return nil, 0, fmt.Errorf("failed to split backfilled stats row (%v) and close failed: %w", err, closeErr)
+					}
+					return nil, 0, fmt.Errorf("failed to split backfilled stats row: %w", err)
+				}
+				if err := rebuiltIdx.ApplyBatch(ctx, []sds.Change{
 					{
 						Seq:      snapPos,
 						TypeName: VolumeStatsTypeName,
@@ -4168,7 +4356,12 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 						RawVal:   vBytes,
 						Row:      stats,
 					},
-				})
+				}); err != nil {
+					if closeErr := rebuiltIdx.Close(); closeErr != nil {
+						return nil, 0, fmt.Errorf("failed to apply backfilled stats (%v) and close failed: %w", err, closeErr)
+					}
+					return nil, 0, fmt.Errorf("failed to apply backfilled stats: %w", err)
+				}
 			}
 		}
 	}
@@ -4311,6 +4504,10 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		v.dirParents[1] = 1
 	}
 
+	if snapPos > v.lastCommitSeq {
+		v.lastCommitSeq = snapPos
+	}
+
 	// Replay stream from snapPos
 	var highestReplayedIno uint64
 	if v.stream != nil {
@@ -4361,6 +4558,16 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 					klog.Warningf("volume %s: failed to decode authoritative record at seq %d: %v", v.volumeID, seq, decErr)
 				} else if rec.TypeID == record.TypeIDSnapshotPointer {
 					if ptr, ok := rec.Message.(*sdsv1.SnapshotPointer); ok && ptr != nil {
+						if ptr.GetRestoredFrom() != "" {
+							if err := v.applyRestoreRecordLocked(ctx, ptr, seq, &highestReplayedIno); err != nil {
+								return err
+							}
+							cr.DiscardPending()
+							if seq >= witnessHead {
+								break
+							}
+							continue
+						}
 						v.snapshotPointers = append(v.snapshotPointers, ptr)
 					}
 				}
@@ -4396,6 +4603,13 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				klog.Warningf("volume %s: failed to decode local recovered record at seq %d: %v", v.volumeID, rec.StreamSeq, decErr)
 			} else if r.TypeID == record.TypeIDSnapshotPointer {
 				if ptr, ok := r.Message.(*sdsv1.SnapshotPointer); ok && ptr != nil {
+					if ptr.GetRestoredFrom() != "" {
+						if err := v.applyRestoreRecordLocked(ctx, ptr, rec.StreamSeq, &highestReplayedIno); err != nil {
+							return err
+						}
+						cr.DiscardPending()
+						continue
+					}
 					v.snapshotPointers = append(v.snapshotPointers, ptr)
 				}
 			}
@@ -4498,6 +4712,9 @@ func (v *Volume) ListSnapshots(ctx context.Context) ([]*sdsv1.SnapshotPointer, e
 func (v *Volume) listSnapshotsLocked(ctx context.Context) ([]*sdsv1.SnapshotPointer, error) {
 	pointersByLoc := make(map[string]*sdsv1.SnapshotPointer)
 	for _, ptr := range v.snapshotPointers {
+		if ptr.GetRestoredFrom() != "" {
+			continue
+		}
 		pointersByLoc[ptr.GetLocation()] = ptr
 	}
 
@@ -4569,10 +4786,11 @@ func (v *Volume) getSnapshotInfoLocked(ctx context.Context, snapshotName string)
 	return nil, fmt.Errorf("snapshot %q not found", snapshotName)
 }
 
-// RestoreSnapshot restores the volume filesystem state to a specific snapshot using indexFactory.RestoreSnapshot.
-// Note: Snapshot restore is currently local to the running controller instance; a controller restart
-// replays subsequent stream records against the latest published snapshot. Durable restore across restarts
-// is tracked in issue #225.
+// RestoreSnapshot restores the volume filesystem state to a specific snapshot.
+// A restore is appended to the stream as a Restore record (SnapshotPointer with restored_from set)
+// at the head (H+1). The index is restored from the snapshot, its position set to H+1, stats and
+// allocator re-initialized (with inode numbers monotonic across the restore), and a fresh index
+// snapshot published at H+1 so recovery has a snapshot that already reflects the restore.
 func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error {
 	v.stagingMu.Lock()
 	v.stagedChunks = make(map[uint64]map[int][]byte)
@@ -4610,14 +4828,55 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 		return fmt.Errorf("snapshot %q not found", snapshotName)
 	}
 
+	if err := v.flushOverlayLocked(ctx); err != nil {
+		return fmt.Errorf("failed to flush overlay before restore: %w", err)
+	}
+
+	var preRestoreMaxIno uint64
+	if v.liveStats != nil {
+		preRestoreMaxIno = v.liveStats.GetMaxIno()
+	}
+	if v.nextInode > preRestoreMaxIno {
+		preRestoreMaxIno = v.nextInode
+	}
+
+	restorePtr := &sdsv1.SnapshotPointer{
+		Position:     targetPtr.GetPosition(),
+		Format:       targetPtr.GetFormat(),
+		Location:     targetPtr.GetLocation(),
+		Name:         snapshotName,
+		CreatedAt:    timestamppb.Now(),
+		RestoredFrom: targetPtr.GetLocation(),
+	}
+
+	var restoreSeq uint64
+	if v.metadataStream != nil {
+		seq, err := v.metadataStream.AppendSnapshotPointer(ctx, restorePtr)
+		if err != nil {
+			return fmt.Errorf("failed to append restore record: %w", err)
+		}
+		restoreSeq = seq
+	} else {
+		restoreSeq = v.lastCommitSeq + 1
+	}
+	v.lastCommitSeq = restoreSeq
+
+	if v.stream != nil && v.stream.ReplicationLevel() == walclient.Permanent {
+		if err := v.stream.Flush(ctx); err != nil {
+			return fmt.Errorf("failed to flush WAL stream after restore: %w", err)
+		}
+	}
+
+	var oldIdx sds.LocalIndex
 	if v.metadataView != nil {
+		oldIdx = v.metadataView.Index()
 		if err := v.metadataView.Close(); err != nil {
 			return fmt.Errorf("failed to close metadata view: %w", err)
 		}
 		v.metadataView = nil
 	}
 
-	restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), targetPtr.GetLocation(), v.localStorageDir)
+	restoredIdx, err := v.rebuildRestoreSnapshot(ctx, oldIdx, restorePtr, restoreSeq, preRestoreMaxIno)
 	if err != nil {
 		return fmt.Errorf("failed to restore snapshot %q: %w", snapshotName, err)
 	}
@@ -4625,7 +4884,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 	if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
 		return fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
 	}
-	v.lastCommitSeq = rPos
+	v.lastCommitSeq = restoreSeq
 
 	v.metadataView.ClearCache()
 	v.dirParents = make(map[uint64]uint64)
@@ -4633,10 +4892,34 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 	// Active file handles (v.handles) and open inode refcounts (v.openInodes)
 	// are retained across snapshot restore because they refer to the running clients.
 	v.initLiveStatsLocked()
-	if err := v.initNextInodeFromStatsLocked(ctx, 0); err != nil {
+	if err := v.initNextInodeFromStatsLocked(ctx, preRestoreMaxIno); err != nil {
 		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
 	}
 	v.assertStatsMatchLocked("after RestoreSnapshot")
+
+	snap, ok := v.metadataView.Index().(sds.Snapshotter)
+	if !ok {
+		return fmt.Errorf("volume metadata index does not support snapshots")
+	}
+
+	freshKey, freshPos, err := snap.PublishSnapshot(ctx, v.backend)
+	if err != nil {
+		return fmt.Errorf("failed to publish fresh index snapshot after restore: %w", err)
+	}
+
+	format := ""
+	if v.indexFactory != nil {
+		format = v.indexFactory.Format()
+	}
+
+	freshPtr := &sdsv1.SnapshotPointer{
+		Position:  freshPos,
+		Format:    format,
+		Location:  freshKey,
+		Name:      path.Base(freshKey),
+		CreatedAt: timestamppb.Now(),
+	}
+	v.snapshotPointers = append(v.snapshotPointers, restorePtr, freshPtr)
 
 	return nil
 }
