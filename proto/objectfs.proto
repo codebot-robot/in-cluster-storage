@@ -43,6 +43,7 @@ service ObjectFSController {
 
   rpc ListBlobs(ListBlobsRequest) returns (ListBlobsResponse);
   rpc GetBlob(GetBlobRequest) returns (stream GetBlobResponse);
+  rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
@@ -333,6 +334,20 @@ message GetBlobRequest {
 
 message GetBlobResponse {
   bytes data = 1;
+}
+
+message GetManifestRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+}
+
+message GetManifestResponse {
+  uint64 inode = 1;
+  uint32 chunk_size = 2;
+  int64 total_size = 3;
+  repeated string chunk_sha256 = 4;
+  bytes inline_data = 5;
+  int32 error = 6;
 }
 
 message ListVolumesRequest {
