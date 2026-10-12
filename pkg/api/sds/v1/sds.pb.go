@@ -298,6 +298,7 @@ type SnapshotPointer struct {
 	RegistryFingerprint []byte                 `protobuf:"bytes,4,opt,name=registry_fingerprint,json=registryFingerprint,proto3" json:"registry_fingerprint,omitempty"`
 	Name                string                 `protobuf:"bytes,5,opt,name=name,proto3" json:"name,omitempty"`
 	CreatedAt           *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	RestoredFrom        string                 `protobuf:"bytes,7,opt,name=restored_from,json=restoredFrom,proto3" json:"restored_from,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
@@ -374,6 +375,13 @@ func (x *SnapshotPointer) GetCreatedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *SnapshotPointer) GetRestoredFrom() string {
+	if x != nil {
+		return x.RestoredFrom
+	}
+	return ""
+}
+
 type Registry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Types         []*TypeDefinition      `protobuf:"bytes,1,rep,name=types,proto3" json:"types,omitempty"`
@@ -446,7 +454,7 @@ const file_proto_sds_proto_rawDesc = "" +
 	"\bTxCommit\x12\x13\n" +
 	"\x05tx_id\x18\x01 \x01(\x04R\x04txId\x12;\n" +
 	"\vcommit_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"commitTime\"\xe3\x01\n" +
+	"commitTime\"\x88\x02\n" +
 	"\x0fSnapshotPointer\x12\x1a\n" +
 	"\bposition\x18\x01 \x01(\x04R\bposition\x12\x16\n" +
 	"\x06format\x18\x02 \x01(\tR\x06format\x12\x1a\n" +
@@ -454,7 +462,8 @@ const file_proto_sds_proto_rawDesc = "" +
 	"\x14registry_fingerprint\x18\x04 \x01(\fR\x13registryFingerprint\x12\x12\n" +
 	"\x04name\x18\x05 \x01(\tR\x04name\x129\n" +
 	"\n" +
-	"created_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"8\n" +
+	"created_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12#\n" +
+	"\rrestored_from\x18\a \x01(\tR\frestoredFrom\"8\n" +
 	"\bRegistry\x12,\n" +
 	"\x05types\x18\x01 \x03(\v2\x16.sds.v1.TypeDefinitionR\x05typesB:Z8github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1;v1b\x06proto3"
 
