@@ -368,6 +368,25 @@ func (c *NodeCache) GetDirtyEntries() []*CachedEntry {
 	return dirty
 }
 
+func (c *NodeCache) GetDirtySize(inode uint64) (int64, Generation, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, ok := c.entries[inode]
+	if !ok || entry.SizeGen == 0 {
+		return 0, 0, false
+	}
+	return entry.Size, entry.SizeGen, true
+}
+
+func (c *NodeCache) IsInodeDirty(inode uint64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, ok := c.entries[inode]
+	return ok && entry.IsDirty
+}
+
 func (c *NodeCache) GetDirtyBytes() int64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -625,6 +644,11 @@ func (c *NodeCache) Truncate(inode uint64, size int64, modTime time.Time) Genera
 				}
 				entry.Chunks[idx] = chunk[:lastChunkLen]
 			}
+		}
+	}
+	for idx := range entry.DirtyChunks {
+		if idx >= numChunks {
+			delete(entry.DirtyChunks, idx)
 		}
 	}
 
