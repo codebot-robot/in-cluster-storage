@@ -72,7 +72,58 @@ The E2E suite will:
 
 ## 4. Error Handling Mandate
 
-**Never ignore errors silently.** If an error cannot be proven safe to discard or recover from, it must be returned to the caller or explicitly logged with technical context. Silently discarding errors hides corrupted state, data loss, and race conditions.
+**Never ignore errors silently.** Silently discarding errors hides corrupted state, data loss, and race conditions. Every error must be handled in one of three ways:
+
+1. **Return to the caller** when the current function cannot safely complete or recover:
+   ```go
+   if err := doSomething(); err != nil {
+       return fmt.Errorf("failed to do something: %w", err)
+   }
+   ```
+
+2. **Log with technical context** when the operation is best-effort or part of cleanup where failure should not abort the caller:
+   ```go
+   if err := unmount(path); err != nil {
+       klog.Warningf("failed to unmount %s: %v", path, err)
+   }
+   ```
+
+3. **Handle explicitly** when a specific error code or condition is expected and benign:
+   ```go
+   if err := syscall.Unmount(path, 0); err != nil && err != syscall.EINVAL {
+       return fmt.Errorf("failed to unmount %s: %w", path, err)
+   }
+   ```
+
+### Safe Cleanup Helpers (`pkg/errutil`)
+
+For closing `io.Closer` resources without dropping errors, use the helpers in `pkg/errutil`:
+
+- **`errutil.CloseAndLog(c, what)`**: For read-only resources (files opened for reading, HTTP response bodies, network connections) where a close failure does not affect data durability:
+  ```go
+  stream, err := blobStore.GetBlob(ctx, sha)
+  if err != nil {
+      return err
+  }
+  defer errutil.CloseAndLog(stream, "blob stream")
+  ```
+
+- **`errutil.CloseWithErr(c, &err)`**: For writable resources (files or streams opened for writing) where buffered data is flushed on close, so a close failure must be returned if no earlier error occurred:
+  ```go
+  func writeToFile(path string, data []byte) (err error) {
+      f, err := os.Create(path)
+      if err != nil {
+          return err
+      }
+      defer errutil.CloseWithErr(f, &err)
+      _, err = f.Write(data)
+      return err
+  }
+  ```
+
+### Enforcement & Ratchet Baseline
+
+`ap lint` enforces error handling via the `droppederrors` check using a ratchet baseline in `.ap/droppederrors-baseline.txt`. This baseline only ever shrinks as grandfathered sites are resolved; never run `ap lint droppederrors --write-baseline` to add new entries. See #189 for the dropped-errors burn-down tracker.
 
 ---
 
