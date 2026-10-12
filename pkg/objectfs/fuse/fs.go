@@ -801,8 +801,122 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		totalSize = clientSize
 	}
 
+	numChunks := endChunk - startChunk + 1
+
+	type chunkSlot struct {
+		data []byte
+	}
+	slots := make([]chunkSlot, numChunks)
+
+	type uncachedChunk struct {
+		pIdx       int
+		chunkIdx   int
+		chunkStart int64
+	}
+	var uncached []uncachedChunk
+
+	for i := startChunk; i <= endChunk; i++ {
+		pIdx := i - startChunk
+		if cachedChunk, ok := fs.cache.GetChunk(input.NodeId, i); ok {
+			slots[pIdx].data = cachedChunk
+		} else {
+			uncached = append(uncached, uncachedChunk{
+				pIdx:       pIdx,
+				chunkIdx:   i,
+				chunkStart: int64(i) * cs,
+			})
+		}
+	}
+
+	fetchChunk := func(fCtx context.Context, uc uncachedChunk) ([]byte, int64, fuse.Status, error) {
+		readGen := fs.cache.GetGeneration(input.NodeId)
+		resp, err := fs.client.ReadFile(fCtx, &pb.ReadFileRequest{
+			VolumeId: fs.volumeID,
+			Inode:    input.NodeId,
+			Offset:   uc.chunkStart,
+			Size:     cs,
+		})
+		if err != nil {
+			return nil, 0, fs.grpcErrorToStatus("ReadFile", err), err
+		}
+		if resp.GetError() != 0 {
+			return nil, 0, fuse.Status(resp.GetError()), nil
+		}
+		fetchedData := resp.GetData()
+		if (int64(len(fetchedData)) == cs || resp.GetEof()) && len(fetchedData) > 0 {
+			fs.cache.PutChunk(input.NodeId, uc.chunkIdx, uint32(cs), resp.GetTotalSize(), fetchedData, time.Now(), readGen)
+		}
+		return fetchedData, resp.GetTotalSize(), fuse.OK, nil
+	}
+
+	if len(uncached) == 1 {
+		u := uncached[0]
+		data, tSize, st, err := fetchChunk(ctx, u)
+		if st != fuse.OK {
+			return nil, st
+		}
+		if err != nil {
+			return nil, fs.grpcErrorToStatus("ReadFile", err)
+		}
+		if tSize > totalSize {
+			totalSize = tSize
+		}
+		slots[u.pIdx].data = data
+	} else if len(uncached) > 1 {
+		var wg sync.WaitGroup
+		var errMu sync.Mutex
+		var firstErr error
+		var firstStatus fuse.Status = fuse.OK
+
+		fetchCtx, fetchCancel := context.WithCancel(ctx)
+		defer fetchCancel()
+
+		for _, u := range uncached {
+			wg.Add(1)
+			go func(uc uncachedChunk) {
+				defer wg.Done()
+
+				if fetchCtx.Err() != nil {
+					return
+				}
+
+				data, tSize, st, err := fetchChunk(fetchCtx, uc)
+				if st != fuse.OK || err != nil {
+					errMu.Lock()
+					if firstErr == nil && firstStatus == fuse.OK {
+						firstErr = err
+						firstStatus = st
+						fetchCancel()
+					}
+					errMu.Unlock()
+					return
+				}
+
+				errMu.Lock()
+				if tSize > totalSize {
+					totalSize = tSize
+				}
+				errMu.Unlock()
+
+				slots[uc.pIdx].data = data
+			}(u)
+		}
+		wg.Wait()
+
+		if firstStatus != fuse.OK {
+			return nil, firstStatus
+		}
+		if firstErr != nil {
+			return nil, fs.grpcErrorToStatus("ReadFile", firstErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, fs.grpcErrorToStatus("ReadFile", err)
+		}
+	}
+
 	var result []byte
 	for i := startChunk; i <= endChunk; i++ {
+		pIdx := i - startChunk
 		chunkStart := int64(i) * cs
 		rStart := offset - chunkStart
 		if rStart < 0 {
@@ -813,80 +927,30 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 			rEnd = cs
 		}
 
-		// 1. Check if chunk is in cache
-		if cachedChunk, ok := fs.cache.GetChunk(input.NodeId, i); ok {
-			chunkLen := int64(len(cachedChunk))
-			if hasClientEntry && totalSize > 0 {
-				expectedLen := cs
-				if int64(i+1)*cs > totalSize {
-					expectedLen = totalSize - chunkStart
-				}
-				if expectedLen < 0 {
-					expectedLen = 0
-				}
-				if chunkLen < expectedLen {
-					padded := make([]byte, expectedLen)
-					copy(padded, cachedChunk)
-					cachedChunk = padded
-					chunkLen = expectedLen
-				}
+		chunkData := slots[pIdx].data
+		chunkLen := int64(len(chunkData))
+		if totalSize > 0 {
+			expectedLen := cs
+			if int64(i+1)*cs > totalSize {
+				expectedLen = totalSize - chunkStart
 			}
-			if rStart < chunkLen {
-				end := rEnd
-				if end > chunkLen {
-					end = chunkLen
-				}
-				result = append(result, cachedChunk[rStart:end]...)
+			if expectedLen < 0 {
+				expectedLen = 0
 			}
-			continue
+			if chunkLen < expectedLen {
+				padded := make([]byte, expectedLen)
+				copy(padded, chunkData)
+				chunkData = padded
+				chunkLen = expectedLen
+			}
 		}
 
-		// 2. Not in cache: fetch chunk from controller
-		readGen := fs.cache.GetGeneration(input.NodeId)
-		resp, err := fs.client.ReadFile(ctx, &pb.ReadFileRequest{
-			VolumeId: fs.volumeID,
-			Inode:    input.NodeId,
-			Offset:   chunkStart,
-			Size:     cs,
-		})
-		if err != nil {
-			return nil, fs.grpcErrorToStatus("ReadFile", err)
-		}
-		if resp.GetError() != 0 {
-			return nil, fuse.Status(resp.GetError())
-		}
-
-		if resp.GetTotalSize() > totalSize {
-			totalSize = resp.GetTotalSize()
-		}
-
-		fetchedData := resp.GetData()
-		// Cache full clean chunk if complete
-		if (int64(len(fetchedData)) == cs || resp.GetEof()) && len(fetchedData) > 0 {
-			fs.cache.PutChunk(input.NodeId, i, uint32(cs), resp.GetTotalSize(), fetchedData, time.Now(), readGen)
-		}
-
-		// If chunk has fewer bytes than expected by totalSize (e.g. hole or unflushed write), zero pad
-		expectedChunkLen := cs
-		if int64(i+1)*cs > totalSize {
-			expectedChunkLen = totalSize - chunkStart
-		}
-		if expectedChunkLen < 0 {
-			expectedChunkLen = 0
-		}
-		if int64(len(fetchedData)) < expectedChunkLen {
-			padded := make([]byte, expectedChunkLen)
-			copy(padded, fetchedData)
-			fetchedData = padded
-		}
-
-		fetchedLen := int64(len(fetchedData))
-		if rStart < fetchedLen {
+		if rStart < chunkLen {
 			end := rEnd
-			if end > fetchedLen {
-				end = fetchedLen
+			if end > chunkLen {
+				end = chunkLen
 			}
-			result = append(result, fetchedData[rStart:end]...)
+			result = append(result, chunkData[rStart:end]...)
 		}
 	}
 
@@ -1034,6 +1098,7 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 
 	var lastEpoch int64
 	var uncleanedRuns [][]int
+	var drained bool
 
 	for i := 0; i < len(runs); i++ {
 		run := runs[i]
@@ -1067,8 +1132,10 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 		}
 		if resp.GetError() == int32(syscall.ENOSPC) {
 			// Controller staging cap reached. Issue a blocking Fsync to pack and commit
-			// what has been staged so far, mark those chunks clean in cache, then retry this run.
-			if len(uncleanedRuns) > 0 {
+			// what has been staged so far (or whatever other inodes staged if this inode
+			// hasn't pushed anything yet), mark any pushed runs clean, then retry this run.
+			if !drained {
+				drained = true
 				fResp, fErr := fs.client.Fsync(ctx, &pb.FsyncRequest{
 					VolumeId:     fs.volumeID,
 					Inode:        inode,
@@ -1096,6 +1163,7 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 			}
 			return 0, nil, nil, syscall.ENOSPC
 		}
+		drained = false
 		if resp.GetError() != 0 {
 			return 0, nil, nil, syscall.Errno(resp.GetError())
 		}

@@ -122,7 +122,6 @@ pkg/objectfs/controller/volume.go:(*Volume).loadFromBackendMetadataLocked:(*gith
 pkg/objectfs/controller/volume.go:(*Volume).loadFromBackendMetadataLocked:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
 pkg/objectfs/controller/volume.go:(*Volume).loadFromBackendMetadataLocked:github.com/gke-labs/in-cluster-storage/pkg/sds.SplitKeyAndNonKey
 pkg/objectfs/controller/volume.go:(*Volume).readChunkLocked:(io.Closer).Close
-pkg/objectfs/controller/volume.go:(*Volume).readChunkLocked:(io.Closer).Close
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
 pkg/objectfs/controller/volume.go:(*Volume).rebuildIndex:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close

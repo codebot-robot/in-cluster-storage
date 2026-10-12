@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -3334,5 +3335,195 @@ func TestBudgetTriggeredSyncFlushesAcrossMultipleDirtyFiles(t *testing.T) {
 		}); status != fuse.OK {
 			t.Fatalf("Fsync failed for file %d: %v", fID, status)
 		}
+	}
+}
+
+type concurrencyTrackingClient struct {
+	pb.ObjectFSControllerClient
+	inFlight    atomic.Int64
+	maxInFlight atomic.Int64
+}
+
+func (c *concurrencyTrackingClient) ReadFile(ctx context.Context, in *pb.ReadFileRequest, opts ...grpc.CallOption) (*pb.ReadFileResponse, error) {
+	cur := c.inFlight.Add(1)
+	for {
+		m := c.maxInFlight.Load()
+		if cur <= m || c.maxInFlight.CompareAndSwap(m, cur) {
+			break
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+	defer c.inFlight.Add(-1)
+	return c.ObjectFSControllerClient.ReadFile(ctx, in, opts...)
+}
+
+func TestFUSEReadConcurrentChunks(t *testing.T) {
+	baseClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	trackClient := &concurrencyTrackingClient{
+		ObjectFSControllerClient: baseClient,
+	}
+
+	volumeID := "vol-concurrent-read-test"
+	cache := NewNodeCache(10 * 1024 * 1024)
+	rawFS := NewObjectFS(trackClient, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "multi_chunk.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const cs = int(DefaultChunkSize) // 64 KiB
+	const numChunks = 4
+	totalBytes := numChunks * cs
+	expectedData := make([]byte, totalBytes)
+	for i := range expectedData {
+		expectedData[i] = byte(i % 251)
+	}
+
+	// Write and sync data to controller
+	n, status := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+	}, expectedData)
+	if status != fuse.OK || int(n) != totalBytes {
+		t.Fatalf("Write failed: status=%v, n=%d", status, n)
+	}
+
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
+	// Evict from local cache so Read must fetch chunks from controller
+	cache.Clear()
+	trackClient.maxInFlight.Store(0)
+
+	readBuf := make([]byte, totalBytes)
+	start := time.Now()
+	readRes, status := rawFS.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     uint32(totalBytes),
+	}, readBuf)
+	elapsed := time.Since(start)
+
+	if status != fuse.OK {
+		t.Fatalf("Read failed: %v", status)
+	}
+	readBytes, _ := readRes.Bytes(readBuf)
+	if !bytes.Equal(readBytes, expectedData) {
+		t.Fatalf("Read data mismatch")
+	}
+
+	maxInFlight := trackClient.maxInFlight.Load()
+	t.Logf("Read for %d chunks took %v (maxInFlight=%d)", numChunks, elapsed, maxInFlight)
+
+	if maxInFlight <= 1 {
+		t.Fatalf("Expected chunks to be fetched concurrently in Read, but maxInFlight was %d", maxInFlight)
+	}
+
+	// 4 chunks with 30ms sleep each: serial would take >= 120ms. Concurrent takes ~30-60ms.
+	serialMin := time.Duration(numChunks) * 30 * time.Millisecond
+	if elapsed >= serialMin {
+		t.Fatalf("Read was serial: elapsed %v >= %v", elapsed, serialMin)
+	}
+}
+
+func TestPushDirtyChunksToStaging_DrainAndRetryOnInitialENOSPC(t *testing.T) {
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	// Set controller staging cap to 64 KiB
+	server := controller.NewServer(nil, controller.WithServerMaxStagingBytes(64*1024))
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("Failed to dial bufnet: %v", err)
+	}
+	defer func() {
+		_ = conn.Close()
+		grpcServer.Stop()
+		_ = lis.Close()
+		_ = server.Close()
+	}()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	volumeID := "vol-enospc-drain-retry"
+	cache := NewNodeCache(10 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+
+	// Create file A and file B
+	var createA, createB fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "fileA.bin", &createA); status != fuse.OK {
+		t.Fatalf("Create A failed: %v", status)
+	}
+	fileA := createA.EntryOut.NodeId
+
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "fileB.bin", &createB); status != fuse.OK {
+		t.Fatalf("Create B failed: %v", status)
+	}
+	fileB := createB.EntryOut.NodeId
+
+	// 1. Stage 64 KiB on File A directly via client.WriteFile without fsyncing,
+	// filling the controller's 64 KiB staging cap completely.
+	wResp, err := client.WriteFile(t.Context(), &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     fileA,
+		Offset:    0,
+		Data:      make([]byte, 64*1024),
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || wResp.GetError() != 0 {
+		t.Fatalf("WriteFile A failed: %v, errCode=%d", err, wResp.GetError())
+	}
+
+	// 2. Write 64 KiB to File B locally in the FUSE cache (does not push to controller yet)
+	bData := bytes.Repeat([]byte("B"), 64*1024)
+	n, status := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileB},
+		Offset:   0,
+	}, bData)
+	if status != fuse.OK || int(n) != len(bData) {
+		t.Fatalf("Write B failed: status=%v, n=%d", status, n)
+	}
+
+	// 3. Push File B's dirty chunks. Its very first run receives ENOSPC from the controller
+	// because File A occupies the staging cap. pushDirtyChunksToStaging must issue a blocking
+	// Fsync to drain File A's staged data, then successfully retry and stage File B.
+	epoch, runs, gens, err := rawFS.pushDirtyChunksToStaging(t.Context(), fileB)
+	if err != nil {
+		t.Fatalf("pushDirtyChunksToStaging failed on initial ENOSPC drain-and-retry: %v", err)
+	}
+	if epoch == 0 || len(runs) == 0 || len(gens) == 0 {
+		t.Fatalf("expected non-empty push result, got epoch=%d, runs=%v, gens=%v", epoch, runs, gens)
+	}
+
+	// 4. Verify Fsync on File B succeeds
+	if status := rawFS.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: fileB},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync B failed: %v", status)
 	}
 }
