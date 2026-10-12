@@ -118,7 +118,10 @@ func (h *Harness) getContainerLogs(pod, container, namespace string, previous bo
 	}
 	out, err := exec.Command("kubectl", args...).CombinedOutput()
 	if err != nil {
-		return ""
+		if previous {
+			return ""
+		}
+		return fmt.Sprintf("failed to get logs: %v\n%s", err, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -141,17 +144,19 @@ func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 	if prevLogs := h.getContainerLogs("agentfs-controller-0", "agentfs-controller", "default", true); prevLogs != "" {
 		t.Logf("AgentFS Controller Previous Logs:\n%s\n", prevLogs)
 	}
-	if logs := h.getContainerLogs("objectfs-controller-0", "objectfs-controller", "default", false); logs != "" {
-		t.Logf("ObjectFS Controller Logs:\n%s\n", logs)
+	ctrlPods := h.getPodNames("app=objectfs-controller", "default")
+	if len(ctrlPods) == 0 {
+		ctrlPods = []string{"objectfs-controller-0"}
 	}
-	if prevLogs := h.getContainerLogs("objectfs-controller-0", "objectfs-controller", "default", true); prevLogs != "" {
-		t.Logf("ObjectFS Controller Previous Logs:\n%s\n", prevLogs)
-	}
-	if logs := h.getContainerLogs("objectfs-controller-0", "csi-provisioner", "default", false); logs != "" {
-		t.Logf("ObjectFS CSI Provisioner Logs:\n%s\n", logs)
-	}
-	if prevLogs := h.getContainerLogs("objectfs-controller-0", "csi-provisioner", "default", true); prevLogs != "" {
-		t.Logf("ObjectFS CSI Provisioner Previous Logs:\n%s\n", prevLogs)
+	for _, pod := range ctrlPods {
+		for _, container := range []string{"objectfs-controller", "csi-provisioner"} {
+			if logs := h.getContainerLogs(pod, container, "default", false); logs != "" {
+				t.Logf("ObjectFS Controller (%s / %s) Logs:\n%s\n", pod, container, logs)
+			}
+			if prevLogs := h.getContainerLogs(pod, container, "default", true); prevLogs != "" {
+				t.Logf("ObjectFS Controller (%s / %s) Previous Logs:\n%s\n", pod, container, prevLogs)
+			}
+		}
 	}
 	if logs := h.getContainerLogs("wal-buffer-0", "wal-buffer", "default", false); logs != "" {
 		t.Logf("WAL Buffer Logs:\n%s\n", logs)

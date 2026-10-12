@@ -1027,7 +1027,10 @@ spec:
 		t.Fatalf("Expected 'node2-file-content' back on Node 1, got: %q (err: %v)", outF2, err)
 	}
 
-	// Write additional file back on node1 to ensure sequence numbering continues cleanly
+	// Write additional file back on node1 to ensure sequence numbering continues cleanly.
+	// Under the stage-and-sync model (#245), even if the close-triggered sync is in-flight when the controller
+	// restarts, the client holds the chunks dirty and serves subsequent reads from its cache.
+	t.Logf("Writing final file on Node 1 (%s)", node1)
 	_, err = h.RunInPod(writerPodName, "default", "/bin/sh", "-c", "echo 'node1-final-content' > /data/final.txt && sync")
 	if err != nil {
 		t.Fatalf("Failed to write final.txt on Node 1: %v", err)
@@ -1043,6 +1046,10 @@ spec:
 	h.RunCommand("kubectl", "delete", "pod", "objectfs-controller-0", "-n", "default", "--force", "--grace-period=0")
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS Controller failed to restart on Node 1: %v", err)
+	}
+
+	if logs := h.getContainerLogs("objectfs-controller-0", "objectfs-controller", "default", false); logs != "" {
+		t.Logf("ObjectFS Controller post-restart recovery logs:\n%s\n", logs)
 	}
 
 	outFinal2, err := retryCatInPod(h, writerPodName, "/data/final.txt", 30*time.Second)
