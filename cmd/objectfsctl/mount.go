@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -127,7 +128,9 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 	}
 	go server.Serve()
 	if err := server.WaitMount(); err != nil {
-		_ = server.Unmount()
+		if unmountErr := server.Unmount(); unmountErr != nil {
+			log.Printf("failed to unmount %s after WaitMount failure: %v", mountpoint, unmountErr)
+		}
 		return fmt.Errorf("failed waiting for FUSE mount at %s: %w", mountpoint, err)
 	}
 

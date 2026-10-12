@@ -304,7 +304,9 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	}
 	go server.Serve()
 	if err := server.WaitMount(); err != nil {
-		_ = server.Unmount()
+		if unmountErr := server.Unmount(); unmountErr != nil {
+			klog.Warningf("failed to unmount %s after WaitMount failure: %v", targetPath, unmountErr)
+		}
 		return nil, fmt.Errorf("failed waiting for FUSE mount at %s: %w", targetPath, err)
 	}
 
@@ -316,7 +318,9 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	// Clean up any previous mount at this targetPath if any
 	if old, ok := d.mounts[targetPath]; ok {
 		old.cancelFunc()
-		_ = old.server.Unmount()
+		if unmountErr := old.server.Unmount(); unmountErr != nil {
+			klog.Warningf("failed to unmount previous mount at %s: %v", targetPath, unmountErr)
+		}
 	}
 	d.mounts[targetPath] = &activeMount{
 		server:     server,
@@ -365,11 +369,15 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 		mountInfo.cancelFunc()
 		if err := mountInfo.server.Unmount(); err != nil {
 			klog.Warningf("FUSE server unmount returned error: %v, attempting system unmount", err)
-			_ = syscall.Unmount(targetPath, 0)
+			if err := syscall.Unmount(targetPath, 0); err != nil && err != syscall.EINVAL {
+				return nil, fmt.Errorf("failed to unmount %s: %w", targetPath, err)
+			}
 		}
 	} else {
 		// Fallback unmount if not tracked
-		_ = syscall.Unmount(targetPath, 0)
+		if err := syscall.Unmount(targetPath, 0); err != nil && err != syscall.EINVAL {
+			return nil, fmt.Errorf("failed to unmount %s: %w", targetPath, err)
+		}
 	}
 
 	klog.Infof("Successfully unpublished ObjectFS volume from %s", targetPath)
