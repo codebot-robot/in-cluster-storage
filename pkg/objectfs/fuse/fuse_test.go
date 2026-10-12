@@ -31,7 +31,10 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
+	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -4114,5 +4117,211 @@ func TestSharedDiskBlobCacheAcrossMounts(t *testing.T) {
 	// Both mounts share one budget (500 bytes)
 	if sharedCache.CurrentBytes() > sharedCache.MaxBytes() {
 		t.Fatalf("Shared cache exceeded budget: %d > %d", sharedCache.CurrentBytes(), sharedCache.MaxBytes())
+	}
+}
+
+func startTestWalBuffer(t *testing.T, dir string, backend controller.ObjectStorageBackend) (string, func()) {
+	srv, err := walbuffer.NewServer(t.Context(), walbuffer.ServerConfig{
+		Backend:       backend,
+		DataDir:       dir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 2 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create walbuffer server: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for walbuffer: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	walpb.RegisterWalBufferServer(grpcServer, srv)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	cleanup := func() {
+		grpcServer.Stop()
+		_ = srv.Close()
+		_ = listener.Close()
+	}
+
+	return listener.Addr().String(), cleanup
+}
+
+func TestDirtyReadSurvivesControllerRestartWhileSyncInFlight(t *testing.T) {
+	// Reproduces issue #252:
+	// A close-triggered non-blocking sync is in-flight when the controller crashes/restarts.
+	// The restarted controller has not committed staged chunks (reports size 0).
+	// Lookup and Read from the client must preserve and return the dirty cached data.
+
+	ctx := t.Context()
+	backend := controller.NewMemoryBackend()
+	volumeID := "test-dirty-survive-vol"
+
+	bufDir := t.TempDir()
+	target, cleanupBuf := startTestWalBuffer(t, bufDir, backend)
+	defer cleanupBuf()
+
+	// 1. Controller 1 starts with Witness durability against wal-buffer
+	clientDir1 := t.TempDir()
+	lis1 := bufconn.Listen(1024 * 1024)
+	grpcServer1 := grpc.NewServer()
+	ctrl1 := controller.NewServer(backend, controller.WithServerWAL(clientDir1, target, walclient.Witness))
+	pb.RegisterObjectFSControllerServer(grpcServer1, ctrl1)
+	go func() { _ = grpcServer1.Serve(lis1) }()
+
+	currentLis := lis1
+	var lisMu sync.RWMutex
+
+	conn, err := grpc.NewClient("passthrough://bufnet-failover",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			lisMu.RLock()
+			l := currentLis
+			lisMu.RUnlock()
+			return l.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	)
+	if err != nil {
+		t.Fatalf("Failed to dial bufnet: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	cache := NewNodeCache(10 * 1024 * 1024)
+	rawFS := NewObjectFSWithTimeout(client, volumeID, pb.WriteMode_LAZY_WRITE, cache, 5*time.Second)
+
+	// 2. Create file final.txt (committed to wal-buffer)
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "final.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create final.txt failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+	fileContent := []byte("node1-final-content")
+
+	// 3. Write data to final.txt locally
+	n, status := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+	}, fileContent)
+	if status != fuse.OK || int(n) != len(fileContent) {
+		t.Fatalf("Write failed: status=%v, n=%d", status, n)
+	}
+
+	// 4. Client pushes to staging (simulating Flush on close)
+	epoch, runs, gens, err := rawFS.pushDirtyChunksToStaging(ctx, fileID)
+	if err != nil {
+		t.Fatalf("pushDirtyChunksToStaging failed: %v", err)
+	}
+	if epoch == 0 || len(runs) == 0 || len(gens) == 0 {
+		t.Fatalf("Expected non-empty staging push")
+	}
+
+	// 5. Controller 1 crashes/stops while sync is in flight (Fsync was never completed/acked)
+	grpcServer1.Stop()
+	_ = ctrl1.Close()
+	_ = lis1.Close()
+
+	// 6. Controller 2 starts on the same backend & wal-buffer (uncommitted staged chunks lost)
+	clientDir2 := t.TempDir()
+	lis2 := bufconn.Listen(1024 * 1024)
+	grpcServer2 := grpc.NewServer()
+	ctrl2 := controller.NewServer(backend, controller.WithServerWAL(clientDir2, target, walclient.Witness))
+	pb.RegisterObjectFSControllerServer(grpcServer2, ctrl2)
+	go func() { _ = grpcServer2.Serve(lis2) }()
+	defer func() {
+		grpcServer2.Stop()
+		_ = ctrl2.Close()
+	}()
+
+	lisMu.Lock()
+	currentLis = lis2
+	lisMu.Unlock()
+
+	// Verify that Controller 2 itself only knows size 0 (un-synced chunks lost on controller crash)
+	attrResp, err := ctrl2.GetAttr(ctx, &pb.GetAttrRequest{
+		VolumeId: volumeID,
+		Inode:    fileID,
+	})
+	if err != nil {
+		t.Fatalf("Controller 2 GetAttr failed: %v", err)
+	}
+	if attrResp.GetAttr().GetInode().GetSize() != 0 {
+		t.Fatalf("Expected Controller 2 to have size 0 for un-synced file, got %d", attrResp.GetAttr().GetInode().GetSize())
+	}
+
+	// 7. Client reconnects / watcher runs InvalidateAllClean
+	cache.InvalidateAllClean()
+
+	// 8. Client performs Lookup for final.txt:
+	// Prior to the fix, Lookup returned Attr.Size = 0 (from Controller 2), poisoning the kernel attribute cache
+	// and causing subsequent reads to return empty EOF without querying FUSE Read.
+	// With the fix, fillEntryOut / fillAttrOut overrides with the client's dirty cache entry size.
+	var lookupOut fuse.EntryOut
+	if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "final.txt", &lookupOut); st != fuse.OK {
+		t.Fatalf("Lookup final.txt failed: %v", st)
+	}
+	if lookupOut.Attr.Size != uint64(len(fileContent)) {
+		t.Fatalf("Expected Lookup to report dirty size %d, got %d", len(fileContent), lookupOut.Attr.Size)
+	}
+
+	// 9. Client reads final.txt via Read: must return the dirty content from local cache
+	buf := make([]byte, 1024)
+	res, st := rawFS.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Size:     1024,
+	}, buf)
+	if st != fuse.OK {
+		t.Fatalf("Read final.txt failed: %v", st)
+	}
+	readBytes, rSt := res.Bytes(buf)
+	if rSt != fuse.OK {
+		t.Fatalf("Read result Bytes failed: %v", rSt)
+	}
+	if !bytes.Equal(readBytes, fileContent) {
+		t.Fatalf("Read data mismatch: got %q, want %q", string(readBytes), string(fileContent))
+	}
+
+	// 10. ReadDirPlus also must report dirty size
+	dirList := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := rawFS.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, dirList); st != fuse.OK {
+		t.Fatalf("ReadDirPlus failed: %v", st)
+	}
+
+	// 11. Now trigger sync to Controller 2 (simulating retry / background sync)
+	// Because staging epoch changed on Controller 2, syncVolumeNonBlocking re-pushes dirty chunks
+	if err := rawFS.syncVolumeNonBlocking(ctx); err != nil {
+		t.Fatalf("syncVolumeNonBlocking failed: %v", err)
+	}
+
+	// 12. Verify Controller 2 now has the durable committed size and content
+	attrResp2, err := ctrl2.GetAttr(ctx, &pb.GetAttrRequest{
+		VolumeId: volumeID,
+		Inode:    fileID,
+	})
+	if err != nil {
+		t.Fatalf("Controller 2 GetAttr after sync failed: %v", err)
+	}
+	if attrResp2.GetAttr().GetInode().GetSize() != int64(len(fileContent)) {
+		t.Fatalf("Expected Controller 2 to have durable size %d after sync, got %d", len(fileContent), attrResp2.GetAttr().GetInode().GetSize())
+	}
+
+	// Invalidate client cache completely to ensure controller is serving
+	cache.Clear()
+	var lookupOut2 fuse.EntryOut
+	if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "final.txt", &lookupOut2); st != fuse.OK {
+		t.Fatalf("Lookup after cache clear failed: %v", st)
+	}
+	if lookupOut2.Attr.Size != uint64(len(fileContent)) {
+		t.Fatalf("Expected Lookup after cache clear to report durable size %d, got %d", len(fileContent), lookupOut2.Attr.Size)
 	}
 }
