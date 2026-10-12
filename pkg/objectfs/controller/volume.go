@@ -415,6 +415,10 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		opt(v)
 	}
 
+	if v.stream == nil {
+		klog.Warningf("Volume %s: no WAL stream configured: fsync is NOT durable across controller restarts; volume behaves as an ephemeral shared disk and metadata is persisted only by periodic flush and on shutdown", v.volumeID)
+	}
+
 	if err := v.initMetadataStreamLocked(); err != nil {
 		return nil, fmt.Errorf("failed to init metadata stream: %w", err)
 	}
