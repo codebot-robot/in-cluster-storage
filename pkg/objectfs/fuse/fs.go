@@ -961,7 +961,24 @@ const MaxSyncRunChunks = 32
 const MaxSyncRunBytes = 2 * 1024 * 1024
 
 func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) (int64, [][]int, map[int]Generation, error) {
-	dirtyChunks, chunkGens, chunkSize, _, isDirty := fs.cache.GetDirtyChunks(inode)
+	dirtySize, sizeGen, hasDirtySize := fs.cache.GetDirtySize(inode)
+	if hasDirtySize {
+		resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
+			VolumeId: fs.volumeID,
+			Inode:    inode,
+			Size:     dirtySize,
+		})
+		if err != nil {
+			fs.logRPCError("TruncateFile", err)
+			return 0, nil, nil, err
+		}
+		if resp.GetError() != 0 {
+			return 0, nil, nil, syscall.Errno(resp.GetError())
+		}
+		fs.cache.MarkSizeClean(inode, sizeGen)
+	}
+
+	dirtyChunks, chunkGens, chunkSize, entrySize, isDirty := fs.cache.GetDirtyChunks(inode)
 	if !isDirty || len(dirtyChunks) == 0 {
 		return 0, nil, nil, nil
 	}
@@ -970,8 +987,19 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 	}
 
 	indices := make([]int, 0, len(dirtyChunks))
-	for idx := range dirtyChunks {
+	for idx, chunkData := range dirtyChunks {
+		chunkOffset := int64(idx) * int64(chunkSize)
+		if chunkOffset >= entrySize {
+			fs.cache.MarkChunkClean(inode, idx, chunkGens[idx])
+			continue
+		}
+		if chunkOffset+int64(len(chunkData)) > entrySize {
+			dirtyChunks[idx] = chunkData[:entrySize-chunkOffset]
+		}
 		indices = append(indices, idx)
+	}
+	if len(indices) == 0 {
+		return 0, nil, nil, nil
 	}
 	sort.Ints(indices)
 
@@ -1275,7 +1303,7 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 
 func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	if fs.syncOnClose {
-		if _, _, _, _, isDirty := fs.cache.GetDirtyChunks(input.NodeId); isDirty {
+		if fs.cache.IsInodeDirty(input.NodeId) {
 			select {
 			case fs.syncTrigger <- struct{}{}:
 			default:

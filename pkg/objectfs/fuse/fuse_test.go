@@ -2470,19 +2470,39 @@ func TestFUSEConcurrentOperationsRace(t *testing.T) {
 
 type recordingClient struct {
 	pb.ObjectFSControllerClient
-	mu        sync.Mutex
-	writeReqs []*pb.WriteFileRequest
-	failWrite bool
+	mu                sync.Mutex
+	writeReqs         []*pb.WriteFileRequest
+	truncateReqs      []*pb.TruncateFileRequest
+	callOrder         []string
+	failWrite         bool
+	failTruncate      bool
+	failTruncateCount int
 }
 
 func (c *recordingClient) WriteFile(ctx context.Context, in *pb.WriteFileRequest, opts ...grpc.CallOption) (*pb.WriteFileResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.callOrder = append(c.callOrder, "WriteFile")
 	if c.failWrite {
 		return nil, status.Errorf(codes.Unavailable, "injected write failure")
 	}
 	c.writeReqs = append(c.writeReqs, proto.Clone(in).(*pb.WriteFileRequest))
 	return c.ObjectFSControllerClient.WriteFile(ctx, in, opts...)
+}
+
+func (c *recordingClient) TruncateFile(ctx context.Context, in *pb.TruncateFileRequest, opts ...grpc.CallOption) (*pb.TruncateFileResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.callOrder = append(c.callOrder, "TruncateFile")
+	c.truncateReqs = append(c.truncateReqs, proto.Clone(in).(*pb.TruncateFileRequest))
+	if c.failTruncateCount > 0 {
+		c.failTruncateCount--
+		return nil, status.Errorf(codes.Unavailable, "injected truncate failure")
+	}
+	if c.failTruncate {
+		return nil, status.Errorf(codes.Unavailable, "injected truncate failure")
+	}
+	return c.ObjectFSControllerClient.TruncateFile(ctx, in, opts...)
 }
 
 func TestSyncFileToServiceCoalescesContiguousChunks(t *testing.T) {
@@ -2788,6 +2808,181 @@ func TestSyncFileToServiceConcurrentWritePreservesDirtyGeneration(t *testing.T) 
 	}
 	if !bytes.Equal(c1Data, c1v2) {
 		t.Errorf("Dirty chunk 1 content should be version 2, got %q", c1Data[:10])
+	}
+}
+
+func TestSyncFileToServiceRetriesFailedTruncateAndClearsSizeGen(t *testing.T) {
+	baseClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	rec := &recordingClient{
+		ObjectFSControllerClient: baseClient,
+		failTruncateCount:        1,
+	}
+	cache := NewNodeCache(8 * 1024 * 1024)
+	fs := NewObjectFS(rec, "vol-retry-trunc", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := fs.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test_retry_trunc.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Write 100 bytes and sync cleanly
+	initialData := bytes.Repeat([]byte("A"), 100)
+	cache.WriteAt(fileID, 0, initialData, time.Now())
+	if err := fs.syncFileToService(t.Context(), fileID); err != nil {
+		t.Fatalf("Initial syncFileToService failed: %v", err)
+	}
+
+	// First SetAttr with FATTR_SIZE fails because TruncateFile fails
+	var setAttrOut fuse.AttrOut
+	status := fs.SetAttr(nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_SIZE,
+			Size:     50,
+		},
+	}, &setAttrOut)
+	if status == fuse.OK {
+		t.Fatalf("Expected SetAttr to fail when TruncateFile fails, got OK")
+	}
+
+	// Confirm SizeGen is set and entry remains dirty
+	dirtySize, sizeGen, hasDirtySize := cache.GetDirtySize(fileID)
+	if !hasDirtySize || sizeGen == 0 || dirtySize != 50 {
+		t.Fatalf("Expected dirty size 50 with non-zero SizeGen, got dirty=%v size=%d gen=%d", hasDirtySize, dirtySize, sizeGen)
+	}
+	if _, isDirty := cache.GetDirty(fileID); !isDirty {
+		t.Fatalf("Expected entry to remain dirty while SizeGen is set")
+	}
+
+	// The next syncFileToService should retry TruncateFile and succeed
+	if err := fs.syncFileToService(t.Context(), fileID); err != nil {
+		t.Fatalf("Next syncFileToService failed: %v", err)
+	}
+
+	// Confirm SizeGen is cleared and entry is clean
+	_, sizeGenAfter, hasDirtySizeAfter := cache.GetDirtySize(fileID)
+	if hasDirtySizeAfter || sizeGenAfter != 0 {
+		t.Fatalf("Expected SizeGen to be cleared after sync, got dirty=%v gen=%d", hasDirtySizeAfter, sizeGenAfter)
+	}
+	if _, isDirty := cache.GetDirty(fileID); isDirty {
+		t.Fatalf("Expected entry to be clean after successful sync")
+	}
+
+	// Confirm controller reports truncated size 50
+	attrResp, err := baseClient.GetAttr(t.Context(), &pb.GetAttrRequest{
+		VolumeId: "vol-retry-trunc",
+		Inode:    fileID,
+	})
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if attrResp.GetAttr().GetInode().GetSize() != 50 {
+		t.Fatalf("Expected controller file size 50, got %d", attrResp.GetAttr().GetInode().GetSize())
+	}
+}
+
+func TestSyncFileToServiceOrderingDirtySizeBeforeChunksAndDropsBeyondEOF(t *testing.T) {
+	baseClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	rec := &recordingClient{
+		ObjectFSControllerClient: baseClient,
+	}
+	cache := NewNodeCache(8 * 1024 * 1024)
+	fs := NewObjectFS(rec, "vol-ordering", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := fs.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test_ordering.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const cs = int64(DefaultChunkSize)
+
+	// Write chunk 0 (0..64KB) and chunk 1 (64KB..128KB) in cache
+	c0 := bytes.Repeat([]byte("0"), int(cs))
+	c1 := bytes.Repeat([]byte("1"), int(cs))
+	cache.WriteAt(fileID, 0, append(c0, c1...), time.Now())
+
+	// Fail the next TruncateFile so SetAttr leaves SizeGen set
+	rec.failTruncateCount = 1
+	var setAttrOut fuse.AttrOut
+	status := fs.SetAttr(nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_SIZE,
+			Size:     uint64(cs / 2), // Truncate to cs/2 (32 KiB)
+		},
+	}, &setAttrOut)
+	if status == fuse.OK {
+		t.Fatalf("Expected SetAttr to fail, got OK")
+	}
+
+	// Manually inject a dirty chunk beyond the new EOF (e.g. chunk 1 at 64KB) into the cache
+	// to simulate dirty size plus dirty chunks beyond the new EOF.
+	entry, ok := cache.Get(fileID)
+	if !ok {
+		t.Fatalf("Entry not found")
+	}
+	gen := cache.GetGeneration(fileID)
+	entry.Chunks[1] = c1
+	entry.DirtyChunks[1] = gen
+
+	// Clear recorded RPC calls before sync
+	rec.mu.Lock()
+	rec.callOrder = nil
+	rec.truncateReqs = nil
+	rec.writeReqs = nil
+	rec.mu.Unlock()
+
+	// Run syncFileToService
+	if err := fs.syncFileToService(t.Context(), fileID); err != nil {
+		t.Fatalf("syncFileToService failed: %v", err)
+	}
+
+	rec.mu.Lock()
+	callOrder := append([]string(nil), rec.callOrder...)
+	writeReqs := append([]*pb.WriteFileRequest(nil), rec.writeReqs...)
+	truncReqs := append([]*pb.TruncateFileRequest(nil), rec.truncateReqs...)
+	rec.mu.Unlock()
+
+	// 1. Confirm TruncateFile was sent first
+	if len(truncReqs) != 1 {
+		t.Fatalf("Expected 1 TruncateFile RPC, got %d", len(truncReqs))
+	}
+	if truncReqs[0].Size != cs/2 {
+		t.Fatalf("Expected TruncateFile size %d, got %d", cs/2, truncReqs[0].Size)
+	}
+	if len(callOrder) == 0 || callOrder[0] != "TruncateFile" {
+		t.Fatalf("Expected TruncateFile to be sent first, got call order %v", callOrder)
+	}
+
+	// 2. Confirm chunks beyond new EOF were NOT written
+	for _, req := range writeReqs {
+		if req.Offset >= cs/2 {
+			t.Fatalf("WriteFile chunk beyond EOF was sent: offset=%d, eof=%d", req.Offset, cs/2)
+		}
+		if req.Offset+int64(len(req.Data)) > cs/2 {
+			t.Fatalf("WriteFile data extends past EOF: offset=%d len=%d eof=%d", req.Offset, len(req.Data), cs/2)
+		}
+	}
+
+	// 3. Confirm SizeGen is clean
+	_, _, hasDirtySize := cache.GetDirtySize(fileID)
+	if hasDirtySize {
+		t.Fatalf("Expected dirty size to be clean after sync")
+	}
+	if _, isDirty := cache.GetDirty(fileID); isDirty {
+		t.Fatalf("Expected entry to be clean after sync")
 	}
 }
 
