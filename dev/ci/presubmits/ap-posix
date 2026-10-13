@@ -149,6 +149,24 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+echo "==> Verifying filesystem statistics with df -k..."
+df -k .
+df_out=\$(df -k .)
+data_line=\$(echo "\${df_out}" | tail -n 1)
+blocks=\$(echo "\${data_line}" | awk '{print \$2}')
+avail=\$(echo "\${data_line}" | awk '{print \$4}')
+echo "Mount stats: Blocks=\${blocks} (1K blocks), Available=\${avail} (1K blocks)"
+if [[ -z "\${blocks}" || "\${blocks}" -le 0 ]]; then
+  echo "ERROR: df -k reported invalid or zero blocks: \${blocks}"
+  exit 1
+fi
+if [[ -z "\${avail}" || "\${avail}" -le 0 ]]; then
+  echo "ERROR: df -k reported invalid or non-positive available space: \${avail}"
+  exit 1
+fi
+echo "Filesystem statistics verified: df -k returned non-zero Blocks and sane Available space."
+echo
+
 echo "==> Running fsx data-integrity test across multiple seeds..."
 # File size limit raised well above 1MB (16MB) using 64 KiB chunked blob-first writes (#143).
 # Mapped writes are disabled (-W) pending kernel page cache writeback coherency.

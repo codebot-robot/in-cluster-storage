@@ -1822,12 +1822,30 @@ func TestObjectFS_StatFs(t *testing.T) {
 	if status != fuse.OK {
 		t.Fatalf("StatFs returned %v", status)
 	}
+	if out.Bsize != 4096 {
+		t.Errorf("expected Bsize 4096, got %d", out.Bsize)
+	}
+	if out.Frsize != 4096 {
+		t.Errorf("expected Frsize 4096, got %d", out.Frsize)
+	}
+	if out.Blocks != 1073741824 {
+		t.Errorf("expected 1073741824 blocks, got %d", out.Blocks)
+	}
+	if out.Bfree != 1073741824 {
+		t.Errorf("expected 1073741824 free blocks, got %d", out.Bfree)
+	}
+	if out.Bavail != 1073741824 {
+		t.Errorf("expected 1073741824 available blocks, got %d", out.Bavail)
+	}
 	if out.Files != 10000000 {
 		t.Errorf("expected 10000000 nominal files, got %d", out.Files)
 	}
 	// Used inodes = 1 (root dir), so free should be 10000000 - 1 = 9999999
 	if out.Ffree != 9999999 {
 		t.Errorf("expected 9999999 free inodes, got %d", out.Ffree)
+	}
+	if out.NameLen != 255 {
+		t.Errorf("expected NameLen 255, got %d", out.NameLen)
 	}
 
 	// Create a file and write 8192 bytes (2 blocks of 4096)
@@ -1862,19 +1880,130 @@ func TestObjectFS_StatFs(t *testing.T) {
 	// StatFs should now reflect 2 inodes used and 2 blocks (8192 bytes) used
 	var out2 fuse.StatfsOut
 	expectedFreeBlocks := uint64(1073741824 - 2)
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		status = fs.StatFs(nil, &fuse.InHeader{}, &out2)
 		if status != fuse.OK {
 			t.Fatalf("StatFs returned %v", status)
 		}
-		if out2.Ffree == 9999998 && out2.Bfree == expectedFreeBlocks {
+		if out2.Ffree == 9999998 && out2.Bfree == expectedFreeBlocks && out2.Bavail == expectedFreeBlocks && out2.Blocks == 1073741824 {
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for StatFs to reflect write: got Ffree=%d (want 9999998), Bfree=%d (want %d)", out2.Ffree, out2.Bfree, expectedFreeBlocks)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type faultStatsClient struct {
+	pb.ObjectFSControllerClient
+	err     error
+	respErr int32
+}
+
+func (c *faultStatsClient) GetVolumeStats(ctx context.Context, in *pb.GetVolumeStatsRequest, opts ...grpc.CallOption) (*pb.GetVolumeStatsResponse, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
+	if c.respErr != 0 {
+		return &pb.GetVolumeStatsResponse{Error: c.respErr}, nil
+	}
+	return c.ObjectFSControllerClient.GetVolumeStats(ctx, in, opts...)
+}
+
+func TestObjectFS_StatFs_RPCFailure(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-statfs-fail"
+	cache := NewNodeCache(1024 * 1024)
+
+	// 1. Nil client yields EIO
+	nilFS := &ObjectFS{}
+	var out1 fuse.StatfsOut
+	if st := nilFS.StatFs(nil, &fuse.InHeader{}, &out1); st != fuse.EIO {
+		t.Fatalf("expected EIO on nil client, got %v", st)
+	}
+
+	// 2. gRPC RPC transport error yields EIO
+	errClient := &faultStatsClient{
+		ObjectFSControllerClient: client,
+		err:                      status.Error(codes.Unavailable, "controller unavailable"),
+	}
+	errFS := NewObjectFS(errClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	var out2 fuse.StatfsOut
+	if st := errFS.StatFs(nil, &fuse.InHeader{}, &out2); st != fuse.EIO {
+		t.Fatalf("expected EIO on gRPC error, got %v", st)
+	}
+
+	// 3. Response error field yields EIO
+	respErrClient := &faultStatsClient{
+		ObjectFSControllerClient: client,
+		respErr:                  int32(syscall.EIO),
+	}
+	respErrFS := NewObjectFS(respErrClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	var out3 fuse.StatfsOut
+	if st := respErrFS.StatFs(nil, &fuse.InHeader{}, &out3); st != fuse.EIO {
+		t.Fatalf("expected EIO on response error, got %v", st)
+	}
+}
+
+type countingStatsClient struct {
+	pb.ObjectFSControllerClient
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingStatsClient) GetVolumeStats(ctx context.Context, in *pb.GetVolumeStatsRequest, opts ...grpc.CallOption) (*pb.GetVolumeStatsResponse, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return c.ObjectFSControllerClient.GetVolumeStats(ctx, in, opts...)
+}
+
+func TestObjectFS_StatFs_Cache(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-statfs-cache"
+	countClient := &countingStatsClient{
+		ObjectFSControllerClient: client,
+	}
+	cache := NewNodeCache(1024 * 1024)
+	fs := NewObjectFS(countClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var out1 fuse.StatfsOut
+	if st := fs.StatFs(nil, &fuse.InHeader{}, &out1); st != fuse.OK {
+		t.Fatalf("StatFs returned %v", st)
+	}
+	if countClient.calls != 1 {
+		t.Fatalf("expected 1 call to GetVolumeStats, got %d", countClient.calls)
+	}
+
+	// Immediate second call should hit the cache and not invoke GetVolumeStats
+	var out2 fuse.StatfsOut
+	if st := fs.StatFs(nil, &fuse.InHeader{}, &out2); st != fuse.OK {
+		t.Fatalf("StatFs returned %v", st)
+	}
+	if countClient.calls != 1 {
+		t.Fatalf("expected cache hit (1 call), got %d calls", countClient.calls)
+	}
+	if out1 != out2 {
+		t.Errorf("cached output mismatch: %+v vs %+v", out1, out2)
+	}
+
+	// After cache expires, call should invoke GetVolumeStats again
+	fs.statfsMu.Lock()
+	fs.statfsExpiry = time.Now().Add(-time.Second) // force expiration
+	fs.statfsMu.Unlock()
+
+	var out3 fuse.StatfsOut
+	if st := fs.StatFs(nil, &fuse.InHeader{}, &out3); st != fuse.OK {
+		t.Fatalf("StatFs returned %v", st)
+	}
+	if countClient.calls != 2 {
+		t.Fatalf("expected 2 calls after cache expiration, got %d", countClient.calls)
 	}
 }
 
