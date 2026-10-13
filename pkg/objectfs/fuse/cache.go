@@ -663,6 +663,92 @@ func (c *NodeCache) Truncate(inode uint64, size int64, modTime time.Time) Genera
 	return gen
 }
 
+func (c *NodeCache) PunchHole(inode uint64, offset, length int64, keepSize bool, modTime time.Time) Generation {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.curGen++
+	gen := c.curGen
+
+	entry, ok := c.entries[inode]
+	if !ok {
+		return gen
+	}
+
+	entry.Generation = gen
+	cs := int64(entry.ChunkSize)
+	if cs == 0 {
+		cs = int64(DefaultChunkSize)
+	}
+
+	if !keepSize && offset+length > entry.Size {
+		entry.Size = offset + length
+		entry.SizeGen = gen
+	}
+
+	punchStart := offset
+	punchEnd := offset + length
+	if keepSize && punchEnd > entry.Size {
+		punchEnd = entry.Size
+	}
+
+	if punchEnd > punchStart {
+		if len(entry.Data) > 0 {
+			zEnd := punchEnd
+			if zEnd > int64(len(entry.Data)) {
+				zEnd = int64(len(entry.Data))
+			}
+			if zEnd > punchStart {
+				for b := punchStart; b < zEnd; b++ {
+					entry.Data[b] = 0
+				}
+			}
+		}
+
+		for idx, chunk := range entry.Chunks {
+			cStart := int64(idx) * cs
+			cEnd := cStart + cs
+			fullyCovered := punchStart <= cStart && punchEnd >= cEnd
+
+			_, isDirty := entry.DirtyChunks[idx]
+
+			if fullyCovered {
+				c.curBytes -= int64(len(chunk))
+				delete(entry.Chunks, idx)
+				if isDirty {
+					c.dirtyBytes -= int64(len(chunk))
+					delete(entry.DirtyChunks, idx)
+				}
+			} else if punchStart < cEnd && punchEnd > cStart {
+				if !isDirty {
+					// Drop clean chunk in the punched range so it re-fetches from controller
+					c.curBytes -= int64(len(chunk))
+					delete(entry.Chunks, idx)
+				} else {
+					// Zero dirty chunk in place
+					zStart := punchStart - cStart
+					if zStart < 0 {
+						zStart = 0
+					}
+					zEnd := punchEnd - cStart
+					if zEnd > int64(len(chunk)) {
+						zEnd = int64(len(chunk))
+					}
+					if zEnd > zStart {
+						for b := zStart; b < zEnd; b++ {
+							chunk[b] = 0
+						}
+					}
+				}
+			}
+		}
+	}
+
+	entry.ModTime = modTime
+	entry.LastRead = time.Now()
+	return gen
+}
+
 func (c *NodeCache) evictIfNeededLocked(neededBytes int64) {
 	for c.curBytes+neededBytes > c.maxBytes && len(c.entries) > 0 {
 		var oldestInode uint64
