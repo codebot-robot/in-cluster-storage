@@ -136,7 +136,7 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 
 	watchCtx, cancelWatch := context.WithCancel(ctx)
 	defer cancelWatch()
-	objectfuse.StartWatcher(watchCtx, client, opts.volumeID, nodeID, nodeCache)
+	objectfuse.StartWatcher(watchCtx, client, opts.volumeID, nodeID, nodeCache, rawFS)
 
 	fmt.Fprintf(os.Stderr, "Mounted volume %s at %s (writeMode=%v); press Ctrl-C to unmount\n", opts.volumeID, mountpoint, writeMode)
 
