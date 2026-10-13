@@ -76,7 +76,7 @@ func TestNodeCacheWriteAndDirtyTracking(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected inode 100 to be in cache")
 	}
-	if !entry.IsDirty {
+	if !entry.Dirty() {
 		t.Fatalf("Expected entry to be marked dirty")
 	}
 	if string(entry.Data) != "hello world!" {
@@ -109,8 +109,8 @@ func TestNodeCacheWriteAndDirtyTracking(t *testing.T) {
 	// Truncate
 	truncGen := cache.Truncate(100, 5, time.Now())
 	entryTrunc, ok := cache.Get(100)
-	if !ok || !entryTrunc.IsDirty || string(entryTrunc.Data) != "hello" {
-		t.Fatalf("Expected dirty truncated entry 'hello', got %q (dirty=%v)", string(entryTrunc.Data), entryTrunc.IsDirty)
+	if !ok || !entryTrunc.Dirty() || string(entryTrunc.Data) != "hello" {
+		t.Fatalf("Expected dirty truncated entry 'hello', got %q (dirty=%v)", string(entryTrunc.Data), entryTrunc.Dirty())
 	}
 	cache.MarkSizeClean(100, truncGen)
 	if _, isDirty := cache.GetDirty(100); isDirty {

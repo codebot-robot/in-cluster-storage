@@ -461,6 +461,17 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 		Uid: inoRow.GetUid(),
 		Gid: inoRow.GetGid(),
 	}
+
+	if fs.cache != nil && out.Ino != 0 {
+		if entry, isDirty := fs.cache.GetDirty(out.Ino); isDirty {
+			out.Size = uint64(entry.Size)
+			out.Mtime = uint64(entry.ModTime.Unix())
+			out.Mtimensec = uint32(entry.ModTime.Nanosecond())
+			// Cache tracks ModTime but no separate inode change time; align Ctime with Mtime.
+			out.Ctime = out.Mtime
+			out.Ctimensec = out.Mtimensec
+		}
+	}
 }
 
 func (fs *ObjectFS) fillEntryOut(attr *pb.EntryAttr, out *fuse.EntryOut) {
@@ -518,12 +529,6 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 		return fuse.ENOENT
 	}
 	fs.fillAttrOut(attr, &out.Attr)
-
-	if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
-		out.Attr.Size = uint64(entry.Size)
-		out.Attr.Mtime = uint64(entry.ModTime.Unix())
-		out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
-	}
 	out.SetTimeout(1 * time.Second)
 	return fuse.OK
 }
@@ -618,10 +623,6 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	fs.fillAttrOut(finalAttr, &out.Attr)
 	if input.Valid&fuse.FATTR_SIZE != 0 {
 		out.Attr.Size = input.Size
-	} else if entry, isDirty := fs.cache.GetDirty(input.NodeId); isDirty {
-		out.Attr.Size = uint64(entry.Size)
-		out.Attr.Mtime = uint64(entry.ModTime.Unix())
-		out.Attr.Mtimensec = uint32(entry.ModTime.Nanosecond())
 	}
 	out.SetTimeout(1 * time.Second)
 	return fuse.OK
