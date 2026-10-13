@@ -84,6 +84,11 @@ type ObjectFS struct {
 	activePrefetches   map[uint64]*prefetchHandle
 	lastReadChunk      map[uint64]int
 	furthestPrefetched map[uint64]int
+
+	statfsMu     sync.Mutex
+	statfsCache  fuse.StatfsOut
+	statfsExpiry time.Time
+	statfsTTL    time.Duration
 }
 
 var _ fuse.RawFileSystem = (*ObjectFS)(nil)
@@ -121,6 +126,7 @@ func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string
 		activePrefetches:       make(map[uint64]*prefetchHandle),
 		lastReadChunk:          make(map[uint64]int),
 		furthestPrefetched:     make(map[uint64]int),
+		statfsTTL:              time.Second,
 	}
 	return fs
 }
@@ -1707,56 +1713,68 @@ func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 }
 
 func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
+	fs.statfsMu.Lock()
+	if time.Now().Before(fs.statfsExpiry) {
+		*out = fs.statfsCache
+		fs.statfsMu.Unlock()
+		return fuse.OK
+	}
+	fs.statfsMu.Unlock()
+
+	if fs.client == nil {
+		return fuse.EIO
+	}
+
 	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
-	blockSize := uint64(4096)
-	nominalTotalBytes := uint64(4 * 1024 * 1024 * 1024 * 1024)
-	nominalTotalInodes := uint64(10000000)
-
-	totalBlocks := nominalTotalBytes / blockSize
-	usedBytes := uint64(0)
-	usedInodes := uint64(0)
-
-	if fs.client != nil {
-		resp, err := fs.client.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: fs.volumeID})
-		if err != nil {
-			fs.logRPCError("GetVolumeStats", err)
-		} else if resp.GetError() == 0 {
-			if resp.GetTotalBytes() > 0 {
-				nominalTotalBytes = uint64(resp.GetTotalBytes())
-				totalBlocks = nominalTotalBytes / blockSize
-			}
-			if resp.GetUsedBytes() > 0 {
-				usedBytes = uint64(resp.GetUsedBytes())
-			}
-			if resp.GetTotalInodes() > 0 {
-				nominalTotalInodes = uint64(resp.GetTotalInodes())
-			}
-			if resp.GetUsedInodes() > 0 {
-				usedInodes = uint64(resp.GetUsedInodes())
-			}
-		}
+	resp, err := fs.client.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: fs.volumeID})
+	if err != nil {
+		fs.logRPCError("GetVolumeStats", err)
+		return fuse.EIO
+	}
+	if resp.GetError() != 0 {
+		return fuse.EIO
 	}
 
-	usedBlocks := (usedBytes + blockSize - 1) / blockSize
-	freeBlocks := uint64(0)
-	if totalBlocks > usedBlocks {
-		freeBlocks = totalBlocks - usedBlocks
+	const blockSize = 4096
+	var total, avail uint64
+	if resp.GetTotalBytes() > 0 {
+		total = uint64(resp.GetTotalBytes())
 	}
-	freeInodes := uint64(0)
-	if nominalTotalInodes > usedInodes {
-		freeInodes = nominalTotalInodes - usedInodes
+	if resp.GetAvailableBytes() > 0 {
+		avail = uint64(resp.GetAvailableBytes())
+	}
+	var files, ffree uint64
+	if resp.GetTotalInodes() > 0 {
+		files = uint64(resp.GetTotalInodes())
+	}
+	if resp.GetFreeInodes() > 0 {
+		ffree = uint64(resp.GetFreeInodes())
 	}
 
-	out.Blocks = totalBlocks
-	out.Bfree = freeBlocks
-	out.Bavail = freeBlocks
-	out.Bsize = uint32(blockSize)
-	out.Frsize = uint32(blockSize)
-	out.Files = nominalTotalInodes
-	out.Ffree = freeInodes
-	out.NameLen = MaxNameLength
+	res := fuse.StatfsOut{
+		Blocks:  total / blockSize,
+		Bfree:   avail / blockSize,
+		Bavail:  avail / blockSize,
+		Bsize:   blockSize,
+		Frsize:  blockSize,
+		Files:   files,
+		Ffree:   ffree,
+		NameLen: 255,
+	}
+
+	ttl := fs.statfsTTL
+	if ttl <= 0 {
+		ttl = time.Second
+	}
+
+	fs.statfsMu.Lock()
+	fs.statfsCache = res
+	fs.statfsExpiry = time.Now().Add(ttl)
+	fs.statfsMu.Unlock()
+
+	*out = res
 	return fuse.OK
 }
 
