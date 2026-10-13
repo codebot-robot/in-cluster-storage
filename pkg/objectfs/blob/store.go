@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"k8s.io/klog/v2"
 )
 
@@ -97,16 +98,18 @@ func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error
 			shaHex := prep.SHA256Hex()
 			looseStream, err := EncodeLooseBlob(prep)
 			if err != nil {
-				_ = prep.Close()
+				errutil.CloseAndLog(prep, "encoded blob")
 				return fmt.Errorf("failed to encode loose blob %s: %w", shaHex, err)
 			}
 
 			key := s.blobKey(shaHex)
 			if _, err := s.backend.PutObject(ctx, "", key, looseStream); err != nil {
-				_ = looseStream.Close()
+				errutil.CloseAndLog(looseStream, "loose blob stream")
 				return fmt.Errorf("failed to write standalone loose blob %s: %w", key, err)
 			}
-			_ = looseStream.Close()
+			if err := looseStream.Close(); err != nil {
+				return fmt.Errorf("failed to close loose blob stream %s: %w", key, err)
+			}
 
 			s.mu.Lock()
 			s.shaToLocation[shaHex] = BlobLocation{
@@ -131,30 +134,38 @@ func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error
 
 	packFile, err := WritePackfile(tf, smallInputs)
 	if err != nil {
-		_ = tf.Close()
-		_ = os.Remove(tempPath)
+		errutil.CloseAndLog(tf, "temp packfile")
+		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
+			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, remErr)
+		}
 		return fmt.Errorf("failed to write packfile: %w", err)
 	}
 
 	st, err := tf.Stat()
 	if err != nil {
-		_ = tf.Close()
-		_ = os.Remove(tempPath)
+		errutil.CloseAndLog(tf, "temp packfile")
+		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
+			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, remErr)
+		}
 		return fmt.Errorf("failed to stat temp packfile: %w", err)
 	}
 	if _, err := tf.Seek(0, io.SeekStart); err != nil {
-		_ = tf.Close()
-		_ = os.Remove(tempPath)
+		errutil.CloseAndLog(tf, "temp packfile")
+		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
+			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, remErr)
+		}
 		return fmt.Errorf("failed to seek temp packfile: %w", err)
 	}
 
 	packStream := NewByteStreamFromFile(tf, st.Size(), true)
 	packFileKey := s.packKey(packID, len(smallInputs))
 	if _, err := s.backend.PutObject(ctx, "", packFileKey, packStream); err != nil {
-		_ = packStream.Close()
+		errutil.CloseAndLog(packStream, "temp packfile stream")
 		return fmt.Errorf("failed to write packfile %s to backend: %w", packFileKey, err)
 	}
-	_ = packStream.Close()
+	if err := packStream.Close(); err != nil {
+		return fmt.Errorf("failed to close packfile stream %s: %w", packFileKey, err)
+	}
 
 	s.mu.Lock()
 	s.packIndexes[packFileKey] = packFile.Entries
@@ -322,7 +333,9 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 	var looseBuf bytes.Buffer
 	if err := s.backend.GetObject(ctx, "", standaloneKey, 0, 0, &looseBuf); err == nil && looseBuf.Len() >= SingleBlobHeaderSize {
 		stream, _, err := DecodeLooseBlob(&looseBuf)
-		if err == nil {
+		if err != nil {
+			klog.Warningf("failed to decode standalone loose blob %s: %v", standaloneKey, err)
+		} else {
 			s.mu.Lock()
 			s.shaToLocation[sha256Hex] = BlobLocation{IsStandalone: true}
 			s.mu.Unlock()

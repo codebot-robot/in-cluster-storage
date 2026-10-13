@@ -27,6 +27,9 @@ import (
 	"io"
 	"os"
 	"sort"
+
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -144,7 +147,9 @@ func (f *fileByteStream) Seek(offset int64, whence int) (int64, error) {
 func (f *fileByteStream) Close() error {
 	err := f.file.Close()
 	if f.autoDelete && f.path != "" {
-		_ = os.Remove(f.path)
+		if remErr := os.Remove(f.path); remErr != nil && !os.IsNotExist(remErr) {
+			klog.Warningf("failed to remove temporary file %s: %v", f.path, remErr)
+		}
 	}
 	return err
 }
@@ -326,17 +331,21 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 	zw := zlib.NewWriter(outputWriter)
 	tee := io.TeeReader(src, hasher)
 	if _, err := io.Copy(zw, tee); err != nil {
-		_ = zw.Close()
+		errutil.CloseAndLog(zw, "zlib compressor")
 		if outputTempFile != nil {
-			_ = outputTempFile.Close()
-			_ = os.Remove(outputTempPath)
+			errutil.CloseAndLog(outputTempFile, "temp compression file")
+			if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
+				klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
+			}
 		}
 		return nil, fmt.Errorf("compression failed: %w", err)
 	}
 	if err := zw.Close(); err != nil {
 		if outputTempFile != nil {
-			_ = outputTempFile.Close()
-			_ = os.Remove(outputTempPath)
+			errutil.CloseAndLog(outputTempFile, "temp compression file")
+			if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
+				klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
+			}
 		}
 		return nil, fmt.Errorf("compression close failed: %w", err)
 	}
@@ -346,7 +355,14 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 
 	var outputLen int64
 	if useTemp {
-		st, _ := outputTempFile.Stat()
+		st, err := outputTempFile.Stat()
+		if err != nil {
+			errutil.CloseAndLog(outputTempFile, "temp compression file")
+			if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
+				klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
+			}
+			return nil, fmt.Errorf("failed to stat temp compression file: %w", err)
+		}
 		outputLen = st.Size()
 	} else {
 		outputLen = int64(outputMem.Len())
@@ -356,9 +372,11 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 		// Compression is a win
 		if useTemp {
 			if _, err := outputTempFile.Seek(0, io.SeekStart); err != nil {
-				_ = outputTempFile.Close()
-				_ = os.Remove(outputTempPath)
-				return nil, err
+				errutil.CloseAndLog(outputTempFile, "temp compression file")
+				if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
+					klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
+				}
+				return nil, fmt.Errorf("failed to seek temp compression file: %w", err)
 			}
 			return &EncodedBlob{
 				Stream:       NewByteStreamFromFile(outputTempFile, outputLen, true),
@@ -379,8 +397,10 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 
 	// Compression was not a win, discard compressed output and use raw src
 	if outputTempFile != nil {
-		_ = outputTempFile.Close()
-		_ = os.Remove(outputTempPath)
+		errutil.CloseAndLog(outputTempFile, "temp compression file")
+		if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
+			klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
+		}
 	}
 	if err := src.Rewind(); err != nil {
 		return nil, err
@@ -455,7 +475,7 @@ func decodePayloadToByteStream(r io.Reader, encoding uint32, finalLen int64) (By
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize zlib decompressor: %w", err)
 		}
-		defer zr.Close()
+		defer errutil.CloseAndLog(zr, "zlib decompressor")
 		src = zr
 	} else if encoding != EncodingRaw && encoding != EncodingChunked {
 		return nil, fmt.Errorf("unsupported encoding: %d", encoding)
@@ -477,15 +497,19 @@ func decodePayloadToByteStream(r io.Reader, encoding uint32, finalLen int64) (By
 
 	written, err := io.Copy(tf, src)
 	if err != nil {
-		_ = tf.Close()
-		_ = os.Remove(tempPath)
+		errutil.CloseAndLog(tf, "temp payload file")
+		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
+			klog.Warningf("failed to remove temporary payload file %s: %v", tempPath, remErr)
+		}
 		return nil, fmt.Errorf("failed writing to temp file: %w", err)
 	}
 
 	if _, err := tf.Seek(0, io.SeekStart); err != nil {
-		_ = tf.Close()
-		_ = os.Remove(tempPath)
-		return nil, err
+		errutil.CloseAndLog(tf, "temp payload file")
+		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
+			klog.Warningf("failed to remove temporary payload file %s: %v", tempPath, remErr)
+		}
+		return nil, fmt.Errorf("failed to seek temp payload file: %w", err)
 	}
 
 	return NewByteStreamFromFile(tf, written, true), nil
