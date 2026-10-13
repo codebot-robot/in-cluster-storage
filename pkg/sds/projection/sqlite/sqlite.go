@@ -32,11 +32,13 @@ import (
 	"time"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
+	"k8s.io/klog/v2"
 	sqlite "modernc.org/sqlite" // Pure-Go SQLite driver
 )
 
@@ -93,11 +95,32 @@ func (f *Factory) FindLatestSnapshot(ctx context.Context, backend objectstore.Ba
 	return FindLatestSnapshot(ctx, backend, streamID, maxPos)
 }
 
+// removeDatabaseFiles removes the SQLite database file and any associated WAL and SHM files.
+func removeDatabaseFiles(dbPath string) error {
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove stale file %q: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// removeAndLog removes a file and logs a warning with technical context if removal fails (ignoring os.ErrNotExist).
+func removeAndLog(path, what string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		klog.Warningf("failed to remove %s %s: %v", what, path, err)
+	}
+}
+
 // RestoreSnapshot restores a SQLite snapshot from object storage into dir.
 func (f *Factory) RestoreSnapshot(ctx context.Context, backend objectstore.Backend, streamID string, key string, dir string) (sds.LocalIndex, uint64, error) {
-	_ = os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, 0, fmt.Errorf("failed to create directory %q: %w", dir, err)
+	}
 	dbPath := filepath.Join(dir, "metadata.sqlite")
-	_ = os.Remove(dbPath)
+	if err := removeDatabaseFiles(dbPath); err != nil {
+		return nil, 0, err
+	}
 	opts := append([]Option{
 		WithLockingMode("EXCLUSIVE"),
 		WithJournalMode("WAL"),
@@ -108,11 +131,13 @@ func (f *Factory) RestoreSnapshot(ctx context.Context, backend objectstore.Backe
 
 // NewEmpty creates a new empty SQLite database in dir.
 func (f *Factory) NewEmpty(ctx context.Context, streamID string, dir string) (sds.LocalIndex, error) {
-	_ = os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory %q: %w", dir, err)
+	}
 	dbPath := filepath.Join(dir, "metadata.sqlite")
-	_ = os.Remove(dbPath)
-	_ = os.Remove(dbPath + "-wal")
-	_ = os.Remove(dbPath + "-shm")
+	if err := removeDatabaseFiles(dbPath); err != nil {
+		return nil, err
+	}
 	opts := append([]Option{
 		WithStreamID(streamID),
 		WithLockingMode("EXCLUSIVE"),
@@ -305,12 +330,12 @@ func Open(ctx context.Context, path string, opts ...Option) (*DB, error) {
 	}
 
 	if err := db.initBookkeeping(ctx); err != nil {
-		_ = sqlDB.Close()
+		errutil.CloseAndLog(sqlDB, "sqlite connection")
 		return nil, err
 	}
 
 	if err := db.loadState(ctx); err != nil {
-		_ = sqlDB.Close()
+		errutil.CloseAndLog(sqlDB, "sqlite connection")
 		return nil, err
 	}
 
@@ -391,14 +416,19 @@ func (d *DB) IsUnrecoverable(err error) bool {
 func (d *DB) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, ts := range d.stmts {
-		_ = ts.Close()
+	var errs []error
+	for name, ts := range d.stmts {
+		if err := ts.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close statements for %s: %w", name, err))
+		}
 	}
 	d.stmts = make(map[string]*tableStmts)
 	if d.sqlDB != nil {
-		return d.sqlDB.Close()
+		if err := d.sqlDB.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close sqlite db: %w", err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (d *DB) ensureTableStmtsLocked(ctx context.Context, tableName string) (*tableStmts, error) {
@@ -411,7 +441,7 @@ func (d *DB) ensureTableStmtsLocked(ctx context.Context, tableName string) (*tab
 	var err error
 	defer func() {
 		if err != nil {
-			_ = ts.Close()
+			errutil.CloseAndLog(ts, fmt.Sprintf("table statements for %s", tableName))
 		}
 	}()
 
@@ -485,7 +515,7 @@ func (d *DB) loadTypes(ctx context.Context) ([]*sdsv1.TypeDefinition, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to query _stream_types: %w", err)
 	}
-	defer rows.Close()
+	defer errutil.CloseAndLog(rows, "types rows")
 
 	var defs []*sdsv1.TypeDefinition
 	for rows.Next() {
@@ -531,15 +561,18 @@ func (d *DB) loadPosition(ctx context.Context) (string, uint64, bool, error) {
 	if err != nil {
 		return "", 0, false, fmt.Errorf("failed to query _stream_position: %w", err)
 	}
-	defer rows.Close()
+	defer errutil.CloseAndLog(rows, "position rows")
 
 	if rows.Next() {
 		var sID string
 		var pos uint64
 		if err := rows.Scan(&sID, &pos); err != nil {
-			return "", 0, false, fmt.Errorf("failed to scan _stream_position: %w", err)
+			return "", 0, false, fmt.Errorf("failed to scan _stream_position row: %w", err)
 		}
 		return sID, pos, true, nil
+	}
+	if err := rows.Err(); err != nil {
+		return "", 0, false, fmt.Errorf("failed to read _stream_position: %w", err)
 	}
 	return "", 0, false, nil
 }
@@ -603,7 +636,9 @@ func (d *DB) Feed(ctx context.Context, seq uint64, payload []byte) ([]sds.Change
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() {
-		_ = tx.Rollback()
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			klog.Warningf("failed to rollback transaction: %v", rollbackErr)
+		}
 	}()
 
 	for _, ch := range changes {
@@ -659,7 +694,9 @@ func (d *DB) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() {
-		_ = tx.Rollback()
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			klog.Warningf("failed to rollback transaction: %v", rollbackErr)
+		}
 	}()
 
 	var maxSeq uint64 = d.position
@@ -983,7 +1020,7 @@ func (d *DB) ScanLimit(ctx context.Context, typeName string, keyPrefix []byte, l
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan rows from %q: %w", typeName, err)
 	}
-	defer rows.Close()
+	defer errutil.CloseAndLog(rows, fmt.Sprintf("%s rows", typeName))
 
 	var result []proto.Message
 	for rows.Next() {
@@ -1044,7 +1081,7 @@ func (d *DB) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter.S
 			yield(nil, fmt.Errorf("failed to scan rows from %q: %w", typeName, err))
 			return
 		}
-		defer rows.Close()
+		defer errutil.CloseAndLog(rows, fmt.Sprintf("%s scan rows", typeName))
 
 		for rows.Next() {
 			var keydata, valuedata []byte

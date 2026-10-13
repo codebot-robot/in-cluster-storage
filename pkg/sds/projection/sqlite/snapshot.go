@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 )
@@ -139,15 +140,26 @@ func RestoreSnapshotKey(ctx context.Context, backend objectstore.Backend, stream
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create restore file %q: %w", targetPath, err)
 	}
-	defer outFile.Close()
+	defer func() {
+		if outFile != nil {
+			errutil.CloseAndLog(outFile, "restore file")
+		}
+	}()
 
 	if err := backend.GetObject(ctx, "", key, 0, 0, outFile); err != nil {
-		_ = os.Remove(targetPath)
+		removeAndLog(targetPath, "incomplete restore file")
 		return nil, 0, fmt.Errorf("failed to download snapshot %q: %w", key, err)
 	}
 	if err := outFile.Sync(); err != nil {
+		removeAndLog(targetPath, "incomplete restore file")
 		return nil, 0, fmt.Errorf("failed to sync restored file %q: %w", targetPath, err)
 	}
+	if err := outFile.Close(); err != nil {
+		outFile = nil
+		removeAndLog(targetPath, "incomplete restore file")
+		return nil, 0, fmt.Errorf("failed to close restore file %q: %w", targetPath, err)
+	}
+	outFile = nil
 
 	allOpts := append([]Option{WithStreamID(streamID)}, opts...)
 	db, err := Open(ctx, targetPath, allOpts...)
@@ -183,8 +195,11 @@ func PublishSnapshot(ctx context.Context, db *DB, backend objectstore.Backend, t
 		return "", 0, fmt.Errorf("failed to create temp file for snapshot: %w", err)
 	}
 	tmpPath := tmpFile.Name()
-	_ = tmpFile.Close()
-	defer os.Remove(tmpPath)
+	if err := tmpFile.Close(); err != nil {
+		removeAndLog(tmpPath, "temp snapshot file")
+		return "", 0, fmt.Errorf("failed to close temp file %q: %w", tmpPath, err)
+	}
+	defer removeAndLog(tmpPath, "temp snapshot file")
 
 	// Use SQLite VACUUM INTO to create a defragmented, clean snapshot file
 	vacuumSQL := fmt.Sprintf("VACUUM INTO %q;", tmpPath)
@@ -201,7 +216,7 @@ func PublishSnapshot(ctx context.Context, db *DB, backend objectstore.Backend, t
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to open snapshot file for reading: %w", err)
 	}
-	defer f.Close()
+	defer errutil.CloseAndLog(f, "snapshot file")
 
 	key := SnapshotKey(streamID, pos)
 	stream := blob.NewByteStreamFromFile(f, stat.Size(), false)
@@ -225,8 +240,11 @@ func BuildSnapshot(ctx context.Context, streamID string, payloads [][]byte, back
 		return "", 0, fmt.Errorf("failed to create temp file: %w", err)
 	}
 	tmpPath := tmpFile.Name()
-	_ = tmpFile.Close()
-	defer os.Remove(tmpPath)
+	if err := tmpFile.Close(); err != nil {
+		removeAndLog(tmpPath, "temp build file")
+		return "", 0, fmt.Errorf("failed to close temp file %q: %w", tmpPath, err)
+	}
+	defer removeAndLog(tmpPath, "temp snapshot file")
 
 	db, err := Open(ctx, tmpPath,
 		WithStreamID(streamID),
@@ -240,13 +258,13 @@ func BuildSnapshot(ctx context.Context, streamID string, payloads [][]byte, back
 	for i, payload := range payloads {
 		seq := uint64(i + 1)
 		if _, err := db.Feed(ctx, seq, payload); err != nil {
-			_ = db.Close()
+			errutil.CloseAndLog(db, "build db")
 			return "", 0, fmt.Errorf("feed failed at seq %d: %w", seq, err)
 		}
 	}
 
 	if db.ChangeReader().HasPending() {
-		_ = db.Close()
+		errutil.CloseAndLog(db, "build db")
 		return "", 0, ErrPendingTransaction
 	}
 
@@ -260,7 +278,7 @@ func BuildSnapshot(ctx context.Context, streamID string, payloads [][]byte, back
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to open build db file: %w", err)
 	}
-	defer f.Close()
+	defer errutil.CloseAndLog(f, "build db file")
 
 	if err := f.Sync(); err != nil {
 		return "", 0, fmt.Errorf("failed to fsync build db file: %w", err)
