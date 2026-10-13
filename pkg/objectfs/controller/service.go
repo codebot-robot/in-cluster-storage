@@ -31,12 +31,14 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/klog/v2"
 )
 
 func volErrToSyscall(err error) int32 {
@@ -366,10 +368,12 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 
 // Close stops periodic flushing and closes all active volumes and streams.
 func (s *Server) Close() error {
-	s.StopPeriodicFlush()
+	var firstErr error
+	if err := s.StopPeriodicFlush(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var firstErr error
 	for _, v := range s.volumes {
 		if err := v.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -417,21 +421,22 @@ func (s *Server) StartPeriodicFlush(ctx context.Context, interval time.Duration)
 		for {
 			select {
 			case <-ctx.Done():
-				_ = s.FlushAll(context.Background())
 				return
 			case <-stopFlush:
-				_ = s.FlushAll(context.Background())
 				return
 			case <-ticker.C:
-				_ = s.FlushAll(ctx)
+				if err := s.FlushAll(ctx); err != nil {
+					klog.Warningf("periodic flush failed: %v", err)
+				}
 			}
 		}
 	}()
 }
 
-func (s *Server) StopPeriodicFlush() {
+func (s *Server) StopPeriodicFlush() error {
 	s.mu.Lock()
-	if s.flushTicker != nil {
+	hadTicker := (s.flushTicker != nil)
+	if hadTicker {
 		s.flushTicker.Stop()
 		close(s.stopFlush)
 		s.flushTicker = nil
@@ -439,12 +444,15 @@ func (s *Server) StopPeriodicFlush() {
 	}
 	s.mu.Unlock()
 	s.flushWg.Wait()
+	if hadTicker {
+		return s.FlushAll(context.Background())
+	}
+	return nil
 }
 
-// GetVolume returns the Volume instance for the given volumeID, or nil if creation fails.
-func (s *Server) GetVolume(volumeID string) *Volume {
-	vol, _ := s.getOrCreateVolume(volumeID)
-	return vol
+// GetVolume returns the Volume instance for the given volumeID, or an error if creation fails.
+func (s *Server) GetVolume(volumeID string) (*Volume, error) {
+	return s.getOrCreateVolume(volumeID)
 }
 
 // RestoreSnapshot restores the volume filesystem state to a specific snapshot.
@@ -822,7 +830,7 @@ func (s *Server) GetBlob(req *pb.GetBlobRequest, stream pb.ObjectFSController_Ge
 	if err != nil {
 		return status.Errorf(codes.NotFound, "failed to get blob: %v", err)
 	}
-	defer bStream.Close()
+	defer errutil.CloseAndLog(bStream, "blob stream")
 
 	if offset > 0 {
 		if _, err := bStream.Seek(offset, io.SeekStart); err != nil {
@@ -878,9 +886,11 @@ func parseSnapshotTime(name string) time.Time {
 		time.RFC3339,
 	}
 	for _, f := range formats {
-		if t, err := time.Parse(f, trimmed); err == nil {
-			return t
+		t, err := time.Parse(f, trimmed)
+		if err != nil {
+			continue
 		}
+		return t
 	}
 	return time.Time{}
 }
@@ -896,13 +906,14 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 
 	if s.backend != nil {
 		objects, err := s.backend.ListObjects(ctx, "", "volumes/")
-		if err == nil {
-			for _, obj := range objects {
-				trimmed := strings.TrimPrefix(obj, "volumes/")
-				parts := strings.Split(trimmed, "/")
-				if len(parts) > 0 && parts[0] != "" {
-					volMap[parts[0]] = struct{}{}
-				}
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to list volumes from backend: %v", err)
+		}
+		for _, obj := range objects {
+			trimmed := strings.TrimPrefix(obj, "volumes/")
+			parts := strings.Split(trimmed, "/")
+			if len(parts) > 0 && parts[0] != "" {
+				volMap[parts[0]] = struct{}{}
 			}
 		}
 	}

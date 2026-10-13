@@ -22,8 +22,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -141,18 +143,17 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 	server := controller.NewServer(backend, serverOpts...)
-	defer server.Close()
 	csiController := controller.NewCSIController(server)
 
 	if *flushInterval > 0 {
 		server.StartPeriodicFlush(ctx, *flushInterval)
-		defer server.StopPeriodicFlush()
 	}
 
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
 	csi.RegisterIdentityServer(grpcServer, csiController)
 	csi.RegisterControllerServer(grpcServer, csiController)
 
+	var csiServer *grpc.Server
 	if *csiEndpoint != "" {
 		proto, addr, err := parseEndpoint(*csiEndpoint)
 		if err != nil {
@@ -171,7 +172,7 @@ func main() {
 			klog.Fatalf("failed to listen on CSI endpoint %s: %v", *csiEndpoint, err)
 		}
 
-		csiServer := grpc.NewServer()
+		csiServer = grpc.NewServer()
 		csi.RegisterIdentityServer(csiServer, csiController)
 		csi.RegisterControllerServer(csiServer, csiController)
 
@@ -183,8 +184,25 @@ func main() {
 		}()
 	}
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		klog.Infof("Shutting down ObjectFS controller...")
+		if csiServer != nil {
+			csiServer.GracefulStop()
+		}
+		grpcServer.GracefulStop()
+	}()
+
 	klog.Infof("ObjectFS Controller listening on port %d (flushInterval=%v)", *port, *flushInterval)
-	if err := grpcServer.Serve(listener); err != nil {
-		klog.Fatalf("failed to serve: %v", err)
+	serveErr := grpcServer.Serve(listener)
+	if err := server.Close(); err != nil {
+		klog.Errorf("failed to close server on shutdown: %v", err)
+		klog.Flush()
+		os.Exit(1)
+	}
+	if serveErr != nil {
+		klog.Fatalf("failed to serve: %v", serveErr)
 	}
 }

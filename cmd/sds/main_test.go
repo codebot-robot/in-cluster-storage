@@ -330,7 +330,10 @@ func TestSdsCatObjectFSStream(t *testing.T) {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
 
-	vol := server.GetVolume(volumeID)
+	vol, err := server.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
 	if vol == nil || vol.Stream() == nil {
 		t.Fatalf("Expected active volume stream")
 	}

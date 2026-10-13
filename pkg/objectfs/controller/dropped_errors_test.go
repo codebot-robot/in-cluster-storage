@@ -17,12 +17,20 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"iter"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"google.golang.org/protobuf/proto"
@@ -184,5 +192,246 @@ func TestRegression_ChunkListScanFailure(t *testing.T) {
 	_, _, _, err = vol.ReadFile(ctx, ino, 0, int64(len(data)))
 	if err == nil {
 		t.Fatal("expected ReadFile to fail when FileChunk scan fails, got nil")
+	}
+}
+
+type faultyListBackend struct {
+	objectstore.Backend
+	failList atomic.Bool
+}
+
+func (b *faultyListBackend) ListObjects(ctx context.Context, bucket, prefix string) ([]string, error) {
+	if b.failList.Load() {
+		return nil, errors.New("injected backend list failure")
+	}
+	return b.Backend.ListObjects(ctx, bucket, prefix)
+}
+
+func TestRegression_ListVolumesBackendFailure(t *testing.T) {
+	ctx := t.Context()
+	backend := &faultyListBackend{Backend: inmemorystorage.New()}
+	server := NewServer(backend)
+
+	// ListVolumes succeeds when backend does not fail
+	resp, err := server.ListVolumes(ctx, &pb.ListVolumesRequest{})
+	if err != nil {
+		t.Fatalf("ListVolumes failed unexpectedly: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected non-nil response")
+	}
+
+	// ListVolumes must surface the error when backend.ListObjects fails
+	backend.failList.Store(true)
+	_, err = server.ListVolumes(ctx, &pb.ListVolumesRequest{})
+	if err == nil {
+		t.Fatal("expected ListVolumes to fail when backend.ListObjects fails, got nil")
+	}
+}
+
+type faultyInodeGetIndex struct {
+	sds.LocalIndex
+	failInodeGet atomic.Bool
+}
+
+func (f *faultyInodeGetIndex) Get(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
+	if f.failInodeGet.Load() && typeName == "objectfs.v1alpha1.Inode" {
+		rootKey, _ := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
+		if !bytes.Equal(key.Bytes(), rootKey.Bytes()) {
+			return nil, false, errors.New("injected Inode get failure")
+		}
+	}
+	return f.LocalIndex.Get(ctx, typeName, key)
+}
+
+type faultyInodeGetFactory struct {
+	sds.IndexFactory
+	idx *faultyInodeGetIndex
+}
+
+func (f *faultyInodeGetFactory) NewEmpty(ctx context.Context, streamID string, dir string) (sds.LocalIndex, error) {
+	inner, err := f.IndexFactory.NewEmpty(ctx, streamID, dir)
+	if err != nil {
+		return nil, err
+	}
+	f.idx.LocalIndex = inner
+	return f.idx, nil
+}
+
+func (f *faultyInodeGetFactory) OpenLocal(ctx context.Context, streamID string, dir string) (sds.LocalIndex, bool, error) {
+	inner, found, err := f.IndexFactory.OpenLocal(ctx, streamID, dir)
+	if err != nil || !found {
+		return nil, found, err
+	}
+	f.idx.LocalIndex = inner
+	return f.idx, true, nil
+}
+
+func TestRegression_ReadDirEntryAttrFailure(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+
+	baseFactory, err := sds.GetIndexFactory("memory")
+	if err != nil {
+		t.Fatalf("GetIndexFactory failed: %v", err)
+	}
+
+	faultyIdx := &faultyInodeGetIndex{}
+	factory := &faultyInodeGetFactory{IndexFactory: baseFactory, idx: faultyIdx}
+
+	vol := MustNewVolume(t, "test-vol-readdir-fail", backend, NewEventBroadcaster(),
+		WithIndexFactory(factory),
+		WithMetadataCacheDisabled(true),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	_, err = vol.CreateFile(ctx, 1, "child.txt", 0644, []byte("content"), 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	if err := vol.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay failed: %v", err)
+	}
+	vol.metadataView.ClearCache()
+
+	// ReadDir succeeds before failure injection
+	entries, err := vol.ReadDir(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReadDir failed unexpectedly: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+
+	// Inject error on Inode Get
+	faultyIdx.failInodeGet.Store(true)
+
+	// ReadDir must return the error rather than silently omitting entries
+	_, err = vol.ReadDir(ctx, 1)
+	if err == nil {
+		t.Fatal("expected ReadDir to fail when toEntryAttrLocked fails, got nil")
+	}
+	expectedPrefix := "readdir 1: entry \"child.txt\""
+	if !strings.Contains(err.Error(), expectedPrefix) {
+		t.Fatalf("expected error containing %q, got: %v", expectedPrefix, err)
+	}
+}
+
+type faultyPutBackend struct {
+	objectstore.Backend
+	failPut atomic.Bool
+}
+
+func (b *faultyPutBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
+	if b.failPut.Load() {
+		return "", errors.New("injected backend put failure")
+	}
+	return b.Backend.PutObject(ctx, volumeID, key, stream)
+}
+
+func TestRegression_TruncateFilePutBlobsFailure(t *testing.T) {
+	ctx := t.Context()
+	backend := &faultyPutBackend{Backend: inmemorystorage.New()}
+
+	vol := MustNewVolume(t, "test-vol-truncate-fail", backend, NewEventBroadcaster(),
+		WithChunkSize(1024),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Create file spanning multiple chunks (> maxInlineLen of 4096)
+	data := bytes.Repeat([]byte("a"), 10000)
+	attr, err := vol.CreateFile(ctx, 1, "test.txt", 0644, data, 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := attr.GetInode().GetIno()
+
+	if err := vol.Fsync(ctx, ino); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	// Now fail backend PutObject during TruncateFile (which uploads the truncated chunk boundary)
+	backend.failPut.Store(true)
+
+	_, err = vol.TruncateFile(ctx, ino, 5500)
+	if err == nil {
+		t.Fatal("expected TruncateFile to fail when PutBlobs fails, got nil")
+	}
+}
+
+func TestRegression_CorruptLocalIndexRecovery(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+
+	baseDir := t.TempDir()
+	localDir := filepath.Join(baseDir, "idx")
+	if err := os.MkdirAll(localDir, 0755); err != nil {
+		t.Fatalf("failed to create local dir: %v", err)
+	}
+	dbPath := filepath.Join(localDir, "metadata.sqlite")
+	// Write garbage into the local index SQLite file so OpenLocal fails
+	if err := os.WriteFile(dbPath, []byte("garbage not a valid sqlite database header"), 0644); err != nil {
+		t.Fatalf("failed to write corrupt db: %v", err)
+	}
+
+	vol, err := NewVolume("test-vol-corrupt-idx", backend, NewEventBroadcaster(),
+		WithLocalStorageDir(localDir),
+	)
+	if err != nil {
+		t.Fatalf("expected volume to start successfully despite corrupt local index, got: %v", err)
+	}
+	defer vol.Close()
+
+	// Verify volume came up and is functional
+	entries, err := vol.ReadDir(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected empty directory, got %d entries", len(entries))
+	}
+
+	// Verify the corrupt directory was renamed aside to a .corrupt-* path
+	matches, err := filepath.Glob(filepath.Join(baseDir, "idx.corrupt-*"))
+	if err != nil || len(matches) == 0 {
+		t.Fatalf("expected corrupt directory to be renamed to idx.corrupt-*, found matches: %v", matches)
+	}
+}
+
+func TestRegression_ShutdownFlushFailureSurfacedInClose(t *testing.T) {
+	ctx := t.Context()
+	backend := &faultyPutBackend{Backend: inmemorystorage.New()}
+	server := NewServer(backend)
+
+	volumeID := "test-vol-shutdown-flush"
+	vol, err := server.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
+
+	// Create a file to ensure there is state that needs flushing
+	_, err = vol.CreateFile(ctx, 1, "test.txt", 0644, []byte("data"), 1000, 1000)
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// Start periodic flush
+	server.StartPeriodicFlush(ctx, 1*time.Hour)
+
+	// Inject backend failure
+	backend.failPut.Store(true)
+
+	// Close must return error so controller exits non-zero on failed final flush
+	if err := server.Close(); err == nil {
+		t.Fatal("expected server.Close() to fail when final flush fails, got nil")
 	}
 }
