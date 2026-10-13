@@ -333,10 +333,18 @@ func (v *Volume) initMetadataViewLocked(ctx context.Context, customIndex sds.Loc
 		if v.localStorageDir == "" {
 			v.localStorageDir = path.Join(os.TempDir(), fmt.Sprintf("objectfs-local-%s-%d", v.volumeID, time.Now().UnixNano()))
 		}
-		var err error
-		if localIdx, found, _ := v.indexFactory.OpenLocal(ctx, v.streamID.String(), v.localStorageDir); found && localIdx != nil {
+		localIdx, found, openErr := v.indexFactory.OpenLocal(ctx, v.streamID.String(), v.localStorageDir)
+		if openErr != nil {
+			klog.Errorf("Volume %s: corrupt or unreadable local index at %s: %v; moving aside and initializing empty index", v.volumeID, v.localStorageDir, openErr)
+			corruptDir := fmt.Sprintf("%s.corrupt-%d", v.localStorageDir, time.Now().UnixNano())
+			if renErr := os.Rename(v.localStorageDir, corruptDir); renErr != nil {
+				klog.Warningf("Volume %s: failed to rename corrupt directory %s to %s: %v", v.volumeID, v.localStorageDir, corruptDir, renErr)
+			}
+		} else if found && localIdx != nil {
 			index = localIdx
-		} else {
+		}
+		if index == nil {
+			var err error
 			index, err = v.indexFactory.NewEmpty(ctx, v.streamID.String(), v.localStorageDir)
 			if err != nil {
 				return fmt.Errorf("failed to create local index: %w", err)
@@ -345,7 +353,9 @@ func (v *Volume) initMetadataViewLocked(ctx context.Context, customIndex sds.Loc
 	}
 
 	if v.metadataView != nil {
-		_ = v.metadataView.Close()
+		if err := v.metadataView.Close(); err != nil {
+			return fmt.Errorf("failed to close existing metadata view: %w", err)
+		}
 	}
 
 	viewOpts := append([]view.Option{}, v.viewOpts...)
@@ -381,7 +391,10 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		blobStore = blob.NewStore(backend, 0)
 	}
 
-	f, _ := sds.GetIndexFactory("sqlite")
+	f, err := sds.GetIndexFactory("sqlite")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get default index factory: %w", err)
+	}
 
 	v := &Volume{
 		volumeID:        volumeID,
@@ -427,8 +440,14 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		return nil, fmt.Errorf("failed to init metadata view: %w", err)
 	}
 
-	rootKey, _ := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
-	msg, ok, _ := v.metadataView.Get(context.Background(), "objectfs.v1alpha1.Inode", rootKey)
+	rootKey, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract root inode key: %w", err)
+	}
+	msg, ok, err := v.metadataView.Get(context.Background(), "objectfs.v1alpha1.Inode", rootKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get root inode: %w", err)
+	}
 	if !ok || msg == nil {
 		rootInodeMsg := &pb.Inode{
 			Ino:   proto.Uint64(1),
@@ -1858,7 +1877,7 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 
 	dirNode, err := v.getOrLoadInodeLocked(ctx, nil, dirInodeID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("readdir %d: %w", dirInodeID, err)
 	}
 	if !dirNode.Row.GetIsDir() {
 		return nil, fmt.Errorf("inode %d is not a directory: %w", dirInodeID, syscall.ENOTDIR)
@@ -1886,9 +1905,10 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 	for _, name := range names {
 		de := entriesMap[name]
 		attr, err := v.toEntryAttrLocked(ctx, nil, de.GetIno(), name)
-		if err == nil {
-			entries = append(entries, attr)
+		if err != nil {
+			return nil, fmt.Errorf("readdir %d: entry %q (ino %d): %w", dirInodeID, name, de.GetIno(), err)
 		}
+		entries = append(entries, attr)
 	}
 	return entries, nil
 }
@@ -2150,7 +2170,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				return nil, nil, fmt.Errorf("file %q already exists: %w", name, syscall.EEXIST)
 			}
 			if childInode.Data != nil {
-				_ = childInode.Data.Close()
+				errutil.CloseAndLog(childInode.Data, "inode data")
 				childInode.Data = nil
 			}
 
@@ -3233,7 +3253,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			node.DirtyChunks = nil
 			node.InlineData = nil
 			if node.Data != nil {
-				_ = node.Data.Close()
+				errutil.CloseAndLog(node.Data, "inode data")
 				node.Data = nil
 			}
 
@@ -3324,9 +3344,11 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 					chunkSha := fmt.Sprintf("%x", sha256.Sum256(truncatedData))
 					node.Chunks[uint32(lastIdx)] = chunkSha
 					if v.blobStore != nil {
-						_ = v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{
+						if err := v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{
 							chunkSha: blob.NewByteStreamFromBytes(truncatedData),
-						})
+						}); err != nil {
+							return nil, nil, fmt.Errorf("failed to upload truncated chunk: %w", err)
+						}
 					}
 					if _, err := tx.Insert(ctx, &pb.FileChunk{
 						Ino:    proto.Uint64(node.Row.GetIno()),
@@ -3460,13 +3482,14 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			row.Ctime = timestamppb.New(now)
 		})
 
-		parentInode, _ := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
-		if parentInode != nil {
-			parentInode.mutate(func(row *pb.Inode) {
-				row.Mtime = timestamppb.New(now)
-				row.Ctime = timestamppb.New(now)
-			})
+		parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
+		if err != nil {
+			return nil, err
 		}
+		parentInode.mutate(func(row *pb.Inode) {
+			row.Mtime = timestamppb.New(now)
+			row.Ctime = timestamppb.New(now)
+		})
 
 		// Reads before writes: scan chunk rows before buffering any deletions into tx.
 		var chunkMsgs []proto.Message
@@ -3585,16 +3608,17 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		delete(v.dirParents, childInodeID)
 
 		now := time.Now()
-		parentInode, _ := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
-		if parentInode != nil {
-			parentInode.mutate(func(row *pb.Inode) {
-				if row.GetNlink() > 2 {
-					row.Nlink--
-				}
-				row.Mtime = timestamppb.New(now)
-				row.Ctime = timestamppb.New(now)
-			})
+		parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
+		if err != nil {
+			return nil, err
 		}
+		parentInode.mutate(func(row *pb.Inode) {
+			if row.GetNlink() > 2 {
+				row.Nlink--
+			}
+			row.Mtime = timestamppb.New(now)
+			row.Ctime = timestamppb.New(now)
+		})
 
 		var commitSeq uint64
 		if _, err = tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
@@ -3691,7 +3715,10 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			return nil, nil, err
 		}
 
-		oldParentInode, _ := v.getOrLoadInodeLocked(ctx, tx, oldParentInodeID)
+		oldParentInode, err := v.getOrLoadInodeLocked(ctx, tx, oldParentInodeID)
+		if err != nil {
+			return nil, nil, err
+		}
 
 		var targetInode *CachedInode
 		var targetChunkMsgs []proto.Message
@@ -4064,10 +4091,10 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		volKey := fmt.Sprintf("volumes/%s/stream.id", v.volumeID)
 		streamObj := blob.NewByteStreamFromBytes([]byte(v.streamID.String()))
 		if _, err := v.backend.PutObject(ctx, "", volKey, streamObj); err != nil {
-			_ = streamObj.Close()
+			errutil.CloseAndLog(streamObj, "stream id object")
 			return fmt.Errorf("failed to save volume marker: %w", err)
 		}
-		_ = streamObj.Close()
+		errutil.CloseAndLog(streamObj, "stream id object")
 	}
 
 	return nil
@@ -4366,7 +4393,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 	// 3. Sync registry
 	if v.metadataStream != nil {
 		if err := rebuiltIdx.SyncRegistry(ctx, v.metadataStream.Registry()); err != nil {
-			_ = rebuiltIdx.Close()
+			errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 			return nil, 0, fmt.Errorf("failed to sync registry to rebuilt index: %w", err)
 		}
 	}
@@ -4401,7 +4428,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 			},
 		}
 		if err := rebuiltIdx.ApplyBatch(ctx, initChanges); err != nil {
-			_ = rebuiltIdx.Close()
+			errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 			return nil, 0, fmt.Errorf("failed to init root inode in rebuilt index: %w", err)
 		}
 	}
@@ -4440,7 +4467,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 		if witnessHead > snapPos {
 			tailIter, err := v.stream.Tail(ctx, snapPos)
 			if err != nil {
-				_ = rebuiltIdx.Close()
+				errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 				return nil, 0, fmt.Errorf("failed to tail authoritative stream from wal-buffer during rebuild: %w", err)
 			}
 			for seq, payload := range tailIter {
@@ -4448,7 +4475,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 					continue
 				}
 				if seq != expectedSeq {
-					_ = rebuiltIdx.Close()
+					errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 					return nil, 0, fmt.Errorf("stream contiguity violation in wal-buffer tail during rebuild: expected seq %d, got %d", expectedSeq, seq)
 				}
 				expectedSeq++
@@ -4471,11 +4498,11 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 				}
 				changes, err := cr.Feed(seq, payload)
 				if err != nil {
-					_ = rebuiltIdx.Close()
+					errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 					return nil, 0, fmt.Errorf("failed to feed authoritative record at seq %d during rebuild: %w", seq, err)
 				}
 				if err := applyChanges(changes); err != nil {
-					_ = rebuiltIdx.Close()
+					errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 					return nil, 0, err
 				}
 				if seq >= witnessHead {
@@ -4483,7 +4510,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 				}
 			}
 			if expectedSeq-1 < witnessHead {
-				_ = rebuiltIdx.Close()
+				errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 				return nil, 0, fmt.Errorf("failed to rebuild authoritative stream from wal-buffer: expected head %d but only reached %d", witnessHead, expectedSeq-1)
 			}
 		}
@@ -4495,7 +4522,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 				continue
 			}
 			if rec.StreamSeq != expectedSeq {
-				_ = rebuiltIdx.Close()
+				errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 				return nil, 0, fmt.Errorf("stream contiguity violation in local records during rebuild: expected seq %d, got %d", expectedSeq, rec.StreamSeq)
 			}
 			expectedSeq++
@@ -4515,11 +4542,11 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 			}
 			changes, err := cr.Feed(rec.StreamSeq, rec.Payload)
 			if err != nil {
-				_ = rebuiltIdx.Close()
+				errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 				return nil, 0, fmt.Errorf("failed to feed local record at seq %d during rebuild: %w", rec.StreamSeq, err)
 			}
 			if err := applyChanges(changes); err != nil {
-				_ = rebuiltIdx.Close()
+				errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 				return nil, 0, err
 			}
 		}
@@ -4536,7 +4563,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 					continue
 				}
 				if seq != expectedSeq {
-					_ = rebuiltIdx.Close()
+					errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 					return nil, 0, fmt.Errorf("stream contiguity violation in memAppender: expected seq %d, got %d", expectedSeq, seq)
 				}
 				expectedSeq++
@@ -4555,12 +4582,12 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 				}
 				chs, err := cr.Feed(seq, p)
 				if err != nil {
-					_ = rebuiltIdx.Close()
+					errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 					return nil, 0, fmt.Errorf("failed to feed memory record %d: %w", seq, err)
 				}
 				if len(chs) > 0 {
 					if err := rebuiltIdx.ApplyBatch(ctx, chs); err != nil {
-						_ = rebuiltIdx.Close()
+						errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 						return nil, 0, fmt.Errorf("failed to apply replayed changes: %w", err)
 					}
 					for _, ch := range chs {
@@ -4709,7 +4736,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 					}
 				} else {
 					klog.Infof("Volume %s: local SQLite metadata index on disk is stale (local pos %d < remote snapshot pos %d); restoring snapshot %s", v.volumeID, localIdx.Position(), remoteSnapPos, remoteSnapKey)
-					_ = localIdx.Close()
+					errutil.CloseAndLog(localIdx, "stale local index")
 				}
 			}
 		}
@@ -4718,7 +4745,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	// 2. Otherwise restore latest published snapshot
 	if !initialized && remoteSnapKey != "" && v.backend != nil {
 		if v.metadataView != nil {
-			_ = v.metadataView.Close()
+			errutil.CloseAndLog(v.metadataView, "metadata view")
 			v.metadataView = nil
 		}
 		restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), remoteSnapKey, v.localStorageDir)
@@ -4734,7 +4761,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	if !initialized {
 		if isRemoteWAL {
 			if v.metadataView != nil {
-				_ = v.metadataView.Close()
+				errutil.CloseAndLog(v.metadataView, "metadata view")
 				v.metadataView = nil
 			}
 			if v.localStorageDir != "" {
@@ -4751,8 +4778,14 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				return fmt.Errorf("failed to init empty metadata view: %w", err)
 			}
 		}
-		rootKey, _ := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
-		msg, ok, _ := v.metadataView.Get(ctx, "objectfs.v1alpha1.Inode", rootKey)
+		rootKey, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
+		if err != nil {
+			return fmt.Errorf("failed to extract root inode key: %w", err)
+		}
+		msg, ok, err := v.metadataView.Get(ctx, "objectfs.v1alpha1.Inode", rootKey)
+		if err != nil {
+			return fmt.Errorf("failed to get root inode: %w", err)
+		}
 		if !ok || msg == nil {
 			rootInodeMsg := &pb.Inode{
 				Ino:   proto.Uint64(1),

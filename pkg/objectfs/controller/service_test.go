@@ -54,6 +54,15 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+func mustGetVolume(t *testing.T, server *Server, volumeID string) *Volume {
+	t.Helper()
+	vol, err := server.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume %q failed: %v", volumeID, err)
+	}
+	return vol
+}
+
 func resolvePath(ctx context.Context, server *Server, volumeID, p string) (uint64, error) {
 	vol, err := server.getOrCreateVolume(volumeID)
 	if err != nil {
@@ -552,7 +561,7 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 	}
 
 	// Verify snapshots exist in backend
-	vol := server.GetVolume(volumeID)
+	vol := mustGetVolume(t, server, volumeID)
 	prefix := fmt.Sprintf("streams/%s/snapshots/", vol.StreamID().String())
 	snaps, err := backend.ListObjects(ctx, "", prefix)
 	if err != nil || len(snaps) == 0 {
@@ -1436,7 +1445,7 @@ func TestSnapshotRestoreRebuildFromLog(t *testing.T) {
 	if err := server1.FlushAll(ctx); err != nil {
 		t.Fatalf("FlushAll failed: %v", err)
 	}
-	vol1 := server1.GetVolume(volumeID)
+	vol1 := mustGetVolume(t, server1, volumeID)
 	if err := vol1.FlushOverlay(ctx); err != nil {
 		t.Fatalf("FlushOverlay failed: %v", err)
 	}
@@ -2032,7 +2041,7 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 		t.Fatalf("Unexpected mkdir name: %s", mkdirResp.GetAttr().GetName())
 	}
 
-	vol := server.GetVolume(volumeID)
+	vol := mustGetVolume(t, server, volumeID)
 	if vol == nil || vol.Stream() == nil {
 		t.Fatalf("Expected volume to have an active WAL stream")
 	}
@@ -2120,7 +2129,7 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	}
 
 	// Step 2: Flush snapshot to backend
-	vol1 := server1.GetVolume(volumeID)
+	vol1 := mustGetVolume(t, server1, volumeID)
 	snapName, err := vol1.CreateSnapshot(ctx, "")
 	if err != nil {
 		t.Fatalf("CreateSnapshot failed: %v", err)
@@ -2147,7 +2156,7 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	server2 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
 	defer func() { _ = server2.Close() }()
 
-	vol2 := server2.GetVolume(volumeID)
+	vol2 := mustGetVolume(t, server2, volumeID)
 	if vol2 == nil {
 		t.Fatalf("Failed to get recovered volume")
 	}
@@ -2207,7 +2216,7 @@ func TestStreamsDurabilityModes(t *testing.T) {
 		t.Fatalf("Mkdir with Witness durability failed: %v", err)
 	}
 
-	vol := server.GetVolume(volumeID)
+	vol := mustGetVolume(t, server, volumeID)
 	local, witness, _ := vol.Stream().Watermarks()
 	if local < 1 || witness < 1 {
 		t.Fatalf("Expected local >= 1 and witness >= 1, got local=%d, witness=%d", local, witness)
@@ -2461,7 +2470,7 @@ func TestTargetlessWALDurabilityFastFail(t *testing.T) {
 	}
 
 	// Direct Volume.WriteFile with WRITE_THROUGH_FSYNC (Permanent) should fail promptly with typed error
-	vol := server.GetVolume(volumeID)
+	vol := mustGetVolume(t, server, volumeID)
 	_, _, _, err = volWriteFile(ctx, vol, "/test.txt", 0, []byte("data-permanent"), pb.WriteMode_WRITE_THROUGH_FSYNC)
 	if err == nil {
 		t.Fatalf("expected vol.WriteFile(WRITE_THROUGH_FSYNC) to fail on target-less WAL, got nil")
@@ -3171,7 +3180,7 @@ func TestSDSStepReplayScratch(t *testing.T) {
 		t.Fatalf("Rmdir failed: %v", err)
 	}
 
-	liveVol := server.GetVolume(volumeID)
+	liveVol := mustGetVolume(t, server, volumeID)
 	if liveVol == nil || liveVol.Stream() == nil {
 		t.Fatalf("Expected live volume with active stream")
 	}
@@ -3273,7 +3282,7 @@ func TestSDSCatOnObjectFSStream(t *testing.T) {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 
-	vol := server.GetVolume(volumeID)
+	vol := mustGetVolume(t, server, volumeID)
 	if vol == nil || vol.Stream() == nil {
 		t.Fatalf("Expected active volume stream")
 	}
@@ -3951,7 +3960,7 @@ func TestSnapshotRestartRecoveryFromSnapshotPlusStream(t *testing.T) {
 	server2 := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
 
 	// Verify volume recovered from snapshot + stream suffix
-	vol2 := server2.GetVolume(volumeID)
+	vol2 := mustGetVolume(t, server2, volumeID)
 	if vol2 == nil {
 		t.Fatalf("Expected volume to be loaded on restart")
 	}
@@ -4021,7 +4030,7 @@ func TestSnapshotSafePositionAndS3Watermark(t *testing.T) {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 
-	vol := server.GetVolume(volumeID)
+	vol := mustGetVolume(t, server, volumeID)
 	if vol == nil || vol.Stream() == nil {
 		t.Fatalf("Expected active volume and stream")
 	}
