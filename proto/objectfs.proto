@@ -30,6 +30,7 @@ service ObjectFSController {
   rpc ReadFile(ReadFileRequest) returns (ReadFileResponse);
   rpc WriteFile(WriteFileRequest) returns (WriteFileResponse);
   rpc TruncateFile(TruncateFileRequest) returns (TruncateFileResponse);
+  rpc PunchHole(PunchHoleRequest) returns (PunchHoleResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
   rpc Rmdir(RmdirRequest) returns (RmdirResponse);
   rpc Rename(RenameRequest) returns (RenameResponse);
@@ -183,6 +184,19 @@ message TruncateFileRequest {
 }
 
 message TruncateFileResponse {
+  EntryAttr attr = 1;
+  int32 error = 2;
+}
+
+message PunchHoleRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+  int64 offset = 3;
+  int64 length = 4;
+  bool keep_size = 5;
+}
+
+message PunchHoleResponse {
   EntryAttr attr = 1;
   int32 error = 2;
 }

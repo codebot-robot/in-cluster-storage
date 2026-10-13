@@ -42,6 +42,7 @@ const (
 	ObjectFSController_ReadFile_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/ReadFile"
 	ObjectFSController_WriteFile_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/WriteFile"
 	ObjectFSController_TruncateFile_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/TruncateFile"
+	ObjectFSController_PunchHole_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/PunchHole"
 	ObjectFSController_Unlink_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/Unlink"
 	ObjectFSController_Rmdir_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Rmdir"
 	ObjectFSController_Rename_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/Rename"
@@ -74,6 +75,7 @@ type ObjectFSControllerClient interface {
 	ReadFile(ctx context.Context, in *ReadFileRequest, opts ...grpc.CallOption) (*ReadFileResponse, error)
 	WriteFile(ctx context.Context, in *WriteFileRequest, opts ...grpc.CallOption) (*WriteFileResponse, error)
 	TruncateFile(ctx context.Context, in *TruncateFileRequest, opts ...grpc.CallOption) (*TruncateFileResponse, error)
+	PunchHole(ctx context.Context, in *PunchHoleRequest, opts ...grpc.CallOption) (*PunchHoleResponse, error)
 	Unlink(ctx context.Context, in *UnlinkRequest, opts ...grpc.CallOption) (*UnlinkResponse, error)
 	Rmdir(ctx context.Context, in *RmdirRequest, opts ...grpc.CallOption) (*RmdirResponse, error)
 	Rename(ctx context.Context, in *RenameRequest, opts ...grpc.CallOption) (*RenameResponse, error)
@@ -185,6 +187,16 @@ func (c *objectFSControllerClient) TruncateFile(ctx context.Context, in *Truncat
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(TruncateFileResponse)
 	err := c.cc.Invoke(ctx, ObjectFSController_TruncateFile_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) PunchHole(ctx context.Context, in *PunchHoleRequest, opts ...grpc.CallOption) (*PunchHoleResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PunchHoleResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_PunchHole_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -392,6 +404,7 @@ type ObjectFSControllerServer interface {
 	ReadFile(context.Context, *ReadFileRequest) (*ReadFileResponse, error)
 	WriteFile(context.Context, *WriteFileRequest) (*WriteFileResponse, error)
 	TruncateFile(context.Context, *TruncateFileRequest) (*TruncateFileResponse, error)
+	PunchHole(context.Context, *PunchHoleRequest) (*PunchHoleResponse, error)
 	Unlink(context.Context, *UnlinkRequest) (*UnlinkResponse, error)
 	Rmdir(context.Context, *RmdirRequest) (*RmdirResponse, error)
 	Rename(context.Context, *RenameRequest) (*RenameResponse, error)
@@ -445,6 +458,9 @@ func (UnimplementedObjectFSControllerServer) WriteFile(context.Context, *WriteFi
 }
 func (UnimplementedObjectFSControllerServer) TruncateFile(context.Context, *TruncateFileRequest) (*TruncateFileResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method TruncateFile not implemented")
+}
+func (UnimplementedObjectFSControllerServer) PunchHole(context.Context, *PunchHoleRequest) (*PunchHoleResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PunchHole not implemented")
 }
 func (UnimplementedObjectFSControllerServer) Unlink(context.Context, *UnlinkRequest) (*UnlinkResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Unlink not implemented")
@@ -676,6 +692,24 @@ func _ObjectFSController_TruncateFile_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ObjectFSControllerServer).TruncateFile(ctx, req.(*TruncateFileRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_PunchHole_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PunchHoleRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).PunchHole(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_PunchHole_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).PunchHole(ctx, req.(*PunchHoleRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1014,6 +1048,10 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "TruncateFile",
 			Handler:    _ObjectFSController_TruncateFile_Handler,
+		},
+		{
+			MethodName: "PunchHole",
+			Handler:    _ObjectFSController_PunchHole_Handler,
 		},
 		{
 			MethodName: "Unlink",
