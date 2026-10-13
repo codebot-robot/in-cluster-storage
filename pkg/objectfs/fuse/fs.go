@@ -634,6 +634,135 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	return fuse.OK
 }
 
+const (
+	fallocAllocRange    uint32 = 0x00
+	fallocKeepSize      uint32 = 0x01
+	fallocPunchHole     uint32 = 0x02
+	fallocCollapseRange uint32 = 0x08
+	fallocZeroRange     uint32 = 0x10
+	fallocInsertRange   uint32 = 0x20
+	fallocUnshareRange  uint32 = 0x40
+)
+
+func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) fuse.Status {
+	// 1. Check for unsupported modes: COLLAPSE_RANGE, INSERT_RANGE, UNSHARE_RANGE, and any unknown flags.
+	if input.Mode&(fallocCollapseRange|fallocInsertRange|fallocUnshareRange) != 0 {
+		return fuse.Status(syscall.EOPNOTSUPP)
+	}
+	const knownFlags = fallocKeepSize | fallocPunchHole | fallocCollapseRange | fallocZeroRange | fallocInsertRange | fallocUnshareRange
+	if input.Mode&^knownFlags != 0 {
+		return fuse.Status(syscall.EOPNOTSUPP)
+	}
+
+	offset := int64(input.Offset)
+	length := int64(input.Length)
+	if offset < 0 || length <= 0 || offset+length < 0 {
+		return fuse.Status(syscall.EINVAL)
+	}
+
+	isPunchHole := input.Mode&fallocPunchHole != 0
+	keepSize := input.Mode&fallocKeepSize != 0
+	isZeroRange := input.Mode&fallocZeroRange != 0
+
+	// Linux requires FALLOC_FL_PUNCH_HOLE to be used with FALLOC_FL_KEEP_SIZE.
+	if isPunchHole && !keepSize {
+		return fuse.Status(syscall.EINVAL)
+	}
+
+	// 2. Punch-hole and Zero-range operations.
+	if isPunchHole || isZeroRange {
+		punchKeepSize := keepSize
+		if isPunchHole {
+			punchKeepSize = true
+		}
+
+		syncCtx, syncCancel := fs.makeSyncContext(cancel)
+		if err := fs.syncFileToService(syncCtx, input.NodeId); err != nil {
+			syncCancel()
+			return fs.grpcErrorToStatus("PunchHole:Sync", err)
+		}
+		syncCancel()
+
+		ctx, cancelFunc := fs.makeContext(cancel)
+		defer cancelFunc()
+
+		resp, err := fs.client.PunchHole(ctx, &pb.PunchHoleRequest{
+			VolumeId: fs.volumeID,
+			Inode:    input.NodeId,
+			Offset:   offset,
+			Length:   length,
+			KeepSize: punchKeepSize,
+		})
+		if err != nil {
+			return fs.grpcErrorToStatus("PunchHole", err)
+		}
+		if resp.GetError() != 0 {
+			return fuse.Status(resp.GetError())
+		}
+
+		punchGen := fs.cache.PunchHole(input.NodeId, offset, length, punchKeepSize, time.Now())
+		fs.invalidateManifest(input.NodeId)
+		fs.cache.MarkSizeClean(input.NodeId, punchGen)
+		return fuse.OK
+	}
+
+	// 3. FALLOC_FL_KEEP_SIZE alone: no-op (no pre-allocation reservation).
+	if input.Mode == fallocKeepSize {
+		return fuse.OK
+	}
+
+	// 4. Mode 0 (allocate): extend file size to offset+len if target exceeds size (truncate-up with holes).
+	if input.Mode == fallocAllocRange {
+		syncCtx, syncCancel := fs.makeSyncContext(cancel)
+		if err := fs.syncFileToService(syncCtx, input.NodeId); err != nil {
+			syncCancel()
+			return fs.grpcErrorToStatus("Fallocate:Sync", err)
+		}
+		syncCancel()
+
+		ctx, cancelFunc := fs.makeContext(cancel)
+		defer cancelFunc()
+
+		var curSize int64
+		if clientSize, hasSize := fs.cache.GetSize(input.NodeId); hasSize {
+			curSize = clientSize
+		} else {
+			attrResp, err := fs.client.GetAttr(ctx, &pb.GetAttrRequest{
+				VolumeId: fs.volumeID,
+				Inode:    input.NodeId,
+			})
+			if err != nil {
+				return fs.grpcErrorToStatus("Fallocate:GetAttr", err)
+			}
+			if attrResp.GetError() != 0 {
+				return fuse.Status(attrResp.GetError())
+			}
+			curSize = attrResp.GetAttr().GetInode().GetSize()
+		}
+
+		targetSize := offset + length
+		if targetSize > curSize {
+			truncGen := fs.cache.Truncate(input.NodeId, targetSize, time.Now())
+			resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
+				VolumeId: fs.volumeID,
+				Inode:    input.NodeId,
+				Size:     targetSize,
+			})
+			if err != nil {
+				return fs.grpcErrorToStatus("Fallocate:TruncateFile", err)
+			}
+			if resp.GetError() != 0 {
+				return fuse.Status(resp.GetError())
+			}
+			fs.cache.MarkSizeClean(input.NodeId, truncGen)
+			fs.invalidateManifest(input.NodeId)
+		}
+		return fuse.OK
+	}
+
+	return fuse.Status(syscall.EOPNOTSUPP)
+}
+
 func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
 	if len(name) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)

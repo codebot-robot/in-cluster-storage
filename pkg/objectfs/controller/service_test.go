@@ -5238,3 +5238,400 @@ func TestGetManifest(t *testing.T) {
 		}
 	}
 }
+
+func TestPunchHoleWholeChunks(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithServerMutationCheck())
+	volumeID := "test-punch-whole-ctrl"
+
+	chunkSize := 64 * 1024
+	totalSize := 3 * chunkSize
+	content := make([]byte, totalSize)
+	for i := range content {
+		content[i] = byte(i%251 + 1)
+	}
+
+	cf, err := testCreateFile(ctx, server, volumeID, "/hole.bin", 0644, nil, 0, 0)
+	if err != nil || cf.GetError() != 0 {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+	ino := cf.GetAttr().GetInode().GetIno()
+
+	for i := 0; i < 3; i++ {
+		wResp, err := testWriteFile(ctx, server, volumeID, "/hole.bin", int64(i*chunkSize), content[i*chunkSize:(i+1)*chunkSize], pb.WriteMode_WRITE_THROUGH_FSYNC)
+		if err != nil || wResp.GetError() != 0 {
+			t.Fatalf("testWriteFile %d failed: %v", i, err)
+		}
+	}
+	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino, Blocking: true})
+	if err != nil || fsyncResp.GetError() != 0 {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	// Punch chunk 1
+	pResp, err := server.PunchHole(ctx, &pb.PunchHoleRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   int64(chunkSize),
+		Length:   int64(chunkSize),
+		KeepSize: true,
+	})
+	if err != nil || pResp.GetError() != 0 {
+		t.Fatalf("PunchHole failed: err=%v, code=%d", err, pResp.GetError())
+	}
+	if pResp.GetAttr().GetInode().GetSize() != int64(totalSize) {
+		t.Fatalf("Expected size %d, got %d", totalSize, pResp.GetAttr().GetInode().GetSize())
+	}
+
+	// Verify manifest
+	mResp, err := server.GetManifest(ctx, &pb.GetManifestRequest{VolumeId: volumeID, Inode: ino})
+	if err != nil {
+		t.Fatalf("GetManifest failed: %v", err)
+	}
+	if len(mResp.GetChunkSha256()) != 3 {
+		t.Fatalf("Expected 3 chunks in manifest, got %d", len(mResp.GetChunkSha256()))
+	}
+	if mResp.GetChunkSha256()[1] != "" {
+		t.Fatalf("Expected chunk 1 sha to be empty (hole), got %s", mResp.GetChunkSha256()[1])
+	}
+	if mResp.GetChunkSha256()[0] == "" || mResp.GetChunkSha256()[2] == "" {
+		t.Fatalf("Expected chunk 0 and 2 shas to be present")
+	}
+
+	// Read whole file back
+	rResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   0,
+		Size:     int64(totalSize),
+	})
+	if err != nil || rResp.GetError() != 0 {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	rData := rResp.GetData()
+	if !bytes.Equal(rData[:chunkSize], content[:chunkSize]) {
+		t.Fatalf("Chunk 0 data corrupted")
+	}
+	if !bytes.Equal(rData[chunkSize:2*chunkSize], make([]byte, chunkSize)) {
+		t.Fatalf("Chunk 1 not all zeros")
+	}
+	if !bytes.Equal(rData[2*chunkSize:], content[2*chunkSize:]) {
+		t.Fatalf("Chunk 2 data corrupted")
+	}
+}
+
+func TestPunchHolePartialEdgesAndGrowSize(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithServerMutationCheck())
+	volumeID := "test-punch-edges-ctrl"
+
+	content := make([]byte, 150*1024)
+	for i := range content {
+		content[i] = byte(i%251 + 1)
+	}
+
+	cf, err := testCreateFile(ctx, server, volumeID, "/edges.bin", 0644, nil, 0, 0)
+	if err != nil || cf.GetError() != 0 {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+	ino := cf.GetAttr().GetInode().GetIno()
+
+	// Write and fsync
+	wResp, err := testWriteFile(ctx, server, volumeID, "/edges.bin", 0, content, pb.WriteMode_WRITE_THROUGH_FSYNC)
+	if err != nil || wResp.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino, Blocking: true})
+	if err != nil || fsyncResp.GetError() != 0 {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	// Partial punch spanning 32 KiB to 96 KiB
+	pResp, err := server.PunchHole(ctx, &pb.PunchHoleRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   32 * 1024,
+		Length:   64 * 1024,
+		KeepSize: true,
+	})
+	if err != nil || pResp.GetError() != 0 {
+		t.Fatalf("PunchHole failed: %v", err)
+	}
+
+	rResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino, Offset: 0, Size: int64(len(content))})
+	if err != nil || rResp.GetError() != 0 {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	rData := rResp.GetData()
+	if !bytes.Equal(rData[:32*1024], content[:32*1024]) {
+		t.Fatalf("Leading bytes corrupted")
+	}
+	if !bytes.Equal(rData[32*1024:96*1024], make([]byte, 64*1024)) {
+		t.Fatalf("Punched range not zeros")
+	}
+	if !bytes.Equal(rData[96*1024:], content[96*1024:]) {
+		t.Fatalf("Trailing bytes corrupted")
+	}
+
+	// Zero-range extending size to 200 KiB (offset 100 KiB, length 100 KiB, KeepSize: false)
+	pzResp, err := server.PunchHole(ctx, &pb.PunchHoleRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   100 * 1024,
+		Length:   100 * 1024,
+		KeepSize: false,
+	})
+	if err != nil || pzResp.GetError() != 0 {
+		t.Fatalf("PunchHole extend failed: %v", err)
+	}
+	if pzResp.GetAttr().GetInode().GetSize() != 200*1024 {
+		t.Fatalf("Expected size 200 KiB, got %d", pzResp.GetAttr().GetInode().GetSize())
+	}
+
+	rResp2, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino, Offset: 0, Size: 200 * 1024})
+	if err != nil || rResp2.GetError() != 0 {
+		t.Fatalf("ReadFile 200KB failed: %v", err)
+	}
+	rData2 := rResp2.GetData()
+	if !bytes.Equal(rData2[100*1024:], make([]byte, 100*1024)) {
+		t.Fatalf("Extended region not all zeros")
+	}
+}
+
+func TestPunchHoleStagedChunks(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithServerMutationCheck())
+	volumeID := "test-punch-staged"
+
+	chunkSize := 64 * 1024
+	content := make([]byte, 2*chunkSize)
+	for i := range content {
+		content[i] = byte(i%251 + 1)
+	}
+
+	cf, err := testCreateFile(ctx, server, volumeID, "/staged.bin", 0644, nil, 0, 0)
+	if err != nil || cf.GetError() != 0 {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+	ino := cf.GetAttr().GetInode().GetIno()
+
+	// Write using LAZY_WRITE (staged in server memory)
+	wResp, err := testWriteFile(ctx, server, volumeID, "/staged.bin", 0, content, pb.WriteMode_LAZY_WRITE)
+	if err != nil || wResp.GetError() != 0 {
+		t.Fatalf("WriteFile LAZY_WRITE failed: %v", err)
+	}
+
+	// Punch chunk 0 in staged chunks
+	pResp, err := server.PunchHole(ctx, &pb.PunchHoleRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   0,
+		Length:   int64(chunkSize),
+		KeepSize: true,
+	})
+	if err != nil || pResp.GetError() != 0 {
+		t.Fatalf("PunchHole staged failed: %v", err)
+	}
+
+	// Fsync commits the staged chunks
+	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino, Blocking: true})
+	if err != nil || fsyncResp.GetError() != 0 {
+		t.Fatalf("Fsync after punch failed: %v", err)
+	}
+
+	// Read back: chunk 0 must be zeros, chunk 1 must have content
+	rResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino, Offset: 0, Size: int64(2 * chunkSize)})
+	if err != nil || rResp.GetError() != 0 {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	rData := rResp.GetData()
+	if !bytes.Equal(rData[:chunkSize], make([]byte, chunkSize)) {
+		t.Fatalf("Staged chunk 0 was not punched (expected zeros)")
+	}
+	if !bytes.Equal(rData[chunkSize:], content[chunkSize:]) {
+		t.Fatalf("Staged chunk 1 corrupted")
+	}
+}
+
+func TestPunchHoleChunkBoundaryCases(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithServerMutationCheck())
+	volumeID := "test-punch-boundary-ctrl"
+
+	// Case 1: file size 128 KiB, punch [0, 10 KiB) (keep_size)
+	// Chunk 0 starts at 0, punch ends at 10 KiB within chunk 0.
+	content128 := make([]byte, 128*1024)
+	for i := range content128 {
+		content128[i] = byte(i%251 + 1)
+	}
+	cf1, err := testCreateFile(ctx, server, volumeID, "/c1.bin", 0644, nil, 0, 0)
+	if err != nil || cf1.GetError() != 0 {
+		t.Fatalf("testCreateFile /c1.bin failed: %v", err)
+	}
+	ino1 := cf1.GetAttr().GetInode().GetIno()
+	if _, err := testWriteFile(ctx, server, volumeID, "/c1.bin", 0, content128, pb.WriteMode_WRITE_THROUGH_FSYNC); err != nil {
+		t.Fatalf("Write /c1.bin failed: %v", err)
+	}
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino1, Blocking: true}); err != nil {
+		t.Fatalf("Fsync /c1.bin failed: %v", err)
+	}
+	p1, err := server.PunchHole(ctx, &pb.PunchHoleRequest{
+		VolumeId: volumeID,
+		Inode:    ino1,
+		Offset:   0,
+		Length:   10 * 1024,
+		KeepSize: true,
+	})
+	if err != nil || p1.GetError() != 0 {
+		t.Fatalf("PunchHole /c1.bin failed: %v", err)
+	}
+	r1, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino1, Offset: 0, Size: 128 * 1024})
+	if err != nil || r1.GetError() != 0 {
+		t.Fatalf("ReadFile /c1.bin failed: %v", err)
+	}
+	if !bytes.Equal(r1.GetData()[:10*1024], make([]byte, 10*1024)) {
+		t.Fatalf("Case 1: [0, 10 KiB) was not zeroed")
+	}
+	if !bytes.Equal(r1.GetData()[10*1024:], content128[10*1024:]) {
+		t.Fatalf("Case 1: unpunched range corrupted")
+	}
+
+	// Case 2: file size 100 KiB, punch [64 KiB, 100 KiB) (keep_size, chunk 1 start to EOF)
+	content100 := make([]byte, 100*1024)
+	for i := range content100 {
+		content100[i] = byte(i%251 + 1)
+	}
+	cf2, err := testCreateFile(ctx, server, volumeID, "/c2.bin", 0644, nil, 0, 0)
+	if err != nil || cf2.GetError() != 0 {
+		t.Fatalf("testCreateFile /c2.bin failed: %v", err)
+	}
+	ino2 := cf2.GetAttr().GetInode().GetIno()
+	if _, err := testWriteFile(ctx, server, volumeID, "/c2.bin", 0, content100, pb.WriteMode_WRITE_THROUGH_FSYNC); err != nil {
+		t.Fatalf("Write /c2.bin failed: %v", err)
+	}
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino2, Blocking: true}); err != nil {
+		t.Fatalf("Fsync /c2.bin failed: %v", err)
+	}
+	p2, err := server.PunchHole(ctx, &pb.PunchHoleRequest{
+		VolumeId: volumeID,
+		Inode:    ino2,
+		Offset:   64 * 1024,
+		Length:   36 * 1024,
+		KeepSize: true,
+	})
+	if err != nil || p2.GetError() != 0 {
+		t.Fatalf("PunchHole /c2.bin failed: %v", err)
+	}
+	r2, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino2, Offset: 0, Size: 100 * 1024})
+	if err != nil || r2.GetError() != 0 {
+		t.Fatalf("ReadFile /c2.bin failed: %v", err)
+	}
+	if !bytes.Equal(r2.GetData()[:64*1024], content100[:64*1024]) {
+		t.Fatalf("Case 2: chunk 0 corrupted")
+	}
+	if !bytes.Equal(r2.GetData()[64*1024:], make([]byte, 36*1024)) {
+		t.Fatalf("Case 2: [64 KiB, 100 KiB) was not zeroed")
+	}
+
+	// Case 3: file size 200 KiB, punch [64 KiB, 65 KiB) (keep_size)
+	content200 := make([]byte, 200*1024)
+	for i := range content200 {
+		content200[i] = byte(i%251 + 1)
+	}
+	cf3, err := testCreateFile(ctx, server, volumeID, "/c3.bin", 0644, nil, 0, 0)
+	if err != nil || cf3.GetError() != 0 {
+		t.Fatalf("testCreateFile /c3.bin failed: %v", err)
+	}
+	ino3 := cf3.GetAttr().GetInode().GetIno()
+	if _, err := testWriteFile(ctx, server, volumeID, "/c3.bin", 0, content200, pb.WriteMode_WRITE_THROUGH_FSYNC); err != nil {
+		t.Fatalf("Write /c3.bin failed: %v", err)
+	}
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino3, Blocking: true}); err != nil {
+		t.Fatalf("Fsync /c3.bin failed: %v", err)
+	}
+	p3, err := server.PunchHole(ctx, &pb.PunchHoleRequest{
+		VolumeId: volumeID,
+		Inode:    ino3,
+		Offset:   64 * 1024,
+		Length:   1000,
+		KeepSize: true,
+	})
+	if err != nil || p3.GetError() != 0 {
+		t.Fatalf("PunchHole /c3.bin failed: %v", err)
+	}
+	r3, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino3, Offset: 0, Size: 200 * 1024})
+	if err != nil || r3.GetError() != 0 {
+		t.Fatalf("ReadFile /c3.bin failed: %v", err)
+	}
+	if !bytes.Equal(r3.GetData()[:64*1024], content200[:64*1024]) {
+		t.Fatalf("Case 3: prefix before punch corrupted")
+	}
+	if !bytes.Equal(r3.GetData()[64*1024:64*1024+1000], make([]byte, 1000)) {
+		t.Fatalf("Case 3: [64 KiB, 65 KiB) was not zeroed")
+	}
+	if !bytes.Equal(r3.GetData()[64*1024+1000:], content200[64*1024+1000:]) {
+		t.Fatalf("Case 3: suffix after punch corrupted")
+	}
+}
+
+func TestPunchHoleStagedWriteKeepsSize(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithServerMutationCheck())
+	volumeID := "test-punch-staged-size"
+
+	chunkSize := 64 * 1024
+	content := bytes.Repeat([]byte("S"), chunkSize)
+
+	cf, err := testCreateFile(ctx, server, volumeID, "/staged_size.bin", 0644, nil, 0, 0)
+	if err != nil || cf.GetError() != 0 {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+	ino := cf.GetAttr().GetInode().GetIno()
+
+	// WriteFile 64 KiB into empty file (no fsync, staged in server memory)
+	wResp, err := testWriteFile(ctx, server, volumeID, "/staged_size.bin", 0, content, pb.WriteMode_LAZY_WRITE)
+	if err != nil || wResp.GetError() != 0 {
+		t.Fatalf("WriteFile LAZY_WRITE failed: %v", err)
+	}
+
+	// PunchHole(0, 64 KiB, keep_size)
+	pResp, err := server.PunchHole(ctx, &pb.PunchHoleRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   0,
+		Length:   int64(chunkSize),
+		KeepSize: true,
+	})
+	if err != nil || pResp.GetError() != 0 {
+		t.Fatalf("PunchHole failed: %v, resp=%v", err, pResp)
+	}
+	if pResp.GetAttr().GetInode().GetSize() != int64(chunkSize) {
+		t.Fatalf("Expected PunchHole to report size %d, got %d", chunkSize, pResp.GetAttr().GetInode().GetSize())
+	}
+
+	// Fsync and GetAttr
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino, Blocking: true}); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+	gResp, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Inode: ino})
+	if err != nil || gResp.GetError() != 0 {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if gResp.GetAttr().GetInode().GetSize() != int64(chunkSize) {
+		t.Fatalf("Expected GetAttr to report size %d, got %d", chunkSize, gResp.GetAttr().GetInode().GetSize())
+	}
+
+	// Read back: 64 KiB of zeros
+	rResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino, Offset: 0, Size: int64(chunkSize)})
+	if err != nil || rResp.GetError() != 0 {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if !bytes.Equal(rResp.GetData(), make([]byte, chunkSize)) {
+		t.Fatalf("Expected 64 KiB of zeros")
+	}
+}

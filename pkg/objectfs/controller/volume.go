@@ -3401,6 +3401,278 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 	return attr, nil
 }
 
+func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length int64, keepSize bool) (*pb.EntryAttr, error) {
+	if offset < 0 || length <= 0 || offset+length < 0 {
+		return nil, fmt.Errorf("invalid offset %d or length %d: %w", offset, length, syscall.EINVAL)
+	}
+
+	v.mu.RLock()
+	inodeID = v.normalizeInodeID(inodeID)
+	v.mu.RUnlock()
+
+	// Sync any staged state for this inode first so we operate on committed state only.
+	if err := v.Fsync(ctx, inodeID); err != nil {
+		return nil, err
+	}
+
+	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+
+		tx := v.beginTxLocked("PunchHole")
+
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, nil, err
+		}
+
+		inodeID = v.normalizeInodeID(inodeID)
+
+		node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if node.Row.GetIsDir() {
+			return nil, nil, fmt.Errorf("cannot punch hole on directory: %w", syscall.EISDIR)
+		}
+
+		now := time.Now()
+		if err := v.ensureInodeChunksLoadedLocked(ctx, tx, node); err != nil {
+			return nil, nil, fmt.Errorf("punch hole: ensure inode chunks loaded: %w", err)
+		}
+
+		currSize := node.Row.GetSize()
+		newSize := currSize
+		if !keepSize && offset+length > currSize {
+			newSize = offset + length
+		}
+
+		punchStart := offset
+		punchEnd := offset + length
+		if keepSize && punchEnd > currSize {
+			punchEnd = currSize
+		}
+
+		if keepSize && punchStart >= currSize {
+			attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
+			return attr, nil, nil
+		}
+
+		cs := int64(node.Row.GetChunkSize())
+		if cs == 0 {
+			cs = int64(v.chunkSize)
+			if cs == 0 {
+				cs = 64 * 1024
+			}
+		}
+
+		if len(node.InlineData) > 0 {
+			node.IsDirty = true
+			if newSize <= v.maxInlineLen {
+				if newSize > int64(len(node.InlineData)) {
+					newBuf := make([]byte, newSize)
+					copy(newBuf, node.InlineData)
+					node.InlineData = newBuf
+				}
+				zEnd := punchEnd
+				if zEnd > int64(len(node.InlineData)) {
+					zEnd = int64(len(node.InlineData))
+				}
+				if zEnd > punchStart {
+					for b := punchStart; b < zEnd; b++ {
+						node.InlineData[b] = 0
+					}
+				}
+				node.mutate(func(row *pb.Inode) {
+					row.Mtime = timestamppb.New(now)
+					row.Ctime = timestamppb.New(now)
+					row.Size = newSize
+					row.ContentSha256 = fmt.Sprintf("%x", sha256.Sum256(node.InlineData))
+					row.Sha256 = ""
+					row.ManifestSha256 = ""
+				})
+				if _, err := tx.Insert(ctx, &pb.FileChunk{
+					Ino:        proto.Uint64(node.Row.GetIno()),
+					Index:      proto.Uint32(0),
+					InlineData: append([]byte(nil), node.InlineData...),
+				}); err != nil {
+					return nil, nil, fmt.Errorf("failed to update inline FileChunk: %w", err)
+				}
+			} else {
+				c0 := make([]byte, cs)
+				copy(c0, node.InlineData)
+				zEnd := punchEnd
+				if zEnd > cs {
+					zEnd = cs
+				}
+				if zEnd > punchStart {
+					for b := punchStart; b < zEnd; b++ {
+						c0[b] = 0
+					}
+				}
+				c0Len := int64(len(node.InlineData))
+				if cs < c0Len {
+					c0Len = cs
+				}
+				truncatedC0 := c0[:c0Len]
+				sha0 := fmt.Sprintf("%x", sha256.Sum256(truncatedC0))
+				if v.blobStore != nil {
+					if err := v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{
+						sha0: blob.NewByteStreamFromBytes(truncatedC0),
+					}); err != nil {
+						return nil, nil, fmt.Errorf("failed to upload chunk 0: %w", err)
+					}
+				}
+				node.InlineData = nil
+				if node.Chunks == nil {
+					node.Chunks = make(map[uint32]string)
+				}
+				node.Chunks[0] = sha0
+				node.mutate(func(row *pb.Inode) {
+					row.Mtime = timestamppb.New(now)
+					row.Ctime = timestamppb.New(now)
+					row.ChunkSize = uint32(cs)
+					row.Size = newSize
+					row.ContentSha256 = ""
+					row.Sha256 = ""
+					row.ManifestSha256 = ""
+				})
+				if _, err := tx.Insert(ctx, &pb.FileChunk{
+					Ino:    proto.Uint64(node.Row.GetIno()),
+					Index:  proto.Uint32(0),
+					Sha256: sha0,
+				}); err != nil {
+					return nil, nil, fmt.Errorf("failed to update FileChunk 0: %w", err)
+				}
+			}
+		} else if punchEnd > punchStart {
+			if node.Chunks == nil {
+				node.Chunks = make(map[uint32]string)
+			}
+
+			firstChunk := punchStart / cs
+			lastChunk := (punchEnd - 1) / cs
+
+			// Reads before writes: read all partially covered chunks that exist before mutating tx.
+			partialData := make(map[uint32][]byte)
+			for i := firstChunk; i <= lastChunk; i++ {
+				cStart := i * cs
+				cEnd := cStart + cs
+				fullyCovered := punchStart <= cStart && punchEnd >= cEnd
+				if !fullyCovered {
+					if _, exists := node.Chunks[uint32(i)]; exists {
+						data, err := v.readChunkLocked(ctx, tx, node, int(i))
+						if err != nil {
+							return nil, nil, fmt.Errorf("failed to read chunk %d: %w", i, err)
+						}
+						partialData[uint32(i)] = data
+					}
+				}
+			}
+
+			// Writes: delete fully covered chunks; zero and re-put partially covered chunks.
+			for i := firstChunk; i <= lastChunk; i++ {
+				cStart := i * cs
+				cEnd := cStart + cs
+				fullyCovered := punchStart <= cStart && punchEnd >= cEnd
+
+				if fullyCovered {
+					if _, exists := node.Chunks[uint32(i)]; exists {
+						delete(node.Chunks, uint32(i))
+						if _, err := tx.Delete(ctx, &pb.FileChunk{
+							Ino:   proto.Uint64(node.Row.GetIno()),
+							Index: proto.Uint32(uint32(i)),
+						}); err != nil {
+							return nil, nil, fmt.Errorf("failed to delete FileChunk row %d: %w", i, err)
+						}
+					}
+				} else {
+					if chunkData, exists := partialData[uint32(i)]; exists && len(chunkData) > 0 {
+						overlapStart := punchStart - cStart
+						if overlapStart < 0 {
+							overlapStart = 0
+						}
+						overlapEnd := punchEnd - cStart
+						if overlapEnd > int64(len(chunkData)) {
+							overlapEnd = int64(len(chunkData))
+						}
+						if overlapEnd > overlapStart {
+							for b := overlapStart; b < overlapEnd; b++ {
+								chunkData[b] = 0
+							}
+							chunkSha := fmt.Sprintf("%x", sha256.Sum256(chunkData))
+							node.Chunks[uint32(i)] = chunkSha
+							if v.blobStore != nil {
+								if err := v.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{
+									chunkSha: blob.NewByteStreamFromBytes(chunkData),
+								}); err != nil {
+									return nil, nil, fmt.Errorf("failed to upload modified chunk %d: %w", i, err)
+								}
+							}
+							if _, err := tx.Insert(ctx, &pb.FileChunk{
+								Ino:    proto.Uint64(node.Row.GetIno()),
+								Index:  proto.Uint32(uint32(i)),
+								Sha256: chunkSha,
+							}); err != nil {
+								return nil, nil, fmt.Errorf("failed to log modified chunk %d: %w", i, err)
+							}
+						}
+					}
+				}
+			}
+
+			node.mutate(func(row *pb.Inode) {
+				row.Mtime = timestamppb.New(now)
+				row.Ctime = timestamppb.New(now)
+				row.ChunkSize = uint32(cs)
+				row.Size = newSize
+				row.ContentSha256 = ""
+				row.Sha256 = ""
+				row.ManifestSha256 = ""
+			})
+		} else {
+			node.mutate(func(row *pb.Inode) {
+				row.Mtime = timestamppb.New(now)
+				row.Ctime = timestamppb.New(now)
+				row.ChunkSize = uint32(cs)
+				row.Size = newSize
+				row.ContentSha256 = ""
+				row.Sha256 = ""
+				row.ManifestSha256 = ""
+			})
+		}
+
+		if _, err := tx.Update(ctx, node.Row); err != nil {
+			return nil, nil, fmt.Errorf("failed to log node inode update: %w", err)
+		}
+
+		commitSeq, err := tx.Commit(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to commit punch hole transaction: %w", err)
+		}
+		v.applyTxChangesLocked(ctx, tx)
+
+		waitFn := v.makeWaitFn(commitSeq, nil)
+
+		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_MODIFIED,
+			Attr:      attr,
+			Inode:     node.Row.GetIno(),
+		})
+		return attr, waitFn, nil
+	}()
+	if err != nil {
+		return nil, err
+	}
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return attr, nil
+}
+
 func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) error {
 	if len(name) > MaxNameLength {
 		return fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)

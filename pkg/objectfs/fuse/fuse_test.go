@@ -4454,3 +4454,618 @@ func TestDirtyReadSurvivesControllerRestartWhileSyncInFlight(t *testing.T) {
 		t.Fatalf("Expected Lookup after cache clear to report durable size %d, got %d", len(fileContent), lookupOut2.Attr.Size)
 	}
 }
+
+func TestFUSEFallocateAllocate(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-falloc-alloc"
+	cache := NewNodeCache(4 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "alloc.bin", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// 1. Initial write of 100 bytes
+	data100 := bytes.Repeat([]byte("A"), 100)
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, data100); st != fuse.OK {
+		t.Fatalf("Write failed: %v", st)
+	}
+
+	// Mode 0 with offset+len <= size (e.g. 50 + 40 = 90 <= 100) is a no-op
+	st := rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   50,
+		Length:   40,
+		Mode:     fallocAllocRange,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate mode 0 <= size failed: %v", st)
+	}
+	var attrOut fuse.AttrOut
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != 100 {
+		t.Fatalf("Expected size 100 after no-op fallocate, got %d", attrOut.Attr.Size)
+	}
+
+	// Mode 0 with offset+len > size (e.g. 100 + 400 = 500) extends the file
+	st = rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   100,
+		Length:   400,
+		Mode:     fallocAllocRange,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate mode 0 extending size failed: %v", st)
+	}
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != 500 {
+		t.Fatalf("Expected size 500 after extending fallocate, got %d", attrOut.Attr.Size)
+	}
+
+	// Read back: 0..100 has 'A', 100..500 has 0
+	buf := make([]byte, 500)
+	res, st := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0, Size: 500}, buf)
+	if st != fuse.OK {
+		t.Fatalf("Read failed: %v", st)
+	}
+	readBytes, _ := res.Bytes(buf)
+	if !bytes.Equal(readBytes[:100], data100) {
+		t.Fatalf("Prefix mismatch: got %q", readBytes[:100])
+	}
+	if !bytes.Equal(readBytes[100:], make([]byte, 400)) {
+		t.Fatalf("Extended region not zero-filled")
+	}
+
+	// Prior unsynced write in client cache:
+	// Write 50 bytes at 500..550 in cache (without fsync)
+	data50 := bytes.Repeat([]byte("B"), 50)
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 500}, data50); st != fuse.OK {
+		t.Fatalf("Unsynced write failed: %v", st)
+	}
+	// Fallocate to 700
+	st = rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   600,
+		Length:   100,
+		Mode:     fallocAllocRange,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate with prior unsynced write failed: %v", st)
+	}
+	buf700 := make([]byte, 700)
+	res, st = rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0, Size: 700}, buf700)
+	if st != fuse.OK {
+		t.Fatalf("Read 700 failed: %v", st)
+	}
+	readBytes700, _ := res.Bytes(buf700)
+	if !bytes.Equal(readBytes700[500:550], data50) {
+		t.Fatalf("Unsynced write corrupted after fallocate")
+	}
+	if !bytes.Equal(readBytes700[550:700], make([]byte, 150)) {
+		t.Fatalf("Unsynced extension not zero-filled")
+	}
+}
+
+func TestFUSEFallocateKeepSize(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-falloc-keepsize"
+	cache := NewNodeCache(4 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "keepsize.bin", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	data := bytes.Repeat([]byte("K"), 200)
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, data); st != fuse.OK {
+		t.Fatalf("Write failed: %v", st)
+	}
+
+	st := rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   1000,
+		Length:   500,
+		Mode:     fallocKeepSize,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate KEEP_SIZE failed: %v", st)
+	}
+
+	var attrOut fuse.AttrOut
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != 200 {
+		t.Fatalf("Expected size 200 after KEEP_SIZE, got %d", attrOut.Attr.Size)
+	}
+
+	// Unsynced write in cache
+	dataMore := bytes.Repeat([]byte("Z"), 50)
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 200}, dataMore); st != fuse.OK {
+		t.Fatalf("Unsynced write failed: %v", st)
+	}
+	st = rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   500,
+		Length:   500,
+		Mode:     fallocKeepSize,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate KEEP_SIZE with unsynced write failed: %v", st)
+	}
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != 250 {
+		t.Fatalf("Expected size 250 with unsynced write, got %d", attrOut.Attr.Size)
+	}
+}
+
+func TestFUSEFallocatePunchHoleWholeChunks(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-punch-whole"
+	cache := NewNodeCache(8 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "punch_whole.bin", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const cs = int(DefaultChunkSize)
+	// Write 3 full chunks (192 KiB)
+	chunk0 := bytes.Repeat([]byte("0"), cs)
+	chunk1 := bytes.Repeat([]byte("1"), cs)
+	chunk2 := bytes.Repeat([]byte("2"), cs)
+	allData := append(append(chunk0, chunk1...), chunk2...)
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, allData); st != fuse.OK {
+		t.Fatalf("Write failed: %v", st)
+	}
+	if st := rawFS.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); st != fuse.OK {
+		t.Fatalf("Fsync failed: %v", st)
+	}
+
+	// Verify manifest before punch has all 3 chunks
+	mResp, err := client.GetManifest(t.Context(), &pb.GetManifestRequest{VolumeId: volumeID, Inode: fileID})
+	if err != nil || len(mResp.GetChunkSha256()) != 3 || mResp.GetChunkSha256()[1] == "" {
+		t.Fatalf("Unexpected manifest before punch: %v", mResp)
+	}
+
+	// Punch hole covering whole chunk 1: offset 64 KiB, length 64 KiB
+	st := rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   uint64(cs),
+		Length:   uint64(cs),
+		Mode:     fallocPunchHole | fallocKeepSize,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate punch-hole failed: %v", st)
+	}
+
+	// Size unchanged
+	var attrOut fuse.AttrOut
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != uint64(3*cs) {
+		t.Fatalf("Expected size %d after punch-hole, got %d", 3*cs, attrOut.Attr.Size)
+	}
+
+	// Controller manifest shows chunk 1 has no row (empty sha, hole)
+	mRespAfter, err := client.GetManifest(t.Context(), &pb.GetManifestRequest{VolumeId: volumeID, Inode: fileID})
+	if err != nil {
+		t.Fatalf("GetManifest after punch failed: %v", err)
+	}
+	if mRespAfter.GetChunkSha256()[1] != "" {
+		t.Fatalf("Expected chunk 1 row to be deleted in manifest, got sha %s", mRespAfter.GetChunkSha256()[1])
+	}
+	if mRespAfter.GetChunkSha256()[0] == "" || mRespAfter.GetChunkSha256()[2] == "" {
+		t.Fatalf("Expected chunks 0 and 2 to remain present in manifest")
+	}
+
+	// Read back through FUSE: chunk 0 intact, chunk 1 zeros, chunk 2 intact
+	buf := make([]byte, 3*cs)
+	res, st := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0, Size: uint32(3 * cs)}, buf)
+	if st != fuse.OK {
+		t.Fatalf("Read failed: %v", st)
+	}
+	readBytes, _ := res.Bytes(buf)
+	if !bytes.Equal(readBytes[:cs], chunk0) {
+		t.Fatalf("Chunk 0 data corrupted")
+	}
+	if !bytes.Equal(readBytes[cs:2*cs], make([]byte, cs)) {
+		t.Fatalf("Chunk 1 not all zeros")
+	}
+	if !bytes.Equal(readBytes[2*cs:], chunk2) {
+		t.Fatalf("Chunk 2 data corrupted")
+	}
+
+	// Now test punch-hole with prior unsynced dirty writes in client cache:
+	// Overwrite chunk 1 with unsynced dirty data 'D'
+	dirtyChunk1 := bytes.Repeat([]byte("D"), cs)
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: uint64(cs)}, dirtyChunk1); st != fuse.OK {
+		t.Fatalf("Dirty write failed: %v", st)
+	}
+	// Verify it's dirty in cache
+	if _, _, _, _, isDirty := cache.GetDirtyChunks(fileID); !isDirty {
+		t.Fatalf("Expected cache to be dirty before punch")
+	}
+
+	// Punch chunk 1 again while dirty
+	st = rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   uint64(cs),
+		Length:   uint64(cs),
+		Mode:     fallocPunchHole | fallocKeepSize,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate punch-hole on dirty chunk failed: %v", st)
+	}
+
+	// Read back: chunk 1 must be zeros
+	res, st = rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: uint64(cs), Size: uint32(cs)}, buf[:cs])
+	if st != fuse.OK {
+		t.Fatalf("Read chunk 1 failed: %v", st)
+	}
+	readChunk1, _ := res.Bytes(buf[:cs])
+	if !bytes.Equal(readChunk1, make([]byte, cs)) {
+		t.Fatalf("Punched dirty chunk not zero-filled")
+	}
+}
+
+func TestFUSEFallocatePunchHolePartialChunks(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-punch-partial"
+	cache := NewNodeCache(8 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "punch_partial.bin", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const cs = int(DefaultChunkSize) // 64 KiB
+	// Total size: 150 KiB (2 chunks of 64 KiB + 1 chunk of 22 KiB)
+	initialData := make([]byte, 150*1024)
+	for i := range initialData {
+		initialData[i] = byte(i%251 + 1)
+	}
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, initialData); st != fuse.OK {
+		t.Fatalf("Write failed: %v", st)
+	}
+	if st := rawFS.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: fileID}}); st != fuse.OK {
+		t.Fatalf("Flush failed: %v", st)
+	}
+
+	// Punch partial range from 32 KiB to 96 KiB (offset 32 KiB, length 64 KiB):
+	// Spans end of chunk 0 (32..64 KiB) and start of chunk 1 (0..32 KiB within chunk 1)
+	punchOff := 32 * 1024
+	punchLen := 64 * 1024
+	st := rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   uint64(punchOff),
+		Length:   uint64(punchLen),
+		Mode:     fallocPunchHole | fallocKeepSize,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate partial punch failed: %v", st)
+	}
+
+	// Read back: 0..32KB intact, 32KB..96KB zeros, 96KB..150KB intact
+	buf := make([]byte, len(initialData))
+	res, st := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0, Size: uint32(len(initialData))}, buf)
+	if st != fuse.OK {
+		t.Fatalf("Read failed: %v", st)
+	}
+	readBytes, _ := res.Bytes(buf)
+	if !bytes.Equal(readBytes[:punchOff], initialData[:punchOff]) {
+		t.Fatalf("Leading bytes before punch corrupted")
+	}
+	if !bytes.Equal(readBytes[punchOff:punchOff+punchLen], make([]byte, punchLen)) {
+		t.Fatalf("Punched range not zeroed")
+	}
+	if !bytes.Equal(readBytes[punchOff+punchLen:], initialData[punchOff+punchLen:]) {
+		t.Fatalf("Trailing bytes after punch corrupted")
+	}
+
+	// With prior unsynced write in cache:
+	// Write new pattern over 20KB..40KB (unsynced dirty write)
+	patch := bytes.Repeat([]byte{0x77}, 20*1024)
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 20 * 1024}, patch); st != fuse.OK {
+		t.Fatalf("Write patch failed: %v", st)
+	}
+	// Punch 25KB..35KB
+	st = rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   25 * 1024,
+		Length:   10 * 1024,
+		Mode:     fallocPunchHole | fallocKeepSize,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate partial punch with dirty write failed: %v", st)
+	}
+
+	// Verify 20KB..25KB has 0x77, 25KB..35KB has 0, 35KB..40KB has 0x77
+	buf40 := make([]byte, 40*1024)
+	res, st = rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0, Size: 40 * 1024}, buf40)
+	if st != fuse.OK {
+		t.Fatalf("Read failed: %v", st)
+	}
+	r40, _ := res.Bytes(buf40)
+	if !bytes.Equal(r40[20*1024:25*1024], bytes.Repeat([]byte{0x77}, 5*1024)) {
+		t.Fatalf("Expected dirty bytes before hole to remain 0x77")
+	}
+	if !bytes.Equal(r40[25*1024:35*1024], make([]byte, 10*1024)) {
+		t.Fatalf("Expected punched range to be zeros")
+	}
+	if !bytes.Equal(r40[35*1024:40*1024], bytes.Repeat([]byte{0x77}, 5*1024)) {
+		t.Fatalf("Expected dirty bytes after hole to remain 0x77")
+	}
+}
+
+func TestFUSEFallocateZeroRangeGrowsSize(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-zero-range"
+	cache := NewNodeCache(8 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "zero_range.bin", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Initial file size: 50 KiB
+	data50k := bytes.Repeat([]byte("Z"), 50*1024)
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, data50k); st != fuse.OK {
+		t.Fatalf("Write failed: %v", st)
+	}
+
+	// Zero-range from 30 KiB to 130 KiB (offset 30 KiB, length 100 KiB) without KEEP_SIZE
+	st := rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   30 * 1024,
+		Length:   100 * 1024,
+		Mode:     fallocZeroRange,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate ZERO_RANGE failed: %v", st)
+	}
+
+	// Size must grow to 130 KiB
+	var attrOut fuse.AttrOut
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != 130*1024 {
+		t.Fatalf("Expected size 130 KiB after ZERO_RANGE, got %d", attrOut.Attr.Size)
+	}
+
+	// Read back: 0..30KB has 'Z', 30KB..130KB has 0
+	buf := make([]byte, 130*1024)
+	res, st := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0, Size: 130 * 1024}, buf)
+	if st != fuse.OK {
+		t.Fatalf("Read failed: %v", st)
+	}
+	r, _ := res.Bytes(buf)
+	if !bytes.Equal(r[:30*1024], data50k[:30*1024]) {
+		t.Fatalf("Prefix before zero-range corrupted")
+	}
+	if !bytes.Equal(r[30*1024:], make([]byte, 100*1024)) {
+		t.Fatalf("Zeroed range not zeros")
+	}
+
+	// Zero-range with KEEP_SIZE: size remains unchanged
+	st = rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   100 * 1024,
+		Length:   50 * 1024,
+		Mode:     fallocZeroRange | fallocKeepSize,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate ZERO_RANGE|KEEP_SIZE failed: %v", st)
+	}
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != 130*1024 {
+		t.Fatalf("Expected size 130 KiB with KEEP_SIZE, got %d", attrOut.Attr.Size)
+	}
+}
+
+func TestFUSEFallocateUnsupportedModes(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-unsupported"
+	cache := NewNodeCache(4 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "unsupported.bin", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Prior unsynced dirty write in client cache
+	data := []byte("important unsynced data")
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, data); st != fuse.OK {
+		t.Fatalf("Write failed: %v", st)
+	}
+
+	// Collapse range -> EOPNOTSUPP
+	st := rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Length:   10,
+		Mode:     fallocCollapseRange,
+	})
+	if st != fuse.Status(syscall.EOPNOTSUPP) {
+		t.Fatalf("Expected EOPNOTSUPP for COLLAPSE_RANGE, got %v", st)
+	}
+
+	// Insert range -> EOPNOTSUPP
+	st = rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Length:   10,
+		Mode:     fallocInsertRange,
+	})
+	if st != fuse.Status(syscall.EOPNOTSUPP) {
+		t.Fatalf("Expected EOPNOTSUPP for INSERT_RANGE, got %v", st)
+	}
+
+	// Unshare range -> EOPNOTSUPP
+	st = rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Length:   10,
+		Mode:     fallocUnshareRange,
+	})
+	if st != fuse.Status(syscall.EOPNOTSUPP) {
+		t.Fatalf("Expected EOPNOTSUPP for UNSHARE_RANGE, got %v", st)
+	}
+
+	// Punch hole without KEEP_SIZE -> EINVAL
+	st = rawFS.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Length:   10,
+		Mode:     fallocPunchHole,
+	})
+	if st != fuse.Status(syscall.EINVAL) {
+		t.Fatalf("Expected EINVAL for PUNCH_HOLE without KEEP_SIZE, got %v", st)
+	}
+
+	// Verify unsynced data is preserved
+	buf := make([]byte, len(data))
+	res, st := rawFS.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0, Size: uint32(len(data))}, buf)
+	if st != fuse.OK {
+		t.Fatalf("Read failed: %v", st)
+	}
+	r, _ := res.Bytes(buf)
+	if !bytes.Equal(r, data) {
+		t.Fatalf("Unsynced data was modified or corrupted: got %q, want %q", string(r), string(data))
+	}
+}
+
+func TestFUSEFallocateMultiClientReadsZeros(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-multi-client-punch"
+	cache1 := NewNodeCache(8 * 1024 * 1024)
+	rawFS1 := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache1)
+
+	cache2 := NewNodeCache(8 * 1024 * 1024)
+	rawFS2 := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache2)
+
+	var createOut fuse.CreateOut
+	if st := rawFS1.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "shared.bin", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Write 128 KiB through rawFS1 and fsync
+	content := make([]byte, 128*1024)
+	for i := range content {
+		content[i] = byte(i%251 + 1)
+	}
+	if _, st := rawFS1.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0}, content); st != fuse.OK {
+		t.Fatalf("Write failed: %v", st)
+	}
+	if st := rawFS1.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: fileID}}); st != fuse.OK {
+		t.Fatalf("Fsync failed: %v", st)
+	}
+
+	// Punch range [0, 10 KiB) through rawFS1 (starts on chunk boundary, ends inside chunk 0)
+	st := rawFS1.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+		Length:   10 * 1024,
+		Mode:     fallocPunchHole | fallocKeepSize,
+	})
+	if st != fuse.OK {
+		t.Fatalf("Fallocate punch-hole failed: %v", st)
+	}
+
+	// Warm client (rawFS1) reads back zeros in [0, 10 KiB)
+	buf1 := make([]byte, 10*1024)
+	res1, st := rawFS1.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID}, Offset: 0, Size: 10 * 1024}, buf1)
+	if st != fuse.OK {
+		t.Fatalf("rawFS1 Read failed: %v", st)
+	}
+	r1, _ := res1.Bytes(buf1)
+	if !bytes.Equal(r1, make([]byte, 10*1024)) {
+		t.Fatalf("Warm client: punched range has non-zero bytes")
+	}
+
+	// Second / cold client (rawFS2) on the same volume reads back zeros in [0, 10 KiB)
+	var lookupOut fuse.EntryOut
+	if st := rawFS2.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "shared.bin", &lookupOut); st != fuse.OK {
+		t.Fatalf("rawFS2 Lookup failed: %v", st)
+	}
+	fileID2 := lookupOut.NodeId
+
+	buf2 := make([]byte, 10*1024)
+	res2, st := rawFS2.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID2}, Offset: 0, Size: 10 * 1024}, buf2)
+	if st != fuse.OK {
+		t.Fatalf("rawFS2 Read failed: %v", st)
+	}
+	r2, _ := res2.Bytes(buf2)
+	if !bytes.Equal(r2, make([]byte, 10*1024)) {
+		t.Fatalf("Cold client: punched range has non-zero bytes (controller bug masked by warm client cache)")
+	}
+
+	// Cold client reads the rest of the file and verifies unpunched data is intact
+	bufRest := make([]byte, 118*1024)
+	resRest, st := rawFS2.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fileID2}, Offset: 10 * 1024, Size: 118 * 1024}, bufRest)
+	if st != fuse.OK {
+		t.Fatalf("rawFS2 Read rest failed: %v", st)
+	}
+	rRest, _ := resRest.Bytes(bufRest)
+	if !bytes.Equal(rRest, content[10*1024:]) {
+		t.Fatalf("Cold client: unpunched range corrupted")
+	}
+}

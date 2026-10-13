@@ -634,6 +634,21 @@ func (s *Server) TruncateFile(ctx context.Context, req *pb.TruncateFileRequest) 
 	return &pb.TruncateFileResponse{Attr: attr}, nil
 }
 
+func (s *Server) PunchHole(ctx context.Context, req *pb.PunchHoleRequest) (*pb.PunchHoleResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, volInitError(err)
+	}
+	attr, err := vol.PunchHole(ctx, req.GetInode(), req.GetOffset(), req.GetLength(), req.GetKeepSize())
+	if err != nil {
+		return &pb.PunchHoleResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.PunchHoleResponse{Attr: attr}, nil
+}
+
 func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")

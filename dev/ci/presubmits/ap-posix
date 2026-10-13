@@ -169,12 +169,14 @@ echo
 
 echo "==> Running fsx data-integrity test across multiple seeds..."
 # File size limit raised well above 1MB (16MB) using 64 KiB chunked blob-first writes (#143).
-# Mapped writes are disabled (-W) pending kernel page cache writeback coherency.
+# Mapped writes are disabled (-W) pending kernel page cache writeback coherency (#269).
+# Fallocate, punch-hole, and zero-range are enabled (#268).
+# Collapse (-C), insert (-I), exchange (-0), dedupe (-B), clone (-J), and copy range (-E) remain disabled.
 FSX_SEEDS=(42 1337 2026 777 9999)
 for seed in "\${FSX_SEEDS[@]}"; do
   echo "--- fsx run (seed=\${seed}, 1000 ops) ---"
   set +o errexit
-  "${XFSTESTS_DIR}/fsx" -N 1000 -S "\${seed}" -l 16777216 -o 65536 -p 200 -W fsx-test.bin
+  "${XFSTESTS_DIR}/fsx" -N 1000 -S "\${seed}" -l 16777216 -o 65536 -p 200 -W -C -I -0 -B -J -E fsx-test.bin
   fsx_exit=\$?
   set -o errexit
   if [[ \${fsx_exit} -ne 0 ]]; then
