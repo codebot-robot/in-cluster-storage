@@ -2308,7 +2308,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	}
 
 	// Direct Unlink
-	err = vol.Unlink(ctx, dirAttr.GetInode().GetIno(), "bar.txt")
+	_, err = vol.Unlink(ctx, dirAttr.GetInode().GetIno(), "bar.txt")
 	if err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
@@ -2318,7 +2318,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	}
 
 	// Direct Rmdir
-	err = vol.Rmdir(ctx, 1, "c")
+	_, err = vol.Rmdir(ctx, 1, "c")
 	if err != nil {
 		t.Fatalf("Rmdir failed: %v", err)
 	}
@@ -2424,7 +2424,7 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	}
 
 	// 5. Unlink orig.txt -> link1.txt still exists with Nlink 1
-	if err := vol.Unlink(ctx, 1, "orig.txt"); err != nil {
+	if _, err := vol.Unlink(ctx, 1, "orig.txt"); err != nil {
 		t.Fatalf("Unlink orig.txt failed: %v", err)
 	}
 	_, err = vol.Lookup(ctx, 1, "orig.txt")
@@ -2443,7 +2443,7 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	}
 
 	// 6. Unlink link1.txt -> file is deleted (no open handles)
-	if err := vol.Unlink(ctx, 1, "link1.txt"); err != nil {
+	if _, err := vol.Unlink(ctx, 1, "link1.txt"); err != nil {
 		t.Fatalf("Unlink link1.txt failed: %v", err)
 	}
 	_, err = vol.GetAttr(ctx, fileAttr.GetInode().GetIno())

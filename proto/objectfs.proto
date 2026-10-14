@@ -62,6 +62,7 @@ message EntryAttr {
   Inode inode = 1;
   string name = 2;
   string redirect_url = 3;
+  uint64 stream_position = 4;
 }
 
 message GetAttrRequest {
@@ -127,6 +128,7 @@ message MkdirRequest {
 message MkdirResponse {
   EntryAttr attr = 1;
   int32 error = 2;
+  uint64 stream_position = 3;
 }
 
 message CreateFileRequest {
@@ -144,6 +146,7 @@ message CreateFileResponse {
   EntryAttr attr = 1;
   int32 error = 2;
   uint64 fh = 3;
+  uint64 stream_position = 4;
 }
 
 message ReadFileRequest {
@@ -175,6 +178,7 @@ message WriteFileResponse {
   google.protobuf.Timestamp mod_time = 3;
   int32 error = 4;
   int64 staging_epoch = 5;
+  uint64 stream_position = 6;
 }
 
 message TruncateFileRequest {
@@ -186,6 +190,7 @@ message TruncateFileRequest {
 message TruncateFileResponse {
   EntryAttr attr = 1;
   int32 error = 2;
+  uint64 stream_position = 3;
 }
 
 message PunchHoleRequest {
@@ -199,6 +204,7 @@ message PunchHoleRequest {
 message PunchHoleResponse {
   EntryAttr attr = 1;
   int32 error = 2;
+  uint64 stream_position = 3;
 }
 
 message UnlinkRequest {
@@ -210,6 +216,7 @@ message UnlinkRequest {
 message UnlinkResponse {
   bool success = 1;
   int32 error = 2;
+  uint64 stream_position = 3;
 }
 
 message RmdirRequest {
@@ -221,6 +228,7 @@ message RmdirRequest {
 message RmdirResponse {
   bool success = 1;
   int32 error = 2;
+  uint64 stream_position = 3;
 }
 
 message RenameRequest {
@@ -234,6 +242,7 @@ message RenameRequest {
 message RenameResponse {
   EntryAttr attr = 1;
   int32 error = 2;
+  uint64 stream_position = 3;
 }
 
 message FsyncRequest {
@@ -247,6 +256,7 @@ message FsyncResponse {
   bool success = 1;
   int32 error = 2;
   int64 staging_epoch = 3;
+  uint64 stream_position = 4;
 }
 
 message WatchVolumeRequest {
@@ -270,6 +280,7 @@ message WatchVolumeResponse {
   string name = 5;
   uint64 old_parent_inode = 6;
   string old_name = 7;
+  uint64 stream_position = 8;
 }
 
 message SymlinkRequest {
@@ -284,6 +295,7 @@ message SymlinkRequest {
 message SymlinkResponse {
   EntryAttr attr = 1;
   int32 error = 2;
+  uint64 stream_position = 3;
 }
 
 message ReadlinkRequest {
@@ -306,6 +318,7 @@ message LinkRequest {
 message LinkResponse {
   EntryAttr attr = 1;
   int32 error = 2;
+  uint64 stream_position = 3;
 }
 
 message OpenRequest {
