@@ -78,11 +78,6 @@ pkg/sds/view/view.go:(*View).Rebuild:(github.com/gke-labs/in-cluster-storage/pkg
 pkg/sds/view/view.go:(*View).Scan:github.com/gke-labs/in-cluster-storage/pkg/sds.ExtractKey
 pkg/sds/view/view.go:(*View).Scan:error-only-checked-for-success:(google.golang.org/protobuf/proto.MarshalOptions).Marshal
 pkg/sds/view/view.go:(*View).SyncRegistry:(*github.com/gke-labs/in-cluster-storage/pkg/sds/record.Registry).Import
-pkg/wal/client/client.go:(*streamImpl).Close:(*google.golang.org/grpc.ClientConn).Close
-pkg/wal/client/client.go:Open:(*github.com/gke-labs/in-cluster-storage/pkg/wal.ClientSegmentStore).Close
-pkg/wal/client/client.go:Open:(*github.com/gke-labs/in-cluster-storage/pkg/wal/client.streamImpl).Close
-pkg/wal/client/client.go:Open:(*github.com/gke-labs/in-cluster-storage/pkg/wal/client.streamImpl).Close
-pkg/wal/client/client.go:TailStream:(*google.golang.org/grpc.ClientConn).Close
 tests/bench/benchmark.go:main:(*os.File).Close
 tests/bench/benchmark.go:main:(*os.File).WriteString
 tests/bench/benchmark.go:main:strconv.Atoi

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -134,6 +135,7 @@ type streamImpl struct {
 
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
+	initialHelloAckErr  error
 
 	// Retained in-memory records queue for network sending & replay
 	retainedMu      sync.RWMutex
@@ -206,7 +208,7 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		conn, err := grpc.NewClient(target, dialOpts...)
 		if err != nil {
 			cancelFunc()
-			_ = store.Close()
+			errutil.CloseAndLog(store, "client segment store")
 			return nil, fmt.Errorf("failed to dial target %s: %w", target, err)
 		}
 		s.grpcConn = conn
@@ -231,11 +233,15 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 
 		select {
 		case <-s.initialHelloAckDone:
+			if s.initialHelloAckErr != nil {
+				errutil.CloseAndLog(s, "wal stream")
+				return nil, s.initialHelloAckErr
+			}
 		case <-time.After(helloTimeout):
-			_ = s.Close()
+			errutil.CloseAndLog(s, "wal stream")
 			return nil, fmt.Errorf("timeout waiting for initial HelloAck from WAL buffer target %s", target)
 		case <-ctx.Done():
-			_ = s.Close()
+			errutil.CloseAndLog(s, "wal stream")
 			return nil, fmt.Errorf("failed to receive initial HelloAck from WAL buffer: %w", ctx.Err())
 		}
 	}
@@ -251,6 +257,9 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 
 	select {
 	case <-s.initialHelloAckDone:
+		if s.initialHelloAckErr != nil {
+			return 0, s.initialHelloAckErr
+		}
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-s.cancelCtx.Done():
@@ -494,7 +503,7 @@ func (s *streamImpl) Close() error {
 	s.wg.Wait()
 
 	if s.grpcConn != nil {
-		_ = s.grpcConn.Close()
+		errutil.CloseAndLog(s.grpcConn, "grpc connection")
 	}
 
 	if s.store != nil {
@@ -566,6 +575,10 @@ func (s *streamImpl) runStreamSession() error {
 	}
 
 	if err := s.handleHelloAck(helloAck); err != nil {
+		s.initialHelloAckOnce.Do(func() {
+			s.initialHelloAckErr = err
+			close(s.initialHelloAckDone)
+		})
 		return fmt.Errorf("handleHelloAck failed: %w", err)
 	}
 
@@ -712,7 +725,7 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 
 				if s.store != nil {
 					if err := s.store.TruncateAfter(witnessHead); err != nil {
-						klog.Warningf("Stream %s: failed to truncate local segment store to %d: %v", s.streamID, witnessHead, err)
+						return fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err)
 					}
 				}
 
@@ -807,7 +820,7 @@ func TailStream(ctx context.Context, target string, streamID uuid.UUID, fromSeq 
 				return
 			}
 			localConn = conn
-			defer localConn.Close()
+			defer errutil.CloseAndLog(localConn, "grpc connection")
 			grpcClient = pb.NewWalBufferClient(conn)
 		}
 
