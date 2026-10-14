@@ -27,6 +27,7 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
@@ -616,7 +617,9 @@ func (s *Server) commitItems(items []incomingItem) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			_, _ = s.flushInternal(ctx)
+			if _, err := s.flushInternal(ctx); err != nil {
+				klog.Warningf("background flush triggered by commit failed: %v", err)
+			}
 		}()
 	}
 }
@@ -638,7 +641,9 @@ func (s *Server) periodicFlushLoop(interval time.Duration) {
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			_, _ = s.flushInternal(ctx)
+			if _, err := s.flushInternal(ctx); err != nil {
+				klog.Warningf("periodic flush failed: %v", err)
+			}
 			cancel()
 		}
 	}
@@ -732,7 +737,7 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 
 	segPath := fmt.Sprintf("%s%012d-%012d.wal", SegmentsPrefix, firstPos, lastPos)
 	segStream := blob.NewByteStreamFromBytes(segBuf.Bytes())
-	defer segStream.Close()
+	defer errutil.CloseAndLog(segStream, fmt.Sprintf("segment stream %s", segPath))
 
 	// 2. Put segment object to object storage
 	if _, err := s.backend.PutObject(ctx, "", segPath, segStream); err != nil {
@@ -995,12 +1000,16 @@ func (s *Server) tailPerStream(ctx context.Context, streamID uuid.UUID, req *pb.
 		if sm.Path != "" {
 			if recs, _, err := ReadRecordsFromOffset(sm.Path, 0); err == nil && len(recs) > 0 {
 				records = recs
+			} else if err != nil {
+				klog.Warningf("failed to read local sealed file %s: %v, falling back to backend", sm.Path, err)
 			}
 		}
 		if records == nil && sm.Key != "" && s.backend != nil {
-			if recs, err := ReadSegmentFromBackend(ctx, s.backend, sm.Key); err == nil {
-				records = recs
+			recs, err := ReadSegmentFromBackend(ctx, s.backend, sm.Key)
+			if err != nil {
+				return fmt.Errorf("failed to read sealed segment %s from backend: %w", sm.Key, err)
 			}
+			records = recs
 		}
 		for _, rec := range records {
 			if err := sendRecord(rec); err != nil {

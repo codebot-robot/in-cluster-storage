@@ -78,16 +78,6 @@ pkg/sds/view/view.go:(*View).Rebuild:(github.com/gke-labs/in-cluster-storage/pkg
 pkg/sds/view/view.go:(*View).Scan:github.com/gke-labs/in-cluster-storage/pkg/sds.ExtractKey
 pkg/sds/view/view.go:(*View).Scan:error-only-checked-for-success:(google.golang.org/protobuf/proto.MarshalOptions).Marshal
 pkg/sds/view/view.go:(*View).SyncRegistry:(*github.com/gke-labs/in-cluster-storage/pkg/sds/record.Registry).Import
-pkg/wal/buffer/server.go:(*Server).commitItems:(*github.com/gke-labs/in-cluster-storage/pkg/wal/buffer.Server).flushInternal
-pkg/wal/buffer/server.go:(*Server).doFlush:(io.Closer).Close
-pkg/wal/buffer/server.go:(*Server).periodicFlushLoop:(*github.com/gke-labs/in-cluster-storage/pkg/wal/buffer.Server).flushInternal
-pkg/wal/buffer/server.go:(*Server).tailPerStream:error-only-checked-for-success:github.com/gke-labs/in-cluster-storage/pkg/wal/buffer.ReadSegmentFromBackend
-pkg/wal/buffer/stream_store.go:(*StreamStore).Recover:error-only-checked-for-success:github.com/google/uuid.Parse
-pkg/wal/buffer/stream_store.go:(*StreamStore).Recover:error-only-checked-for-success:os.ReadDir
-pkg/wal/buffer/stream_store.go:(*streamWriter).recoverStream:error-only-checked-for-success:os.ReadDir
-pkg/wal/buffer/stream_store.go:(*streamWriter).sealLocked:(*os.File).Close
-pkg/wal/buffer/stream_store.go:(*streamWriter).uploadSealedMetaLocked:(io.Closer).Close
-pkg/wal/buffer/stream_store.go:ReadRecordsFromOffset:(*os.File).Close
 pkg/wal/client/client.go:(*streamImpl).Close:(*google.golang.org/grpc.ClientConn).Close
 pkg/wal/client/client.go:Open:(*github.com/gke-labs/in-cluster-storage/pkg/wal.ClientSegmentStore).Close
 pkg/wal/client/client.go:Open:(*github.com/gke-labs/in-cluster-storage/pkg/wal/client.streamImpl).Close
