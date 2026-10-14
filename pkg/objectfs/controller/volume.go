@@ -58,9 +58,14 @@ const (
 	MaxNameLength = 255
 )
 
+type syncResult struct {
+	pos uint64
+	err error
+}
+
 type syncWaiter struct {
 	seq uint64
-	ch  chan error
+	ch  chan syncResult
 }
 
 type Volume struct {
@@ -491,7 +496,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	return v, nil
 }
 
-func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int][]byte) error {
+func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int][]byte, pos uint64) error {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
 
@@ -521,7 +526,7 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 	var remainingWaiters []*syncWaiter
 	for _, w := range v.coalesceWaiters {
 		if w.seq <= snapshotSeq {
-			w.ch <- err
+			w.ch <- syncResult{pos: pos, err: err}
 			close(w.ch)
 		} else {
 			remainingWaiters = append(remainingWaiters, w)
@@ -550,17 +555,17 @@ func (v *Volume) triggerCoalesceSync() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	if err := v.executeSyncLocked(ctx, true); err != nil {
+	if _, err := v.executeSyncLocked(ctx, true); err != nil {
 		klog.Warningf("ObjectFS volume %s coalesce sync failed: %v", v.volumeID, err)
 	}
 }
 
 func (v *Volume) Fsync(ctx context.Context, inodeID uint64) error {
-	_, err := v.FsyncWithEpoch(ctx, inodeID, true, 0)
+	_, _, err := v.FsyncWithEpoch(ctx, inodeID, true, 0)
 	return err
 }
 
-func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bool, reqEpoch int64) (int64, error) {
+func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bool, reqEpoch int64) (int64, uint64, error) {
 	v.mu.RLock()
 	if inodeID == 0 {
 		inodeID = v.rootInodeID
@@ -569,14 +574,14 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 	_, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
 	v.mu.RUnlock()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	v.stagingMu.Lock()
 	if reqEpoch != 0 && reqEpoch != v.stagingEpoch {
 		epoch := v.stagingEpoch
 		v.stagingMu.Unlock()
-		return epoch, syscall.ESTALE
+		return epoch, 0, syscall.ESTALE
 	}
 
 	epoch := v.stagingEpoch
@@ -585,7 +590,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 		if prevErr, ok := v.lastSyncError[inodeID]; ok {
 			delete(v.lastSyncError, inodeID)
 			v.stagingMu.Unlock()
-			return epoch, prevErr
+			return epoch, 0, prevErr
 		}
 
 		if v.coalesceTimer != nil {
@@ -599,30 +604,32 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 
 		if len(v.stagedChunks) == 0 {
 			snapSeq := v.stagingSeq
+			pos := v.Position()
 			v.stagingMu.Unlock()
 			if v.stream != nil {
 				if v.stream.ReplicationLevel() < walclient.Permanent {
-					return epoch, fmt.Errorf("durability level permanent requested but %w", walclient.ErrDurabilityUnavailable)
+					return epoch, 0, fmt.Errorf("durability level permanent requested but %w", walclient.ErrDurabilityUnavailable)
 				}
 				if err := v.stream.Flush(ctx); err != nil {
-					return epoch, err
+					return epoch, 0, err
 				}
 			}
-			return epoch, v.finishSync(snapSeq, nil, nil)
+			return epoch, pos, v.finishSync(snapSeq, nil, nil, pos)
 		}
 
-		err := v.executeSyncLocked(ctx, true)
-		return epoch, err
+		pos, err := v.executeSyncLocked(ctx, true)
+		return epoch, pos, err
 	}
 
 	// Non-blocking sync request
 	if len(v.stagedChunks) == 0 {
+		pos := v.Position()
 		v.stagingMu.Unlock()
-		return epoch, nil
+		return epoch, pos, nil
 	}
 
 	waitSeq := v.stagingSeq
-	waitCh := make(chan error, 1)
+	waitCh := make(chan syncResult, 1)
 	v.coalesceWaiters = append(v.coalesceWaiters, &syncWaiter{seq: waitSeq, ch: waitCh})
 
 	if v.coalesceTimer == nil {
@@ -632,25 +639,26 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 	v.stagingMu.Unlock()
 
 	select {
-	case err := <-waitCh:
-		return epoch, err
+	case res := <-waitCh:
+		return epoch, res.pos, res.err
 	case <-ctx.Done():
-		return epoch, ctx.Err()
+		return epoch, 0, ctx.Err()
 	}
 }
 
-func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) error {
+func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (uint64, error) {
 	// Must be called with v.stagingMu held.
 	// Invariant: ALWAYS returns with v.stagingMu UNLOCKED.
 	if len(v.stagedChunks) == 0 {
 		snapSeq := v.stagingSeq
+		pos := v.Position()
 		v.stagingMu.Unlock()
 		if v.stream != nil && v.stream.ReplicationLevel() == walclient.Permanent {
 			if err := v.stream.Flush(ctx); err != nil {
 				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
 			}
 		}
-		return v.finishSync(snapSeq, nil, nil)
+		return pos, v.finishSync(snapSeq, nil, nil, pos)
 	}
 
 	snapshotSeq := v.stagingSeq
@@ -700,7 +708,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) e
 			if currentBatchBytes+stream.Length() > maxPackCapBytes && len(currentBatch) > 0 {
 				if err := v.blobStore.PutBlobs(ctx, currentBatch); err != nil {
 					klog.Errorf("ObjectFS volume %s sync PutBlobs failed: %v", v.volumeID, err)
-					return v.finishSync(snapshotSeq, err, snapshotChunks)
+					return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
 				}
 				currentBatch = make(map[string]blob.ByteStream)
 				currentBatchBytes = 0
@@ -711,7 +719,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) e
 		if len(currentBatch) > 0 {
 			if err := v.blobStore.PutBlobs(ctx, currentBatch); err != nil {
 				klog.Errorf("ObjectFS volume %s sync PutBlobs failed: %v", v.volumeID, err)
-				return v.finishSync(snapshotSeq, err, snapshotChunks)
+				return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
 			}
 		}
 	}
@@ -726,7 +734,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) e
 		node, err := v.getOrLoadInodeLocked(ctx, tx, ino)
 		if err != nil {
 			v.mu.Unlock()
-			return v.finishSync(snapshotSeq, err, snapshotChunks)
+			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
 		}
 		nodes[ino] = node
 	}
@@ -764,7 +772,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) e
 				InlineData: append([]byte(nil), inlineData...),
 			}); err != nil {
 				v.mu.Unlock()
-				return v.finishSync(snapshotSeq, fmt.Errorf("failed to log inline FileChunk: %w", err), snapshotChunks)
+				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to log inline FileChunk: %w", err), snapshotChunks, 0)
 			}
 
 			node.mutate(func(row *pb.Inode) {
@@ -790,7 +798,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) e
 					Sha256: sha,
 				}); err != nil {
 					v.mu.Unlock()
-					return v.finishSync(snapshotSeq, fmt.Errorf("failed to log FileChunk: %w", err), snapshotChunks)
+					return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to log FileChunk: %w", err), snapshotChunks, 0)
 				}
 			}
 
@@ -812,7 +820,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) e
 			manifestBlob, mErr := blob.EncodeManifest(manifest)
 			if mErr != nil {
 				v.mu.Unlock()
-				return v.finishSync(snapshotSeq, fmt.Errorf("failed to encode manifest: %w", mErr), snapshotChunks)
+				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to encode manifest: %w", mErr), snapshotChunks, 0)
 			}
 			manifestHex := manifestBlob.SHA256Hex()
 
@@ -831,19 +839,22 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) e
 
 		if _, err := tx.Update(ctx, node.Row); err != nil {
 			v.mu.Unlock()
-			return v.finishSync(snapshotSeq, fmt.Errorf("failed to log inode update: %w", err), snapshotChunks)
+			return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to log inode update: %w", err), snapshotChunks, 0)
 		}
-
-		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
-		modifiedAttrs = append(modifiedAttrs, attr)
 	}
 
 	commitSeq, err := tx.Commit(ctx)
 	if err != nil {
 		v.mu.Unlock()
-		return v.finishSync(snapshotSeq, fmt.Errorf("failed to commit sync transaction: %w", err), snapshotChunks)
+		return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to commit sync transaction: %w", err), snapshotChunks, 0)
 	}
 	v.applyTxChangesLocked(ctx, tx)
+
+	for ino := range snapshotChunks {
+		node := nodes[ino]
+		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
+		modifiedAttrs = append(modifiedAttrs, attr)
+	}
 
 	reqLevel := v.durability
 	waitFn := v.makeWaitFn(commitSeq, &reqLevel)
@@ -851,30 +862,31 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) e
 
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			return v.finishSync(snapshotSeq, err, snapshotChunks)
+			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
 		}
 	}
 	if v.stream != nil {
 		if requirePermanent && v.stream.ReplicationLevel() < walclient.Permanent {
 			err := fmt.Errorf("durability level permanent requested but %w", walclient.ErrDurabilityUnavailable)
-			return v.finishSync(snapshotSeq, err, snapshotChunks)
+			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
 		}
 		if v.stream.ReplicationLevel() == walclient.Permanent {
 			if err := v.stream.Flush(ctx); err != nil {
-				return v.finishSync(snapshotSeq, err, snapshotChunks)
+				return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
 			}
 		}
 	}
 
 	for _, attr := range modifiedAttrs {
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_MODIFIED,
-			Attr:      attr,
-			Inode:     attr.GetInode().GetIno(),
+			EventType:      pb.WatchEventType_EVENT_MODIFIED,
+			Attr:           attr,
+			Inode:          attr.GetInode().GetIno(),
+			StreamPosition: commitSeq,
 		})
 	}
 
-	return v.finishSync(snapshotSeq, nil, snapshotChunks)
+	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq)
 }
 
 type memoryAppender struct {
@@ -1126,7 +1138,7 @@ func (v *Volume) Close() error {
 		v.coalesceTimer = nil
 	}
 	for _, w := range v.coalesceWaiters {
-		w.ch <- fmt.Errorf("volume closed")
+		w.ch <- syncResult{err: fmt.Errorf("volume closed")}
 		close(w.ch)
 	}
 	v.coalesceWaiters = nil
@@ -1699,23 +1711,24 @@ func (v *Volume) resolvePathLocked(ctx context.Context, p string) (uint64, uint6
 	return currInodeID, parentInodeID, baseName, nil
 }
 
-func toEntryAttr(row *pb.Inode, name, redirectURL string, rootInodeID uint64) *pb.EntryAttr {
+func (v *Volume) toEntryAttr(row *pb.Inode, name, redirectURL string) *pb.EntryAttr {
 	if row == nil {
 		return nil
 	}
 	ino := row.GetIno()
-	if name == "" && (ino == rootInodeID || ino == 1) {
+	if name == "" && (ino == v.rootInodeID || ino == 1) {
 		name = "/"
 	}
-	if rootInodeID != 0 && ino == rootInodeID && rootInodeID != 1 {
+	if v.rootInodeID != 0 && ino == v.rootInodeID && v.rootInodeID != 1 {
 		rowCopy := proto.Clone(row).(*pb.Inode)
 		rowCopy.Ino = proto.Uint64(1)
 		row = rowCopy
 	}
 	return &pb.EntryAttr{
-		Inode:       row,
-		Name:        name,
-		RedirectUrl: redirectURL,
+		Inode:          row,
+		Name:           name,
+		RedirectUrl:    redirectURL,
+		StreamPosition: v.lastCommitSeq,
 	}
 }
 
@@ -1724,7 +1737,7 @@ func (v *Volume) toEntryAttrLocked(ctx context.Context, tx *sds.Tx, inodeID uint
 	if err != nil {
 		return nil, err
 	}
-	return toEntryAttr(node.Row, name, node.RedirectURL, v.rootInodeID), nil
+	return v.toEntryAttr(node.Row, name, node.RedirectURL), nil
 }
 
 func (v *Volume) GetAttr(ctx context.Context, inodeID uint64) (*pb.EntryAttr, error) {
@@ -1804,7 +1817,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
+		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return attr, waitFn, nil
 	}()
 	if err != nil {
@@ -1817,9 +1830,10 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 	}
 	if v.broadcaster != nil {
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_MODIFIED,
-			Attr:      attr,
-			Inode:     attr.GetInode().GetIno(),
+			EventType:      pb.WatchEventType_EVENT_MODIFIED,
+			Attr:           attr,
+			Inode:          attr.GetInode().GetIno(),
+			StreamPosition: attr.GetStreamPosition(),
 		})
 	}
 	return attr, nil
@@ -2060,13 +2074,14 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := toEntryAttr(childInodeMsg, name, "", v.rootInodeID)
+		attr := v.toEntryAttr(childInodeMsg, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType:   pb.WatchEventType_EVENT_CREATED,
-			Attr:        attr,
-			Inode:       childInodeID,
-			ParentInode: parentInodeID,
-			Name:        name,
+			EventType:      pb.WatchEventType_EVENT_CREATED,
+			Attr:           attr,
+			Inode:          childInodeID,
+			ParentInode:    parentInodeID,
+			Name:           name,
+			StreamPosition: commitSeq,
 		})
 
 		return attr, waitFn, nil
@@ -2284,13 +2299,14 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 			waitFn := v.makeWaitFn(commitSeq, nil)
 
-			attr := toEntryAttr(childInode.Row, name, childInode.RedirectURL, v.rootInodeID)
+			attr := v.toEntryAttr(childInode.Row, name, childInode.RedirectURL)
 			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-				EventType:   pb.WatchEventType_EVENT_MODIFIED,
-				Attr:        attr,
-				Inode:       childInode.Row.GetIno(),
-				ParentInode: parentInodeID,
-				Name:        name,
+				EventType:      pb.WatchEventType_EVENT_MODIFIED,
+				Attr:           attr,
+				Inode:          childInode.Row.GetIno(),
+				ParentInode:    parentInodeID,
+				Name:           name,
+				StreamPosition: commitSeq,
 			})
 			return attr, waitFn, nil
 		}
@@ -2393,13 +2409,14 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := toEntryAttr(childInode.Row, name, "", v.rootInodeID)
+		attr := v.toEntryAttr(childInode.Row, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType:   pb.WatchEventType_EVENT_CREATED,
-			Attr:        attr,
-			Inode:       childInodeID,
-			ParentInode: parentInodeID,
-			Name:        name,
+			EventType:      pb.WatchEventType_EVENT_CREATED,
+			Attr:           attr,
+			Inode:          childInodeID,
+			ParentInode:    parentInodeID,
+			Name:           name,
+			StreamPosition: commitSeq,
 		})
 
 		return attr, waitFn, nil
@@ -2506,13 +2523,14 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := toEntryAttr(childInode.Row, name, "", v.rootInodeID)
+		attr := v.toEntryAttr(childInode.Row, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType:   pb.WatchEventType_EVENT_CREATED,
-			Attr:        attr,
-			Inode:       childInodeID,
-			ParentInode: parentInodeID,
-			Name:        name,
+			EventType:      pb.WatchEventType_EVENT_CREATED,
+			Attr:           attr,
+			Inode:          childInodeID,
+			ParentInode:    parentInodeID,
+			Name:           name,
+			StreamPosition: commitSeq,
 		})
 		return attr, waitFn, nil
 	}()
@@ -2629,13 +2647,14 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := toEntryAttr(oldNode.Row, newName, "", v.rootInodeID)
+		attr := v.toEntryAttr(oldNode.Row, newName, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType:   pb.WatchEventType_EVENT_CREATED,
-			Attr:        attr,
-			Inode:       oldNode.Row.GetIno(),
-			ParentInode: newParentInodeID,
-			Name:        newName,
+			EventType:      pb.WatchEventType_EVENT_CREATED,
+			Attr:           attr,
+			Inode:          oldNode.Row.GetIno(),
+			ParentInode:    newParentInodeID,
+			Name:           newName,
+			StreamPosition: commitSeq,
 		})
 		return attr, waitFn, nil
 	}()
@@ -3382,11 +3401,12 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
+		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_MODIFIED,
-			Attr:      attr,
-			Inode:     node.Row.GetIno(),
+			EventType:      pb.WatchEventType_EVENT_MODIFIED,
+			Attr:           attr,
+			Inode:          node.Row.GetIno(),
+			StreamPosition: commitSeq,
 		})
 		return attr, waitFn, nil
 	}()
@@ -3454,7 +3474,7 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 		}
 
 		if keepSize && punchStart >= currSize {
-			attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
+			attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 			return attr, nil, nil
 		}
 
@@ -3654,11 +3674,12 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := toEntryAttr(node.Row, "", node.RedirectURL, v.rootInodeID)
+		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_MODIFIED,
-			Attr:      attr,
-			Inode:     node.Row.GetIno(),
+			EventType:      pb.WatchEventType_EVENT_MODIFIED,
+			Attr:           attr,
+			Inode:          node.Row.GetIno(),
+			StreamPosition: commitSeq,
 		})
 		return attr, waitFn, nil
 	}()
@@ -3673,9 +3694,9 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 	return attr, nil
 }
 
-func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) error {
+func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) (uint64, error) {
 	if len(name) > MaxNameLength {
-		return fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+		return 0, fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
 	}
 
 	v.mu.Lock()
@@ -3685,20 +3706,20 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	de, ok, err := v.getDirEntrySQLiteLocked(ctx, nil, parentInodeID, name)
 	if err != nil {
 		v.mu.Unlock()
-		return err
+		return 0, err
 	}
 	if !ok {
 		v.mu.Unlock()
-		return fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
+		return 0, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 	}
 	childInode, err := v.getOrLoadInodeLocked(ctx, nil, de.GetIno())
 	if err != nil {
 		v.mu.Unlock()
-		return err
+		return 0, err
 	}
 	if childInode.Row.GetIsDir() {
 		v.mu.Unlock()
-		return fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
+		return 0, fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
 	}
 	childInodeID = childInode.Row.GetIno()
 	v.mu.Unlock()
@@ -3714,27 +3735,27 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	}
 	v.stagingMu.Unlock()
 
-	waitFn, err := func() (func(context.Context) error, error) {
+	waitFn, commitSeq, err := func() (func(context.Context) error, uint64, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("Unlink")
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		_, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if !ok {
-			return nil, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
+			return nil, 0, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 		}
 
 		childInode, err := v.getOrLoadInodeLocked(ctx, tx, childInodeID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		if childInode.Data != nil {
@@ -3756,7 +3777,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 
 		parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		parentInode.mutate(func(row *pb.Inode) {
 			row.Mtime = timestamppb.New(now)
@@ -3768,81 +3789,82 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		if childInode.Row.GetNlink() == 0 && !v.hasOpenHandlesLocked(childInodeID) {
 			chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInodeID)}, 1)
 			if err != nil {
-				return nil, fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", childInodeID, err)
+				return nil, 0, fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", childInodeID, err)
 			}
 			chunkMsgs, err = v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
 			if err != nil {
-				return nil, fmt.Errorf("failed to scan chunk rows for inode %d: %w", childInodeID, err)
+				return nil, 0, fmt.Errorf("failed to scan chunk rows for inode %d: %w", childInodeID, err)
 			}
 		}
 
 		var commitSeq uint64
 		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
-			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
+			return nil, 0, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
 
 		if childInode.Row.GetNlink() > 0 || v.hasOpenHandlesLocked(childInodeID) {
 			if _, err := tx.Update(ctx, childInode.Row); err != nil {
-				return nil, fmt.Errorf("failed to log child inode update: %w", err)
+				return nil, 0, fmt.Errorf("failed to log child inode update: %w", err)
 			}
 		} else {
 			if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInodeID)}); err != nil {
-				return nil, fmt.Errorf("failed to log child inode deletion: %w", err)
+				return nil, 0, fmt.Errorf("failed to log child inode deletion: %w", err)
 			}
 			for _, cMsg := range chunkMsgs {
 				c := cMsg.(*pb.FileChunk)
 				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
-					return nil, fmt.Errorf("failed to log chunk deletion for inode %d: %w", childInodeID, err)
+					return nil, 0, fmt.Errorf("failed to log chunk deletion for inode %d: %w", childInodeID, err)
 				}
 			}
 		}
 
 		if parentInode != nil {
 			if _, err := tx.Update(ctx, parentInode.Row); err != nil {
-				return nil, fmt.Errorf("failed to log parent inode update: %w", err)
+				return nil, 0, fmt.Errorf("failed to log parent inode update: %w", err)
 			}
 		}
 		commitSeq, err = tx.Commit(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to commit transaction: %w", err)
+			return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType:   pb.WatchEventType_EVENT_DELETED,
-			Inode:       childInode.Row.GetIno(),
-			ParentInode: parentInodeID,
-			Name:        name,
+			EventType:      pb.WatchEventType_EVENT_DELETED,
+			Inode:          childInode.Row.GetIno(),
+			ParentInode:    parentInodeID,
+			Name:           name,
+			StreamPosition: commitSeq,
 		})
 
-		return waitFn, nil
+		return waitFn, commitSeq, nil
 	}()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return commitSeq, nil
 }
 
-func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) error {
+func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (uint64, error) {
 	if len(name) > MaxNameLength {
-		return fmt.Errorf("directory name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+		return 0, fmt.Errorf("directory name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
 	}
 
-	waitFn, err := func() (func(context.Context) error, error) {
+	waitFn, commitSeq, err := func() (func(context.Context) error, uint64, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("Rmdir")
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		parentInodeID = v.normalizeInodeID(parentInodeID)
@@ -3850,31 +3872,31 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		var childInodeID uint64
 		de, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if !ok {
-			return nil, fmt.Errorf("directory %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
+			return nil, 0, fmt.Errorf("directory %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 		}
 		childInodeID = de.GetIno()
 		childInode, err := v.getOrLoadInodeLocked(ctx, tx, childInodeID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if !childInode.Row.GetIsDir() {
-			return nil, fmt.Errorf("cannot rmdir non-directory %s: %w", name, syscall.ENOTDIR)
+			return nil, 0, fmt.Errorf("cannot rmdir non-directory %s: %w", name, syscall.ENOTDIR)
 		}
 
 		// Emptiness check: scan child directory with limit 1
 		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.DirEntry{ParentIno: proto.Uint64(childInodeID)}, 1)
 		if pErr != nil {
-			return nil, pErr
+			return nil, 0, pErr
 		}
 		subEntries, err := v.scanLimitSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.DirEntry", prefixBytes, 1)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if len(subEntries) > 0 {
-			return nil, fmt.Errorf("directory %s not empty: %w", name, syscall.ENOTEMPTY)
+			return nil, 0, fmt.Errorf("directory %s not empty: %w", name, syscall.ENOTEMPTY)
 		}
 
 		delete(v.dirParents, childInodeID)
@@ -3882,7 +3904,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		now := time.Now()
 		parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		parentInode.mutate(func(row *pb.Inode) {
 			if row.GetNlink() > 2 {
@@ -3894,42 +3916,43 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 
 		var commitSeq uint64
 		if _, err = tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
-			return nil, fmt.Errorf("failed to log dir entry deletion: %w", err)
+			return nil, 0, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
 		if _, err = tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInodeID)}); err != nil {
-			return nil, fmt.Errorf("failed to log inode deletion: %w", err)
+			return nil, 0, fmt.Errorf("failed to log inode deletion: %w", err)
 		}
 		if parentInode != nil {
 			if _, err = tx.Update(ctx, parentInode.Row); err != nil {
-				return nil, fmt.Errorf("failed to log parent inode update: %w", err)
+				return nil, 0, fmt.Errorf("failed to log parent inode update: %w", err)
 			}
 		}
 		commitSeq, err = tx.Commit(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to commit transaction: %w", err)
+			return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 		v.applyTxChangesLocked(ctx, tx)
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType:   pb.WatchEventType_EVENT_DELETED,
-			Inode:       childInodeID,
-			ParentInode: parentInodeID,
-			Name:        name,
+			EventType:      pb.WatchEventType_EVENT_DELETED,
+			Inode:          childInodeID,
+			ParentInode:    parentInodeID,
+			Name:           name,
+			StreamPosition: commitSeq,
 		})
 
-		return waitFn, nil
+		return waitFn, commitSeq, nil
 	}()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return commitSeq, nil
 }
 
 func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName string, newParentInodeID uint64, newName string) (*pb.EntryAttr, error) {
@@ -4191,7 +4214,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 
 		waitFn := v.makeWaitFn(commitSeq, nil)
 
-		attr := toEntryAttr(childInode.Row, newName, childInode.RedirectURL, v.rootInodeID)
+		attr := v.toEntryAttr(childInode.Row, newName, childInode.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:      pb.WatchEventType_EVENT_RENAMED,
 			Attr:           attr,
@@ -4200,6 +4223,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			OldName:        oldName,
 			ParentInode:    newParentInodeID,
 			Name:           newName,
+			StreamPosition: commitSeq,
 		})
 
 		return attr, waitFn, nil
@@ -4378,7 +4402,7 @@ func (v *Volume) FlushToBackend(ctx context.Context) error {
 		v.syncCond.Wait()
 	}
 	if len(v.stagedChunks) > 0 {
-		if err := v.executeSyncLocked(ctx, false); err != nil {
+		if _, err := v.executeSyncLocked(ctx, false); err != nil {
 			return err
 		}
 	} else {

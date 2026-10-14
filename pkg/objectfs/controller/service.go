@@ -558,7 +558,7 @@ func (s *Server) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MkdirResp
 	if err != nil {
 		return &pb.MkdirResponse{Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.MkdirResponse{Attr: attr}, nil
+	return &pb.MkdirResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
 }
 
 func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb.CreateFileResponse, error) {
@@ -574,7 +574,7 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 	fh := vol.AllocFh(attr.GetInode().GetIno())
-	return &pb.CreateFileResponse{Attr: attr, Fh: fh}, nil
+	return &pb.CreateFileResponse{Attr: attr, Fh: fh, StreamPosition: attr.GetStreamPosition()}, nil
 }
 
 func (s *Server) ReadFile(ctx context.Context, req *pb.ReadFileRequest) (*pb.ReadFileResponse, error) {
@@ -612,10 +612,11 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 		return &pb.WriteFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.WriteFileResponse{
-		BytesWritten: bytesWritten,
-		NewSize:      newSize,
-		ModTime:      timestamppb.New(modTime),
-		StagingEpoch: stagingEpoch,
+		BytesWritten:   bytesWritten,
+		NewSize:        newSize,
+		ModTime:        timestamppb.New(modTime),
+		StagingEpoch:   stagingEpoch,
+		StreamPosition: vol.Position(),
 	}, nil
 }
 
@@ -631,7 +632,7 @@ func (s *Server) TruncateFile(ctx context.Context, req *pb.TruncateFileRequest) 
 	if err != nil {
 		return &pb.TruncateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.TruncateFileResponse{Attr: attr}, nil
+	return &pb.TruncateFileResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
 }
 
 func (s *Server) PunchHole(ctx context.Context, req *pb.PunchHoleRequest) (*pb.PunchHoleResponse, error) {
@@ -646,7 +647,7 @@ func (s *Server) PunchHole(ctx context.Context, req *pb.PunchHoleRequest) (*pb.P
 	if err != nil {
 		return &pb.PunchHoleResponse{Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.PunchHoleResponse{Attr: attr}, nil
+	return &pb.PunchHoleResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
 }
 
 func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkResponse, error) {
@@ -657,10 +658,11 @@ func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkR
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	if err := vol.Unlink(ctx, req.GetParentInode(), req.GetName()); err != nil {
+	pos, err := vol.Unlink(ctx, req.GetParentInode(), req.GetName())
+	if err != nil {
 		return &pb.UnlinkResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.UnlinkResponse{Success: true}, nil
+	return &pb.UnlinkResponse{Success: true, StreamPosition: pos}, nil
 }
 
 func (s *Server) Rmdir(ctx context.Context, req *pb.RmdirRequest) (*pb.RmdirResponse, error) {
@@ -671,10 +673,11 @@ func (s *Server) Rmdir(ctx context.Context, req *pb.RmdirRequest) (*pb.RmdirResp
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	if err := vol.Rmdir(ctx, req.GetParentInode(), req.GetName()); err != nil {
+	pos, err := vol.Rmdir(ctx, req.GetParentInode(), req.GetName())
+	if err != nil {
 		return &pb.RmdirResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.RmdirResponse{Success: true}, nil
+	return &pb.RmdirResponse{Success: true, StreamPosition: pos}, nil
 }
 
 func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameResponse, error) {
@@ -689,7 +692,7 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	if err != nil {
 		return &pb.RenameResponse{Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.RenameResponse{Attr: attr}, nil
+	return &pb.RenameResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
 }
 
 func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResponse, error) {
@@ -700,11 +703,11 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	stagingEpoch, err := vol.FsyncWithEpoch(ctx, req.GetInode(), req.GetBlocking(), req.GetStagingEpoch())
+	stagingEpoch, pos, err := vol.FsyncWithEpoch(ctx, req.GetInode(), req.GetBlocking(), req.GetStagingEpoch())
 	if err != nil {
-		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err), StagingEpoch: stagingEpoch}, nil
+		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err), StagingEpoch: stagingEpoch, StreamPosition: pos}, nil
 	}
-	return &pb.FsyncResponse{Success: true, StagingEpoch: stagingEpoch}, nil
+	return &pb.FsyncResponse{Success: true, StagingEpoch: stagingEpoch, StreamPosition: pos}, nil
 }
 
 func (s *Server) Symlink(ctx context.Context, req *pb.SymlinkRequest) (*pb.SymlinkResponse, error) {
@@ -719,7 +722,7 @@ func (s *Server) Symlink(ctx context.Context, req *pb.SymlinkRequest) (*pb.Symli
 	if err != nil {
 		return &pb.SymlinkResponse{Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.SymlinkResponse{Attr: attr}, nil
+	return &pb.SymlinkResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
 }
 
 func (s *Server) Readlink(ctx context.Context, req *pb.ReadlinkRequest) (*pb.ReadlinkResponse, error) {
@@ -749,7 +752,7 @@ func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkRespons
 	if err != nil {
 		return &pb.LinkResponse{Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.LinkResponse{Attr: attr}, nil
+	return &pb.LinkResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
 }
 
 func (s *Server) Open(ctx context.Context, req *pb.OpenRequest) (*pb.OpenResponse, error) {
