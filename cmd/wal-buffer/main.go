@@ -77,7 +77,6 @@ func main() {
 	if err != nil {
 		klog.Fatalf("failed to initialize WAL buffer server: %v", err)
 	}
-	defer srv.Close()
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterWalBufferServer(grpcServer, srv)
@@ -92,7 +91,13 @@ func main() {
 	}()
 
 	klog.Infof("WAL Buffer Service listening on port %d (last_position=%d, backend=%s, data-dir=%s)", *port, srv.LastPosition(), *backendType, *dataDir)
-	if err := grpcServer.Serve(listener); err != nil {
-		klog.Fatalf("failed to serve: %v", err)
+	serveErr := grpcServer.Serve(listener)
+	if err := srv.Close(); err != nil {
+		klog.Errorf("failed to close server on shutdown: %v", err)
+		klog.Flush()
+		os.Exit(1)
+	}
+	if serveErr != nil {
+		klog.Fatalf("failed to serve: %v", serveErr)
 	}
 }

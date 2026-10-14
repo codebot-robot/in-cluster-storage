@@ -26,6 +26,7 @@ import (
 	"syscall"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/spf13/cobra"
@@ -98,11 +99,11 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 		return fmt.Errorf("failed to create mountpoint %s: %w", mountpoint, err)
 	}
 
-	client, closeConn, err := dialServer(opts.serverAddr)
+	client, conn, err := dialServer(opts.serverAddr)
 	if err != nil {
 		return err
 	}
-	defer closeConn()
+	defer errutil.CloseAndLog(conn, "server connection")
 
 	// Fail early with a clear error if the controller is not reachable.
 	if resp, err := client.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: opts.volumeID, Inode: 1}); err != nil {

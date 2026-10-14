@@ -24,6 +24,7 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -53,7 +54,7 @@ func run(args []string) error {
 	}
 }
 
-func runAppend(args []string) error {
+func runAppend(args []string) (err error) {
 	fs := flag.NewFlagSet("append", flag.ContinueOnError)
 	dir := fs.String("dir", "/data/wal", "Local WAL directory")
 	streamIDStr := fs.String("stream-id", "", "Stream UUID")
@@ -67,12 +68,12 @@ func runAppend(args []string) error {
 	}
 
 	var streamID uuid.UUID
-	var err error
 	if *streamIDStr != "" {
-		streamID, err = uuid.Parse(*streamIDStr)
-		if err != nil {
-			return fmt.Errorf("invalid stream-id %q: %w", *streamIDStr, err)
+		sid, parseErr := uuid.Parse(*streamIDStr)
+		if parseErr != nil {
+			return fmt.Errorf("invalid stream-id %q: %w", *streamIDStr, parseErr)
 		}
+		streamID = sid
 	} else {
 		streamID = uuid.New()
 	}
@@ -98,7 +99,7 @@ func runAppend(args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open stream: %w", err)
 	}
-	defer stream.Close()
+	defer errutil.CloseWithErr(stream, &err)
 
 	for i := 1; i <= *count; i++ {
 		payload := []byte(fmt.Sprintf("wal-record-%s-%d", streamID.String(), i))
@@ -155,7 +156,7 @@ func runTail(args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to dial target %s: %w", *target, err)
 	}
-	defer conn.Close()
+	defer errutil.CloseAndLog(conn, "grpc connection")
 
 	walClient := pb.NewWalBufferClient(conn)
 	tailStream, err := walClient.Tail(ctx, &pb.TailRequest{
