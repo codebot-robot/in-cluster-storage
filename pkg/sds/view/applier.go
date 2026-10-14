@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
@@ -276,7 +277,7 @@ func (a *applier) loop() {
 					a.v.indexMu.Unlock()
 
 					if oldIndex != nil {
-						_ = oldIndex.Close()
+						errutil.CloseAndLog(oldIndex, "superseded local index")
 					}
 					continue
 				}

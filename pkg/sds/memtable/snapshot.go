@@ -235,18 +235,20 @@ func RestoreSnapshotKey(ctx context.Context, backend objectstore.Backend, stream
 	for tblName, rows := range data.Tables {
 		tbl := store.GetOrCreateTable(tblName)
 		def, _, ok := store.registry.LookupByName(tblName)
+		if !ok {
+			return nil, 0, fmt.Errorf("table %q in snapshot not found in registry", tblName)
+		}
+		msgType, err := store.registry.ResolveMessageType(def.GetId())
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to resolve message type for table %q: %w", tblName, err)
+		}
 		for _, r := range rows {
 			key := sds.NewKeyFromBytes(r.Key)
-			if ok {
-				msgType, err := store.registry.ResolveMessageType(def.GetId())
-				if err == nil {
-					target := msgType.New().Interface()
-					if err := proto.Unmarshal(r.Val, target); err == nil {
-						tbl.Put(key, target)
-						continue
-					}
-				}
+			target := msgType.New().Interface()
+			if err := proto.Unmarshal(r.Val, target); err != nil {
+				return nil, 0, fmt.Errorf("failed to unmarshal row in table %q: %w", tblName, err)
 			}
+			tbl.Put(key, target)
 		}
 	}
 

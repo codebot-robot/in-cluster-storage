@@ -35,6 +35,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"google.golang.org/protobuf/proto"
@@ -294,7 +295,7 @@ func (v *View) Rebuild(ctx context.Context) error {
 	v.mu.Unlock()
 
 	if oldIndex != nil {
-		_ = oldIndex.Close()
+		errutil.CloseAndLog(oldIndex, "superseded local index")
 	}
 	return nil
 }
@@ -643,7 +644,10 @@ func (v *View) SyncRegistry(ctx context.Context, reg *record.Registry) error {
 		if v.reg == nil {
 			v.reg = record.NewRegistry()
 		}
-		_ = v.reg.Import(reg.Export())
+		if err := v.reg.Import(reg.Export()); err != nil {
+			v.mu.Unlock()
+			return fmt.Errorf("failed to import registry: %w", err)
+		}
 	}
 	idx := v.index
 	v.mu.Unlock()
@@ -885,13 +889,20 @@ func (v *View) Scan(ctx context.Context, typeName string, keyPrefix []byte) iter
 				}
 				var k sds.Key
 				if len(keyFields) > 0 {
-					k, _ = sds.ExtractKey(idxMsg, keyFields)
+					var err error
+					k, err = sds.ExtractKey(idxMsg, keyFields)
+					if err != nil {
+						yield(nil, fmt.Errorf("failed to extract key for %s: %w", typeName, err))
+						return
+					}
 				}
 				if k.IsZero() {
 					kBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(idxMsg)
-					if err == nil {
-						k = sds.NewKeyFromBytes(kBytes)
+					if err != nil {
+						yield(nil, fmt.Errorf("failed to marshal message for %s: %w", typeName, err))
+						return
 					}
+					k = sds.NewKeyFromBytes(kBytes)
 				}
 				if !k.IsZero() {
 					kStr := k.String()

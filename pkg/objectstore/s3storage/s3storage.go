@@ -30,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 )
 
@@ -192,7 +193,7 @@ func (b *Backend) GetObject(ctx context.Context, volumeID, key string, offset, l
 		}
 		return fmt.Errorf("failed to get s3 object %s: %w", s3Key, err)
 	}
-	defer out.Body.Close()
+	defer errutil.CloseAndLog(out.Body, "s3 response body")
 
 	if _, err := io.Copy(w, out.Body); err != nil {
 		return fmt.Errorf("failed to stream s3 object %s: %w", s3Key, err)

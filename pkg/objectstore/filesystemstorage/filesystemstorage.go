@@ -26,7 +26,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"k8s.io/klog/v2"
 )
 
 var (
@@ -83,8 +85,10 @@ func (b *Backend) PutObject(ctx context.Context, volumeID, key string, stream bl
 	cleanup := true
 	defer func() {
 		if cleanup {
-			_ = tf.Close()
-			_ = os.Remove(tempPath)
+			errutil.CloseAndLog(tf, "temp upload file")
+			if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
+				klog.Warningf("failed to remove temp upload file %s: %v", tempPath, remErr)
+			}
 		}
 	}()
 
@@ -123,7 +127,7 @@ func (b *Backend) GetObject(ctx context.Context, volumeID, key string, offset, l
 		}
 		return err
 	}
-	defer f.Close()
+	defer errutil.CloseAndLog(f, "backend object file")
 
 	st, err := f.Stat()
 	if err != nil {
