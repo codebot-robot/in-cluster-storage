@@ -549,3 +549,35 @@ func TestVolumesAndSnapshotsOverUnixSocket(t *testing.T) {
 		t.Fatalf("expected %s in snapshots list output %q", snapName, snapListOut)
 	}
 }
+
+func TestSnapshotsListInvalidTimeFlags(t *testing.T) {
+	_, serverAddr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// Invalid --from-time should fail
+	_, err := executeCommand("--server", serverAddr, "snapshots", "list", "any-vol", "--from-time", "not-a-timestamp")
+	if err == nil {
+		t.Fatalf("expected error with invalid --from-time, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid --from-time") {
+		t.Errorf("expected 'invalid --from-time' in error, got: %v", err)
+	}
+
+	// Invalid --to-time should fail
+	_, err = executeCommand("--server", serverAddr, "snapshots", "list", "any-vol", "--to-time", "not-a-timestamp")
+	if err == nil {
+		t.Fatalf("expected error with invalid --to-time, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid --to-time") {
+		t.Errorf("expected 'invalid --to-time' in error, got: %v", err)
+	}
+
+	// Invalid --to should fail
+	_, err = executeCommand("--server", serverAddr, "snapshots", "list", "any-vol", "--to", "not-a-timestamp")
+	if err == nil {
+		t.Fatalf("expected error with invalid --to, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid --to") {
+		t.Errorf("expected 'invalid --to' in error, got: %v", err)
+	}
+}

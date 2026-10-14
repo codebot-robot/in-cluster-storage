@@ -25,6 +25,7 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -35,7 +36,7 @@ type options struct {
 	serverAddr string
 }
 
-func dialServer(addr string) (pb.ObjectFSControllerClient, func() error, error) {
+func dialServer(addr string) (pb.ObjectFSControllerClient, io.Closer, error) {
 	if addr == "" {
 		return nil, nil, fmt.Errorf("--server is required")
 	}
@@ -51,7 +52,7 @@ func dialServer(addr string) (pb.ObjectFSControllerClient, func() error, error) 
 	}
 
 	client := pb.NewObjectFSControllerClient(conn)
-	return client, conn.Close, nil
+	return client, conn, nil
 }
 
 func NewRootCommand() *cobra.Command {
@@ -106,11 +107,11 @@ func newBlobsListCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("--server is required")
 			}
 
-			client, closeConn, err := dialServer(listOpts.serverAddr)
+			client, conn, err := dialServer(listOpts.serverAddr)
 			if err != nil {
 				return err
 			}
-			defer closeConn()
+			defer errutil.CloseAndLog(conn, "server connection")
 
 			fromSHA := listOpts.from
 			remainingLimit := listOpts.limit
@@ -128,7 +129,9 @@ func newBlobsListCommand(opts *options) *cobra.Command {
 				}
 
 				for _, sha := range resp.GetSha256() {
-					fmt.Fprintln(out, sha)
+					if _, err := fmt.Fprintln(out, sha); err != nil {
+						return fmt.Errorf("failed writing to output: %w", err)
+					}
 					fromSHA = sha
 					if remainingLimit > 0 {
 						remainingLimit--
@@ -169,11 +172,11 @@ func newBlobsGetCommand(opts *options) *cobra.Command {
 			}
 
 			sha := args[0]
-			client, closeConn, err := dialServer(getOpts.serverAddr)
+			client, conn, err := dialServer(getOpts.serverAddr)
 			if err != nil {
 				return err
 			}
-			defer closeConn()
+			defer errutil.CloseAndLog(conn, "server connection")
 
 			stream, err := client.GetBlob(cmd.Context(), &pb.GetBlobRequest{
 				Sha256: sha,
@@ -236,11 +239,11 @@ func newVolumesListCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("--server is required")
 			}
 
-			client, closeConn, err := dialServer(listOpts.serverAddr)
+			client, conn, err := dialServer(listOpts.serverAddr)
 			if err != nil {
 				return err
 			}
-			defer closeConn()
+			defer errutil.CloseAndLog(conn, "server connection")
 
 			fromVol := listOpts.from
 			remainingLimit := listOpts.limit
@@ -257,7 +260,9 @@ func newVolumesListCommand(opts *options) *cobra.Command {
 				}
 
 				for _, vol := range resp.GetVolumes() {
-					fmt.Fprintln(out, vol.GetVolumeId())
+					if _, err := fmt.Fprintln(out, vol.GetVolumeId()); err != nil {
+						return fmt.Errorf("failed writing to output: %w", err)
+					}
 					fromVol = vol.GetVolumeId()
 					if remainingLimit > 0 {
 						remainingLimit--
@@ -302,7 +307,7 @@ type snapshotsListOptions struct {
 	limit    int32
 }
 
-func parseTimeFlag(val string) (time.Time, bool) {
+func parseTimeFlag(val string) (time.Time, error) {
 	formats := []string{
 		"2006-01-02T15:04:05.000000Z",
 		"2006-01-02T15:04:05Z",
@@ -311,12 +316,15 @@ func parseTimeFlag(val string) (time.Time, bool) {
 		"20060102T150405.000000Z",
 		"20060102T150405Z",
 	}
+	var lastErr error
 	for _, f := range formats {
-		if t, err := time.Parse(f, val); err == nil {
-			return t, true
+		var t time.Time
+		t, lastErr = time.Parse(f, val)
+		if lastErr == nil {
+			return t, nil
 		}
 	}
-	return time.Time{}, false
+	return time.Time{}, fmt.Errorf("cannot parse %q as timestamp: %w", val, lastErr)
 }
 
 func newSnapshotsListCommand(opts *options) *cobra.Command {
@@ -339,23 +347,28 @@ func newSnapshotsListCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("volume_id is required")
 			}
 
-			client, closeConn, err := dialServer(listOpts.serverAddr)
+			client, conn, err := dialServer(listOpts.serverAddr)
 			if err != nil {
 				return err
 			}
-			defer closeConn()
+			defer errutil.CloseAndLog(conn, "server connection")
 
 			var fromTimePb, toTimePb *timestamppb.Timestamp
 			fromSnapshot := ""
 
 			if listOpts.fromTime != "" {
-				if t, ok := parseTimeFlag(listOpts.fromTime); ok {
-					fromTimePb = timestamppb.New(t)
+				t, err := parseTimeFlag(listOpts.fromTime)
+				if err != nil {
+					return fmt.Errorf("invalid --from-time %q: %w", listOpts.fromTime, err)
 				}
+				fromTimePb = timestamppb.New(t)
 			}
 
 			if listOpts.from != "" {
-				if t, ok := parseTimeFlag(listOpts.from); ok && listOpts.fromTime == "" {
+				// --from has dual meaning (documented in flag help as timestamp or snapshot name):
+				// if it parses as a timestamp and --from-time is unset, use it as a time bound;
+				// otherwise a parse failure legitimately means it is a snapshot name to resume listing after.
+				if t, err := parseTimeFlag(listOpts.from); err == nil && listOpts.fromTime == "" {
 					fromTimePb = timestamppb.New(t)
 				} else {
 					fromSnapshot = listOpts.from
@@ -363,13 +376,17 @@ func newSnapshotsListCommand(opts *options) *cobra.Command {
 			}
 
 			toVal := listOpts.to
+			toFlag := "--to"
 			if listOpts.toTime != "" {
 				toVal = listOpts.toTime
+				toFlag = "--to-time"
 			}
 			if toVal != "" {
-				if t, ok := parseTimeFlag(toVal); ok {
-					toTimePb = timestamppb.New(t)
+				t, err := parseTimeFlag(toVal)
+				if err != nil {
+					return fmt.Errorf("invalid %s %q: %w", toFlag, toVal, err)
 				}
+				toTimePb = timestamppb.New(t)
 			}
 
 			remainingLimit := listOpts.limit
@@ -389,7 +406,9 @@ func newSnapshotsListCommand(opts *options) *cobra.Command {
 				}
 
 				for _, snap := range resp.GetSnapshots() {
-					fmt.Fprintln(out, snap.GetName())
+					if _, err := fmt.Fprintln(out, snap.GetName()); err != nil {
+						return fmt.Errorf("failed writing to output: %w", err)
+					}
 					fromSnapshot = snap.GetName()
 					if remainingLimit > 0 {
 						remainingLimit--
@@ -446,11 +465,11 @@ func newSnapshotCreateCommand(opts *options) *cobra.Command {
 				snapName = args[1]
 			}
 
-			client, closeConn, err := dialServer(createOpts.serverAddr)
+			client, conn, err := dialServer(createOpts.serverAddr)
 			if err != nil {
 				return err
 			}
-			defer closeConn()
+			defer errutil.CloseAndLog(conn, "server connection")
 
 			resp, err := client.CreateSnapshot(cmd.Context(), &pb.CreateSnapshotRequest{
 				VolumeId: volID,
@@ -461,7 +480,9 @@ func newSnapshotCreateCommand(opts *options) *cobra.Command {
 			}
 
 			out := cmd.OutOrStdout()
-			fmt.Fprintln(out, resp.GetSnapshotName())
+			if _, err := fmt.Fprintln(out, resp.GetSnapshotName()); err != nil {
+				return fmt.Errorf("failed writing to output: %w", err)
+			}
 			return nil
 		},
 	}

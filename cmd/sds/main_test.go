@@ -361,3 +361,154 @@ func TestSdsCatObjectFSStream(t *testing.T) {
 		t.Errorf("expected TxCommit in sds cat output, got: %s", out)
 	}
 }
+
+func TestFormatRecord_RegisteredTypeUnmarshalError(t *testing.T) {
+	fields := []*descriptorpb.FieldDescriptorProto{
+		field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	}
+	md := buildDynamicMessageDescriptor(t, "Item", fields)
+
+	reg := record.NewRegistry()
+	def, err := reg.RegisterDescriptor(md, 1)
+	if err != nil {
+		t.Fatalf("RegisterDescriptor failed: %v", err)
+	}
+
+	// Corrupted protobuf payload (invalid wire data)
+	corruptBody := []byte{0x08, 0xff, 0xff}
+	corruptPayload, err := record.EncodeFrame(def.GetId(), corruptBody)
+	if err != nil {
+		t.Fatalf("EncodeFrame failed: %v", err)
+	}
+
+	// Should fail with unmarshal error
+	_, err = formatRecord(1, corruptPayload, reg)
+	if err == nil {
+		t.Fatalf("expected error from formatRecord on corrupt registered message, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to unmarshal message for type") {
+		t.Errorf("expected 'failed to unmarshal message for type' in error, got: %v", err)
+	}
+
+	// Unregistered type should fall back to unknown hex format without error
+	unregPayload, err := record.EncodeFrame(999, corruptBody)
+	if err != nil {
+		t.Fatalf("EncodeFrame failed: %v", err)
+	}
+	formatted, err := formatRecord(2, unregPayload, reg)
+	if err != nil {
+		t.Fatalf("expected unknown type to format without error, got: %v", err)
+	}
+	if !strings.Contains(formatted, "unknown") {
+		t.Errorf("expected 'unknown' in output for unregistered type, got: %s", formatted)
+	}
+}
+
+func TestSdsCat_CorruptRecordContinuesAndReportsError(t *testing.T) {
+	tempDir := t.TempDir()
+	streamID := uuid.New()
+
+	// Register "User" message descriptor
+	fields := []*descriptorpb.FieldDescriptorProto{
+		field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("name", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	}
+	md := buildDynamicMessageDescriptor(t, "User", fields)
+
+	reg := record.NewRegistry()
+	def, err := reg.RegisterDescriptor(md, 1)
+	if err != nil {
+		t.Fatalf("RegisterDescriptor failed: %v", err)
+	}
+
+	regProto := reg.Export()
+	regBytes, err := proto.Marshal(regProto)
+	if err != nil {
+		t.Fatalf("Marshal registry failed: %v", err)
+	}
+	registryFile := filepath.Join(tempDir, "registry.pb")
+	if err := os.WriteFile(registryFile, regBytes, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// 1. Good record 1
+	msg1 := dynamicpb.NewMessage(md)
+	msg1.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
+	msg1.Set(md.Fields().ByName("name"), protoreflect.ValueOfString("Alice"))
+	body1, err := proto.Marshal(msg1)
+	if err != nil {
+		t.Fatalf("Marshal msg1 failed: %v", err)
+	}
+	payload1, err := record.EncodeFrame(def.GetId(), body1)
+	if err != nil {
+		t.Fatalf("EncodeFrame payload1 failed: %v", err)
+	}
+
+	// 2. Corrupt registered record 2
+	corruptBody := []byte{0x08, 0xff, 0xff}
+	payload2, err := record.EncodeFrame(def.GetId(), corruptBody)
+	if err != nil {
+		t.Fatalf("EncodeFrame payload2 failed: %v", err)
+	}
+
+	// 3. Good record 3
+	msg3 := dynamicpb.NewMessage(md)
+	msg3.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(3))
+	msg3.Set(md.Fields().ByName("name"), protoreflect.ValueOfString("Charlie"))
+	body3, err := proto.Marshal(msg3)
+	if err != nil {
+		t.Fatalf("Marshal msg3 failed: %v", err)
+	}
+	payload3, err := record.EncodeFrame(def.GetId(), body3)
+	if err != nil {
+		t.Fatalf("EncodeFrame payload3 failed: %v", err)
+	}
+
+	// Write all 3 into a segment file
+	segmentFile := filepath.Join(tempDir, "000000000001-000000000003.wal")
+	rec1 := &wal.LogRecord{Position: 1, StreamID: streamID, StreamSeq: 1, Payload: payload1}
+	rec2 := &wal.LogRecord{Position: 2, StreamID: streamID, StreamSeq: 2, Payload: payload2}
+	rec3 := &wal.LogRecord{Position: 3, StreamID: streamID, StreamSeq: 3, Payload: payload3}
+
+	f, err := os.Create(segmentFile)
+	if err != nil {
+		t.Fatalf("Create segment file failed: %v", err)
+	}
+	if _, err := f.Write(rec1.Encode()); err != nil {
+		f.Close()
+		t.Fatalf("Write rec1 failed: %v", err)
+	}
+	if _, err := f.Write(rec2.Encode()); err != nil {
+		f.Close()
+		t.Fatalf("Write rec2 failed: %v", err)
+	}
+	if _, err := f.Write(rec3.Encode()); err != nil {
+		f.Close()
+		t.Fatalf("Write rec3 failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close segment file failed: %v", err)
+	}
+
+	out, catErr := executeCommand(t.Context(), "cat", "--segment", segmentFile, "--registry", registryFile)
+	if catErr == nil {
+		t.Fatalf("expected error from cat with corrupt record, got nil")
+	}
+	if !strings.Contains(catErr.Error(), "could not be decoded") {
+		t.Errorf("expected 'could not be decoded' error, got: %v", catErr)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 output lines, got %d: %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "Alice") {
+		t.Errorf("expected line 0 to contain Alice, got: %s", lines[0])
+	}
+	if !strings.Contains(lines[1], "error") || !strings.Contains(lines[1], "failed to unmarshal") {
+		t.Errorf("expected line 1 to report unmarshal error, got: %s", lines[1])
+	}
+	if !strings.Contains(lines[2], "Charlie") {
+		t.Errorf("expected line 2 to contain Charlie, got: %s", lines[2])
+	}
+}

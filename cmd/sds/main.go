@@ -22,6 +22,7 @@ import (
 	"os"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -102,19 +103,33 @@ func formatRecord(seq uint64, payload []byte, reg *record.Registry) (string, err
 		// Application type ID >= 16 (or custom type)
 		if reg != nil {
 			msgType, err := reg.ResolveMessageType(typeID)
-			if err == nil && msgType != nil {
-				msg := msgType.New().Interface()
-				if err := proto.Unmarshal(body, msg); err == nil {
-					typeName := string(msg.ProtoReflect().Descriptor().FullName())
-					b, err := protojson.Marshal(msg)
-					if err == nil {
-						return fmt.Sprintf("%d\t%d\t%s\t%s", seq, typeID, typeName, string(b)), nil
-					}
+			if err != nil {
+				if !errors.Is(err, record.ErrTypeNotRegistered) {
+					return "", fmt.Errorf("failed to resolve message type %d: %w", typeID, err)
 				}
+			} else if msgType != nil {
+				msg := msgType.New().Interface()
+				if err := proto.Unmarshal(body, msg); err != nil {
+					return "", fmt.Errorf("failed to unmarshal message for type %d: %w", typeID, err)
+				}
+				typeName := string(msg.ProtoReflect().Descriptor().FullName())
+				b, err := protojson.Marshal(msg)
+				if err != nil {
+					return "", fmt.Errorf("failed to marshal message for type %d: %w", typeID, err)
+				}
+				return fmt.Sprintf("%d\t%d\t%s\t%s", seq, typeID, typeName, string(b)), nil
 			}
 		}
 		return fmt.Sprintf("%d\t%d\tunknown\t%s", seq, typeID, hex.EncodeToString(body)), nil
 	}
+}
+
+func formatErrorRecord(seq uint64, payload []byte, err error) string {
+	typeID, _, splitErr := record.SplitFrame(payload)
+	if splitErr != nil {
+		return fmt.Sprintf("%d\t?\terror\t%v", seq, err)
+	}
+	return fmt.Sprintf("%d\t%d\terror\t%v", seq, typeID, err)
 }
 
 func runCat(cmd *cobra.Command, opts *catOptions) error {
@@ -153,12 +168,22 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 			return fmt.Errorf("failed to tail stream from server %s: %w", opts.server, err)
 		}
 
+		var decodeErrors int
 		for seq, payload := range tailIter {
 			line, err := formatRecord(seq, payload, reg)
 			if err != nil {
-				return err
+				decodeErrors++
+				line = formatErrorRecord(seq, payload, err)
 			}
-			fmt.Fprintln(out, line)
+			if _, err := fmt.Fprintln(out, line); err != nil {
+				return fmt.Errorf("failed writing output: %w", err)
+			}
+		}
+		if decodeErrors > 0 {
+			if decodeErrors == 1 {
+				return fmt.Errorf("1 record could not be decoded")
+			}
+			return fmt.Errorf("%d records could not be decoded", decodeErrors)
 		}
 		return nil
 	}
@@ -177,7 +202,7 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 		if err != nil {
 			return fmt.Errorf("failed to open segment file %s: %w", opts.segment, err)
 		}
-		defer f.Close()
+		defer errutil.CloseAndLog(f, fmt.Sprintf("segment file %s", opts.segment))
 
 		var magic [4]byte
 		if _, err := io.ReadFull(f, magic[:]); err != nil {
@@ -196,6 +221,7 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 		// 2. Local client WAL segments written directly to disk by client writers before/during buffer ingestion,
 		//    which use the ClientRecord format (magic "WALC", 36-byte header with stream-level fields).
 		if magic == wal.LogMagicBytes {
+			var decodeErrors int
 			for {
 				rec, err := wal.DecodeLogRecord(f)
 				if err != nil {
@@ -209,12 +235,22 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 				}
 				line, err := formatRecord(rec.StreamSeq, rec.Payload, reg)
 				if err != nil {
-					return err
+					decodeErrors++
+					line = formatErrorRecord(rec.StreamSeq, rec.Payload, err)
 				}
-				fmt.Fprintln(out, line)
+				if _, err := fmt.Fprintln(out, line); err != nil {
+					return fmt.Errorf("failed writing output: %w", err)
+				}
+			}
+			if decodeErrors > 0 {
+				if decodeErrors == 1 {
+					return fmt.Errorf("1 record could not be decoded")
+				}
+				return fmt.Errorf("%d records could not be decoded", decodeErrors)
 			}
 			return nil
 		} else if magic == wal.ClientMagicBytes {
+			var decodeErrors int
 			for {
 				rec, err := wal.DecodeClientRecord(f)
 				if err != nil {
@@ -228,9 +264,18 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 				}
 				line, err := formatRecord(rec.StreamSeq, rec.Payload, reg)
 				if err != nil {
-					return err
+					decodeErrors++
+					line = formatErrorRecord(rec.StreamSeq, rec.Payload, err)
 				}
-				fmt.Fprintln(out, line)
+				if _, err := fmt.Fprintln(out, line); err != nil {
+					return fmt.Errorf("failed writing output: %w", err)
+				}
+			}
+			if decodeErrors > 0 {
+				if decodeErrors == 1 {
+					return fmt.Errorf("1 record could not be decoded")
+				}
+				return fmt.Errorf("%d records could not be decoded", decodeErrors)
 			}
 			return nil
 		}
