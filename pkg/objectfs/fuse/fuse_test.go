@@ -5069,3 +5069,285 @@ func TestFUSEFallocateMultiClientReadsZeros(t *testing.T) {
 		t.Fatalf("Cold client: unpunched range corrupted")
 	}
 }
+
+func TestWatchEventDecisionLogic(t *testing.T) {
+	cache := NewNodeCache(1024 * 1024)
+	fs := &ObjectFS{
+		manifests: make(map[uint64]*fileManifest),
+	}
+
+	var events []notifyEvent
+	fs.notifyHook = func(e notifyEvent) {
+		events = append(events, e)
+	}
+
+	// 1. EVENT_MODIFIED: emits InodeNotify(ino, 0, -1) and clears clean cache & manifest
+	fs.manifests[100] = &fileManifest{inode: 100}
+	cache.Put(100, []byte("clean-data"), time.Now(), "")
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType: pb.WatchEventType_EVENT_MODIFIED,
+		Inode:     100,
+	}, cache, []*ObjectFS{fs})
+
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 notify event for EVENT_MODIFIED, got %d", len(events))
+	}
+	if events[0].Op != "inode" || events[0].Inode != 100 || events[0].Off != 0 || events[0].Length != -1 {
+		t.Fatalf("Unexpected notify event for EVENT_MODIFIED: %+v", events[0])
+	}
+	if fs.manifests[100] != nil {
+		t.Fatalf("Expected manifest to be invalidated for clean inode 100")
+	}
+	if _, ok := cache.Get(100); ok {
+		t.Fatalf("Expected clean cache entry to be invalidated for inode 100")
+	}
+
+	// 2. Dirty skip: local writer wins locally (#222/#263).
+	// If inode is dirty, skip all notifications and do not touch cache/manifest.
+	cache.WriteAt(200, 0, []byte("dirty-data"), time.Now())
+	fs.manifests[200] = &fileManifest{inode: 200}
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType: pb.WatchEventType_EVENT_MODIFIED,
+		Inode:     200,
+	}, cache, []*ObjectFS{fs})
+
+	if len(events) != 0 {
+		t.Fatalf("Expected 0 notify events for dirty inode 200, got %d (%+v)", len(events), events)
+	}
+	if !cache.IsInodeDirty(200) {
+		t.Fatalf("Expected dirty cache entry for inode 200 to remain dirty")
+	}
+	if fs.manifests[200] == nil {
+		t.Fatalf("Expected dirty inode 200 manifest to be preserved")
+	}
+
+	// Dirty skip also applies to DELETED and RENAMED
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:   pb.WatchEventType_EVENT_DELETED,
+		Inode:       200,
+		ParentInode: 1,
+		Name:        "file.txt",
+	}, cache, []*ObjectFS{fs})
+	if len(events) != 0 {
+		t.Fatalf("Expected 0 notify events for dirty deleted inode 200, got %d", len(events))
+	}
+
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_RENAMED,
+		Inode:          200,
+		OldParentInode: 1,
+		OldName:        "old.txt",
+		ParentInode:    2,
+		Name:           "new.txt",
+	}, cache, []*ObjectFS{fs})
+	if len(events) != 0 {
+		t.Fatalf("Expected 0 notify events for dirty renamed inode 200, got %d", len(events))
+	}
+
+	// 3. EVENT_CREATED: emits EntryNotify(parent, name)
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:   pb.WatchEventType_EVENT_CREATED,
+		Inode:       300,
+		ParentInode: 1,
+		Name:        "created.txt",
+	}, cache, []*ObjectFS{fs})
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 notify event for EVENT_CREATED, got %d", len(events))
+	}
+	if events[0].Op != "entry" || events[0].Parent != 1 || events[0].Name != "created.txt" {
+		t.Fatalf("Unexpected notify event for EVENT_CREATED: %+v", events[0])
+	}
+
+	// 4. EVENT_DELETED with known child inode: emits DeleteNotify(parent, child, name)
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:   pb.WatchEventType_EVENT_DELETED,
+		Inode:       400,
+		ParentInode: 1,
+		Name:        "deleted.txt",
+	}, cache, []*ObjectFS{fs})
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 notify event for EVENT_DELETED, got %d", len(events))
+	}
+	if events[0].Op != "delete" || events[0].Parent != 1 || events[0].Child != 400 || events[0].Name != "deleted.txt" {
+		t.Fatalf("Unexpected notify event for EVENT_DELETED: %+v", events[0])
+	}
+
+	// 5. EVENT_DELETED with unknown child inode (0): emits EntryNotify(parent, name)
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:   pb.WatchEventType_EVENT_DELETED,
+		Inode:       0,
+		ParentInode: 1,
+		Name:        "deleted_unknown.txt",
+	}, cache, []*ObjectFS{fs})
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 notify event for EVENT_DELETED unknown child, got %d", len(events))
+	}
+	if events[0].Op != "entry" || events[0].Parent != 1 || events[0].Name != "deleted_unknown.txt" {
+		t.Fatalf("Unexpected notify event for EVENT_DELETED unknown child: %+v", events[0])
+	}
+
+	// 6. EVENT_RENAMED across different directories:
+	// emits EntryNotify on both (old_parent, old_name) and (parent, name), plus InodeNotify on both directories
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_RENAMED,
+		Inode:          500,
+		OldParentInode: 1,
+		OldName:        "from.txt",
+		ParentInode:    2,
+		Name:           "to.txt",
+	}, cache, []*ObjectFS{fs})
+	if len(events) != 4 {
+		t.Fatalf("Expected 4 notify events for cross-dir EVENT_RENAMED, got %d (%+v)", len(events), events)
+	}
+	if events[0].Op != "entry" || events[0].Parent != 1 || events[0].Name != "from.txt" {
+		t.Errorf("Unexpected event 0: %+v", events[0])
+	}
+	if events[1].Op != "inode" || events[1].Inode != 1 || events[1].Off != -1 || events[1].Length != 0 {
+		t.Errorf("Unexpected event 1: %+v", events[1])
+	}
+	if events[2].Op != "entry" || events[2].Parent != 2 || events[2].Name != "to.txt" {
+		t.Errorf("Unexpected event 2: %+v", events[2])
+	}
+	if events[3].Op != "inode" || events[3].Inode != 2 || events[3].Off != -1 || events[3].Length != 0 {
+		t.Errorf("Unexpected event 3: %+v", events[3])
+	}
+
+	// 7. EVENT_RENAMED within the same directory:
+	// emits EntryNotify for old and new name, plus InodeNotify on the directory once
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_RENAMED,
+		Inode:          500,
+		OldParentInode: 1,
+		OldName:        "same_from.txt",
+		ParentInode:    1,
+		Name:           "same_to.txt",
+	}, cache, []*ObjectFS{fs})
+	if len(events) != 3 {
+		t.Fatalf("Expected 3 notify events for same-dir EVENT_RENAMED, got %d (%+v)", len(events), events)
+	}
+	if events[0].Op != "entry" || events[0].Parent != 1 || events[0].Name != "same_from.txt" {
+		t.Errorf("Unexpected event 0: %+v", events[0])
+	}
+	if events[1].Op != "inode" || events[1].Inode != 1 || events[1].Off != -1 || events[1].Length != 0 {
+		t.Errorf("Unexpected event 1: %+v", events[1])
+	}
+	if events[2].Op != "entry" || events[2].Parent != 1 || events[2].Name != "same_to.txt" {
+		t.Errorf("Unexpected event 2: %+v", events[2])
+	}
+}
+
+func TestCrossNodeWatchVolumeKernelNotifications(t *testing.T) {
+	clientA, cleanup := createTestClient(t)
+	defer cleanup()
+	clientB := clientA
+
+	volumeID := "vol-cross-node-notify"
+	cacheA := NewNodeCache(1024 * 1024)
+	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheA)
+
+	cacheB := NewNodeCache(1024 * 1024)
+	fsB := NewObjectFS(clientB, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheB)
+
+	var notifyEvents []notifyEvent
+	var notifyMu sync.Mutex
+	fsB.notifyHook = func(e notifyEvent) {
+		notifyMu.Lock()
+		notifyEvents = append(notifyEvents, e)
+		notifyMu.Unlock()
+	}
+
+	// Start watcher on fsB
+	watchCtx, cancelWatch := context.WithCancel(t.Context())
+	defer cancelWatch()
+	StartWatcher(watchCtx, clientB, volumeID, "node-B", cacheB, fsB)
+
+	// Client A creates a file: triggers EVENT_CREATED
+	var createOut fuse.CreateOut
+	if status := fsA.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test-file.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileInode := createOut.EntryOut.NodeId
+
+	// Verify fsB received EntryNotify for the created file
+	deadline := time.Now().Add(3 * time.Second)
+	foundCreated := false
+	for time.Now().Before(deadline) {
+		notifyMu.Lock()
+		for _, e := range notifyEvents {
+			if e.Op == "entry" && e.Parent == fuse.FUSE_ROOT_ID && e.Name == "test-file.txt" {
+				foundCreated = true
+				break
+			}
+		}
+		notifyMu.Unlock()
+		if foundCreated {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !foundCreated {
+		t.Fatalf("Client B did not receive EntryNotify for created file")
+	}
+
+	// Client A writes and fsyncs data: triggers EVENT_MODIFIED on fileInode
+	data := []byte("cross-node-content")
+	written, status := fsA.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileInode},
+		Offset:   0,
+	}, data)
+	if status != fuse.OK || int(written) != len(data) {
+		t.Fatalf("Write failed: %v", status)
+	}
+	if status := fsA.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: fileInode},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
+	// Verify fsB received InodeNotify for the modified file
+	deadline = time.Now().Add(3 * time.Second)
+	foundModified := false
+	for time.Now().Before(deadline) {
+		notifyMu.Lock()
+		for _, e := range notifyEvents {
+			if e.Op == "inode" && e.Inode == fileInode && e.Off == 0 && e.Length == -1 {
+				foundModified = true
+				break
+			}
+		}
+		notifyMu.Unlock()
+		if foundModified {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !foundModified {
+		t.Fatalf("Client B did not receive InodeNotify for modified file")
+	}
+
+	// Client B reads the file and immediately sees the new data
+	resB, status := fsB.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileInode},
+		Offset:   0,
+		Size:     uint32(len(data)),
+	}, nil)
+	if status != fuse.OK {
+		t.Fatalf("Client B read failed: %v", status)
+	}
+	readBytes, _ := resB.Bytes(nil)
+	if !bytes.Equal(readBytes, data) {
+		t.Fatalf("Client B expected data %q, got %q", string(data), string(readBytes))
+	}
+}

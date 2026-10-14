@@ -1070,6 +1070,248 @@ spec:
 	t.Logf("Successfully verified ObjectFS multi-node failover and stale segment recovery across nodes!")
 }
 
+func TestObjectFSCrossNodeVisibilityE2E(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("Skipping ObjectFS Cross-Node Visibility E2E test; RUN_E2E not set")
+	}
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t, "objectfs-cross-node-vis-e2e")
+	volumeID := "cross-node-vis-vol"
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+			t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		}
+	})
+
+	pod1Name := "cross-vis-pod-node1"
+	pod1Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod1Name, node1, volumeID)
+
+	pod2Name := "cross-vis-pod-node2"
+	pod2Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod2Name, node2, volumeID)
+
+	t.Logf("Starting Pod 1 on Node 1 (%s) and Pod 2 on Node 2 (%s)", node1, node2)
+	h.KubectlApplyContent(pod1Name, pod1Yaml)
+	h.KubectlApplyContent(pod2Name, pod2Yaml)
+
+	if err := h.WaitForPodReady(pod1Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Pod 1 failed to become ready: %v", err)
+	}
+	if err := h.WaitForPodReady(pod2Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Pod 2 failed to become ready: %v", err)
+	}
+
+	// Warm both mounts: have each do one write + fsync + read so mounts and watch streams are initialized
+	t.Logf("Warming mounts on Pod 1 and Pod 2")
+	_, err := h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "echo 'warm-pod1' > /data/warm1.txt && sync /data/warm1.txt && cat /data/warm1.txt")
+	if err != nil {
+		t.Fatalf("Warm write on Pod 1 failed: %v", err)
+	}
+	_, err = h.RunInPod(pod2Name, "default", "/bin/sh", "-c", "echo 'warm-pod2' > /data/warm2.txt && sync /data/warm2.txt && cat /data/warm2.txt")
+	if err != nil {
+		t.Fatalf("Warm write on Pod 2 failed: %v", err)
+	}
+
+	// Prove the precondition: poll until both node daemons show WatchVolume subscription established for this volume
+	t.Logf("Waiting for WatchVolume subscriptions to be established on both node daemons for volume %s", volumeID)
+	deadline := time.Now().Add(30 * time.Second)
+	var daemonLogs string
+	subscribed := false
+	for time.Now().Before(deadline) {
+		daemonLogs = h.GetPodLogs("app=objectfs-node-daemon", "default")
+		hasNode1 := strings.Contains(daemonLogs, fmt.Sprintf("WatchVolume subscription established for volume %s, node %s", volumeID, node1))
+		hasNode2 := strings.Contains(daemonLogs, fmt.Sprintf("WatchVolume subscription established for volume %s, node %s", volumeID, node2))
+		if hasNode1 && hasNode2 {
+			subscribed = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !subscribed {
+		t.Fatalf("Precondition failed: WatchVolume subscriptions were not established on both nodes within 30s for volume %s (logs: %s)", volumeID, daemonLogs)
+	}
+	t.Logf("Both node daemons confirmed subscribed to WatchVolume for %s", volumeID)
+
+	// Short settle delay so watcher goroutines are idle and in steady state
+	time.Sleep(500 * time.Millisecond)
+
+	// Check 1: Overwrite and immediate cat & stat (Node 2 writes, Node 1 reads with no sleeps)
+	t.Logf("1. Testing immediate visibility on overwrite: Pod 1 primes cache, Pod 2 overwrites")
+	_, err = h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "echo 'initial-val-1' > /data/watched1.txt && sync /data/watched1.txt && cat /data/watched1.txt")
+	if err != nil {
+		t.Fatalf("Failed to prime watched1.txt on Pod 1: %v", err)
+	}
+	_, err = h.RunInPod(pod2Name, "default", "/bin/sh", "-c", "echo 'updated-val-from-pod2' > /data/watched1.txt && sync /data/watched1.txt")
+	if err != nil {
+		t.Fatalf("Failed to overwrite watched1.txt from Pod 2: %v", err)
+	}
+	out1, err := h.RunInPod(pod1Name, "default", "cat", "/data/watched1.txt")
+	if err != nil || !strings.Contains(out1, "updated-val-from-pod2") {
+		t.Fatalf("Immediate WatchVolume invalidation failed: Pod 1 did not see updated watched1.txt: %v (out: %s)", err, out1)
+	}
+	outStat1, err := h.RunInPod(pod1Name, "default", "stat", "-c", "%s", "/data/watched1.txt")
+	if err != nil || strings.TrimSpace(outStat1) != fmt.Sprintf("%d", len("updated-val-from-pod2\n")) {
+		t.Fatalf("Immediate stat invalidation failed: Pod 1 stat returned %q (err: %v)", outStat1, err)
+	}
+
+	// Check 2: Reverse overwrite and immediate cat & stat (Node 1 writes, Node 2 reads with no sleeps)
+	t.Logf("2. Testing immediate visibility on reverse overwrite: Pod 2 primes cache, Pod 1 overwrites")
+	_, err = h.RunInPod(pod2Name, "default", "/bin/sh", "-c", "echo 'initial-val-2' > /data/watched2.txt && sync /data/watched2.txt && cat /data/watched2.txt")
+	if err != nil {
+		t.Fatalf("Failed to prime watched2.txt on Pod 2: %v", err)
+	}
+	_, err = h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "echo 'updated-val-from-pod1' > /data/watched2.txt && sync /data/watched2.txt")
+	if err != nil {
+		t.Fatalf("Failed to overwrite watched2.txt from Pod 1: %v", err)
+	}
+	out2, err := h.RunInPod(pod2Name, "default", "cat", "/data/watched2.txt")
+	if err != nil || !strings.Contains(out2, "updated-val-from-pod1") {
+		t.Fatalf("Immediate WatchVolume invalidation failed: Pod 2 did not see updated watched2.txt: %v (out: %s)", err, out2)
+	}
+	outStat2, err := h.RunInPod(pod2Name, "default", "stat", "-c", "%s", "/data/watched2.txt")
+	if err != nil || strings.TrimSpace(outStat2) != fmt.Sprintf("%d", len("updated-val-from-pod1\n")) {
+		t.Fatalf("Immediate stat invalidation failed: Pod 2 stat returned %q (err: %v)", outStat2, err)
+	}
+
+	// Check 3: Newly created file immediate visibility
+	t.Logf("3. Testing newly created file immediate visibility: Pod 1 probes non-existent file, Pod 2 creates")
+	_, _ = h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "cat /data/new_file.txt 2>/dev/null || true")
+	_, err = h.RunInPod(pod2Name, "default", "/bin/sh", "-c", "echo 'new-file-content' > /data/new_file.txt && sync /data/new_file.txt")
+	if err != nil {
+		t.Fatalf("Failed to create new_file.txt from Pod 2: %v", err)
+	}
+	outNew, err := h.RunInPod(pod1Name, "default", "cat", "/data/new_file.txt")
+	if err != nil || !strings.Contains(outNew, "new-file-content") {
+		t.Fatalf("Immediate visibility failed: Pod 1 did not see new_file.txt: %v (out: %s)", err, outNew)
+	}
+	outLs, err := h.RunInPod(pod1Name, "default", "ls", "/data")
+	if err != nil || !strings.Contains(outLs, "new_file.txt") {
+		t.Fatalf("Immediate ls failed: Pod 1 ls did not list new_file.txt: %v (out: %s)", err, outLs)
+	}
+
+	// Check 4: Immediate visibility through an already-open file descriptor
+	t.Logf("4. Testing immediate visibility through an already-open file descriptor")
+	_, err = h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "echo 'open-initial-content' > /data/open_file.txt && sync /data/open_file.txt")
+	if err != nil {
+		t.Fatalf("Failed to write open_file.txt: %v", err)
+	}
+
+	// Start a background reader in Pod 1 that holds descriptor 3 open and reads initial data
+	_, err = h.RunInPod(pod1Name, "default", "/bin/sh", "-c", `(
+		exec 3< /data/open_file.txt
+		head -n 1 <&3 > /tmp/open_initial.txt
+		echo ready > /tmp/open_ready
+		i=0
+		while [ ! -f /tmp/open_trigger ] && [ $i -lt 60 ]; do
+			usleep 50000 2>/dev/null || sleep 0.05
+			i=$((i+1))
+		done
+		dd bs=65536 <&3 > /tmp/open_updated.txt 2>/dev/null
+		echo done > /tmp/open_done
+	) </dev/null >/dev/null 2>&1 &`)
+	if err != nil {
+		t.Fatalf("Failed to start open descriptor process on Pod 1: %v", err)
+	}
+
+	// Wait for the background process to be ready with the file open
+	var readyOut string
+	for i := 0; i < 50; i++ {
+		readyOut, err = h.RunInPod(pod1Name, "default", "cat", "/tmp/open_ready")
+		if err == nil && strings.Contains(readyOut, "ready") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(readyOut, "ready") {
+		t.Fatalf("Background process on Pod 1 failed to open file: %v (out: %s)", err, readyOut)
+	}
+
+	// Pod 2 appends new content to open_file.txt and syncs
+	_, err = h.RunInPod(pod2Name, "default", "/bin/sh", "-c", "echo 'appended-across-nodes' >> /data/open_file.txt && sync /data/open_file.txt")
+	if err != nil {
+		t.Fatalf("Failed to append to open_file.txt from Pod 2: %v", err)
+	}
+
+	// Trigger Pod 1's already-open descriptor to read without any delay
+	_, err = h.RunInPod(pod1Name, "default", "touch", "/tmp/open_trigger")
+	if err != nil {
+		t.Fatalf("Failed to trigger read on Pod 1: %v", err)
+	}
+
+	// Wait for background reader to complete
+	var doneOut string
+	for i := 0; i < 50; i++ {
+		doneOut, err = h.RunInPod(pod1Name, "default", "cat", "/tmp/open_done")
+		if err == nil && strings.Contains(doneOut, "done") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(doneOut, "done") {
+		t.Fatalf("Background process on Pod 1 failed to complete read: %v (out: %s)", err, doneOut)
+	}
+
+	outOpenUpdated, err := h.RunInPod(pod1Name, "default", "cat", "/tmp/open_updated.txt")
+	if err != nil || !strings.Contains(outOpenUpdated, "appended-across-nodes") {
+		t.Fatalf("Immediate visibility on already-open file failed: expected 'appended-across-nodes', got: %q (err: %v)", outOpenUpdated, err)
+	}
+
+	// Also verify that stat from a fresh process reflects the appended size immediately
+	expectedSize := len("open-initial-content\n") + len("appended-across-nodes\n")
+	outStatOpen, err := h.RunInPod(pod1Name, "default", "stat", "-c", "%s", "/data/open_file.txt")
+	if err != nil || strings.TrimSpace(outStatOpen) != fmt.Sprintf("%d", expectedSize) {
+		t.Fatalf("Immediate stat invalidation on open file failed: expected size %d, got %q (err: %v)", expectedSize, outStatOpen, err)
+	}
+
+	h.DeletePod(pod1Name, "default")
+	h.DeletePod(pod2Name, "default")
+	t.Logf("Successfully verified immediate cross-node visibility in steady state!")
+}
+
 func TestObjectFSControllerCrashMidWriteE2E(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("Skipping ObjectFS Controller Crash Mid-Write E2E test; RUN_E2E not set")

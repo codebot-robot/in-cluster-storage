@@ -89,6 +89,8 @@ type ObjectFS struct {
 	statfsCache  fuse.StatfsOut
 	statfsExpiry time.Time
 	statfsTTL    time.Duration
+
+	notifyHook func(notifyEvent)
 }
 
 var _ fuse.RawFileSystem = (*ObjectFS)(nil)
@@ -1911,10 +1913,130 @@ func (fs *ObjectFS) Access(cancel <-chan struct{}, input *fuse.AccessIn) fuse.St
 	return fuse.OK
 }
 
+type notifyEvent struct {
+	Op     string // "inode", "entry", "delete"
+	Inode  uint64
+	Parent uint64
+	Child  uint64
+	Name   string
+	Off    int64
+	Length int64
+}
+
+func (fs *ObjectFS) notifyInode(ino uint64, off, length int64) {
+	if fs.notifyHook != nil {
+		fs.notifyHook(notifyEvent{Op: "inode", Inode: ino, Off: off, Length: length})
+	}
+	if fs.server != nil {
+		if st := fs.server.InodeNotify(ino, off, length); !st.Ok() {
+			if st == fuse.ENOENT {
+				klog.V(4).Infof("InodeNotify(%d, off=%d, len=%d) returned ENOENT (kernel does not cache inode)", ino, off, length)
+			} else {
+				klog.V(2).Infof("InodeNotify(%d, off=%d, len=%d) returned status %v", ino, off, length, st)
+			}
+		}
+	}
+}
+
+func (fs *ObjectFS) notifyEntry(parent uint64, name string) {
+	if fs.notifyHook != nil {
+		fs.notifyHook(notifyEvent{Op: "entry", Parent: parent, Name: name})
+	}
+	if fs.server != nil {
+		if st := fs.server.EntryNotify(parent, name); !st.Ok() {
+			if st == fuse.ENOENT {
+				klog.V(4).Infof("EntryNotify(parent=%d, name=%q) returned ENOENT (kernel does not cache entry)", parent, name)
+			} else {
+				klog.V(2).Infof("EntryNotify(parent=%d, name=%q) returned status %v", parent, name, st)
+			}
+		}
+	}
+}
+
+func (fs *ObjectFS) notifyDelete(parent, child uint64, name string) {
+	if fs.notifyHook != nil {
+		fs.notifyHook(notifyEvent{Op: "delete", Parent: parent, Child: child, Name: name})
+	}
+	if fs.server != nil {
+		if st := fs.server.DeleteNotify(parent, child, name); !st.Ok() {
+			if st == fuse.ENOENT {
+				klog.V(4).Infof("DeleteNotify(parent=%d, child=%d, name=%q) returned ENOENT (kernel does not cache entry)", parent, child, name)
+			} else {
+				klog.V(2).Infof("DeleteNotify(parent=%d, child=%d, name=%q) returned status %v", parent, child, name, st)
+			}
+		}
+	}
+}
+
+func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*ObjectFS) {
+	if ev == nil {
+		return
+	}
+	ino := ev.GetInode()
+	isDirty := ino != 0 && cache != nil && cache.IsInodeDirty(ino)
+	klog.V(4).Infof("handleWatchEvent: event_type=%v, inode=%d, parent=%d, name=%q, old_parent=%d, old_name=%q, dirty_skip=%v",
+		ev.GetEventType(), ino, ev.GetParentInode(), ev.GetName(), ev.GetOldParentInode(), ev.GetOldName(), isDirty)
+	// Skip notifications for inodes the local cache holds dirty (the local writer wins locally; the #222/#263 rules).
+	if isDirty {
+		return
+	}
+
+	if ino != 0 {
+		if cache != nil {
+			cache.InvalidateIfNotDirty(ino)
+		}
+		for _, f := range fs {
+			if f != nil {
+				f.invalidateManifest(ino)
+			}
+		}
+	}
+
+	for _, f := range fs {
+		if f == nil {
+			continue
+		}
+		switch ev.GetEventType() {
+		case pb.WatchEventType_EVENT_MODIFIED:
+			if ino != 0 {
+				f.notifyInode(ino, 0, -1)
+			}
+		case pb.WatchEventType_EVENT_CREATED:
+			if parent := ev.GetParentInode(); parent != 0 && ev.GetName() != "" {
+				f.notifyEntry(parent, ev.GetName())
+			}
+		case pb.WatchEventType_EVENT_DELETED:
+			if parent := ev.GetParentInode(); parent != 0 && ev.GetName() != "" {
+				if ino != 0 {
+					f.notifyDelete(parent, ino, ev.GetName())
+				} else {
+					f.notifyEntry(parent, ev.GetName())
+				}
+			}
+		case pb.WatchEventType_EVENT_RENAMED:
+			oldParent := ev.GetOldParentInode()
+			oldName := ev.GetOldName()
+			newParent := ev.GetParentInode()
+			newName := ev.GetName()
+
+			if oldParent != 0 && oldName != "" {
+				f.notifyEntry(oldParent, oldName)
+				f.notifyInode(oldParent, -1, 0)
+			}
+			if newParent != 0 && newName != "" {
+				f.notifyEntry(newParent, newName)
+				if newParent != oldParent {
+					f.notifyInode(newParent, -1, 0)
+				}
+			}
+		}
+	}
+}
+
 func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, nodeID string, cache *NodeCache, fs ...*ObjectFS) {
 	go func() {
 		backoff := 100 * time.Millisecond
-		maxBackoff := 5 * time.Second
+		maxBackoff := 1 * time.Second
 		hasDisconnected := false
 
 		for {
@@ -1930,6 +2052,7 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 			})
 			if err != nil {
 				hasDisconnected = true
+				klog.V(2).Infof("WatchVolume dial error for volume %s, node %s: %v; backing off %v", volumeID, nodeID, err, backoff)
 				select {
 				case <-ctx.Done():
 					return
@@ -1942,8 +2065,10 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				continue
 			}
 
+			klog.V(2).Infof("WatchVolume subscription established for volume %s, node %s", volumeID, nodeID)
 			if hasDisconnected {
 				// Invalidate all clean entries that might have changed on controller while disconnected
+				klog.V(2).Infof("WatchVolume reconnected for volume %s, node %s; invalidating clean cache and manifests", volumeID, nodeID)
 				cache.InvalidateAllClean()
 				for _, f := range fs {
 					if f != nil {
@@ -1957,16 +2082,10 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				ev, err := stream.Recv()
 				if err != nil {
 					hasDisconnected = true
+					klog.V(2).Infof("WatchVolume stream error for volume %s, node %s: %v; backing off %v", volumeID, nodeID, err, backoff)
 					break
 				}
-				if ev.GetInode() != 0 {
-					cache.InvalidateIfNotDirty(ev.GetInode())
-					for _, f := range fs {
-						if f != nil {
-							f.invalidateManifest(ev.GetInode())
-						}
-					}
-				}
+				handleWatchEvent(ev, cache, fs)
 			}
 			select {
 			case <-ctx.Done():
