@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
@@ -127,7 +128,7 @@ func (w *streamWriter) uploadSealedMetaLocked(ctx context.Context, backend objec
 		return err
 	}
 	stream := blob.NewByteStreamFromBytes(data)
-	defer stream.Close()
+	defer errutil.CloseAndLog(stream, fmt.Sprintf("sealed stream %s", m.Path))
 	objKey := wal.FormatStreamObjectKey(w.streamID, m.FromSeq, m.ToSeq)
 	if _, err := backend.PutObject(ctx, "", objKey, stream); err != nil {
 		return fmt.Errorf("failed to upload sealed stream file %s: %w", objKey, err)
@@ -153,7 +154,7 @@ func (w *streamWriter) sealLocked(ctx context.Context, backend objectstore.Backe
 		return nil, fmt.Errorf("failed to open stream file %s for fsync: %w", openPath, err)
 	}
 	if err := f.Sync(); err != nil {
-		_ = f.Close()
+		errutil.CloseAndLog(f, fmt.Sprintf("stream file %s", openPath))
 		return nil, fmt.Errorf("failed to fsync stream file %s: %w", openPath, err)
 	}
 	if err := f.Close(); err != nil {
@@ -251,22 +252,30 @@ func (w *streamWriter) recoverStream(ctx context.Context, backend objectstore.Ba
 	defer w.mu.Unlock()
 
 	// 1. Scan local directory for sealed and open files
-	if entries, err := os.ReadDir(w.dir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
+	entries, err := os.ReadDir(w.dir)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read stream directory %s: %w", w.dir, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		from, to, sealed, err := wal.ParseStreamPath(e.Name())
+		if err != nil {
+			continue
+		}
+		filePath := filepath.Join(w.dir, e.Name())
+		if sealed {
+			w.sealed = append(w.sealed, &StreamMeta{FromSeq: from, ToSeq: to, Path: filePath})
+			if to > w.lastSeq {
+				w.lastSeq = to
 			}
-			from, to, sealed, err := wal.ParseStreamPath(e.Name())
+		} else {
+			recs, meta, err := wal.ScanLogSegmentFile(filePath)
 			if err != nil {
-				continue
+				return fmt.Errorf("failed to scan open segment file %s: %w", filePath, err)
 			}
-			filePath := filepath.Join(w.dir, e.Name())
-			if sealed {
-				w.sealed = append(w.sealed, &StreamMeta{FromSeq: from, ToSeq: to, Path: filePath})
-				if to > w.lastSeq {
-					w.lastSeq = to
-				}
-			} else if recs, meta, err := wal.ScanLogSegmentFile(filePath); err == nil && meta != nil {
+			if meta != nil {
 				w.openFrom = from
 				w.recCount = meta.RecordCount
 				w.fileSize = meta.Size
@@ -303,7 +312,7 @@ func ReadRecordsFromOffset(path string, startOffset int64) ([]*wal.LogRecord, in
 		}
 		return nil, startOffset, err
 	}
-	defer f.Close()
+	defer errutil.CloseAndLog(f, fmt.Sprintf("stream file %s", path))
 
 	if startOffset > 0 {
 		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
@@ -579,13 +588,18 @@ func (s *StreamStore) CheckSegmentGC(ctx context.Context) ([]string, error) {
 func (s *StreamStore) Recover(ctx context.Context, aggRecords []*wal.LogRecord) error {
 	streamIDs := make(map[uuid.UUID]struct{})
 	streamsDir := filepath.Join(s.dataDir, "streams")
-	if entries, err := os.ReadDir(streamsDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				if id, err := uuid.Parse(e.Name()); err == nil {
-					streamIDs[id] = struct{}{}
-				}
+	entries, err := os.ReadDir(streamsDir)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read streams directory %s: %w", streamsDir, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			id, err := uuid.Parse(e.Name())
+			if err != nil {
+				klog.Warningf("ignoring non-UUID directory in %s: %s: %v", streamsDir, e.Name(), err)
+				continue
 			}
+			streamIDs[id] = struct{}{}
 		}
 	}
 	for _, rec := range aggRecords {
