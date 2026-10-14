@@ -1368,6 +1368,42 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 }
 
 func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
+	origLen := uint32(len(data))
+	if input.WriteFlags&fuse.WRITE_CACHE != 0 {
+		clientSize, hasSize := fs.cache.GetSize(input.NodeId)
+		if !hasSize {
+			ctx, cancelFunc := fs.makeContext(cancel)
+			resp, err := fs.client.GetAttr(ctx, &pb.GetAttrRequest{
+				VolumeId: fs.volumeID,
+				Inode:    input.NodeId,
+			})
+			cancelFunc()
+			if err != nil {
+				return 0, fs.grpcErrorToStatus("Write:GetAttr", err)
+			}
+			if resp.GetError() != 0 {
+				return 0, fuse.Status(resp.GetError())
+			}
+			if resp.GetAttr() == nil || resp.GetAttr().GetInode() == nil {
+				return 0, fuse.EIO
+			}
+			clientSize = resp.GetAttr().GetInode().GetSize()
+			hasSize = true
+		}
+		if hasSize {
+			if int64(input.Offset) >= clientSize {
+				// Mapped page writeback completely beyond EOF (e.g. truncated page) is discarded.
+				klog.V(4).Infof("Write: discarding WRITE_CACHE write beyond EOF: inode=%d, offset=%d, length=%d, clientSize=%d", input.NodeId, input.Offset, len(data), clientSize)
+				return origLen, fuse.OK
+			}
+			if int64(input.Offset)+int64(len(data)) > clientSize {
+				// Page-aligned writeback must not grow the file beyond EOF.
+				klog.V(4).Infof("Write: clamping WRITE_CACHE write to EOF: inode=%d, offset=%d, length=%d, clientSize=%d", input.NodeId, input.Offset, len(data), clientSize)
+				data = data[:clientSize-int64(input.Offset)]
+			}
+		}
+	}
+
 	// If any chunk touched by write is not fully overwritten and not in cache, load existing chunk content into cache first
 	cs := int64(DefaultChunkSize)
 	startChunk := int64(input.Offset) / cs
@@ -1424,7 +1460,7 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 
 	// Buffer write locally and mark dirty per chunk
 	fs.cache.WriteAt(input.NodeId, int64(input.Offset), data, time.Now())
-	return uint32(len(data)), fuse.OK
+	return origLen, fuse.OK
 }
 
 // MaxSyncRunChunks is the maximum number of contiguous chunks coalesced into a single WriteFile RPC.

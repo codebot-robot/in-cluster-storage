@@ -140,6 +140,9 @@ EOF
   gcc -Wall -O2 -I. -Isrc -Iinclude -o fsx ltp/fsx.c
 )
 
+echo "Compiling mmap shared write coherency test..."
+gcc -Wall -O2 -o "${WORK_DIR}/test_mmap" "${REPO_ROOT}/tests/posix/test_mmap.c"
+
 RUNNER_SCRIPT="${WORK_DIR}/run-tests.sh"
 EXPECTED_FAILURES_FILE="${REPO_ROOT}/tests/posix/expected-failures.txt"
 
@@ -169,14 +172,14 @@ echo
 
 echo "==> Running fsx data-integrity test across multiple seeds..."
 # File size limit raised well above 1MB (16MB) using 64 KiB chunked blob-first writes (#143).
-# Mapped writes are disabled (-W) pending kernel page cache writeback coherency (#269).
+# Mapped writes are enabled (#269).
 # Fallocate, punch-hole, and zero-range are enabled (#268).
 # Collapse (-C), insert (-I), exchange (-0), dedupe (-B), clone (-J), and copy range (-E) remain disabled.
 FSX_SEEDS=(42 1337 2026 777 9999)
 for seed in "\${FSX_SEEDS[@]}"; do
   echo "--- fsx run (seed=\${seed}, 1000 ops) ---"
   set +o errexit
-  "${XFSTESTS_DIR}/fsx" -N 1000 -S "\${seed}" -l 16777216 -o 65536 -p 200 -W -C -I -0 -B -J -E fsx-test.bin
+  "${XFSTESTS_DIR}/fsx" -N 1000 -S "\${seed}" -l 16777216 -o 65536 -p 200 -C -I -0 -B -J -E fsx-test.bin
   fsx_exit=\$?
   set -o errexit
   if [[ \${fsx_exit} -ne 0 ]]; then
@@ -193,6 +196,11 @@ for seed in "\${FSX_SEEDS[@]}"; do
   rm -f fsx-test.bin fsx-test.bin.fsxops fsx-test.bin.fsxgood
 done
 echo "fsx passed successfully across all seeds!"
+echo
+
+echo "==> Running mmap shared write coherency test..."
+"${WORK_DIR}/test_mmap" .
+echo "mmap shared write coherency test: PASS"
 echo
 
 echo "==> Running pjdfstest POSIX conformance test suite..."
@@ -271,7 +279,8 @@ echo
 echo "============================================================"
 echo "POSIX & Data-Integrity Conformance Summary:"
 echo "------------------------------------------------------------"
-echo "  fsx data-integrity test: PASS (5 seeds, 1000 ops each, max_len=16MB)"
+echo "  fsx data-integrity test: PASS (5 seeds, 1000 ops each, max_len=16MB, mapped writes enabled)"
+echo "  mmap coherency test:     PASS (4 suites: basic, size preservation, interleaving, dirty page truncated away)"
 echo "------------------------------------------------------------"
 echo "  pjdfstest POSIX test suite:"
 echo "    Total tests executed:  \${total_count}"

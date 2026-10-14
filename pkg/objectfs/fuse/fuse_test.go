@@ -5351,3 +5351,181 @@ func TestCrossNodeWatchVolumeKernelNotifications(t *testing.T) {
 		t.Fatalf("Client B expected data %q, got %q", string(data), string(readBytes))
 	}
 }
+
+// TestWriteCacheWritebackPastEOFStaleKernelSize tests the scenario where a remote truncate
+// on another node reduced the authoritative file size on the controller, but this node's
+// kernel i_size is still stale (e.g. before an invalidation is observed). In that case, the
+// local kernel may send a writeback WRITE with WRITE_CACHE past the controller's authoritative EOF.
+// ObjectFS.Write must clamp or discard the write so NodeCache does not re-extend the file to a
+// page boundary or resurrect bytes past EOF.
+func TestWriteCacheWritebackPastEOFStaleKernelSize(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-mmap-writeback"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test.bin", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Write 100 bytes via write(2)
+	initialData := bytes.Repeat([]byte("A"), 100)
+	n, st := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+	}, initialData)
+	if st != fuse.OK || n != 100 {
+		t.Fatalf("Write 100 bytes failed: %v", st)
+	}
+
+	// Simulate a writeback write with WRITE_CACHE flag from a kernel whose i_size was
+	// stale or rounded up, covering the full 4096-byte page [0, 4096)
+	pageData := bytes.Repeat([]byte("B"), 4096)
+	n, st = rawFS.Write(nil, &fuse.WriteIn{
+		InHeader:   fuse.InHeader{NodeId: fileID},
+		Offset:     0,
+		WriteFlags: fuse.WRITE_CACHE,
+	}, pageData)
+	if st != fuse.OK || n != 4096 {
+		t.Fatalf("Write with WRITE_CACHE failed: %v (n=%d)", st, n)
+	}
+
+	// Size MUST NOT have grown to 4096! It must remain 100!
+	var attrOut fuse.AttrOut
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != 100 {
+		t.Fatalf("File size grew to page boundary: expected 100, got %d", attrOut.Attr.Size)
+	}
+}
+
+// TestWriteCacheWritebackAfterRemoteTruncate tests that when a file is truncated down,
+// any late writeback WRITE with WRITE_CACHE arriving for ranges at or beyond the new EOF
+// (such as when the local kernel's i_size was stale relative to the truncate) is safely
+// discarded or clamped, preserving the truncated file size and avoiding resurrecting truncated data.
+func TestWriteCacheWritebackAfterRemoteTruncate(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-mmap-truncate"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test_trunc.bin", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Write 4096 bytes
+	initialData := bytes.Repeat([]byte("A"), 4096)
+	n, st := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Offset:   0,
+	}, initialData)
+	if st != fuse.OK || n != 4096 {
+		t.Fatalf("Write 4096 bytes failed: %v", st)
+	}
+
+	// Truncate to 100 bytes
+	var attrOut fuse.AttrOut
+	if st := rawFS.SetAttr(nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_SIZE,
+			Size:     100,
+		},
+	}, &attrOut); st != fuse.OK {
+		t.Fatalf("SetAttr truncate failed: %v", st)
+	}
+	if attrOut.Attr.Size != 100 {
+		t.Fatalf("Truncate size unexpected: %d", attrOut.Attr.Size)
+	}
+
+	// Late writeback write arriving for [2048, 4096) completely beyond EOF
+	lateDataBeyond := bytes.Repeat([]byte("Z"), 2048)
+	n, st = rawFS.Write(nil, &fuse.WriteIn{
+		InHeader:   fuse.InHeader{NodeId: fileID},
+		Offset:     2048,
+		WriteFlags: fuse.WRITE_CACHE,
+	}, lateDataBeyond)
+	if st != fuse.OK || n != 2048 {
+		t.Fatalf("Late writeback beyond EOF failed: %v (n=%d)", st, n)
+	}
+
+	// Size must remain 100
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != 100 {
+		t.Fatalf("File size resurrected after late writeback beyond EOF: expected 100, got %d", attrOut.Attr.Size)
+	}
+
+	// Late writeback write arriving for [0, 4096) overlapping truncated EOF
+	lateDataOverlap := bytes.Repeat([]byte("Y"), 4096)
+	n, st = rawFS.Write(nil, &fuse.WriteIn{
+		InHeader:   fuse.InHeader{NodeId: fileID},
+		Offset:     0,
+		WriteFlags: fuse.WRITE_CACHE,
+	}, lateDataOverlap)
+	if st != fuse.OK || n != 4096 {
+		t.Fatalf("Late writeback overlapping EOF failed: %v (n=%d)", st, n)
+	}
+
+	// Size must still remain 100
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Attr.Size != 100 {
+		t.Fatalf("File size resurrected after late writeback overlapping EOF: expected 100, got %d", attrOut.Attr.Size)
+	}
+
+	// Read back through cold client / controller directly
+	readResp, err := client.ReadFile(t.Context(), &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    fileID,
+		Offset:   0,
+		Size:     4096,
+	})
+	if err != nil || readResp.GetError() != 0 {
+		t.Fatalf("Controller ReadFile failed: %v, resp: %v", err, readResp)
+	}
+	if readResp.GetTotalSize() != 100 {
+		t.Fatalf("Controller reports resurrected size: expected 100, got %d", readResp.GetTotalSize())
+	}
+}
+
+// TestWriteCacheWritebackGetAttrFailureReturnsEIO tests that when size is not cached and
+// GetAttr to the controller fails during a WRITE_CACHE writeback, Write returns an EIO
+// status rather than silently proceeding without clamping.
+func TestWriteCacheWritebackGetAttrFailureReturnsEIO(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-mmap-getattr-err"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Write to non-existent inode with WRITE_CACHE flag when not in cache
+	nonExistentInode := uint64(999999)
+	pageData := bytes.Repeat([]byte("B"), 4096)
+	_, st := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader:   fuse.InHeader{NodeId: nonExistentInode},
+		Offset:     0,
+		WriteFlags: fuse.WRITE_CACHE,
+	}, pageData)
+	if st == fuse.OK {
+		t.Fatalf("Expected error status for non-existent inode during WRITE_CACHE writeback, got OK")
+	}
+}
