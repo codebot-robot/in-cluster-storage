@@ -144,12 +144,13 @@ func (WatchEventType) EnumDescriptor() ([]byte, []int) {
 }
 
 type EntryAttr struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Inode         *Inode                 `protobuf:"bytes,1,opt,name=inode,proto3" json:"inode,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	RedirectUrl   string                 `protobuf:"bytes,3,opt,name=redirect_url,json=redirectUrl,proto3" json:"redirect_url,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Inode          *Inode                 `protobuf:"bytes,1,opt,name=inode,proto3" json:"inode,omitempty"`
+	Name           string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	RedirectUrl    string                 `protobuf:"bytes,3,opt,name=redirect_url,json=redirectUrl,proto3" json:"redirect_url,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,4,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *EntryAttr) Reset() {
@@ -201,6 +202,13 @@ func (x *EntryAttr) GetRedirectUrl() string {
 		return x.RedirectUrl
 	}
 	return ""
+}
+
+func (x *EntryAttr) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
+	}
+	return 0
 }
 
 type GetAttrRequest struct {
@@ -792,11 +800,12 @@ func (x *MkdirRequest) GetGid() uint32 {
 }
 
 type MkdirResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Attr          *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Attr           *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,3,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *MkdirResponse) Reset() {
@@ -839,6 +848,13 @@ func (x *MkdirResponse) GetAttr() *EntryAttr {
 func (x *MkdirResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *MkdirResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -944,12 +960,13 @@ func (x *CreateFileRequest) GetRdev() uint32 {
 }
 
 type CreateFileResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Attr          *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	Fh            uint64                 `protobuf:"varint,3,opt,name=fh,proto3" json:"fh,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Attr           *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	Fh             uint64                 `protobuf:"varint,3,opt,name=fh,proto3" json:"fh,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,4,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateFileResponse) Reset() {
@@ -999,6 +1016,13 @@ func (x *CreateFileResponse) GetError() int32 {
 func (x *CreateFileResponse) GetFh() uint64 {
 	if x != nil {
 		return x.Fh
+	}
+	return 0
+}
+
+func (x *CreateFileResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -1224,14 +1248,15 @@ func (x *WriteFileRequest) GetWriteMode() WriteMode {
 }
 
 type WriteFileResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	BytesWritten  int64                  `protobuf:"varint,1,opt,name=bytes_written,json=bytesWritten,proto3" json:"bytes_written,omitempty"`
-	NewSize       int64                  `protobuf:"varint,2,opt,name=new_size,json=newSize,proto3" json:"new_size,omitempty"`
-	ModTime       *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
-	Error         int32                  `protobuf:"varint,4,opt,name=error,proto3" json:"error,omitempty"`
-	StagingEpoch  int64                  `protobuf:"varint,5,opt,name=staging_epoch,json=stagingEpoch,proto3" json:"staging_epoch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	BytesWritten   int64                  `protobuf:"varint,1,opt,name=bytes_written,json=bytesWritten,proto3" json:"bytes_written,omitempty"`
+	NewSize        int64                  `protobuf:"varint,2,opt,name=new_size,json=newSize,proto3" json:"new_size,omitempty"`
+	ModTime        *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=mod_time,json=modTime,proto3" json:"mod_time,omitempty"`
+	Error          int32                  `protobuf:"varint,4,opt,name=error,proto3" json:"error,omitempty"`
+	StagingEpoch   int64                  `protobuf:"varint,5,opt,name=staging_epoch,json=stagingEpoch,proto3" json:"staging_epoch,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,6,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *WriteFileResponse) Reset() {
@@ -1299,6 +1324,13 @@ func (x *WriteFileResponse) GetStagingEpoch() int64 {
 	return 0
 }
 
+func (x *WriteFileResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
+	}
+	return 0
+}
+
 type TruncateFileRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
@@ -1360,11 +1392,12 @@ func (x *TruncateFileRequest) GetSize() int64 {
 }
 
 type TruncateFileResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Attr          *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Attr           *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,3,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *TruncateFileResponse) Reset() {
@@ -1407,6 +1440,13 @@ func (x *TruncateFileResponse) GetAttr() *EntryAttr {
 func (x *TruncateFileResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *TruncateFileResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -1488,11 +1528,12 @@ func (x *PunchHoleRequest) GetKeepSize() bool {
 }
 
 type PunchHoleResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Attr          *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Attr           *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,3,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *PunchHoleResponse) Reset() {
@@ -1535,6 +1576,13 @@ func (x *PunchHoleResponse) GetAttr() *EntryAttr {
 func (x *PunchHoleResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *PunchHoleResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -1600,11 +1648,12 @@ func (x *UnlinkRequest) GetName() string {
 }
 
 type UnlinkResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Success        bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,3,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *UnlinkResponse) Reset() {
@@ -1647,6 +1696,13 @@ func (x *UnlinkResponse) GetSuccess() bool {
 func (x *UnlinkResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *UnlinkResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -1712,11 +1768,12 @@ func (x *RmdirRequest) GetName() string {
 }
 
 type RmdirResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Success        bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,3,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *RmdirResponse) Reset() {
@@ -1759,6 +1816,13 @@ func (x *RmdirResponse) GetSuccess() bool {
 func (x *RmdirResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *RmdirResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -1840,11 +1904,12 @@ func (x *RenameRequest) GetNewName() string {
 }
 
 type RenameResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Attr          *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Attr           *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,3,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *RenameResponse) Reset() {
@@ -1887,6 +1952,13 @@ func (x *RenameResponse) GetAttr() *EntryAttr {
 func (x *RenameResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *RenameResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -1960,12 +2032,13 @@ func (x *FsyncRequest) GetStagingEpoch() int64 {
 }
 
 type FsyncResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	StagingEpoch  int64                  `protobuf:"varint,3,opt,name=staging_epoch,json=stagingEpoch,proto3" json:"staging_epoch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Success        bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StagingEpoch   int64                  `protobuf:"varint,3,opt,name=staging_epoch,json=stagingEpoch,proto3" json:"staging_epoch,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,4,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *FsyncResponse) Reset() {
@@ -2015,6 +2088,13 @@ func (x *FsyncResponse) GetError() int32 {
 func (x *FsyncResponse) GetStagingEpoch() int64 {
 	if x != nil {
 		return x.StagingEpoch
+	}
+	return 0
+}
+
+func (x *FsyncResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -2080,6 +2160,7 @@ type WatchVolumeResponse struct {
 	Name           string                 `protobuf:"bytes,5,opt,name=name,proto3" json:"name,omitempty"`
 	OldParentInode uint64                 `protobuf:"varint,6,opt,name=old_parent_inode,json=oldParentInode,proto3" json:"old_parent_inode,omitempty"`
 	OldName        string                 `protobuf:"bytes,7,opt,name=old_name,json=oldName,proto3" json:"old_name,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,8,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -2161,6 +2242,13 @@ func (x *WatchVolumeResponse) GetOldName() string {
 		return x.OldName
 	}
 	return ""
+}
+
+func (x *WatchVolumeResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
+	}
+	return 0
 }
 
 type SymlinkRequest struct {
@@ -2248,11 +2336,12 @@ func (x *SymlinkRequest) GetGid() uint32 {
 }
 
 type SymlinkResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Attr          *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Attr           *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,3,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *SymlinkResponse) Reset() {
@@ -2295,6 +2384,13 @@ func (x *SymlinkResponse) GetAttr() *EntryAttr {
 func (x *SymlinkResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *SymlinkResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -2472,11 +2568,12 @@ func (x *LinkRequest) GetNewName() string {
 }
 
 type LinkResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Attr          *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
-	Error         int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Attr           *EntryAttr             `protobuf:"bytes,1,opt,name=attr,proto3" json:"attr,omitempty"`
+	Error          int32                  `protobuf:"varint,2,opt,name=error,proto3" json:"error,omitempty"`
+	StreamPosition uint64                 `protobuf:"varint,3,opt,name=stream_position,json=streamPosition,proto3" json:"stream_position,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *LinkResponse) Reset() {
@@ -2519,6 +2616,13 @@ func (x *LinkResponse) GetAttr() *EntryAttr {
 func (x *LinkResponse) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *LinkResponse) GetStreamPosition() uint64 {
+	if x != nil {
+		return x.StreamPosition
 	}
 	return 0
 }
@@ -4163,11 +4267,12 @@ var File_proto_objectfs_proto protoreflect.FileDescriptor
 
 const file_proto_objectfs_proto_rawDesc = "" +
 	"\n" +
-	"\x14proto/objectfs.proto\x12\x11objectfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"r\n" +
+	"\x14proto/objectfs.proto\x12\x11objectfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x9b\x01\n" +
 	"\tEntryAttr\x12.\n" +
 	"\x05inode\x18\x01 \x01(\v2\x18.objectfs.v1alpha1.InodeR\x05inode\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12!\n" +
-	"\fredirect_url\x18\x03 \x01(\tR\vredirectUrl\"C\n" +
+	"\fredirect_url\x18\x03 \x01(\tR\vredirectUrl\x12'\n" +
+	"\x0fstream_position\x18\x04 \x01(\x04R\x0estreamPosition\"C\n" +
 	"\x0eGetAttrRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\"Y\n" +
@@ -4214,10 +4319,11 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x04name\x18\x03 \x01(\tR\x04name\x12\x12\n" +
 	"\x04mode\x18\x04 \x01(\rR\x04mode\x12\x10\n" +
 	"\x03uid\x18\x05 \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\x06 \x01(\rR\x03gid\"W\n" +
+	"\x03gid\x18\x06 \x01(\rR\x03gid\"\x80\x01\n" +
 	"\rMkdirResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"\xdc\x01\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xdc\x01\n" +
 	"\x11CreateFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
@@ -4226,11 +4332,12 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x0finitial_content\x18\x05 \x01(\fR\x0einitialContent\x12\x10\n" +
 	"\x03uid\x18\x06 \x01(\rR\x03uid\x12\x10\n" +
 	"\x03gid\x18\a \x01(\rR\x03gid\x12\x12\n" +
-	"\x04rdev\x18\b \x01(\rR\x04rdev\"l\n" +
+	"\x04rdev\x18\b \x01(\rR\x04rdev\"\x95\x01\n" +
 	"\x12CreateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12\x0e\n" +
-	"\x02fh\x18\x03 \x01(\x04R\x02fh\"p\n" +
+	"\x02fh\x18\x03 \x01(\x04R\x02fh\x12'\n" +
+	"\x0fstream_position\x18\x04 \x01(\x04R\x0estreamPosition\"p\n" +
 	"\x0fReadFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x16\n" +
@@ -4249,64 +4356,71 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x12\n" +
 	"\x04data\x18\x04 \x01(\fR\x04data\x12;\n" +
 	"\n" +
-	"write_mode\x18\x05 \x01(\x0e2\x1c.objectfs.v1alpha1.WriteModeR\twriteMode\"\xc5\x01\n" +
+	"write_mode\x18\x05 \x01(\x0e2\x1c.objectfs.v1alpha1.WriteModeR\twriteMode\"\xee\x01\n" +
 	"\x11WriteFileResponse\x12#\n" +
 	"\rbytes_written\x18\x01 \x01(\x03R\fbytesWritten\x12\x19\n" +
 	"\bnew_size\x18\x02 \x01(\x03R\anewSize\x125\n" +
 	"\bmod_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\amodTime\x12\x14\n" +
 	"\x05error\x18\x04 \x01(\x05R\x05error\x12#\n" +
-	"\rstaging_epoch\x18\x05 \x01(\x03R\fstagingEpoch\"\\\n" +
+	"\rstaging_epoch\x18\x05 \x01(\x03R\fstagingEpoch\x12'\n" +
+	"\x0fstream_position\x18\x06 \x01(\x04R\x0estreamPosition\"\\\n" +
 	"\x13TruncateFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x12\n" +
-	"\x04size\x18\x03 \x01(\x03R\x04size\"^\n" +
+	"\x04size\x18\x03 \x01(\x03R\x04size\"\x87\x01\n" +
 	"\x14TruncateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"\x92\x01\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\x92\x01\n" +
 	"\x10PunchHoleRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x16\n" +
 	"\x06length\x18\x04 \x01(\x03R\x06length\x12\x1b\n" +
-	"\tkeep_size\x18\x05 \x01(\bR\bkeepSize\"[\n" +
+	"\tkeep_size\x18\x05 \x01(\bR\bkeepSize\"\x84\x01\n" +
 	"\x11PunchHoleResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"c\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"c\n" +
 	"\rUnlinkRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
-	"\x04name\x18\x03 \x01(\tR\x04name\"@\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\"i\n" +
 	"\x0eUnlinkResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"b\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"b\n" +
 	"\fRmdirRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
-	"\x04name\x18\x03 \x01(\tR\x04name\"?\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\"h\n" +
 	"\rRmdirResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"\xb6\x01\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xb6\x01\n" +
 	"\rRenameRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12(\n" +
 	"\x10old_parent_inode\x18\x02 \x01(\x04R\x0eoldParentInode\x12\x19\n" +
 	"\bold_name\x18\x03 \x01(\tR\aoldName\x12(\n" +
 	"\x10new_parent_inode\x18\x04 \x01(\x04R\x0enewParentInode\x12\x19\n" +
-	"\bnew_name\x18\x05 \x01(\tR\anewName\"X\n" +
+	"\bnew_name\x18\x05 \x01(\tR\anewName\"\x81\x01\n" +
 	"\x0eRenameResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"\x82\x01\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\x82\x01\n" +
 	"\fFsyncRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x1a\n" +
 	"\bblocking\x18\x03 \x01(\bR\bblocking\x12#\n" +
-	"\rstaging_epoch\x18\x04 \x01(\x03R\fstagingEpoch\"d\n" +
+	"\rstaging_epoch\x18\x04 \x01(\x03R\fstagingEpoch\"\x8d\x01\n" +
 	"\rFsyncResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12#\n" +
-	"\rstaging_epoch\x18\x03 \x01(\x03R\fstagingEpoch\"J\n" +
+	"\rstaging_epoch\x18\x03 \x01(\x03R\fstagingEpoch\x12'\n" +
+	"\x0fstream_position\x18\x04 \x01(\x04R\x0estreamPosition\"J\n" +
 	"\x12WatchVolumeRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x17\n" +
-	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"\x9b\x02\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"\xc4\x02\n" +
 	"\x13WatchVolumeResponse\x12@\n" +
 	"\n" +
 	"event_type\x18\x01 \x01(\x0e2!.objectfs.v1alpha1.WatchEventTypeR\teventType\x120\n" +
@@ -4315,17 +4429,19 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\fparent_inode\x18\x04 \x01(\x04R\vparentInode\x12\x12\n" +
 	"\x04name\x18\x05 \x01(\tR\x04name\x12(\n" +
 	"\x10old_parent_inode\x18\x06 \x01(\x04R\x0eoldParentInode\x12\x19\n" +
-	"\bold_name\x18\a \x01(\tR\aoldName\"\xa0\x01\n" +
+	"\bold_name\x18\a \x01(\tR\aoldName\x12'\n" +
+	"\x0fstream_position\x18\b \x01(\x04R\x0estreamPosition\"\xa0\x01\n" +
 	"\x0eSymlinkRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
 	"\x04name\x18\x03 \x01(\tR\x04name\x12\x16\n" +
 	"\x06target\x18\x04 \x01(\tR\x06target\x12\x10\n" +
 	"\x03uid\x18\x05 \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\x06 \x01(\rR\x03gid\"Y\n" +
+	"\x03gid\x18\x06 \x01(\rR\x03gid\"\x82\x01\n" +
 	"\x0fSymlinkResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"D\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"D\n" +
 	"\x0fReadlinkRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\"@\n" +
@@ -4336,10 +4452,11 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1b\n" +
 	"\told_inode\x18\x02 \x01(\x04R\boldInode\x12(\n" +
 	"\x10new_parent_inode\x18\x03 \x01(\x04R\x0enewParentInode\x12\x19\n" +
-	"\bnew_name\x18\x04 \x01(\tR\anewName\"V\n" +
+	"\bnew_name\x18\x04 \x01(\tR\anewName\"\x7f\n" +
 	"\fLinkResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"V\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"V\n" +
 	"\vOpenRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x14\n" +
