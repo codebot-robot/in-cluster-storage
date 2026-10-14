@@ -470,7 +470,15 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 		Gid: inoRow.GetGid(),
 	}
 
+	isDir := inoRow.GetIsDir() || (out.Mode&syscall.S_IFMT) == syscall.S_IFDIR
 	if fs.cache != nil && out.Ino != 0 {
+		// Record attribute-derived positions only for regular files and symlinks.
+		// A directory stat refreshes directory attributes but leaves child dentries
+		// intact, so directory positions must only come from operations that update
+		// dentries (this node's own mutations).
+		if !isDir && attr.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(out.Ino, attr.GetStreamPosition())
+		}
 		if entry, isDirty := fs.cache.GetDirty(out.Ino); isDirty {
 			out.Size = uint64(entry.Size)
 			out.Mtime = uint64(entry.ModTime.Unix())
@@ -565,6 +573,9 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 		}
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
+		}
+		if fs.cache != nil && resp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
 		}
 		fs.cache.MarkSizeClean(input.NodeId, truncGen)
 		fs.invalidateManifest(input.NodeId)
@@ -701,6 +712,9 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
 		}
+		if fs.cache != nil && resp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+		}
 
 		punchGen := fs.cache.PunchHole(input.NodeId, offset, length, punchKeepSize, time.Now())
 		fs.invalidateManifest(input.NodeId)
@@ -756,6 +770,9 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 			if resp.GetError() != 0 {
 				return fuse.Status(resp.GetError())
 			}
+			if fs.cache != nil && resp.GetStreamPosition() > 0 {
+				fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+			}
 			fs.cache.MarkSizeClean(input.NodeId, truncGen)
 			fs.invalidateManifest(input.NodeId)
 		}
@@ -790,6 +807,9 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 	if attr == nil {
 		return fuse.EIO
 	}
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+	}
 	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
@@ -820,6 +840,9 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 		return fuse.EIO
 	}
 
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+	}
 	fs.cache.Put(attr.GetInode().GetIno(), []byte{}, time.Now(), "")
 	fs.fillEntryOut(attr, &out.EntryOut)
 	out.OpenOut.Fh = resp.GetFh()
@@ -852,6 +875,9 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 	if attr == nil {
 		return fuse.EIO
 	}
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+	}
 	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
@@ -874,6 +900,9 @@ func (fs *ObjectFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name s
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
 	}
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		fs.cache.RecordPosition(header.NodeId, resp.GetStreamPosition())
+	}
 	return fuse.OK
 }
 
@@ -894,6 +923,9 @@ func (fs *ObjectFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name st
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
+	}
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		fs.cache.RecordPosition(header.NodeId, resp.GetStreamPosition())
 	}
 	return fuse.OK
 }
@@ -917,6 +949,14 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
+	}
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		pos := resp.GetStreamPosition()
+		fs.cache.RecordPosition(input.NodeId, pos)
+		fs.cache.RecordPosition(input.Newdir, pos)
+		if attr := resp.GetAttr(); attr != nil && attr.GetInode() != nil {
+			fs.cache.RecordPosition(attr.GetInode().GetIno(), pos)
+		}
 	}
 	return fuse.OK
 }
@@ -1051,6 +1091,9 @@ func (fs *ObjectFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, point
 	if attr == nil {
 		return fuse.EIO
 	}
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		fs.cache.RecordPosition(header.NodeId, resp.GetStreamPosition())
+	}
 	fs.fillEntryOut(attr, out)
 	return fuse.OK
 }
@@ -1094,6 +1137,11 @@ func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename st
 	attr := resp.GetAttr()
 	if attr == nil {
 		return fuse.EIO
+	}
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		pos := resp.GetStreamPosition()
+		fs.cache.RecordPosition(input.NodeId, pos)
+		fs.cache.RecordPosition(input.Oldnodeid, pos)
 	}
 	fs.fillEntryOut(attr, out)
 	return fuse.OK
@@ -1485,6 +1533,9 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 		if resp.GetError() != 0 {
 			return 0, nil, nil, syscall.Errno(resp.GetError())
 		}
+		if fs.cache != nil && resp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(inode, resp.GetStreamPosition())
+		}
 		fs.cache.MarkSizeClean(inode, sizeGen)
 	}
 
@@ -1595,6 +1646,9 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 				if fResp.GetError() != 0 {
 					return 0, nil, nil, syscall.Errno(fResp.GetError())
 				}
+				if fs.cache != nil && fResp.GetStreamPosition() > 0 {
+					fs.cache.RecordPosition(inode, fResp.GetStreamPosition())
+				}
 				for _, r := range uncleanedRuns {
 					for _, idx := range r {
 						fs.cache.MarkChunkClean(inode, idx, chunkGens[idx])
@@ -1688,6 +1742,9 @@ func (fs *ObjectFS) syncVolumeBlocking(ctx context.Context) error {
 			}
 		}
 		fs.invalidateManifest(item.inode)
+		if fs.cache != nil && resp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(item.inode, resp.GetStreamPosition())
+		}
 	}
 	if fs.diskCache != nil {
 		fs.cache.InvalidateAllClean()
@@ -1747,6 +1804,9 @@ func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context) error {
 			}
 		}
 		fs.invalidateManifest(item.inode)
+		if fs.cache != nil && resp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(item.inode, resp.GetStreamPosition())
+		}
 	}
 	if fs.diskCache != nil {
 		fs.cache.InvalidateAllClean()
@@ -1795,6 +1855,9 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 			}
 		}
 		fs.invalidateManifest(inode)
+		if fs.cache != nil && retryResp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(inode, retryResp.GetStreamPosition())
+		}
 		if fs.diskCache != nil {
 			fs.cache.InvalidateAllClean()
 		}
@@ -1810,6 +1873,9 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 		}
 	}
 	fs.invalidateManifest(inode)
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		fs.cache.RecordPosition(inode, resp.GetStreamPosition())
+	}
 	if fs.diskCache != nil {
 		fs.cache.InvalidateAllClean()
 	}
@@ -2010,10 +2076,36 @@ func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*Object
 	}
 	ino := ev.GetInode()
 	isDirty := ino != 0 && cache != nil && cache.IsInodeDirty(ino)
-	klog.V(4).Infof("handleWatchEvent: event_type=%v, inode=%d, parent=%d, name=%q, old_parent=%d, old_name=%q, dirty_skip=%v",
-		ev.GetEventType(), ino, ev.GetParentInode(), ev.GetName(), ev.GetOldParentInode(), ev.GetOldName(), isDirty)
-	// Skip notifications for inodes the local cache holds dirty (the local writer wins locally; the #222/#263 rules).
-	if isDirty {
+
+	eventPos := ev.GetStreamPosition()
+	var targets []uint64
+	if ino != 0 {
+		targets = append(targets, ino)
+	}
+	if parent := ev.GetParentInode(); parent != 0 {
+		targets = append(targets, parent)
+	}
+	if oldParent := ev.GetOldParentInode(); oldParent != 0 {
+		targets = append(targets, oldParent)
+	}
+
+	skip := false
+	if cache != nil && eventPos > 0 && len(targets) > 0 {
+		allKnown := true
+		for _, target := range targets {
+			if eventPos > cache.KnownPosition(target) {
+				allKnown = false
+				break
+			}
+		}
+		skip = allKnown
+	}
+
+	klog.V(4).Infof("handleWatchEvent: event_type=%v, inode=%d, parent=%d, name=%q, old_parent=%d, old_name=%q, pos=%d, dirty_skip=%v, pos_skip=%v",
+		ev.GetEventType(), ino, ev.GetParentInode(), ev.GetName(), ev.GetOldParentInode(), ev.GetOldName(), eventPos, isDirty, skip)
+	// Skip notifications for inodes the local cache holds dirty (the local writer wins locally; the #222/#263 rules)
+	// or when event.position <= KnownPosition(ino) for every inode the event targets.
+	if isDirty || skip {
 		return
 	}
 
@@ -2067,6 +2159,12 @@ func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*Object
 			}
 		}
 	}
+
+	if cache != nil && eventPos > 0 {
+		for _, target := range targets {
+			cache.RecordPosition(target, eventPos)
+		}
+	}
 }
 
 func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, nodeID string, cache *NodeCache, fs ...*ObjectFS) {
@@ -2105,7 +2203,10 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 			if hasDisconnected {
 				// Invalidate all clean entries that might have changed on controller while disconnected
 				klog.V(2).Infof("WatchVolume reconnected for volume %s, node %s; invalidating clean cache and manifests", volumeID, nodeID)
-				cache.InvalidateAllClean()
+				if cache != nil {
+					cache.ResetKnownPositions()
+					cache.InvalidateAllClean()
+				}
 				for _, f := range fs {
 					if f != nil {
 						f.invalidateAllManifests()

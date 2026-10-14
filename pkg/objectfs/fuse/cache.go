@@ -62,12 +62,13 @@ func (e *CachedEntry) Dirty() bool {
 }
 
 type NodeCache struct {
-	mu         sync.RWMutex
-	entries    map[uint64]*CachedEntry
-	maxBytes   int64
-	curBytes   int64
-	dirtyBytes int64
-	curGen     Generation
+	mu             sync.RWMutex
+	entries        map[uint64]*CachedEntry
+	knownPositions map[uint64]uint64
+	maxBytes       int64
+	curBytes       int64
+	dirtyBytes     int64
+	curGen         Generation
 }
 
 func NewNodeCache(maxBytes int64) *NodeCache {
@@ -75,9 +76,45 @@ func NewNodeCache(maxBytes int64) *NodeCache {
 		maxBytes = 128 * 1024 * 1024 // 128MB default cache
 	}
 	return &NodeCache{
-		entries:  make(map[uint64]*CachedEntry),
-		maxBytes: maxBytes,
+		entries:        make(map[uint64]*CachedEntry),
+		knownPositions: make(map[uint64]uint64),
+		maxBytes:       maxBytes,
 	}
+}
+
+// KnownPosition returns the highest known position for the given inode.
+func (c *NodeCache) KnownPosition(inode uint64) uint64 {
+	if c == nil || inode == 0 {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.knownPositions[inode]
+}
+
+// RecordPosition updates the known position for the given inode if pos is higher than the current value.
+func (c *NodeCache) RecordPosition(inode uint64, pos uint64) {
+	if c == nil || inode == 0 || pos == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.knownPositions == nil {
+		c.knownPositions = make(map[uint64]uint64)
+	}
+	if pos > c.knownPositions[inode] {
+		c.knownPositions[inode] = pos
+	}
+}
+
+// ResetKnownPositions clears all tracked known positions.
+func (c *NodeCache) ResetKnownPositions() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.knownPositions = make(map[uint64]uint64)
 }
 
 func (c *NodeCache) Get(inode uint64) (*CachedEntry, bool) {

@@ -5529,3 +5529,331 @@ func TestWriteCacheWritebackGetAttrFailureReturnsEIO(t *testing.T) {
 		t.Fatalf("Expected error status for non-existent inode during WRITE_CACHE writeback, got OK")
 	}
 }
+
+func TestWatchEventPositionDecisionLogic(t *testing.T) {
+	cache := NewNodeCache(1024 * 1024)
+	fs := &ObjectFS{
+		manifests: make(map[uint64]*fileManifest),
+	}
+
+	var events []notifyEvent
+	fs.notifyHook = func(e notifyEvent) {
+		events = append(events, e)
+	}
+
+	// 1. Self event (position equal to the fsync/known position) is skipped.
+	// Inode 100 has known position 50.
+	cache.RecordPosition(100, 50)
+	if pos := cache.KnownPosition(100); pos != 50 {
+		t.Fatalf("Expected KnownPosition 50, got %d", pos)
+	}
+	fs.manifests[100] = &fileManifest{inode: 100}
+	cache.Put(100, []byte("cached-data"), time.Now(), "")
+	events = nil
+
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_MODIFIED,
+		Inode:          100,
+		StreamPosition: 50,
+	}, cache, []*ObjectFS{fs})
+
+	if len(events) != 0 {
+		t.Fatalf("Expected 0 notify events for self event at pos 50, got %d", len(events))
+	}
+	if fs.manifests[100] == nil {
+		t.Fatalf("Expected manifest to be preserved on self event")
+	}
+	if _, ok := cache.Get(100); !ok {
+		t.Fatalf("Expected cache entry to be preserved on self event")
+	}
+
+	// Also an older event (pos 40 <= 50) is skipped.
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_MODIFIED,
+		Inode:          100,
+		StreamPosition: 40,
+	}, cache, []*ObjectFS{fs})
+	if len(events) != 0 {
+		t.Fatalf("Expected 0 notify events for stale event at pos 40, got %d", len(events))
+	}
+
+	// 2. Foreign event with a higher position is NOT skipped.
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_MODIFIED,
+		Inode:          100,
+		StreamPosition: 51,
+	}, cache, []*ObjectFS{fs})
+
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 notify event for foreign event at pos 51, got %d", len(events))
+	}
+	if events[0].Op != "inode" || events[0].Inode != 100 || events[0].Off != 0 || events[0].Length != -1 {
+		t.Fatalf("Unexpected notify event: %+v", events[0])
+	}
+	if fs.manifests[100] != nil {
+		t.Fatalf("Expected manifest to be invalidated for foreign event")
+	}
+	if _, ok := cache.Get(100); ok {
+		t.Fatalf("Expected cache entry to be invalidated for foreign event")
+	}
+	if pos := cache.KnownPosition(100); pos != 51 {
+		t.Fatalf("Expected KnownPosition to be updated to 51, got %d", pos)
+	}
+
+	// 3. After reconnect, all KnownPositions are reset and a stale-looking event is applied.
+	cache.RecordPosition(100, 100)
+	cache.ResetKnownPositions()
+	if pos := cache.KnownPosition(100); pos != 0 {
+		t.Fatalf("Expected KnownPosition 0 after reset, got %d", pos)
+	}
+
+	fs.manifests[100] = &fileManifest{inode: 100}
+	cache.Put(100, []byte("fresh-data"), time.Now(), "")
+	events = nil
+
+	// Stale-looking event at pos 50 (previously lower than 100, but now KnownPosition is 0)
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_MODIFIED,
+		Inode:          100,
+		StreamPosition: 50,
+	}, cache, []*ObjectFS{fs})
+
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 notify event after reconnect reset, got %d", len(events))
+	}
+	if fs.manifests[100] != nil {
+		t.Fatalf("Expected manifest to be invalidated after reconnect")
+	}
+	if _, ok := cache.Get(100); ok {
+		t.Fatalf("Expected cache entry to be invalidated after reconnect")
+	}
+
+	// 4. Multi-target event: skips only if ALL targets are known >= event.position.
+	cache.ResetKnownPositions()
+	cache.RecordPosition(100, 60)
+	cache.RecordPosition(1, 59) // parent known position is lower than event pos 60
+
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_CREATED,
+		Inode:          100,
+		ParentInode:    1,
+		Name:           "file.txt",
+		StreamPosition: 60,
+	}, cache, []*ObjectFS{fs})
+
+	if len(events) != 1 || events[0].Op != "entry" {
+		t.Fatalf("Expected 1 entry notify event when parent position is lower, got %+v", events)
+	}
+
+	// When both are known >= event.position, it is skipped.
+	cache.RecordPosition(1, 60)
+	events = nil
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_CREATED,
+		Inode:          100,
+		ParentInode:    1,
+		Name:           "file.txt",
+		StreamPosition: 60,
+	}, cache, []*ObjectFS{fs})
+
+	if len(events) != 0 {
+		t.Fatalf("Expected 0 notify events when both child and parent positions are known, got %d", len(events))
+	}
+
+	// 5. Attribute-derived positions are recorded for regular files and symlinks, but never for directories.
+	fs.cache = cache
+	fileAttr := &pb.EntryAttr{
+		Inode: &pb.Inode{
+			Ino:  proto.Uint64(200),
+			Mode: 0644 | syscall.S_IFREG,
+		},
+		StreamPosition: 80,
+	}
+	var fileOut fuse.Attr
+	fs.fillAttrOut(fileAttr, &fileOut)
+	if pos := cache.KnownPosition(200); pos != 80 {
+		t.Fatalf("Expected file KnownPosition 80 after fillAttrOut, got %d", pos)
+	}
+
+	dirAttr := &pb.EntryAttr{
+		Inode: &pb.Inode{
+			Ino:   proto.Uint64(300),
+			Mode:  0755 | syscall.S_IFDIR,
+			IsDir: true,
+		},
+		StreamPosition: 90,
+	}
+	var dirOut fuse.Attr
+	fs.fillAttrOut(dirAttr, &dirOut)
+	if pos := cache.KnownPosition(300); pos != 0 {
+		t.Fatalf("Expected directory KnownPosition to remain 0 after fillAttrOut, got %d", pos)
+	}
+}
+
+func TestDirectoryGetAttrDoesNotSuppressDeleteNotify(t *testing.T) {
+	cache := NewNodeCache(1024 * 1024)
+	fs := &ObjectFS{
+		cache:     cache,
+		manifests: make(map[uint64]*fileManifest),
+	}
+
+	var events []notifyEvent
+	fs.notifyHook = func(e notifyEvent) {
+		events = append(events, e)
+	}
+
+	parentIno := uint64(10)
+	childIno := uint64(20)
+
+	// Node B runs GetAttr on the parent directory d. The reply carries Position 105.
+	parentAttr := &pb.EntryAttr{
+		Inode: &pb.Inode{
+			Ino:   proto.Uint64(parentIno),
+			Mode:  0755 | syscall.S_IFDIR,
+			IsDir: true,
+		},
+		StreamPosition: 105,
+	}
+	var outAttr fuse.Attr
+	fs.fillAttrOut(parentAttr, &outAttr)
+
+	// Since parentIno is a directory, fillAttrOut must NOT record KnownPosition for it.
+	if pos := cache.KnownPosition(parentIno); pos != 0 {
+		t.Fatalf("Expected directory parent KnownPosition to remain 0 after GetAttr, got %d", pos)
+	}
+
+	// Node A unlinks child "x" at position 100 (which is <= parentAttr.Position 105).
+	// When Node B receives the EVENT_DELETED watch event, it must NOT skip the notification.
+	handleWatchEvent(&pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_DELETED,
+		Inode:          childIno,
+		ParentInode:    parentIno,
+		Name:           "x",
+		StreamPosition: 100,
+	}, cache, []*ObjectFS{fs})
+
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 notify event for DELETED, got %d", len(events))
+	}
+	if events[0].Op != "delete" || events[0].Parent != parentIno || events[0].Child != childIno || events[0].Name != "x" {
+		t.Fatalf("Unexpected notify event: %+v", events[0])
+	}
+}
+
+func TestTwoClientNoSelfInvalidation(t *testing.T) {
+	clientA, cleanup := createTestClient(t)
+	defer cleanup()
+	clientB := clientA
+
+	volumeID := "vol-no-self-invalidation"
+	cacheA := NewNodeCache(1024 * 1024)
+	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheA)
+
+	cacheB := NewNodeCache(1024 * 1024)
+	fsB := NewObjectFS(clientB, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheB)
+
+	var notifyEventsA []notifyEvent
+	var notifyMuA sync.Mutex
+	fsA.notifyHook = func(e notifyEvent) {
+		notifyMuA.Lock()
+		notifyEventsA = append(notifyEventsA, e)
+		notifyMuA.Unlock()
+	}
+
+	var notifyEventsB []notifyEvent
+	var notifyMuB sync.Mutex
+	fsB.notifyHook = func(e notifyEvent) {
+		notifyMuB.Lock()
+		notifyEventsB = append(notifyEventsB, e)
+		notifyMuB.Unlock()
+	}
+
+	watchCtx, cancelWatch := context.WithCancel(t.Context())
+	defer cancelWatch()
+	StartWatcher(watchCtx, clientA, volumeID, "node-A", cacheA, fsA)
+	StartWatcher(watchCtx, clientB, volumeID, "node-B", cacheB, fsB)
+
+	// Short settle delay for watcher subscriptions
+	time.Sleep(50 * time.Millisecond)
+
+	// Client A creates a file
+	var createOut fuse.CreateOut
+	if status := fsA.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test-self-inval.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileInode := createOut.EntryOut.NodeId
+
+	// Client A writes and fsyncs data
+	data := []byte("self-invalidation-data")
+	written, status := fsA.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileInode},
+		Offset:   0,
+	}, data)
+	if status != fuse.OK || int(written) != len(data) {
+		t.Fatalf("Write failed: %v", status)
+	}
+	if status := fsA.Fsync(nil, &fuse.FsyncIn{
+		InHeader: fuse.InHeader{NodeId: fileInode},
+	}); status != fuse.OK {
+		t.Fatalf("Fsync failed: %v", status)
+	}
+
+	// Verify fsB received InodeNotify for fileInode
+	deadline := time.Now().Add(3 * time.Second)
+	foundModifiedB := false
+	for time.Now().Before(deadline) {
+		notifyMuB.Lock()
+		for _, e := range notifyEventsB {
+			if e.Op == "inode" && e.Inode == fileInode {
+				foundModifiedB = true
+				break
+			}
+		}
+		notifyMuB.Unlock()
+		if foundModifiedB {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !foundModifiedB {
+		t.Fatalf("Client B did not receive InodeNotify for modified file")
+	}
+
+	// Verify fsA saw NO InodeNotify for fileInode (self-invalidation was skipped!)
+	notifyMuA.Lock()
+	sawSelfInodeInval := false
+	for _, e := range notifyEventsA {
+		if e.Op == "inode" && e.Inode == fileInode {
+			sawSelfInodeInval = true
+			break
+		}
+	}
+	notifyMuA.Unlock()
+
+	if sawSelfInodeInval {
+		t.Fatalf("Client A unexpectedly received InodeNotify for its own write/fsync!")
+	}
+
+	// Verify Client A's cached entry was preserved and reads directly from cache
+	entryA, hasA := cacheA.Get(fileInode)
+	if !hasA || entryA == nil {
+		t.Fatalf("Client A's clean cache entry was invalidated; expected it to be preserved")
+	}
+
+	resA, status := fsA.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: fileInode},
+		Offset:   0,
+		Size:     uint32(len(data)),
+	}, nil)
+	if status != fuse.OK {
+		t.Fatalf("Client A read failed: %v", status)
+	}
+	readBytesA, _ := resA.Bytes(nil)
+	if !bytes.Equal(readBytesA, data) {
+		t.Fatalf("Client A expected data %q, got %q", string(data), string(readBytesA))
+	}
+}
