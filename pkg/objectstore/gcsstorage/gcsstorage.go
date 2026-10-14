@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"google.golang.org/api/iterator"
 )
@@ -95,7 +96,7 @@ func (b *Backend) PutObject(ctx context.Context, volumeID, key string, stream bl
 	w := obj.NewWriter(ctx)
 
 	if _, err := io.Copy(w, stream); err != nil {
-		_ = w.Close()
+		errutil.CloseAndLog(w, "gcs writer")
 		return "", fmt.Errorf("failed to write gcs object %s: %w", gcsKey, err)
 	}
 	if err := w.Close(); err != nil {
@@ -131,7 +132,7 @@ func (b *Backend) GetObject(ctx context.Context, volumeID, key string, offset, l
 		}
 		return fmt.Errorf("failed to get gcs object %s: %w", gcsKey, err)
 	}
-	defer r.Close()
+	defer errutil.CloseAndLog(r, "gcs reader")
 
 	if _, err := io.Copy(w, r); err != nil {
 		return fmt.Errorf("failed to stream gcs object %s: %w", gcsKey, err)

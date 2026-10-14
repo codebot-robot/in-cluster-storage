@@ -780,7 +780,10 @@ func generateAllVectors(ctx context.Context) ([]GoldenVector, error) {
 		// Extract final tables
 		expectedTables := make(map[string][]json.RawMessage)
 		for _, tableName := range store.Tables() {
-			rows := store.Rows(tableName)
+			rows, err := store.Rows(tableName)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get rows for %s: %w", tableName, err)
+			}
 			var rowJSONs []json.RawMessage
 			for _, row := range rows {
 				b, err := marshalOpts.Marshal(row)
@@ -944,7 +947,10 @@ func TestGoldenVectors(t *testing.T) {
 
 			// Validate final table states
 			for tableName, expRowsJSON := range vector.ExpectedTables {
-				actRows := store.Rows(tableName)
+				actRows, err := store.Rows(tableName)
+				if err != nil {
+					t.Fatalf("table %q rows failed: %v", tableName, err)
+				}
 				if len(actRows) != len(expRowsJSON) {
 					t.Fatalf("table %q rows count mismatch: got %d, expected %d", tableName, len(actRows), len(expRowsJSON))
 				}

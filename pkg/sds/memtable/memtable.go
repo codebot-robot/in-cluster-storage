@@ -321,12 +321,14 @@ func (m *MemStore) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 				}
 				if ok {
 					msgType, err := m.registry.ResolveMessageType(def.GetId())
-					if err == nil {
-						target := msgType.New().Interface()
-						if err := sds.MergeKeyAndNonKey(target, change.RawKey, change.RawVal); err == nil {
-							row = target
-						}
+					if err != nil {
+						return fmt.Errorf("failed to resolve message type %d for table %s: %w", def.GetId(), tableName, err)
 					}
+					target := msgType.New().Interface()
+					if err := sds.MergeKeyAndNonKey(target, change.RawKey, change.RawVal); err != nil {
+						return fmt.Errorf("failed to merge row fields for table %s: %w", tableName, err)
+					}
+					row = target
 				}
 			}
 			if row == nil {
@@ -441,9 +443,8 @@ func (m *MemStore) ScanSlice(ctx context.Context, typeName string, keyPrefix []b
 }
 
 // Rows returns a slice of all row messages in the specified table in canonical key-byte order.
-func (m *MemStore) Rows(tableName string) []proto.Message {
-	res, _ := m.ScanSlice(context.Background(), tableName, nil)
-	return res
+func (m *MemStore) Rows(tableName string) ([]proto.Message, error) {
+	return m.ScanSlice(context.Background(), tableName, nil)
 }
 
 // Count returns the number of rows in the specified table.

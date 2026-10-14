@@ -142,6 +142,8 @@ func RunBackendTests(t *testing.T, b objectstore.Backend) {
 		var buf bytes.Buffer
 		if err := b.GetObject(ctx, "", key, 0, 0, &buf); err == nil {
 			t.Fatalf("Expected GetObject after DeleteObject to fail, got success with %d bytes", buf.Len())
+		} else {
+			t.Logf("GetObject after DeleteObject returned expected error: %v", err)
 		}
 
 		// Idempotent delete on non-existent object
@@ -154,6 +156,8 @@ func RunBackendTests(t *testing.T, b objectstore.Backend) {
 		var buf bytes.Buffer
 		if err := b.GetObject(ctx, "", "conformance/definitely-not-found.dat", 0, 0, &buf); err == nil {
 			t.Fatalf("Expected GetObject on non-existent object to return error, got nil")
+		} else {
+			t.Logf("GetObject on non-existent object returned expected error: %v", err)
 		}
 	})
 

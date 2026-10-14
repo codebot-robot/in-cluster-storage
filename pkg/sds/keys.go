@@ -175,7 +175,7 @@ func (pk *PrimaryKey) Split(msg proto.Message) (keyBytes []byte, valBytes []byte
 		}
 	}
 
-	marshalOpts := proto.MarshalOptions{Deterministic: true}
+	marshalOpts := proto.MarshalOptions{Deterministic: true, AllowPartial: true}
 	keyBytes, err = marshalOpts.Marshal(keyMsg.Interface())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to marshal key proto: %w", err)
@@ -213,7 +213,7 @@ func MergeKeyAndNonKey(target proto.Message, keyBytes, valBytes []byte) error {
 	if target == nil {
 		return errors.New("nil target message")
 	}
-	opts := proto.UnmarshalOptions{Merge: true}
+	opts := proto.UnmarshalOptions{Merge: true, AllowPartial: true}
 	if len(keyBytes) > 0 {
 		if err := opts.Unmarshal(keyBytes, target); err != nil {
 			return fmt.Errorf("failed to unmarshal key proto bytes: %w", err)
