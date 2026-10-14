@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/google/uuid"
 	"k8s.io/klog/v2"
 )
@@ -53,34 +54,38 @@ type SegmentMeta struct {
 func backupCorruptedSegment(path string) {
 	recoverPath := fmt.Sprintf("%s.%d.recover", path, time.Now().UnixNano())
 	data, err := os.ReadFile(path)
-	if err == nil {
-		if writeErr := os.WriteFile(recoverPath, data, 0644); writeErr == nil {
-			klog.Infof("Saved copy of corrupted segment file to %s", recoverPath)
-		}
+	if err != nil {
+		klog.Warningf("failed to read corrupted segment file %s for backup: %v", path, err)
+		return
 	}
+	if writeErr := os.WriteFile(recoverPath, data, 0644); writeErr != nil {
+		klog.Warningf("failed to write corrupted segment backup to %s: %v", recoverPath, writeErr)
+		return
+	}
+	klog.Infof("Saved copy of corrupted segment file to %s", recoverPath)
 }
 
 // ScanClientSegmentFile reads a client segment file from disk, validating all records.
 // If a torn trailing record is detected at the end of the file, it backs up the file,
 // truncates to the last valid record boundary, and returns only the valid records.
-func ScanClientSegmentFile(path string) ([]*ClientRecord, *SegmentMeta, error) {
+func ScanClientSegmentFile(path string) (records []*ClientRecord, meta *SegmentMeta, err error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open segment file %s: %w", path, err)
 	}
-	defer f.Close()
+	defer errutil.CloseWithErr(f, &err)
 
 	var validRecords []*ClientRecord
 	var validOffset int64 = 0
 
 	for {
-		rec, err := DecodeClientRecord(f)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
+		rec, decErr := DecodeClientRecord(f)
+		if decErr != nil {
+			if errors.Is(decErr, io.EOF) {
 				break
 			}
-			if errors.Is(err, ErrTruncatedRecord) || errors.Is(err, ErrChecksumMismatch) || errors.Is(err, ErrCorruptedRecord) {
-				klog.Warningf("Torn trailing record detected in client segment %s at offset %d (%v), creating recover backup and truncating file", path, validOffset, err)
+			if errors.Is(decErr, ErrTruncatedRecord) || errors.Is(decErr, ErrChecksumMismatch) || errors.Is(decErr, ErrCorruptedRecord) {
+				klog.Warningf("Torn trailing record detected in client segment %s at offset %d (%v), creating recover backup and truncating file", path, validOffset, decErr)
 				backupCorruptedSegment(path)
 				if err := f.Truncate(validOffset); err != nil {
 					return nil, nil, fmt.Errorf("failed to truncate segment file %s at %d: %w", path, validOffset, err)
@@ -90,14 +95,14 @@ func ScanClientSegmentFile(path string) ([]*ClientRecord, *SegmentMeta, error) {
 				}
 				break
 			}
-			return nil, nil, fmt.Errorf("read error while scanning segment file %s: %w", path, err)
+			return nil, nil, fmt.Errorf("read error while scanning segment file %s: %w", path, decErr)
 		}
 
 		validRecords = append(validRecords, rec)
 		validOffset += int64(ClientHeaderSize + len(rec.Payload))
 	}
 
-	meta := &SegmentMeta{
+	meta = &SegmentMeta{
 		Path:        path,
 		Size:        validOffset,
 		RecordCount: len(validRecords),
@@ -112,24 +117,24 @@ func ScanClientSegmentFile(path string) ([]*ClientRecord, *SegmentMeta, error) {
 
 // ScanLogSegmentFile reads a witness log segment file from disk, validating all records.
 // If a torn trailing record is detected, it backs up the file, truncates, and returns valid records.
-func ScanLogSegmentFile(path string) ([]*LogRecord, *SegmentMeta, error) {
+func ScanLogSegmentFile(path string) (records []*LogRecord, meta *SegmentMeta, err error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open segment file %s: %w", path, err)
 	}
-	defer f.Close()
+	defer errutil.CloseWithErr(f, &err)
 
 	var validRecords []*LogRecord
 	var validOffset int64 = 0
 
 	for {
-		rec, err := DecodeLogRecord(f)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
+		rec, decErr := DecodeLogRecord(f)
+		if decErr != nil {
+			if errors.Is(decErr, io.EOF) {
 				break
 			}
-			if errors.Is(err, ErrTruncatedRecord) || errors.Is(err, ErrChecksumMismatch) || errors.Is(err, ErrCorruptedRecord) {
-				klog.Warningf("Torn trailing record detected in log segment %s at offset %d (%v), creating recover backup and truncating file", path, validOffset, err)
+			if errors.Is(decErr, ErrTruncatedRecord) || errors.Is(decErr, ErrChecksumMismatch) || errors.Is(decErr, ErrCorruptedRecord) {
+				klog.Warningf("Torn trailing record detected in log segment %s at offset %d (%v), creating recover backup and truncating file", path, validOffset, decErr)
 				backupCorruptedSegment(path)
 				if err := f.Truncate(validOffset); err != nil {
 					return nil, nil, fmt.Errorf("failed to truncate segment file %s at %d: %w", path, validOffset, err)
@@ -139,14 +144,14 @@ func ScanLogSegmentFile(path string) ([]*LogRecord, *SegmentMeta, error) {
 				}
 				break
 			}
-			return nil, nil, fmt.Errorf("read error while scanning segment file %s: %w", path, err)
+			return nil, nil, fmt.Errorf("read error while scanning segment file %s: %w", path, decErr)
 		}
 
 		validRecords = append(validRecords, rec)
 		validOffset += int64(LogHeaderSize + len(rec.Payload))
 	}
 
-	meta := &SegmentMeta{
+	meta = &SegmentMeta{
 		Path:        path,
 		Size:        validOffset,
 		RecordCount: len(validRecords),
@@ -203,6 +208,7 @@ func NewClientSegmentStore(dir string, filePrefix string, maxSegmentSize int64) 
 	}
 
 	var allRecords []*ClientRecord
+	var removeErrs []error
 	for _, file := range walFiles {
 		records, meta, err := ScanClientSegmentFile(file)
 		if err != nil {
@@ -212,8 +218,13 @@ func NewClientSegmentStore(dir string, filePrefix string, maxSegmentSize int64) 
 			store.segments = append(store.segments, meta)
 			allRecords = append(allRecords, records...)
 		} else {
-			_ = os.Remove(file)
+			if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+				removeErrs = append(removeErrs, fmt.Errorf("failed to remove empty segment file %s: %w", file, err))
+			}
 		}
+	}
+	if len(removeErrs) > 0 {
+		return nil, nil, errors.Join(removeErrs...)
 	}
 
 	return store, allRecords, nil
@@ -257,9 +268,12 @@ func (s *ClientSegmentStore) Append(rec *ClientRecord) error {
 
 func (s *ClientSegmentStore) rotateLocked(firstSeq uint64) error {
 	if s.activeFile != nil {
-		_ = s.activeFile.Sync()
-		_ = s.activeFile.Close()
+		syncErr := s.activeFile.Sync()
+		closeErr := s.activeFile.Close()
 		s.activeFile = nil
+		if err := errors.Join(syncErr, closeErr); err != nil {
+			return fmt.Errorf("failed to sync/close previous segment file: %w", err)
+		}
 	}
 
 	path := s.segmentFilename(firstSeq)
@@ -286,18 +300,25 @@ func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var errs []error
 	if s.activeFile != nil {
-		_ = s.activeFile.Sync()
-		_ = s.activeFile.Close()
+		syncErr := s.activeFile.Sync()
+		closeErr := s.activeFile.Close()
 		s.activeFile = nil
 		s.activeMeta = nil
+		if err := errors.Join(syncErr, closeErr); err != nil {
+			errs = append(errs, fmt.Errorf("failed to sync/close active segment file: %w", err))
+		}
 	}
 
 	var remaining []*SegmentMeta
 	for _, seg := range s.segments {
 		if seg.FirstSeq > maxSeq {
 			// Entire segment is after maxSeq -> delete file
-			_ = os.Remove(seg.Path)
+			if err := os.Remove(seg.Path); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, fmt.Errorf("failed to remove segment file %s: %w", seg.Path, err))
+				remaining = append(remaining, seg)
+			}
 			continue
 		}
 
@@ -310,7 +331,9 @@ func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
 		// Partial segment: scan records, find offset where StreamSeq <= maxSeq, truncate file
 		f, err := os.OpenFile(seg.Path, os.O_RDWR, 0644)
 		if err != nil {
-			return fmt.Errorf("failed to open segment file %s for truncate: %w", seg.Path, err)
+			errs = append(errs, fmt.Errorf("failed to open segment file %s for truncate: %w", seg.Path, err))
+			remaining = append(remaining, seg)
+			continue
 		}
 
 		var validOffset int64
@@ -331,17 +354,29 @@ func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
 		}
 
 		if validCount == 0 {
-			_ = f.Close()
-			_ = os.Remove(seg.Path)
+			if closeErr := f.Close(); closeErr != nil {
+				errs = append(errs, fmt.Errorf("failed to close segment file %s: %w", seg.Path, closeErr))
+			}
+			if remErr := os.Remove(seg.Path); remErr != nil && !os.IsNotExist(remErr) {
+				errs = append(errs, fmt.Errorf("failed to remove segment file %s: %w", seg.Path, remErr))
+				remaining = append(remaining, seg)
+			}
 			continue
 		}
 
 		if err := f.Truncate(validOffset); err != nil {
-			_ = f.Close()
-			return fmt.Errorf("failed to truncate segment file %s to %d: %w", seg.Path, validOffset, err)
+			errutil.CloseAndLog(f, fmt.Sprintf("segment file %s", seg.Path))
+			errs = append(errs, fmt.Errorf("failed to truncate segment file %s to %d: %w", seg.Path, validOffset, err))
+			remaining = append(remaining, seg)
+			continue
 		}
-		_ = f.Sync()
-		_ = f.Close()
+		syncErr := f.Sync()
+		closeErr := f.Close()
+		if err := errors.Join(syncErr, closeErr); err != nil {
+			errs = append(errs, fmt.Errorf("failed to sync/close segment file %s after truncate: %w", seg.Path, err))
+			remaining = append(remaining, seg)
+			continue
+		}
 
 		seg.Size = validOffset
 		seg.RecordCount = validCount
@@ -351,7 +386,7 @@ func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
 	}
 
 	s.segments = remaining
-	return nil
+	return errors.Join(errs...)
 }
 
 // DeleteSegmentsBeforeS3Ack deletes completed segment files whose records are all <= s3AckedSeq.
@@ -386,10 +421,10 @@ func (s *ClientSegmentStore) Close() error {
 	defer s.mu.Unlock()
 
 	if s.activeFile != nil {
-		_ = s.activeFile.Sync()
-		err := s.activeFile.Close()
+		syncErr := s.activeFile.Sync()
+		closeErr := s.activeFile.Close()
 		s.activeFile = nil
-		return err
+		return errors.Join(syncErr, closeErr)
 	}
 	return nil
 }
@@ -424,10 +459,17 @@ func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64) (*L
 		return nil, fmt.Errorf("failed to read directory %s: %w", dir, err)
 	}
 
+	var removeErrs []error
 	for _, entry := range entries {
 		if !entry.IsDir() && (strings.HasSuffix(entry.Name(), ".wal") || strings.Contains(entry.Name(), ".wal.")) {
-			_ = os.Remove(filepath.Join(dir, entry.Name()))
+			p := filepath.Join(dir, entry.Name())
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				removeErrs = append(removeErrs, fmt.Errorf("failed to remove stale segment file %s: %w", p, err))
+			}
 		}
+	}
+	if len(removeErrs) > 0 {
+		return nil, errors.Join(removeErrs...)
 	}
 
 	store := &LogSegmentStore{
@@ -485,9 +527,12 @@ func (s *LogSegmentStore) AppendBatch(records []*LogRecord) error {
 
 func (s *LogSegmentStore) rotateLocked(firstPos uint64) error {
 	if s.activeFile != nil {
-		_ = s.activeFile.Sync()
-		_ = s.activeFile.Close()
+		syncErr := s.activeFile.Sync()
+		closeErr := s.activeFile.Close()
 		s.activeFile = nil
+		if err := errors.Join(syncErr, closeErr); err != nil {
+			return fmt.Errorf("failed to sync/close previous segment file: %w", err)
+		}
 	}
 
 	path := s.segmentFilename(firstPos)
@@ -533,31 +578,34 @@ func (s *LogSegmentStore) ReadFrom(position uint64, fn func(*LogRecord) error) e
 	}
 
 	for _, seg := range segs[startIdx:] {
-		f, err := os.Open(seg.Path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return fmt.Errorf("failed to open segment %s: %w", seg.Path, err)
-		}
-
-		for {
-			rec, err := DecodeLogRecord(f)
+		if err := func() error {
+			f, err := os.Open(seg.Path)
 			if err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, ErrTruncatedRecord) || errors.Is(err, io.ErrUnexpectedEOF) {
-					break
+				if os.IsNotExist(err) {
+					return nil
 				}
-				_ = f.Close()
-				return fmt.Errorf("failed decoding log record in %s: %w", seg.Path, err)
+				return fmt.Errorf("failed to open segment %s: %w", seg.Path, err)
 			}
-			if rec.Position >= position {
-				if err := fn(rec); err != nil {
-					_ = f.Close()
-					return err
+			defer errutil.CloseAndLog(f, fmt.Sprintf("segment %s", seg.Path))
+
+			for {
+				rec, err := DecodeLogRecord(f)
+				if err != nil {
+					if errors.Is(err, io.EOF) || errors.Is(err, ErrTruncatedRecord) || errors.Is(err, io.ErrUnexpectedEOF) {
+						break
+					}
+					return fmt.Errorf("failed decoding log record in %s: %w", seg.Path, err)
+				}
+				if rec.Position >= position {
+					if err := fn(rec); err != nil {
+						return err
+					}
 				}
 			}
+			return nil
+		}(); err != nil {
+			return err
 		}
-		_ = f.Close()
 	}
 
 	return nil
@@ -605,10 +653,10 @@ func (s *LogSegmentStore) Close() error {
 	defer s.mu.Unlock()
 
 	if s.activeFile != nil {
-		_ = s.activeFile.Sync()
-		err := s.activeFile.Close()
+		syncErr := s.activeFile.Sync()
+		closeErr := s.activeFile.Close()
 		s.activeFile = nil
-		return err
+		return errors.Join(syncErr, closeErr)
 	}
 	return nil
 }
