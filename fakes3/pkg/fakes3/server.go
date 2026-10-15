@@ -38,10 +38,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/crc32"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -131,9 +133,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("x-amz-request-id", requestID)
 	w.Header().Set("Server", "fakes3")
 
-	bucketName, key := s.resolve(r)
-
 	rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
+	bucketName, key, err := s.resolve(r)
+	if err != nil {
+		writeError(rw, r, http.StatusBadRequest, "InvalidArgument", "Invalid Host header: "+err.Error(), "")
+		if s.logf != nil {
+			s.logf("%s %s host=%q -> %d", r.Method, r.URL.RequestURI(), r.Host, rw.status)
+		}
+		return
+	}
+
 	s.route(rw, r, bucketName, key)
 
 	if s.logf != nil {
@@ -155,24 +165,33 @@ func (r *statusRecorder) WriteHeader(code int) {
 // (bucket.host/key) or path-style (host/bucket/key) requests. Virtual-hosted
 // style is only recognised for buckets that already exist, since we cannot
 // otherwise tell a bucket label apart from an ordinary hostname component.
-func (s *Server) resolve(r *http.Request) (string, string) {
+func (s *Server) resolve(r *http.Request) (string, string, error) {
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
 	host := r.Host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	if host != "" {
+		if h, _, err := net.SplitHostPort(host); err != nil {
+			var addrErr *net.AddrError
+			if errors.As(err, &addrErr) && addrErr.Err == "missing port in address" {
+				// Host does not specify a port; keep host as-is.
+			} else {
+				return "", "", fmt.Errorf("invalid host %q: %w", host, err)
+			}
+		} else {
+			host = h
+		}
 	}
 	if label, _, ok := strings.Cut(host, "."); ok && label != "" && net.ParseIP(host) == nil {
 		s.mu.RLock()
 		_, known := s.buckets[label]
 		s.mu.RUnlock()
 		if known {
-			return label, path
+			return label, path, nil
 		}
 	}
 
 	bucketName, key, _ := strings.Cut(path, "/")
-	return bucketName, key
+	return bucketName, key, nil
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, bucketName, key string) {
@@ -603,9 +622,12 @@ type copyObjectResult struct {
 
 func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucketName, key string) {
 	source := r.Header.Get("x-amz-copy-source")
-	if decoded, err := url.PathUnescape(source); err == nil {
-		source = decoded
+	decoded, err := url.PathUnescape(source)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-copy-source header: "+err.Error(), bucketName+"/"+key)
+		return
 	}
+	source = decoded
 	source = strings.TrimPrefix(source, "/")
 	srcBucket, srcKey, ok := strings.Cut(source, "/")
 	if !ok || srcBucket == "" || srcKey == "" {
@@ -739,7 +761,9 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucketName, k
 	h.Set("Content-Length", strconv.FormatInt(end-start, 10))
 	w.WriteHeader(status)
 	if withBody {
-		_, _ = w.Write(data[start:end])
+		if _, err := w.Write(data[start:end]); err != nil {
+			log.Printf("fakes3: write getObject response: %v (client went away?)", err)
+		}
 	}
 }
 
@@ -1037,6 +1061,8 @@ func writeXML(w http.ResponseWriter, r *http.Request, status int, v any) {
 	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
 	w.WriteHeader(status)
 	if r.Method != http.MethodHead {
-		_, _ = w.Write(buf.Bytes())
+		if _, err := w.Write(buf.Bytes()); err != nil {
+			log.Printf("fakes3: write XML response: %v (client went away?)", err)
+		}
 	}
 }
