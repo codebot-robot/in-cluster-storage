@@ -30,10 +30,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/pebble/v2"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
-	_ "github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
 )
@@ -1041,4 +1043,11 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 func init() {
 	_ = walclient.Local
+	// Controller registration uses explicit options:
+	// stream is the source of truth, position and rows move in one batch.
+	tableCache := pebble.NewCache(64 * 1024 * 1024)
+	sds.RegisterIndexFactory(table.NewFactory(
+		table.WithDisableWAL(true), // stream is the source of truth, position and rows move in one batch
+		table.WithCache(tableCache),
+	))
 }

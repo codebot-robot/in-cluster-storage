@@ -119,6 +119,16 @@ func WithDisableWAL(disable bool) Option {
 	}
 }
 
+// WithWAL enables Pebble's internal write-ahead log.
+// By default, table runs with DisableWAL=true because structured-data streams
+// are the source of truth and recovery replays from the persisted position.
+// Callers who do not run behind a stream must opt into the WAL.
+func WithWAL() Option {
+	return func(o *options) {
+		o.disableWAL = false
+	}
+}
+
 // WithCacheSize sets the Pebble block cache size in bytes.
 func WithCacheSize(bytes int64) Option {
 	return func(o *options) {
@@ -162,8 +172,40 @@ func WithPebbleOptions(opts *pebble.Options) Option {
 }
 
 // Open opens or creates a table DB in the specified directory.
+//
+// Defaults:
+//   - DisableWAL: true. Pebble's internal WAL is disabled because table runs as
+//     an SDS projection where the structured-data stream is the source of truth;
+//     position and rows move in one atomic batch, and crash recovery replays from
+//     the stream's persisted position. Callers that do not run behind a stream
+//     must opt into the WAL via WithWAL() or WithDisableWAL(false).
+//   - Sync: false (pebble.NoSync). Batch commits do not synchronously fsync to
+//     disk; durability is provided by the stream log.
+//   - MemTableSize: Pebble default ramp (starts at min(256KB, MemTableSize) and
+//     doubles up to 4MB steady state).
+//   - Cache: Pebble default (8 MB unshared per DB, or shared across DBs via WithCache).
+//
+// Recovery Contract (DisableWAL=true):
+// With Pebble's WAL disabled, mutations and the stream position key move atomically
+// in one batch in memory. On clean shutdown (Close), unflushed memtable rows are
+// flushed to disk to preserve the local index state across restarts. In the event
+// of an unclean crash, unpersisted rows in the active memtable and their corresponding
+// stream position key are lost together, leaving the on-disk SSTables at the last
+// flushed position. On restart, the controller reopens the local index at this flushed
+// position and replays forward from the stream change log.
+// If the stream has been trimmed past the index's flushed position (e.g. following
+// snapshot archival and retention pruning), the local index is detected as stale in
+// LoadFromBackend (pkg/objectfs/controller/volume.go:5020-5047), which discards the
+// stale local index, restores the latest published snapshot from object storage, and
+// replays forward from the snapshot position.
+//
+// Maximum crash replay cost:
+// Replay is bounded by Pebble's memtable capacity (up to 4 MB of serialized rows),
+// which replays in milliseconds at typical stream apply throughput (>50k ops/sec).
 func Open(ctx context.Context, dir string, opts ...Option) (*DB, error) {
-	var o options
+	o := options{
+		disableWAL: true,
+	}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -333,6 +375,11 @@ func (d *DB) SetPosition(pos uint64) error {
 
 	d.position = pos
 	return nil
+}
+
+// DisableWAL returns whether Pebble's write-ahead log is disabled.
+func (d *DB) DisableWAL() bool {
+	return d.opts.disableWAL
 }
 
 // StreamID returns the stream ID associated with this table DB.
@@ -735,14 +782,22 @@ func (d *DB) IsUnrecoverable(err error) bool {
 	return pebble.IsCorruptionError(err) || errors.Is(err, pebble.ErrCorruption)
 }
 
-// Close closes the underlying Pebble DB.
+// Close closes the underlying Pebble DB. If the WAL was disabled, unflushed
+// memtable changes are flushed to stable storage before closing.
 func (d *DB) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.db != nil {
-		err := d.db.Close()
+		var flushErr error
+		if d.opts.disableWAL {
+			flushErr = d.db.Flush()
+		}
+		closeErr := d.db.Close()
 		d.db = nil
-		return err
+		if flushErr != nil {
+			return flushErr
+		}
+		return closeErr
 	}
 	return nil
 }
@@ -811,5 +866,6 @@ func (f *Factory) NewEmpty(ctx context.Context, streamID string, dir string) (sd
 }
 
 func init() {
-	sds.RegisterIndexFactory(&Factory{})
+	// Stream is the source of truth; position and rows move in one batch.
+	sds.RegisterIndexFactory(NewFactory(WithDisableWAL(true)))
 }
