@@ -503,3 +503,111 @@ func TestRegistryCompiledTypeSharingAndDynamicFallback(t *testing.T) {
 		t.Errorf("expected dynamic message type descriptor %p to equal dynMD1 %p", dynMT.Descriptor(), dynMD1)
 	}
 }
+
+func TestRegistryExportSharedTypeDefinitionPointer(t *testing.T) {
+	// 1. Two registries registering the same compiled type independently
+	reg1 := NewRegistry()
+	reg2 := NewRegistry()
+
+	def1, err := reg1.RegisterMessage(&sdsv1.TxCommit{}, 1)
+	if err != nil {
+		t.Fatalf("reg1.RegisterMessage failed: %v", err)
+	}
+	def2, err := reg2.RegisterMessage(&sdsv1.TxCommit{}, 1)
+	if err != nil {
+		t.Fatalf("reg2.RegisterMessage failed: %v", err)
+	}
+
+	// Assert that RegisterMessage returned the exact same interned pointer
+	if def1 != def2 {
+		t.Errorf("expected def1 %p to equal def2 %p", def1, def2)
+	}
+
+	// Assert that LookupByID returns the shared interned pointer
+	lookupDef1, _, ok1 := reg1.LookupByID(def1.GetId())
+	lookupDef2, _, ok2 := reg2.LookupByID(def2.GetId())
+	if !ok1 || !ok2 {
+		t.Fatalf("LookupByID failed: ok1=%v, ok2=%v", ok1, ok2)
+	}
+	if lookupDef1 != lookupDef2 {
+		t.Errorf("expected lookupDef1 %p to equal lookupDef2 %p", lookupDef1, lookupDef2)
+	}
+
+	// Assert that Export from both registries returns the exact same TypeDefinition pointer
+	exp1 := reg1.Export()
+	exp2 := reg2.Export()
+	if len(exp1.GetTypes()) != 1 || len(exp2.GetTypes()) != 1 {
+		t.Fatalf("expected 1 type in exports, got %d and %d", len(exp1.GetTypes()), len(exp2.GetTypes()))
+	}
+	if exp1.GetTypes()[0] != exp2.GetTypes()[0] {
+		t.Errorf("expected Export types to be pointer equal: %p != %p", exp1.GetTypes()[0], exp2.GetTypes()[0])
+	}
+
+	// 2. A third registry importing from Export also reuses the shared pointer
+	reg3 := NewRegistry()
+	if err := reg3.Import(exp1); err != nil {
+		t.Fatalf("reg3.Import failed: %v", err)
+	}
+	exp3 := reg3.Export()
+	if len(exp3.GetTypes()) != 1 {
+		t.Fatalf("expected 1 type in reg3 export, got %d", len(exp3.GetTypes()))
+	}
+	if exp3.GetTypes()[0] != exp1.GetTypes()[0] {
+		t.Errorf("expected imported type in reg3 to share pointer with reg1: %p != %p",
+			exp3.GetTypes()[0], exp1.GetTypes()[0])
+	}
+}
+
+func TestRegistryInternedTypeDefinitionDifferentIDs(t *testing.T) {
+	reg1 := NewRegistry()
+	reg2 := NewRegistry()
+
+	// Registry 1 registers TxCommit with ID 16
+	def1, err := reg1.RegisterMessage(&sdsv1.TxCommit{}, 1)
+	if err != nil {
+		t.Fatalf("reg1.RegisterMessage failed: %v", err)
+	}
+	if def1.GetId() != 16 {
+		t.Fatalf("def1.GetId() = %d, want 16", def1.GetId())
+	}
+
+	// Registry 2 registers the same type schema but with ID 25
+	md := (&sdsv1.TxCommit{}).ProtoReflect().Descriptor()
+	def2, err := BuildTypeDefinition(25, md, []int32{1})
+	if err != nil {
+		t.Fatalf("BuildTypeDefinition(25) failed: %v", err)
+	}
+	if err := reg2.Register(def2); err != nil {
+		t.Fatalf("reg2.Register failed: %v", err)
+	}
+
+	lookup1, _, ok1 := reg1.LookupByName(def1.GetName())
+	lookup2, _, ok2 := reg2.LookupByName(def2.GetName())
+	if !ok1 || !ok2 {
+		t.Fatalf("LookupByName failed: ok1=%v, ok2=%v", ok1, ok2)
+	}
+
+	// Each registry must preserve its own per-stream ID
+	if lookup1.GetId() != 16 {
+		t.Errorf("lookup1.GetId() = %d, want 16", lookup1.GetId())
+	}
+	if lookup2.GetId() != 25 {
+		t.Errorf("lookup2.GetId() = %d, want 25", lookup2.GetId())
+	}
+
+	// Export must report the per-registry ID
+	exp1 := reg1.Export()
+	exp2 := reg2.Export()
+	if exp1.GetTypes()[0].GetId() != 16 {
+		t.Errorf("exp1 type ID = %d, want 16", exp1.GetTypes()[0].GetId())
+	}
+	if exp2.GetTypes()[0].GetId() != 25 {
+		t.Errorf("exp2 type ID = %d, want 25", exp2.GetTypes()[0].GetId())
+	}
+
+	// The descriptor-bearing FileDescriptorSet must be shared (pointer-equal)
+	if lookup1.GetDescriptors() != lookup2.GetDescriptors() {
+		t.Errorf("expected shared Descriptors pointer across different IDs: %p != %p",
+			lookup1.GetDescriptors(), lookup2.GetDescriptors())
+	}
+}

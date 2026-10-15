@@ -17,12 +17,14 @@ package record
 import (
 	"crypto/sha256"
 	"fmt"
+	"slices"
 	"sort"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
@@ -136,23 +138,74 @@ func ComputeMessageFingerprint(md protoreflect.MessageDescriptor) ([]byte, *desc
 	return fp, fds, nil
 }
 
-// BuildTypeDefinition constructs a TypeDefinition proto for a message descriptor.
+// BuildTypeDefinition constructs a TypeDefinition proto for a message descriptor,
+// returning an interned instance when available to prevent re-extracting FileDescriptorSets.
 func BuildTypeDefinition(typeID uint32, md protoreflect.MessageDescriptor, keyFields []int32) (*sdsv1.TypeDefinition, error) {
 	if md == nil {
 		return nil, fmt.Errorf("nil message descriptor")
 	}
+
+	fullName := md.FullName()
+	if d, err := protoregistry.GlobalFiles.FindDescriptorByName(fullName); err == nil && d == md {
+		fp, err := getCompiledFingerprint(md)
+		if err != nil {
+			return nil, err
+		}
+		key := typeDefKey{name: string(fullName), fingerprint: string(fp)}
+		if v, ok := typeDefCache.Load(key); ok {
+			interned := v.(*sdsv1.TypeDefinition)
+			if interned.GetId() == typeID && slices.Equal(interned.GetKeyFields(), keyFields) {
+				return interned, nil
+			}
+			kf := interned.GetKeyFields()
+			if !slices.Equal(keyFields, kf) {
+				kf = slices.Clone(keyFields)
+			}
+			return &sdsv1.TypeDefinition{
+				Id:          typeID,
+				Name:        interned.GetName(),
+				Fingerprint: interned.GetFingerprint(),
+				Descriptors: interned.GetDescriptors(),
+				KeyFields:   kf,
+			}, nil
+		}
+	}
+
 	fp, fds, err := ComputeMessageFingerprint(md)
 	if err != nil {
 		return nil, err
 	}
-	kf := make([]int32, len(keyFields))
-	copy(kf, keyFields)
+	key := typeDefKey{name: string(md.FullName()), fingerprint: string(fp)}
+	if v, ok := typeDefCache.Load(key); ok {
+		interned := v.(*sdsv1.TypeDefinition)
+		if interned.GetId() == typeID && slices.Equal(interned.GetKeyFields(), keyFields) {
+			return interned, nil
+		}
+		kf := interned.GetKeyFields()
+		if !slices.Equal(keyFields, kf) {
+			kf = slices.Clone(keyFields)
+		}
+		return &sdsv1.TypeDefinition{
+			Id:          typeID,
+			Name:        interned.GetName(),
+			Fingerprint: interned.GetFingerprint(),
+			Descriptors: interned.GetDescriptors(),
+			KeyFields:   kf,
+		}, nil
+	}
 
-	return &sdsv1.TypeDefinition{
+	kf := slices.Clone(keyFields)
+	def := &sdsv1.TypeDefinition{
 		Id:          typeID,
 		Name:        string(md.FullName()),
 		Fingerprint: fp,
 		Descriptors: fds,
 		KeyFields:   kf,
-	}, nil
+	}
+	actual, _ := typeDefCache.LoadOrStore(key, def)
+	interned := actual.(*sdsv1.TypeDefinition)
+	if interned.GetId() == typeID && slices.Equal(interned.GetKeyFields(), keyFields) {
+		return interned, nil
+	}
+	return def, nil
 }
