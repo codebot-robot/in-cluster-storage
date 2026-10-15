@@ -1990,7 +1990,9 @@ func WriteImage(w io.WriterAt, root Node) error {
 				off: n.dataOffset,
 			}
 			written, err := io.Copy(wrapper, rc)
-			rc.Close()
+			if closeErr := rc.Close(); closeErr != nil && err == nil {
+				return fmt.Errorf("failed to close file %s: %w", n.name, closeErr)
+			}
 			if err != nil {
 				return fmt.Errorf("failed to stream file content for %s: %w", n.name, err)
 			}

@@ -45,7 +45,10 @@ func (h *Harness) SetupMultiNode(workerNodes int) {
 		return
 	}
 
-	out, _ := exec.Command("kind", "get", "clusters").Output()
+	out, err := exec.Command("kind", "get", "clusters").Output()
+	if err != nil {
+		h.t.Fatalf("failed to list kind clusters: %v", err)
+	}
 	clusters := strings.Fields(string(out))
 	exists := false
 	for _, c := range clusters {
@@ -62,9 +65,12 @@ func (h *Harness) SetupMultiNode(workerNodes int) {
 			b.WriteString("- role: worker\n")
 		}
 		configFile := filepath.Join(h.t.TempDir(), "kind-config.yaml")
-		if err := os.WriteFile(configFile, []byte(b.String()), 0644); err == nil {
-			cmd := exec.Command("kind", "create", "cluster", "--name", h.ClusterName, "--config", configFile)
-			_ = cmd.Run()
+		if err := os.WriteFile(configFile, []byte(b.String()), 0644); err != nil {
+			h.t.Fatalf("failed to write kind config %s: %v", configFile, err)
+		}
+		cmd := exec.Command("kind", "create", "cluster", "--name", h.ClusterName, "--config", configFile)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			h.t.Fatalf("failed to create kind cluster %s: %v (output: %s)", h.ClusterName, err, strings.TrimSpace(string(out)))
 		}
 	}
 
@@ -130,7 +136,9 @@ func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 	t.Log("======= DUMPING DIAGNOSTIC LOGS =======")
 
 	// Pod overview
-	if out, err := exec.Command("kubectl", "get", "pods", "-n", "default", "-o", "wide").CombinedOutput(); err == nil {
+	if out, err := exec.Command("kubectl", "get", "pods", "-n", "default", "-o", "wide").CombinedOutput(); err != nil {
+		t.Logf("Warning: failed to get pods in default namespace: %v (out: %s)", err, strings.TrimSpace(string(out)))
+	} else {
 		t.Logf("Pods in default namespace:\n%s\n", strings.TrimSpace(string(out)))
 	}
 
@@ -192,7 +200,9 @@ func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 	allPods := h.getPodNames("", "default")
 	for _, pod := range allPods {
 		if strings.HasPrefix(pod, "layers-pod-") || strings.HasPrefix(pod, "test-pod-") || strings.HasPrefix(pod, "dev-vscode") || strings.HasPrefix(pod, "persistent-pod-") || strings.HasPrefix(pod, "failover-") || strings.HasPrefix(pod, "crash-") || strings.HasPrefix(pod, "outage-") || strings.HasPrefix(pod, "wal-") {
-			if desc, err := exec.Command("kubectl", "describe", "pod", pod, "-n", "default").CombinedOutput(); err == nil {
+			if desc, err := exec.Command("kubectl", "describe", "pod", pod, "-n", "default").CombinedOutput(); err != nil {
+				t.Logf("Warning: failed to describe pod %s: %v (out: %s)", pod, err, strings.TrimSpace(string(desc)))
+			} else {
 				t.Logf("Pod %s Description:\n%s\n", pod, strings.TrimSpace(string(desc)))
 			}
 			if logs := h.getContainerLogs(pod, "", "default", false); logs != "" {

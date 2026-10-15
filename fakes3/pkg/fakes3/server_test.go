@@ -414,6 +414,11 @@ func TestCopyObject(t *testing.T) {
 	if string(data) != "payload" || got.Metadata["m"] != "1" {
 		t.Errorf("copy = %q metadata %v", data, got.Metadata)
 	}
+
+	// CopyObject with invalid percent-encoding in x-amz-copy-source returns InvalidArgument.
+	if _, err := client.CopyObject(ctx, &s3.CopyObjectInput{Bucket: aws.String("dst"), Key: aws.String("copy"), CopySource: aws.String("src/a%zz")}); apiErrorCode(err) != "InvalidArgument" {
+		t.Errorf("CopyObject with invalid unescape: err = %v, want InvalidArgument", err)
+	}
 }
 
 func TestPresignedGet(t *testing.T) {
@@ -460,6 +465,23 @@ func TestVirtualHostedStyle(t *testing.T) {
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(data) != "vh" {
 		t.Errorf("GET path-style: status %d body %q", resp.StatusCode, data)
+	}
+}
+
+func TestInvalidHostHeader(t *testing.T) {
+	_, srv := newTestClient(t, WithBuckets("b"))
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/b/somekey", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Host = "[invalid:80"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET with invalid host: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected status 400 Bad Request, got %d", resp.StatusCode)
 	}
 }
 

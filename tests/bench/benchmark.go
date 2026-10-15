@@ -32,7 +32,9 @@ func runOpsBenchmark(dataDir string, n int) {
 	fmt.Printf("Running FUSE end-to-end ops benchmark in %s (N=%d)\n", dataDir, n)
 
 	testDir := filepath.Join(dataDir, "fuse_bench")
-	_ = os.MkdirAll(testDir, 0755)
+	if err := os.MkdirAll(testDir, 0755); err != nil {
+		panic(fmt.Sprintf("mkdir %s failed: %v", testDir, err))
+	}
 
 	// 1. Create benchmark
 	start := time.Now()
@@ -91,8 +93,16 @@ func main() {
 	}
 
 	dataDir := args[0]
-	seed, _ := strconv.ParseInt(args[1], 10, 64)
-	count, _ := strconv.Atoi(args[2])
+	seed, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid seed %q: %v\n", args[1], err)
+		os.Exit(1)
+	}
+	count, err := strconv.Atoi(args[2])
+	if err != nil {
+		fmt.Printf("Invalid count %q: %v\n", args[2], err)
+		os.Exit(1)
+	}
 
 	fmt.Printf("Starting benchmark. DataDir: %s, Seed: %d, Count: %d\n", dataDir, seed, count)
 
@@ -126,12 +136,19 @@ func main() {
 			if content, exists := state.Files[fileID]; exists {
 				filename := filepath.Join(dataDir, fmt.Sprintf("file-%d.txt", fileID))
 				appendStr := fmt.Sprintf("-appended-%d", stepRand.Intn(1000))
-				if f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644); err == nil {
-					f.WriteString(appendStr)
-					f.Close()
-					state.Files[fileID] = content + appendStr
-				} else {
+				f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
+				if err != nil {
 					fmt.Printf("Step %d: Failed to append to file %s: %v\n", step, filename, err)
+				} else {
+					_, writeErr := f.WriteString(appendStr)
+					closeErr := f.Close()
+					if writeErr != nil {
+						fmt.Printf("Step %d: Failed to write to file %s: %v\n", step, filename, writeErr)
+					} else if closeErr != nil {
+						fmt.Printf("Step %d: Failed to close file %s after append: %v\n", step, filename, closeErr)
+					} else {
+						state.Files[fileID] = content + appendStr
+					}
 				}
 			}
 		case 2: // Delete

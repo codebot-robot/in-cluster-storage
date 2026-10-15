@@ -16,6 +16,7 @@ package erofs
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1075,5 +1076,40 @@ func TestErofsSpecialFiles(t *testing.T) {
 		if inode.Rdev != exp.rdev {
 			t.Errorf("%s: expected Rdev 0x%x, got 0x%x", de.Name, exp.rdev, inode.Rdev)
 		}
+	}
+}
+
+type errorCloseReader struct {
+	io.Reader
+}
+
+func (e *errorCloseReader) Close() error {
+	return errors.New("simulated close error")
+}
+
+type errorCloseNode struct {
+	Node
+}
+
+func (e *errorCloseNode) Open() (io.ReadCloser, error) {
+	rc, err := e.Node.Open()
+	if err != nil {
+		return nil, err
+	}
+	return &errorCloseReader{Reader: rc}, nil
+}
+
+func TestErofsWriteImageCloseError(t *testing.T) {
+	fileNode := NewMemoryNode("file.txt", false, 0644, []byte("some content"), nil)
+	wrappedFile := &errorCloseNode{Node: fileNode}
+	root := NewMemoryNode("", true, 0755, nil, []Node{wrappedFile}, WithIno(0))
+
+	mw := &memoryWriterAt{}
+	err := WriteImage(mw, root)
+	if err == nil {
+		t.Fatalf("expected error from WriteImage when Close() fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "simulated close error") {
+		t.Fatalf("expected simulated close error, got: %v", err)
 	}
 }
