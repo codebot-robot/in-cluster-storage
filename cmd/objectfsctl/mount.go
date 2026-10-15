@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
@@ -34,12 +35,14 @@ import (
 
 type mountOptions struct {
 	*options
-	volumeID    string
-	writeMode   string
-	cacheSizeMB int64
-	nodeID      string
-	allowOther  bool
-	debug       bool
+	volumeID     string
+	writeMode    string
+	cacheSizeMB  int64
+	nodeID       string
+	allowOther   bool
+	debug        bool
+	entryTimeout time.Duration
+	attrTimeout  time.Duration
 }
 
 func parseWriteMode(val string) (pb.WriteMode, error) {
@@ -73,6 +76,8 @@ func newMountCommand(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&mountOpts.nodeID, "node-id", "", "Node ID reported to the controller (defaults to the hostname)")
 	cmd.Flags().BoolVar(&mountOpts.allowOther, "allow-other", false, "Allow other users to access the mount (requires user_allow_other in /etc/fuse.conf when not root)")
 	cmd.Flags().BoolVar(&mountOpts.debug, "debug", false, "Log every FUSE request")
+	cmd.Flags().DurationVar(&mountOpts.entryTimeout, "entry-timeout", 60*time.Second, "Kernel dentry cache timeout while watcher is healthy")
+	cmd.Flags().DurationVar(&mountOpts.attrTimeout, "attr-timeout", 60*time.Second, "Kernel attribute cache timeout while watcher is healthy")
 	return cmd
 }
 
@@ -114,6 +119,8 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 
 	nodeCache := objectfuse.NewNodeCache(opts.cacheSizeMB * 1024 * 1024)
 	rawFS := objectfuse.NewObjectFS(client, opts.volumeID, writeMode, nodeCache)
+	rawFS.SetEntryTimeout(opts.entryTimeout)
+	rawFS.SetAttrTimeout(opts.attrTimeout)
 
 	fuseOpts := &gofuse.MountOptions{
 		FsName:     "objectfs",

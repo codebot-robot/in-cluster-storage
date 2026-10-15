@@ -1307,6 +1307,80 @@ spec:
 		t.Fatalf("Immediate stat invalidation on open file failed: expected size %d, got %q (err: %v)", expectedSize, outStatOpen, err)
 	}
 
+	// 5. Testing dentry revalidation across watcher reconnection gap:
+	// A creates d/x, B lists d (dentry cached with long timeout),
+	// kill B's watch stream (restart controller), A deletes d/x during gap,
+	// wait for B's daemon to re-establish subscription, then ls d on B must not show x.
+	t.Logf("5. Testing dentry revalidation across watcher reconnection gap")
+
+	// Pod 1 (Client A) creates d/x and syncs
+	_, err = h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "mkdir -p /data/gap_dir && echo 'gap-content' > /data/gap_dir/gap_file.txt && sync /data/gap_dir/gap_file.txt")
+	if err != nil {
+		t.Fatalf("Failed to create gap_dir/gap_file.txt from Pod 1: %v", err)
+	}
+
+	// Pod 2 (Client B) lists d (dentry cached with 60s timeout)
+	lsOut1, err := h.RunInPod(pod2Name, "default", "ls", "/data/gap_dir")
+	if err != nil || !strings.Contains(lsOut1, "gap_file.txt") {
+		t.Fatalf("Pod 2 failed to list gap_dir: %v, out: %q", err, lsOut1)
+	}
+
+	// Record initial subscription count on Node 2's daemon
+	var daemonPodNode2 string
+	for _, pod := range h.getPodNames("app=objectfs-node-daemon", "default") {
+		logs := h.getContainerLogs(pod, "objectfs-node-daemon", "default", false)
+		if strings.Contains(logs, "node "+node2) {
+			daemonPodNode2 = pod
+			break
+		}
+	}
+	if daemonPodNode2 == "" {
+		t.Fatalf("Failed to identify daemon pod on Node 2 (%s)", node2)
+	}
+
+	subMsg := fmt.Sprintf("WatchVolume subscription established for volume %s, node %s", volumeID, node2)
+	initialLogs := h.getContainerLogs(daemonPodNode2, "objectfs-node-daemon", "default", false)
+	initialSubCount := strings.Count(initialLogs, subMsg)
+
+	// Restart controller to create a watcher outage
+	t.Logf("Restarting objectfs-controller to simulate watch stream outage")
+	h.RunCommand("kubectl", "delete", "pod", "objectfs-controller-0", "-n", "default", "--force", "--grace-period=0")
+	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
+		t.Fatalf("Controller failed to restart: %v", err)
+	}
+
+	// Pod 1 deletes d/x and syncs
+	_, err = h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "rm -f /data/gap_dir/gap_file.txt && sync")
+	if err != nil {
+		t.Fatalf("Failed to delete gap_file.txt from Pod 1: %v", err)
+	}
+
+	// Wait for Node 2's daemon log to show subscription re-established
+	t.Logf("Waiting for Node 2 daemon to re-establish WatchVolume subscription")
+	reconnectDeadline := time.Now().Add(30 * time.Second)
+	reconnected := false
+	for time.Now().Before(reconnectDeadline) {
+		logs := h.getContainerLogs(daemonPodNode2, "objectfs-node-daemon", "default", false)
+		currentCount := strings.Count(logs, subMsg)
+		if currentCount > initialSubCount {
+			reconnected = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !reconnected {
+		t.Fatalf("Node 2 daemon failed to re-establish subscription within 30s")
+	}
+
+	// Immediately ls d on Pod 2: gap_file.txt must not show up, without any further sleep!
+	lsOut2, err := h.RunInPod(pod2Name, "default", "ls", "/data/gap_dir")
+	if err != nil {
+		t.Fatalf("Pod 2 failed to list gap_dir after reconnect: %v", err)
+	}
+	if strings.Contains(lsOut2, "gap_file.txt") {
+		t.Fatalf("Dentry revalidation after reconnect failed: gap_file.txt still visible in ls output: %q", lsOut2)
+	}
+
 	h.DeletePod(pod1Name, "default")
 	h.DeletePod(pod2Name, "default")
 	t.Logf("Successfully verified immediate cross-node visibility in steady state!")

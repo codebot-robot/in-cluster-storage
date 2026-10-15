@@ -1802,7 +1802,7 @@ func TestFillAttrOutFromEmbeddedInode(t *testing.T) {
 	}
 
 	var entryOut fuse.EntryOut
-	fs.fillEntryOut(entry, &entryOut)
+	fs.fillEntryOut(entry, &entryOut, 1, "embedded")
 	if entryOut.NodeId != 42 {
 		t.Errorf("NodeId mismatch: got %d, want 42", entryOut.NodeId)
 	}
@@ -5855,5 +5855,611 @@ func TestTwoClientNoSelfInvalidation(t *testing.T) {
 	readBytesA, _ := resA.Bytes(nil)
 	if !bytes.Equal(readBytesA, data) {
 		t.Fatalf("Client A expected data %q, got %q", string(data), string(readBytesA))
+	}
+}
+
+func TestFOPENKeepCache(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-keep-cache-vol"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Create sets FOPEN_KEEP_CACHE in OpenOut
+	var createOut fuse.CreateOut
+	createStatus := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+		Flags:    syscall.O_CREAT | syscall.O_RDWR,
+	}, "testfile.txt", &createOut)
+	if createStatus != fuse.OK {
+		t.Fatalf("Create failed: %v", createStatus)
+	}
+	if createOut.OpenOut.OpenFlags&fuse.FOPEN_KEEP_CACHE == 0 {
+		t.Errorf("Expected FOPEN_KEEP_CACHE to be set in Create OpenOut.OpenFlags, got: %x", createOut.OpenOut.OpenFlags)
+	}
+
+	fileID := createOut.EntryOut.NodeId
+	if fileID == 0 {
+		t.Fatalf("Expected valid NodeId from Create")
+	}
+
+	// 2. Open sets FOPEN_KEEP_CACHE in OpenOut
+	var openOut fuse.OpenOut
+	openStatus := rawFS.Open(nil, &fuse.OpenIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Flags:    syscall.O_RDONLY,
+	}, &openOut)
+	if openStatus != fuse.OK {
+		t.Fatalf("Open failed: %v", openStatus)
+	}
+	if openOut.OpenFlags&fuse.FOPEN_KEEP_CACHE == 0 {
+		t.Errorf("Expected FOPEN_KEEP_CACHE to be set in Open OpenFlags, got: %x", openOut.OpenFlags)
+	}
+}
+
+func TestInodeLookupCountTracking(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-lookup-tracking-vol"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Initial state: root directory (inode 1) has lookup count 1
+	if count := rawFS.LookupCount(fuse.FUSE_ROOT_ID); count != 1 {
+		t.Fatalf("Expected root lookup count 1, got %d", count)
+	}
+	held := rawFS.HeldInodes()
+	if len(held) != 1 || held[0] != fuse.FUSE_ROOT_ID {
+		t.Fatalf("Expected initial HeldInodes to be [1], got: %v", held)
+	}
+
+	// 2. Create increments lookup count for new file
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "file1.txt", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+	if count := rawFS.LookupCount(fileID); count != 1 {
+		t.Errorf("Expected file1 lookup count 1 after Create, got %d", count)
+	}
+
+	// 3. Lookup increments lookup count
+	var lookupOut fuse.EntryOut
+	if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "file1.txt", &lookupOut); st != fuse.OK {
+		t.Fatalf("Lookup failed: %v", st)
+	}
+	if count := rawFS.LookupCount(fileID); count != 2 {
+		t.Errorf("Expected file1 lookup count 2 after Lookup, got %d", count)
+	}
+
+	// 4. Mkdir increments lookup count for new directory
+	var mkdirOut fuse.EntryOut
+	if st := rawFS.Mkdir(nil, &fuse.MkdirIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0755,
+	}, "subdir", &mkdirOut); st != fuse.OK {
+		t.Fatalf("Mkdir failed: %v", st)
+	}
+	dirID := mkdirOut.NodeId
+	if count := rawFS.LookupCount(dirID); count != 1 {
+		t.Errorf("Expected subdir lookup count 1 after Mkdir, got %d", count)
+	}
+
+	// 5. Mknod increments lookup count
+	var mknodOut fuse.EntryOut
+	if st := rawFS.Mknod(nil, &fuse.MknodIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     syscall.S_IFIFO | 0644,
+	}, "myfifo", &mknodOut); st != fuse.OK {
+		t.Fatalf("Mknod failed: %v", st)
+	}
+	fifoID := mknodOut.NodeId
+	if count := rawFS.LookupCount(fifoID); count != 1 {
+		t.Errorf("Expected fifo lookup count 1 after Mknod, got %d", count)
+	}
+
+	// 6. Symlink increments lookup count
+	var symOut fuse.EntryOut
+	if st := rawFS.Symlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "file1.txt", "symlink1", &symOut); st != fuse.OK {
+		t.Fatalf("Symlink failed: %v", st)
+	}
+	symID := symOut.NodeId
+	if count := rawFS.LookupCount(symID); count != 1 {
+		t.Errorf("Expected symlink lookup count 1 after Symlink, got %d", count)
+	}
+
+	// 7. Link increments lookup count
+	var linkOut fuse.EntryOut
+	if st := rawFS.Link(nil, &fuse.LinkIn{
+		InHeader:  fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Oldnodeid: fileID,
+	}, "hardlink1", &linkOut); st != fuse.OK {
+		t.Fatalf("Link failed: %v", st)
+	}
+	if count := rawFS.LookupCount(fileID); count != 3 {
+		t.Errorf("Expected file1 lookup count 3 after Link, got %d", count)
+	}
+
+	// 8. ReadDirPlus increments lookup count for all entries returned.
+	// Root contains file1.txt (fileID), subdir (dirID), myfifo (fifoID), symlink1 (symID), and hardlink1 (fileID).
+	// Because file1.txt and hardlink1 share fileID, fileID is incremented twice (+2 -> 5).
+	dirEntries := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := rawFS.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, dirEntries); st != fuse.OK {
+		t.Fatalf("ReadDirPlus failed: %v", st)
+	}
+	if count := rawFS.LookupCount(fileID); count != 5 {
+		t.Errorf("Expected file1 lookup count 5 after ReadDirPlus, got %d", count)
+	}
+	if count := rawFS.LookupCount(dirID); count != 2 {
+		t.Errorf("Expected subdir lookup count 2 after ReadDirPlus, got %d", count)
+	}
+	if count := rawFS.LookupCount(fifoID); count != 2 {
+		t.Errorf("Expected fifo lookup count 2 after ReadDirPlus, got %d", count)
+	}
+	if count := rawFS.LookupCount(symID); count != 2 {
+		t.Errorf("Expected symlink lookup count 2 after ReadDirPlus, got %d", count)
+	}
+
+	// 9. Forget decrements lookup count
+	rawFS.Forget(fileID, 1)
+	if count := rawFS.LookupCount(fileID); count != 4 {
+		t.Errorf("Expected file1 lookup count 4 after Forget(1), got %d", count)
+	}
+
+	// Decrement remaining count: 4 -> drops to 0 and deleted
+	rawFS.Forget(fileID, 4)
+	if count := rawFS.LookupCount(fileID); count != 0 {
+		t.Errorf("Expected file1 lookup count 0 after Forget(4), got %d", count)
+	}
+
+	// Verify fileID is no longer in HeldInodes
+	held = rawFS.HeldInodes()
+	for _, id := range held {
+		if id == fileID {
+			t.Errorf("Did not expect fileID %d in HeldInodes after forgetting all references", fileID)
+		}
+	}
+
+	// 10. Forget decrements multiple inodes
+	rawFS.Forget(dirID, 2)
+	rawFS.Forget(fifoID, 2)
+	if count := rawFS.LookupCount(dirID); count != 0 {
+		t.Errorf("Expected dirID lookup count 0 after Forget, got %d", count)
+	}
+	if count := rawFS.LookupCount(fifoID); count != 0 {
+		t.Errorf("Expected fifoID lookup count 0 after Forget, got %d", count)
+	}
+
+	// Over-forgetting drops count to 0 without panicking or underflowing
+	rawFS.Forget(symID, 999)
+	if count := rawFS.LookupCount(symID); count != 0 {
+		t.Errorf("Expected symID lookup count 0 after over-forgetting, got %d", count)
+	}
+}
+
+func TestHealthGatedTimeouts(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-gated-timeouts-vol"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Create test file
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "testfile.txt", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// 1. Initially disconnected: timeouts should be 1 second
+	if rawFS.IsWatcherConnected() {
+		t.Fatalf("Expected IsWatcherConnected to be false initially")
+	}
+
+	var lookupOut fuse.EntryOut
+	if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "testfile.txt", &lookupOut); st != fuse.OK {
+		t.Fatalf("Lookup failed: %v", st)
+	}
+	if lookupOut.EntryTimeout() != 1*time.Second {
+		t.Errorf("Expected disconnected EntryTimeout 1s, got %v", lookupOut.EntryTimeout())
+	}
+	if lookupOut.AttrTimeout() != 1*time.Second {
+		t.Errorf("Expected disconnected AttrTimeout 1s, got %v", lookupOut.AttrTimeout())
+	}
+
+	var attrOut fuse.AttrOut
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOut); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOut.Timeout() != 1*time.Second {
+		t.Errorf("Expected disconnected GetAttr Timeout 1s, got %v", attrOut.Timeout())
+	}
+
+	var setAttrOut fuse.AttrOut
+	if st := rawFS.SetAttr(nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			InHeader: fuse.InHeader{NodeId: fileID},
+			Valid:    fuse.FATTR_MODE,
+			Mode:     0600,
+		},
+	}, &setAttrOut); st != fuse.OK {
+		t.Fatalf("SetAttr failed: %v", st)
+	}
+	if setAttrOut.Timeout() != 1*time.Second {
+		t.Errorf("Expected disconnected SetAttr Timeout 1s, got %v", setAttrOut.Timeout())
+	}
+
+	// 2. Watcher connected: timeouts should be DefaultConnectedEntryTimeout (60s)
+	rawFS.SetWatcherConnected(true)
+	if !rawFS.IsWatcherConnected() {
+		t.Fatalf("Expected IsWatcherConnected to be true")
+	}
+
+	var lookupOutConn fuse.EntryOut
+	if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "testfile.txt", &lookupOutConn); st != fuse.OK {
+		t.Fatalf("Lookup failed: %v", st)
+	}
+	if lookupOutConn.EntryTimeout() != 60*time.Second {
+		t.Errorf("Expected connected EntryTimeout 60s, got %v", lookupOutConn.EntryTimeout())
+	}
+	if lookupOutConn.AttrTimeout() != 60*time.Second {
+		t.Errorf("Expected connected AttrTimeout 60s, got %v", lookupOutConn.AttrTimeout())
+	}
+
+	var attrOutConn fuse.AttrOut
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOutConn); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOutConn.Timeout() != 60*time.Second {
+		t.Errorf("Expected connected GetAttr Timeout 60s, got %v", attrOutConn.Timeout())
+	}
+
+	// 3. Custom configured timeouts while connected
+	rawFS.SetEntryTimeout(45 * time.Second)
+	rawFS.SetAttrTimeout(30 * time.Second)
+
+	var lookupOutCustom fuse.EntryOut
+	if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "testfile.txt", &lookupOutCustom); st != fuse.OK {
+		t.Fatalf("Lookup failed: %v", st)
+	}
+	if lookupOutCustom.EntryTimeout() != 45*time.Second {
+		t.Errorf("Expected custom EntryTimeout 45s, got %v", lookupOutCustom.EntryTimeout())
+	}
+	if lookupOutCustom.AttrTimeout() != 30*time.Second {
+		t.Errorf("Expected custom AttrTimeout 30s, got %v", lookupOutCustom.AttrTimeout())
+	}
+
+	var attrOutCustom fuse.AttrOut
+	if st := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fileID}}, &attrOutCustom); st != fuse.OK {
+		t.Fatalf("GetAttr failed: %v", st)
+	}
+	if attrOutCustom.Timeout() != 30*time.Second {
+		t.Errorf("Expected custom GetAttr Timeout 30s, got %v", attrOutCustom.Timeout())
+	}
+
+	// 4. Watcher disconnects: timeouts fall back to 1 second
+	rawFS.SetWatcherConnected(false)
+
+	var lookupOutFallback fuse.EntryOut
+	if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "testfile.txt", &lookupOutFallback); st != fuse.OK {
+		t.Fatalf("Lookup failed: %v", st)
+	}
+	if lookupOutFallback.EntryTimeout() != 1*time.Second {
+		t.Errorf("Expected fallback EntryTimeout 1s, got %v", lookupOutFallback.EntryTimeout())
+	}
+	if lookupOutFallback.AttrTimeout() != 1*time.Second {
+		t.Errorf("Expected fallback AttrTimeout 1s, got %v", lookupOutFallback.AttrTimeout())
+	}
+}
+
+func TestReconnectSweep(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-reconnect-sweep-vol"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var notifyMu sync.Mutex
+	var events []notifyEvent
+	rawFS.notifyHook = func(e notifyEvent) {
+		notifyMu.Lock()
+		events = append(events, e)
+		notifyMu.Unlock()
+	}
+
+	// Create file1 (ino ~10) and file2 (ino ~20)
+	var create1, create2 fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "f1.txt", &create1); st != fuse.OK {
+		t.Fatalf("Create f1 failed: %v", st)
+	}
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "f2.txt", &create2); st != fuse.OK {
+		t.Fatalf("Create f2 failed: %v", st)
+	}
+
+	f1ID := create1.EntryOut.NodeId
+	f2ID := create2.EntryOut.NodeId
+
+	// Held inodes are now root (1), f1ID, and f2ID
+	held := rawFS.HeldInodes()
+	if len(held) != 3 {
+		t.Fatalf("Expected 3 held inodes, got %v", held)
+	}
+
+	// Trigger reconnect sweep
+	notifyMu.Lock()
+	events = nil
+	notifyMu.Unlock()
+
+	rawFS.SweepRevalidateInodes()
+
+	notifyMu.Lock()
+	sweepEvents := make([]notifyEvent, len(events))
+	copy(sweepEvents, events)
+	notifyMu.Unlock()
+
+	// Verify sweep issued EntryNotify for tracked dentries and InodeNotify(ino, -1, 0) for each held inode:
+	// 2 dentries (f1.txt, f2.txt) + 3 inodes (root, f1ID, f2ID) = 5 events.
+	if len(sweepEvents) != 5 {
+		t.Fatalf("Expected 5 sweep events, got %d: %+v", len(sweepEvents), sweepEvents)
+	}
+
+	expectedInodes := map[uint64]bool{
+		fuse.FUSE_ROOT_ID: true,
+		f1ID:              true,
+		f2ID:              true,
+	}
+	expectedDentries := map[string]bool{
+		"f1.txt": true,
+		"f2.txt": true,
+	}
+	for _, ev := range sweepEvents {
+		if ev.Op == "entry" {
+			if ev.Parent != fuse.FUSE_ROOT_ID {
+				t.Errorf("Expected parent %d, got %d", fuse.FUSE_ROOT_ID, ev.Parent)
+			}
+			if !expectedDentries[ev.Name] {
+				t.Errorf("Unexpected dentry name in sweep: %s", ev.Name)
+			}
+			delete(expectedDentries, ev.Name)
+		} else if ev.Op == "inode" {
+			if ev.Off != -1 || ev.Length != 0 {
+				t.Errorf("Expected metadata-only invalidation (-1, 0), got (%d, %d)", ev.Off, ev.Length)
+			}
+			if !expectedInodes[ev.Inode] {
+				t.Errorf("Unexpected inode in sweep: %d", ev.Inode)
+			}
+			delete(expectedInodes, ev.Inode)
+		} else {
+			t.Errorf("Unexpected op: %s", ev.Op)
+		}
+	}
+	if len(expectedInodes) != 0 {
+		t.Errorf("Missing inodes in sweep: %+v", expectedInodes)
+	}
+	if len(expectedDentries) != 0 {
+		t.Errorf("Missing dentries in sweep: %+v", expectedDentries)
+	}
+
+	// Now forget f2ID completely
+	rawFS.Forget(f2ID, rawFS.LookupCount(f2ID))
+
+	// Sweep again: f2ID and its dentry must NOT be swept
+	notifyMu.Lock()
+	events = nil
+	notifyMu.Unlock()
+
+	rawFS.SweepRevalidateInodes()
+
+	notifyMu.Lock()
+	sweepEvents2 := make([]notifyEvent, len(events))
+	copy(sweepEvents2, events)
+	notifyMu.Unlock()
+
+	// 1 dentry (f1.txt) + 2 inodes (root, f1ID) = 3 events
+	if len(sweepEvents2) != 3 {
+		t.Fatalf("Expected 3 sweep events after forgetting f2ID, got %d: %+v", len(sweepEvents2), sweepEvents2)
+	}
+	for _, ev := range sweepEvents2 {
+		if ev.Op == "inode" && ev.Inode == f2ID {
+			t.Errorf("Forgotten inode %d was unexpectedly swept!", f2ID)
+		}
+		if ev.Op == "entry" && ev.Name == "f2.txt" {
+			t.Errorf("Forgotten dentry f2.txt was unexpectedly swept!")
+		}
+	}
+}
+
+func TestTwoClientsDentryAndInodeReconnectSweep(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-two-clients-sweep-vol"
+	cacheA := NewNodeCache(1024 * 1024)
+	cacheB := NewNodeCache(1024 * 1024)
+	rawFSA := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheA)
+	rawFSB := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheB)
+
+	// A creates a file under root
+	var createA fuse.CreateOut
+	if st := rawFSA.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "shared_file.txt", &createA); st != fuse.OK {
+		t.Fatalf("Client A failed to create file: %v", st)
+	}
+	fileID := createA.EntryOut.NodeId
+
+	// B hooks notifications
+	var notifyMu sync.Mutex
+	var eventsB []notifyEvent
+	rawFSB.notifyHook = func(e notifyEvent) {
+		notifyMu.Lock()
+		eventsB = append(eventsB, e)
+		notifyMu.Unlock()
+	}
+
+	// B looks up the file, populating its dentry and inode cache
+	var lookupB fuse.EntryOut
+	if st := rawFSB.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "shared_file.txt", &lookupB); st != fuse.OK {
+		t.Fatalf("Client B failed to lookup file: %v", st)
+	}
+	if lookupB.NodeId != fileID {
+		t.Fatalf("Client B got NodeId %d, want %d", lookupB.NodeId, fileID)
+	}
+
+	// B holds dentry (1, "shared_file.txt") and inode fileID
+	dentriesB := rawFSB.TrackedDentries()
+	if len(dentriesB) != 1 || dentriesB[0].Parent != fuse.FUSE_ROOT_ID || dentriesB[0].Name != "shared_file.txt" {
+		t.Fatalf("Client B expected tracked dentry (1, shared_file.txt), got: %+v", dentriesB)
+	}
+
+	// Simulate watcher drop and reconnect on B
+	notifyMu.Lock()
+	eventsB = nil
+	notifyMu.Unlock()
+
+	rawFSB.SweepRevalidateInodes()
+
+	notifyMu.Lock()
+	sweep1 := make([]notifyEvent, len(eventsB))
+	copy(sweep1, eventsB)
+	notifyMu.Unlock()
+
+	// Assert sweep emits EntryNotify(1, "shared_file.txt") and InodeNotify(fileID, -1, 0)
+	foundEntry := false
+	foundInode := false
+	for _, ev := range sweep1 {
+		if ev.Op == "entry" && ev.Parent == fuse.FUSE_ROOT_ID && ev.Name == "shared_file.txt" {
+			foundEntry = true
+		}
+		if ev.Op == "inode" && ev.Inode == fileID && ev.Off == -1 && ev.Length == 0 {
+			foundInode = true
+		}
+	}
+	if !foundEntry {
+		t.Errorf("Expected sweep to emit EntryNotify(1, shared_file.txt), got events: %+v", sweep1)
+	}
+	if !foundInode {
+		t.Errorf("Expected sweep to emit InodeNotify(%d, -1, 0), got events: %+v", fileID, sweep1)
+	}
+
+	// B forgets the file completely
+	rawFSB.Forget(fileID, rawFSB.LookupCount(fileID))
+
+	// Re-sweep: neither EntryNotify nor InodeNotify for fileID should be emitted
+	notifyMu.Lock()
+	eventsB = nil
+	notifyMu.Unlock()
+
+	rawFSB.SweepRevalidateInodes()
+
+	notifyMu.Lock()
+	sweep2 := make([]notifyEvent, len(eventsB))
+	copy(sweep2, eventsB)
+	notifyMu.Unlock()
+
+	for _, ev := range sweep2 {
+		if ev.Op == "entry" && ev.Name == "shared_file.txt" {
+			t.Errorf("Forgotten dentry shared_file.txt was unexpectedly swept after Forget: %+v", ev)
+		}
+		if ev.Op == "inode" && ev.Inode == fileID {
+			t.Errorf("Forgotten inode %d was unexpectedly swept after Forget: %+v", fileID, ev)
+		}
+	}
+}
+
+func TestStartWatcherHealthAndSweep(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "test-watcher-health-vol"
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var notifyMu sync.Mutex
+	var events []notifyEvent
+	rawFS.notifyHook = func(e notifyEvent) {
+		notifyMu.Lock()
+		events = append(events, e)
+		notifyMu.Unlock()
+	}
+
+	// File created before watcher starts
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "prefile.txt", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+
+	if rawFS.IsWatcherConnected() {
+		t.Fatalf("Expected watcher to be disconnected initially")
+	}
+
+	watchCtx, cancelWatch := context.WithCancel(t.Context())
+	defer cancelWatch()
+
+	StartWatcher(watchCtx, client, volumeID, "test-node", cache, rawFS)
+
+	// Poll until IsWatcherConnected becomes true
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if rawFS.IsWatcherConnected() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !rawFS.IsWatcherConnected() {
+		t.Fatalf("Expected watcher to become connected")
+	}
+
+	// While connected, timeouts are 60s
+	var lookupOut fuse.EntryOut
+	if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "prefile.txt", &lookupOut); st != fuse.OK {
+		t.Fatalf("Lookup failed: %v", st)
+	}
+	if lookupOut.EntryTimeout() != 60*time.Second {
+		t.Errorf("Expected 60s EntryTimeout while connected, got %v", lookupOut.EntryTimeout())
+	}
+
+	// Cancel watcher
+	cancelWatch()
+
+	// Poll until IsWatcherConnected becomes false
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !rawFS.IsWatcherConnected() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rawFS.IsWatcherConnected() {
+		t.Fatalf("Expected watcher to become disconnected after context cancellation")
+	}
+
+	// While disconnected, timeouts fall back to 1s
+	if st := rawFS.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "prefile.txt", &lookupOut); st != fuse.OK {
+		t.Fatalf("Lookup failed: %v", st)
+	}
+	if lookupOut.EntryTimeout() != 1*time.Second {
+		t.Errorf("Expected 1s EntryTimeout after disconnect, got %v", lookupOut.EntryTimeout())
 	}
 }

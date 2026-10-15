@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,8 +46,32 @@ const DefaultRPCTimeout = 30 * time.Second
 // DefaultSyncTimeout is the default deadline applied to sync operations (Fsync, Flush, Write).
 const DefaultSyncTimeout = 10 * time.Minute
 
+// DefaultConnectedEntryTimeout is the dentry cache timeout returned while the watcher is connected.
+const DefaultConnectedEntryTimeout = 60 * time.Second
+
+// DefaultConnectedAttrTimeout is the attribute cache timeout returned while the watcher is connected.
+const DefaultConnectedAttrTimeout = 60 * time.Second
+
+// DisconnectedTimeout is the entry and attribute timeout returned while the watcher is disconnected.
+const DisconnectedTimeout = 1 * time.Second
+
+// LongWatcherGapThreshold is the duration after which an ongoing watcher disconnect
+// triggers a warning log.
+const LongWatcherGapThreshold = 10 * time.Second
+
 // DefaultPrefetchWindow is the number of chunks to prefetch ahead (32 chunks * 64KB = 2 MiB).
 const DefaultPrefetchWindow = 32
+
+type dentryKey struct {
+	parent uint64
+	name   string
+}
+
+// TrackedDentry represents a (parent, name) directory entry held in kernel cache.
+type TrackedDentry struct {
+	Parent uint64
+	Name   string
+}
 
 type fileManifest struct {
 	inode      uint64
@@ -90,6 +115,15 @@ type ObjectFS struct {
 	statfsExpiry time.Time
 	statfsTTL    time.Duration
 
+	entryTimeout     time.Duration
+	attrTimeout      time.Duration
+	watcherConnected atomic.Bool
+
+	lookupMu      sync.Mutex
+	lookups       map[uint64]uint64
+	dentries      map[uint64]map[string]struct{}
+	childDentries map[uint64]map[dentryKey]struct{}
+
 	notifyHook func(notifyEvent)
 }
 
@@ -129,7 +163,13 @@ func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string
 		lastReadChunk:          make(map[uint64]int),
 		furthestPrefetched:     make(map[uint64]int),
 		statfsTTL:              time.Second,
+		entryTimeout:           DefaultConnectedEntryTimeout,
+		attrTimeout:            DefaultConnectedAttrTimeout,
+		lookups:                make(map[uint64]uint64),
+		dentries:               make(map[uint64]map[string]struct{}),
+		childDentries:          make(map[uint64]map[dentryKey]struct{}),
 	}
+	fs.lookups[fuse.FUSE_ROOT_ID] = 1
 	return fs
 }
 
@@ -341,6 +381,170 @@ func (fs *ObjectFS) Init(server *fuse.Server) {
 	fs.server = server
 }
 
+func (fs *ObjectFS) SetEntryTimeout(d time.Duration) {
+	fs.entryTimeout = d
+}
+
+func (fs *ObjectFS) SetAttrTimeout(d time.Duration) {
+	fs.attrTimeout = d
+}
+
+func (fs *ObjectFS) EntryTimeout() time.Duration {
+	return fs.entryTimeout
+}
+
+func (fs *ObjectFS) AttrTimeout() time.Duration {
+	return fs.attrTimeout
+}
+
+func (fs *ObjectFS) SetWatcherConnected(connected bool) {
+	fs.watcherConnected.Store(connected)
+}
+
+func (fs *ObjectFS) IsWatcherConnected() bool {
+	return fs.watcherConnected.Load()
+}
+
+func (fs *ObjectFS) currentEntryTimeout() time.Duration {
+	if fs.IsWatcherConnected() {
+		if fs.entryTimeout > 0 {
+			return fs.entryTimeout
+		}
+		return DefaultConnectedEntryTimeout
+	}
+	return DisconnectedTimeout
+}
+
+func (fs *ObjectFS) currentAttrTimeout() time.Duration {
+	if fs.IsWatcherConnected() {
+		if fs.attrTimeout > 0 {
+			return fs.attrTimeout
+		}
+		return DefaultConnectedAttrTimeout
+	}
+	return DisconnectedTimeout
+}
+
+func (fs *ObjectFS) trackDentryLocked(parent uint64, name string, childIno uint64) {
+	if parent == 0 || name == "" || childIno == 0 {
+		return
+	}
+	if fs.dentries == nil {
+		fs.dentries = make(map[uint64]map[string]struct{})
+	}
+	names, ok := fs.dentries[parent]
+	if !ok {
+		names = make(map[string]struct{})
+		fs.dentries[parent] = names
+	}
+	names[name] = struct{}{}
+
+	if fs.childDentries == nil {
+		fs.childDentries = make(map[uint64]map[dentryKey]struct{})
+	}
+	dk := dentryKey{parent: parent, name: name}
+	dkMap, ok := fs.childDentries[childIno]
+	if !ok {
+		dkMap = make(map[dentryKey]struct{})
+		fs.childDentries[childIno] = dkMap
+	}
+	dkMap[dk] = struct{}{}
+}
+
+// TrackedDentries returns a sorted slice of all (parent, name) pairs currently tracked as held by the kernel.
+func (fs *ObjectFS) TrackedDentries() []TrackedDentry {
+	fs.lookupMu.Lock()
+	defer fs.lookupMu.Unlock()
+	var res []TrackedDentry
+	for parent, names := range fs.dentries {
+		for name := range names {
+			res = append(res, TrackedDentry{Parent: parent, Name: name})
+		}
+	}
+	sort.Slice(res, func(i, j int) bool {
+		if res[i].Parent != res[j].Parent {
+			return res[i].Parent < res[j].Parent
+		}
+		return res[i].Name < res[j].Name
+	})
+	return res
+}
+
+// Forget is called by the kernel when discarding an entry from its dentry/inode cache.
+func (fs *ObjectFS) Forget(nodeid, nlookup uint64) {
+	if nodeid == 0 || nlookup == 0 {
+		return
+	}
+	fs.lookupMu.Lock()
+	defer fs.lookupMu.Unlock()
+	if fs.lookups == nil {
+		return
+	}
+	cur := fs.lookups[nodeid]
+	if cur <= nlookup {
+		delete(fs.lookups, nodeid)
+		if fs.childDentries != nil {
+			if dks, ok := fs.childDentries[nodeid]; ok {
+				for dk := range dks {
+					if names, ok := fs.dentries[dk.parent]; ok {
+						delete(names, dk.name)
+						if len(names) == 0 {
+							delete(fs.dentries, dk.parent)
+						}
+					}
+				}
+				delete(fs.childDentries, nodeid)
+			}
+		}
+	} else {
+		fs.lookups[nodeid] = cur - nlookup
+	}
+}
+
+// LookupCount returns the kernel lookup count currently tracked for the inode.
+func (fs *ObjectFS) LookupCount(nodeid uint64) uint64 {
+	fs.lookupMu.Lock()
+	defer fs.lookupMu.Unlock()
+	if fs.lookups == nil {
+		return 0
+	}
+	return fs.lookups[nodeid]
+}
+
+// HeldInodes returns a sorted slice of all inode IDs currently tracked as held by the kernel.
+func (fs *ObjectFS) HeldInodes() []uint64 {
+	fs.lookupMu.Lock()
+	defer fs.lookupMu.Unlock()
+	if fs.lookups == nil {
+		return nil
+	}
+	inodes := make([]uint64, 0, len(fs.lookups))
+	for ino, count := range fs.lookups {
+		if count > 0 {
+			inodes = append(inodes, ino)
+		}
+	}
+	sort.Slice(inodes, func(i, j int) bool { return inodes[i] < inodes[j] })
+	return inodes
+}
+
+// SweepRevalidateInodes sends EntryNotify(parent, name) for every tracked dentry
+// and InodeNotify(ino, -1, 0) for every held inode, invalidating kernel caches
+// after a watcher reconnection.
+func (fs *ObjectFS) SweepRevalidateInodes() {
+	dentries := fs.TrackedDentries()
+	inodes := fs.HeldInodes()
+
+	klog.V(2).Infof("ObjectFS(%s): sweeping %d dentries and %d inodes on reconnect", fs.volumeID, len(dentries), len(inodes))
+
+	for _, d := range dentries {
+		fs.notifyEntry(d.Parent, d.Name)
+	}
+	for _, ino := range inodes {
+		fs.notifyInode(ino, -1, 0)
+	}
+}
+
 func (fs *ObjectFS) makeContext(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
 	return fs.makeContextWithTimeout(cancel, fs.rpcTimeout, DefaultRPCTimeout)
 }
@@ -490,14 +694,25 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 	}
 }
 
-func (fs *ObjectFS) fillEntryOut(attr *pb.EntryAttr, out *fuse.EntryOut) {
+func (fs *ObjectFS) fillEntryOut(attr *pb.EntryAttr, out *fuse.EntryOut, parent uint64, name string) {
 	fs.fillAttrOut(attr, &out.Attr)
 	if attr != nil && attr.GetInode() != nil {
 		out.NodeId = attr.GetInode().GetIno()
 	}
 	out.Generation = 1
-	out.SetEntryTimeout(1 * time.Second)
-	out.SetAttrTimeout(1 * time.Second)
+	out.SetEntryTimeout(fs.currentEntryTimeout())
+	out.SetAttrTimeout(fs.currentAttrTimeout())
+	if out.NodeId != 0 {
+		fs.lookupMu.Lock()
+		if fs.lookups == nil {
+			fs.lookups = make(map[uint64]uint64)
+		}
+		fs.lookups[out.NodeId]++
+		if parent != 0 && name != "" {
+			fs.trackDentryLocked(parent, name, out.NodeId)
+		}
+		fs.lookupMu.Unlock()
+	}
 }
 
 func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
@@ -522,7 +737,7 @@ func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 	if attr == nil {
 		return fuse.ENOENT
 	}
-	fs.fillEntryOut(attr, out)
+	fs.fillEntryOut(attr, out, header.NodeId, name)
 	return fuse.OK
 }
 
@@ -545,7 +760,7 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 		return fuse.ENOENT
 	}
 	fs.fillAttrOut(attr, &out.Attr)
-	out.SetTimeout(1 * time.Second)
+	out.SetTimeout(fs.currentAttrTimeout())
 	return fuse.OK
 }
 
@@ -643,7 +858,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	if input.Valid&fuse.FATTR_SIZE != 0 {
 		out.Attr.Size = input.Size
 	}
-	out.SetTimeout(1 * time.Second)
+	out.SetTimeout(fs.currentAttrTimeout())
 	return fuse.OK
 }
 
@@ -810,7 +1025,7 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 	if fs.cache != nil && resp.GetStreamPosition() > 0 {
 		fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
 	}
-	fs.fillEntryOut(attr, out)
+	fs.fillEntryOut(attr, out, input.NodeId, name)
 	return fuse.OK
 }
 
@@ -844,8 +1059,9 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 		fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
 	}
 	fs.cache.Put(attr.GetInode().GetIno(), []byte{}, time.Now(), "")
-	fs.fillEntryOut(attr, &out.EntryOut)
+	fs.fillEntryOut(attr, &out.EntryOut, input.NodeId, name)
 	out.OpenOut.Fh = resp.GetFh()
+	out.OpenOut.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 	return fuse.OK
 }
 
@@ -878,7 +1094,7 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 	if fs.cache != nil && resp.GetStreamPosition() > 0 {
 		fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
 	}
-	fs.fillEntryOut(attr, out)
+	fs.fillEntryOut(attr, out, input.NodeId, name)
 	return fuse.OK
 }
 
@@ -977,6 +1193,7 @@ func (fs *ObjectFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.O
 		return fuse.Status(resp.GetError())
 	}
 	out.Fh = resp.GetFh()
+	out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 
 	if fs.diskCache != nil {
 		fs.startPrefetchOnOpen(input.NodeId, out.Fh)
@@ -1061,7 +1278,7 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 		if entryOut == nil {
 			break
 		}
-		fs.fillEntryOut(entry, entryOut)
+		fs.fillEntryOut(entry, entryOut, input.NodeId, entry.GetName())
 	}
 	return fuse.OK
 }
@@ -1094,7 +1311,7 @@ func (fs *ObjectFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, point
 	if fs.cache != nil && resp.GetStreamPosition() > 0 {
 		fs.cache.RecordPosition(header.NodeId, resp.GetStreamPosition())
 	}
-	fs.fillEntryOut(attr, out)
+	fs.fillEntryOut(attr, out, header.NodeId, linkName)
 	return fuse.OK
 }
 
@@ -1143,7 +1360,7 @@ func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename st
 		fs.cache.RecordPosition(input.NodeId, pos)
 		fs.cache.RecordPosition(input.Oldnodeid, pos)
 	}
-	fs.fillEntryOut(attr, out)
+	fs.fillEntryOut(attr, out, input.NodeId, filename)
 	return fuse.OK
 }
 
@@ -2169,9 +2386,19 @@ func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*Object
 
 func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, nodeID string, cache *NodeCache, fs ...*ObjectFS) {
 	go func() {
+		defer func() {
+			for _, f := range fs {
+				if f != nil {
+					f.SetWatcherConnected(false)
+				}
+			}
+		}()
+
 		backoff := 100 * time.Millisecond
 		maxBackoff := 1 * time.Second
 		hasDisconnected := false
+		var disconnectTime time.Time
+		loggedLongGap := false
 
 		for {
 			select {
@@ -2185,7 +2412,21 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				NodeId:   nodeID,
 			})
 			if err != nil {
-				hasDisconnected = true
+				if !hasDisconnected {
+					hasDisconnected = true
+					disconnectTime = time.Now()
+					loggedLongGap = false
+				}
+				for _, f := range fs {
+					if f != nil {
+						f.SetWatcherConnected(false)
+					}
+				}
+				gap := time.Since(disconnectTime)
+				if gap >= LongWatcherGapThreshold && !loggedLongGap {
+					klog.Warningf("WatchVolume disconnected for volume %s, node %s for %v (exceeds %v threshold)", volumeID, nodeID, gap.Round(time.Millisecond), LongWatcherGapThreshold)
+					loggedLongGap = true
+				}
 				klog.V(2).Infof("WatchVolume dial error for volume %s, node %s: %v; backing off %v", volumeID, nodeID, err, backoff)
 				select {
 				case <-ctx.Done():
@@ -2201,8 +2442,8 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 
 			klog.V(2).Infof("WatchVolume subscription established for volume %s, node %s", volumeID, nodeID)
 			if hasDisconnected {
-				// Invalidate all clean entries that might have changed on controller while disconnected
-				klog.V(2).Infof("WatchVolume reconnected for volume %s, node %s; invalidating clean cache and manifests", volumeID, nodeID)
+				totalGap := time.Since(disconnectTime)
+				klog.V(2).Infof("WatchVolume reconnected for volume %s, node %s after total gap of %v; invalidating clean cache and manifests", volumeID, nodeID, totalGap.Round(time.Millisecond))
 				if cache != nil {
 					cache.ResetKnownPositions()
 					cache.InvalidateAllClean()
@@ -2210,7 +2451,15 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				for _, f := range fs {
 					if f != nil {
 						f.invalidateAllManifests()
+						f.SweepRevalidateInodes()
 					}
+				}
+				hasDisconnected = false
+				loggedLongGap = false
+			}
+			for _, f := range fs {
+				if f != nil {
+					f.SetWatcherConnected(true)
 				}
 			}
 			backoff = 100 * time.Millisecond
@@ -2218,7 +2467,16 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 			for {
 				ev, err := stream.Recv()
 				if err != nil {
-					hasDisconnected = true
+					if !hasDisconnected {
+						hasDisconnected = true
+						disconnectTime = time.Now()
+						loggedLongGap = false
+					}
+					for _, f := range fs {
+						if f != nil {
+							f.SetWatcherConnected(false)
+						}
+					}
 					klog.V(2).Infof("WatchVolume stream error for volume %s, node %s: %v; backing off %v", volumeID, nodeID, err, backoff)
 					break
 				}
