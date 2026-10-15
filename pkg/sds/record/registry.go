@@ -16,6 +16,7 @@ package record
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sort"
@@ -27,6 +28,7 @@ import (
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
@@ -35,7 +37,55 @@ var (
 	ErrMissingDescriptors = errors.New("missing FileDescriptorSet for new type registration")
 	// ErrTypeIDTooLow is returned when an application type definition uses an ID < 16.
 	ErrTypeIDTooLow = errors.New("application type ID must be >= 16")
+
+	compiledFPCache   sync.Map // protoreflect.FullName -> []byte
+	dynamicFilesMu    sync.RWMutex
+	dynamicFilesCache = make(map[[32]byte]*protoregistry.Files)
 )
+
+func getCompiledFingerprint(md protoreflect.MessageDescriptor) ([]byte, error) {
+	name := md.FullName()
+	if v, ok := compiledFPCache.Load(name); ok {
+		return v.([]byte), nil
+	}
+	fp, _, err := ComputeMessageFingerprint(md)
+	if err != nil {
+		return nil, err
+	}
+	compiledFPCache.Store(name, fp)
+	return fp, nil
+}
+
+func getOrCreateFiles(fds *descriptorpb.FileDescriptorSet) (*protoregistry.Files, error) {
+	if fds == nil {
+		return nil, ErrMissingDescriptors
+	}
+	raw, err := proto.Marshal(fds)
+	if err != nil {
+		return nil, err
+	}
+	key := sha256.Sum256(raw)
+
+	dynamicFilesMu.RLock()
+	files, ok := dynamicFilesCache[key]
+	dynamicFilesMu.RUnlock()
+	if ok {
+		return files, nil
+	}
+
+	dynamicFilesMu.Lock()
+	defer dynamicFilesMu.Unlock()
+	if files, ok := dynamicFilesCache[key]; ok {
+		return files, nil
+	}
+
+	files, err = protodesc.NewFiles(fds)
+	if err != nil {
+		return nil, err
+	}
+	dynamicFilesCache[key] = files
+	return files, nil
+}
 
 type typeEntry struct {
 	def          *sdsv1.TypeDefinition
@@ -216,11 +266,21 @@ func registerIntoSnapshot(s *registrySnapshot, def *sdsv1.TypeDefinition) error 
 }
 
 func resolveMessageDescriptor(def *sdsv1.TypeDefinition) (protoreflect.MessageDescriptor, error) {
-	files, err := protodesc.NewFiles(def.GetDescriptors())
+	fullName := protoreflect.FullName(def.GetName())
+	if d, err := protoregistry.GlobalFiles.FindDescriptorByName(fullName); err == nil && d != nil {
+		if md, ok := d.(protoreflect.MessageDescriptor); ok {
+			compiledFP, err := getCompiledFingerprint(md)
+			if err == nil && bytes.Equal(compiledFP, def.GetFingerprint()) {
+				return md, nil
+			}
+		}
+	}
+
+	files, err := getOrCreateFiles(def.GetDescriptors())
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse descriptors for type ID %d: %w", def.GetId(), err)
 	}
-	d, err := files.FindDescriptorByName(protoreflect.FullName(def.GetName()))
+	d, err := files.FindDescriptorByName(fullName)
 	if err != nil {
 		return nil, fmt.Errorf("message %q not found in descriptors for type ID %d: %w", def.GetName(), def.GetId(), err)
 	}
@@ -239,7 +299,10 @@ func resolveMessageType(def *sdsv1.TypeDefinition, md protoreflect.MessageDescri
 	fullName := protoreflect.FullName(def.GetName())
 	if globalType, err := protoregistry.GlobalTypes.FindMessageByName(fullName); err == nil && globalType != nil {
 		compiledMD := globalType.Descriptor()
-		compiledFP, _, err := ComputeMessageFingerprint(compiledMD)
+		if compiledMD == md {
+			return globalType, nil
+		}
+		compiledFP, err := getCompiledFingerprint(compiledMD)
 		if err != nil {
 			return nil, fmt.Errorf("failed to compute fingerprint for compiled type %s: %w", fullName, err)
 		}

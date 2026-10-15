@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
@@ -378,5 +379,127 @@ func TestRegistryRejectsUnresolvableDefinition(t *testing.T) {
 	}
 	if _, err := reg.ResolveMessageType(def.GetId()); !errors.Is(err, ErrTypeNotRegistered) {
 		t.Errorf("ResolveMessageType error = %v, want ErrTypeNotRegistered", err)
+	}
+}
+
+func TestRegistryCompiledTypeSharingAndDynamicFallback(t *testing.T) {
+	// 1. Register a compiled Go type in two registries.
+	// Assert descriptor pointers match the compiled descriptor.
+	reg1 := NewRegistry()
+	reg2 := NewRegistry()
+
+	compiledMD := (&sdsv1.TxCommit{}).ProtoReflect().Descriptor()
+	def1, err := reg1.RegisterMessage(&sdsv1.TxCommit{}, 1)
+	if err != nil {
+		t.Fatalf("reg1.RegisterMessage failed: %v", err)
+	}
+	def2, err := reg2.RegisterMessage(&sdsv1.TxCommit{}, 1)
+	if err != nil {
+		t.Fatalf("reg2.RegisterMessage failed: %v", err)
+	}
+
+	_, md1, ok1 := reg1.LookupByID(def1.GetId())
+	if !ok1 || md1 == nil {
+		t.Fatalf("reg1.LookupByID failed")
+	}
+	_, md2, ok2 := reg2.LookupByID(def2.GetId())
+	if !ok2 || md2 == nil {
+		t.Fatalf("reg2.LookupByID failed")
+	}
+
+	if md1 != compiledMD {
+		t.Errorf("reg1 descriptor pointer = %p, want compiled descriptor %p", md1, compiledMD)
+	}
+	if md2 != compiledMD {
+		t.Errorf("reg2 descriptor pointer = %p, want compiled descriptor %p", md2, compiledMD)
+	}
+	if md1 != md2 {
+		t.Errorf("expected identical descriptor pointer across registries, got %p != %p", md1, md2)
+	}
+
+	// Verify ResolveMessageType also resolves to the compiled type.
+	mt1, err := reg1.ResolveMessageType(def1.GetId())
+	if err != nil {
+		t.Fatalf("reg1.ResolveMessageType failed: %v", err)
+	}
+	mt2, err := reg2.ResolveMessageType(def2.GetId())
+	if err != nil {
+		t.Fatalf("reg2.ResolveMessageType failed: %v", err)
+	}
+	if mt1.Descriptor() != compiledMD || mt2.Descriptor() != compiledMD {
+		t.Errorf("ResolveMessageType descriptor mismatch: mt1=%p, mt2=%p, want compiled %p",
+			mt1.Descriptor(), mt2.Descriptor(), compiledMD)
+	}
+
+	// 2. Register a dynamic schema with the same message name as a compiled type,
+	// but a different schema (different fields, hence mismatched fingerprint).
+	// Assert that it does NOT use the compiled descriptor and goes through NewFiles.
+	dynMsgProto := &descriptorpb.DescriptorProto{
+		Name: proto.String("TxCommit"),
+		Field: []*descriptorpb.FieldDescriptorProto{
+			field("tx_id", 1, descriptorpb.FieldDescriptorProto_TYPE_UINT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+			field("dynamic_field", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		},
+	}
+	dynFileProto := &descriptorpb.FileDescriptorProto{
+		Name:        proto.String("sds_dynamic.proto"),
+		Package:     proto.String("sds.v1"),
+		MessageType: []*descriptorpb.DescriptorProto{dynMsgProto},
+		Syntax:      proto.String("proto3"),
+	}
+	dynFDS := &descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{dynFileProto},
+	}
+	dynFP, err := ComputeFingerprint(dynFDS)
+	if err != nil {
+		t.Fatalf("ComputeFingerprint failed: %v", err)
+	}
+
+	dynDef := &sdsv1.TypeDefinition{
+		Id:          20,
+		Name:        "sds.v1.TxCommit",
+		Fingerprint: dynFP,
+		Descriptors: dynFDS,
+		KeyFields:   []int32{1},
+	}
+
+	regDyn1 := NewRegistry()
+	regDyn2 := NewRegistry()
+
+	if err := regDyn1.Register(dynDef); err != nil {
+		t.Fatalf("regDyn1.Register(dynDef) failed: %v", err)
+	}
+	if err := regDyn2.Register(dynDef); err != nil {
+		t.Fatalf("regDyn2.Register(dynDef) failed: %v", err)
+	}
+
+	_, dynMD1, okDyn1 := regDyn1.LookupByID(dynDef.GetId())
+	if !okDyn1 || dynMD1 == nil {
+		t.Fatalf("regDyn1.LookupByID failed")
+	}
+	_, dynMD2, okDyn2 := regDyn2.LookupByID(dynDef.GetId())
+	if !okDyn2 || dynMD2 == nil {
+		t.Fatalf("regDyn2.LookupByID failed")
+	}
+
+	// Dynamic type with different fingerprint must NOT match compiled descriptor.
+	if dynMD1 == compiledMD {
+		t.Errorf("dynamic descriptor should NOT match compiled descriptor %p", compiledMD)
+	}
+	// Dynamic schemas with the same FileDescriptorSet share the cached NewFiles descriptor.
+	if dynMD1 != dynMD2 {
+		t.Errorf("expected shared cached dynamic descriptor across registries: %p != %p", dynMD1, dynMD2)
+	}
+
+	// Verify ResolveMessageType returns the dynamic message type with dynMD1.
+	dynMT, err := regDyn1.ResolveMessageType(dynDef.GetId())
+	if err != nil {
+		t.Fatalf("regDyn1.ResolveMessageType failed: %v", err)
+	}
+	if dynMT.Descriptor() == compiledMD {
+		t.Errorf("expected dynamic message type to NOT use compiled descriptor")
+	}
+	if dynMT.Descriptor() != dynMD1 {
+		t.Errorf("expected dynamic message type descriptor %p to equal dynMD1 %p", dynMT.Descriptor(), dynMD1)
 	}
 }
