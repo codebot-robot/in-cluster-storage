@@ -41,6 +41,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -5343,6 +5344,8 @@ func (v *Volume) listSnapshotsLocked(ctx context.Context) ([]*sdsv1.SnapshotPoin
 					_, pos, parseErr = sqlite.ParseSnapshotKey(key)
 				} else if format == "memory" {
 					_, pos, parseErr = memtable.ParseSnapshotKey(key)
+				} else if format == "table" {
+					_, pos, parseErr = table.ParseSnapshotKey(key)
 				}
 				if parseErr != nil {
 					return nil, fmt.Errorf("failed to parse snapshot key %q: %w", key, parseErr)
