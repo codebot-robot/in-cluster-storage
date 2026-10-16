@@ -288,3 +288,16 @@ metadata:
 provisioner: objectfs.labs.gke.io
 volumeBindingMode: Immediate
 reclaimPolicy: Delete
+
+---
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: objectfs-exclusive-local
+provisioner: objectfs.labs.gke.io
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+parameters:
+  mode: exclusive-local
+

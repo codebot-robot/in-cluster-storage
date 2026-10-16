@@ -105,6 +105,58 @@ For deployment and installation instructions with real object storage (GCS/S3) a
 
 ---
 
+## Mount Modes: Standard FUSE vs. Exclusive-Local
+
+ObjectFS supports two distinct mount modes, selected via the `mode` parameter in the volume context (StorageClass parameters or CSI volume attributes):
+
+1. **Standard FUSE Mode (`mode: fuse`, default):**
+   - Workloads interact with the volume through a user-space FUSE driver (`go-fuse`).
+   - Supports multi-node concurrent access (`ReadWriteMany` / `ReadWriteOnce`).
+   - Read and write operations issue per-operation RPCs to the controller or interact with the local in-memory/disk cache, with remote writes invalidated proactively via `WatchVolume` event streams.
+
+2. **Exclusive-Local Mode (`mode: exclusive-local`):**
+   - The node daemon eagerly materialises the volume from the controller into a local directory (`<cacheDir>/<volume>/lower`), mounts an **OverlayFS** filesystem into the pod with local `upper` and `work` directories, and serves I/O at local kernel filesystem speed with **no FUSE overhead and no per-operation RPCs**.
+   - **Durability Contract:** Writes remain entirely local on the node until a **checkpoint**. Writes are durable *at unmount*: when the pod terminates, `NodeUnpublishVolume` unmounts the overlay, scans `upper/` for changes, and commits the upper layer back to the controller via ordinary RPCs (`Mkdir`, `CreateFile`, `WriteFile`, `TruncateFile`, `Unlink`, `Rmdir`, `Symlink`, `SetAttr`, and blocking `Fsync`). If a pod or worker node is killed between checkpoints, uncommitted writes since mount (or the last checkpoint) are lost; this is the explicit contract until periodic checkpoints are added in step 4.
+   - **Leftover Recovery & Checkpoint Failure Safety:** A failed checkpoint never discards or purges uncommitted local state. If scanning or replay fails during `NodeUnpublishVolume`, `upper/` is kept completely intact on disk, and an error is returned so kubelet retries unpublish until durability is achieved. Furthermore, if a new pod mounts the volume on the same node after an unmount failure, `publishExclusiveLocal` detects the non-empty `upper/`, replays and commits it to the controller first, and only then wipes the directory and materialises fresh. If recovery replay fails, publish fails with an error naming the leftover directory.
+   - **Resumable Eager Materialisation & Kubelet Timeout:** Kubelet imposes a default 2-minute timeout on CSI `NodePublishVolume` calls. If a large volume exceeds 2 minutes to materialise, kubelet cancels and retries `NodePublishVolume`. Materialisation is designed to be resumable: files are written to temporary files and atomically renamed upon completion. Subsequent retries inspect existing files in `lower/` and skip downloading any file whose size and modification time already match the live volume. Active progress (files and bytes completed) is logged every 5 seconds.
+   - **Access Mode & Exclusivity Requirement:** Because multiple concurrent writers to the same volume in exclusive-local mode would diverge without synchronization, exclusivity is enforced through CSI access modes. Drivers advertise `SINGLE_NODE_SINGLE_WRITER` (`NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER`). Volumes mounted in `exclusive-local` mode **must** be claimed with `ReadWriteOncePod` (RWOP). Mounting with any other access mode is rejected with `InvalidArgument`.
+   - **Using Exclusive-Local via StorageClass:** The recommended and primary way to use exclusive-local mode in Kubernetes is via the `objectfs-exclusive-local` StorageClass (`volumeBindingMode: WaitForFirstConsumer`) paired with a `ReadWriteOncePod` PersistentVolumeClaim:
+     ```yaml
+     apiVersion: storage.k8s.io/v1
+     kind: StorageClass
+     metadata:
+       name: objectfs-exclusive-local
+     provisioner: objectfs.labs.gke.io
+     volumeBindingMode: WaitForFirstConsumer
+     reclaimPolicy: Delete
+     parameters:
+       mode: exclusive-local
+     ---
+     apiVersion: v1
+     kind: PersistentVolumeClaim
+     metadata:
+       name: my-exclusive-pvc
+     spec:
+       accessModes:
+         - ReadWriteOncePod
+       storageClassName: objectfs-exclusive-local
+       resources:
+         requests:
+           storage: 10Gi
+     ```
+     Static PersistentVolumes also remain supported by specifying `mode: exclusive-local` in `spec.csi.volumeAttributes`.
+   - **Local Disk Requirements:** The worker node must have sufficient local scratch disk capacity under the daemon's cache directory (`/var/cache/objectfs/<volume>`) to store the eagerly downloaded `lower/` layer, overlay `upper/`, and `work/` trees.
+   - **Metadata Preservation Semantics:**
+     - **Regular Files & Directories:** Permissions (mode) and modification times (mtime) are preserved.
+     - **Ownership (UID / GID):** Preserved on materialisation and during checkpoint replay.
+     - **Symlinks:** Preserved across mount and checkpoint.
+     - **Hard Links:** Not preserved. Materialised as independent copies, and checkpoint replay commits them as separate files.
+     - **Extended Attributes (xattr):** Not preserved across checkpoints (outside internal OverlayFS whiteout and opaque markers).
+     - **Special Files (FIFOs, Sockets, Device Nodes):** Not supported; skipped with a warning during materialisation and checkpoint scan.
+     - **Renames:** File renames performed in the upper layer appear natively to OverlayFS as an unlink of the old path plus a creation of the new path; these are replayed as `Unlink` followed by `CreateFile` during checkpoint commit.
+
+---
+
 ## Metadata Architecture & Management
 
 A core strength of ObjectFS is separating metadata operations from data payloads, eliminating the high latency and eventual-consistency hazards typical of naive object-storage-backed filesystems.

@@ -1988,3 +1988,173 @@ echo $? > /tmp/wal_workload.status
 	h.DeletePod(writerPodName, "default")
 	t.Logf("Successfully verified WAL buffer restart durability, mid-workload restart, and continued writes!")
 }
+
+func TestObjectFSExclusiveLocalE2E(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("Skipping ObjectFS Exclusive-Local E2E test; RUN_E2E not set")
+	}
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t, "objectfs-exclusive-local-e2e")
+	volumeID := "exclusive-local-e2e-vol"
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+			t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		}
+	})
+
+	// Setup PVC with storageClassName: objectfs-exclusive-local and ReadWriteOncePod
+	pvcYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s-pvc
+spec:
+  accessModes:
+    - ReadWriteOncePod
+  storageClassName: objectfs-exclusive-local
+  resources:
+    requests:
+      storage: 1Gi
+`, volumeID)
+
+	t.Logf("Creating PVC for exclusive-local volume")
+	h.KubectlApplyContent("exclusive-pvc", pvcYaml)
+
+	// Step 1: Deploy Pod A on Node 1 in exclusive-local mode
+	podAName := "exclusive-pod-a"
+	podAYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: %s-pvc
+`, podAName, node1, volumeID)
+
+	t.Logf("Starting Pod A on Node 1 (%s)", node1)
+	h.KubectlApplyContent(podAName, podAYaml)
+	if err := h.WaitForPodReady(podAName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Pod A failed to start: %v", err)
+	}
+
+	// Write files inside Pod A
+	t.Logf("Pod A writing files in exclusive-local mode")
+	_, err := h.RunInPod(podAName, "default", "/bin/sh", "-c", "echo 'hello-from-pod-a' > /data/hello.txt && mkdir /data/subdir && echo 'nested-content-a' > /data/subdir/nested.txt && sync")
+	if err != nil {
+		t.Fatalf("Failed to write files in Pod A: %v", err)
+	}
+
+	// Step 2: Delete Pod A (triggers unmount checkpoint)
+	t.Logf("Deleting Pod A on Node 1 to trigger unmount checkpoint")
+	h.DeletePod(podAName, "default")
+	h.RunCommand("kubectl", "wait", "--for=delete", "pod/"+podAName, "-n", "default", "--timeout=60s")
+
+	// Step 3: Deploy Pod B on Node 2 in exclusive-local mode
+	podBName := "exclusive-pod-b"
+	podBYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: %s-pvc
+`, podBName, node2, volumeID)
+
+	t.Logf("Starting Pod B on Node 2 (%s) mounting the checkpointed volume", node2)
+	h.KubectlApplyContent(podBName, podBYaml)
+	if err := h.WaitForPodReady(podBName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Pod B failed to start: %v", err)
+	}
+
+	// Verify files in Pod B
+	outHelloB, err := retryCatInPod(h, podBName, "/data/hello.txt", 15*time.Second)
+	if err != nil || !strings.Contains(outHelloB, "hello-from-pod-a") {
+		t.Fatalf("Pod B did not see /data/hello.txt: err=%v, out=%s", err, outHelloB)
+	}
+	outNestedB, err := retryCatInPod(h, podBName, "/data/subdir/nested.txt", 15*time.Second)
+	if err != nil || !strings.Contains(outNestedB, "nested-content-a") {
+		t.Fatalf("Pod B did not see /data/subdir/nested.txt: err=%v, out=%s", err, outNestedB)
+	}
+	t.Logf("Pod B on Node 2 successfully verified checkpointed files from Pod A!")
+
+	// Delete Pod B
+	t.Logf("Deleting Pod B on Node 2")
+	h.DeletePod(podBName, "default")
+	h.RunCommand("kubectl", "wait", "--for=delete", "pod/"+podBName, "-n", "default", "--timeout=60s")
+
+	// Step 4: Verify via FUSE mount that same volume has same content
+	actualVolumeID, err := h.GetPVForPVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+	if err != nil {
+		t.Fatalf("Failed to get PV volumeName for PVC %s-pvc: %v", volumeID, err)
+	}
+
+	fusePodName := "fuse-reader-pod"
+	fusePodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, fusePodName, node1, actualVolumeID)
+
+	t.Logf("Starting FUSE reader Pod on Node 1 to verify standard FUSE visibility of checkpoint")
+	h.KubectlApplyContent(fusePodName, fusePodYaml)
+	if err := h.WaitForPodReady(fusePodName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("FUSE reader pod failed to start: %v", err)
+	}
+
+	outHelloFUSE, err := retryCatInPod(h, fusePodName, "/data/hello.txt", 15*time.Second)
+	if err != nil || !strings.Contains(outHelloFUSE, "hello-from-pod-a") {
+		t.Fatalf("FUSE reader pod did not see /data/hello.txt: err=%v, out=%s", err, outHelloFUSE)
+	}
+	outNestedFUSE, err := retryCatInPod(h, fusePodName, "/data/subdir/nested.txt", 15*time.Second)
+	if err != nil || !strings.Contains(outNestedFUSE, "nested-content-a") {
+		t.Fatalf("FUSE reader pod did not see /data/subdir/nested.txt: err=%v, out=%s", err, outNestedFUSE)
+	}
+	t.Logf("FUSE reader pod successfully saw same content committed by exclusive-local unmount checkpoint!")
+
+	h.DeletePod(fusePodName, "default")
+	h.DeletePVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+}
