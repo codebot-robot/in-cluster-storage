@@ -585,6 +585,23 @@ func TestBenchmarkMeasurements(t *testing.T) {
 			t.Fatalf("failed to load volume (%s): %v", mode, err)
 		}
 
+		flushAndCompact := func() error {
+			idx := vol.Index()
+			if tDB, ok := idx.(*table.DB); ok {
+				if err := tDB.Pebble().Flush(); err != nil {
+					return fmt.Errorf("pebble flush: %w", err)
+				}
+				if err := tDB.Pebble().Compact(ctx, []byte{0x00}, []byte{0xff}, false); err != nil {
+					return fmt.Errorf("pebble compact: %w", err)
+				}
+			} else if sDB, ok := idx.(*sqlite.DB); ok {
+				if _, err := sDB.SQLDB().ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+					return fmt.Errorf("sqlite wal_checkpoint: %w", err)
+				}
+			}
+			return nil
+		}
+
 		// A. CreateFile
 		dirAttr, err := vol.Mkdir(ctx, 1, "test_dir", 0755, 0, 0)
 		if err != nil {
@@ -592,6 +609,9 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		}
 		if err := vol.FlushOverlay(ctx); err != nil {
 			t.Fatalf("FlushOverlay failed: %v", err)
+		}
+		if err := flushAndCompact(); err != nil {
+			t.Fatalf("flushAndCompact failed: %v", err)
 		}
 		ioBeforeCreate := readProcSelfWriteBytes()
 		for i := 0; i < opCount; i++ {
@@ -602,7 +622,11 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		if err := vol.FlushOverlay(ctx); err != nil {
 			t.Fatalf("FlushOverlay failed: %v", err)
 		}
-		ioAfterCreate := readProcSelfWriteBytes()
+		ioAfterCreateInWindow := readProcSelfWriteBytes()
+		if err := flushAndCompact(); err != nil {
+			t.Fatalf("flushAndCompact failed: %v", err)
+		}
+		ioAfterCreateAmortized := readProcSelfWriteBytes()
 
 		// B. 64 KiB Write
 		fAttr, err := vol.CreateFile(ctx, 1, "target.bin", 0644, nil, 0, 0)
@@ -611,6 +635,9 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		}
 		if err := vol.FlushOverlay(ctx); err != nil {
 			t.Fatalf("FlushOverlay failed: %v", err)
+		}
+		if err := flushAndCompact(); err != nil {
+			t.Fatalf("flushAndCompact failed: %v", err)
 		}
 		data64K := make([]byte, 64*1024)
 		ioBeforeWrite := readProcSelfWriteBytes()
@@ -622,7 +649,11 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		if err := vol.FlushOverlay(ctx); err != nil {
 			t.Fatalf("FlushOverlay failed: %v", err)
 		}
-		ioAfterWrite := readProcSelfWriteBytes()
+		ioAfterWriteInWindow := readProcSelfWriteBytes()
+		if err := flushAndCompact(); err != nil {
+			t.Fatalf("flushAndCompact failed: %v", err)
+		}
+		ioAfterWriteAmortized := readProcSelfWriteBytes()
 
 		// C. Rename
 		if _, err := vol.CreateFile(ctx, 1, "ren_a.txt", 0644, []byte("x"), 0, 0); err != nil {
@@ -630,6 +661,9 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		}
 		if err := vol.FlushOverlay(ctx); err != nil {
 			t.Fatalf("FlushOverlay failed: %v", err)
+		}
+		if err := flushAndCompact(); err != nil {
+			t.Fatalf("flushAndCompact failed: %v", err)
 		}
 		ioBeforeRename := readProcSelfWriteBytes()
 		for i := 0; i < opCount; i++ {
@@ -644,19 +678,28 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		if err := vol.FlushOverlay(ctx); err != nil {
 			t.Fatalf("FlushOverlay failed: %v", err)
 		}
-		ioAfterRename := readProcSelfWriteBytes()
+		ioAfterRenameInWindow := readProcSelfWriteBytes()
+		if err := flushAndCompact(); err != nil {
+			t.Fatalf("flushAndCompact failed: %v", err)
+		}
+		ioAfterRenameAmortized := readProcSelfWriteBytes()
 
 		// Close volume and check error at the end of each iteration to prevent goroutine leak / data race
 		if err := vol.Close(); err != nil {
 			t.Fatalf("failed to close volume (%s): %v", mode, err)
 		}
 
-		createWA := (ioAfterCreate - ioBeforeCreate) / int64(opCount)
-		writeWA := (ioAfterWrite - ioBeforeWrite) / int64(opCount)
-		renameWA := (ioAfterRename - ioBeforeRename) / int64(opCount)
+		createInWindow := (ioAfterCreateInWindow - ioBeforeCreate) / int64(opCount)
+		createAmortized := (ioAfterCreateAmortized - ioBeforeCreate) / int64(opCount)
+		writeInWindow := (ioAfterWriteInWindow - ioBeforeWrite) / int64(opCount)
+		writeAmortized := (ioAfterWriteAmortized - ioBeforeWrite) / int64(opCount)
+		renameInWindow := (ioAfterRenameInWindow - ioBeforeRename) / int64(opCount)
+		renameAmortized := (ioAfterRenameAmortized - ioBeforeRename) / int64(opCount)
 
-		t.Logf("[%s] Write Amp /proc/self/io: Create: %d B/op | 64K Write: %d B/op | Rename: %d B/op",
-			mode, createWA, writeWA, renameWA)
+		t.Logf("[%s] Write Amp /proc/self/io (in-window, deferred to flush): Create: %d B/op | 64K Write: %d B/op | Rename: %d B/op",
+			mode, createInWindow, writeInWindow, renameInWindow)
+		t.Logf("[%s] Write Amp /proc/self/io (amortized Flush+Compact):      Create: %d B/op | 64K Write: %d B/op | Rename: %d B/op",
+			mode, createAmortized, writeAmortized, renameAmortized)
 	}
 
 	// ------------------------------------------------------------------
@@ -705,4 +748,14 @@ func TestBenchmarkMeasurements(t *testing.T) {
 	}
 
 	t.Log("==================================================================")
+}
+
+func init() {
+	// Controller registration uses explicit options:
+	// stream is the source of truth, position and rows move in one batch.
+	tableCache := pebble.NewCache(64 * 1024 * 1024)
+	sds.RegisterIndexFactory(table.NewFactory(
+		table.WithDisableWAL(true), // stream is the source of truth, position and rows move in one batch
+		table.WithCache(tableCache),
+	))
 }

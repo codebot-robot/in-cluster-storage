@@ -700,3 +700,55 @@ func TestPublishedSnapshotCompactedTableInvariant(t *testing.T) {
 		t.Fatalf("updated ino 5 mode = %o, want 0755", msg5.(*pb.Inode).GetMode())
 	}
 }
+
+func TestTableOpenDefaultsAndWALOptions(t *testing.T) {
+	ctx := t.Context()
+
+	// 1. Default Open runs with DisableWAL = true
+	dir1 := t.TempDir()
+	dbDefault, err := table.Open(ctx, dir1)
+	if err != nil {
+		t.Fatalf("Open with defaults failed: %v", err)
+	}
+	defer dbDefault.Close()
+
+	if !dbDefault.DisableWAL() {
+		t.Errorf("dbDefault.DisableWAL() = false, want true (default)")
+	}
+
+	// 2. Open with WithWAL() opts into the WAL (DisableWAL = false)
+	dir2 := t.TempDir()
+	dbWithWAL, err := table.Open(ctx, dir2, table.WithWAL())
+	if err != nil {
+		t.Fatalf("Open with WithWAL() failed: %v", err)
+	}
+	defer dbWithWAL.Close()
+
+	if dbWithWAL.DisableWAL() {
+		t.Errorf("dbWithWAL.DisableWAL() = true, want false when WithWAL() is used")
+	}
+
+	// 3. Open with WithDisableWAL(false) opts into the WAL (DisableWAL = false)
+	dir3 := t.TempDir()
+	dbWithDisableFalse, err := table.Open(ctx, dir3, table.WithDisableWAL(false))
+	if err != nil {
+		t.Fatalf("Open with WithDisableWAL(false) failed: %v", err)
+	}
+	defer dbWithDisableFalse.Close()
+
+	if dbWithDisableFalse.DisableWAL() {
+		t.Errorf("dbWithDisableFalse.DisableWAL() = true, want false when WithDisableWAL(false) is used")
+	}
+
+	// 4. Open with WithDisableWAL(true) disables WAL
+	dir4 := t.TempDir()
+	dbWithDisableTrue, err := table.Open(ctx, dir4, table.WithDisableWAL(true))
+	if err != nil {
+		t.Fatalf("Open with WithDisableWAL(true) failed: %v", err)
+	}
+	defer dbWithDisableTrue.Close()
+
+	if !dbWithDisableTrue.DisableWAL() {
+		t.Errorf("dbWithDisableTrue.DisableWAL() = false, want true when WithDisableWAL(true) is used")
+	}
+}

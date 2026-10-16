@@ -28,11 +28,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
-	_ "github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
@@ -48,6 +50,7 @@ var (
 	walTarget                = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer:50051)")
 	walDurability            = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
 	metadataIndex            = flag.String("metadata-index", "sqlite", "Metadata local index type (sqlite, memory, table)")
+	metadataIndexCacheMB     = flag.Int("metadata-index-cache-mb", 64, "Pebble shared block cache size in megabytes for table metadata index")
 	metadataCacheEntries     = flag.Int("metadata-cache-entries", 0, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
 	metadataCacheBytes       = flag.Int64("metadata-cache-bytes", 64*1024*1024, "Maximum byte size of metadata read cache")
 	metadataOverlayMaxBytes  = flag.Int64("metadata-overlay-max-bytes", 64*1024*1024, "Maximum byte size of unapplied metadata overlay before applying backpressure")
@@ -74,6 +77,19 @@ func parseEndpoint(endpoint string) (string, string, error) {
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	// Controller registration uses explicit options: WithDisableWAL(true)
+	// (stream is the source of truth, position and rows move in one batch),
+	// and one process-wide pebble.Cache shared by all volumes. Memtable size
+	// keeps Pebble's ramp default (starts at min(256KB, MemTableSize) and doubles up to 4MB).
+	var tableOpts []table.Option
+	tableOpts = append(tableOpts, table.WithDisableWAL(true)) // stream is the source of truth, position and rows move in one batch
+	if *metadataIndexCacheMB > 0 {
+		tableCache := pebble.NewCache(int64(*metadataIndexCacheMB) * 1024 * 1024)
+		defer tableCache.Unref()
+		tableOpts = append(tableOpts, table.WithCache(tableCache))
+	}
+	sds.RegisterIndexFactory(table.NewFactory(tableOpts...))
 
 	if *backendFlag == "" {
 		klog.Fatalf("missing required flag: --backend (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
