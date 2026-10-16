@@ -26,6 +26,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -46,7 +47,7 @@ func dialServer(addr string) (pb.ObjectFSControllerClient, io.Closer, error) {
 		target = strings.TrimPrefix(target, "tcp://")
 	}
 
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(target, grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials()))...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to server at %s: %w", addr, err)
 	}

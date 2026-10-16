@@ -25,6 +25,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -152,7 +153,7 @@ func runTail(args []string) error {
 		streamIDBytes = sid[:]
 	}
 
-	conn, err := grpc.NewClient(*target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(*target, grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials()))...)
 	if err != nil {
 		return fmt.Errorf("failed to dial target %s: %w", *target, err)
 	}

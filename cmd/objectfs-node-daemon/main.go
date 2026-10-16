@@ -30,6 +30,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
@@ -188,8 +189,10 @@ func (d *objectFSDriver) getClient() (pb.ObjectFSControllerClient, error) {
 	}
 
 	conn, err := grpc.NewClient(d.controllerAddress,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+		grpcutil.DialOptions(
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+		)...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to controller at %s: %w", d.controllerAddress, err)

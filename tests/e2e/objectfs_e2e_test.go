@@ -1738,10 +1738,22 @@ spec:
 	}
 
 	t.Logf("Verifying existing mount on Pod 1 works after controller is back up")
+	recStart1 := time.Now()
 	outInitial, err := retryCatInPod(h, pod1Name, "/data/initial.txt", 30*time.Second)
+	recDur1 := time.Since(recStart1)
 	if err != nil || !strings.Contains(outInitial, "initial-outage-data") {
 		t.Fatalf("Failed to read initial.txt on Pod 1 after outage recovery: %v (out: %s)", err, outInitial)
 	}
+	t.Logf("Pod 1 mount recovered in %v", recDur1)
+
+	t.Logf("Verifying existing mount on Pod 2 works after controller is back up")
+	recStart2 := time.Now()
+	outInitial2, err := retryCatInPod(h, pod2Name, "/data/initial.txt", 30*time.Second)
+	recDur2 := time.Since(recStart2)
+	if err != nil || !strings.Contains(outInitial2, "initial-outage-data") {
+		t.Fatalf("Failed to read initial.txt on Pod 2 after outage recovery: %v (out: %s)", err, outInitial2)
+	}
+	t.Logf("Pod 2 mount recovered in %v", recDur2)
 
 	_, err = h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "echo 'post-outage-from-node1' > /data/from-node1.txt && sync /data/from-node1.txt")
 	if err != nil {
