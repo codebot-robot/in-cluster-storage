@@ -25,6 +25,7 @@ import (
 	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"k8s.io/klog/v2"
 )
 
@@ -36,6 +37,23 @@ func isExclusiveLocalDir(volumeDir string) bool {
 		return true
 	}
 	return false
+}
+
+func isUpperNonEmpty(upperPath string) (bool, error) {
+	f, err := os.Open(upperPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer errutil.CloseAndLog(f, "upper directory")
+
+	names, err := f.Readdirnames(1)
+	if err != nil && err.Error() != "EOF" {
+		return false, err
+	}
+	return len(names) > 0, nil
 }
 
 func isNotMountPoint(path string) (bool, error) {
@@ -80,6 +98,26 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	client, err := d.getClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get controller client: %w", err)
+	}
+
+	// Check if a previous session left an uncommitted upper layer (e.g. from a failed checkpoint)
+	if hasLeftover, err := isUpperNonEmpty(upperPath); err != nil {
+		return nil, fmt.Errorf("failed to inspect upper directory at %s: %w", upperPath, err)
+	} else if hasLeftover {
+		klog.Warningf("Found non-empty upper directory at %s from previous uncommitted session; replaying checkpoint first", upperPath)
+		opList, scanErr := ScanUpperLayer(lowerPath, upperPath)
+		if scanErr != nil {
+			return nil, fmt.Errorf("failed to scan leftover upper layer at %s: %w", upperPath, scanErr)
+		}
+		if replayErr := ReplayOperations(ctx, client, volumeID, opList); replayErr != nil {
+			// On failure, leave upper intact and fail publish naming upperPath
+			return nil, fmt.Errorf("failed to recover and commit leftover upper layer from previous session at %s: %w", upperPath, replayErr)
+		}
+		klog.Infof("Successfully recovered and committed leftover upper layer from previous session for volume %s", volumeID)
+		// After successful recovery, wipe volumeDir clean to materialise fresh
+		if err := os.RemoveAll(volumeDir); err != nil {
+			return nil, fmt.Errorf("failed to cleanup volume directory %s after recovery: %w", volumeDir, err)
+		}
 	}
 
 	if err := os.MkdirAll(lowerPath, 0755); err != nil {
@@ -147,9 +185,38 @@ func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.N
 	targetPath := req.GetTargetPath()
 	klog.Infof("Unpublishing ObjectFS exclusive-local volume %s from %s", volumeID, targetPath)
 
+	lowerPath := filepath.Join(volumeDir, "lower")
+	upperPath := filepath.Join(volumeDir, "upper")
+
+	// 1. Unmount overlay from targetPath
 	if err := unmountTarget(targetPath); err != nil {
 		return nil, fmt.Errorf("failed to unmount overlay at %s: %w", targetPath, err)
 	}
 
+	// 2. Scan upper layer to build operation list
+	opList, err := ScanUpperLayer(lowerPath, upperPath)
+	if err != nil {
+		klog.Errorf("Failed to scan upper layer for volume %s: %v. Leaving upper layer intact.", volumeID, err)
+		return nil, fmt.Errorf("checkpoint scan failed: %w", err)
+	}
+
+	// 3. Connect to controller and replay operations
+	client, err := d.getClient()
+	if err != nil {
+		klog.Errorf("Failed to connect to controller for checkpoint on volume %s: %v. Leaving upper layer intact.", volumeID, err)
+		return nil, fmt.Errorf("failed to get controller client: %w", err)
+	}
+
+	if err := ReplayOperations(ctx, client, volumeID, opList); err != nil {
+		klog.Errorf("Failed to replay checkpoint operations for volume %s: %v. Leaving upper layer intact.", volumeID, err)
+		return nil, fmt.Errorf("checkpoint replay failed: %w", err)
+	}
+
+	// 4. On SUCCESS only, clean up volumeDir
+	if err := os.RemoveAll(volumeDir); err != nil {
+		klog.Warningf("Failed to cleanup volume directory %s after checkpoint: %v", volumeDir, err)
+	}
+
+	klog.Infof("Successfully unpublished and checkpointed ObjectFS volume %s", volumeID)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
