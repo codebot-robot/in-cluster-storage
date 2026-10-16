@@ -35,6 +35,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -144,6 +145,9 @@ type Server struct {
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
 	flushWg     sync.WaitGroup
+
+	checkpointMu      sync.Mutex
+	checkpointWaiters map[string]chan uint64
 }
 
 // ServerOption configures the controller Server.
@@ -277,6 +281,7 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		backend:           backend,
 		blobStore:         blob.NewStore(backend, 0),
 		broadcaster:       NewEventBroadcaster(),
+		checkpointWaiters: make(map[string]chan uint64),
 		syncTimeout:       10 * time.Minute,
 		defaultDurability: walclient.Local,
 	}
@@ -784,6 +789,11 @@ func (s *Server) Release(ctx context.Context, req *pb.ReleaseRequest) (*pb.Relea
 	return &pb.ReleaseResponse{}, nil
 }
 
+// Broadcaster returns the EventBroadcaster for the server.
+func (s *Server) Broadcaster() *EventBroadcaster {
+	return s.broadcaster
+}
+
 func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSController_WatchVolumeServer) error {
 	if !isValidVolumeID(req.GetVolumeId()) {
 		return status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", req.GetVolumeId())
@@ -1110,4 +1120,74 @@ func (s *Server) GetVolumeStats(ctx context.Context, req *pb.GetVolumeStatsReque
 		FreeInodes:     freeInodes,
 		Error:          0,
 	}, nil
+}
+
+// Checkpoint requests an immediate checkpoint commit on an exclusive-local volume and waits
+// for the mounting node daemon to acknowledge it. Only exclusive-local mounts act on the event;
+// FUSE mounts ignore it.
+func (s *Server) Checkpoint(ctx context.Context, req *pb.CheckpointRequest) (*pb.CheckpointResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	volumeID := req.GetVolumeId()
+
+	if _, err := s.getOrCreateVolume(volumeID); err != nil {
+		return nil, volInitError(err)
+	}
+
+	requestID := uuid.NewString()
+	ch := make(chan uint64, 1)
+
+	s.checkpointMu.Lock()
+	s.checkpointWaiters[requestID] = ch
+	s.checkpointMu.Unlock()
+
+	defer func() {
+		s.checkpointMu.Lock()
+		delete(s.checkpointWaiters, requestID)
+		s.checkpointMu.Unlock()
+	}()
+
+	// Broadcast checkpoint request to all active watchers on this volume
+	s.broadcaster.Broadcast(volumeID, &pb.WatchVolumeResponse{
+		EventType:           pb.WatchEventType_EVENT_CHECKPOINT_REQUEST,
+		CheckpointRequestId: requestID,
+	})
+
+	// Server-side timeout: return DeadlineExceeded if no exclusive-local mount acks within 60s
+	timer := time.NewTimer(60 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case pos := <-ch:
+		return &pb.CheckpointResponse{
+			StreamPosition: pos,
+		}, nil
+	case <-timer.C:
+		return nil, status.Errorf(codes.DeadlineExceeded, "checkpoint timed out after 60s waiting for exclusive-local mount acknowledgement on volume %s", volumeID)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// AckCheckpoint acknowledges completion of an explicit checkpoint commit by a node daemon.
+func (s *Server) AckCheckpoint(ctx context.Context, req *pb.AckCheckpointRequest) (*pb.AckCheckpointResponse, error) {
+	if req.GetVolumeId() == "" || req.GetRequestId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id and request_id are required")
+	}
+
+	s.checkpointMu.Lock()
+	ch, ok := s.checkpointWaiters[req.GetRequestId()]
+	if ok {
+		delete(s.checkpointWaiters, req.GetRequestId())
+	}
+	s.checkpointMu.Unlock()
+
+	if ok {
+		select {
+		case ch <- req.GetStreamPosition():
+		default:
+		}
+	}
+	return &pb.AckCheckpointResponse{}, nil
 }

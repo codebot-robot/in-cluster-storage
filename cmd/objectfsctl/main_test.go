@@ -581,3 +581,44 @@ func TestSnapshotsListInvalidTimeFlags(t *testing.T) {
 		t.Errorf("expected 'invalid --to' in error, got: %v", err)
 	}
 }
+
+func TestCheckpointCommand(t *testing.T) {
+	server, serverAddr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	volumeID := "test-checkpoint-vol"
+
+	// Missing volume argument
+	_, err := executeCommand("--server", serverAddr, "checkpoint")
+	if err == nil {
+		t.Fatalf("expected error for missing volume argument")
+	}
+
+	// Subscribe watcher to simulate node daemon receiving EVENT_CHECKPOINT_REQUEST
+	watcherCh := server.Broadcaster().Subscribe(volumeID)
+	defer server.Broadcaster().Unsubscribe(volumeID, watcherCh)
+
+	// In a goroutine, wait for EVENT_CHECKPOINT_REQUEST and simulate daemon acknowledgement
+	go func() {
+		select {
+		case ev := <-watcherCh:
+			if ev.GetEventType() == pb.WatchEventType_EVENT_CHECKPOINT_REQUEST {
+				_, _ = server.AckCheckpoint(t.Context(), &pb.AckCheckpointRequest{
+					VolumeId:       volumeID,
+					RequestId:      ev.GetCheckpointRequestId(),
+					StreamPosition: 9876,
+				})
+			}
+		case <-time.After(5 * time.Second):
+		}
+	}()
+
+	out, err := executeCommand("--server", serverAddr, "checkpoint", volumeID)
+	if err != nil {
+		t.Fatalf("checkpoint command failed: %v", err)
+	}
+	expected := fmt.Sprintf("Checkpoint completed for volume %s at stream position 9876", volumeID)
+	if !strings.Contains(out, expected) {
+		t.Fatalf("expected output %q to contain %q", out, expected)
+	}
+}

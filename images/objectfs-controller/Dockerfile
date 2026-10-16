@@ -18,13 +18,16 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
+# Build controller daemon and objectfsctl CLI (shipped in controller image for operator convenience)
 COPY . .
-RUN CGO_ENABLED=0 go build -o objectfs-controller ./cmd/objectfs-controller
+RUN CGO_ENABLED=0 go build -o objectfs-controller ./cmd/objectfs-controller && \
+    CGO_ENABLED=0 go build -o objectfsctl ./cmd/objectfsctl
 
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/objectfs-controller /usr/local/bin/objectfs-controller
+COPY --from=builder /app/objectfsctl /usr/local/bin/objectfsctl
 
 ENTRYPOINT ["/usr/local/bin/objectfs-controller"]

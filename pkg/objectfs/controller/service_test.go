@@ -5635,3 +5635,70 @@ func TestPunchHoleStagedWriteKeepsSize(t *testing.T) {
 		t.Fatalf("Expected 64 KiB of zeros")
 	}
 }
+
+func TestControllerCheckpointRPC(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-checkpoint-rpc-vol"
+
+	// 1. Empty volume_id returns error
+	if _, err := server.Checkpoint(ctx, &pb.CheckpointRequest{}); err == nil {
+		t.Fatalf("Expected error for empty volume_id")
+	}
+
+	// 2. Subscribe a watcher to receive events
+	watcherCh := server.broadcaster.Subscribe(volumeID)
+	defer server.broadcaster.Unsubscribe(volumeID, watcherCh)
+
+	// 3. Initiate checkpoint request in a goroutine
+	reqDone := make(chan *pb.CheckpointResponse, 1)
+	reqErr := make(chan error, 1)
+	go func() {
+		resp, err := server.Checkpoint(ctx, &pb.CheckpointRequest{
+			VolumeId: volumeID,
+		})
+		if err != nil {
+			reqErr <- err
+		} else {
+			reqDone <- resp
+		}
+	}()
+
+	// 4. Watcher should receive EVENT_CHECKPOINT_REQUEST with requestID
+	var requestID string
+	select {
+	case ev := <-watcherCh:
+		if ev.GetEventType() != pb.WatchEventType_EVENT_CHECKPOINT_REQUEST {
+			t.Fatalf("Expected EVENT_CHECKPOINT_REQUEST, got %v", ev.GetEventType())
+		}
+		requestID = ev.GetCheckpointRequestId()
+		if requestID == "" {
+			t.Fatalf("Expected non-empty CheckpointRequestId in event")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for WatchVolume EVENT_CHECKPOINT_REQUEST")
+	}
+
+	// 5. Node daemon acknowledges via AckCheckpoint
+	_, err := server.AckCheckpoint(ctx, &pb.AckCheckpointRequest{
+		VolumeId:       volumeID,
+		RequestId:      requestID,
+		StreamPosition: 12345,
+	})
+	if err != nil {
+		t.Fatalf("AckCheckpoint failed: %v", err)
+	}
+
+	// 6. Waiting caller should unblock with stream position 12345
+	select {
+	case resp := <-reqDone:
+		if resp.GetStreamPosition() != 12345 {
+			t.Fatalf("Expected stream position 12345, got %d", resp.GetStreamPosition())
+		}
+	case err := <-reqErr:
+		t.Fatalf("Checkpoint request failed: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for Checkpoint caller to unblock")
+	}
+}
