@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,11 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+type typeDefKey struct {
+	name        string
+	fingerprint string
+}
+
 var (
 	// ErrMissingDescriptors is returned when registering a new type without descriptors.
 	ErrMissingDescriptors = errors.New("missing FileDescriptorSet for new type registration")
@@ -41,7 +47,47 @@ var (
 	compiledFPCache   sync.Map // protoreflect.FullName -> []byte
 	dynamicFilesMu    sync.RWMutex
 	dynamicFilesCache = make(map[[32]byte]*protoregistry.Files)
+	typeDefCache      sync.Map // typeDefKey -> *sdsv1.TypeDefinition
 )
+
+func internOrCloneTypeDef(def *sdsv1.TypeDefinition) *sdsv1.TypeDefinition {
+	if def == nil {
+		return nil
+	}
+	key := typeDefKey{
+		name:        def.GetName(),
+		fingerprint: string(def.GetFingerprint()),
+	}
+	if v, ok := typeDefCache.Load(key); ok {
+		interned := v.(*sdsv1.TypeDefinition)
+		if def.GetId() == interned.GetId() && slices.Equal(def.GetKeyFields(), interned.GetKeyFields()) {
+			return interned
+		}
+		kf := interned.GetKeyFields()
+		if !slices.Equal(def.GetKeyFields(), kf) {
+			kf = slices.Clone(def.GetKeyFields())
+		}
+		return &sdsv1.TypeDefinition{
+			Id:          def.GetId(),
+			Name:        interned.GetName(),
+			Fingerprint: interned.GetFingerprint(),
+			Descriptors: interned.GetDescriptors(),
+			KeyFields:   kf,
+		}
+	}
+	return proto.Clone(def).(*sdsv1.TypeDefinition)
+}
+
+func maybeInternTypeDef(def *sdsv1.TypeDefinition) {
+	if def == nil || def.GetName() == "" || len(def.GetFingerprint()) == 0 || def.GetDescriptors() == nil {
+		return
+	}
+	key := typeDefKey{
+		name:        def.GetName(),
+		fingerprint: string(def.GetFingerprint()),
+	}
+	typeDefCache.LoadOrStore(key, def)
+}
 
 func getCompiledFingerprint(md protoreflect.MessageDescriptor) ([]byte, error) {
 	name := md.FullName()
@@ -88,6 +134,7 @@ func getOrCreateFiles(fds *descriptorpb.FileDescriptorSet) (*protoregistry.Files
 }
 
 type typeEntry struct {
+	id           uint32
 	def          *sdsv1.TypeDefinition
 	descriptor   protoreflect.MessageDescriptor
 	resolvedType protoreflect.MessageType
@@ -156,9 +203,9 @@ func (r *Registry) Register(def *sdsv1.TypeDefinition) error {
 	if def == nil {
 		return fmt.Errorf("nil TypeDefinition")
 	}
-	defCopy := proto.Clone(def).(*sdsv1.TypeDefinition)
+	defInterned := internOrCloneTypeDef(def)
 	return r.update(func(s *registrySnapshot) error {
-		return registerIntoSnapshot(s, defCopy)
+		return registerIntoSnapshot(s, defInterned)
 	})
 }
 
@@ -188,6 +235,18 @@ func registerIntoSnapshot(s *registrySnapshot, def *sdsv1.TypeDefinition) error 
 			return fmt.Errorf("incompatible schema evolution for type ID %d (%s): %w", def.GetId(), def.GetName(), err)
 		}
 
+		key := typeDefKey{name: def.GetName(), fingerprint: string(def.GetFingerprint())}
+		if _, isInterned := typeDefCache.Load(key); !isInterned {
+			expectedFP, err := ComputeFingerprint(def.GetDescriptors())
+			if err != nil {
+				return fmt.Errorf("failed to compute fingerprint for type ID %d: %w", def.GetId(), err)
+			}
+			if !bytes.Equal(expectedFP, def.GetFingerprint()) {
+				return fmt.Errorf("fingerprint mismatch for type ID %d (%s): provided %x, computed %x",
+					def.GetId(), def.GetName(), def.GetFingerprint(), expectedFP)
+			}
+		}
+
 		// Parse the new descriptor and update entry.
 		md, err := resolveMessageDescriptor(def)
 		if err != nil {
@@ -200,11 +259,13 @@ func registerIntoSnapshot(s *registrySnapshot, def *sdsv1.TypeDefinition) error 
 		}
 
 		s.types[def.GetId()] = &typeEntry{
+			id:           def.GetId(),
 			def:          def,
 			descriptor:   md,
 			resolvedType: msgType,
 		}
 		s.byName[def.GetName()] = def.GetId()
+		maybeInternTypeDef(def)
 		return nil
 	}
 
@@ -214,13 +275,18 @@ func registerIntoSnapshot(s *registrySnapshot, def *sdsv1.TypeDefinition) error 
 	}
 
 	// Validate fingerprint.
-	expectedFP, err := ComputeFingerprint(def.GetDescriptors())
-	if err != nil {
-		return fmt.Errorf("failed to compute fingerprint for type ID %d: %w", def.GetId(), err)
-	}
-	if !bytes.Equal(expectedFP, def.GetFingerprint()) {
-		return fmt.Errorf("fingerprint mismatch for type ID %d (%s): provided %x, computed %x",
-			def.GetId(), def.GetName(), def.GetFingerprint(), expectedFP)
+	// If def is already interned or its fingerprint matches an interned definition,
+	// fingerprint has already been verified.
+	key := typeDefKey{name: def.GetName(), fingerprint: string(def.GetFingerprint())}
+	if _, isInterned := typeDefCache.Load(key); !isInterned {
+		expectedFP, err := ComputeFingerprint(def.GetDescriptors())
+		if err != nil {
+			return fmt.Errorf("failed to compute fingerprint for type ID %d: %w", def.GetId(), err)
+		}
+		if !bytes.Equal(expectedFP, def.GetFingerprint()) {
+			return fmt.Errorf("fingerprint mismatch for type ID %d (%s): provided %x, computed %x",
+				def.GetId(), def.GetName(), def.GetFingerprint(), expectedFP)
+		}
 	}
 
 	md, err := resolveMessageDescriptor(def)
@@ -252,6 +318,7 @@ func registerIntoSnapshot(s *registrySnapshot, def *sdsv1.TypeDefinition) error 
 	}
 
 	s.types[def.GetId()] = &typeEntry{
+		id:           def.GetId(),
 		def:          def,
 		descriptor:   md,
 		resolvedType: msgType,
@@ -261,6 +328,8 @@ func registerIntoSnapshot(s *registrySnapshot, def *sdsv1.TypeDefinition) error 
 	if def.GetId() >= s.nextID {
 		s.nextID = def.GetId() + 1
 	}
+
+	maybeInternTypeDef(def)
 
 	return nil
 }
@@ -420,8 +489,8 @@ func (r *Registry) Import(reg *sdsv1.Registry) error {
 			if def == nil {
 				continue
 			}
-			defCopy := proto.Clone(def).(*sdsv1.TypeDefinition)
-			if err := registerIntoSnapshot(s, defCopy); err != nil {
+			defInterned := internOrCloneTypeDef(def)
+			if err := registerIntoSnapshot(s, defInterned); err != nil {
 				return err
 			}
 		}
