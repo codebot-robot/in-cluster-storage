@@ -60,6 +60,8 @@ const (
 	ObjectFSController_ListSnapshots_FullMethodName  = "/objectfs.v1alpha1.ObjectFSController/ListSnapshots"
 	ObjectFSController_CreateSnapshot_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/CreateSnapshot"
 	ObjectFSController_GetVolumeStats_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/GetVolumeStats"
+	ObjectFSController_Checkpoint_FullMethodName     = "/objectfs.v1alpha1.ObjectFSController/Checkpoint"
+	ObjectFSController_AckCheckpoint_FullMethodName  = "/objectfs.v1alpha1.ObjectFSController/AckCheckpoint"
 )
 
 // ObjectFSControllerClient is the client API for ObjectFSController service.
@@ -93,6 +95,12 @@ type ObjectFSControllerClient interface {
 	ListSnapshots(ctx context.Context, in *ListSnapshotsRequest, opts ...grpc.CallOption) (*ListSnapshotsResponse, error)
 	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
 	GetVolumeStats(ctx context.Context, in *GetVolumeStatsRequest, opts ...grpc.CallOption) (*GetVolumeStatsResponse, error)
+	// Checkpoint requests an immediate checkpoint commit on an exclusive-local volume and waits
+	// for the mounting node daemon to acknowledge it. Only exclusive-local mounts act on the event;
+	// FUSE mounts ignore it.
+	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
+	// AckCheckpoint acknowledges completion of an explicit checkpoint by a node daemon.
+	AckCheckpoint(ctx context.Context, in *AckCheckpointRequest, opts ...grpc.CallOption) (*AckCheckpointResponse, error)
 }
 
 type objectFSControllerClient struct {
@@ -391,6 +399,26 @@ func (c *objectFSControllerClient) GetVolumeStats(ctx context.Context, in *GetVo
 	return out, nil
 }
 
+func (c *objectFSControllerClient) Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckpointResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_Checkpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) AckCheckpoint(ctx context.Context, in *AckCheckpointRequest, opts ...grpc.CallOption) (*AckCheckpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AckCheckpointResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_AckCheckpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ObjectFSControllerServer is the server API for ObjectFSController service.
 // All implementations must embed UnimplementedObjectFSControllerServer
 // for forward compatibility.
@@ -422,6 +450,12 @@ type ObjectFSControllerServer interface {
 	ListSnapshots(context.Context, *ListSnapshotsRequest) (*ListSnapshotsResponse, error)
 	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
 	GetVolumeStats(context.Context, *GetVolumeStatsRequest) (*GetVolumeStatsResponse, error)
+	// Checkpoint requests an immediate checkpoint commit on an exclusive-local volume and waits
+	// for the mounting node daemon to acknowledge it. Only exclusive-local mounts act on the event;
+	// FUSE mounts ignore it.
+	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
+	// AckCheckpoint acknowledges completion of an explicit checkpoint by a node daemon.
+	AckCheckpoint(context.Context, *AckCheckpointRequest) (*AckCheckpointResponse, error)
 	mustEmbedUnimplementedObjectFSControllerServer()
 }
 
@@ -512,6 +546,12 @@ func (UnimplementedObjectFSControllerServer) CreateSnapshot(context.Context, *Cr
 }
 func (UnimplementedObjectFSControllerServer) GetVolumeStats(context.Context, *GetVolumeStatsRequest) (*GetVolumeStatsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetVolumeStats not implemented")
+}
+func (UnimplementedObjectFSControllerServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Checkpoint not implemented")
+}
+func (UnimplementedObjectFSControllerServer) AckCheckpoint(context.Context, *AckCheckpointRequest) (*AckCheckpointResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AckCheckpoint not implemented")
 }
 func (UnimplementedObjectFSControllerServer) mustEmbedUnimplementedObjectFSControllerServer() {}
 func (UnimplementedObjectFSControllerServer) testEmbeddedByValue()                            {}
@@ -1006,6 +1046,42 @@ func _ObjectFSController_GetVolumeStats_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ObjectFSController_Checkpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).Checkpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_Checkpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).Checkpoint(ctx, req.(*CheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_AckCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AckCheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).AckCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_AckCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).AckCheckpoint(ctx, req.(*AckCheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ObjectFSController_ServiceDesc is the grpc.ServiceDesc for ObjectFSController service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1112,6 +1188,14 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetVolumeStats",
 			Handler:    _ObjectFSController_GetVolumeStats_Handler,
+		},
+		{
+			MethodName: "Checkpoint",
+			Handler:    _ObjectFSController_Checkpoint_Handler,
+		},
+		{
+			MethodName: "AckCheckpoint",
+			Handler:    _ObjectFSController_AckCheckpoint_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
