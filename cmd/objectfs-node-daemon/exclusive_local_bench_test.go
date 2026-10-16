@@ -158,7 +158,7 @@ func BenchmarkExclusiveLocalVsFUSE(b *testing.B) {
 			if err != nil {
 				b.Fatalf("ScanUpperLayer: %v", err)
 			}
-			if err := ReplayOperations(ctx, client, volID, ops); err != nil {
+			if _, err := ReplayOperations(ctx, client, volID, ops); err != nil {
 				b.Fatalf("ReplayOperations: %v", err)
 			}
 		}
@@ -250,7 +250,7 @@ func BenchmarkExclusiveLocalVsFUSE(b *testing.B) {
 			if err != nil {
 				b.Fatalf("ScanUpperLayer: %v", err)
 			}
-			if err := ReplayOperations(ctx, client, volID, ops); err != nil {
+			if _, err := ReplayOperations(ctx, client, volID, ops); err != nil {
 				b.Fatalf("ReplayOperations: %v", err)
 			}
 		}

@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -112,23 +113,29 @@ func pathDepth(p string) int {
 	return strings.Count(clean, string(filepath.Separator)) + 1
 }
 
-// ScanUpperLayer compares lowerDir and upperDir and produces an ordered list of FileOps.
+// ScanUpperLayer compares lowerDir and upperDir (optionally diffing against an existing CheckpointManifest)
+// and produces an ordered list of FileOps.
 // Renames appear as unlink+create; hard links are scanned as independent files.
-func ScanUpperLayer(lowerDir, upperDir string) ([]FileOp, error) {
+func ScanUpperLayer(lowerDir, upperDir string, manifests ...*CheckpointManifest) ([]FileOp, error) {
 	if _, err := os.Stat(upperDir); os.IsNotExist(err) {
 		return nil, nil
+	}
+
+	var manifest *CheckpointManifest
+	if len(manifests) > 0 && manifests[0] != nil {
+		manifest = manifests[0]
 	}
 
 	deletedInLower := make(map[string]bool)
 
 	// Phase 1: Scan whiteouts and opaque directories for deletions
-	deletions, err := scanWhiteoutsAndOpaqueDirs(lowerDir, upperDir, deletedInLower)
+	deletions, err := scanWhiteoutsAndOpaqueDirs(lowerDir, upperDir, deletedInLower, manifest)
 	if err != nil {
 		return nil, err
 	}
 
 	// Phase 2: Scan creations, modifications, symlinks, and directory creations
-	creations, writes, attrs, err := scanModificationsAndCreations(lowerDir, upperDir, deletedInLower)
+	creations, writes, attrs, err := scanModificationsAndCreations(lowerDir, upperDir, deletedInLower, manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +164,7 @@ func ScanUpperLayer(lowerDir, upperDir string) ([]FileOp, error) {
 	return result, nil
 }
 
-func scanWhiteoutsAndOpaqueDirs(lowerDir, upperDir string, deletedInLower map[string]bool) ([]FileOp, error) {
+func scanWhiteoutsAndOpaqueDirs(lowerDir, upperDir string, deletedInLower map[string]bool, manifest *CheckpointManifest) ([]FileOp, error) {
 	var deletions []FileOp
 
 	err := filepath.Walk(upperDir, func(path string, info os.FileInfo, walkErr error) error {
@@ -173,6 +180,11 @@ func scanWhiteoutsAndOpaqueDirs(lowerDir, upperDir string, deletedInLower map[st
 		}
 
 		if isWhiteout(path, info) {
+			if manifest != nil && manifest.Whiteouts[relPath] {
+				// Already committed in a previous checkpoint; skip to avoid redundant unlinks
+				deletedInLower[relPath] = true
+				return nil
+			}
 			lowerPath := filepath.Join(lowerDir, relPath)
 			if lInfo, lErr := os.Lstat(lowerPath); lErr == nil {
 				if lInfo.IsDir() {
@@ -262,6 +274,9 @@ func scanWhiteoutsAndOpaqueDirs(lowerDir, upperDir string, deletedInLower map[st
 		}
 
 		if info.IsDir() && isOpaqueDir(path) {
+			if manifest != nil && manifest.OpaqueDirs[relPath] {
+				return nil
+			}
 			// Opaque directory: prune any entries in lowerDir under relPath not in upperDir
 			lowerPath := filepath.Join(lowerDir, relPath)
 			if lInfo, lErr := os.Stat(lowerPath); lErr == nil && lInfo.IsDir() {
@@ -326,7 +341,7 @@ func scanWhiteoutsAndOpaqueDirs(lowerDir, upperDir string, deletedInLower map[st
 	return deletions, nil
 }
 
-func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map[string]bool) (creations, writes, attrs []FileOp, err error) {
+func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map[string]bool, manifest *CheckpointManifest) (creations, writes, attrs []FileOp, err error) {
 	err = filepath.Walk(upperDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -358,7 +373,11 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 		existsInLower := (lErr == nil) && !deletedInLower[relPath]
 
 		if info.IsDir() {
-			if !existsInLower {
+			var inManifest bool
+			if manifest != nil && manifest.Files != nil {
+				_, inManifest = manifest.Files[relPath]
+			}
+			if !existsInLower && !inManifest {
 				creations = append(creations, FileOp{
 					Type:   OpMkdir,
 					Path:   relPath,
@@ -387,6 +406,13 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 			if rErr != nil {
 				return fmt.Errorf("readlink %s: %w", path, rErr)
 			}
+			var inManifest bool
+			if manifest != nil && manifest.Files != nil {
+				_, inManifest = manifest.Files[relPath]
+			}
+			if inManifest {
+				return nil
+			}
 			if existsInLower {
 				if lStat.IsDir() {
 					creations = append(creations, FileOp{Type: OpRmdir, Path: relPath, Parent: parent, Name: name})
@@ -414,8 +440,86 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 
 		// Regular file
 		fileSize := info.Size()
+		mtimeNano := info.ModTime().UnixNano()
 
-		if !existsInLower || (lStat != nil && lStat.IsDir()) {
+		var inManifest bool
+		var prevEntry ManifestEntry
+		if manifest != nil && manifest.Files != nil {
+			prevEntry, inManifest = manifest.Files[relPath]
+		}
+
+		// Design Comment (Concurrency Tolerance & Point-in-Time Prefix):
+		// During exclusive-local periodic interval or explicit checkpoints, workloads keep running
+		// and mutating files in the overlayfs upper directory. The scan must tolerate files changing
+		// underneath it without aborting the checkpoint:
+		// - If a file is unlinked concurrently before Open/Read, the scan tolerates ENOENT and skips it;
+		//   subsequent checkpoints or unmount will process the whiteout/deletion.
+		// - If a file is truncated or appended concurrently while reading chunks, the scan commits
+		//   the prefix that it successfully read; the next checkpoint picks up the rest.
+		// - A checkpoint represents a point-in-time prefix per file, not a cross-file snapshot.
+		// - For appended files where a prefix was already committed in a previous checkpoint (recorded
+		//   in the checkpoint manifest), the scan seeks directly to the previous size and only reads/emits
+		//   writes for the newly appended bytes, avoiding rewriting already-committed prefix chunks.
+		// - lower/ and upper/ layers are NEVER modified or deleted by the daemon while mounted, complying
+		//   with kernel OverlayFS invariants.
+
+		if inManifest {
+			if lStat != nil && lStat.IsDir() {
+				creations = append(creations, FileOp{Type: OpRmdir, Path: relPath, Parent: parent, Name: name})
+			}
+
+			if fileSize == prevEntry.Size && mtimeNano == prevEntry.Mtime {
+				// Unchanged since previous checkpoint; skip
+				return nil
+			}
+
+			f, oErr := os.Open(path)
+			if oErr != nil {
+				if os.IsNotExist(oErr) {
+					return nil
+				}
+				return oErr
+			}
+
+			startOffset := int64(0)
+			if fileSize > prevEntry.Size {
+				// File was appended: start reading from previous committed size
+				startOffset = prevEntry.Size
+				if _, sErr := f.Seek(startOffset, io.SeekStart); sErr != nil {
+					errutil.CloseAndLog(f, "upper file")
+					return fmt.Errorf("seek appended file %s to %d: %w", path, startOffset, sErr)
+				}
+			} else if fileSize != prevEntry.Size {
+				writes = append(writes, FileOp{
+					Type: OpTruncateFile,
+					Path: relPath,
+					Size: fileSize,
+				})
+			}
+
+			offset := startOffset
+			for {
+				chunkBuf := make([]byte, 64*1024)
+				readN, readErr := io.ReadFull(f, chunkBuf)
+				if readN > 0 {
+					writes = append(writes, FileOp{
+						Type:   OpWriteFile,
+						Path:   relPath,
+						Offset: offset,
+						Data:   chunkBuf[:readN],
+					})
+					offset += int64(readN)
+				}
+				if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+					break
+				}
+				if readErr != nil {
+					errutil.CloseAndLog(f, "upper file")
+					return fmt.Errorf("read chunk of modified file %s at %d: %w", path, offset, readErr)
+				}
+			}
+			errutil.CloseAndLog(f, "upper file")
+		} else if !existsInLower || (lStat != nil && lStat.IsDir()) {
 			if existsInLower && lStat.IsDir() {
 				creations = append(creations, FileOp{Type: OpRmdir, Path: relPath, Parent: parent, Name: name})
 			}
@@ -423,20 +527,20 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 			// Read first 64 KiB chunk for initial_content
 			f, oErr := os.Open(path)
 			if oErr != nil {
+				if os.IsNotExist(oErr) {
+					return nil
+				}
 				return oErr
 			}
 
 			initialChunkSize := int64(64 * 1024)
-			if fileSize < initialChunkSize {
-				initialChunkSize = fileSize
-			}
 			initBuf := make([]byte, initialChunkSize)
-			if initialChunkSize > 0 {
-				if _, err := io.ReadFull(f, initBuf); err != nil {
-					errutil.CloseAndLog(f, "upper file")
-					return fmt.Errorf("read initial content of %s: %w", path, err)
-				}
+			n, rErr := io.ReadFull(f, initBuf)
+			if rErr != nil && rErr != io.EOF && rErr != io.ErrUnexpectedEOF {
+				errutil.CloseAndLog(f, "upper file")
+				return fmt.Errorf("read initial content of %s: %w", path, rErr)
 			}
+			initBuf = initBuf[:n]
 
 			creations = append(creations, FileOp{
 				Type:   OpCreateFile,
@@ -444,37 +548,47 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 				Parent: parent,
 				Name:   name,
 				Mode:   mode,
-				Size:   fileSize,
+				Size:   int64(n),
 				Uid:    uid,
 				Gid:    gid,
 				Data:   initBuf,
 			})
 
 			// Remaining chunks
-			offset := int64(len(initBuf))
-			for offset < fileSize {
-				chunkLen := int64(64 * 1024)
-				if offset+chunkLen > fileSize {
-					chunkLen = fileSize - offset
+			offset := int64(n)
+			for {
+				chunkBuf := make([]byte, 64*1024)
+				readN, readErr := io.ReadFull(f, chunkBuf)
+				if readN > 0 {
+					writes = append(writes, FileOp{
+						Type:   OpWriteFile,
+						Path:   relPath,
+						Offset: offset,
+						Data:   chunkBuf[:readN],
+					})
+					offset += int64(readN)
 				}
-				chunkBuf := make([]byte, chunkLen)
-				if _, err := io.ReadFull(f, chunkBuf); err != nil {
+				if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+					break
+				}
+				if readErr != nil {
 					errutil.CloseAndLog(f, "upper file")
-					return fmt.Errorf("read chunk of %s at %d: %w", path, offset, err)
+					return fmt.Errorf("read chunk of %s at %d: %w", path, offset, readErr)
 				}
-				writes = append(writes, FileOp{
-					Type:   OpWriteFile,
-					Path:   relPath,
-					Offset: offset,
-					Data:   chunkBuf,
-				})
-				offset += chunkLen
 			}
 			errutil.CloseAndLog(f, "upper file")
 		} else {
-			// Modified file
+			// Modified file from lower layer before any checkpoint
+			if lStat.Size() == fileSize && lStat.ModTime().Equal(info.ModTime()) {
+				// Identical to lower layer
+				return nil
+			}
+
 			f, oErr := os.Open(path)
 			if oErr != nil {
+				if os.IsNotExist(oErr) {
+					return nil
+				}
 				return oErr
 			}
 
@@ -487,23 +601,25 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 			}
 
 			offset := int64(0)
-			for offset < fileSize {
-				chunkLen := int64(64 * 1024)
-				if offset+chunkLen > fileSize {
-					chunkLen = fileSize - offset
+			for {
+				chunkBuf := make([]byte, 64*1024)
+				readN, readErr := io.ReadFull(f, chunkBuf)
+				if readN > 0 {
+					writes = append(writes, FileOp{
+						Type:   OpWriteFile,
+						Path:   relPath,
+						Offset: offset,
+						Data:   chunkBuf[:readN],
+					})
+					offset += int64(readN)
 				}
-				chunkBuf := make([]byte, chunkLen)
-				if _, err := io.ReadFull(f, chunkBuf); err != nil {
+				if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+					break
+				}
+				if readErr != nil {
 					errutil.CloseAndLog(f, "upper file")
-					return fmt.Errorf("read chunk of modified file %s at %d: %w", path, offset, err)
+					return fmt.Errorf("read chunk of modified file %s at %d: %w", path, offset, readErr)
 				}
-				writes = append(writes, FileOp{
-					Type:   OpWriteFile,
-					Path:   relPath,
-					Offset: offset,
-					Data:   chunkBuf,
-				})
-				offset += chunkLen
 			}
 			errutil.CloseAndLog(f, "upper file")
 		}
@@ -574,8 +690,10 @@ func resolveInode(ctx context.Context, client pb.ObjectFSControllerClient, volum
 	return currIno, nil
 }
 
-// ReplayOperations executes the scanned operations sequentially as RPCs against the controller.
-func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, volumeID string, ops []FileOp) error {
+// ReplayOperations executes the scanned operations sequentially as RPCs against the controller,
+// and issues blocking fsyncs on all touched inodes. It returns the highest stream position
+// committed by the fsyncs.
+func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, volumeID string, ops []FileOp) (uint64, error) {
 	pathInodes := make(map[string]uint64)
 	pathInodes[""] = 1
 	pathInodes["."] = 1
@@ -596,12 +714,12 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				Name:        op.Name,
 			})
 			if err != nil {
-				return fmt.Errorf("unlink %s (parent %d, name %s): %w", op.Path, parentIno, op.Name, err)
+				return 0, fmt.Errorf("unlink %s (parent %d, name %s): %w", op.Path, parentIno, op.Name, err)
 			}
 			// Treat ENOENT as success: if a previous cleanup removed lower/ but not upper/,
 			// whiteouts without a lower counterpart replay as unlinks of names that may not exist.
 			if resp.GetError() != 0 && resp.GetError() != int32(syscall.ENOENT) {
-				return fmt.Errorf("unlink %s returned error: %d", op.Path, resp.GetError())
+				return 0, fmt.Errorf("unlink %s returned error: %d", op.Path, resp.GetError())
 			}
 			delete(pathInodes, op.Path)
 			touchedInodes[parentIno] = true
@@ -618,11 +736,11 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				Name:        op.Name,
 			})
 			if err != nil {
-				return fmt.Errorf("rmdir %s (parent %d, name %s): %w", op.Path, parentIno, op.Name, err)
+				return 0, fmt.Errorf("rmdir %s (parent %d, name %s): %w", op.Path, parentIno, op.Name, err)
 			}
 			// Treat ENOENT as success if the directory does not exist on controller.
 			if resp.GetError() != 0 && resp.GetError() != int32(syscall.ENOENT) {
-				return fmt.Errorf("rmdir %s returned error: %d", op.Path, resp.GetError())
+				return 0, fmt.Errorf("rmdir %s returned error: %d", op.Path, resp.GetError())
 			}
 			delete(pathInodes, op.Path)
 			touchedInodes[parentIno] = true
@@ -630,7 +748,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 		case OpMkdir:
 			parentIno, err := resolveInode(ctx, client, volumeID, pathInodes, op.Parent)
 			if err != nil {
-				return fmt.Errorf("resolve parent for mkdir %s: %w", op.Path, err)
+				return 0, fmt.Errorf("resolve parent for mkdir %s: %w", op.Path, err)
 			}
 			mode := op.Mode
 			if mode == 0 {
@@ -645,10 +763,10 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				Gid:         op.Gid,
 			})
 			if err != nil {
-				return fmt.Errorf("mkdir %s: %w", op.Path, err)
+				return 0, fmt.Errorf("mkdir %s: %w", op.Path, err)
 			}
 			if resp.GetError() != 0 {
-				return fmt.Errorf("mkdir %s returned error: %d", op.Path, resp.GetError())
+				return 0, fmt.Errorf("mkdir %s returned error: %d", op.Path, resp.GetError())
 			}
 			newIno := resp.GetAttr().GetInode().GetIno()
 			pathInodes[op.Path] = newIno
@@ -658,7 +776,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 		case OpCreateFile:
 			parentIno, err := resolveInode(ctx, client, volumeID, pathInodes, op.Parent)
 			if err != nil {
-				return fmt.Errorf("resolve parent for create %s: %w", op.Path, err)
+				return 0, fmt.Errorf("resolve parent for create %s: %w", op.Path, err)
 			}
 			mode := op.Mode
 			if mode == 0 {
@@ -674,10 +792,10 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				InitialContent: op.Data,
 			})
 			if err != nil {
-				return fmt.Errorf("create file %s: %w", op.Path, err)
+				return 0, fmt.Errorf("create file %s: %w", op.Path, err)
 			}
 			if resp.GetError() != 0 {
-				return fmt.Errorf("create file %s returned error: %d", op.Path, resp.GetError())
+				return 0, fmt.Errorf("create file %s returned error: %d", op.Path, resp.GetError())
 			}
 			newIno := resp.GetAttr().GetInode().GetIno()
 			pathInodes[op.Path] = newIno
@@ -687,7 +805,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 		case OpSymlink:
 			parentIno, err := resolveInode(ctx, client, volumeID, pathInodes, op.Parent)
 			if err != nil {
-				return fmt.Errorf("resolve parent for symlink %s: %w", op.Path, err)
+				return 0, fmt.Errorf("resolve parent for symlink %s: %w", op.Path, err)
 			}
 			resp, err := client.Symlink(ctx, &pb.SymlinkRequest{
 				VolumeId:    volumeID,
@@ -698,10 +816,10 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				Gid:         op.Gid,
 			})
 			if err != nil {
-				return fmt.Errorf("symlink %s: %w", op.Path, err)
+				return 0, fmt.Errorf("symlink %s: %w", op.Path, err)
 			}
 			if resp.GetError() != 0 {
-				return fmt.Errorf("symlink %s returned error: %d", op.Path, resp.GetError())
+				return 0, fmt.Errorf("symlink %s returned error: %d", op.Path, resp.GetError())
 			}
 			newIno := resp.GetAttr().GetInode().GetIno()
 			pathInodes[op.Path] = newIno
@@ -711,7 +829,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 		case OpTruncateFile:
 			ino, err := resolveInode(ctx, client, volumeID, pathInodes, op.Path)
 			if err != nil {
-				return fmt.Errorf("resolve inode for truncate %s: %w", op.Path, err)
+				return 0, fmt.Errorf("resolve inode for truncate %s: %w", op.Path, err)
 			}
 			resp, err := client.TruncateFile(ctx, &pb.TruncateFileRequest{
 				VolumeId: volumeID,
@@ -719,17 +837,17 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				Size:     op.Size,
 			})
 			if err != nil {
-				return fmt.Errorf("truncate file %s: %w", op.Path, err)
+				return 0, fmt.Errorf("truncate file %s: %w", op.Path, err)
 			}
 			if resp.GetError() != 0 {
-				return fmt.Errorf("truncate file %s returned error: %d", op.Path, resp.GetError())
+				return 0, fmt.Errorf("truncate file %s returned error: %d", op.Path, resp.GetError())
 			}
 			touchedInodes[ino] = true
 
 		case OpWriteFile:
 			ino, err := resolveInode(ctx, client, volumeID, pathInodes, op.Path)
 			if err != nil {
-				return fmt.Errorf("resolve inode for write %s: %w", op.Path, err)
+				return 0, fmt.Errorf("resolve inode for write %s: %w", op.Path, err)
 			}
 			resp, err := client.WriteFile(ctx, &pb.WriteFileRequest{
 				VolumeId:  volumeID,
@@ -739,10 +857,10 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
 			})
 			if err != nil {
-				return fmt.Errorf("write file %s (offset %d): %w", op.Path, op.Offset, err)
+				return 0, fmt.Errorf("write file %s (offset %d): %w", op.Path, op.Offset, err)
 			}
 			if resp.GetError() != 0 {
-				return fmt.Errorf("write file %s (offset %d) returned error: %d", op.Path, op.Offset, resp.GetError())
+				return 0, fmt.Errorf("write file %s (offset %d) returned error: %d", op.Path, op.Offset, resp.GetError())
 			}
 			touchedInodes[ino] = true
 
@@ -770,10 +888,10 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 			}
 			resp, err := client.SetAttr(ctx, req)
 			if err != nil {
-				return fmt.Errorf("setAttr %s: %w", op.Path, err)
+				return 0, fmt.Errorf("setAttr %s: %w", op.Path, err)
 			}
 			if resp.GetError() != 0 {
-				return fmt.Errorf("setAttr %s returned error: %d", op.Path, resp.GetError())
+				return 0, fmt.Errorf("setAttr %s returned error: %d", op.Path, resp.GetError())
 			}
 			touchedInodes[ino] = true
 		}
@@ -783,6 +901,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 	touchedInodes[1] = true
 
 	// Issue blocking fsync per touched inode
+	var lastStreamPos uint64
 	for ino := range touchedInodes {
 		fsyncResp, err := client.Fsync(ctx, &pb.FsyncRequest{
 			VolumeId: volumeID,
@@ -790,12 +909,123 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 			Blocking: true,
 		})
 		if err != nil {
-			return fmt.Errorf("fsync ino %d: %w", ino, err)
+			return 0, fmt.Errorf("fsync ino %d: %w", ino, err)
 		}
 		if fsyncResp.GetError() != 0 {
-			return fmt.Errorf("fsync ino %d returned error: %d", ino, fsyncResp.GetError())
+			return 0, fmt.Errorf("fsync ino %d returned error: %d", ino, fsyncResp.GetError())
+		}
+		if fsyncResp.GetStreamPosition() > lastStreamPos {
+			lastStreamPos = fsyncResp.GetStreamPosition()
 		}
 	}
 
+	return lastStreamPos, nil
+}
+
+// CheckpointManifest records state committed to the controller during previous checkpoints,
+// allowing subsequent scans to be purely incremental without modifying lower/ or upper/.
+type CheckpointManifest struct {
+	Files      map[string]ManifestEntry `json:"files,omitempty"`
+	Whiteouts  map[string]bool          `json:"whiteouts,omitempty"`
+	OpaqueDirs map[string]bool          `json:"opaque_dirs,omitempty"`
+}
+
+type ManifestEntry struct {
+	Size  int64 `json:"size"`
+	Mtime int64 `json:"mtime_unix_nano"`
+}
+
+// NewCheckpointManifest creates an empty CheckpointManifest.
+func NewCheckpointManifest() *CheckpointManifest {
+	return &CheckpointManifest{
+		Files:      make(map[string]ManifestEntry),
+		Whiteouts:  make(map[string]bool),
+		OpaqueDirs: make(map[string]bool),
+	}
+}
+
+// LoadCheckpointManifest loads the checkpoint manifest from the given path.
+func LoadCheckpointManifest(path string) (*CheckpointManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return NewCheckpointManifest(), nil
+		}
+		return nil, fmt.Errorf("read checkpoint manifest %s: %w", path, err)
+	}
+	var m CheckpointManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("unmarshal checkpoint manifest %s: %w", path, err)
+	}
+	if m.Files == nil {
+		m.Files = make(map[string]ManifestEntry)
+	}
+	if m.Whiteouts == nil {
+		m.Whiteouts = make(map[string]bool)
+	}
+	if m.OpaqueDirs == nil {
+		m.OpaqueDirs = make(map[string]bool)
+	}
+	return &m, nil
+}
+
+// SaveCheckpointManifest writes the manifest atomically to path.tmp then renames it to path.
+func SaveCheckpointManifest(path string, m *CheckpointManifest) error {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal checkpoint manifest: %w", err)
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("write tmp checkpoint manifest %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename checkpoint manifest %s to %s: %w", tmpPath, path, err)
+	}
 	return nil
+}
+
+// UpdateCheckpointManifest records the newly committed operations into the in-memory manifest.
+func UpdateCheckpointManifest(m *CheckpointManifest, upperDir string, ops []FileOp) {
+	if m == nil {
+		return
+	}
+	for _, op := range ops {
+		switch op.Type {
+		case OpUnlink:
+			m.Whiteouts[op.Path] = true
+			delete(m.Files, op.Path)
+		case OpRmdir:
+			m.Whiteouts[op.Path] = true
+			delete(m.Files, op.Path)
+		case OpCreateFile, OpWriteFile, OpTruncateFile, OpSetAttr:
+			upperPath := filepath.Join(upperDir, op.Path)
+			if uInfo, err := os.Lstat(upperPath); err == nil && !isWhiteout(upperPath, uInfo) && !uInfo.IsDir() {
+				m.Files[op.Path] = ManifestEntry{
+					Size:  uInfo.Size(),
+					Mtime: uInfo.ModTime().UnixNano(),
+				}
+			} else {
+				entry := m.Files[op.Path]
+				if op.Type == OpCreateFile {
+					entry.Size = op.Size
+				} else if op.Type == OpWriteFile {
+					end := op.Offset + int64(len(op.Data))
+					if end > entry.Size {
+						entry.Size = end
+					}
+				} else if op.Type == OpTruncateFile {
+					entry.Size = op.Size
+				}
+				if !op.Mtime.IsZero() {
+					entry.Mtime = op.Mtime.UnixNano()
+				}
+				m.Files[op.Path] = entry
+			}
+		case OpMkdir, OpSymlink:
+			m.Files[op.Path] = ManifestEntry{
+				Size: 0,
+			}
+		}
+	}
 }
