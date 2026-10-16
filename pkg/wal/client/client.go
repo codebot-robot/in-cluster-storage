@@ -28,6 +28,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -204,7 +205,7 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 	if opt.grpcClient != nil {
 		s.grpcClient = opt.grpcClient
 	} else if target != "" {
-		dialOpts := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, opt.dialOpts...)
+		dialOpts := append(grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())), opt.dialOpts...)
 		conn, err := grpc.NewClient(target, dialOpts...)
 		if err != nil {
 			cancelFunc()
@@ -813,7 +814,7 @@ func TailStream(ctx context.Context, target string, streamID uuid.UUID, fromSeq 
 		var localConn *grpc.ClientConn
 		grpcClient := opt.grpcClient
 		if grpcClient == nil {
-			dialOpts := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, opt.dialOpts...)
+			dialOpts := append(grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())), opt.dialOpts...)
 			conn, err := grpc.NewClient(target, dialOpts...)
 			if err != nil {
 				klog.Errorf("TailStream failed to dial target %s: %v", target, err)
