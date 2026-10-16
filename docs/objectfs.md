@@ -116,7 +116,12 @@ ObjectFS supports two distinct mount modes, selected via the `mode` parameter in
 
 2. **Exclusive-Local Mode (`mode: exclusive-local`):**
    - The node daemon eagerly materialises the volume from the controller into a local directory (`<cacheDir>/<volume>/lower`), mounts an **OverlayFS** filesystem into the pod with local `upper` and `work` directories, and serves I/O at local kernel filesystem speed with **no FUSE overhead and no per-operation RPCs**.
-   - **Durability Contract:** Writes remain entirely local on the node until a **checkpoint**. Writes are durable *at unmount*: when the pod terminates, `NodeUnpublishVolume` unmounts the overlay, scans `upper/` for changes, and commits the upper layer back to the controller via ordinary RPCs (`Mkdir`, `CreateFile`, `WriteFile`, `TruncateFile`, `Unlink`, `Rmdir`, `Symlink`, `SetAttr`, and blocking `Fsync`). If a pod or worker node is killed between checkpoints, uncommitted writes since mount (or the last checkpoint) are lost; this is the explicit contract until periodic checkpoints are added in step 4.
+   - **Durability Contract:** Writes remain entirely local on the node until a **checkpoint**. Writes are durable **at unmount, at each checkpoint, and on request**:
+     - **At unmount:** when the pod terminates, `NodeUnpublishVolume` unmounts the overlay, scans `upper/` for changes, and commits the upper layer back to the controller via ordinary RPCs (`Mkdir`, `CreateFile`, `WriteFile`, `TruncateFile`, `Unlink`, `Rmdir`, `Symlink`, `SetAttr`, and blocking `Fsync`).
+     - **At each checkpoint (periodic interval):** configured via the `checkpointInterval` parameter on the `objectfs-exclusive-local` StorageClass or as a volume attribute (duration string, e.g. `checkpointInterval: "10s"`, default off). The daemon runs the upper-layer commit on a timer without unmounting; pieces written since the last checkpoint are committed, tracked via a local checkpoint manifest without mutating `lower/` or `upper/`, the overlay stays mounted, and the pod keeps running. Concurrency: the scan tolerates files changing underneath it (commits what it reads as a point-in-time prefix per file; the next checkpoint picks up the rest).
+     - **On request (explicit checkpoint):** triggered via `objectfsctl checkpoint <volume>`. The controller records the request with a unique request ID, broadcasts `EVENT_CHECKPOINT_REQUEST` over the existing `WatchVolume` stream to the node daemon, the daemon commits the upper layer and acknowledges via `AckCheckpoint` with the stream position of the commit, unblocking the CLI.
+     - Writes are lost only when a worker node dies before unmount can run, which is bounded by the periodic checkpoint interval; a force-deleted pod still has its volume unpublished and committed by kubelet.
+     - **Hand-off Race Limitation (#307):** After a force delete (`--force --grace-period=0`), a pod scheduled onto another node may observe the volume before the previous node's final checkpoint has committed; the checkpoint still commits and is visible on the next mount (#307).
    - **Leftover Recovery & Checkpoint Failure Safety:** A failed checkpoint never discards or purges uncommitted local state. If scanning or replay fails during `NodeUnpublishVolume`, `upper/` is kept completely intact on disk, and an error is returned so kubelet retries unpublish until durability is achieved. Furthermore, if a new pod mounts the volume on the same node after an unmount failure, `publishExclusiveLocal` detects the non-empty `upper/`, replays and commits it to the controller first, and only then wipes the directory and materialises fresh. If recovery replay fails, publish fails with an error naming the leftover directory.
    - **Resumable Eager Materialisation & Kubelet Timeout:** Kubelet imposes a default 2-minute timeout on CSI `NodePublishVolume` calls. If a large volume exceeds 2 minutes to materialise, kubelet cancels and retries `NodePublishVolume`. Materialisation is designed to be resumable: files are written to temporary files and atomically renamed upon completion. Subsequent retries inspect existing files in `lower/` and skip downloading any file whose size and modification time already match the live volume. Active progress (files and bytes completed) is logged every 5 seconds.
    - **Access Mode & Exclusivity Requirement:** Because multiple concurrent writers to the same volume in exclusive-local mode would diverge without synchronization, exclusivity is enforced through CSI access modes. Drivers advertise `SINGLE_NODE_SINGLE_WRITER` (`NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER`). Volumes mounted in `exclusive-local` mode **must** be claimed with `ReadWriteOncePod` (RWOP). Mounting with any other access mode is rejected with `InvalidArgument`.
@@ -131,6 +136,7 @@ ObjectFS supports two distinct mount modes, selected via the `mode` parameter in
      reclaimPolicy: Delete
      parameters:
        mode: exclusive-local
+       checkpointInterval: "10s" # optional: periodic checkpoint interval (e.g. "10s", "1m", default off)
      ---
      apiVersion: v1
      kind: PersistentVolumeClaim
@@ -144,7 +150,7 @@ ObjectFS supports two distinct mount modes, selected via the `mode` parameter in
          requests:
            storage: 10Gi
      ```
-     Static PersistentVolumes also remain supported by specifying `mode: exclusive-local` in `spec.csi.volumeAttributes`.
+     Static PersistentVolumes also remain supported by specifying `mode: exclusive-local` and optional `checkpointInterval: "10s"` in `spec.csi.volumeAttributes`.
    - **Local Disk Requirements:** The worker node must have sufficient local scratch disk capacity under the daemon's cache directory (`/var/cache/objectfs/<volume>`) to store the eagerly downloaded `lower/` layer, overlay `upper/`, and `work/` trees.
    - **Metadata Preservation Semantics:**
      - **Regular Files & Directories:** Permissions (mode) and modification times (mtime) are preserved.
@@ -415,6 +421,8 @@ The gRPC contract between `objectfs-node-daemon` and `objectfs-controller` is de
 | | `ListVolumes` | Discovers available volumes across the cluster. |
 | | `ListSnapshots` | Lists point-in-time EROFS snapshots for a volume. |
 | | `CreateSnapshot` | Manually triggers an immediate EROFS snapshot compilation. |
+| | `Checkpoint` | Triggers an explicit checkpoint commit on an exclusive-local volume and waits for acknowledgement. |
+| | `AckCheckpoint` | Acknowledges completion of an explicit checkpoint commit by a node daemon. |
 
 ---
 

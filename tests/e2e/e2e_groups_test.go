@@ -36,9 +36,11 @@ var (
 	}
 
 	multiNodeGroup = map[string]bool{
-		"TestObjectFSMultiNodeFailoverE2E":   true,
-		"TestObjectFSCrossNodeVisibilityE2E": true,
-		"TestObjectFSExclusiveLocalE2E":      true, // #290
+		"TestObjectFSMultiNodeFailoverE2E":      true,
+		"TestObjectFSCrossNodeVisibilityE2E":    true,
+		"TestObjectFSExclusiveLocalE2E":         true, // #290
+		"TestObjectFSExclusiveLocalKillE2E":     true, // #288
+		"TestObjectFSExclusiveLocalIntervalE2E": true, // #288
 	}
 
 	chaosGroup = map[string]bool{
