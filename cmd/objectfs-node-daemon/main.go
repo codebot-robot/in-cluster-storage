@@ -115,6 +115,8 @@ type activeMount struct {
 	server     *gofuse.Server
 	cancelFunc context.CancelFunc
 	volumeID   string
+	mode       string
+	volumeDir  string
 }
 
 type objectFSDriver struct {
@@ -244,6 +246,13 @@ func (d *objectFSDriver) NodeGetCapabilities(ctx context.Context, req *csi.NodeG
 					},
 				},
 			},
+			{
+				Type: &csi.NodeServiceCapability_Rpc{
+					Rpc: &csi.NodeServiceCapability_RPC{
+						Type: csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+					},
+				},
+			},
 		},
 	}, nil
 }
@@ -269,6 +278,15 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	}
 	if volumeID == "" {
 		return nil, fmt.Errorf("volumeID is required")
+	}
+
+	mode := strings.ToLower(req.GetVolumeContext()["mode"])
+	if mode == "exclusive-local" {
+		cap := req.GetVolumeCapability()
+		if cap == nil || cap.GetAccessMode() == nil || cap.GetAccessMode().GetMode() != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
+			return nil, status.Errorf(codes.InvalidArgument, "exclusive-local mode requires SINGLE_NODE_SINGLE_WRITER access mode (ReadWriteOncePod)")
+		}
+		return d.publishExclusiveLocal(ctx, req, volumeID)
 	}
 
 	writeModeStr := req.GetVolumeContext()["writeMode"]
@@ -320,15 +338,20 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	d.mu.Lock()
 	// Clean up any previous mount at this targetPath if any
 	if old, ok := d.mounts[targetPath]; ok {
-		old.cancelFunc()
-		if unmountErr := old.server.Unmount(); unmountErr != nil {
-			klog.Warningf("failed to unmount previous mount at %s: %v", targetPath, unmountErr)
+		if old.cancelFunc != nil {
+			old.cancelFunc()
+		}
+		if old.server != nil {
+			if unmountErr := old.server.Unmount(); unmountErr != nil {
+				klog.Warningf("failed to unmount previous mount at %s: %v", targetPath, unmountErr)
+			}
 		}
 	}
 	d.mounts[targetPath] = &activeMount{
 		server:     server,
 		cancelFunc: cancel,
 		volumeID:   volumeID,
+		mode:       "fuse",
 	}
 	d.mu.Unlock()
 
@@ -346,6 +369,15 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 		delete(d.mounts, targetPath)
 	}
 	d.mu.Unlock()
+
+	volumeID := req.GetVolumeId()
+	if ok && mountInfo != nil && mountInfo.volumeID != "" {
+		volumeID = mountInfo.volumeID
+	}
+	volumeDir := filepath.Join(d.cacheDir, volumeID)
+	if (ok && mountInfo != nil && mountInfo.mode == "exclusive-local") || isExclusiveLocalDir(volumeDir) {
+		return d.unpublishExclusiveLocal(ctx, req, volumeID, volumeDir)
+	}
 
 	if ok && mountInfo != nil {
 		client, err := d.getClient()
@@ -369,9 +401,17 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 				return nil, fmt.Errorf("fsync ObjectFS volume %s returned error: %d", mountInfo.volumeID, resp.GetError())
 			}
 		}
-		mountInfo.cancelFunc()
-		if err := mountInfo.server.Unmount(); err != nil {
-			klog.Warningf("FUSE server unmount returned error: %v, attempting system unmount", err)
+		if mountInfo.cancelFunc != nil {
+			mountInfo.cancelFunc()
+		}
+		if mountInfo.server != nil {
+			if err := mountInfo.server.Unmount(); err != nil {
+				klog.Warningf("FUSE server unmount returned error: %v, attempting system unmount", err)
+				if err := syscall.Unmount(targetPath, 0); err != nil && err != syscall.EINVAL {
+					return nil, fmt.Errorf("failed to unmount %s: %w", targetPath, err)
+				}
+			}
+		} else {
 			if err := syscall.Unmount(targetPath, 0); err != nil && err != syscall.EINVAL {
 				return nil, fmt.Errorf("failed to unmount %s: %w", targetPath, err)
 			}
