@@ -141,6 +141,7 @@ type Server struct {
 	syncCoalesceWindow       time.Duration
 	maxStagingBytes          int64
 	syncTimeout              time.Duration
+	acceptUnversioned        bool
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -272,6 +273,13 @@ func WithServerSyncTimeout(d time.Duration) ServerOption {
 	}
 }
 
+// WithServerAcceptUnversioned configures whether unversioned segments, streams, and snapshots are accepted.
+func WithServerAcceptUnversioned(accept bool) ServerOption {
+	return func(s *Server) {
+		s.acceptUnversioned = accept
+	}
+}
+
 func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if backend == nil {
 		backend = NewMemoryBackend()
@@ -310,7 +318,11 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 			volOpts = append(volOpts, WithStream(stream))
 		} else if s.walDir != "" {
 			streamID := StreamIDForVolume(volumeID)
-			stream, err := walclient.Open(context.Background(), s.walDir, streamID, s.walTarget)
+			var walOpts []walclient.Option
+			if s.acceptUnversioned {
+				walOpts = append(walOpts, walclient.WithAcceptUnversioned(true))
+			}
+			stream, err := walclient.Open(context.Background(), s.walDir, streamID, s.walTarget, walOpts...)
 			if err != nil {
 				return nil, fmt.Errorf("failed to open stream for volume %s: %w", volumeID, err)
 			}
@@ -356,6 +368,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if s.syncTimeout > 0 {
 			volOpts = append(volOpts, WithSyncTimeout(s.syncTimeout))
+		}
+		if s.acceptUnversioned {
+			volOpts = append(volOpts, WithAcceptUnversioned(true))
 		}
 
 		var err error

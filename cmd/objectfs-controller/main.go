@@ -34,6 +34,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
@@ -41,25 +42,26 @@ import (
 )
 
 var (
-	port                     = flag.Int("port", 50051, "The server port")
-	csiEndpoint              = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
-	backendFlag              = flag.String("backend", "", "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
-	metadataDir              = flag.String("metadata-dir", "", "Local directory for persistent metadata indices (e.g. SQLite databases)")
-	flushInterval            = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
-	walDir                   = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
-	walTarget                = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
-	walDurability            = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
-	metadataIndex            = flag.String("metadata-index", "sqlite", "Metadata local index type (sqlite, memory, table)")
-	metadataIndexCacheMB     = flag.Int("metadata-index-cache-mb", 64, "Pebble shared block cache size in megabytes for table metadata index")
-	metadataCacheEntries     = flag.Int("metadata-cache-entries", 0, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
-	metadataCacheBytes       = flag.Int64("metadata-cache-bytes", 64*1024*1024, "Maximum byte size of metadata read cache")
-	metadataOverlayMaxBytes  = flag.Int64("metadata-overlay-max-bytes", 64*1024*1024, "Maximum byte size of unapplied metadata overlay before applying backpressure")
-	metadataApplierBatchSize = flag.Int("metadata-applier-batch-size", 100, "Maximum batch size for SQLite background applier")
-	debugMutationCheck       = flag.Bool("debug-mutation-check", false, "Enable debug mutation checking on metadata view (for test/CI gates)")
-	debugStatsCheck          = flag.Bool("debug-stats-check", false, "Enable debug volume stats checking (for test/CI gates)")
-	syncCoalesceWindow       = flag.Duration("sync-coalesce-window", 1*time.Second, "Coalescing window for non-blocking sync requests")
-	maxStagingBytes          = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
-	controllerSyncTimeout    = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
+	port                      = flag.Int("port", 50051, "The server port")
+	csiEndpoint               = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
+	backendFlag               = flag.String("backend", "", "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
+	metadataDir               = flag.String("metadata-dir", "", "Local directory for persistent metadata indices (e.g. SQLite databases)")
+	flushInterval             = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
+	walDir                    = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
+	walTarget                 = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
+	walDurability             = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
+	metadataIndex             = flag.String("metadata-index", "sqlite", "Metadata local index type (sqlite, memory, table)")
+	metadataIndexCacheMB      = flag.Int("metadata-index-cache-mb", 64, "Pebble shared block cache size in megabytes for table metadata index")
+	metadataCacheEntries      = flag.Int("metadata-cache-entries", 0, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
+	metadataCacheBytes        = flag.Int64("metadata-cache-bytes", 64*1024*1024, "Maximum byte size of metadata read cache")
+	metadataOverlayMaxBytes   = flag.Int64("metadata-overlay-max-bytes", 64*1024*1024, "Maximum byte size of unapplied metadata overlay before applying backpressure")
+	metadataApplierBatchSize  = flag.Int("metadata-applier-batch-size", 100, "Maximum batch size for SQLite background applier")
+	debugMutationCheck        = flag.Bool("debug-mutation-check", false, "Enable debug mutation checking on metadata view (for test/CI gates)")
+	debugStatsCheck           = flag.Bool("debug-stats-check", false, "Enable debug volume stats checking (for test/CI gates)")
+	syncCoalesceWindow        = flag.Duration("sync-coalesce-window", 1*time.Second, "Coalescing window for non-blocking sync requests")
+	maxStagingBytes           = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
+	controllerSyncTimeout     = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
+	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
 )
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -88,6 +90,10 @@ func main() {
 		tableCache := pebble.NewCache(int64(*metadataIndexCacheMB) * 1024 * 1024)
 		defer tableCache.Unref()
 		tableOpts = append(tableOpts, table.WithCache(tableCache))
+	}
+	if *acceptUnversionedSegments {
+		tableOpts = append(tableOpts, table.WithAcceptUnversioned(true))
+		sds.RegisterIndexFactory(sqlite.NewFactory(sqlite.WithAcceptUnversioned(true)))
 	}
 	sds.RegisterIndexFactory(table.NewFactory(tableOpts...))
 
@@ -136,6 +142,9 @@ func main() {
 	}
 	if *controllerSyncTimeout > 0 {
 		serverOpts = append(serverOpts, controller.WithServerSyncTimeout(*controllerSyncTimeout))
+	}
+	if *acceptUnversionedSegments {
+		serverOpts = append(serverOpts, controller.WithServerAcceptUnversioned(true))
 	}
 	// TODO: We always want to assume a WAL, and maybe it would be nice to have a wal-client mode that was local-only e.g. for testing.
 	if *walDir != "" {
