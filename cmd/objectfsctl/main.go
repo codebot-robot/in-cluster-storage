@@ -223,8 +223,99 @@ func newVolumesCommand(opts *options) *cobra.Command {
 	}
 
 	volumesCmd.AddCommand(newVolumesListCommand(opts))
+	volumesCmd.AddCommand(newVolumesDescribeCommand(opts))
 
 	return volumesCmd
+}
+
+func newVolumesDescribeCommand(opts *options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "describe <volume>",
+		Aliases: []string{"desc", "show", "get"},
+		Short:   "Describe a volume and its current exclusive-local hold",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.serverAddr == "" {
+				return fmt.Errorf("--server is required")
+			}
+			volumeID := args[0]
+			if volumeID == "" {
+				return fmt.Errorf("volume ID is required")
+			}
+
+			client, conn, err := dialServer(opts.serverAddr)
+			if err != nil {
+				return err
+			}
+			defer errutil.CloseAndLog(conn, "server connection")
+
+			out := cmd.OutOrStdout()
+			var printErr error
+			printf := func(format string, a ...any) {
+				if printErr != nil {
+					return
+				}
+				if _, err := fmt.Fprintf(out, format, a...); err != nil {
+					printErr = fmt.Errorf("failed writing to output: %w", err)
+				}
+			}
+			println := func(a ...any) {
+				if printErr != nil {
+					return
+				}
+				if _, err := fmt.Fprintln(out, a...); err != nil {
+					printErr = fmt.Errorf("failed writing to output: %w", err)
+				}
+			}
+
+			printf("Volume: %s\n", volumeID)
+
+			holdResp, err := client.GetExclusiveHold(cmd.Context(), &pb.GetExclusiveHoldRequest{
+				VolumeId: volumeID,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to get exclusive hold for volume %s: %w", volumeID, err)
+			}
+
+			hold := holdResp.GetHold()
+			if hold != nil && hold.GetNodeId() != "" {
+				println("Exclusive Hold:")
+				printf("  Holder Node:  %s\n", hold.GetNodeId())
+				printf("  Mount ID:     %s\n", hold.GetMountId())
+				if hold.GetAcquiredAt() != nil {
+					printf("  Acquired:     %s\n", hold.GetAcquiredAt().AsTime().Format(time.RFC3339))
+				}
+				if hold.GetLeaseExpiry() != nil {
+					expiry := hold.GetLeaseExpiry().AsTime()
+					remaining := time.Until(expiry).Round(time.Second)
+					if remaining > 0 {
+						printf("  Lease Expiry: %s (%s remaining)\n", expiry.Format(time.RFC3339), remaining)
+					} else {
+						printf("  Lease Expiry: %s (expired)\n", expiry.Format(time.RFC3339))
+					}
+				}
+			} else {
+				println("Exclusive Hold: none")
+			}
+
+			// Also display stats if volume exists in store
+			statsResp, err := client.GetVolumeStats(cmd.Context(), &pb.GetVolumeStatsRequest{
+				VolumeId: volumeID,
+			})
+			if err != nil {
+				printf("Stats: unavailable (%v)\n", err)
+			} else if statsResp.GetStats() != nil {
+				s := statsResp.GetStats()
+				println("Stats:")
+				printf("  Files:         %d\n", s.GetInodesFile())
+				printf("  Directories:   %d\n", s.GetInodesDir())
+				printf("  Logical Bytes: %d\n", s.GetLogicalBytes())
+			}
+
+			return printErr
+		},
+	}
+	return cmd
 }
 
 type volumesListOptions struct {
