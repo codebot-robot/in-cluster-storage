@@ -2288,7 +2288,7 @@ func (fs *ObjectFS) notifyDelete(parent, child uint64, name string) {
 }
 
 func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*ObjectFS) {
-	if ev == nil {
+	if ev == nil || ev.GetEventType() == pb.WatchEventType_EVENT_CHECKPOINT_REQUEST {
 		return
 	}
 	ino := ev.GetInode()

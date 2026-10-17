@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1989,6 +1990,34 @@ echo $? > /tmp/wal_workload.status
 	t.Logf("Successfully verified WAL buffer restart durability, mid-workload restart, and continued writes!")
 }
 
+// deletePodBounded deletes a pod with --wait=false and polls until it is completely deleted
+// within the specified timeout. On timeout expiry, it dumps diagnostic evidence (kubectl describe,
+// node daemon logs, controller logs) and calls t.Fatalf.
+func deletePodBounded(t *testing.T, h *Harness, podName, namespace string, timeout time.Duration) {
+	t.Helper()
+	t.Logf("Deleting pod %s in namespace %s with timeout %v", podName, namespace, timeout)
+	h.RunCommand("kubectl", "delete", "pod", podName, "-n", namespace, "--wait=false", "--ignore-not-found")
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("kubectl", "get", "pod", podName, "-n", namespace).CombinedOutput()
+		if err != nil && (strings.Contains(string(out), "NotFound") || strings.Contains(string(out), "not found")) {
+			t.Logf("Pod %s successfully deleted", podName)
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// Timeout expired: dump diagnostics before failing
+	t.Logf("======= DUMPING DIAGNOSTICS FOR HUNG POD DELETION: %s =======", podName)
+	if desc, err := exec.Command("kubectl", "describe", "pod", podName, "-n", namespace).CombinedOutput(); err == nil {
+		t.Logf("kubectl describe pod %s:\n%s\n", podName, string(desc))
+	}
+	t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", namespace))
+	t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", namespace))
+	t.Fatalf("Timed out waiting %v for pod %s to be deleted", timeout, podName)
+}
+
 func TestObjectFSExclusiveLocalE2E(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("Skipping ObjectFS Exclusive-Local E2E test; RUN_E2E not set")
@@ -2061,8 +2090,7 @@ spec:
 
 	// Step 2: Delete Pod A (triggers unmount checkpoint)
 	t.Logf("Deleting Pod A on Node 1 to trigger unmount checkpoint")
-	h.DeletePod(podAName, "default")
-	h.RunCommand("kubectl", "wait", "--for=delete", "pod/"+podAName, "-n", "default", "--timeout=60s")
+	deletePodBounded(t, h, podAName, "default", 3*time.Minute)
 
 	// Step 3: Deploy Pod B on Node 2 in exclusive-local mode
 	podBName := "exclusive-pod-b"
@@ -2155,6 +2183,302 @@ spec:
 	}
 	t.Logf("FUSE reader pod successfully saw same content committed by exclusive-local unmount checkpoint!")
 
-	h.DeletePod(fusePodName, "default")
+	deletePodBounded(t, h, fusePodName, "default", 3*time.Minute)
+	deletePodBounded(t, h, podBName, "default", 3*time.Minute)
+	h.DeletePVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+}
+
+func TestObjectFSExclusiveLocalKillE2E(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("Skipping ObjectFS Exclusive-Local Kill E2E test; RUN_E2E not set")
+	}
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t, "objectfs-exclusive-local-kill-e2e")
+	volumeID := "exclusive-kill-e2e-vol"
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+			t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		}
+	})
+
+	// Setup PVC with storageClassName: objectfs-exclusive-local and ReadWriteOncePod
+	pvcYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s-pvc
+spec:
+  accessModes:
+    - ReadWriteOncePod
+  storageClassName: objectfs-exclusive-local
+  resources:
+    requests:
+      storage: 1Gi
+`, volumeID)
+
+	t.Logf("Creating PVC for exclusive-local volume")
+	h.KubectlApplyContent("exclusive-kill-pvc", pvcYaml)
+
+	// Step 1: Deploy Pod A on Node 1 in exclusive-local mode
+	podAName := "exclusive-kill-pod-a"
+	podAYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: %s-pvc
+`, podAName, node1, volumeID)
+
+	t.Logf("Starting Pod A on Node 1 (%s)", node1)
+	h.KubectlApplyContent(podAName, podAYaml)
+	if err := h.WaitForPodReady(podAName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Pod A failed to start: %v", err)
+	}
+
+	// Pod A writes initial checkpointed files
+	t.Logf("Pod A writing files before checkpoint")
+	_, err := h.RunInPod(podAName, "default", "/bin/sh", "-c", "echo 'durable-checkpoint-data' > /data/checkpointed.txt && sync")
+	if err != nil {
+		t.Fatalf("Failed to write initial file in Pod A: %v", err)
+	}
+
+	// Trigger explicit checkpoint via objectfsctl checkpoint <volume>
+	actualVolumeID, err := h.GetPVForPVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+	if err != nil {
+		t.Fatalf("Failed to get PV volumeName for PVC %s-pvc: %v", volumeID, err)
+	}
+
+	t.Logf("Executing objectfsctl checkpoint for volume %s", actualVolumeID)
+	h.RunCommand("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "checkpoint", actualVolumeID)
+
+	// Pod A writes more files AFTER the checkpoint
+	t.Logf("Pod A writing files after checkpoint")
+	_, err = h.RunInPod(podAName, "default", "/bin/sh", "-c", "echo 'post-checkpoint-data' > /data/post_checkpoint.txt && sync")
+	if err != nil {
+		t.Fatalf("Failed to write post-checkpoint file in Pod A: %v", err)
+	}
+
+	// Step 2: Pod A is deleted via force delete (--force --grace-period=0)
+	// Kubelet still unpublishes the volume on force delete, so unmount checkpoint runs and commits.
+	t.Logf("Force-deleting Pod A on Node 1 (--force --grace-period=0)")
+	h.RunCommand("kubectl", "delete", "pod", podAName, "-n", "default", "--force", "--grace-period=0", "--wait=false")
+
+	// Wait for Node 1's final checkpoint before starting Pod B.
+	// Note (#307): A force delete removes the pod object immediately, freeing the ReadWriteOncePod claim,
+	// so without this wait, Pod B would schedule and materialise on Node 2 before Node 1's unpublish
+	// finishes committing the post-checkpoint writes to the controller (racing the hand-off).
+	// This wait is removed when the controller-side hold with a lease lands in #307.
+	t.Logf("Waiting for Node 1 final unpublish checkpoint for volume %s", actualVolumeID)
+	deadline := time.Now().Add(60 * time.Second)
+	expectedLog := fmt.Sprintf("Successfully unpublished and checkpointed ObjectFS volume %s", actualVolumeID)
+	checkpointed := false
+	var daemonLogs string
+	for time.Now().Before(deadline) {
+		daemonLogs = h.GetPodLogs("app=objectfs-node-daemon", "default")
+		if strings.Contains(daemonLogs, expectedLog) {
+			checkpointed = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !checkpointed {
+		t.Fatalf("Precondition failed: Node 1 did not complete final checkpoint within 60s for volume %s (logs: %s)", actualVolumeID, daemonLogs)
+	}
+	t.Logf("Node 1 successfully completed final unpublish checkpoint for volume %s", actualVolumeID)
+
+	// Step 3: Deploy Pod B on Node 2 in exclusive-local mode
+	podBName := "exclusive-kill-pod-b"
+	podBYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: %s-pvc
+`, podBName, node2, volumeID)
+
+	t.Logf("Starting Pod B on Node 2 (%s) mounting the volume after force-delete", node2)
+	h.KubectlApplyContent(podBName, podBYaml)
+	if err := h.WaitForPodReady(podBName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Pod B failed to start: %v", err)
+	}
+
+	// Verify contract: Pod B MUST have the checkpointed file and MUST ALSO have the post-checkpoint file
+	// because kubelet still unpublished the volume, ensuring unmount durability.
+	outCheckpointed, err := retryCatInPod(h, podBName, "/data/checkpointed.txt", 15*time.Second)
+	if err != nil || !strings.Contains(outCheckpointed, "durable-checkpoint-data") {
+		t.Fatalf("Pod B did not see checkpointed file /data/checkpointed.txt: err=%v, out=%s", err, outCheckpointed)
+	}
+	t.Logf("Pod B successfully found checkpointed file /data/checkpointed.txt!")
+
+	outPostCheckpoint, err := retryCatInPod(h, podBName, "/data/post_checkpoint.txt", 15*time.Second)
+	if err != nil || !strings.Contains(outPostCheckpoint, "post-checkpoint-data") {
+		t.Fatalf("Pod B did not see post-checkpoint file /data/post_checkpoint.txt: err=%v, out=%s", err, outPostCheckpoint)
+	}
+	t.Logf("Pod B successfully found post-checkpoint file /data/post_checkpoint.txt (unmount durability verified)!")
+
+	deletePodBounded(t, h, podBName, "default", 3*time.Minute)
+	h.DeletePVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+}
+
+func TestObjectFSExclusiveLocalIntervalE2E(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("Skipping ObjectFS Exclusive-Local Interval E2E test; RUN_E2E not set")
+	}
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t, "objectfs-exclusive-local-interval-e2e")
+	volumeID := "exclusive-interval-e2e-vol"
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+			t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		}
+	})
+
+	// StorageClass with checkpointInterval: 2s
+	scYaml := `
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: objectfs-exclusive-local-interval
+provisioner: objectfs.labs.gke.io
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+parameters:
+  mode: exclusive-local
+  checkpointInterval: "2s"
+`
+	h.KubectlApplyContent("sc-interval", scYaml)
+
+	// Setup PVC
+	pvcYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s-pvc
+spec:
+  accessModes:
+    - ReadWriteOncePod
+  storageClassName: objectfs-exclusive-local-interval
+  resources:
+    requests:
+      storage: 1Gi
+`, volumeID)
+
+	t.Logf("Creating PVC for interval exclusive-local volume")
+	h.KubectlApplyContent("exclusive-interval-pvc", pvcYaml)
+
+	// Step 1: Deploy Pod A on Node 1 in exclusive-local mode
+	podAName := "exclusive-interval-pod-a"
+	podAYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: %s-pvc
+`, podAName, node1, volumeID)
+
+	t.Logf("Starting Pod A on Node 1 (%s)", node1)
+	h.KubectlApplyContent(podAName, podAYaml)
+	if err := h.WaitForPodReady(podAName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Pod A failed to start: %v", err)
+	}
+
+	actualVolumeID, err := h.GetPVForPVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+	if err != nil {
+		t.Fatalf("Failed to get PV volumeName for PVC %s-pvc: %v", volumeID, err)
+	}
+
+	// Step 2: Deploy FUSE reader Pod on Node 2
+	fusePodName := "fuse-interval-reader-node2"
+	fusePodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, fusePodName, node2, actualVolumeID)
+
+	t.Logf("Starting FUSE reader Pod on Node 2 (%s)", node2)
+	h.KubectlApplyContent(fusePodName, fusePodYaml)
+	if err := h.WaitForPodReady(fusePodName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("FUSE reader pod failed to start: %v", err)
+	}
+
+	// Step 3: Pod A writes file while keeping running (no unmount!)
+	t.Logf("Pod A writing file without unmounting")
+	_, err = h.RunInPod(podAName, "default", "/bin/sh", "-c", "echo 'interval-checkpoint-data' > /data/interval_file.txt && sync")
+	if err != nil {
+		t.Fatalf("Failed to write file in Pod A: %v", err)
+	}
+
+	// Step 4: Within one interval (checkpointInterval=2s), FUSE mount on Node 2 observes the write!
+	t.Logf("FUSE reader on Node 2 observing write within interval window")
+	outInterval, err := retryCatInPod(h, fusePodName, "/data/interval_file.txt", 15*time.Second)
+	if err != nil || !strings.Contains(outInterval, "interval-checkpoint-data") {
+		t.Fatalf("FUSE reader pod on Node 2 did not observe interval checkpoint write: err=%v, out=%s", err, outInterval)
+	}
+	t.Logf("FUSE reader on Node 2 successfully observed file written by running exclusive-local pod via interval checkpoint!")
+
+	deletePodBounded(t, h, fusePodName, "default", 3*time.Minute)
+	deletePodBounded(t, h, podAName, "default", 3*time.Minute)
 	h.DeletePVC(fmt.Sprintf("%s-pvc", volumeID), "default")
 }

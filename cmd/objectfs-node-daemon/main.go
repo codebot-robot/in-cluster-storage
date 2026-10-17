@@ -114,6 +114,7 @@ func parseEndpoint(endpoint string) (string, string, error) {
 type activeMount struct {
 	server     *gofuse.Server
 	cancelFunc context.CancelFunc
+	syncWg     *sync.WaitGroup
 	volumeID   string
 	mode       string
 	volumeDir  string
@@ -376,7 +377,7 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 	}
 	volumeDir := filepath.Join(d.cacheDir, volumeID)
 	if (ok && mountInfo != nil && mountInfo.mode == "exclusive-local") || isExclusiveLocalDir(volumeDir) {
-		return d.unpublishExclusiveLocal(ctx, req, volumeID, volumeDir)
+		return d.unpublishExclusiveLocal(ctx, req, volumeID, volumeDir, mountInfo)
 	}
 
 	if ok && mountInfo != nil {

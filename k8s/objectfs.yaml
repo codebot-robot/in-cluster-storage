@@ -300,4 +300,5 @@ volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete
 parameters:
   mode: exclusive-local
+  checkpointInterval: "0s" # optional: duration string (e.g. "10s", "1m", default "0s" off)
 

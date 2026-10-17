@@ -39,6 +39,9 @@ type options struct {
 
 func dialServer(addr string) (pb.ObjectFSControllerClient, io.Closer, error) {
 	if addr == "" {
+		addr = os.Getenv("OBJECTFS_SERVER")
+	}
+	if addr == "" {
 		return nil, nil, fmt.Errorf("--server is required")
 	}
 
@@ -73,6 +76,7 @@ func NewRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newVolumesCommand(opts))
 	rootCmd.AddCommand(newSnapshotsCommand(opts))
 	rootCmd.AddCommand(newMountCommand(opts))
+	rootCmd.AddCommand(newCheckpointCommand(opts))
 
 	return rootCmd
 }
@@ -489,6 +493,50 @@ func newSnapshotCreateCommand(opts *options) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&createOpts.volumeID, "volume", "", "Volume ID")
 	cmd.Flags().StringVar(&createOpts.name, "name", "", "Snapshot name (optional)")
+	return cmd
+}
+
+func newCheckpointCommand(opts *options) *cobra.Command {
+	var timeout time.Duration
+	cmd := &cobra.Command{
+		Use:     "checkpoint <volume>",
+		Aliases: []string{"cp"},
+		Short:   "Trigger an explicit checkpoint on an exclusive-local volume and wait for it",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			volumeID := args[0]
+			if volumeID == "" {
+				return fmt.Errorf("volume ID is required")
+			}
+
+			client, conn, err := dialServer(opts.serverAddr)
+			if err != nil {
+				return err
+			}
+			defer errutil.CloseAndLog(conn, "server connection")
+
+			ctx := cmd.Context()
+			if timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+
+			resp, err := client.Checkpoint(ctx, &pb.CheckpointRequest{
+				VolumeId: volumeID,
+			})
+			if err != nil {
+				return fmt.Errorf("checkpoint failed for volume %s: %w", volumeID, err)
+			}
+
+			out := cmd.OutOrStdout()
+			if _, err := fmt.Fprintf(out, "Checkpoint completed for volume %s at stream position %d\n", volumeID, resp.GetStreamPosition()); err != nil {
+				return fmt.Errorf("failed writing output: %w", err)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "Timeout for waiting for the checkpoint to complete (default no timeout)")
 	return cmd
 }
 

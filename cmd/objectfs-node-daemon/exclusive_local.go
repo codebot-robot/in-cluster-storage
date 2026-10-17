@@ -22,9 +22,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"k8s.io/klog/v2"
 )
@@ -109,7 +112,7 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 		if scanErr != nil {
 			return nil, fmt.Errorf("failed to scan leftover upper layer at %s: %w", upperPath, scanErr)
 		}
-		if replayErr := ReplayOperations(ctx, client, volumeID, opList); replayErr != nil {
+		if _, replayErr := ReplayOperations(ctx, client, volumeID, opList); replayErr != nil {
 			// On failure, leave upper intact and fail publish naming upperPath
 			return nil, fmt.Errorf("failed to recover and commit leftover upper layer from previous session at %s: %w", upperPath, replayErr)
 		}
@@ -159,10 +162,27 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 		return nil, fmt.Errorf("failed to mount overlayfs at %s: %w", targetPath, err)
 	}
 
+	// Parse checkpointInterval from volume context (e.g. "10s", "1m"). Default off (0).
+	var checkpointInterval time.Duration
+	if intervalStr, ok := req.GetVolumeContext()["checkpointInterval"]; ok && intervalStr != "" {
+		if dur, pErr := time.ParseDuration(intervalStr); pErr == nil && dur > 0 {
+			checkpointInterval = dur
+		} else if pErr != nil {
+			klog.Warningf("exclusive-local: invalid checkpointInterval %q for volume %s: %v", intervalStr, volumeID, pErr)
+		}
+	}
+
+	var syncWg sync.WaitGroup
+	watchCtx, cancel := context.WithCancel(context.Background())
+	d.startExclusiveLocalSync(watchCtx, &syncWg, client, volumeID, volumeDir, lowerPath, upperPath, checkpointInterval)
+
 	d.mu.Lock()
 	if old, ok := d.mounts[targetPath]; ok {
 		if old.cancelFunc != nil {
 			old.cancelFunc()
+		}
+		if old.syncWg != nil {
+			old.syncWg.Wait()
 		}
 		if old.server != nil {
 			if unmountErr := old.server.Unmount(); unmountErr != nil {
@@ -171,9 +191,11 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 		}
 	}
 	d.mounts[targetPath] = &activeMount{
-		volumeID:  volumeID,
-		mode:      "exclusive-local",
-		volumeDir: volumeDir,
+		volumeID:   volumeID,
+		mode:       "exclusive-local",
+		volumeDir:  volumeDir,
+		cancelFunc: cancel,
+		syncWg:     &syncWg,
 	}
 	d.mu.Unlock()
 
@@ -181,38 +203,179 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, volumeID, volumeDir string) (*csi.NodeUnpublishVolumeResponse, error) {
+func (d *objectFSDriver) startExclusiveLocalSync(ctx context.Context, wg *sync.WaitGroup, client pb.ObjectFSControllerClient, volumeID, volumeDir, lowerPath, upperPath string, interval time.Duration) {
+	var cpMu sync.Mutex
+	manifestPath := filepath.Join(volumeDir, "checkpoint.json")
+
+	doCheckpoint := func() (uint64, error) {
+		cpMu.Lock()
+		defer cpMu.Unlock()
+
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+
+		manifest, err := LoadCheckpointManifest(manifestPath)
+		if err != nil {
+			return 0, fmt.Errorf("load checkpoint manifest: %w", err)
+		}
+
+		opList, err := ScanUpperLayer(lowerPath, upperPath, manifest)
+		if err != nil {
+			return 0, fmt.Errorf("scan upper layer: %w", err)
+		}
+
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+
+		commitSeq, err := ReplayOperations(ctx, client, volumeID, opList)
+		if err != nil {
+			return 0, fmt.Errorf("replay operations: %w", err)
+		}
+		UpdateCheckpointManifest(manifest, upperPath, opList)
+		if err := SaveCheckpointManifest(manifestPath, manifest); err != nil {
+			klog.Warningf("exclusive-local [%s]: failed to save checkpoint manifest: %v", volumeID, err)
+		}
+		return commitSeq, nil
+	}
+
+	// 1. Periodic interval checkpoint
+	if interval > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			klog.Infof("exclusive-local [%s]: starting periodic checkpoint loop with interval %v", volumeID, interval)
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if ctx.Err() != nil {
+						return
+					}
+					if _, err := doCheckpoint(); err != nil {
+						if ctx.Err() != nil {
+							return
+						}
+						klog.Warningf("exclusive-local [%s]: periodic checkpoint failed: %v", volumeID, err)
+					} else {
+						klog.V(4).Infof("exclusive-local [%s]: periodic checkpoint committed successfully", volumeID)
+					}
+				}
+			}
+		}()
+	}
+
+	// 2. Explicit checkpoint requests over WatchVolume stream
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			stream, err := client.WatchVolume(ctx, &pb.WatchVolumeRequest{
+				VolumeId: volumeID,
+				NodeId:   d.nodeID,
+			})
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(1 * time.Second):
+					continue
+				}
+			}
+
+			for {
+				ev, err := stream.Recv()
+				if err != nil {
+					break // reconnect loop or stream canceled
+				}
+				if ev.GetEventType() == pb.WatchEventType_EVENT_CHECKPOINT_REQUEST {
+					requestID := ev.GetCheckpointRequestId()
+					klog.Infof("exclusive-local [%s]: received EVENT_CHECKPOINT_REQUEST (reqID=%s), executing checkpoint", volumeID, requestID)
+					commitSeq, cpErr := doCheckpoint()
+					if cpErr != nil {
+						if ctx.Err() != nil {
+							return
+						}
+						klog.Errorf("exclusive-local [%s]: checkpoint execution failed: %v", volumeID, cpErr)
+						continue
+					}
+					// Acknowledge checkpoint commit with stream_position
+					_, ackErr := client.AckCheckpoint(ctx, &pb.AckCheckpointRequest{
+						VolumeId:       volumeID,
+						RequestId:      requestID,
+						StreamPosition: commitSeq,
+					})
+					if ackErr != nil {
+						klog.Errorf("exclusive-local [%s]: failed to acknowledge checkpoint: %v", volumeID, ackErr)
+					} else {
+						klog.Infof("exclusive-local [%s]: checkpoint acknowledged at position %d", volumeID, commitSeq)
+					}
+				}
+			}
+		}
+	}()
+}
+
+func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, volumeID, volumeDir string, mountInfo *activeMount) (*csi.NodeUnpublishVolumeResponse, error) {
 	targetPath := req.GetTargetPath()
 	klog.Infof("Unpublishing ObjectFS exclusive-local volume %s from %s", volumeID, targetPath)
 
 	lowerPath := filepath.Join(volumeDir, "lower")
 	upperPath := filepath.Join(volumeDir, "upper")
+	manifestPath := filepath.Join(volumeDir, "checkpoint.json")
 
-	// 1. Unmount overlay from targetPath
+	// Unpublish ordering: cancel, wait, unmount, scan, replay, remove
+	// 1. Cancel background watcher and ticker
+	if mountInfo != nil && mountInfo.cancelFunc != nil {
+		mountInfo.cancelFunc()
+	}
+
+	// 2. Wait for background goroutines to finish cleanly
+	if mountInfo != nil && mountInfo.syncWg != nil {
+		mountInfo.syncWg.Wait()
+	}
+
+	// 3. Unmount overlay from targetPath
 	if err := unmountTarget(targetPath); err != nil {
 		return nil, fmt.Errorf("failed to unmount overlay at %s: %w", targetPath, err)
 	}
 
-	// 2. Scan upper layer to build operation list
-	opList, err := ScanUpperLayer(lowerPath, upperPath)
+	// 4. Scan upper layer against checkpoint manifest
+	manifest, err := LoadCheckpointManifest(manifestPath)
+	if err != nil {
+		klog.Warningf("Failed to load checkpoint manifest for volume %s: %v", volumeID, err)
+		manifest = nil
+	}
+
+	opList, err := ScanUpperLayer(lowerPath, upperPath, manifest)
 	if err != nil {
 		klog.Errorf("Failed to scan upper layer for volume %s: %v. Leaving upper layer intact.", volumeID, err)
 		return nil, fmt.Errorf("checkpoint scan failed: %w", err)
 	}
 
-	// 3. Connect to controller and replay operations
+	// 5. Connect to controller and replay operations
 	client, err := d.getClient()
 	if err != nil {
 		klog.Errorf("Failed to connect to controller for checkpoint on volume %s: %v. Leaving upper layer intact.", volumeID, err)
 		return nil, fmt.Errorf("failed to get controller client: %w", err)
 	}
 
-	if err := ReplayOperations(ctx, client, volumeID, opList); err != nil {
+	if _, err := ReplayOperations(ctx, client, volumeID, opList); err != nil {
 		klog.Errorf("Failed to replay checkpoint operations for volume %s: %v. Leaving upper layer intact.", volumeID, err)
 		return nil, fmt.Errorf("checkpoint replay failed: %w", err)
 	}
 
-	// 4. On SUCCESS only, clean up volumeDir
+	// 6. On SUCCESS only, clean up volumeDir
 	if err := os.RemoveAll(volumeDir); err != nil {
 		klog.Warningf("Failed to cleanup volume directory %s after checkpoint: %v", volumeDir, err)
 	}

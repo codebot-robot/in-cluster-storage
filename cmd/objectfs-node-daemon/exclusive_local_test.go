@@ -289,7 +289,7 @@ func TestReplayOperations(t *testing.T) {
 	}
 
 	// Replay
-	if err := ReplayOperations(ctx, client, volumeID, ops); err != nil {
+	if _, err := ReplayOperations(ctx, client, volumeID, ops); err != nil {
 		t.Fatalf("ReplayOperations failed: %v", err)
 	}
 
