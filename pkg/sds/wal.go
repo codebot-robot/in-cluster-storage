@@ -73,12 +73,13 @@ func (a *WALAppender) Append(ctx context.Context, payload []byte) (uint64, error
 // records from a writer restart and tailing remote records from a WAL buffer service
 // via walclient.TailStream, feeding them into sds.ChangeReader.
 type StreamReader struct {
-	changeReader *ChangeReader
-	recovered    []*wal.ClientRecord
-	target       string
-	streamID     uuid.UUID
-	tailOpts     []walclient.Option
-	lastErr      error
+	changeReader      *ChangeReader
+	recovered         []*wal.ClientRecord
+	target            string
+	streamID          uuid.UUID
+	tailOpts          []walclient.Option
+	lastErr           error
+	acceptUnversioned bool
 }
 
 // StreamReaderOption configures a StreamReader.
@@ -88,6 +89,16 @@ type StreamReaderOption func(*StreamReader)
 func WithChangeReader(cr *ChangeReader) StreamReaderOption {
 	return func(r *StreamReader) {
 		r.changeReader = cr
+	}
+}
+
+// WithStreamReaderAcceptUnversioned configures whether unversioned streams are accepted.
+func WithStreamReaderAcceptUnversioned(accept bool) StreamReaderOption {
+	return func(r *StreamReader) {
+		r.acceptUnversioned = accept
+		if r.changeReader != nil {
+			r.changeReader.SetAcceptUnversioned(accept)
+		}
 	}
 }
 
@@ -115,7 +126,9 @@ func NewStreamReader(target string, streamID uuid.UUID, opts ...StreamReaderOpti
 		opt(r)
 	}
 	if r.changeReader == nil {
-		r.changeReader = NewChangeReader()
+		r.changeReader = NewChangeReaderWithOptions(r.acceptUnversioned)
+	} else if r.acceptUnversioned {
+		r.changeReader.SetAcceptUnversioned(true)
 	}
 	return r
 }
