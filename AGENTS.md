@@ -48,12 +48,14 @@ GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e
 ```
 
 The E2E suite will:
-1. Spin up local `kind` Kubernetes clusters (single-node for core tests, two-worker clusters for multi-node and chaos tests).
-2. Compile and build the `objectfs-controller:e2e`, `objectfs-node-daemon:e2e`, and `wal-buffer:e2e` Docker images.
+1. Spin up shared local `kind` Kubernetes clusters (`objectfs-shared-single` for single-node core tests, `objectfs-shared-multinode` for 2-worker multi-node and chaos tests).
+2. Compile and build the `objectfs-controller:e2e`, `objectfs-node-daemon:e2e`, and `wal-buffer:e2e` Docker images once per test process.
 3. Load the built images directly into the `kind` cluster nodes.
-4. Deploy the ObjectFS controller StatefulSet, node daemon DaemonSet, and WAL buffer (`k8s/wal.yaml` and `k8s/objectfs.yaml`).
-5. Create and run test pods verifying standard FUSE operations, StatefulSet volumes, cross-node migration, failover, crash recovery, and exclusive-local OverlayFS checkpoints.
-6. Automatically clean up and teardown the cluster.
+4. Deploy the ObjectFS controller StatefulSet, node daemon DaemonSet, WAL buffer, and FakeS3 object storage (`k8s/wal.yaml` and `k8s/objectfs.yaml`).
+5. Create and run test pods in isolated namespaces verifying standard FUSE operations, StatefulSet volumes, cross-node migration, failover, crash recovery, and exclusive-local OverlayFS checkpoints.
+6. Automatically clean up and teardown the clusters upon exit via `TestMain`.
+
+Set `OBJECTFS_E2E_KEEP_CLUSTERS=1` to keep the shared clusters running after test completion when iterating locally. Stale clusters from previously aborted runs are automatically cleaned up at the start of a new run.
 
 ### E2E Presubmit Groups
 

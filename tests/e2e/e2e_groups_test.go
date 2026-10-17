@@ -74,7 +74,7 @@ func findE2ETestFunctions(t *testing.T, dir string) (map[string]*ast.FuncDecl, *
 				if !ok {
 					continue
 				}
-				if strings.HasPrefix(fn.Name.Name, "Test") {
+				if strings.HasPrefix(fn.Name.Name, "Test") && fn.Name.Name != "TestMain" {
 					tests[fn.Name.Name] = fn
 				}
 			}
