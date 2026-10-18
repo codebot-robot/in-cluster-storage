@@ -583,6 +583,12 @@ func (s *streamImpl) runStreamSession() error {
 		return fmt.Errorf("handleHelloAck failed: %w", err)
 	}
 
+	if s.target != "" {
+		klog.Infof("WAL client stream %s: replication session established with %s", s.streamID, s.target)
+	} else {
+		klog.Infof("WAL client stream %s: replication session established", s.streamID)
+	}
+
 	// 3. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
 	s.retainedMu.RLock()
 	var recordsToReplay []*wal.ClientRecord

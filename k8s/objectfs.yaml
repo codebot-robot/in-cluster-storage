@@ -256,7 +256,7 @@ spec:
             - "--backend=$(OBJECT_STORAGE_BACKEND)"
             - "--wal-dir=/var/lib/objectfs/controller/wal"
             - "--metadata-dir=/var/lib/objectfs/controller/metadata"
-            - "--wal-target=wal-buffer:50051"
+            - "--wal-target=wal-buffer-client:50051"
             - "--wal-durability=witness"
           env:
             - name: OBJECT_STORAGE_BACKEND

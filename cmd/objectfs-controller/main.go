@@ -47,7 +47,7 @@ var (
 	metadataDir              = flag.String("metadata-dir", "", "Local directory for persistent metadata indices (e.g. SQLite databases)")
 	flushInterval            = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
 	walDir                   = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
-	walTarget                = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer:50051)")
+	walTarget                = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
 	walDurability            = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
 	metadataIndex            = flag.String("metadata-index", "sqlite", "Metadata local index type (sqlite, memory, table)")
 	metadataIndexCacheMB     = flag.Int("metadata-index-cache-mb", 64, "Pebble shared block cache size in megabytes for table metadata index")

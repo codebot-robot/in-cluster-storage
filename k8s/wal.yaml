@@ -36,6 +36,21 @@ spec:
 
 ---
 
+apiVersion: v1
+kind: Service
+metadata:
+  name: wal-buffer-client
+  namespace: kube-objectfs-system
+spec:
+  selector:
+    app: wal-buffer
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+
+---
+
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

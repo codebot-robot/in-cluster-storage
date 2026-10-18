@@ -59,7 +59,7 @@ func runAppend(args []string) (err error) {
 	fs := flag.NewFlagSet("append", flag.ContinueOnError)
 	dir := fs.String("dir", "/data/wal", "Local WAL directory")
 	streamIDStr := fs.String("stream-id", "", "Stream UUID")
-	target := fs.String("target", "wal-buffer:50051", "WAL buffer service target")
+	target := fs.String("target", "wal-buffer-client:50051", "WAL buffer service target")
 	count := fs.Int("count", 10, "Number of records to append")
 	waitLevelStr := fs.String("wait-level", "witness", "Durability level to wait for (local, witness, permanent)")
 	doFlush := fs.Bool("flush", false, "Whether to call Flush to permanent storage at the end")
@@ -132,7 +132,7 @@ func runAppend(args []string) (err error) {
 
 func runTail(args []string) error {
 	fs := flag.NewFlagSet("tail", flag.ContinueOnError)
-	target := fs.String("target", "wal-buffer:50051", "WAL buffer service target")
+	target := fs.String("target", "wal-buffer-client:50051", "WAL buffer service target")
 	fromPos := fs.Uint64("from-pos", 1, "Starting position")
 	streamIDStr := fs.String("stream-id", "", "Optional stream UUID to filter")
 	fromSeq := fs.Uint64("from-seq", 0, "Optional stream_seq lower bound (with stream-id)")
