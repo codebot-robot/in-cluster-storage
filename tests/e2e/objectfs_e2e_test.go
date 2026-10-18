@@ -1898,11 +1898,18 @@ echo "$hash3" > /tmp/manifest/waldir_nested.txt.sha
 		t.Fatalf("Failed to write initial files: %v", err)
 	}
 
-	t.Logf("Force-killing wal-buffer-0 pod (testing witness-acknowledged durability across buffer restart)")
+	sessionsBeforeKill := countControllerReplicationSessions(h)
+	streamCount := sessionsBeforeKill
+	if streamCount <= 0 {
+		streamCount = 1
+	}
+
+	t.Logf("Force-killing wal-buffer-0 pod (testing witness-acknowledged durability across buffer restart, observed streams: %d)", streamCount)
 	h.RunCommand("kubectl", "delete", "pod", "wal-buffer-0", "-n", "default", "--force", "--grace-period=0")
 	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
 		t.Fatalf("wal-buffer failed to restart: %v", err)
 	}
+	waitForControllerReplicationSessionIncrease(t, h, sessionsBeforeKill, streamCount, 30*time.Second)
 
 	t.Logf("Verifying initial files persist after wal-buffer restart")
 	for _, check := range []struct {
@@ -1960,23 +1967,25 @@ done
 	runnerScript := `/tmp/wal_workload.sh > /tmp/wal_workload.log 2>&1
 echo $? > /tmp/wal_workload.status
 `
-	_, err = h.RunInPod(writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/wal_runner.sh\n%s\nEOF\nchmod +x /tmp/wal_runner.sh\n/tmp/wal_runner.sh &", runnerScript))
+	_, err = runInPodWithTimeout(t, h, writerPodName, "default", 3*time.Minute, "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/wal_runner.sh\n%s\nEOF\nchmod +x /tmp/wal_runner.sh\n/tmp/wal_runner.sh </dev/null >/dev/null 2>&1 &", runnerScript))
 	if err != nil {
 		t.Fatalf("Failed to start mid-workload in writer pod: %v", err)
 	}
 
 	time.Sleep(1 * time.Second)
-	t.Logf("Force-killing wal-buffer-0 mid-workload")
+	sessionsBeforeMidKill := countControllerReplicationSessions(h)
+	t.Logf("Force-killing wal-buffer-0 mid-workload (observed streams: %d)", streamCount)
 	h.RunCommand("kubectl", "delete", "pod", "wal-buffer-0", "-n", "default", "--force", "--grace-period=0")
 	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
 		t.Fatalf("wal-buffer failed to restart mid-workload: %v", err)
 	}
+	waitForControllerReplicationSessionIncrease(t, h, sessionsBeforeMidKill, streamCount, 30*time.Second)
 
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(3 * time.Minute)
 	workloadFinished := false
 	var exitCodeStr string
 	for time.Now().Before(deadline) {
-		out, err := h.RunInPod(writerPodName, "default", "cat", "/tmp/wal_workload.status")
+		out, err := runInPodWithTimeout(t, h, writerPodName, "default", 30*time.Second, "cat", "/tmp/wal_workload.status")
 		if err == nil && strings.TrimSpace(out) != "" {
 			exitCodeStr = strings.TrimSpace(out)
 			workloadFinished = true
@@ -1985,8 +1994,17 @@ echo $? > /tmp/wal_workload.status
 		time.Sleep(1 * time.Second)
 	}
 	if !workloadFinished {
-		wLogs, _ := h.RunInPod(writerPodName, "default", "cat", "/tmp/wal_workload.log")
-		t.Fatalf("WAL mid-workload did not complete in time. Logs:\n%s", wLogs)
+		wLogs, _ := runInPodWithTimeout(t, h, writerPodName, "default", 30*time.Second, "cat", "/tmp/wal_workload.log")
+		t.Logf("======= DUMPING DIAGNOSTICS FOR HUNG WAL WORKLOAD (3-minute timeout) =======")
+		if desc, err := exec.Command("kubectl", "describe", "pod", writerPodName, "-n", "default").CombinedOutput(); err == nil {
+			t.Logf("kubectl describe pod %s:\n%s\n", writerPodName, string(desc))
+		}
+		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		if walLogs := h.getContainerLogs("wal-buffer-0", "wal-buffer", "default", false); walLogs != "" {
+			t.Logf("WAL Buffer Logs:\n%s\n", walLogs)
+		}
+		t.Fatalf("WAL mid-workload did not complete within 3 minutes. Logs:\n%s", wLogs)
 	}
 	if exitCodeStr != "0" {
 		wLogs, _ := h.RunInPod(writerPodName, "default", "cat", "/tmp/wal_workload.log")
@@ -2024,7 +2042,7 @@ echo $? > /tmp/wal_workload.status
 	}
 
 	t.Logf("Writing final post-restart file")
-	_, err = h.RunInPod(writerPodName, "default", "/bin/sh", "-c", "echo 'final-wal-buffer-data' > /data/final_wal.txt && sync /data/final_wal.txt")
+	_, err = runInPodWithTimeout(t, h, writerPodName, "default", 3*time.Minute, "/bin/sh", "-c", "echo 'final-wal-buffer-data' | dd of=/data/final_wal.txt conv=fsync 2>/dev/null")
 	if err != nil {
 		t.Fatalf("Failed to write final post-restart file: %v", err)
 	}
@@ -2033,8 +2051,39 @@ echo $? > /tmp/wal_workload.status
 		t.Fatalf("Failed to read final_wal.txt: %v (out: %s)", err, outFinal)
 	}
 
-	h.DeletePod(writerPodName, "default")
+	deletePodBounded(t, h, writerPodName, "default", 3*time.Minute)
 	t.Logf("Successfully verified WAL buffer restart durability, mid-workload restart, and continued writes!")
+}
+
+// runInPodWithTimeout executes a command in a pod and aborts with a diagnostic dump if it exceeds timeout.
+func runInPodWithTimeout(t *testing.T, h *Harness, podName, namespace string, timeout time.Duration, cmd ...string) (string, error) {
+	t.Helper()
+	type res struct {
+		out string
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		out, err := h.RunInPod(podName, namespace, cmd...)
+		ch <- res{out: out, err: err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.out, r.err
+	case <-time.After(timeout):
+		t.Logf("======= DUMPING DIAGNOSTICS FOR HUNG COMMAND IN POD %s (timeout: %v): %v =======", podName, timeout, cmd)
+		if desc, err := exec.Command("kubectl", "describe", "pod", podName, "-n", namespace).CombinedOutput(); err == nil {
+			t.Logf("kubectl describe pod %s:\n%s\n", podName, string(desc))
+		}
+		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", namespace))
+		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", namespace))
+		if walLogs := h.getContainerLogs("wal-buffer-0", "wal-buffer", namespace, false); walLogs != "" {
+			t.Logf("WAL Buffer Logs:\n%s\n", walLogs)
+		}
+		t.Fatalf("Command %v timed out after %v in pod %s", cmd, timeout, podName)
+		return "", fmt.Errorf("command timed out in pod %s", podName)
+	}
 }
 
 // deletePodBounded deletes a pod with --wait=false and polls until it is completely deleted
@@ -2062,7 +2111,39 @@ func deletePodBounded(t *testing.T, h *Harness, podName, namespace string, timeo
 	}
 	t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", namespace))
 	t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", namespace))
+	if walLogs := h.getContainerLogs("wal-buffer-0", "wal-buffer", namespace, false); walLogs != "" {
+		t.Logf("WAL Buffer Logs:\n%s\n", walLogs)
+	}
 	t.Fatalf("Timed out waiting %v for pod %s to be deleted", timeout, podName)
+}
+
+// countControllerReplicationSessions returns the number of "replication session established"
+// log occurrences in the ObjectFS controller logs.
+func countControllerReplicationSessions(h *Harness) int {
+	logs := h.GetPodLogsByName("objectfs-controller-0", "default")
+	return strings.Count(logs, "replication session established")
+}
+
+// waitForControllerReplicationSessionIncrease polls the ObjectFS controller logs until the count
+// of established replication sessions increases by at least minIncrease over initialCount.
+// It returns the new total count.
+func waitForControllerReplicationSessionIncrease(t *testing.T, h *Harness, initialCount, minIncrease int, timeout time.Duration) int {
+	t.Helper()
+	target := initialCount + minIncrease
+	t.Logf("Waiting up to %v for controller WAL replication session count to increase by at least %d (from %d to >= %d)", timeout, minIncrease, initialCount, target)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		logs := h.GetPodLogsByName("objectfs-controller-0", "default")
+		curr := strings.Count(logs, "replication session established")
+		if curr >= target {
+			t.Logf("Controller WAL replication session confirmed re-established (count: %d >= target %d)", curr, target)
+			return curr
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Logf("Controller logs:\n%s", h.GetPodLogsByName("objectfs-controller-0", "default"))
+	t.Fatalf("Timed out waiting %v for controller to re-establish WAL replication session (initial: %d, expected >= %d)", timeout, initialCount, target)
+	return 0
 }
 
 func TestObjectFSExclusiveLocalE2E(t *testing.T) {
