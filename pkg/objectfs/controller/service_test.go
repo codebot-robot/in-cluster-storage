@@ -5914,3 +5914,61 @@ func TestControllerTerminalWALStreamDegraded(t *testing.T) {
 		t.Fatalf("expected empty degraded_reason on vol2, got: %q", stats2.GetDegradedReason())
 	}
 }
+
+func TestSharedWALBufferConnectionAcrossVolumes(t *testing.T) {
+	bufDir := t.TempDir()
+	_, target, cleanup := startTestWalBufferServer(t, bufDir)
+	defer cleanup()
+
+	var dialCount atomic.Int32
+	testDialer := func(ctx context.Context, addr string) (net.Conn, error) {
+		dialCount.Add(1)
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
+	}
+
+	clientDir := t.TempDir()
+	backend := NewMemoryBackend()
+	server := NewServer(backend,
+		WithServerWAL(clientDir, target, walclient.Witness),
+		WithServerWALDialOptions(grpc.WithContextDialer(testDialer)),
+	)
+	defer func() { _ = server.Close() }()
+
+	ctx := t.Context()
+
+	// Open two volumes on the controller and perform mutations.
+	_, err := testMkdir(ctx, server, "vol-1", "/dir1", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("vol-1 mkdir failed: %v", err)
+	}
+	_, err = testMkdir(ctx, server, "vol-2", "/dir2", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("vol-2 mkdir failed: %v", err)
+	}
+
+	vol1 := mustGetVolume(t, server, "vol-1")
+	vol2 := mustGetVolume(t, server, "vol-2")
+	if vol1.Stream() == nil || vol2.Stream() == nil {
+		t.Fatalf("expected both volumes to have active WAL streams")
+	}
+
+	// Verify watermarks to ensure records reached the buffer over the connection.
+	local1, witness1, _ := vol1.Stream().Watermarks()
+	if local1 < 1 || witness1 < 1 {
+		t.Fatalf("vol-1 expected local and witness watermarks >= 1, got local=%d witness=%d", local1, witness1)
+	}
+	local2, witness2, _ := vol2.Stream().Watermarks()
+	if local2 < 1 || witness2 < 1 {
+		t.Fatalf("vol-2 expected local and witness watermarks >= 1, got local=%d witness=%d", local2, witness2)
+	}
+
+	// Assert only a single connection was dialed across both volumes.
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 dialed connection across volumes, got %d", got)
+	}
+
+	if err := server.Close(); err != nil {
+		t.Fatalf("server.Close failed: %v", err)
+	}
+}
