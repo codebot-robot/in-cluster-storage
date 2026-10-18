@@ -62,6 +62,10 @@ func (l Level) String() string {
 // (Witness or Permanent) is requested on a stream with no remote target configured.
 var ErrDurabilityUnavailable = errors.New("WAL has no remote target")
 
+// ErrTerminalStream indicates that the WAL stream encountered an unrecoverable local store failure
+// (such as segment truncation error) and cannot safely accept or wait for further writes.
+var ErrTerminalStream = errors.New("terminal WAL stream failure")
+
 // Stream is the interface used by node daemons to append to the WAL.
 type Stream interface {
 	// Append writes and fsyncs locally, then returns the stream_seq.
@@ -78,6 +82,8 @@ type Stream interface {
 	ReplicationLevel() Level
 	// Tail returns an iterator yielding (stream_seq, payload) pairs from the remote buffer service starting after fromSeq.
 	Tail(ctx context.Context, fromSeq uint64) (iter.Seq2[uint64, []byte], error)
+	// TerminalError returns any fatal, unrecoverable stream error encountered by the stream.
+	TerminalError() error
 	Close() error
 }
 
@@ -150,6 +156,7 @@ type streamImpl struct {
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
 	initialHelloAckErr  error
+	terminalErr         error
 
 	// Retained in-memory records queue for network sending & replay
 	retainedMu      sync.RWMutex
@@ -274,6 +281,14 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		return 0, errors.New("stream closed")
 	}
 
+	s.mu.RLock()
+	if s.terminalErr != nil {
+		err := s.terminalErr
+		s.mu.RUnlock()
+		return 0, err
+	}
+	s.mu.RUnlock()
+
 	select {
 	case <-s.initialHelloAckDone:
 		if s.initialHelloAckErr != nil {
@@ -289,11 +304,11 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 
 	// Degraded mode / backpressure check: block if retained bytes exceed maxRetainedBytes
 	s.mu.Lock()
-	for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() {
+	for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.terminalErr == nil {
 		doneCh := make(chan struct{})
 		go func() {
 			s.mu.Lock()
-			for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() {
+			for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.terminalErr == nil {
 				s.cond.Wait()
 			}
 			s.mu.Unlock()
@@ -309,6 +324,12 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		case <-doneCh:
 		}
 		s.mu.Lock()
+	}
+
+	if s.terminalErr != nil {
+		err := s.terminalErr
+		s.mu.Unlock()
+		return 0, err
 	}
 
 	s.localSeq++
@@ -354,7 +375,12 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 	s.mu.RLock()
 	witness := s.witnessSeq
 	s3 := s.s3Seq
+	termErr := s.terminalErr
 	s.mu.RUnlock()
+
+	if termErr != nil {
+		return termErr
+	}
 
 	if level == Witness && witness >= seq {
 		return nil
@@ -367,7 +393,7 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 		waitChan := make(chan struct{})
 		go func() {
 			s.mu.Lock()
-			for !s.closed.Load() {
+			for !s.closed.Load() && s.terminalErr == nil {
 				if level == Witness && s.witnessSeq >= seq {
 					break
 				}
@@ -387,8 +413,12 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 			return errors.New("stream closed")
 		case <-waitChan:
 			s.mu.RLock()
+			termErr := s.terminalErr
 			w, s3w := s.witnessSeq, s.s3Seq
 			s.mu.RUnlock()
+			if termErr != nil {
+				return termErr
+			}
 			if level == Witness && w >= seq {
 				return nil
 			}
@@ -410,6 +440,11 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 	}
 
 	s.mu.RLock()
+	if s.terminalErr != nil {
+		err := s.terminalErr
+		s.mu.RUnlock()
+		return err
+	}
 	local := s.localSeq
 	s.mu.RUnlock()
 
@@ -456,6 +491,11 @@ func (s *streamImpl) Flush(ctx context.Context) error {
 	}
 
 	s.mu.RLock()
+	if s.terminalErr != nil {
+		err := s.terminalErr
+		s.mu.RUnlock()
+		return err
+	}
 	targetSeq := s.localSeq
 	s3 := s.s3Seq
 	s.mu.RUnlock()
@@ -505,6 +545,13 @@ func (s *streamImpl) RecoveredRecords() []*wal.ClientRecord {
 	return recs
 }
 
+// TerminalError returns any fatal, unrecoverable stream error encountered by the stream.
+func (s *streamImpl) TerminalError() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.terminalErr
+}
+
 // Close closes the stream, stopping background tasks and closing local store.
 func (s *streamImpl) Close() error {
 	if s.closed.Swap(true) {
@@ -536,6 +583,7 @@ func (s *streamImpl) backgroundReplicationLoop() {
 
 	backoff := 50 * time.Millisecond
 	maxBackoff := 2 * time.Second
+	firstFailure := true
 
 	for {
 		select {
@@ -544,9 +592,29 @@ func (s *streamImpl) backgroundReplicationLoop() {
 		default:
 		}
 
+		s.mu.RLock()
+		termErr := s.terminalErr
+		s.mu.RUnlock()
+		if termErr != nil {
+			return
+		}
+
 		err := s.runStreamSession()
 		if err != nil && !s.closed.Load() {
-			klog.V(4).Infof("WAL client replication session ended: %v, reconnecting in %v", err, backoff)
+			if firstFailure || backoff >= maxBackoff {
+				klog.Warningf("WAL client stream %s: replication session failed: %v, reconnecting in %v", s.streamID, err, backoff)
+				firstFailure = false
+			} else {
+				klog.V(4).Infof("WAL client replication session ended: %v, reconnecting in %v", err, backoff)
+			}
+
+			s.mu.RLock()
+			termErr := s.terminalErr
+			s.mu.RUnlock()
+			if termErr != nil {
+				return
+			}
+
 			select {
 			case <-s.cancelCtx.Done():
 				return
@@ -558,6 +626,7 @@ func (s *streamImpl) backgroundReplicationLoop() {
 			}
 		} else {
 			backoff = 50 * time.Millisecond
+			firstFailure = true
 		}
 	}
 }
@@ -566,7 +635,12 @@ func (s *streamImpl) runStreamSession() error {
 	ctx, cancel := context.WithCancel(s.cancelCtx)
 	defer cancel()
 
-	stream, err := s.grpcClient.Append(ctx)
+	client := s.grpcClient
+	if client == nil {
+		return errors.New("gRPC client is nil")
+	}
+
+	stream, err := client.Append(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to call WalBuffer.Append: %w", err)
 	}
@@ -731,6 +805,24 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 
 			// Only discard if buffer returns a record at witnessHead and its content differs
 			if !bytes.Equal(localRecAtHead.Payload, bufferPayload) {
+				// 1. Order on-disk truncate before the memory mutation so that a failure
+				// leaves memory and disk consistent, allowing divergence to be re-detected on retry.
+				if s.store != nil {
+					if err := s.store.TruncateAfter(witnessHead); err != nil {
+						truncErr := fmt.Errorf("%w: failed to truncate local segment store to %d: %w", ErrTerminalStream, witnessHead, err)
+						s.terminalErr = truncErr
+						if s.cond != nil {
+							s.cond.Broadcast()
+						}
+						s.initialHelloAckOnce.Do(func() {
+							s.initialHelloAckErr = truncErr
+							close(s.initialHelloAckDone)
+						})
+						return truncErr
+					}
+				}
+
+				// 2. Only trim in-memory retained records and localSeq once on-disk truncation succeeds
 				s.retainedMu.Lock()
 				var remaining []*wal.ClientRecord
 				var newRetainedBytes int64
@@ -747,12 +839,6 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 				s.retainedMu.Unlock()
 				s.retainedBytes = newRetainedBytes
 				s.localSeq = witnessHead
-
-				if s.store != nil {
-					if err := s.store.TruncateAfter(witnessHead); err != nil {
-						return fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err)
-					}
-				}
 
 				klog.Warningf("Stream %s: local records above buffer witness watermark (%d) diverged from authoritative buffer history; discarded %d local unacknowledged records",
 					s.streamID, witnessHead, discarded)
@@ -791,7 +877,9 @@ func (s *streamImpl) handleAck(ack *pb.Ack) {
 		s.cleanupS3AckedLocked(ack.S3AckedStreamSeq)
 	}
 
-	s.cond.Broadcast()
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
 }
 
 func (s *streamImpl) cleanupS3AckedLocked(s3AckedSeq uint64) {
@@ -818,10 +906,11 @@ func (s *streamImpl) cleanupS3AckedLocked(s3AckedSeq uint64) {
 
 // Tail returns an iterator yielding (stream_seq, payload) pairs from the remote buffer service starting after fromSeq.
 func (s *streamImpl) Tail(ctx context.Context, fromSeq uint64) (iter.Seq2[uint64, []byte], error) {
-	if s.grpcClient == nil && s.target == "" {
+	client := s.grpcClient
+	if client == nil && s.target == "" {
 		return func(yield func(uint64, []byte) bool) {}, nil
 	}
-	return TailStream(ctx, s.target, s.streamID, fromSeq, WithGRPCClient(s.grpcClient), WithDialOptions(s.opts.dialOpts...))
+	return TailStream(ctx, s.target, s.streamID, fromSeq, WithGRPCClient(client), WithDialOptions(s.opts.dialOpts...))
 }
 
 // TailStream tails records belonging to a specific stream starting after fromSeq (stream_seq > fromSeq).
