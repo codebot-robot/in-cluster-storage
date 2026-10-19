@@ -127,10 +127,19 @@ type Volume struct {
 	handlesMu  sync.Mutex
 	handles    map[uint64]uint64
 	openInodes map[uint64]int
+
+	acceptUnversioned bool
 }
 
 // VolumeOption configures a Volume instance.
 type VolumeOption func(*Volume)
+
+// WithAcceptUnversioned configures whether unversioned segments, streams, and snapshots are accepted.
+func WithAcceptUnversioned(accept bool) VolumeOption {
+	return func(v *Volume) {
+		v.acceptUnversioned = accept
+	}
+}
 
 // WithSyncCoalesceWindow sets the window duration for coalescing non-blocking sync requests.
 func WithSyncCoalesceWindow(d time.Duration) VolumeOption {
@@ -927,15 +936,26 @@ func (m *memoryAppender) StartSeq() uint64 {
 
 func (v *Volume) initMetadataStreamLocked() error {
 	var appender record.Appender
+	var writerOpts []record.WriterOption
 	if v.stream != nil {
 		appender = sds.NewWALAppender(v.stream, walclient.Local)
+		// If the stream already contains local records, mark the header as emitted to avoid
+		// appending a duplicate stream header mid-stream upon controller restart.
+		// Accepted edge: if all local segments were pruned after S3 ack and the buffer
+		// reports witness 0, a header will be re-emitted at seq N; readers tolerate this.
+		if local, _, _ := v.stream.Watermarks(); local > 0 {
+			writerOpts = append(writerOpts, record.WithStreamHeaderEmitted(true))
+		}
 	} else {
 		if v.memAppender == nil {
 			v.memAppender = &memoryAppender{}
 		}
 		appender = v.memAppender
+		if v.memAppender.StartSeq() > 1 || len(v.memAppender.Payloads()) > 0 {
+			writerOpts = append(writerOpts, record.WithStreamHeaderEmitted(true))
+		}
 	}
-	w := sds.NewWriter(appender)
+	w := sds.NewWriter(appender, writerOpts...)
 	if _, err := w.RegisterType(&pb.Inode{}, 1); err != nil {
 		return fmt.Errorf("failed to register Inode type: %w", err)
 	}
@@ -4734,6 +4754,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 	var highestReplayedIno uint64
 	if v.stream != nil {
 		cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
+		cr.SetAcceptUnversioned(v.acceptUnversioned)
 		dec := record.NewDecoder(record.WithDecoderRegistry(v.metadataStream.Registry()))
 		seenSeqs := make(map[uint64]bool)
 		expectedSeq := snapPos + 1
@@ -4852,6 +4873,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 		startSeq := v.memAppender.StartSeq()
 		if len(payloads) > 0 {
 			cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
+			cr.SetAcceptUnversioned(v.acceptUnversioned)
 			dec := record.NewDecoder(record.WithDecoderRegistry(v.metadataStream.Registry()))
 			expectedSeq := snapPos + 1
 			for seqOffset, p := range payloads {
@@ -5123,6 +5145,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	var highestReplayedIno uint64
 	if v.stream != nil {
 		cr := sds.NewChangeReader(record.WithDecoderRegistry(v.metadataStream.Registry()))
+		cr.SetAcceptUnversioned(v.acceptUnversioned)
 		seenSeqs := make(map[uint64]bool)
 		expectedSeq := snapPos + 1
 

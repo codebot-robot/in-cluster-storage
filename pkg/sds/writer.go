@@ -27,6 +27,16 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// WithoutStreamHeader disables automatic emission of a StreamHeader on the first write.
+func WithoutStreamHeader() record.WriterOption {
+	return record.WithoutStreamHeader()
+}
+
+// WithStreamHeaderEmitted configures whether the StreamHeader has already been emitted to the stream.
+func WithStreamHeaderEmitted(emitted bool) record.WriterOption {
+	return record.WithStreamHeaderEmitted(emitted)
+}
+
 // Writer provides Layer 2 relational row-change and transaction writing
 // over a structured data stream using OpRecord framework records.
 type Writer struct {
@@ -49,6 +59,11 @@ func (w *Writer) Registry() *record.Registry {
 // RecordWriter returns the underlying Layer 1 record.Writer.
 func (w *Writer) RecordWriter() *record.Writer {
 	return w.recordWriter
+}
+
+// AppendStreamHeader writes an explicit StreamHeader framework record (TypeID = 6).
+func (w *Writer) AppendStreamHeader(ctx context.Context, hdr *sdsv1.StreamHeader) (uint64, error) {
+	return w.recordWriter.AppendStreamHeader(ctx, hdr)
 }
 
 // RegisterType registers a Go proto.Message type with optional primary key field numbers.

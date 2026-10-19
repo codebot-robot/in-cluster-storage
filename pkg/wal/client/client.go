@@ -82,14 +82,27 @@ type Stream interface {
 }
 
 type options struct {
-	maxRetainedBytes int64
-	maxSegmentSize   int64
-	dialOpts         []grpc.DialOption
-	grpcClient       pb.WalBufferClient
+	maxRetainedBytes  int64
+	maxSegmentSize    int64
+	dialOpts          []grpc.DialOption
+	grpcClient        pb.WalBufferClient
+	acceptUnversioned bool
 }
 
 // Option configures Stream options.
 type Option func(*options)
+
+// WithAcceptUnversioned configures whether unversioned legacy segments are accepted.
+func WithAcceptUnversioned(accept bool) Option {
+	return func(o *options) {
+		o.acceptUnversioned = accept
+	}
+}
+
+// WithAcceptUnversionedSegments is an alias for WithAcceptUnversioned.
+func WithAcceptUnversionedSegments(accept bool) Option {
+	return WithAcceptUnversioned(accept)
+}
 
 // WithMaxRetainedBytes sets the maximum retained bytes before backpressure blocks Append.
 func WithMaxRetainedBytes(bytes int64) Option {
@@ -162,7 +175,12 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		o(&opt)
 	}
 
-	store, recovered, err := wal.NewClientSegmentStore(dir, fmt.Sprintf("stream-%s", streamID.String()), opt.maxSegmentSize)
+	var scanOpts []wal.ScanOption
+	if opt.acceptUnversioned {
+		scanOpts = append(scanOpts, wal.WithAcceptUnversioned(true))
+	}
+
+	store, recovered, err := wal.NewClientSegmentStore(dir, fmt.Sprintf("stream-%s", streamID.String()), opt.maxSegmentSize, scanOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open local segment store in %s: %w", dir, err)
 	}
@@ -752,7 +770,9 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 		s.cleanupS3AckedLocked(helloAck.S3AckedStreamSeq)
 	}
 
-	s.cond.Broadcast()
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
 	s.initialHelloAckOnce.Do(func() {
 		close(s.initialHelloAckDone)
 	})
