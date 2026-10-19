@@ -3259,10 +3259,11 @@ func (x *ListVolumesRequest) GetFromVolumeId() string {
 }
 
 type VolumeInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId       string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	DegradedReason string                 `protobuf:"bytes,2,opt,name=degraded_reason,json=degradedReason,proto3" json:"degraded_reason,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *VolumeInfo) Reset() {
@@ -3298,6 +3299,13 @@ func (*VolumeInfo) Descriptor() ([]byte, []int) {
 func (x *VolumeInfo) GetVolumeId() string {
 	if x != nil {
 		return x.VolumeId
+	}
+	return ""
+}
+
+func (x *VolumeInfo) GetDegradedReason() string {
+	if x != nil {
+		return x.DegradedReason
 	}
 	return ""
 }
@@ -3808,6 +3816,7 @@ type GetVolumeStatsResponse struct {
 	UsedInodes     int64                  `protobuf:"varint,6,opt,name=used_inodes,json=usedInodes,proto3" json:"used_inodes,omitempty"`
 	FreeInodes     int64                  `protobuf:"varint,7,opt,name=free_inodes,json=freeInodes,proto3" json:"free_inodes,omitempty"`
 	Error          int32                  `protobuf:"varint,8,opt,name=error,proto3" json:"error,omitempty"`
+	DegradedReason string                 `protobuf:"bytes,9,opt,name=degraded_reason,json=degradedReason,proto3" json:"degraded_reason,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -3896,6 +3905,13 @@ func (x *GetVolumeStatsResponse) GetError() int32 {
 		return x.Error
 	}
 	return 0
+}
+
+func (x *GetVolumeStatsResponse) GetDegradedReason() string {
+	if x != nil {
+		return x.DegradedReason
+	}
+	return ""
 }
 
 type CheckpointRequest struct {
@@ -4711,10 +4727,11 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05error\x18\x06 \x01(\x05R\x05error\"P\n" +
 	"\x12ListVolumesRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12$\n" +
-	"\x0efrom_volume_id\x18\x02 \x01(\tR\ffromVolumeId\")\n" +
+	"\x0efrom_volume_id\x18\x02 \x01(\tR\ffromVolumeId\"R\n" +
 	"\n" +
 	"VolumeInfo\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"n\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12'\n" +
+	"\x0fdegraded_reason\x18\x02 \x01(\tR\x0edegradedReason\"n\n" +
 	"\x13ListVolumesResponse\x127\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1d.objectfs.v1alpha1.VolumeInfoR\avolumes\x12\x1e\n" +
 	"\vend_of_data\x18\x02 \x01(\bR\tendOfData\"\x8d\x01\n" +
@@ -4752,7 +4769,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\finodes_other\x18\x06 \x01(\x03R\vinodesOther\x12#\n" +
 	"\rlogical_bytes\x18\a \x01(\x03R\flogicalBytes\x12\x1f\n" +
 	"\vfile_chunks\x18\b \x01(\x03R\n" +
-	"fileChunks\"\xb2\x02\n" +
+	"fileChunks\"\xdb\x02\n" +
 	"\x16GetVolumeStatsResponse\x124\n" +
 	"\x05stats\x18\x01 \x01(\v2\x1e.objectfs.v1alpha1.VolumeStatsR\x05stats\x12\x1f\n" +
 	"\vtotal_bytes\x18\x02 \x01(\x03R\n" +
@@ -4765,7 +4782,8 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"usedInodes\x12\x1f\n" +
 	"\vfree_inodes\x18\a \x01(\x03R\n" +
 	"freeInodes\x12\x14\n" +
-	"\x05error\x18\b \x01(\x05R\x05error\"0\n" +
+	"\x05error\x18\b \x01(\x05R\x05error\x12'\n" +
+	"\x0fdegraded_reason\x18\t \x01(\tR\x0edegradedReason\"0\n" +
 	"\x11CheckpointRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"S\n" +
 	"\x12CheckpointResponse\x12'\n" +
