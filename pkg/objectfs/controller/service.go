@@ -46,6 +46,9 @@ func volErrToSyscall(err error) int32 {
 	if err == nil {
 		return 0
 	}
+	if errors.Is(err, walclient.ErrTerminalStream) {
+		return int32(syscall.EIO)
+	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
 		return int32(errno)
@@ -989,11 +992,18 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 	}
 
 	var volInfos []*pb.VolumeInfo
+	s.mu.RLock()
 	for _, id := range filtered {
+		var degradedReason string
+		if vol, ok := s.volumes[id]; ok {
+			degradedReason = vol.DegradedReason()
+		}
 		volInfos = append(volInfos, &pb.VolumeInfo{
-			VolumeId: id,
+			VolumeId:       id,
+			DegradedReason: degradedReason,
 		})
 	}
+	s.mu.RUnlock()
 
 	return &pb.ListVolumesResponse{
 		Volumes:   volInfos,
@@ -1134,6 +1144,7 @@ func (s *Server) GetVolumeStats(ctx context.Context, req *pb.GetVolumeStatsReque
 		UsedInodes:     usedInodes,
 		FreeInodes:     freeInodes,
 		Error:          0,
+		DegradedReason: vol.DegradedReason(),
 	}, nil
 }
 

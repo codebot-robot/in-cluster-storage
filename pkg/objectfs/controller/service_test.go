@@ -52,6 +52,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/klog/v2"
 )
 
 func mustGetVolume(t *testing.T, server *Server, volumeID string) *Volume {
@@ -2585,6 +2586,10 @@ func (s *fakeBlockingStream) ReplicationLevel() walclient.Level {
 
 func (s *fakeBlockingStream) Tail(ctx context.Context, fromSeq uint64) (iter.Seq2[uint64, []byte], error) {
 	return func(yield func(uint64, []byte) bool) {}, nil
+}
+
+func (s *fakeBlockingStream) TerminalError() error {
+	return nil
 }
 
 func (s *fakeBlockingStream) Close() error {
@@ -5700,5 +5705,212 @@ func TestControllerCheckpointRPC(t *testing.T) {
 		t.Fatalf("Checkpoint request failed: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Timed out waiting for Checkpoint caller to unblock")
+	}
+}
+
+type faultInjectingStream struct {
+	walclient.Stream
+	appendHook      func() error
+	terminalErrHook func() error
+}
+
+func (f *faultInjectingStream) Append(ctx context.Context, payload []byte) (uint64, error) {
+	if f.appendHook != nil {
+		if err := f.appendHook(); err != nil {
+			return 0, err
+		}
+	}
+	return f.Stream.Append(ctx, payload)
+}
+
+func (f *faultInjectingStream) TerminalError() error {
+	if f.terminalErrHook != nil {
+		if err := f.terminalErrHook(); err != nil {
+			return err
+		}
+	}
+	return f.Stream.TerminalError()
+}
+
+func TestControllerTerminalWALStreamDegraded(t *testing.T) {
+	ctx := t.Context()
+	storage := NewMemoryBackend()
+	dir := t.TempDir()
+
+	vol1ID := "test-degraded-vol1"
+	vol2ID := "test-healthy-vol2"
+
+	// Create real stream for vol2
+	walDir2 := filepath.Join(dir, "wal2")
+	streamID2 := StreamIDForVolume(vol2ID)
+	stream2, err := walclient.Open(ctx, walDir2, streamID2, "")
+	if err != nil {
+		t.Fatalf("Open stream2 failed: %v", err)
+	}
+	defer stream2.Close()
+
+	// Create real stream for vol1, wrapped with a fault-injecting proxy that returns ErrTerminalStream
+	walDir1 := filepath.Join(dir, "wal1")
+	streamID1 := StreamIDForVolume(vol1ID)
+	realStream1, err := walclient.Open(ctx, walDir1, streamID1, "")
+	if err != nil {
+		t.Fatalf("Open realStream1 failed: %v", err)
+	}
+	defer realStream1.Close()
+
+	terminalFaultErr := fmt.Errorf("%w: failed to truncate local segment store to 1: read-only file system", walclient.ErrTerminalStream)
+	var injectTerminalErr atomic.Bool
+	faultStream1 := &faultInjectingStream{
+		Stream: realStream1,
+		appendHook: func() error {
+			if injectTerminalErr.Load() {
+				return terminalFaultErr
+			}
+			return nil
+		},
+		terminalErrHook: func() error {
+			if injectTerminalErr.Load() {
+				return terminalFaultErr
+			}
+			return nil
+		},
+	}
+
+	server := NewServer(storage,
+		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
+			if volumeID == vol1ID {
+				return faultStream1, nil
+			}
+			if volumeID == vol2ID {
+				return stream2, nil
+			}
+			return nil, fmt.Errorf("unexpected volume %s", volumeID)
+		}),
+	)
+	defer server.Close()
+
+	// Initialize both volumes
+	init1, err := server.Lookup(ctx, &pb.LookupRequest{VolumeId: vol1ID, ParentInode: 1, Name: "nonexistent"})
+	if err != nil || init1.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("Lookup vol1: err=%v, resp=%v", err, init1)
+	}
+	init2, err := server.Lookup(ctx, &pb.LookupRequest{VolumeId: vol2ID, ParentInode: 1, Name: "nonexistent"})
+	if err != nil || init2.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("Lookup vol2: err=%v, resp=%v", err, init2)
+	}
+
+	// Capture klog output to verify single error log
+	var logBuf bytes.Buffer
+	klog.LogToStderr(false)
+	klog.SetOutput(&logBuf)
+	defer func() {
+		klog.LogToStderr(true)
+		klog.SetOutput(os.Stderr)
+	}()
+
+	beforeErrorLines := klog.Stats.Error.Lines()
+
+	// Inject terminal stream failure on vol1
+	injectTerminalErr.Store(true)
+
+	// First mutating operation on vol1 should return EIO
+	resp1, rpcErr := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       vol1ID,
+		ParentInode:    1,
+		Name:           "file1.txt",
+		Mode:           0644,
+		InitialContent: []byte("test"),
+	})
+	if rpcErr != nil {
+		t.Fatalf("unexpected gRPC error on vol1 CreateFile: %v", rpcErr)
+	}
+	if resp1.GetError() != int32(syscall.EIO) {
+		t.Fatalf("expected syscall.EIO on vol1 CreateFile, got %d", resp1.GetError())
+	}
+
+	klog.Flush()
+	expectedLog := fmt.Sprintf("Volume %s degraded due to terminal WAL stream error", vol1ID)
+	if !strings.Contains(logBuf.String(), expectedLog) {
+		t.Fatalf("expected log %q to appear in log output:\n%s", expectedLog, logBuf.String())
+	}
+	if diff := klog.Stats.Error.Lines() - beforeErrorLines; diff != 1 {
+		t.Fatalf("expected exactly 1 error log after first failure, got %d", diff)
+	}
+
+	// Second mutating operation on vol1 should also return EIO and NOT log again
+	resp1Second, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       vol1ID,
+		ParentInode:    1,
+		Name:           "file1_second.txt",
+		Mode:           0644,
+		InitialContent: []byte("test"),
+	})
+	if err != nil {
+		t.Fatalf("unexpected gRPC error on second vol1 CreateFile: %v", err)
+	}
+	if resp1Second.GetError() != int32(syscall.EIO) {
+		t.Fatalf("expected syscall.EIO on second vol1 CreateFile, got %d", resp1Second.GetError())
+	}
+
+	klog.Flush()
+	if diff := klog.Stats.Error.Lines() - beforeErrorLines; diff != 1 {
+		t.Fatalf("expected still exactly 1 error log after second failure, got %d", diff)
+	}
+
+	// Verify GetVolumeStats reports the degraded reason on vol1
+	stats1, err := server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: vol1ID})
+	if err != nil {
+		t.Fatalf("GetVolumeStats vol1 failed: %v", err)
+	}
+	if stats1.GetDegradedReason() == "" || !strings.Contains(stats1.GetDegradedReason(), "read-only file system") {
+		t.Fatalf("expected degraded_reason containing 'read-only file system' on vol1, got: %q", stats1.GetDegradedReason())
+	}
+
+	// Verify ListVolumes reports degraded_reason on vol1 and empty on vol2
+	listResp, err := server.ListVolumes(ctx, &pb.ListVolumesRequest{})
+	if err != nil {
+		t.Fatalf("ListVolumes failed: %v", err)
+	}
+	var foundVol1, foundVol2 bool
+	for _, vi := range listResp.GetVolumes() {
+		if vi.GetVolumeId() == vol1ID {
+			foundVol1 = true
+			if vi.GetDegradedReason() != stats1.GetDegradedReason() {
+				t.Fatalf("expected ListVolumes vol1 degraded_reason %q, got %q", stats1.GetDegradedReason(), vi.GetDegradedReason())
+			}
+		}
+		if vi.GetVolumeId() == vol2ID {
+			foundVol2 = true
+			if vi.GetDegradedReason() != "" {
+				t.Fatalf("expected ListVolumes vol2 degraded_reason to be empty, got %q", vi.GetDegradedReason())
+			}
+		}
+	}
+	if !foundVol1 || !foundVol2 {
+		t.Fatalf("expected both volumes in ListVolumes: foundVol1=%v, foundVol2=%v", foundVol1, foundVol2)
+	}
+
+	// Mutating operation on vol2 on the same server should keep working
+	resp2, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       vol2ID,
+		ParentInode:    1,
+		Name:           "file2.txt",
+		Mode:           0644,
+		InitialContent: []byte("healthy-data"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile vol2 failed: %v", err)
+	}
+	if resp2.GetError() != 0 {
+		t.Fatalf("expected success (error=0) on vol2, got %d", resp2.GetError())
+	}
+
+	// Verify GetVolumeStats on vol2 is not degraded
+	stats2, err := server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: vol2ID})
+	if err != nil {
+		t.Fatalf("GetVolumeStats vol2 failed: %v", err)
+	}
+	if stats2.GetDegradedReason() != "" {
+		t.Fatalf("expected empty degraded_reason on vol2, got: %q", stats2.GetDegradedReason())
 	}
 }
