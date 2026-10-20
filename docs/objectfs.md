@@ -361,20 +361,20 @@ To achieve both high write throughput and optimal packing in cloud object storag
 3. **Consistency Contract ("Nothing is visible or durable before fsync"):**
    - **On the writer's own node:** Visibility is immediate through its local cache (`NodeCache`).
    - **Across remote nodes:** Writes become visible only after a sync occurs. Staged writes are not served by `ReadFile` on the controller until synced.
-   - **Close behavior across nodes:** Close starts a sync immediately; data becomes visible on other nodes once the pack is uploaded and the metadata is durable; close itself does not wait (see #332 for a real close-to-open option).
+   - **Close behavior across nodes:** Close starts a per-inode sync for the closed file; data becomes visible on other nodes once its pack is uploaded and the metadata is durable; other staged data on the volume follows on the coalesce window. Close itself does not wait (see #332 for a real close-to-open option).
 
 4. **Sync Triggers:**
 
 | Trigger | Who | Blocks Caller? | Default |
 | :--- | :--- | :--- | :--- |
 | `fsync` / `fdatasync` | Application via `Fsync` RPC (`blocking=true`) | Yes, until pack uploaded + rows logged at WAL level | Always |
-| Close of written file (`Release`) | Node daemon triggers immediate sync (`blocking=false, trigger=CLOSE`) | No (close returns immediately, like a local fs) | On (`--sync-on-close=true`) |
+| Close of written file (`Release`) | Node daemon triggers per-inode sync (`blocking=false, trigger=CLOSE`) | No (close returns immediately, like a local fs) | On (`--sync-on-close=true`) |
 | Background timer | Node daemon, per volume (`blocking=false, trigger=PERIODIC`) | No | On (`--background-sync-interval=30s`) |
 | Client cache budget | Node daemon, when dirty bytes exceed cache | The write that overflows waits | Always (`--cache-size-mb=128`) |
 
 5. **Controller Coalescing Mechanism:**
    - Non-blocking syncs are coalesced within a configurable window (`--sync-coalesce-window=1s`, default 1s). The controller gathers staged writes and non-blocking sync requests across the volume, then commits them in a single pack and transaction.
-   - When triggered by close (`trigger=CLOSE`), the controller starts the coalesced sync immediately without waiting out the coalesce window; if a window is already active, it preempts the window the same way a blocking `fsync` does, committing all writes staged up to that point without waiting for the timer.
+   - When triggered by close (`trigger=CLOSE`), the controller coalesces close triggers for a short fixed floor window (75ms) so bursts of closes share a pack, and commits only the requested closed file's staged chunks; other staged data on the volume follows on the coalesce window. Waiters registered for other inodes are not completed by a close sync.
    - A blocking `fsync` arriving during an active coalesce window preempts the window and flushes immediately, including all writes in the window.
    - Non-blocking sync failures are retained by the controller and surfaced on the next blocking `fsync` for any affected inode.
    - Controller staging memory is bounded via `--max-staging-bytes=64MB` per volume; writes that exceed this limit are rejected until an `Fsync` commits staged data.
