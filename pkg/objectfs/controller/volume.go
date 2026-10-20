@@ -21,7 +21,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -130,9 +129,6 @@ type Volume struct {
 	openInodes map[uint64]int
 
 	acceptUnversioned bool
-
-	terminalErr   error
-	terminalErrAt time.Time
 }
 
 // VolumeOption configures a Volume instance.
@@ -625,7 +621,6 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 					return epoch, 0, fmt.Errorf("durability level permanent requested but %w", walclient.ErrDurabilityUnavailable)
 				}
 				if err := v.stream.Flush(ctx); err != nil {
-					v.recordTerminalError(err)
 					return epoch, 0, err
 				}
 			}
@@ -916,7 +911,6 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 		}
 		if v.stream.ReplicationLevel() == walclient.Permanent {
 			if err := v.stream.Flush(ctx); err != nil {
-				v.checkTerminalErrorLocked(err)
 				return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
 			}
 		}
@@ -1186,56 +1180,20 @@ func (v *Volume) Durability() walclient.Level {
 	return v.durability
 }
 
-func (v *Volume) checkTerminalErrorLocked(err error) {
-	if err != nil && errors.Is(err, walclient.ErrTerminalStream) {
-		if v.terminalErr == nil {
-			v.terminalErr = err
-			v.terminalErrAt = time.Now()
-			klog.Errorf("Volume %s degraded due to terminal WAL stream error: %v", v.volumeID, err)
-		}
-	}
-}
-
-func (v *Volume) recordTerminalError(err error) {
-	if err == nil || !errors.Is(err, walclient.ErrTerminalStream) {
-		return
-	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.checkTerminalErrorLocked(err)
-}
-
-// TerminalError returns the first terminal WAL error recorded on the volume and the time it occurred.
-func (v *Volume) TerminalError() (error, time.Time) {
+// Degraded returns the DegradedError if the underlying WAL stream is degraded, or nil if healthy.
+func (v *Volume) Degraded() *walclient.DegradedError {
 	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.terminalErr, v.terminalErrAt
-}
-
-// DegradedReason returns the reason why the volume is in a degraded state, or empty string if healthy.
-func (v *Volume) DegradedReason() string {
-	v.mu.RLock()
-	if v.terminalErr != nil {
-		reason := v.terminalErr.Error()
-		v.mu.RUnlock()
-		return reason
-	}
 	stream := v.stream
 	v.mu.RUnlock()
-
 	if stream != nil {
-		if err := stream.TerminalError(); err != nil {
-			v.recordTerminalError(err)
-			return err.Error()
-		}
+		return stream.Degraded()
 	}
-	return ""
+	return nil
 }
 
 func (v *Volume) commitTxLocked(ctx context.Context, tx *sds.Tx) (uint64, error) {
 	commitSeq, err := tx.Commit(ctx)
 	if err != nil {
-		v.checkTerminalErrorLocked(err)
 		return 0, err
 	}
 	v.applyTxChangesLocked(ctx, tx)
@@ -1312,20 +1270,16 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 	}
 
 	return func(waitCtx context.Context) error {
-		var err error
 		switch durability {
 		case walclient.Permanent:
-			err = v.stream.Wait(waitCtx, commitSeq, walclient.Permanent, true)
+			return v.stream.Wait(waitCtx, commitSeq, walclient.Permanent, true)
 		case walclient.Witness:
-			err = v.stream.Wait(waitCtx, commitSeq, walclient.Witness, false)
+			return v.stream.Wait(waitCtx, commitSeq, walclient.Witness, false)
 		case walclient.Local:
 			// Append already fsynced locally
 			return nil
 		}
-		if err != nil {
-			v.recordTerminalError(err)
-		}
-		return err
+		return nil
 	}
 }
 
@@ -1935,12 +1889,10 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 		return attr, waitFn, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return nil, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return nil, err
 		}
 	}
@@ -2202,12 +2154,10 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		return attr, waitFn, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return nil, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return nil, err
 		}
 	}
@@ -2537,12 +2487,10 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		return attr, waitFn, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return nil, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return nil, err
 		}
 	}
@@ -2651,12 +2599,10 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 		return attr, waitFn, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return nil, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return nil, err
 		}
 	}
@@ -2776,12 +2722,10 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 		return attr, waitFn, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return nil, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return nil, err
 		}
 	}
@@ -3529,12 +3473,10 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		return attr, waitFn, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return nil, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return nil, err
 		}
 	}
@@ -3803,12 +3745,10 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 		return attr, waitFn, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return nil, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return nil, err
 		}
 	}
@@ -3962,12 +3902,10 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		return waitFn, commitSeq, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return 0, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return 0, err
 		}
 	}
@@ -4066,12 +4004,10 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (
 		return waitFn, commitSeq, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return 0, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return 0, err
 		}
 	}
@@ -4351,12 +4287,10 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		return attr, waitFn, nil
 	}()
 	if err != nil {
-		v.recordTerminalError(err)
 		return nil, err
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			v.recordTerminalError(err)
 			return nil, err
 		}
 	}
