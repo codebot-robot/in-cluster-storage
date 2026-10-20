@@ -18,6 +18,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -154,7 +155,7 @@ func TestOpen_DivergenceTruncateFailureFailsOpen(t *testing.T) {
 	}
 }
 
-func TestHandleHelloAck_TruncateFailureReturnsError(t *testing.T) {
+func TestHandleHelloAck_TruncateFailureTerminalErr(t *testing.T) {
 	ctx := t.Context()
 	streamID := uuid.New()
 	dir := t.TempDir()
@@ -223,8 +224,33 @@ func TestHandleHelloAck_TruncateFailureReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected handleHelloAck to fail when TruncateAfter fails, got nil")
 	}
+	if !errors.Is(err, ErrTerminalStream) {
+		t.Errorf("expected error to wrap ErrTerminalStream, got: %v", err)
+	}
 	if !strings.Contains(err.Error(), "failed to truncate local segment store") {
 		t.Errorf("expected 'failed to truncate local segment store' in error, got: %v", err)
+	}
+
+	// Verify that memory mutation was NOT applied (order-before-mutation guarantees memory and disk remain consistent)
+	if impl.localSeq != 5 {
+		t.Errorf("expected localSeq to remain unchanged at 5 on truncate failure, got: %d", impl.localSeq)
+	}
+	if len(impl.retainedRecords) != 1 {
+		t.Errorf("expected retainedRecords to remain unchanged on truncate failure, got: %d", len(impl.retainedRecords))
+	}
+
+	// Verify that the stream enters terminal failed state so TerminalError, Append, and Wait return the terminal error immediately
+	if impl.TerminalError() == nil || !errors.Is(impl.TerminalError(), ErrTerminalStream) {
+		t.Errorf("expected TerminalError to return ErrTerminalStream, got: %v", impl.TerminalError())
+	}
+	if _, appendErr := impl.Append(ctx, []byte("should-fail")); appendErr == nil || !errors.Is(appendErr, ErrTerminalStream) {
+		t.Errorf("expected Append to fail with ErrTerminalStream, got: %v", appendErr)
+	}
+	if waitErr := impl.Wait(ctx, 1, Witness, false); waitErr == nil || !errors.Is(waitErr, ErrTerminalStream) {
+		t.Errorf("expected Wait to fail with ErrTerminalStream, got: %v", waitErr)
+	}
+	if flushErr := impl.Flush(ctx); flushErr == nil || !errors.Is(flushErr, ErrTerminalStream) {
+		t.Errorf("expected Flush to fail with ErrTerminalStream, got: %v", flushErr)
 	}
 }
 

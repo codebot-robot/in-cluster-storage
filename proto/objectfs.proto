@@ -392,6 +392,7 @@ message ListVolumesRequest {
 
 message VolumeInfo {
   string volume_id = 1;
+  string degraded_reason = 2;
 }
 
 message ListVolumesResponse {
@@ -453,6 +454,7 @@ message GetVolumeStatsResponse {
   int64 used_inodes = 6;
   int64 free_inodes = 7;
   int32 error = 8;
+  string degraded_reason = 9;
 }
 
 message CheckpointRequest {
