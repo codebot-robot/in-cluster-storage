@@ -19,12 +19,13 @@ Three concurrent workloads run for a configurable duration (default: 10 minutes 
 
 2. **Metadata Churn Generator (Node 1):**
    - Continuously performs `mkdir`, create, `rename`, `unlink`, and `symlink` operations across a nested tree in `/data/churn/`.
-   - Synchronizes changes via directory `sync` and records expected tree state strictly after `sync` returns.
+   - Files verified cross-node (`file1.bin`, `file2_renamed.bin`) are written with `conv=fsync` and explicitly fsynced after rename (`sync`).
+   - Synchronizes directory metadata via directory `sync` and records expected tree state strictly after `sync` returns. Expected hashes are recorded only from files that were fsynced.
 
 3. **Cross-Node Readers (Node 2):**
    - A writer on Node 1 writes checkpointed files with `dd conv=fsync` and records expected SHA256 hashes to a durability manifest.
    - Node 2 reads each checkpointed file back using `dd` and `sha256sum` (via plain `read(2)`, avoiding `splice`/`sendfile` stale EOF per #278) and compares against the manifest.
-   - Cross-node churn verification: Node 2 verifies that the synced directories and files in `/data/churn` exist and match the SHA256 hashes recorded on Node 1.
+   - Cross-node churn verification: Node 2 verifies that the synced directories and files in `/data/churn` exist and match the SHA256 hashes recorded on Node 1. Cross-node content checks are made only on fsynced files; data closed without fsync becomes visible on other nodes asynchronously, once the sync-on-close pack is uploaded and the metadata is durable; the 30 s background interval is the fallback, not the bound.
 
 ---
 
@@ -49,7 +50,7 @@ A violation of any invariant results in an immediate test failure and triggers a
 2. **Invariant 2: `fsx` Integrity:**
    Every `fsx` process verifies its own data integrity continuously. Any detected corruption fails the test immediately.
 3. **Invariant 3: Durability:**
-   Every file written and acknowledged after `fsync` must match its expected SHA256 hash when read on the other node, and must persist byte-for-byte on a fresh cross-node mount of the live volume taken at the end of the run. (Note: Snapshot restore verification is pending an external restore RPC / CSI snapshot dataSource path, tracked in #320).
+   Every file written and acknowledged after `fsync` must match its expected SHA256 hash when read on the other node (cross-node content checks are made only on fsynced files; data closed without fsync becomes visible on other nodes asynchronously, once the sync-on-close pack is uploaded and the metadata is durable; the 30 s background interval is the fallback, not the bound), and must persist byte-for-byte on a fresh cross-node mount of the live volume taken at the end of the run. (Note: Snapshot restore verification is pending an external restore RPC / CSI snapshot dataSource path, tracked in #320).
 4. **Invariant 4: Bounded Outage Failure:**
    FUSE operations may fail with `EIO` only while the controller is scaled to 0 (plus the recovery bound from #299). Any `EIO` observed outside this outage window is a hard failure.
 5. **Invariant 5: No Silent Divergence:**

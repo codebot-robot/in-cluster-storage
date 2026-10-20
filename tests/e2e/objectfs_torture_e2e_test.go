@@ -518,6 +518,12 @@ spec:
 
 	// -------------------------------------------------------------------------
 	// Workload 2: Metadata churn on Node 1 (untar-plus-rename-plus-delete)
+	//
+	// Cross-node content checks are made only on fsynced files (file1.bin and
+	// file2_renamed.bin). Data closed without fsync becomes visible on other
+	// nodes asynchronously, once the sync-on-close pack is uploaded and metadata
+	// is durable; the 30s background interval is the fallback, not the bound.
+	// Expected hashes are recorded only from files that were fsynced.
 	// -------------------------------------------------------------------------
 	type churnState struct {
 		step    int
@@ -548,16 +554,17 @@ spec:
 			churnCmd := fmt.Sprintf(`
 set -e
 mkdir -p /data/churn/dir_%d/sub
-dd if=/dev/urandom of=/data/churn/dir_%d/file1.bin bs=1k count=4 2>/dev/null
-dd if=/dev/urandom of=/data/churn/dir_%d/sub/file2.bin bs=2k count=2 2>/dev/null
+dd if=/dev/urandom of=/data/churn/dir_%d/file1.bin bs=1k count=4 conv=fsync 2>/dev/null
+dd if=/dev/urandom of=/data/churn/dir_%d/sub/file2.bin bs=2k count=2 conv=fsync 2>/dev/null
 ln -s file1.bin /data/churn/dir_%d/sym1 2>/dev/null || true
 mv /data/churn/dir_%d/sub/file2.bin /data/churn/dir_%d/sub/file2_renamed.bin
+sync /data/churn/dir_%d/sub/file2_renamed.bin
 if [ %d -gt 3 ]; then
   old=%d
   rm -rf /data/churn/dir_$old
 fi
 sync /data/churn
-`, step, step, step, step, step, step, step, step-3)
+`, step, step, step, step, step, step, step, step, step-3)
 
 			out, err := runInPodWithDeadline(testCtx, h, pod1Name, stepName, stepDeadline, "/bin/sh", "-c", churnCmd)
 			tracker.RecordResult(stepName, out, err)
@@ -571,7 +578,7 @@ sync /data/churn
 				continue
 			}
 
-			// Record tree state only after sync completes successfully
+			// Record tree state only after sync completes successfully for fsynced files
 			listOut, listErr := runInPodWithDeadline(testCtx, h, pod1Name, "churn_stat_"+stepName, stepDeadline, "/bin/sh", "-c", "cd /data/churn && for f in $(find . -type f | sort); do echo \"$(sha256sum \"$f\" | awk '{print $1}') $f\"; done")
 			if listErr == nil {
 				entries := make(map[string]string)
