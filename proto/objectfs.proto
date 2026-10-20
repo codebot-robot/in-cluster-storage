@@ -405,9 +405,23 @@ message ListVolumesRequest {
   string from_volume_id = 2;
 }
 
+message Degraded {
+  enum Code {
+    DEGRADED_CODE_UNSPECIFIED = 0;
+    WAL_STREAM_DEGRADED = 1;
+  }
+
+  Code code = 1;
+  string message = 2;
+  google.protobuf.Timestamp since = 3;
+}
+
 message VolumeInfo {
+  reserved 2;
+  reserved "degraded_reason";
+
   string volume_id = 1;
-  string degraded_reason = 2;
+  Degraded degraded = 3;
 }
 
 message ListVolumesResponse {
@@ -461,6 +475,9 @@ message VolumeStats {
 }
 
 message GetVolumeStatsResponse {
+  reserved 9;
+  reserved "degraded_reason";
+
   VolumeStats stats = 1;
   int64 total_bytes = 2;
   int64 used_bytes = 3;
@@ -469,7 +486,7 @@ message GetVolumeStatsResponse {
   int64 used_inodes = 6;
   int64 free_inodes = 7;
   int32 error = 8;
-  string degraded_reason = 9;
+  Degraded degraded = 10;
 }
 
 message CheckpointRequest {
