@@ -107,6 +107,32 @@ func runInPodWithDeadline(ctx context.Context, h *Harness, pod, stepName string,
 	return outStr, err
 }
 
+func getPodUID(podName, namespace string) string {
+	out, err := exec.Command("kubectl", "get", "pod", podName, "-n", namespace, "-o", "jsonpath={.metadata.uid}").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func waitForNewPodReady(t *testing.T, h *Harness, podName, namespace, oldUID string, timeout time.Duration) error {
+	t.Helper()
+	t.Logf("Waiting up to %v for pod %s to be replaced (new UID != %q) and ready in namespace %s", timeout, podName, oldUID, namespace)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		uid := getPodUID(podName, namespace)
+		if uid != "" && uid != oldUID {
+			out, err := exec.Command("kubectl", "get", "pod", podName, "-n", namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}").Output()
+			if err == nil && strings.TrimSpace(string(out)) == "True" {
+				t.Logf("Pod %s successfully replaced and ready (UID: %s)", podName, uid)
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting %v for pod %s to be replaced and ready (old UID: %s)", timeout, podName, oldUID)
+}
+
 func dumpAllDiagnosticLogs(t *testing.T, h *Harness, pod1, pod2 string) {
 	t.Log("======= DIAGNOSTIC LOG DUMP =======")
 	t.Logf("ObjectFS Controller Logs:\n%s", h.GetPodLogsByName("objectfs-controller-0", "default"))
@@ -284,8 +310,8 @@ spec:
             - name: OBJECT_STORAGE_BACKEND`
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvController)
 
-	// Pin controller to node1 initially
-	nodeSelectorNode1 := fmt.Sprintf("nodeSelector:\n        kubernetes.io/hostname: %s\n      tolerations:\n        - key: \"node-role.kubernetes.io/control-plane\"\n          operator: \"Exists\"\n          effect: \"NoSchedule\"\n      serviceAccountName: objectfs-controller", node1)
+	// Pin controller to node1 initially and set 5s termination grace period for fast pod recycling
+	nodeSelectorNode1 := fmt.Sprintf("nodeSelector:\n        kubernetes.io/hostname: %s\n      terminationGracePeriodSeconds: 5\n      tolerations:\n        - key: \"node-role.kubernetes.io/control-plane\"\n          operator: \"Exists\"\n          effect: \"NoSchedule\"\n      serviceAccountName: objectfs-controller", node1)
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "serviceAccountName: objectfs-controller", nodeSelectorNode1)
 
 	// WAL buffer manifest
@@ -297,6 +323,7 @@ spec:
 	walManifest := string(b)
 	walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
 	walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
+	walManifest = strings.ReplaceAll(walManifest, "serviceAccountName: wal-buffer", "terminationGracePeriodSeconds: 5\n      serviceAccountName: wal-buffer")
 
 	awsEnvWAL := `env:
             - name: AWS_ACCESS_KEY_ID
@@ -758,8 +785,13 @@ echo "$h1 $h2"
 	runStart := time.Now()
 	runDeadline := runStart.Add(duration)
 
-	nextControllerKill := runStart.Add(90 * time.Second)
-	nextWalBufferKill := runStart.Add(45 * time.Second) // offset by 45s from controller kills
+	streamCount := countControllerReplicationSessions(h)
+	if streamCount <= 0 {
+		streamCount = 1
+	}
+
+	nextWalBufferKill := runStart.Add(45 * time.Second) // offset from controller kills
+	nextControllerKill := runStart.Add(120 * time.Second)
 	outageTriggerTime := runStart.Add(duration / 3)
 	snapshotTriggerTime := runStart.Add(duration / 2)
 	outageDone := false
@@ -780,25 +812,43 @@ disruptionLoop:
 			// Disruption 1: Force-kill objectfs-controller-0 (~90s)
 			if now.After(nextControllerKill) {
 				t.Logf("[%s] DISRUPTION: Force-killing objectfs-controller-0", now.Format("15:04:05"))
+				oldUID := getPodUID("objectfs-controller-0", "default")
 				h.RunCommand("kubectl", "delete", "pod", "objectfs-controller-0", "-n", "default", "--force", "--grace-period=0")
+				if err := waitForNewPodReady(t, h, "objectfs-controller-0", "default", oldUID, 2*time.Minute); err != nil {
+					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
+					t.Fatalf("ObjectFS Controller failed to recover after kill: %v", err)
+				}
 				if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
 					t.Fatalf("ObjectFS Controller failed to recover after kill: %v", err)
 				}
 				t.Logf("[%s] DISRUPTION: objectfs-controller-0 recovered", time.Now().Format("15:04:05"))
 				nextControllerKill = time.Now().Add(90 * time.Second)
+				if time.Until(nextWalBufferKill) < 60*time.Second {
+					nextWalBufferKill = time.Now().Add(60 * time.Second)
+				}
 			}
 
 			// Disruption 2: Force-kill wal-buffer-0 (~120s, offset)
 			if now.After(nextWalBufferKill) {
 				t.Logf("[%s] DISRUPTION: Force-killing wal-buffer-0", now.Format("15:04:05"))
+				sessionsBeforeKill := countControllerReplicationSessions(h)
+				oldWalUID := getPodUID("wal-buffer-0", "default")
 				h.RunCommand("kubectl", "delete", "pod", "wal-buffer-0", "-n", "default", "--force", "--grace-period=0")
+				if err := waitForNewPodReady(t, h, "wal-buffer-0", "default", oldWalUID, 2*time.Minute); err != nil {
+					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
+					t.Fatalf("WAL Buffer failed to recover after kill: %v", err)
+				}
 				if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
 					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
 					t.Fatalf("WAL Buffer failed to recover after kill: %v", err)
 				}
+				waitForControllerReplicationSessionIncrease(t, h, sessionsBeforeKill, streamCount, 2*time.Minute)
 				t.Logf("[%s] DISRUPTION: wal-buffer-0 recovered", time.Now().Format("15:04:05"))
 				nextWalBufferKill = time.Now().Add(120 * time.Second)
+				if time.Until(nextControllerKill) < 60*time.Second {
+					nextControllerKill = time.Now().Add(60 * time.Second)
+				}
 			}
 
 			// Disruption 3: Outage (scale controller to 0 for >30s metadata timeout once per run)
@@ -817,6 +867,12 @@ disruptionLoop:
 				}
 				tracker.EndOutage(5 * time.Second)
 				t.Logf("[%s] DISRUPTION: Outage recovery complete (5s recovery window bounded)", time.Now().Format("15:04:05"))
+				if time.Until(nextControllerKill) < 60*time.Second {
+					nextControllerKill = time.Now().Add(60 * time.Second)
+				}
+				if time.Until(nextWalBufferKill) < 60*time.Second {
+					nextWalBufferKill = time.Now().Add(60 * time.Second)
+				}
 			}
 
 			// Disruption 4: Mid-run snapshot
