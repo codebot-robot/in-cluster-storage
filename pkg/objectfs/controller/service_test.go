@@ -241,7 +241,7 @@ func volCreateFile(ctx context.Context, vol *Volume, p string, mode uint32, init
 	if err != nil {
 		return nil, err
 	}
-	return vol.CreateFile(ctx, parentIno, path.Base(p), mode, initialContent, uid, gid)
+	return vol.CreateFile(ctx, parentIno, path.Base(p), mode, initialContent, uid, gid, 0)
 }
 
 // MustNewVolume creates a new Volume or fails the test if volume initialization fails.
@@ -950,7 +950,7 @@ func TestOverlayEntryKeepsRowAsOfChange(t *testing.T) {
 
 	// Create initial file
 	initialContent := []byte("initial-file-content")
-	attr1, err := vol.CreateFile(ctx, 1, "testfile.txt", 0644, initialContent, 1000, 1000)
+	attr1, err := vol.CreateFile(ctx, 1, "testfile.txt", 0644, initialContent, 1000, 1000, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -1034,7 +1034,7 @@ func TestMutationCheckCatchesInPlaceInodeModification(t *testing.T) {
 	)
 	defer vol.Close()
 
-	attr, err := vol.CreateFile(ctx, 1, "testfile.txt", 0644, []byte("hello"), 1000, 1000)
+	attr, err := vol.CreateFile(ctx, 1, "testfile.txt", 0644, []byte("hello"), 1000, 1000, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -2274,7 +2274,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	}
 
 	// Direct CreateFile
-	fileAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "foo.txt", 0644, []byte("test"), 0, 0)
+	fileAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "foo.txt", 0644, []byte("test"), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -2355,7 +2355,7 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	vol := MustNewVolume(t, "symlink-test", backend, NewEventBroadcaster())
 
 	// 1. Create a regular file
-	fileAttr, err := vol.CreateFile(ctx, 1, "orig.txt", 0644, []byte("contents"), 100, 200)
+	fileAttr, err := vol.CreateFile(ctx, 1, "orig.txt", 0644, []byte("contents"), 100, 200, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -4659,7 +4659,7 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 		WithLocalStorageDir(filepath.Join(node1MetaDir, volumeID)),
 	)
 	_ = volStale.LoadFromBackend(ctx)
-	_, _ = volStale.CreateFile(ctx, 1, "stale_local_file.txt", 0644, []byte("stale-local-data"), 0, 0)
+	_, _ = volStale.CreateFile(ctx, 1, "stale_local_file.txt", 0644, []byte("stale-local-data"), 0, 0, 0)
 	_ = volStale.Close()
 
 	// 2. Authoritative controller on Node 2 writes authoritative files to wal-buffer

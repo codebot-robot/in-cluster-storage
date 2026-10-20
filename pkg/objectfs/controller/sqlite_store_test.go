@@ -71,7 +71,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 
 	// 3. CreateFile (inline)
 	data1 := []byte("hello sqlite world")
-	fileAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "hello.txt", 0644, data1, 1000, 1000)
+	fileAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "hello.txt", 0644, data1, 1000, 1000, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	for i := range largeData {
 		largeData[i] = byte(i % 251)
 	}
-	chunkAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "large.bin", 0644, nil, 1000, 1000)
+	chunkAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "large.bin", 0644, nil, 1000, 1000, 0)
 	if err != nil {
 		t.Fatalf("CreateFile large.bin failed: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestSQLiteMetadataStoreRecoveryFromLocalDB(t *testing.T) {
 	}
 
 	content := []byte("persisted in sqlite")
-	fileAttr, err := vol1.CreateFile(ctx, dirAttr.GetInode().GetIno(), "test.txt", 0644, content, 0, 0)
+	fileAttr, err := vol1.CreateFile(ctx, dirAttr.GetInode().GetIno(), "test.txt", 0644, content, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestSQLiteMetadataStoreRecoveryFromPublishedSnapshot(t *testing.T) {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
 	content := []byte("snapshot restored content")
-	fileAttr, err := vol1.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file.txt", 0644, content, 0, 0)
+	fileAttr, err := vol1.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file.txt", 0644, content, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -403,7 +403,7 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	}
 
 	// 3. Create the file -> replaces negative cache entry with positive entry in same transaction
-	attr, err := vol.CreateFile(ctx, 1, "does_not_exist.txt", 0644, []byte("now I exist"), 0, 0)
+	attr, err := vol.CreateFile(ctx, 1, "does_not_exist.txt", 0644, []byte("now I exist"), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -477,7 +477,7 @@ func TestSQLiteReadCacheCoherence(t *testing.T) {
 	}
 
 	// Create file
-	fAttr, err := vol.CreateFile(ctx, 1, "initial.txt", 0644, []byte("hello"), 0, 0)
+	fAttr, err := vol.CreateFile(ctx, 1, "initial.txt", 0644, []byte("hello"), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -568,7 +568,7 @@ func TestSQLiteReadCacheMemoryLimits(t *testing.T) {
 
 	var inodes []uint64
 	for i := 0; i < 200; i++ {
-		attr, err := vol.CreateFile(ctx, 1, fmt.Sprintf("file_%d.txt", i), 0644, []byte("content"), 0, 0)
+		attr, err := vol.CreateFile(ctx, 1, fmt.Sprintf("file_%d.txt", i), 0644, []byte("content"), 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile failed: %v", err)
 		}
@@ -621,7 +621,7 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 	// Pre-create initial files and directories
 	var initInodes []uint64
 	for i := 0; i < 30; i++ {
-		attr, err := vol.CreateFile(ctx, 1, fmt.Sprintf("init_%d.txt", i), 0644, []byte("init"), 0, 0)
+		attr, err := vol.CreateFile(ctx, 1, fmt.Sprintf("init_%d.txt", i), 0644, []byte("init"), 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile failed: %v", err)
 		}
@@ -658,7 +658,7 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 100; i++ {
 				name := fmt.Sprintf("w_%d_%d.txt", writerID, i)
-				attr, err := vol.CreateFile(ctx, 1, name, 0644, []byte("data"), 0, 0)
+				attr, err := vol.CreateFile(ctx, 1, name, 0644, []byte("data"), 0, 0, 0)
 				if err == nil {
 					renamed := fmt.Sprintf("w_%d_%d_renamed.txt", writerID, i)
 					_, _ = vol.Rename(ctx, 1, name, 1, renamed)
@@ -710,12 +710,12 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 		t.Fatalf("Mkdir failed despite log append commit: %v", err)
 	}
 
-	fAttr1, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file1.txt", 0644, []byte("contents-of-file-1"), 1000, 1000)
+	fAttr1, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file1.txt", 0644, []byte("contents-of-file-1"), 1000, 1000, 0)
 	if err != nil {
 		t.Fatalf("CreateFile 1 failed: %v", err)
 	}
 
-	_, err = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file2.txt", 0644, []byte("contents-of-file-2"), 1000, 1000)
+	_, err = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file2.txt", 0644, []byte("contents-of-file-2"), 1000, 1000, 0)
 	if err != nil {
 		t.Fatalf("CreateFile 2 failed: %v", err)
 	}
@@ -727,7 +727,7 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 	}
 
 	// Create file3, then unlink it
-	_, err = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file3.txt", 0644, []byte("temp"), 1000, 1000)
+	_, err = vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "file3.txt", 0644, []byte("temp"), 1000, 1000, 0)
 	if err != nil {
 		t.Fatalf("CreateFile 3 failed: %v", err)
 	}
@@ -836,7 +836,7 @@ func TestSQLiteApplierCoalescing(t *testing.T) {
 	}
 
 	// Create a single file
-	attr, err := vol.CreateFile(ctx, 1, "hot_file.bin", 0644, []byte("initial"), 0, 0)
+	attr, err := vol.CreateFile(ctx, 1, "hot_file.bin", 0644, []byte("initial"), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -898,7 +898,7 @@ func TestSQLiteApplierFaultInjectionAndDegradedState(t *testing.T) {
 	// Perform operations that succeed on log append
 	for i := 0; i < 5; i++ {
 		name := fmt.Sprintf("degraded_test_%d.txt", i)
-		_, err := vol.CreateFile(ctx, 1, name, 0644, []byte("sample"), 0, 0)
+		_, err := vol.CreateFile(ctx, 1, name, 0644, []byte("sample"), 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile %d failed: %v", i, err)
 		}
@@ -958,7 +958,7 @@ func TestSQLiteBackpressureUnderLag(t *testing.T) {
 	}
 
 	// Write single file that exceeds overlay capacity
-	_, err := vol.CreateFile(ctx, 1, "bp_file.bin", 0644, make([]byte, 1500), 0, 0)
+	_, err := vol.CreateFile(ctx, 1, "bp_file.bin", 0644, make([]byte, 1500), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -970,7 +970,7 @@ func TestSQLiteBackpressureUnderLag(t *testing.T) {
 	// The next operation with a short timeout should be blocked by backpressure and time out
 	timeoutCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
-	_, err = vol.CreateFile(timeoutCtx, 1, "blocked.txt", 0644, []byte("data"), 0, 0)
+	_, err = vol.CreateFile(timeoutCtx, 1, "blocked.txt", 0644, []byte("data"), 0, 0, 0)
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected DeadlineExceeded due to backpressure block, got %v", err)
 	}
@@ -986,7 +986,7 @@ func TestSQLiteBackpressureUnderLag(t *testing.T) {
 	}
 
 	// Now writing succeeds immediately without blocking
-	_, err = vol.CreateFile(ctx, 1, "unblocked.txt", 0644, []byte("success"), 0, 0)
+	_, err = vol.CreateFile(ctx, 1, "unblocked.txt", 0644, []byte("success"), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile after backpressure release failed: %v", err)
 	}
@@ -1029,7 +1029,7 @@ func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		name := fmt.Sprintf("burst_file_%d.txt", i)
 		content := fmt.Sprintf("burst-content-%d", i)
-		attr, cErr := vol.CreateFile(ctx, 1, name, 0644, []byte(content), 0, 0)
+		attr, cErr := vol.CreateFile(ctx, 1, name, 0644, []byte(content), 0, 0, 0)
 		if cErr != nil {
 			t.Fatalf("CreateFile %d failed: %v", i, cErr)
 		}
@@ -1099,7 +1099,7 @@ func TestSQLiteSnapshotFlushesOverlay(t *testing.T) {
 
 	// Create files
 	for i := 0; i < 5; i++ {
-		_, err := vol.CreateFile(ctx, 1, fmt.Sprintf("snap_f_%d.txt", i), 0644, []byte("data"), 0, 0)
+		_, err := vol.CreateFile(ctx, 1, fmt.Sprintf("snap_f_%d.txt", i), 0644, []byte("data"), 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile failed: %v", err)
 		}
@@ -1164,7 +1164,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 	}
 
 	// Create initial file and flush to SQLite
-	fAttr, err := vol.CreateFile(ctx, 1, "before_rename.txt", 0644, []byte("tx-boundary-test"), 0, 0)
+	fAttr, err := vol.CreateFile(ctx, 1, "before_rename.txt", 0644, []byte("tx-boundary-test"), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -1266,7 +1266,7 @@ func TestSQLiteSnapshotFlushNoStarvationUnderContinuousWrites(t *testing.T) {
 			case <-stopWrites:
 				return
 			default:
-				_, err := vol.CreateFile(ctx, 1, fmt.Sprintf("continuous_%d.txt", idx), 0644, []byte("data"), 0, 0)
+				_, err := vol.CreateFile(ctx, 1, fmt.Sprintf("continuous_%d.txt", idx), 0644, []byte("data"), 0, 0, 0)
 				if err != nil {
 					writeErr.Store(err)
 					return
@@ -1336,7 +1336,7 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
 
-	f1Attr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "f1.txt", 0644, []byte("memory-index-content"), 0, 0)
+	f1Attr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "f1.txt", 0644, []byte("memory-index-content"), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile f1 failed: %v", err)
 	}
@@ -1357,7 +1357,7 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 	}
 
 	// 4. Add more data after snapshot
-	f2Attr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "f2.txt", 0644, []byte("f2-content-after-snap"), 0, 0)
+	f2Attr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "f2.txt", 0644, []byte("f2-content-after-snap"), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile f2 failed: %v", err)
 	}
@@ -1427,7 +1427,7 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 				}
 			}
 
-			attr, err := vol.CreateFile(ctx, 1, "large.bin", 0644, fullData, 0, 0)
+			attr, err := vol.CreateFile(ctx, 1, "large.bin", 0644, fullData, 0, 0, 0)
 			if err != nil {
 				t.Fatalf("CreateFile failed: %v", err)
 			}
@@ -1524,7 +1524,7 @@ func TestSQLiteIndexRebuildOnDatabaseCorruption(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		name := fmt.Sprintf("initial_%d.txt", i)
 		data := []byte(fmt.Sprintf("initial data content %d", i))
-		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile %d failed: %v", i, err)
 		}
@@ -1548,7 +1548,7 @@ func TestSQLiteIndexRebuildOnDatabaseCorruption(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		name := fmt.Sprintf("after_corrupt_%d.txt", i)
 		data := []byte(fmt.Sprintf("new data content after corrupt %d", i))
-		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile after corrupt %d failed: %v", i, err)
 		}
@@ -1646,7 +1646,7 @@ func TestSQLiteIndexRebuildOnDatabaseDeletion(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		name := fmt.Sprintf("file_%d.txt", i)
 		data := []byte(fmt.Sprintf("sample data %d", i))
-		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile %d failed: %v", i, err)
 		}
@@ -1665,7 +1665,7 @@ func TestSQLiteIndexRebuildOnDatabaseDeletion(t *testing.T) {
 	for i := 11; i <= 15; i++ {
 		name := fmt.Sprintf("file_%d.txt", i)
 		data := []byte(fmt.Sprintf("sample data %d", i))
-		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile %d failed: %v", i, err)
 		}
@@ -1721,7 +1721,7 @@ func TestRebuildIndexPreservesAllFilesWithoutLoss(t *testing.T) {
 	for i := 1; i <= N; i++ {
 		name := fmt.Sprintf("file_%d.txt", i)
 		data := []byte(fmt.Sprintf("file content %d", i))
-		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0)
+		_, err := vol.CreateFile(ctx, 1, name, 0644, data, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile %d failed: %v", i, err)
 		}

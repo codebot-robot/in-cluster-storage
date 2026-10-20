@@ -262,7 +262,7 @@ func TestBenchmarkMeasurements(t *testing.T) {
 			step = 1
 		}
 		for i := 0; i < numVolEntries; i++ {
-			fAttr, err := vol.CreateFile(ctx, 1, fmt.Sprintf("file_%d.txt", i), 0644, []byte("x"), 0, 0)
+			fAttr, err := vol.CreateFile(ctx, 1, fmt.Sprintf("file_%d.txt", i), 0644, []byte("x"), 0, 0, 0)
 			if err != nil {
 				t.Fatalf("CreateFile failed: %v", err)
 			}
@@ -615,7 +615,7 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		}
 		ioBeforeCreate := readProcSelfWriteBytes()
 		for i := 0; i < opCount; i++ {
-			if _, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), fmt.Sprintf("cr_%d.txt", i), 0644, []byte("val"), 0, 0); err != nil {
+			if _, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), fmt.Sprintf("cr_%d.txt", i), 0644, []byte("val"), 0, 0, 0); err != nil {
 				t.Fatalf("CreateFile failed: %v", err)
 			}
 		}
@@ -629,7 +629,7 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		ioAfterCreateAmortized := readProcSelfWriteBytes()
 
 		// B. 64 KiB Write
-		fAttr, err := vol.CreateFile(ctx, 1, "target.bin", 0644, nil, 0, 0)
+		fAttr, err := vol.CreateFile(ctx, 1, "target.bin", 0644, nil, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("CreateFile failed: %v", err)
 		}
@@ -656,7 +656,7 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		ioAfterWriteAmortized := readProcSelfWriteBytes()
 
 		// C. Rename
-		if _, err := vol.CreateFile(ctx, 1, "ren_a.txt", 0644, []byte("x"), 0, 0); err != nil {
+		if _, err := vol.CreateFile(ctx, 1, "ren_a.txt", 0644, []byte("x"), 0, 0, 0); err != nil {
 			t.Fatalf("CreateFile failed: %v", err)
 		}
 		if err := vol.FlushOverlay(ctx); err != nil {
