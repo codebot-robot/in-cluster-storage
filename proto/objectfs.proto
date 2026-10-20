@@ -256,6 +256,13 @@ message FsyncRequest {
   uint64 inode = 2;
   bool blocking = 3;
   int64 staging_epoch = 4;
+
+  enum SyncTrigger {
+    SYNC_TRIGGER_UNSPECIFIED = 0;
+    SYNC_TRIGGER_PERIODIC = 1;
+    SYNC_TRIGGER_CLOSE = 2;
+  }
+  SyncTrigger trigger = 5;
 }
 
 message FsyncResponse {
