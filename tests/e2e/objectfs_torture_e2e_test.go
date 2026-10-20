@@ -890,7 +890,13 @@ disruptionLoop:
 		}
 	}
 
-	t.Logf("Torture workload duration completed; shutting down workloads and verifying invariants...")
+	fatalErrMu.Lock()
+	if fatalErr != nil {
+		t.Logf("Torture workload stopped early by fatal error; shutting down workloads...")
+	} else {
+		t.Logf("Torture workload duration completed; shutting down workloads and verifying invariants...")
+	}
+	fatalErrMu.Unlock()
 	close(churnStop)
 	close(writerStop)
 	close(readerStop)
