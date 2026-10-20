@@ -559,6 +559,157 @@ func TestStageAndSync_BlockingFsyncPreemptsCoalesceWindow(t *testing.T) {
 	}
 }
 
+// TestStageAndSync_CloseTriggerStartsCoalescedSyncImmediately verifies that a
+// CLOSE-triggered non-blocking Fsync with staged chunks commits without waiting
+// for the coalesce window, while a PERIODIC non-blocking Fsync still waits.
+func TestStageAndSync_CloseTriggerStartsCoalescedSyncImmediately(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	backend := newRecordingBackend(rawBackend)
+	// 10s coalesce window so any difference is unambiguous
+	server := NewServer(backend, WithServerSyncCoalesceWindow(10*time.Second))
+	defer func() { _ = server.Close() }()
+
+	// 1. Periodic non-blocking Fsync: must wait for the coalesce window
+	volPeriodic := "vol-periodic-wait"
+	cResp1, _ := testCreateFile(ctx, server, volPeriodic, "/file1.bin", 0644, nil, 0, 0)
+	ino1 := cResp1.GetAttr().GetInode().GetIno()
+	_, _ = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volPeriodic,
+		Inode:    ino1,
+		Offset:   0,
+		Data:     bytes.Repeat([]byte("1"), 64*1024),
+	})
+
+	periodicDone := make(chan struct{})
+	go func() {
+		defer close(periodicDone)
+		_, _ = server.Fsync(ctx, &pb.FsyncRequest{
+			VolumeId: volPeriodic,
+			Inode:    ino1,
+			Blocking: false,
+			Trigger:  pb.FsyncRequest_SYNC_TRIGGER_PERIODIC,
+		})
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-periodicDone:
+		t.Fatalf("Periodic non-blocking Fsync finished prematurely before coalesce window")
+	default:
+	}
+	if backend.getPackCount() != 0 {
+		t.Fatalf("Periodic non-blocking Fsync uploaded packs before window fired")
+	}
+
+	// 2. Close-triggered non-blocking Fsync: commits immediately without waiting for the window
+	volClose := "vol-close-immediate"
+	cResp2, _ := testCreateFile(ctx, server, volClose, "/file2.bin", 0644, nil, 0, 0)
+	ino2 := cResp2.GetAttr().GetInode().GetIno()
+	_, _ = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volClose,
+		Inode:    ino2,
+		Offset:   0,
+		Data:     bytes.Repeat([]byte("2"), 64*1024),
+	})
+
+	start := time.Now()
+	resp2, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volClose,
+		Inode:    ino2,
+		Blocking: false,
+		Trigger:  pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+	})
+	elapsed := time.Since(start)
+
+	if err != nil || !resp2.GetSuccess() {
+		t.Fatalf("Close-triggered Fsync failed: %v, resp=%v", err, resp2)
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("Close-triggered Fsync waited for coalesce window instead of committing immediately: took %v", elapsed)
+	}
+	if backend.getPackCount() != 1 {
+		t.Fatalf("Expected 1 packfile for close-triggered sync, got %d", backend.getPackCount())
+	}
+}
+
+// TestStageAndSync_CloseTriggerPreemptsActiveWindow verifies that a CLOSE-triggered
+// non-blocking Fsync arriving during an active coalesce window preempts the window
+// immediately, uploading a single packfile containing writes from both callers.
+func TestStageAndSync_CloseTriggerPreemptsActiveWindow(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	backend := newRecordingBackend(rawBackend)
+	// 10s coalesce window so any difference is unambiguous
+	server := NewServer(backend, WithServerSyncCoalesceWindow(10*time.Second))
+	volumeID := "test-close-preempt-window-vol"
+	defer func() { _ = server.Close() }()
+
+	// File 1 writes and issues non-blocking periodic sync (arms 10s window)
+	cResp1, _ := testCreateFile(ctx, server, volumeID, "/file1.bin", 0644, nil, 0, 0)
+	ino1 := cResp1.GetAttr().GetInode().GetIno()
+	_, _ = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino1,
+		Offset:   0,
+		Data:     bytes.Repeat([]byte("1"), 64*1024),
+	})
+
+	periodicDone := make(chan struct{})
+	go func() {
+		defer close(periodicDone)
+		_, _ = server.Fsync(ctx, &pb.FsyncRequest{
+			VolumeId: volumeID,
+			Inode:    ino1,
+			Blocking: false,
+			Trigger:  pb.FsyncRequest_SYNC_TRIGGER_PERIODIC,
+		})
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if backend.getPackCount() != 0 {
+		t.Fatalf("Packs uploaded too early before window flush")
+	}
+
+	// File 2 writes and issues non-blocking CLOSE-triggered sync
+	cResp2, _ := testCreateFile(ctx, server, volumeID, "/file2.bin", 0644, nil, 0, 0)
+	ino2 := cResp2.GetAttr().GetInode().GetIno()
+	_, _ = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino2,
+		Offset:   0,
+		Data:     bytes.Repeat([]byte("2"), 64*1024),
+	})
+
+	start := time.Now()
+	closeResp, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    ino2,
+		Blocking: false,
+		Trigger:  pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+	})
+	elapsed := time.Since(start)
+
+	if err != nil || !closeResp.GetSuccess() {
+		t.Fatalf("Close-triggered non-blocking Fsync failed: %v", err)
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("Close-triggered Fsync waited for coalesce window instead of preempting: took %v", elapsed)
+	}
+
+	// File 1's periodic waiter should also have unblocked promptly
+	select {
+	case <-periodicDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("Periodic non-blocking waiter was not notified by preempting close sync")
+	}
+
+	// Exactly 1 packfile created containing writes from both files
+	if cnt := backend.getPackCount(); cnt != 1 {
+		t.Fatalf("Expected exactly 1 packfile containing both writes, got %d", cnt)
+	}
+}
+
 // TestStageAndSync_NonBlockingSyncFailureSurfacesOnBlockingFsync verifies that failed
 // non-blocking syncs are remembered and returned on the next blocking Fsync.
 func TestStageAndSync_NonBlockingSyncFailureSurfacesOnBlockingFsync(t *testing.T) {

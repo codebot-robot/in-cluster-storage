@@ -766,7 +766,7 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	stagingEpoch, pos, err := vol.FsyncWithEpoch(ctx, req.GetInode(), req.GetBlocking(), req.GetStagingEpoch())
+	stagingEpoch, pos, err := vol.FsyncWithEpoch(ctx, req.GetInode(), req.GetBlocking(), req.GetStagingEpoch(), req.GetTrigger())
 	if err != nil {
 		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err), StagingEpoch: stagingEpoch, StreamPosition: pos}, nil
 	}

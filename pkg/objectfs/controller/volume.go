@@ -579,7 +579,7 @@ func (v *Volume) Fsync(ctx context.Context, inodeID uint64) error {
 	return err
 }
 
-func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bool, reqEpoch int64) (int64, uint64, error) {
+func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bool, reqEpoch int64, trigger ...pb.FsyncRequest_SyncTrigger) (int64, uint64, error) {
 	v.mu.RLock()
 	if inodeID == 0 {
 		inodeID = v.rootInodeID
@@ -641,6 +641,36 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 		pos := v.Position()
 		v.stagingMu.Unlock()
 		return epoch, pos, nil
+	}
+
+	trig := pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED
+	if len(trigger) > 0 {
+		trig = trigger[0]
+	}
+
+	if trig == pb.FsyncRequest_SYNC_TRIGGER_CLOSE {
+		if v.coalesceTimer != nil {
+			v.coalesceTimer.Stop()
+			v.coalesceTimer = nil
+		}
+
+		for v.syncInProgress {
+			v.syncCond.Wait()
+		}
+
+		if v.coalesceTimer != nil {
+			v.coalesceTimer.Stop()
+			v.coalesceTimer = nil
+		}
+
+		if len(v.stagedChunks) == 0 {
+			pos := v.Position()
+			v.stagingMu.Unlock()
+			return epoch, pos, nil
+		}
+
+		pos, err := v.executeSyncLocked(ctx, true)
+		return epoch, pos, err
 	}
 
 	waitSeq := v.stagingSeq
