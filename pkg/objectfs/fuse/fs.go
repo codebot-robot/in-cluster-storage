@@ -1969,15 +1969,10 @@ func (fs *ObjectFS) syncVolumeBlocking(ctx context.Context) error {
 	return nil
 }
 
-func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context, trigger ...pb.FsyncRequest_SyncTrigger) error {
+func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context, trigger pb.FsyncRequest_SyncTrigger) error {
 	entries := fs.cache.GetDirtyEntries()
 	if len(entries) == 0 {
 		return nil
-	}
-
-	trig := pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED
-	if len(trigger) > 0 {
-		trig = trigger[0]
 	}
 
 	var allUncleaned []uncleanedItem
@@ -2007,14 +2002,14 @@ func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context, trigger ...pb.Fsy
 		Inode:        1,
 		Blocking:     false,
 		StagingEpoch: lastEpoch,
-		Trigger:      trig,
+		Trigger:      trigger,
 	})
 	if err != nil {
 		fs.logRPCError("Fsync(volume)", err)
 		return err
 	}
 	if resp.GetError() == int32(syscall.ESTALE) || (resp.GetStagingEpoch() != 0 && lastEpoch != 0 && resp.GetStagingEpoch() != lastEpoch) {
-		return fs.syncVolumeNonBlocking(ctx, trig)
+		return fs.syncVolumeNonBlocking(ctx, trigger)
 	}
 	if resp.GetError() != 0 {
 		return syscall.Errno(resp.GetError())
