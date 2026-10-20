@@ -31,12 +31,16 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
@@ -129,6 +133,10 @@ type Server struct {
 
 	walDir                   string
 	walTarget                string
+	walDialOpts              []grpc.DialOption
+	walConn                  *grpc.ClientConn
+	walClient                walpb.WalBufferClient
+	walErr                   error
 	defaultDurability        walclient.Level
 	metadataIndex            string
 	metadataDir              string
@@ -207,6 +215,14 @@ func WithServerWAL(walDir, walTarget string, durability walclient.Level) ServerO
 		s.walDir = walDir
 		s.walTarget = walTarget
 		s.defaultDurability = durability
+	}
+}
+
+// WithServerWALDialOptions configures additional gRPC dial options when dialing the WAL buffer.
+// This is the extension point for TLS/mTLS credentials (e.g. issue #319).
+func WithServerWALDialOptions(opts ...grpc.DialOption) ServerOption {
+	return func(s *Server) {
+		s.walDialOpts = append(s.walDialOpts, opts...)
 	}
 }
 
@@ -299,6 +315,17 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.walTarget != "" {
+		dialOpts := append(grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())), s.walDialOpts...)
+		conn, err := grpc.NewClient(s.walTarget, dialOpts...)
+		if err != nil {
+			klog.Errorf("failed to dial WAL buffer target %s: %v", s.walTarget, err)
+			s.walErr = err
+		} else {
+			s.walConn = conn
+			s.walClient = walpb.NewWalBufferClient(conn)
+		}
+	}
 	return s
 }
 
@@ -320,10 +347,16 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 			}
 			volOpts = append(volOpts, WithStream(stream))
 		} else if s.walDir != "" {
+			if s.walErr != nil {
+				return nil, fmt.Errorf("failed to dial WAL buffer target %s: %w", s.walTarget, s.walErr)
+			}
 			streamID := StreamIDForVolume(volumeID)
 			var walOpts []walclient.Option
 			if s.acceptUnversioned {
 				walOpts = append(walOpts, walclient.WithAcceptUnversioned(true))
+			}
+			if s.walClient != nil {
+				walOpts = append(walOpts, walclient.WithGRPCClient(s.walClient))
 			}
 			stream, err := walclient.Open(context.Background(), s.walDir, streamID, s.walTarget, walOpts...)
 			if err != nil {
@@ -401,6 +434,13 @@ func (s *Server) Close() error {
 		if err := v.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+	if s.walConn != nil {
+		if err := s.walConn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.walConn = nil
+		s.walClient = nil
 	}
 	return firstErr
 }
