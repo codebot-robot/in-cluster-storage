@@ -258,6 +258,7 @@ message FsyncRequest {
   int64 staging_epoch = 4;
 
   enum SyncTrigger {
+    // UNSPECIFIED is what an explicit, blocking fsync carries.
     SYNC_TRIGGER_UNSPECIFIED = 0;
     SYNC_TRIGGER_PERIODIC = 1;
     SYNC_TRIGGER_CLOSE = 2;

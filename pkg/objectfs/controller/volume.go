@@ -575,11 +575,11 @@ func (v *Volume) triggerCoalesceSync() {
 }
 
 func (v *Volume) Fsync(ctx context.Context, inodeID uint64) error {
-	_, _, err := v.FsyncWithEpoch(ctx, inodeID, true, 0)
+	_, _, err := v.FsyncWithEpoch(ctx, inodeID, true, 0, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED)
 	return err
 }
 
-func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bool, reqEpoch int64, trigger ...pb.FsyncRequest_SyncTrigger) (int64, uint64, error) {
+func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bool, reqEpoch int64, trigger pb.FsyncRequest_SyncTrigger) (int64, uint64, error) {
 	v.mu.RLock()
 	if inodeID == 0 {
 		inodeID = v.rootInodeID
@@ -643,12 +643,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 		return epoch, pos, nil
 	}
 
-	trig := pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED
-	if len(trigger) > 0 {
-		trig = trigger[0]
-	}
-
-	if trig == pb.FsyncRequest_SYNC_TRIGGER_CLOSE {
+	if trigger == pb.FsyncRequest_SYNC_TRIGGER_CLOSE {
 		if v.coalesceTimer != nil {
 			v.coalesceTimer.Stop()
 			v.coalesceTimer = nil
