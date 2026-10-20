@@ -1,6 +1,6 @@
 # Developer & Agent Guidelines
 
-This document describes how to set up your environment and run the full end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), and how to write commit messages and PR descriptions (section 5).
+This document describes how to set up your environment and run the full end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), how to write commit messages and PR descriptions (section 5), and the Go API rules we hold code to (section 6).
 
 ---
 
@@ -158,3 +158,16 @@ For closing `io.Closer` resources without dropping errors, use the helpers in `p
 - **Keep messages true to the final code.** When review changes the approach, rewrite the affected commit messages (amend, or `fixup!` commits squashed with `git rebase --autosquash`) so they describe what the code does now, not the history of attempts. If you add follow-up commits instead, give each one a body explaining what changed and why; a bare `fixup!` subject is not enough. Never leave a message describing code that was later removed.
 - **Reference issues** in the commit body: `Fixes #N` for the commit that completes an issue, `Part of #N` otherwise.
 - **PR description = the commit messages**, in order, for multi-commit PRs. If a reviewer would need information that isn't in the commits, add it to the commits rather than only to the PR description.
+
+---
+
+## 6. Go API Rules
+
+**No variadic parameters as a substitute for optional arguments.** When a function needs a new input, add a parameter and update every call site. Do not write `f(ctx, x, trigger ...Trigger)` so that existing callers keep compiling and silently receive a zero value.
+
+The reason is the point of using a strongly typed language: when a function's inputs change we want to think about every caller, and we want proof that we did. A new required parameter gives that proof for free, because a forgotten call site does not compile. A variadic optional hides exactly the call sites that most need thought, and the zero value they get (`UNSPECIFIED`, `nil`, `0`) is usually the one behaviour nobody designed.
+
+Variadics are fine where the list is genuinely a list: `fmt`-style arguments, `errors.Join(errs...)`, and the functional-options idiom (`opts ...Option`) for *configuration* that has a sensible default by design. They are not fine for a single value that changes what the function does, such as a mode, a trigger, a flag, or a device number.
+
+If a change touches many call sites, that is information, not a problem: it says the function has many callers who now have to decide something. Make the decision visible at each one.
+
