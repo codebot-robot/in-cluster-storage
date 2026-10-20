@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -100,6 +101,8 @@ type ObjectFS struct {
 	syncOnClose            bool
 	backgroundSyncInterval time.Duration
 	syncTrigger            chan struct{}
+	closedInodesMu         sync.Mutex
+	closedInodes           map[uint64]struct{}
 	errMu                  sync.Mutex
 	lastLoggedErr          time.Time
 
@@ -158,6 +161,7 @@ func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string
 		syncOnClose:            true,
 		backgroundSyncInterval: 30 * time.Second,
 		syncTrigger:            make(chan struct{}, 1),
+		closedInodes:           make(map[uint64]struct{}),
 		manifests:              make(map[uint64]*fileManifest),
 		activePrefetches:       make(map[uint64]*prefetchHandle),
 		lastReadChunk:          make(map[uint64]int),
@@ -350,7 +354,7 @@ func (fs *ObjectFS) StartBackgroundSync(ctx context.Context) {
 				cancel()
 			case <-fs.syncTrigger:
 				syncCtx, cancel := context.WithTimeout(ctx, fs.syncTimeout)
-				if err := fs.syncVolumeNonBlocking(syncCtx, pb.FsyncRequest_SYNC_TRIGGER_CLOSE); err != nil {
+				if err := fs.syncClosedInodes(syncCtx); err != nil {
 					klog.Warningf("ObjectFS volume %s sync on close failed: %v", fs.volumeID, err)
 				}
 				cancel()
@@ -2032,10 +2036,35 @@ func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context, trigger pb.FsyncR
 	return nil
 }
 
-func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking bool) error {
+func (fs *ObjectFS) syncClosedInodes(ctx context.Context) error {
+	fs.closedInodesMu.Lock()
+	if len(fs.closedInodes) == 0 {
+		fs.closedInodesMu.Unlock()
+		return nil
+	}
+	inodes := make([]uint64, 0, len(fs.closedInodes))
+	for ino := range fs.closedInodes {
+		inodes = append(inodes, ino)
+	}
+	fs.closedInodes = make(map[uint64]struct{})
+	fs.closedInodesMu.Unlock()
+
+	var errs []error
+	for _, ino := range inodes {
+		if err := fs.syncAndFsync(ctx, ino, false, pb.FsyncRequest_SYNC_TRIGGER_CLOSE); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking bool, trigger pb.FsyncRequest_SyncTrigger) error {
 	epoch, runs, chunkGens, err := fs.pushDirtyChunksToStaging(ctx, inode)
 	if err != nil {
 		return err
+	}
+	if len(runs) == 0 && !blocking {
+		return nil
 	}
 
 	resp, err := fs.client.Fsync(ctx, &pb.FsyncRequest{
@@ -2043,6 +2072,7 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 		Inode:        inode,
 		Blocking:     blocking,
 		StagingEpoch: epoch,
+		Trigger:      trigger,
 	})
 	if err != nil {
 		fs.logRPCError("Fsync", err)
@@ -2059,6 +2089,7 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 			Inode:        inode,
 			Blocking:     blocking,
 			StagingEpoch: newEpoch,
+			Trigger:      trigger,
 		})
 		if rErr != nil {
 			fs.logRPCError("Fsync(retry)", rErr)
@@ -2101,7 +2132,7 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 }
 
 func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
-	return fs.syncAndFsync(ctx, inode, true)
+	return fs.syncAndFsync(ctx, inode, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED)
 }
 
 func (fs *ObjectFS) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
@@ -2119,7 +2150,7 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 	ctx, cancelFunc := fs.makeSyncContext(cancel)
 	defer cancelFunc()
 
-	if err := fs.syncAndFsync(ctx, input.NodeId, true); err != nil {
+	if err := fs.syncAndFsync(ctx, input.NodeId, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
 		return fs.grpcErrorToStatus("Fsync", err)
 	}
 	return fuse.OK
@@ -2138,6 +2169,12 @@ func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 
 	if fs.syncOnClose {
 		if fs.cache.IsInodeDirty(input.NodeId) {
+			fs.closedInodesMu.Lock()
+			if fs.closedInodes == nil {
+				fs.closedInodes = make(map[uint64]struct{})
+			}
+			fs.closedInodes[input.NodeId] = struct{}{}
+			fs.closedInodesMu.Unlock()
 			select {
 			case fs.syncTrigger <- struct{}{}:
 			default:

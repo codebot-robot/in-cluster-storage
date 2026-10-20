@@ -6552,3 +6552,109 @@ func TestSyncVolumeNonBlockingTrigger(t *testing.T) {
 		t.Errorf("Expected blocking to be false")
 	}
 }
+
+func TestSyncOnClose_SyncsOnlyClosedInode(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	recClient := &recordingControllerClient{ObjectFSControllerClient: client}
+	volumeID := "vol-sync-on-close-inode-test"
+	cache := NewNodeCache(10 * 1024 * 1024)
+	rawFS := NewObjectFS(recClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	ctx := t.Context()
+	var createOutA, createOutB fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "fileA.txt", &createOutA); st != fuse.OK {
+		t.Fatalf("Create fileA failed: %v", st)
+	}
+	fileA := createOutA.EntryOut.NodeId
+
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "fileB.txt", &createOutB); st != fuse.OK {
+		t.Fatalf("Create fileB failed: %v", st)
+	}
+	fileB := createOutB.EntryOut.NodeId
+
+	// Write dirty data to both fileA and fileB
+	dataA := []byte("content of file A")
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileA},
+		Fh:       createOutA.OpenOut.Fh,
+		Offset:   0,
+	}, dataA); st != fuse.OK {
+		t.Fatalf("Write fileA failed: %v", st)
+	}
+
+	dataB := []byte("content of file B")
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileB},
+		Fh:       createOutB.OpenOut.Fh,
+		Offset:   0,
+	}, dataB); st != fuse.OK {
+		t.Fatalf("Write fileB failed: %v", st)
+	}
+
+	if !rawFS.cache.IsInodeDirty(fileA) {
+		t.Fatalf("Expected fileA to be dirty in cache")
+	}
+	if !rawFS.cache.IsInodeDirty(fileB) {
+		t.Fatalf("Expected fileB to be dirty in cache")
+	}
+
+	// Release fileA
+	rawFS.Release(nil, &fuse.ReleaseIn{
+		InHeader: fuse.InHeader{NodeId: fileA},
+		Fh:       createOutA.OpenOut.Fh,
+	})
+
+	// Process closed inodes
+	if err := rawFS.syncClosedInodes(ctx); err != nil {
+		t.Fatalf("syncClosedInodes failed: %v", err)
+	}
+
+	lastReq := recClient.getLastRequest()
+	if lastReq == nil {
+		t.Fatalf("Expected FsyncRequest to be recorded for closed inode")
+	}
+	if lastReq.GetInode() != fileA {
+		t.Errorf("Expected Fsync for closed inode %d, got %d", fileA, lastReq.GetInode())
+	}
+	if lastReq.GetTrigger() != pb.FsyncRequest_SYNC_TRIGGER_CLOSE {
+		t.Errorf("Expected trigger CLOSE, got %v", lastReq.GetTrigger())
+	}
+	if lastReq.GetBlocking() {
+		t.Errorf("Expected blocking to be false")
+	}
+
+	// fileA must now be clean, while fileB must still be dirty
+	if rawFS.cache.IsInodeDirty(fileA) {
+		t.Errorf("Expected fileA to be clean in cache after syncOnClose")
+	}
+	if !rawFS.cache.IsInodeDirty(fileB) {
+		t.Errorf("Expected fileB to remain dirty in cache after syncOnClose of fileA")
+	}
+
+	// Now run periodic sync for the volume
+	if err := rawFS.syncVolumeNonBlocking(ctx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC); err != nil {
+		t.Fatalf("syncVolumeNonBlocking(PERIODIC) failed: %v", err)
+	}
+
+	lastReq = recClient.getLastRequest()
+	if lastReq == nil {
+		t.Fatalf("Expected FsyncRequest for periodic sync")
+	}
+	if lastReq.GetInode() != 1 {
+		t.Errorf("Expected volume-level Fsync inode 1, got %d", lastReq.GetInode())
+	}
+	if lastReq.GetTrigger() != pb.FsyncRequest_SYNC_TRIGGER_PERIODIC {
+		t.Errorf("Expected trigger PERIODIC, got %v", lastReq.GetTrigger())
+	}
+	if rawFS.cache.IsInodeDirty(fileB) {
+		t.Errorf("Expected fileB to be clean after periodic sync")
+	}
+}
