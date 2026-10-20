@@ -6463,3 +6463,92 @@ func TestStartWatcherHealthAndSweep(t *testing.T) {
 		t.Errorf("Expected 1s EntryTimeout after disconnect, got %v", lookupOut.EntryTimeout())
 	}
 }
+
+type recordingControllerClient struct {
+	pb.ObjectFSControllerClient
+	mu          sync.Mutex
+	lastRequest *pb.FsyncRequest
+}
+
+func (c *recordingControllerClient) Fsync(ctx context.Context, in *pb.FsyncRequest, opts ...grpc.CallOption) (*pb.FsyncResponse, error) {
+	c.mu.Lock()
+	c.lastRequest = proto.Clone(in).(*pb.FsyncRequest)
+	c.mu.Unlock()
+	return c.ObjectFSControllerClient.Fsync(ctx, in, opts...)
+}
+
+func (c *recordingControllerClient) getLastRequest() *pb.FsyncRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastRequest
+}
+
+func TestSyncVolumeNonBlockingTrigger(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	recClient := &recordingControllerClient{ObjectFSControllerClient: client}
+	volumeID := "vol-sync-trigger-test"
+	cache := NewNodeCache(10 * 1024 * 1024)
+	rawFS := NewObjectFS(recClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	ctx := t.Context()
+	var createOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test.txt", &createOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Write dirty data into cache
+	data1 := []byte("hello close trigger")
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Fh:       createOut.OpenOut.Fh,
+		Offset:   0,
+	}, data1); st != fuse.OK {
+		t.Fatalf("Write failed: %v", st)
+	}
+
+	// Trigger non-blocking sync with CLOSE
+	if err := rawFS.syncVolumeNonBlocking(ctx, pb.FsyncRequest_SYNC_TRIGGER_CLOSE); err != nil {
+		t.Fatalf("syncVolumeNonBlocking(CLOSE) failed: %v", err)
+	}
+	lastReq := recClient.getLastRequest()
+	if lastReq == nil {
+		t.Fatalf("Expected FsyncRequest to be recorded")
+	}
+	if lastReq.GetTrigger() != pb.FsyncRequest_SYNC_TRIGGER_CLOSE {
+		t.Errorf("Expected trigger %v, got %v", pb.FsyncRequest_SYNC_TRIGGER_CLOSE, lastReq.GetTrigger())
+	}
+	if lastReq.GetBlocking() {
+		t.Errorf("Expected blocking to be false")
+	}
+
+	// Write more dirty data into cache
+	data2 := []byte("hello periodic trigger")
+	if _, st := rawFS.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: fileID},
+		Fh:       createOut.OpenOut.Fh,
+		Offset:   uint64(len(data1)),
+	}, data2); st != fuse.OK {
+		t.Fatalf("Write 2 failed: %v", st)
+	}
+
+	// Trigger non-blocking sync with PERIODIC
+	if err := rawFS.syncVolumeNonBlocking(ctx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC); err != nil {
+		t.Fatalf("syncVolumeNonBlocking(PERIODIC) failed: %v", err)
+	}
+	lastReq = recClient.getLastRequest()
+	if lastReq == nil {
+		t.Fatalf("Expected FsyncRequest to be recorded")
+	}
+	if lastReq.GetTrigger() != pb.FsyncRequest_SYNC_TRIGGER_PERIODIC {
+		t.Errorf("Expected trigger %v, got %v", pb.FsyncRequest_SYNC_TRIGGER_PERIODIC, lastReq.GetTrigger())
+	}
+	if lastReq.GetBlocking() {
+		t.Errorf("Expected blocking to be false")
+	}
+}
