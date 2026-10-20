@@ -62,9 +62,29 @@ func (l Level) String() string {
 // (Witness or Permanent) is requested on a stream with no remote target configured.
 var ErrDurabilityUnavailable = errors.New("WAL has no remote target")
 
-// ErrTerminalStream indicates that the WAL stream encountered an unrecoverable local store failure
+// DegradedError indicates that the WAL stream encountered an unrecoverable local store failure
 // (such as segment truncation error) and cannot safely accept or wait for further writes.
-var ErrTerminalStream = errors.New("terminal WAL stream failure")
+type DegradedError struct {
+	Cause error
+	At    time.Time
+}
+
+func (e *DegradedError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Cause != nil {
+		return fmt.Sprintf("WAL stream degraded: %v", e.Cause)
+	}
+	return "WAL stream degraded"
+}
+
+func (e *DegradedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
 
 // Stream is the interface used by node daemons to append to the WAL.
 type Stream interface {
@@ -82,8 +102,8 @@ type Stream interface {
 	ReplicationLevel() Level
 	// Tail returns an iterator yielding (stream_seq, payload) pairs from the remote buffer service starting after fromSeq.
 	Tail(ctx context.Context, fromSeq uint64) (iter.Seq2[uint64, []byte], error)
-	// TerminalError returns any fatal, unrecoverable stream error encountered by the stream.
-	TerminalError() error
+	// Degraded returns any fatal, unrecoverable stream error encountered by the stream.
+	Degraded() *DegradedError
 	Close() error
 }
 
@@ -156,7 +176,7 @@ type streamImpl struct {
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
 	initialHelloAckErr  error
-	terminalErr         error
+	degradedErr         *DegradedError
 
 	// Retained in-memory records queue for network sending & replay
 	retainedMu      sync.RWMutex
@@ -282,8 +302,8 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 	}
 
 	s.mu.RLock()
-	if s.terminalErr != nil {
-		err := s.terminalErr
+	if s.degradedErr != nil {
+		err := s.degradedErr
 		s.mu.RUnlock()
 		return 0, err
 	}
@@ -304,11 +324,11 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 
 	// Degraded mode / backpressure check: block if retained bytes exceed maxRetainedBytes
 	s.mu.Lock()
-	for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.terminalErr == nil {
+	for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.degradedErr == nil {
 		doneCh := make(chan struct{})
 		go func() {
 			s.mu.Lock()
-			for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.terminalErr == nil {
+			for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.degradedErr == nil {
 				s.cond.Wait()
 			}
 			s.mu.Unlock()
@@ -326,8 +346,8 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		s.mu.Lock()
 	}
 
-	if s.terminalErr != nil {
-		err := s.terminalErr
+	if s.degradedErr != nil {
+		err := s.degradedErr
 		s.mu.Unlock()
 		return 0, err
 	}
@@ -375,11 +395,11 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 	s.mu.RLock()
 	witness := s.witnessSeq
 	s3 := s.s3Seq
-	termErr := s.terminalErr
+	degErr := s.degradedErr
 	s.mu.RUnlock()
 
-	if termErr != nil {
-		return termErr
+	if degErr != nil {
+		return degErr
 	}
 
 	if level == Witness && witness >= seq {
@@ -393,7 +413,7 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 		waitChan := make(chan struct{})
 		go func() {
 			s.mu.Lock()
-			for !s.closed.Load() && s.terminalErr == nil {
+			for !s.closed.Load() && s.degradedErr == nil {
 				if level == Witness && s.witnessSeq >= seq {
 					break
 				}
@@ -413,11 +433,11 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 			return errors.New("stream closed")
 		case <-waitChan:
 			s.mu.RLock()
-			termErr := s.terminalErr
+			degErr := s.degradedErr
 			w, s3w := s.witnessSeq, s.s3Seq
 			s.mu.RUnlock()
-			if termErr != nil {
-				return termErr
+			if degErr != nil {
+				return degErr
 			}
 			if level == Witness && w >= seq {
 				return nil
@@ -440,8 +460,8 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 	}
 
 	s.mu.RLock()
-	if s.terminalErr != nil {
-		err := s.terminalErr
+	if s.degradedErr != nil {
+		err := s.degradedErr
 		s.mu.RUnlock()
 		return err
 	}
@@ -491,8 +511,8 @@ func (s *streamImpl) Flush(ctx context.Context) error {
 	}
 
 	s.mu.RLock()
-	if s.terminalErr != nil {
-		err := s.terminalErr
+	if s.degradedErr != nil {
+		err := s.degradedErr
 		s.mu.RUnlock()
 		return err
 	}
@@ -545,11 +565,26 @@ func (s *streamImpl) RecoveredRecords() []*wal.ClientRecord {
 	return recs
 }
 
-// TerminalError returns any fatal, unrecoverable stream error encountered by the stream.
-func (s *streamImpl) TerminalError() error {
+// Degraded returns any fatal, unrecoverable stream error encountered by the stream.
+func (s *streamImpl) Degraded() *DegradedError {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.terminalErr
+	return s.degradedErr
+}
+
+func (s *streamImpl) setDegradedLocked(cause error) *DegradedError {
+	if s.degradedErr != nil {
+		return s.degradedErr
+	}
+	s.degradedErr = &DegradedError{
+		Cause: cause,
+		At:    time.Now(),
+	}
+	klog.Errorf("WAL client stream %s degraded: %v", s.streamID, s.degradedErr)
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
+	return s.degradedErr
 }
 
 // Close closes the stream, stopping background tasks and closing local store.
@@ -593,9 +628,9 @@ func (s *streamImpl) backgroundReplicationLoop() {
 		}
 
 		s.mu.RLock()
-		termErr := s.terminalErr
+		degErr := s.degradedErr
 		s.mu.RUnlock()
-		if termErr != nil {
+		if degErr != nil {
 			return
 		}
 
@@ -609,9 +644,9 @@ func (s *streamImpl) backgroundReplicationLoop() {
 			}
 
 			s.mu.RLock()
-			termErr := s.terminalErr
+			degErr := s.degradedErr
 			s.mu.RUnlock()
-			if termErr != nil {
+			if degErr != nil {
 				return
 			}
 
@@ -809,11 +844,7 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 				// leaves memory and disk consistent, allowing divergence to be re-detected on retry.
 				if s.store != nil {
 					if err := s.store.TruncateAfter(witnessHead); err != nil {
-						truncErr := fmt.Errorf("%w: failed to truncate local segment store to %d: %w", ErrTerminalStream, witnessHead, err)
-						s.terminalErr = truncErr
-						if s.cond != nil {
-							s.cond.Broadcast()
-						}
+						truncErr := s.setDegradedLocked(fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err))
 						s.initialHelloAckOnce.Do(func() {
 							s.initialHelloAckErr = truncErr
 							close(s.initialHelloAckDone)
