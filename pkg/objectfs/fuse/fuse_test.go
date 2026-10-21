@@ -6658,3 +6658,74 @@ func TestSyncOnClose_SyncsOnlyClosedInode(t *testing.T) {
 		t.Errorf("Expected fileB to be clean after periodic sync")
 	}
 }
+
+type fsyncConcurrencyTrackingClient struct {
+	pb.ObjectFSControllerClient
+	concurrentInFlight atomic.Int32
+	maxInFlight        atomic.Int32
+}
+
+func (c *fsyncConcurrencyTrackingClient) Fsync(ctx context.Context, in *pb.FsyncRequest, opts ...grpc.CallOption) (*pb.FsyncResponse, error) {
+	if in.GetTrigger() == pb.FsyncRequest_SYNC_TRIGGER_CLOSE {
+		curr := c.concurrentInFlight.Add(1)
+		defer c.concurrentInFlight.Add(-1)
+		for {
+			oldMax := c.maxInFlight.Load()
+			if curr <= oldMax || c.maxInFlight.CompareAndSwap(oldMax, curr) {
+				break
+			}
+		}
+		// Hold briefly to ensure concurrent requests overlap in time
+		time.Sleep(30 * time.Millisecond)
+	}
+	return c.ObjectFSControllerClient.Fsync(ctx, in, opts...)
+}
+
+func TestSyncClosedInodes_TenClosedInodesOverlapInTime(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	trackClient := &fsyncConcurrencyTrackingClient{ObjectFSControllerClient: client}
+	volumeID := "vol-concurrent-fsync-overlap-test"
+	cache := NewNodeCache(10 * 1024 * 1024)
+	rawFS := NewObjectFS(trackClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	ctx := t.Context()
+	const numFiles = 10
+	for i := 0; i < numFiles; i++ {
+		var createOut fuse.CreateOut
+		fname := fmt.Sprintf("file_%d.txt", i)
+		if st := rawFS.Create(nil, &fuse.CreateIn{
+			InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+			Mode:     0644,
+		}, fname, &createOut); st != fuse.OK {
+			t.Fatalf("Create %s failed: %v", fname, st)
+		}
+		ino := createOut.EntryOut.NodeId
+		fh := createOut.OpenOut.Fh
+
+		data := []byte(fmt.Sprintf("data for file %d", i))
+		if _, st := rawFS.Write(nil, &fuse.WriteIn{
+			InHeader: fuse.InHeader{NodeId: ino},
+			Fh:       fh,
+			Offset:   0,
+		}, data); st != fuse.OK {
+			t.Fatalf("Write %s failed: %v", fname, st)
+		}
+
+		rawFS.Release(nil, &fuse.ReleaseIn{
+			InHeader: fuse.InHeader{NodeId: ino},
+			Fh:       fh,
+		})
+	}
+
+	// Process closed inodes
+	if err := rawFS.syncClosedInodes(ctx); err != nil {
+		t.Fatalf("syncClosedInodes failed: %v", err)
+	}
+
+	maxConcurrent := trackClient.maxInFlight.Load()
+	if maxConcurrent != numFiles {
+		t.Fatalf("Expected all %d close-triggered Fsync requests to overlap in time, got max concurrency %d", numFiles, maxConcurrent)
+	}
+}
