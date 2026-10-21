@@ -4428,7 +4428,7 @@ func TestDirtyReadSurvivesControllerRestartWhileSyncInFlight(t *testing.T) {
 
 	// 11. Now trigger sync to Controller 2 (simulating retry / background sync)
 	// Because staging epoch changed on Controller 2, syncVolumeNonBlocking re-pushes dirty chunks
-	if err := rawFS.syncVolumeNonBlocking(ctx); err != nil {
+	if err := rawFS.syncVolumeNonBlocking(ctx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC); err != nil {
 		t.Fatalf("syncVolumeNonBlocking failed: %v", err)
 	}
 
