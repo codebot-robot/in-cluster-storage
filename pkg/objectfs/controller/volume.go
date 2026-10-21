@@ -579,8 +579,9 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 func (v *Volume) triggerCoalesceSync() {
 	v.stagingMu.Lock()
 	v.coalesceTimer = nil
-	for v.syncInProgress {
-		v.syncCond.Wait()
+	if v.syncInProgress {
+		v.stagingMu.Unlock()
+		return
 	}
 	if len(v.stagedChunks) == 0 {
 		v.stagingMu.Unlock()
@@ -603,19 +604,11 @@ func (v *Volume) triggerCoalesceSync() {
 	}
 }
 
-func (v *Volume) triggerCloseSync() {
-	v.stagingMu.Lock()
-	v.closeTimer = nil
-	for v.syncInProgress {
-		v.syncCond.Wait()
-	}
-	if len(v.closeInodes) == 0 {
-		v.stagingMu.Unlock()
-		return
-	}
-	targetInodes := v.closeInodes
-	v.closeInodes = make(map[uint64]struct{})
-
+// syncInodesLocked executes a per-inode sync for targetInodes under stagingMu.
+// If any of targetInodes have staged chunks, it commits them; otherwise it
+// completes any waiters for targetInodes immediately.
+// Invariant: called with stagingMu held, always returns with stagingMu unlocked.
+func (v *Volume) syncInodesLocked(ctx context.Context, targetInodes map[uint64]struct{}) (uint64, error) {
 	hasStaged := false
 	for ino := range targetInodes {
 		if len(v.stagedChunks[ino]) > 0 {
@@ -629,9 +622,26 @@ func (v *Volume) triggerCloseSync() {
 		v.stagingMu.Unlock()
 		if err := v.finishSync(snapSeq, nil, nil, pos, targetInodes); err != nil {
 			klog.Warningf("ObjectFS volume %s close finishSync failed: %v", v.volumeID, err)
+			return pos, err
 		}
+		return pos, nil
+	}
+
+	return v.executeSyncLocked(ctx, true, targetInodes)
+}
+
+func (v *Volume) triggerCloseSync() {
+	v.stagingMu.Lock()
+	v.closeTimer = nil
+	for v.syncInProgress {
+		v.syncCond.Wait()
+	}
+	if len(v.closeInodes) == 0 {
+		v.stagingMu.Unlock()
 		return
 	}
+	targetInodes := v.closeInodes
+	v.closeInodes = make(map[uint64]struct{})
 
 	timeout := v.syncTimeout
 	if timeout <= 0 {
@@ -639,7 +649,7 @@ func (v *Volume) triggerCloseSync() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	if _, err := v.executeSyncLocked(ctx, true, targetInodes); err != nil {
+	if _, err := v.syncInodesLocked(ctx, targetInodes); err != nil {
 		klog.Warningf("ObjectFS volume %s close sync failed: %v", v.volumeID, err)
 	}
 }

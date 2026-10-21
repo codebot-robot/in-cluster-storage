@@ -27,6 +27,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"golang.org/x/sync/errgroup"
 )
 
 type recordingBackend struct {
@@ -707,6 +708,69 @@ func TestStageAndSync_CloseTriggerPreemptsActiveWindow(t *testing.T) {
 	// Exactly 1 packfile created containing writes from both files
 	if cnt := backend.getPackCount(); cnt != 1 {
 		t.Fatalf("Expected exactly 1 packfile containing both writes, got %d", cnt)
+	}
+}
+
+// TestStageAndSync_TenConcurrentCloseRequestsCoalesceIntoOnePack verifies that ten
+// CLOSE-triggered non-blocking Fsync requests in flight concurrently coalesce into a single packfile.
+func TestStageAndSync_TenConcurrentCloseRequestsCoalesceIntoOnePack(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	backend := newRecordingBackend(rawBackend)
+	server := NewServer(backend, WithServerSyncCoalesceWindow(10*time.Second))
+	volumeID := "test-ten-concurrent-close-vol"
+	defer func() { _ = server.Close() }()
+
+	const numFiles = 10
+	inodes := make([]uint64, numFiles)
+	for i := 0; i < numFiles; i++ {
+		fname := fmt.Sprintf("/c%d.bin", i)
+		cResp, err := testCreateFile(ctx, server, volumeID, fname, 0644, nil, 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, err)
+		}
+		ino := cResp.GetAttr().GetInode().GetIno()
+		inodes[i] = ino
+		_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId: volumeID,
+			Inode:    ino,
+			Offset:   0,
+			Data:     bytes.Repeat([]byte{byte(i + 1)}, 64*1024),
+		})
+		if err != nil {
+			t.Fatalf("WriteFile %d failed: %v", i, err)
+		}
+	}
+
+	startBarrier := make(chan struct{})
+	g, gctx := errgroup.WithContext(ctx)
+	for _, ino := range inodes {
+		ino := ino
+		g.Go(func() error {
+			<-startBarrier
+			resp, err := server.Fsync(gctx, &pb.FsyncRequest{
+				VolumeId: volumeID,
+				Inode:    ino,
+				Blocking: false,
+				Trigger:  pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+			})
+			if err != nil {
+				return err
+			}
+			if !resp.GetSuccess() {
+				return fmt.Errorf("Fsync for inode %d returned success=false", ino)
+			}
+			return nil
+		})
+	}
+
+	close(startBarrier)
+	if err := g.Wait(); err != nil {
+		t.Fatalf("Concurrent close-triggered Fsyncs failed: %v", err)
+	}
+
+	if cnt := backend.getPackCount(); cnt != 1 {
+		t.Fatalf("Expected exactly 1 packfile for ten concurrent close requests, got %d", cnt)
 	}
 }
 
