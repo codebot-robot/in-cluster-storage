@@ -18,10 +18,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -734,10 +736,18 @@ func TestPublishExclusiveLocal_RecoversLeftoverUpper(t *testing.T) {
 	}
 }
 
+type failingReplayServer struct {
+	*controller.Server
+}
+
+func (s *failingReplayServer) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb.CreateFileResponse, error) {
+	return nil, fmt.Errorf("injected replay failure")
+}
+
 // TestPublishExclusiveLocal_FailsIfLeftoverUpperReplayFails verifies that if replay of
 // leftover upper fails on publish, publish fails naming the directory and leaves upper intact.
 func TestPublishExclusiveLocal_FailsIfLeftoverUpperReplayFails(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	cacheDir := t.TempDir()
 	volumeID := "recover-fail-vol"
@@ -752,10 +762,30 @@ func TestPublishExclusiveLocal_FailsIfLeftoverUpperReplayFails(t *testing.T) {
 		t.Fatalf("write leftover file: %v", err)
 	}
 
-	// Controller address is unreachable
-	driver, err := newDriver("test-node", "localhost:59999", cacheDir, 1024*1024, 10*1024*1024, 2*time.Second, 2*time.Second, true, 2*time.Second)
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	fakeServer := &failingReplayServer{Server: controller.NewServer(nil)}
+	pb.RegisterObjectFSControllerServer(grpcServer, fakeServer)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
 	if err != nil {
-		t.Fatalf("newDriver failed: %v", err)
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	client := pb.NewObjectFSControllerClient(conn)
+
+	driver := &objectFSDriver{
+		nodeID:   "test-node",
+		cacheDir: cacheDir,
+		client:   client,
+		mounts:   make(map[string]*activeMount),
 	}
 	defer func() { _ = driver.Close() }()
 
@@ -776,7 +806,7 @@ func TestPublishExclusiveLocal_FailsIfLeftoverUpperReplayFails(t *testing.T) {
 
 	_, err = driver.NodePublishVolume(ctx, req)
 	if err == nil {
-		t.Fatalf("Expected publish to fail due to unreachable controller during recovery")
+		t.Fatalf("Expected publish to fail due to replay failure during recovery")
 	}
 	if !strings.Contains(err.Error(), upperDir) {
 		t.Errorf("Expected error to mention upper directory %s, got: %v", upperDir, err)
@@ -971,5 +1001,299 @@ func TestMaterialiseVolume_Resumable(t *testing.T) {
 	// Verify mtime remained exactly the same
 	if !afterStat.ModTime().Equal(initialStat.ModTime()) {
 		t.Errorf("File was re-written rather than resumed: before=%v, after=%v", initialStat.ModTime(), afterStat.ModTime())
+	}
+}
+
+func TestPublishExclusiveLocal_HoldConflictReturnsAborted(t *testing.T) {
+	ctx := t.Context()
+	server := controller.NewServer(nil)
+	volumeID := "test-conflict-publish-vol"
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	client := pb.NewObjectFSControllerClient(conn)
+
+	// Simulate node-1 holding the exclusive lease on the controller
+	_, err = server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/var/lib/kubelet/target-1",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive for node-1 failed: %v", err)
+	}
+
+	// Driver on node-2 tries to publish the volume
+	cacheDir := t.TempDir()
+	driver := &objectFSDriver{
+		nodeID:   "node-2",
+		cacheDir: cacheDir,
+		client:   client,
+		mounts:   make(map[string]*activeMount),
+	}
+	defer func() { _ = driver.Close() }()
+
+	targetPath := filepath.Join(t.TempDir(), "target")
+	req := &csi.NodePublishVolumeRequest{
+		VolumeId:   volumeID,
+		TargetPath: targetPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+			},
+		},
+		VolumeContext: map[string]string{
+			"volumeID": volumeID,
+			"mode":     "exclusive-local",
+		},
+	}
+
+	_, err = driver.NodePublishVolume(ctx, req)
+	if err == nil {
+		t.Fatalf("Expected NodePublishVolume to fail when volume is held by node-1")
+	}
+
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.Aborted {
+		t.Fatalf("Expected codes.Aborted for kubelet retry backoff, got: %v (st=%v)", err, st)
+	}
+	if !strings.Contains(st.Message(), "node-1") {
+		t.Errorf("Expected error to mention holder node-1, got: %s", st.Message())
+	}
+}
+
+func TestUnpublishExclusiveLocal_ReleasesHoldAfterFinalCheckpoint(t *testing.T) {
+	ctx := t.Context()
+	server := controller.NewServer(nil)
+	volumeID := "test-unpublish-release-vol"
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	client := pb.NewObjectFSControllerClient(conn)
+
+	targetPath := filepath.Join(t.TempDir(), "target")
+	mountID := targetPath
+	cacheDir := t.TempDir()
+	volumeDir := filepath.Join(cacheDir, volumeID)
+	lowerDir := filepath.Join(volumeDir, "lower")
+	upperDir := filepath.Join(volumeDir, "upper")
+	_ = os.MkdirAll(lowerDir, 0755)
+	_ = os.MkdirAll(upperDir, 0755)
+
+	// Acquire hold initially on controller
+	_, err = server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  mountID,
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive failed: %v", err)
+	}
+
+	// Verify hold is active
+	holdResp, err := server.GetExclusiveHold(ctx, &pb.GetExclusiveHoldRequest{VolumeId: volumeID})
+	if err != nil || holdResp.GetHold() == nil || holdResp.GetHold().GetNodeId() != "node-1" {
+		t.Fatalf("Expected active hold on node-1, got: %v", holdResp.GetHold())
+	}
+
+	driver := &objectFSDriver{
+		nodeID:   "node-1",
+		cacheDir: cacheDir,
+		client:   client,
+		mounts:   make(map[string]*activeMount),
+	}
+	defer func() { _ = driver.Close() }()
+
+	mountInfo := &activeMount{
+		volumeID:  volumeID,
+		mode:      "exclusive-local",
+		volumeDir: volumeDir,
+		mountID:   mountID,
+	}
+
+	// Unpublish volume
+	unpubReq := &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   volumeID,
+		TargetPath: targetPath,
+	}
+	_, err = driver.unpublishExclusiveLocal(ctx, unpubReq, volumeID, volumeDir, mountInfo)
+	if err != nil {
+		t.Fatalf("unpublishExclusiveLocal failed: %v", err)
+	}
+
+	// Verify hold was released after unpublish
+	holdRespAfter, err := server.GetExclusiveHold(ctx, &pb.GetExclusiveHoldRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("GetExclusiveHold failed: %v", err)
+	}
+	if holdRespAfter.GetHold() != nil {
+		t.Errorf("Expected hold to be released after unpublish, but hold remains: %v", holdRespAfter.GetHold())
+	}
+}
+
+func TestUnpublishExclusiveLocal_ReplayFailurePreservesHoldUntilRetrySucceeds(t *testing.T) {
+	ctx := t.Context()
+	server := controller.NewServer(nil)
+	volumeID := "test-unpublish-retry-hold-vol"
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	fakeServer := &failingReplayServer{Server: server}
+	pb.RegisterObjectFSControllerServer(grpcServer, fakeServer)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	client := pb.NewObjectFSControllerClient(conn)
+
+	targetPath := filepath.Join(t.TempDir(), "target")
+	mountID := targetPath
+	cacheDir := t.TempDir()
+	volumeDir := filepath.Join(cacheDir, volumeID)
+	lowerDir := filepath.Join(volumeDir, "lower")
+	upperDir := filepath.Join(volumeDir, "upper")
+	_ = os.MkdirAll(lowerDir, 0755)
+	_ = os.MkdirAll(upperDir, 0755)
+
+	// Write uncommitted file in upper
+	if err := os.WriteFile(filepath.Join(upperDir, "uncommitted.txt"), []byte("important writes"), 0644); err != nil {
+		t.Fatalf("write upper: %v", err)
+	}
+
+	// 1. Acquire hold initially on controller
+	_, err = server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  mountID,
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive failed: %v", err)
+	}
+
+	driver := &objectFSDriver{
+		nodeID:   "node-1",
+		cacheDir: cacheDir,
+		client:   client,
+		mounts:   make(map[string]*activeMount),
+	}
+	defer func() { _ = driver.Close() }()
+
+	var syncWg sync.WaitGroup
+	syncCtx, syncCancel := context.WithCancel(t.Context())
+	defer syncCancel()
+	var renewWg sync.WaitGroup
+	renewCtx, renewCancel := context.WithCancel(t.Context())
+	defer renewCancel()
+
+	// Start background renew ticker
+	driver.startExclusiveLocalSync(syncCtx, &syncWg, renewCtx, &renewWg, client, volumeID, volumeDir, lowerDir, upperDir, mountID, 0)
+
+	mountInfo := &activeMount{
+		volumeID:    volumeID,
+		mode:        "exclusive-local",
+		volumeDir:   volumeDir,
+		mountID:     mountID,
+		cancelFunc:  syncCancel,
+		syncWg:      &syncWg,
+		renewCancel: renewCancel,
+		renewWg:     &renewWg,
+	}
+
+	// 2. First unpublish attempt: fails because failingReplayServer rejects CreateFile in replay
+	unpubReq := &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   volumeID,
+		TargetPath: targetPath,
+	}
+	_, err = driver.unpublishExclusiveLocal(ctx, unpubReq, volumeID, volumeDir, mountInfo)
+	if err == nil {
+		t.Fatalf("Expected unpublish to fail during replay")
+	}
+
+	// 3. Verify hold is STILL ALIVE on controller (must NOT be released when uncommitted writes remain!)
+	holdResp, err := server.GetExclusiveHold(ctx, &pb.GetExclusiveHoldRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("GetExclusiveHold failed: %v", err)
+	}
+	if holdResp.GetHold() == nil || holdResp.GetHold().GetNodeId() != "node-1" {
+		t.Fatalf("Expected hold to remain active on node-1 after replay failure, got: %v", holdResp.GetHold())
+	}
+
+	// Verify renew loop is still alive and running (renewCancel was not called)
+	if renewCtx.Err() != nil {
+		t.Fatalf("renewCtx was canceled prematurely on failed unpublish: %v", renewCtx.Err())
+	}
+
+	// 4. Second unpublish attempt (retry) with healthy server
+	healthyLis := bufconn.Listen(1024 * 1024)
+	healthyGrpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(healthyGrpcServer, server)
+	go func() { _ = healthyGrpcServer.Serve(healthyLis) }()
+	defer healthyGrpcServer.Stop()
+
+	healthyConn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return healthyLis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial healthy server: %v", err)
+	}
+	defer func() { _ = healthyConn.Close() }()
+	driver.client = pb.NewObjectFSControllerClient(healthyConn)
+
+	// Retry unpublish
+	_, err = driver.unpublishExclusiveLocal(ctx, unpubReq, volumeID, volumeDir, mountInfo)
+	if err != nil {
+		t.Fatalf("Retry unpublish failed: %v", err)
+	}
+
+	// 5. Verify hold is now released and renew loop was stopped
+	holdRespAfter, err := server.GetExclusiveHold(ctx, &pb.GetExclusiveHoldRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("GetExclusiveHold failed: %v", err)
+	}
+	if holdRespAfter.GetHold() != nil {
+		t.Errorf("Expected hold to be released after successful unpublish retry, got: %v", holdRespAfter.GetHold())
+	}
+	if renewCtx.Err() == nil {
+		t.Errorf("Expected renewCtx to be canceled after successful unpublish")
 	}
 }

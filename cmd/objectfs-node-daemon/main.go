@@ -114,12 +114,15 @@ func parseEndpoint(endpoint string) (string, string, error) {
 }
 
 type activeMount struct {
-	server     *gofuse.Server
-	cancelFunc context.CancelFunc
-	syncWg     *sync.WaitGroup
-	volumeID   string
-	mode       string
-	volumeDir  string
+	server      *gofuse.Server
+	cancelFunc  context.CancelFunc
+	syncWg      *sync.WaitGroup
+	renewCancel context.CancelFunc
+	renewWg     *sync.WaitGroup
+	volumeID    string
+	mode        string
+	volumeDir   string
+	mountID     string
 }
 
 type objectFSDriver struct {
