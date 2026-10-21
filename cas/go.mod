@@ -1,6 +1,6 @@
 module github.com/gke-labs/in-cluster-storage/cas
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/container-storage-interface/spec v1.13.0
