@@ -6465,3 +6465,350 @@ func TestExclusiveHold_ControllerRestart_RenewReestablishes(t *testing.T) {
 		t.Fatalf("Expected node-2 acquire to be rejected after renew re-established hold")
 	}
 }
+
+func TestControllerRepairVolume(t *testing.T) {
+	ctx := t.Context()
+	_, walTarget, stopWal := startTestWalBufferServer(t, t.TempDir())
+	defer stopWal()
+
+	storage := NewMemoryBackend()
+	dir := t.TempDir()
+
+	vol1ID := "repair-vol-1"
+	vol2ID := "healthy-vol-2"
+
+	walDir1 := filepath.Join(dir, "wal1")
+	streamID1 := StreamIDForVolume(vol1ID)
+	realStream1, err := walclient.Open(ctx, walDir1, streamID1, walTarget)
+	if err != nil {
+		t.Fatalf("Open realStream1 failed: %v", err)
+	}
+
+	walDir2 := filepath.Join(dir, "wal2")
+	streamID2 := StreamIDForVolume(vol2ID)
+	stream2, err := walclient.Open(ctx, walDir2, streamID2, walTarget)
+	if err != nil {
+		t.Fatalf("Open stream2 failed: %v", err)
+	}
+	defer stream2.Close()
+
+	faultStream1 := &faultInjectingStream{
+		Stream:   realStream1,
+		streamID: streamID1,
+	}
+
+	var mu sync.Mutex
+	reopened := false
+
+	server := NewServer(storage,
+		WithServerStreamFactory(func(volID string) (walclient.Stream, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if volID == vol1ID {
+				if reopened {
+					newStream, err := walclient.Open(ctx, walDir1, streamID1, walTarget)
+					if err != nil {
+						return nil, err
+					}
+					return newStream, nil
+				}
+				return faultStream1, nil
+			}
+			if volID == vol2ID {
+				return stream2, nil
+			}
+			return nil, fmt.Errorf("unexpected volume %s", volID)
+		}),
+	)
+	defer server.Close()
+
+	// 1. Initialize data on both volumes
+	init1, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       vol1ID,
+		ParentInode:    1,
+		Name:           "file1.txt",
+		InitialContent: []byte("content1"),
+	})
+	if err != nil || init1.GetError() != 0 {
+		t.Fatalf("CreateFile vol1 failed: %v, resp: %v", err, init1)
+	}
+
+	init2, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       vol2ID,
+		ParentInode:    1,
+		Name:           "file2.txt",
+		InitialContent: []byte("content2"),
+	})
+	if err != nil || init2.GetError() != 0 {
+		t.Fatalf("CreateFile vol2 failed: %v, resp: %v", err, init2)
+	}
+
+	wal2EntriesBefore, err := os.ReadDir(walDir2)
+	if err != nil {
+		t.Fatalf("ReadDir walDir2 failed: %v", err)
+	}
+	if len(wal2EntriesBefore) == 0 {
+		t.Fatalf("expected segment files in walDir2 before repair")
+	}
+
+	// 2. Degrade vol1
+	faultStream1.degrade(fmt.Errorf("injected disk failure on vol1"))
+
+	vol1Stats, err := server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: vol1ID})
+	if err != nil {
+		t.Fatalf("GetVolumeStats vol1 failed: %v", err)
+	}
+	if vol1Stats.GetDegraded() == nil {
+		t.Fatalf("expected vol1 to be degraded")
+	}
+
+	vol2Stats, err := server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: vol2ID})
+	if err != nil {
+		t.Fatalf("GetVolumeStats vol2 failed: %v", err)
+	}
+	if vol2Stats.GetDegraded() != nil {
+		t.Fatalf("expected vol2 to be healthy")
+	}
+
+	// 3. RepairVolume on healthy vol2 without --force must be refused
+	_, err = server.RepairVolume(ctx, &pb.RepairVolumeRequest{VolumeId: vol2ID, Force: false})
+	if err == nil {
+		t.Fatalf("expected RepairVolume on healthy volume without --force to fail")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got: %v", err)
+	}
+
+	// 4. RepairVolume on degraded vol1
+	mu.Lock()
+	reopened = true
+	mu.Unlock()
+
+	repairResp, err := server.RepairVolume(ctx, &pb.RepairVolumeRequest{VolumeId: vol1ID, Force: false})
+	if err != nil {
+		t.Fatalf("RepairVolume vol1 failed: %v", err)
+	}
+
+	oldPath := repairResp.GetOldPath()
+	if !strings.HasSuffix(oldPath, ".degraded") {
+		t.Fatalf("expected oldPath to have suffix '.degraded', got: %s", oldPath)
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("expected moved segment directory %s to exist: %v", oldPath, err)
+	}
+
+	// 5. Verify other volume (vol2) was NEVER touched
+	wal2EntriesAfter, err := os.ReadDir(walDir2)
+	if err != nil {
+		t.Fatalf("ReadDir walDir2 after failed: %v", err)
+	}
+	if len(wal2EntriesAfter) != len(wal2EntriesBefore) {
+		t.Fatalf("expected walDir2 untouched (entries: %d vs %d)", len(wal2EntriesAfter), len(wal2EntriesBefore))
+	}
+	wal2DegradedMatches, _ := filepath.Glob(filepath.Join(dir, "wal2.*.degraded"))
+	if len(wal2DegradedMatches) > 0 {
+		t.Fatalf("walDir2 was moved aside during vol1 repair: %v", wal2DegradedMatches)
+	}
+
+	// 6. Verify vol1 accepts an fsynced write afterwards
+	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       vol1ID,
+		ParentInode:    1,
+		Name:           "after_repair.txt",
+		InitialContent: []byte("after repair content"),
+	})
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile on vol1 after repair failed: %v, resp: %v", err, createResp)
+	}
+	fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: vol1ID,
+		Inode:    createResp.GetAttr().GetInode().GetIno(),
+		Blocking: true,
+	})
+	if err != nil || fsyncResp.GetError() != 0 {
+		t.Fatalf("Fsync on vol1 after repair failed: %v, resp: %v", err, fsyncResp)
+	}
+
+	// And vol1 is healthy
+	vol1StatsAfter, err := server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: vol1ID})
+	if err != nil {
+		t.Fatalf("GetVolumeStats vol1 after repair failed: %v", err)
+	}
+	if vol1StatsAfter.GetDegraded() != nil {
+		t.Fatalf("expected vol1 to be healthy after repair, got: %v", vol1StatsAfter.GetDegraded())
+	}
+}
+
+type faultInjectingTruncateStore struct {
+	walclient.SegmentStore
+	fail bool
+}
+
+func (f *faultInjectingTruncateStore) TruncateAfter(seq uint64) error {
+	if f.fail {
+		return fmt.Errorf("injected TruncateAfter failure on store")
+	}
+	return f.SegmentStore.TruncateAfter(seq)
+}
+
+func TestControllerRestartDivergenceRecovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	_, walTarget, stopWal := startTestWalBufferServer(t, t.TempDir())
+	defer stopWal()
+
+	storage := NewMemoryBackend()
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	volumeID := "restart-vol"
+	streamID := StreamIDForVolume(volumeID)
+
+	// 1. Another server node writes authoritative records to wal-buffer for streamID
+	storageB := NewMemoryBackend()
+	nodeBDir := t.TempDir()
+	serverB := NewServer(storageB, WithServerWAL(nodeBDir, walTarget, walclient.Permanent))
+	initB, err := serverB.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		ParentInode:    1,
+		Name:           "fileB.txt",
+		InitialContent: []byte("authoritative content from node B"),
+	})
+	if err != nil || initB.GetError() != 0 {
+		t.Fatalf("CreateFile on serverB failed: %v, resp: %v", err, initB)
+	}
+	fsyncB, err := serverB.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    initB.GetAttr().GetInode().GetIno(),
+		Blocking: true,
+	})
+	if err != nil || fsyncB.GetError() != 0 {
+		t.Fatalf("Fsync on serverB failed: %v, resp: %v", err, fsyncB)
+	}
+	if err := serverB.Close(); err != nil {
+		t.Fatalf("Close serverB failed: %v", err)
+	}
+
+	// 2. Server 1 writes local records in local mode (not replicated to buffer), producing divergent records ahead of buffer
+	server1 := NewServer(storage, WithServerWAL(walDir, "", walclient.Local))
+	for i := 1; i <= 3; i++ {
+		initResp, err := server1.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:       volumeID,
+			ParentInode:    1,
+			Name:           fmt.Sprintf("divergent_local_%d.txt", i),
+			InitialContent: []byte(fmt.Sprintf("divergent local content %d", i)),
+		})
+		if err != nil || initResp.GetError() != 0 {
+			t.Fatalf("CreateFile on server1 %d failed: %v, resp: %v", i, err, initResp)
+		}
+	}
+	if err := server1.Close(); err != nil {
+		t.Fatalf("Close server1 failed: %v", err)
+	}
+
+	// 3. Controller restart with fault STILL PRESENT:
+	// Inject fault so TruncateAfter fails
+	realStore, recovered, err := wal.NewClientSegmentStore(walDir, fmt.Sprintf("stream-%s", streamID.String()), 100)
+	if err != nil {
+		t.Fatalf("NewClientSegmentStore failed: %v", err)
+	}
+	faultStore := &faultInjectingTruncateStore{
+		SegmentStore: realStore,
+		fail:         true,
+	}
+	faultStream := func(volID string) (walclient.Stream, error) {
+		return walclient.Open(ctx, walDir, streamID, walTarget,
+			walclient.WithStore(faultStore, recovered),
+			walclient.WithDegradedRetryBackoff(10*time.Millisecond, 50*time.Millisecond),
+		)
+	}
+
+	// Server 2 starts up cleanly - not crashlooping!
+	server2 := NewServer(storage, WithServerStreamFactory(faultStream), WithServerDurability(walclient.Permanent))
+
+	// Volume comes back degraded, but server is alive and volume is readable
+	statsResp2, err := server2.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("GetVolumeStats on server2 failed: %v", err)
+	}
+	if statsResp2.GetDegraded() == nil {
+		t.Fatalf("expected volume to come back degraded on server2 with fault present")
+	}
+
+	// Lookup succeeds (volume remains readable)
+	lookupResp, err := server2.Lookup(ctx, &pb.LookupRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "divergent_local_1.txt",
+	})
+	if err != nil || lookupResp.GetError() != 0 {
+		t.Fatalf("Lookup on degraded volume failed: %v, resp: %v", err, lookupResp)
+	}
+
+	// Mutating RPC (CreateFile) fails with EIO on degraded volume
+	createResp2, err := server2.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		ParentInode:    1,
+		Name:           "fail_create.txt",
+		InitialContent: []byte("fail"),
+	})
+	if err != nil || createResp2.GetError() != int32(syscall.EIO) {
+		t.Fatalf("expected CreateFile to return EIO on degraded volume, got err=%v, resp=%v", err, createResp2)
+	}
+
+	// WriteFile stages into memory, but Fsync fails with EIO
+	ino := lookupResp.GetAttr().GetInode().GetIno()
+	writeResp2, err := server2.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   0,
+		Data:     []byte("staged data"),
+	})
+	if err != nil || writeResp2.GetError() != 0 {
+		t.Fatalf("expected WriteFile staging to succeed, got err=%v, resp=%v", err, writeResp2)
+	}
+	fsyncResp2, err := server2.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Blocking: true,
+	})
+	if err != nil || fsyncResp2.GetError() != int32(syscall.EIO) {
+		t.Fatalf("expected Fsync to fail with EIO on degraded volume, got err=%v, resp=%v", err, fsyncResp2)
+	}
+
+	if err := server2.Close(); err != nil {
+		t.Fatalf("Close server2 failed: %v", err)
+	}
+
+	// 4. Controller restart with fault CLEARED:
+	// Real store truncate succeeds, controller recovers the volume by itself
+	server3 := NewServer(storage, WithServerWAL(walDir, walTarget, walclient.Permanent))
+	defer server3.Close()
+
+	statsResp3, err := server3.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("GetVolumeStats on server3 failed: %v", err)
+	}
+	if statsResp3.GetDegraded() != nil {
+		t.Fatalf("expected volume to be healthy on server3 with fault cleared, got degraded: %v", statsResp3.GetDegraded())
+	}
+
+	// Volume accepts an fsynced write
+	createResp3, err := server3.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		ParentInode:    1,
+		Name:           "recovered_write.txt",
+		InitialContent: []byte("recovered data"),
+	})
+	if err != nil || createResp3.GetError() != 0 {
+		t.Fatalf("CreateFile on server3 failed: %v, resp: %v", err, createResp3)
+	}
+	fsyncResp3, err := server3.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    createResp3.GetAttr().GetInode().GetIno(),
+		Blocking: true,
+	})
+	if err != nil || fsyncResp3.GetError() != 0 {
+		t.Fatalf("Fsync on server3 failed: %v, resp: %v", err, fsyncResp3)
+	}
+}
