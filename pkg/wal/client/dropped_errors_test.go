@@ -17,6 +17,7 @@ limitations under the License.
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
+	"k8s.io/klog/v2"
 )
 
 func TestOpen_HelloTimeoutCleansUp(t *testing.T) {
@@ -155,7 +157,7 @@ func TestOpen_DivergenceTruncateFailureFailsOpen(t *testing.T) {
 	}
 }
 
-func TestHandleHelloAck_TruncateFailureTerminalErr(t *testing.T) {
+func TestHandleHelloAck_TruncateFailureDegradedErr(t *testing.T) {
 	ctx := t.Context()
 	streamID := uuid.New()
 	dir := t.TempDir()
@@ -220,12 +222,25 @@ func TestHandleHelloAck_TruncateFailureTerminalErr(t *testing.T) {
 	}
 	impl.grpcClient = mockClient
 
+	var logBuf bytes.Buffer
+	klog.LogToStderr(false)
+	klog.SetOutput(&logBuf)
+	defer func() {
+		klog.LogToStderr(true)
+		klog.SetOutput(os.Stderr)
+	}()
+	beforeErrors := klog.Stats.Error.Lines()
+
 	err = impl.handleHelloAck(helloAck)
 	if err == nil {
 		t.Fatalf("expected handleHelloAck to fail when TruncateAfter fails, got nil")
 	}
-	if !errors.Is(err, ErrTerminalStream) {
-		t.Errorf("expected error to wrap ErrTerminalStream, got: %v", err)
+	var degErr *DegradedError
+	if !errors.As(err, &degErr) {
+		t.Fatalf("expected error to be or wrap *DegradedError, got: %v", err)
+	}
+	if degErr.At.IsZero() {
+		t.Errorf("expected DegradedError.At to be populated, got zero time")
 	}
 	if !strings.Contains(err.Error(), "failed to truncate local segment store") {
 		t.Errorf("expected 'failed to truncate local segment store' in error, got: %v", err)
@@ -239,18 +254,27 @@ func TestHandleHelloAck_TruncateFailureTerminalErr(t *testing.T) {
 		t.Errorf("expected retainedRecords to remain unchanged on truncate failure, got: %d", len(impl.retainedRecords))
 	}
 
-	// Verify that the stream enters terminal failed state so TerminalError, Append, and Wait return the terminal error immediately
-	if impl.TerminalError() == nil || !errors.Is(impl.TerminalError(), ErrTerminalStream) {
-		t.Errorf("expected TerminalError to return ErrTerminalStream, got: %v", impl.TerminalError())
+	// Verify that the stream enters degraded state so Degraded, Append, Wait, and Flush return the DegradedError immediately
+	if impl.Degraded() == nil || !errors.As(impl.Degraded(), &degErr) {
+		t.Errorf("expected Degraded to return *DegradedError, got: %v", impl.Degraded())
 	}
-	if _, appendErr := impl.Append(ctx, []byte("should-fail")); appendErr == nil || !errors.Is(appendErr, ErrTerminalStream) {
-		t.Errorf("expected Append to fail with ErrTerminalStream, got: %v", appendErr)
+	if _, appendErr := impl.Append(ctx, []byte("should-fail")); appendErr == nil || !errors.As(appendErr, &degErr) {
+		t.Errorf("expected Append to fail with DegradedError, got: %v", appendErr)
 	}
-	if waitErr := impl.Wait(ctx, 1, Witness, false); waitErr == nil || !errors.Is(waitErr, ErrTerminalStream) {
-		t.Errorf("expected Wait to fail with ErrTerminalStream, got: %v", waitErr)
+	if waitErr := impl.Wait(ctx, 1, Witness, false); waitErr == nil || !errors.As(waitErr, &degErr) {
+		t.Errorf("expected Wait to fail with DegradedError, got: %v", waitErr)
 	}
-	if flushErr := impl.Flush(ctx); flushErr == nil || !errors.Is(flushErr, ErrTerminalStream) {
-		t.Errorf("expected Flush to fail with ErrTerminalStream, got: %v", flushErr)
+	if flushErr := impl.Flush(ctx); flushErr == nil || !errors.As(flushErr, &degErr) {
+		t.Errorf("expected Flush to fail with DegradedError, got: %v", flushErr)
+	}
+
+	klog.Flush()
+	if diff := klog.Stats.Error.Lines() - beforeErrors; diff != 1 {
+		t.Fatalf("expected exactly 1 error log after stream degradation, got %d", diff)
+	}
+	expectedLog := fmt.Sprintf("WAL client stream %s degraded", streamID)
+	if !strings.Contains(logBuf.String(), expectedLog) {
+		t.Fatalf("expected log output to contain %q, got: %s", expectedLog, logBuf.String())
 	}
 }
 

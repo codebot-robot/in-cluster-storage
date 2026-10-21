@@ -50,7 +50,8 @@ func volErrToSyscall(err error) int32 {
 	if err == nil {
 		return 0
 	}
-	if errors.Is(err, walclient.ErrTerminalStream) {
+	var degradedErr *walclient.DegradedError
+	if errors.As(err, &degradedErr) {
 		return int32(syscall.EIO)
 	}
 	var errno syscall.Errno
@@ -1071,13 +1072,19 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 	var volInfos []*pb.VolumeInfo
 	s.mu.RLock()
 	for _, id := range filtered {
-		var degradedReason string
+		var degraded *pb.Degraded
 		if vol, ok := s.volumes[id]; ok {
-			degradedReason = vol.DegradedReason()
+			if deg := vol.Degraded(); deg != nil {
+				degraded = &pb.Degraded{
+					Code:    pb.Degraded_WAL_STREAM_DEGRADED,
+					Message: deg.Error(),
+					Since:   timestamppb.New(deg.At),
+				}
+			}
 		}
 		volInfos = append(volInfos, &pb.VolumeInfo{
-			VolumeId:       id,
-			DegradedReason: degradedReason,
+			VolumeId: id,
+			Degraded: degraded,
 		})
 	}
 	s.mu.RUnlock()
@@ -1212,6 +1219,15 @@ func (s *Server) GetVolumeStats(ctx context.Context, req *pb.GetVolumeStatsReque
 		freeInodes = 0
 	}
 
+	var degraded *pb.Degraded
+	if deg := vol.Degraded(); deg != nil {
+		degraded = &pb.Degraded{
+			Code:    pb.Degraded_WAL_STREAM_DEGRADED,
+			Message: deg.Error(),
+			Since:   timestamppb.New(deg.At),
+		}
+	}
+
 	return &pb.GetVolumeStatsResponse{
 		Stats:          st.Stats,
 		TotalBytes:     totalBytes,
@@ -1221,7 +1237,7 @@ func (s *Server) GetVolumeStats(ctx context.Context, req *pb.GetVolumeStatsReque
 		UsedInodes:     usedInodes,
 		FreeInodes:     freeInodes,
 		Error:          0,
-		DegradedReason: vol.DegradedReason(),
+		Degraded:       degraded,
 	}, nil
 }
 

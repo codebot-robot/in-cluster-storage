@@ -49,6 +49,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -2590,7 +2591,7 @@ func (s *fakeBlockingStream) Tail(ctx context.Context, fromSeq uint64) (iter.Seq
 	return func(yield func(uint64, []byte) bool) {}, nil
 }
 
-func (s *fakeBlockingStream) TerminalError() error {
+func (s *fakeBlockingStream) Degraded() *walclient.DegradedError {
 	return nil
 }
 
@@ -5712,29 +5713,49 @@ func TestControllerCheckpointRPC(t *testing.T) {
 
 type faultInjectingStream struct {
 	walclient.Stream
-	appendHook      func() error
-	terminalErrHook func() error
+	streamID uuid.UUID
+	degraded atomic.Pointer[walclient.DegradedError]
+}
+
+func (f *faultInjectingStream) degrade(cause error) {
+	deg := &walclient.DegradedError{
+		Cause: cause,
+		At:    time.Now(),
+	}
+	if f.degraded.CompareAndSwap(nil, deg) {
+		klog.Errorf("WAL client stream %s degraded: %v", f.streamID, deg)
+	}
 }
 
 func (f *faultInjectingStream) Append(ctx context.Context, payload []byte) (uint64, error) {
-	if f.appendHook != nil {
-		if err := f.appendHook(); err != nil {
-			return 0, err
-		}
+	if deg := f.degraded.Load(); deg != nil {
+		return 0, deg
 	}
 	return f.Stream.Append(ctx, payload)
 }
 
-func (f *faultInjectingStream) TerminalError() error {
-	if f.terminalErrHook != nil {
-		if err := f.terminalErrHook(); err != nil {
-			return err
-		}
+func (f *faultInjectingStream) Wait(ctx context.Context, seq uint64, level walclient.Level, requestFlush bool) error {
+	if deg := f.degraded.Load(); deg != nil {
+		return deg
 	}
-	return f.Stream.TerminalError()
+	return f.Stream.Wait(ctx, seq, level, requestFlush)
 }
 
-func TestControllerTerminalWALStreamDegraded(t *testing.T) {
+func (f *faultInjectingStream) Flush(ctx context.Context) error {
+	if deg := f.degraded.Load(); deg != nil {
+		return deg
+	}
+	return f.Stream.Flush(ctx)
+}
+
+func (f *faultInjectingStream) Degraded() *walclient.DegradedError {
+	if deg := f.degraded.Load(); deg != nil {
+		return deg
+	}
+	return f.Stream.Degraded()
+}
+
+func TestControllerWALStreamDegraded(t *testing.T) {
 	ctx := t.Context()
 	storage := NewMemoryBackend()
 	dir := t.TempDir()
@@ -5751,7 +5772,7 @@ func TestControllerTerminalWALStreamDegraded(t *testing.T) {
 	}
 	defer stream2.Close()
 
-	// Create real stream for vol1, wrapped with a fault-injecting proxy that returns ErrTerminalStream
+	// Create real stream for vol1, wrapped with a fault-injecting proxy
 	walDir1 := filepath.Join(dir, "wal1")
 	streamID1 := StreamIDForVolume(vol1ID)
 	realStream1, err := walclient.Open(ctx, walDir1, streamID1, "")
@@ -5760,22 +5781,9 @@ func TestControllerTerminalWALStreamDegraded(t *testing.T) {
 	}
 	defer realStream1.Close()
 
-	terminalFaultErr := fmt.Errorf("%w: failed to truncate local segment store to 1: read-only file system", walclient.ErrTerminalStream)
-	var injectTerminalErr atomic.Bool
 	faultStream1 := &faultInjectingStream{
-		Stream: realStream1,
-		appendHook: func() error {
-			if injectTerminalErr.Load() {
-				return terminalFaultErr
-			}
-			return nil
-		},
-		terminalErrHook: func() error {
-			if injectTerminalErr.Load() {
-				return terminalFaultErr
-			}
-			return nil
-		},
+		Stream:   realStream1,
+		streamID: streamID1,
 	}
 
 	server := NewServer(storage,
@@ -5791,17 +5799,56 @@ func TestControllerTerminalWALStreamDegraded(t *testing.T) {
 	)
 	defer server.Close()
 
-	// Initialize both volumes
-	init1, err := server.Lookup(ctx, &pb.LookupRequest{VolumeId: vol1ID, ParentInode: 1, Name: "nonexistent"})
-	if err != nil || init1.GetError() != int32(syscall.ENOENT) {
-		t.Fatalf("Lookup vol1: err=%v, resp=%v", err, init1)
+	// Populate initial file and directory objects on vol1 while healthy so mutating RPCs reach the stream
+	initFile, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       vol1ID,
+		ParentInode:    1,
+		Name:           "file1.txt",
+		Mode:           0644,
+		InitialContent: []byte("test-content"),
+	})
+	if err != nil || initFile.GetError() != 0 {
+		t.Fatalf("setup CreateFile file1.txt: err=%v, resp=%v", err, initFile)
 	}
-	init2, err := server.Lookup(ctx, &pb.LookupRequest{VolumeId: vol2ID, ParentInode: 1, Name: "nonexistent"})
-	if err != nil || init2.GetError() != int32(syscall.ENOENT) {
-		t.Fatalf("Lookup vol2: err=%v, resp=%v", err, init2)
+	fileIno := initFile.GetAttr().GetInode().GetIno()
+
+	initUnlink, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    vol1ID,
+		ParentInode: 1,
+		Name:        "file_for_unlink.txt",
+		Mode:        0644,
+	})
+	if err != nil || initUnlink.GetError() != 0 {
+		t.Fatalf("setup CreateFile file_for_unlink.txt: err=%v, resp=%v", err, initUnlink)
 	}
 
-	// Capture klog output to verify single error log
+	initRename, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    vol1ID,
+		ParentInode: 1,
+		Name:        "file_for_rename.txt",
+		Mode:        0644,
+	})
+	if err != nil || initRename.GetError() != 0 {
+		t.Fatalf("setup CreateFile file_for_rename.txt: err=%v, resp=%v", err, initRename)
+	}
+
+	initDir, err := server.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId:    vol1ID,
+		ParentInode: 1,
+		Name:        "dir_for_rmdir",
+		Mode:        0755,
+	})
+	if err != nil || initDir.GetError() != 0 {
+		t.Fatalf("setup Mkdir dir_for_rmdir: err=%v, resp=%v", err, initDir)
+	}
+
+	// Initialize vol2 as well
+	init2, err := server.Lookup(ctx, &pb.LookupRequest{VolumeId: vol2ID, ParentInode: 1, Name: "nonexistent"})
+	if err != nil || init2.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("setup Lookup vol2: err=%v, resp=%v", err, init2)
+	}
+
+	// Capture klog output to verify exactly one error log line in total across all operations
 	var logBuf bytes.Buffer
 	klog.LogToStderr(false)
 	klog.SetOutput(&logBuf)
@@ -5812,63 +5859,243 @@ func TestControllerTerminalWALStreamDegraded(t *testing.T) {
 
 	beforeErrorLines := klog.Stats.Error.Lines()
 
-	// Inject terminal stream failure on vol1
-	injectTerminalErr.Store(true)
+	// Degrade the stream on vol1
+	faultStream1.degrade(errors.New("read-only file system"))
 
-	// First mutating operation on vol1 should return EIO
-	resp1, rpcErr := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       vol1ID,
-		ParentInode:    1,
-		Name:           "file1.txt",
-		Mode:           0644,
-		InitialContent: []byte("test"),
-	})
-	if rpcErr != nil {
-		t.Fatalf("unexpected gRPC error on vol1 CreateFile: %v", rpcErr)
+	// Drive every mutating RPC through the server in a table
+	mutatingOps := []struct {
+		name        string
+		call        func() int32
+		expectedErr int32
+	}{
+		{
+			name: "CreateFile",
+			call: func() int32 {
+				resp, rErr := server.CreateFile(ctx, &pb.CreateFileRequest{
+					VolumeId:    vol1ID,
+					ParentInode: 1,
+					Name:        "newfile.txt",
+					Mode:        0644,
+				})
+				if rErr != nil {
+					t.Fatalf("CreateFile gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			// Buffered write is accepted into staging memory (POSIX contract); durability fails at subsequent Fsync.
+			name: "WriteFile",
+			call: func() int32 {
+				resp, rErr := server.WriteFile(ctx, &pb.WriteFileRequest{
+					VolumeId: vol1ID,
+					Inode:    fileIno,
+					Offset:   0,
+					Data:     []byte("mutating-write-data"),
+				})
+				if rErr != nil {
+					t.Fatalf("WriteFile gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: 0,
+		},
+		{
+			// Fsync following WriteFile flushes staged data to the degraded stream and returns EIO.
+			name: "Fsync",
+			call: func() int32 {
+				resp, rErr := server.Fsync(ctx, &pb.FsyncRequest{
+					VolumeId: vol1ID,
+					Inode:    fileIno,
+					Blocking: true,
+				})
+				if rErr != nil {
+					t.Fatalf("Fsync gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			name: "Mkdir",
+			call: func() int32 {
+				resp, rErr := server.Mkdir(ctx, &pb.MkdirRequest{
+					VolumeId:    vol1ID,
+					ParentInode: 1,
+					Name:        "newdir",
+					Mode:        0755,
+				})
+				if rErr != nil {
+					t.Fatalf("Mkdir gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			name: "SetAttr",
+			call: func() int32 {
+				mode := uint32(0600)
+				resp, rErr := server.SetAttr(ctx, &pb.SetAttrRequest{
+					VolumeId: vol1ID,
+					Inode:    fileIno,
+					Mode:     &mode,
+				})
+				if rErr != nil {
+					t.Fatalf("SetAttr gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			name: "TruncateFile",
+			call: func() int32 {
+				resp, rErr := server.TruncateFile(ctx, &pb.TruncateFileRequest{
+					VolumeId: vol1ID,
+					Inode:    fileIno,
+					Size:     0,
+				})
+				if rErr != nil {
+					t.Fatalf("TruncateFile gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			name: "PunchHole",
+			call: func() int32 {
+				resp, rErr := server.PunchHole(ctx, &pb.PunchHoleRequest{
+					VolumeId: vol1ID,
+					Inode:    fileIno,
+					Offset:   0,
+					Length:   4,
+				})
+				if rErr != nil {
+					t.Fatalf("PunchHole gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			name: "Symlink",
+			call: func() int32 {
+				resp, rErr := server.Symlink(ctx, &pb.SymlinkRequest{
+					VolumeId:    vol1ID,
+					ParentInode: 1,
+					Name:        "newsymlink",
+					Target:      "target",
+				})
+				if rErr != nil {
+					t.Fatalf("Symlink gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			name: "Link",
+			call: func() int32 {
+				resp, rErr := server.Link(ctx, &pb.LinkRequest{
+					VolumeId:       vol1ID,
+					OldInode:       fileIno,
+					NewParentInode: 1,
+					NewName:        "newlink",
+				})
+				if rErr != nil {
+					t.Fatalf("Link gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			name: "Rename",
+			call: func() int32 {
+				resp, rErr := server.Rename(ctx, &pb.RenameRequest{
+					VolumeId:       vol1ID,
+					OldParentInode: 1,
+					OldName:        "file_for_rename.txt",
+					NewParentInode: 1,
+					NewName:        "file_renamed.txt",
+				})
+				if rErr != nil {
+					t.Fatalf("Rename gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			name: "Unlink",
+			call: func() int32 {
+				resp, rErr := server.Unlink(ctx, &pb.UnlinkRequest{
+					VolumeId:    vol1ID,
+					ParentInode: 1,
+					Name:        "file_for_unlink.txt",
+				})
+				if rErr != nil {
+					t.Fatalf("Unlink gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
+		{
+			name: "Rmdir",
+			call: func() int32 {
+				resp, rErr := server.Rmdir(ctx, &pb.RmdirRequest{
+					VolumeId:    vol1ID,
+					ParentInode: 1,
+					Name:        "dir_for_rmdir",
+				})
+				if rErr != nil {
+					t.Fatalf("Rmdir gRPC error: %v", rErr)
+				}
+				return resp.GetError()
+			},
+			expectedErr: int32(syscall.EIO),
+		},
 	}
-	if resp1.GetError() != int32(syscall.EIO) {
-		t.Fatalf("expected syscall.EIO on vol1 CreateFile, got %d", resp1.GetError())
+
+	for _, tc := range mutatingOps {
+		errCode := tc.call()
+		if errCode != tc.expectedErr {
+			t.Errorf("%s: expected error %d, got %d", tc.name, tc.expectedErr, errCode)
+		}
 	}
 
 	klog.Flush()
-	expectedLog := fmt.Sprintf("Volume %s degraded due to terminal WAL stream error", vol1ID)
+	expectedLog := fmt.Sprintf("WAL client stream %s degraded", streamID1)
 	if !strings.Contains(logBuf.String(), expectedLog) {
 		t.Fatalf("expected log %q to appear in log output:\n%s", expectedLog, logBuf.String())
 	}
 	if diff := klog.Stats.Error.Lines() - beforeErrorLines; diff != 1 {
-		t.Fatalf("expected exactly 1 error log after first failure, got %d", diff)
+		t.Fatalf("expected exactly 1 error log line in total, got %d", diff)
 	}
 
-	// Second mutating operation on vol1 should also return EIO and NOT log again
-	resp1Second, err := server.CreateFile(ctx, &pb.CreateFileRequest{
-		VolumeId:       vol1ID,
-		ParentInode:    1,
-		Name:           "file1_second.txt",
-		Mode:           0644,
-		InitialContent: []byte("test"),
-	})
-	if err != nil {
-		t.Fatalf("unexpected gRPC error on second vol1 CreateFile: %v", err)
-	}
-	if resp1Second.GetError() != int32(syscall.EIO) {
-		t.Fatalf("expected syscall.EIO on second vol1 CreateFile, got %d", resp1Second.GetError())
-	}
-
-	klog.Flush()
-	if diff := klog.Stats.Error.Lines() - beforeErrorLines; diff != 1 {
-		t.Fatalf("expected still exactly 1 error log after second failure, got %d", diff)
-	}
-
-	// Verify GetVolumeStats reports the degraded reason on vol1
+	// Verify GetVolumeStats reports structured Degraded status on vol1
 	stats1, err := server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: vol1ID})
 	if err != nil {
 		t.Fatalf("GetVolumeStats vol1 failed: %v", err)
 	}
-	if stats1.GetDegradedReason() == "" || !strings.Contains(stats1.GetDegradedReason(), "read-only file system") {
-		t.Fatalf("expected degraded_reason containing 'read-only file system' on vol1, got: %q", stats1.GetDegradedReason())
+	if stats1.GetDegraded() == nil {
+		t.Fatalf("expected non-nil Degraded status on vol1")
+	}
+	if stats1.GetDegraded().GetCode() != pb.Degraded_WAL_STREAM_DEGRADED {
+		t.Fatalf("expected Degraded.Code to be WAL_STREAM_DEGRADED, got %v", stats1.GetDegraded().GetCode())
+	}
+	if !strings.Contains(stats1.GetDegraded().GetMessage(), "read-only file system") {
+		t.Fatalf("expected Degraded.Message containing 'read-only file system' on vol1, got: %q", stats1.GetDegraded().GetMessage())
+	}
+	if stats1.GetDegraded().GetSince() == nil || stats1.GetDegraded().GetSince().AsTime().IsZero() {
+		t.Fatalf("expected non-zero Degraded.Since on vol1")
 	}
 
-	// Verify ListVolumes reports degraded_reason on vol1 and empty on vol2
+	// Verify ListVolumes reports structured Degraded status on vol1 and nil on vol2
 	listResp, err := server.ListVolumes(ctx, &pb.ListVolumesRequest{})
 	if err != nil {
 		t.Fatalf("ListVolumes failed: %v", err)
@@ -5877,14 +6104,23 @@ func TestControllerTerminalWALStreamDegraded(t *testing.T) {
 	for _, vi := range listResp.GetVolumes() {
 		if vi.GetVolumeId() == vol1ID {
 			foundVol1 = true
-			if vi.GetDegradedReason() != stats1.GetDegradedReason() {
-				t.Fatalf("expected ListVolumes vol1 degraded_reason %q, got %q", stats1.GetDegradedReason(), vi.GetDegradedReason())
+			if vi.GetDegraded() == nil {
+				t.Fatalf("expected non-nil Degraded on vol1 in ListVolumes")
+			}
+			if vi.GetDegraded().GetCode() != stats1.GetDegraded().GetCode() {
+				t.Fatalf("expected ListVolumes vol1 degraded code %v, got %v", stats1.GetDegraded().GetCode(), vi.GetDegraded().GetCode())
+			}
+			if vi.GetDegraded().GetMessage() != stats1.GetDegraded().GetMessage() {
+				t.Fatalf("expected ListVolumes vol1 degraded message %q, got %q", stats1.GetDegraded().GetMessage(), vi.GetDegraded().GetMessage())
+			}
+			if vi.GetDegraded().GetSince() == nil || vi.GetDegraded().GetSince().AsTime().IsZero() {
+				t.Fatalf("expected non-zero Degraded.Since in ListVolumes on vol1")
 			}
 		}
 		if vi.GetVolumeId() == vol2ID {
 			foundVol2 = true
-			if vi.GetDegradedReason() != "" {
-				t.Fatalf("expected ListVolumes vol2 degraded_reason to be empty, got %q", vi.GetDegradedReason())
+			if vi.GetDegraded() != nil {
+				t.Fatalf("expected ListVolumes vol2 degraded to be nil, got %v", vi.GetDegraded())
 			}
 		}
 	}
@@ -5912,8 +6148,8 @@ func TestControllerTerminalWALStreamDegraded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetVolumeStats vol2 failed: %v", err)
 	}
-	if stats2.GetDegradedReason() != "" {
-		t.Fatalf("expected empty degraded_reason on vol2, got: %q", stats2.GetDegradedReason())
+	if stats2.GetDegraded() != nil {
+		t.Fatalf("expected nil Degraded on vol2, got: %v", stats2.GetDegraded())
 	}
 }
 
