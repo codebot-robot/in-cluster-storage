@@ -29,6 +29,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -1557,4 +1558,131 @@ func TestClientReconnectAfterBufferCrash(t *testing.T) {
 			t.Errorf("at index %d: expected seq %d, got %d", i, expectedSeqs[i], seq)
 		}
 	}
+}
+
+type faultInjectingStore struct {
+	SegmentStore
+	mu           sync.Mutex
+	failCount    int
+	successCount int
+}
+
+func (f *faultInjectingStore) TruncateAfter(seq uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failCount < 2 {
+		f.failCount++
+		return fmt.Errorf("injected TruncateAfter failure #%d", f.failCount)
+	}
+	f.successCount++
+	return f.SegmentStore.TruncateAfter(seq)
+}
+
+func TestDivergenceTruncateRetryRecovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir())
+	defer handle.StopGraceful()
+
+	streamID := uuid.New()
+
+	// 1. Another node writes authoritative records 1..2 to wal-buffer (witness watermark = 2)
+	nodeBDir := t.TempDir()
+	streamB, err := Open(ctx, nodeBDir, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("Open streamB failed: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		seq, err := streamB.Append(ctx, []byte(fmt.Sprintf("auth-record-%d", i)))
+		if err != nil {
+			t.Fatalf("streamB append %d failed: %v", i, err)
+		}
+		if err := streamB.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("streamB wait %d failed: %v", seq, err)
+		}
+	}
+	if err := streamB.Close(); err != nil {
+		t.Fatalf("streamB close failed: %v", err)
+	}
+
+	// 2. Client writes records 1..5 locally (diverging from authoritative buffer history at seq 2)
+	clientDir := t.TempDir()
+	streamLocal, err := Open(ctx, clientDir, streamID, "")
+	if err != nil {
+		t.Fatalf("Open streamLocal failed: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		_, err := streamLocal.Append(ctx, []byte(fmt.Sprintf("divergent-record-%d", i)))
+		if err != nil {
+			t.Fatalf("streamLocal append %d failed: %v", i, err)
+		}
+	}
+	if err := streamLocal.Close(); err != nil {
+		t.Fatalf("streamLocal close failed: %v", err)
+	}
+
+	// 3. Re-open local store with fault injection wrapping TruncateAfter to fail twice then succeed
+	realStore, recovered, err := wal.NewClientSegmentStore(clientDir, fmt.Sprintf("stream-%s", streamID.String()), 100)
+	if err != nil {
+		t.Fatalf("NewClientSegmentStore failed: %v", err)
+	}
+	faultStore := &faultInjectingStore{SegmentStore: realStore}
+
+	// 4. Open client stream against wal-buffer with fast retry backoff
+	stream, err := Open(ctx, clientDir, streamID, handle.addr,
+		WithStore(faultStore, recovered),
+		WithDegradedRetryBackoff(10*time.Millisecond, 50*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("expected Open to succeed in degraded state, got: %v", err)
+	}
+	defer stream.Close()
+
+	// 5. Verify stream is degraded during initial truncate failures
+	degErr := stream.Degraded()
+	if degErr == nil {
+		t.Fatalf("expected stream to be degraded initially")
+	}
+
+	// Operations while degraded must fail immediately with DegradedError
+	if _, appErr := stream.Append(ctx, []byte("should-fail-while-degraded")); appErr == nil || !errors.Is(appErr, degErr) {
+		t.Fatalf("expected Append to fail with DegradedError while degraded, got: %v", appErr)
+	}
+	if waitErr := stream.Wait(ctx, 1, Witness, false); waitErr == nil || !errors.Is(waitErr, degErr) {
+		t.Fatalf("expected Wait to fail with DegradedError while degraded, got: %v", waitErr)
+	}
+
+	// 6. Wait for automatic retry to succeed and clear degraded state
+	recoveredHealthy := false
+	for start := time.Now(); time.Since(start) < 5*time.Second; {
+		if stream.Degraded() == nil {
+			recoveredHealthy = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !recoveredHealthy {
+		t.Fatalf("expected stream to recover to healthy after retry succeeded")
+	}
+
+	// 7. Verify subsequent append and wait complete successfully
+	seqNew, err := stream.Append(ctx, []byte("recovered-record-new"))
+	if err != nil {
+		t.Fatalf("append after recovery failed: %v", err)
+	}
+	if err := stream.Wait(ctx, seqNew, Witness, false); err != nil {
+		t.Fatalf("wait after recovery failed: %v", err)
+	}
+	if seqNew != 3 {
+		t.Fatalf("expected new record sequence after recovery to be 3 (resuming from buffer watermark 2), got: %d", seqNew)
+	}
+
+	// 8. Verify divergence was resolved exactly once
+	faultStore.mu.Lock()
+	if faultStore.failCount != 2 {
+		t.Errorf("expected exactly 2 truncate failures, got %d", faultStore.failCount)
+	}
+	faultStore.mu.Unlock()
 }

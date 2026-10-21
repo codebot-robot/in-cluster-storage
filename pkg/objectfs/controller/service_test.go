@@ -2595,6 +2595,10 @@ func (s *fakeBlockingStream) Degraded() *walclient.DegradedError {
 	return nil
 }
 
+func (s *fakeBlockingStream) Dir() string {
+	return ""
+}
+
 func (s *fakeBlockingStream) Close() error {
 	return nil
 }
