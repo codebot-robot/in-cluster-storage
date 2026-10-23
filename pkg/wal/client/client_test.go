@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1588,4 +1590,86 @@ func TestDivergenceTruncateRetryRecovery(t *testing.T) {
 		t.Errorf("expected exactly 2 truncate failures, got %d", faultStore.failCount)
 	}
 	faultStore.mu.Unlock()
+}
+
+func TestMoveSegmentsAside(t *testing.T) {
+	dir := t.TempDir()
+	streamID1 := uuid.New()
+	streamID2 := uuid.New()
+
+	// Create dummy segment and recover files for stream1
+	seg1 := filepath.Join(dir, fmt.Sprintf("stream-%s-0000000000000000001.wal", streamID1.String()))
+	rec1 := filepath.Join(dir, fmt.Sprintf("stream-%s-0000000000000000001.wal.123456789.recover", streamID1.String()))
+	if err := os.WriteFile(seg1, []byte("seg1-content"), 0644); err != nil {
+		t.Fatalf("WriteFile seg1 failed: %v", err)
+	}
+	if err := os.WriteFile(rec1, []byte("rec1-content"), 0644); err != nil {
+		t.Fatalf("WriteFile rec1 failed: %v", err)
+	}
+
+	// Create dummy segment and recover files for stream2
+	seg2 := filepath.Join(dir, fmt.Sprintf("stream-%s-0000000000000000001.wal", streamID2.String()))
+	rec2 := filepath.Join(dir, fmt.Sprintf("stream-%s-0000000000000000001.wal.987654321.recover", streamID2.String()))
+	if err := os.WriteFile(seg2, []byte("seg2-content"), 0644); err != nil {
+		t.Fatalf("WriteFile seg2 failed: %v", err)
+	}
+	if err := os.WriteFile(rec2, []byte("rec2-content"), 0644); err != nil {
+		t.Fatalf("WriteFile rec2 failed: %v", err)
+	}
+
+	// Create unrelated file and directory
+	otherFile := filepath.Join(dir, "other.txt")
+	if err := os.WriteFile(otherFile, []byte("other-content"), 0644); err != nil {
+		t.Fatalf("WriteFile otherFile failed: %v", err)
+	}
+	otherSubdir := filepath.Join(dir, "otherdir")
+	if err := os.Mkdir(otherSubdir, 0755); err != nil {
+		t.Fatalf("Mkdir otherSubdir failed: %v", err)
+	}
+
+	// Move stream1 aside
+	movedDir, err := MoveSegmentsAside(dir, streamID1)
+	if err != nil {
+		t.Fatalf("MoveSegmentsAside failed: %v", err)
+	}
+	if !strings.HasSuffix(movedDir, ".degraded") {
+		t.Fatalf("expected movedDir to end with .degraded, got: %s", movedDir)
+	}
+	expectedPrefix := filepath.Join(dir, fmt.Sprintf("stream-%s.", streamID1.String()))
+	if !strings.HasPrefix(movedDir, expectedPrefix) {
+		t.Fatalf("expected movedDir to have prefix %s, got: %s", expectedPrefix, movedDir)
+	}
+
+	// Verify stream1 files moved into movedDir
+	if _, err := os.Stat(filepath.Join(movedDir, filepath.Base(seg1))); err != nil {
+		t.Errorf("expected seg1 in movedDir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(movedDir, filepath.Base(rec1))); err != nil {
+		t.Errorf("expected rec1 in movedDir: %v", err)
+	}
+
+	// Verify stream1 files NO LONGER in dir
+	if _, err := os.Stat(seg1); !os.IsNotExist(err) {
+		t.Errorf("expected seg1 removed from dir: %v", err)
+	}
+	if _, err := os.Stat(rec1); !os.IsNotExist(err) {
+		t.Errorf("expected rec1 removed from dir: %v", err)
+	}
+
+	// Verify stream2 files and unrelated files REMAIN in dir untouched
+	if _, err := os.Stat(seg2); err != nil {
+		t.Errorf("expected seg2 still in dir: %v", err)
+	}
+	if _, err := os.Stat(rec2); err != nil {
+		t.Errorf("expected rec2 still in dir: %v", err)
+	}
+	if _, err := os.Stat(otherFile); err != nil {
+		t.Errorf("expected otherFile still in dir: %v", err)
+	}
+
+	// Calling MoveSegmentsAside with empty dir returns empty string without error
+	p, err := MoveSegmentsAside("", streamID1)
+	if err != nil || p != "" {
+		t.Fatalf("expected ('', nil) for empty dir, got (%q, %v)", p, err)
+	}
 }
