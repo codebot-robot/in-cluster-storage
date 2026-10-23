@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -39,15 +40,16 @@ import (
 // SQLite index. Blobs are content-addressed by their SHA256 hex string and verified
 // on write. Clean data is served from disk and evicted via LRU size capping.
 type DiskBlobCache struct {
-	dir      string
-	blobsDir string
-	tmpDir   string
-	db       *sql.DB
-	maxBytes int64
-	curBytes int64
-	sf       singleflight.Group
-	mu       sync.Mutex
-	closed   atomic.Bool
+	dir        string
+	blobsDir   string
+	tmpDir     string
+	db         *sql.DB
+	maxBytes   int64
+	curBytes   int64
+	sf         singleflight.Group
+	mu         sync.Mutex
+	closed     atomic.Bool
+	wrapWriter func(io.WriteCloser) io.WriteCloser
 }
 
 // NewDiskBlobCache initializes or opens an on-disk blob cache in dir.
@@ -287,8 +289,22 @@ func (c *DiskBlobCache) FetchBlob(ctx context.Context, client pb.ObjectFSControl
 			return nil, fmt.Errorf("failed creating tmp file %s: %w", tmpPath, err)
 		}
 
+		success := false
+		defer func() {
+			if !success {
+				if remErr := os.Remove(tmpPath); remErr != nil && !os.IsNotExist(remErr) {
+					klog.V(4).Infof("DiskBlobCache: error removing tmp file %s: %v", tmpPath, remErr)
+				}
+			}
+		}()
+
+		var writerCloser io.WriteCloser = tmpFile
+		if c.wrapWriter != nil {
+			writerCloser = c.wrapWriter(tmpFile)
+		}
+
 		hasher := sha256.New()
-		writer := io.MultiWriter(tmpFile, hasher)
+		writer := io.MultiWriter(writerCloser, hasher)
 
 		var totalBytes int64
 		for {
@@ -297,50 +313,31 @@ func (c *DiskBlobCache) FetchBlob(ctx context.Context, client pb.ObjectFSControl
 				break
 			}
 			if rErr != nil {
-				if closeErr := tmpFile.Close(); closeErr != nil {
-					klog.V(4).Infof("DiskBlobCache: error closing tmp file %s: %v", tmpPath, closeErr)
-				}
-				if remErr := os.Remove(tmpPath); remErr != nil {
-					klog.V(4).Infof("DiskBlobCache: error removing tmp file %s: %v", tmpPath, remErr)
-				}
-				return nil, fmt.Errorf("failed receiving blob %s stream: %w", sha, rErr)
+				closeErr := writerCloser.Close()
+				return nil, errors.Join(fmt.Errorf("failed receiving blob %s stream: %w", sha, rErr), closeErr)
 			}
 			data := chunkResp.GetData()
 			if len(data) > 0 {
 				n, wErr := writer.Write(data)
 				if wErr != nil {
-					if closeErr := tmpFile.Close(); closeErr != nil {
-						klog.V(4).Infof("DiskBlobCache: error closing tmp file %s: %v", tmpPath, closeErr)
-					}
-					if remErr := os.Remove(tmpPath); remErr != nil {
-						klog.V(4).Infof("DiskBlobCache: error removing tmp file %s: %v", tmpPath, remErr)
-					}
-					return nil, fmt.Errorf("failed writing blob %s to tmp: %w", sha, wErr)
+					closeErr := writerCloser.Close()
+					return nil, errors.Join(fmt.Errorf("failed writing blob %s to tmp: %w", sha, wErr), closeErr)
 				}
 				totalBytes += int64(n)
 			}
 		}
 
-		if err := tmpFile.Close(); err != nil {
-			if remErr := os.Remove(tmpPath); remErr != nil {
-				klog.V(4).Infof("DiskBlobCache: error removing tmp file %s: %v", tmpPath, remErr)
-			}
+		if err := writerCloser.Close(); err != nil {
 			return nil, fmt.Errorf("failed closing tmp file %s: %w", tmpPath, err)
 		}
 
 		actualSHA := hex.EncodeToString(hasher.Sum(nil))
 		if actualSHA != sha {
-			if remErr := os.Remove(tmpPath); remErr != nil {
-				klog.V(4).Infof("DiskBlobCache: error removing tmp file %s: %v", tmpPath, remErr)
-			}
 			return nil, fmt.Errorf("sha256 mismatch for blob %s: computed %s", sha, actualSHA)
 		}
 
 		finalPath := filepath.Join(c.blobsDir, sha)
 		if err := os.Rename(tmpPath, finalPath); err != nil {
-			if remErr := os.Remove(tmpPath); remErr != nil {
-				klog.V(4).Infof("DiskBlobCache: error removing tmp file %s: %v", tmpPath, remErr)
-			}
 			return nil, fmt.Errorf("failed renaming tmp blob to %s: %w", finalPath, err)
 		}
 
@@ -360,6 +357,7 @@ func (c *DiskBlobCache) FetchBlob(ctx context.Context, client pb.ObjectFSControl
 		c.evictIfNeededLocked()
 		c.mu.Unlock()
 
+		success = true
 		return c.ReadBlob(sha)
 	})
 

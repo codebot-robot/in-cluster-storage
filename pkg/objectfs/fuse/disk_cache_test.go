@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -321,3 +322,79 @@ func TestDiskBlobCacheFetchAndSingleflight(t *testing.T) {
 		t.Fatalf("expected blob to be cached on disk")
 	}
 }
+
+type failCloseWriter struct {
+	io.WriteCloser
+	closeErr error
+}
+
+func (w *failCloseWriter) Close() error {
+	_ = w.WriteCloser.Close()
+	return w.closeErr
+}
+
+func TestDiskBlobCacheFetchCloseError(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "disk-cache-close-err-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	data := []byte("test blob data for close error")
+	sha := shaString(data)
+
+	mockClient := &mockBlobControllerClient{
+		blobs: map[string][]byte{
+			sha: data,
+		},
+	}
+
+	cache, err := NewDiskBlobCache(tempDir, 10*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	injectedErr := errors.New("simulated flush/close error on writer")
+	cache.wrapWriter = func(wc io.WriteCloser) io.WriteCloser {
+		return &failCloseWriter{WriteCloser: wc, closeErr: injectedErr}
+	}
+
+	_, err = cache.FetchBlob(t.Context(), mockClient, sha)
+	if err == nil {
+		t.Fatal("expected FetchBlob to return error on failing Close(), got nil")
+	}
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected error to wrap injectedErr, got: %v", err)
+	}
+
+	// Verify no partial files remain in tmp or blobs
+	if cache.HasBlob(sha) {
+		t.Fatalf("expected HasBlob to return false after failed fetch")
+	}
+	blobs, err := os.ReadDir(filepath.Join(tempDir, "blobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blobs) != 0 {
+		t.Fatalf("expected 0 blobs on close failure, got %d", len(blobs))
+	}
+	tmps, err := os.ReadDir(filepath.Join(tempDir, "tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tmps) != 0 {
+		t.Fatalf("expected 0 tmp files on close failure, got %d", len(tmps))
+	}
+
+	// Verify subsequent fetch without failing Close succeeds and retries
+	cache.wrapWriter = nil
+	fetched, err := cache.FetchBlob(t.Context(), mockClient, sha)
+	if err != nil {
+		t.Fatalf("expected subsequent FetchBlob to succeed, got: %v", err)
+	}
+	if !bytes.Equal(fetched, data) {
+		t.Fatalf("subsequent FetchBlob returned unexpected data")
+	}
+}
+
