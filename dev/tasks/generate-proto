@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script is meant to be run by 'ap generate' (or with 'ap' installed on PATH).
+
 set -o errexit
 set -o nounset
 set -o pipefail
@@ -21,7 +23,7 @@ set -o pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-go run github.com/gke-labs/gke-labs-infra/ap@latest tool protoc \
+ap tool protoc \
   -I. \
   --go_out=. --go_opt=module=github.com/gke-labs/in-cluster-storage \
   --go-grpc_out=. --go-grpc_opt=module=github.com/gke-labs/in-cluster-storage \
