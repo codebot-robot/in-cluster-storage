@@ -740,7 +740,29 @@ func (s *streamImpl) runStreamSession() error {
 		klog.Infof("WAL client stream %s: replication session established", s.streamID)
 	}
 
-	// 3. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
+	// 3. Concurrently receive Acks while replaying and sending newly appended records.
+	// Starting the receiver before replay ensures replayed records can be acked and drained
+	// without filling gRPC/HTTP2 flow control buffers.
+	recvErrCh := make(chan error, 1)
+	var firstAck sync.Once
+	go func() {
+		for {
+			ackResp, err := stream.Recv()
+			if err != nil {
+				recvErrCh <- err
+				return
+			}
+			if ack := ackResp.GetAck(); ack != nil {
+				firstAck.Do(func() {
+					klog.Infof("WAL client stream %s: first ack after reconnect: witness=%d, s3=%d",
+						s.streamID, ack.WitnessAckedStreamSeq, ack.S3AckedStreamSeq)
+				})
+				s.handleAck(ack)
+			}
+		}
+	}()
+
+	// 4. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
 	s.retainedMu.RLock()
 	var recordsToReplay []*wal.ClientRecord
 	for _, r := range s.retainedRecords {
@@ -766,26 +788,6 @@ func (s *streamImpl) runStreamSession() error {
 			return fmt.Errorf("failed to replay record %d: %w", rec.StreamSeq, err)
 		}
 	}
-
-	// 4. Concurrently receive Acks and send newly appended records
-	recvErrCh := make(chan error, 1)
-	var firstAck sync.Once
-	go func() {
-		for {
-			ackResp, err := stream.Recv()
-			if err != nil {
-				recvErrCh <- err
-				return
-			}
-			if ack := ackResp.GetAck(); ack != nil {
-				firstAck.Do(func() {
-					klog.Infof("WAL client stream %s: first ack after reconnect: witness=%d, s3=%d",
-						s.streamID, ack.WitnessAckedStreamSeq, ack.S3AckedStreamSeq)
-				})
-				s.handleAck(ack)
-			}
-		}
-	}()
 
 	nextSeqToSend := uint64(0)
 	if len(recordsToReplay) > 0 {

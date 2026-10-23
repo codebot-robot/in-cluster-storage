@@ -788,10 +788,7 @@ echo "$h1 $h2"
 	runStart := time.Now()
 	runDeadline := runStart.Add(duration)
 
-	streamCount := countControllerReplicationSessions(h)
-	if streamCount <= 0 {
-		streamCount = 1
-	}
+	streamCount := countDistinctControllerReplicationStreams(h)
 
 	nextWalBufferKill := runStart.Add(45 * time.Second) // offset from controller kills
 	nextControllerKill := runStart.Add(120 * time.Second)
@@ -836,6 +833,7 @@ disruptionLoop:
 			if now.After(nextWalBufferKill) {
 				t.Logf("[%s] DISRUPTION: Force-killing wal-buffer-0", now.Format("15:04:05"))
 				sessionsBeforeKill := countControllerReplicationSessions(h)
+				streamCount = countDistinctControllerReplicationStreams(h)
 				oldWalUID := getPodUID("wal-buffer-0", "default")
 				h.RunCommand("kubectl", "delete", "pod", "wal-buffer-0", "-n", "default", "--force", "--grace-period=0")
 				if err := waitForNewPodReady(t, h, "wal-buffer-0", "default", oldWalUID, 2*time.Minute); err != nil {

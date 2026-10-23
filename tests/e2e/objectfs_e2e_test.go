@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -2251,10 +2252,7 @@ echo "$hash3" > /tmp/manifest/waldir_nested.txt.sha
 	}
 
 	sessionsBeforeKill := countControllerReplicationSessions(h)
-	streamCount := sessionsBeforeKill
-	if streamCount <= 0 {
-		streamCount = 1
-	}
+	streamCount := countDistinctControllerReplicationStreams(h)
 
 	t.Logf("Force-killing wal-buffer-0 pod (testing witness-acknowledged durability across buffer restart, observed streams: %d)", streamCount)
 	h.RunCommand("kubectl", "delete", "pod", "wal-buffer-0", "-n", "default", "--force", "--grace-period=0")
@@ -2326,6 +2324,7 @@ echo $? > /tmp/wal_workload.status
 
 	time.Sleep(1 * time.Second)
 	sessionsBeforeMidKill := countControllerReplicationSessions(h)
+	streamCount = countDistinctControllerReplicationStreams(h)
 	t.Logf("Force-killing wal-buffer-0 mid-workload (observed streams: %d)", streamCount)
 	h.RunCommand("kubectl", "delete", "pod", "wal-buffer-0", "-n", "default", "--force", "--grace-period=0")
 	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
@@ -2407,6 +2406,156 @@ echo $? > /tmp/wal_workload.status
 	t.Logf("Successfully verified WAL buffer restart durability, mid-workload restart, and continued writes!")
 }
 
+func TestObjectFSWalBufferInFlightFsyncAcrossKillE2E(t *testing.T) {
+	requireE2EGroup(t, "chaos")
+
+	h, node1, _ := setupObjectFSMultiNodeCluster(t)
+	volumeID := "wal-inflight-fsync-vol"
+
+	writerPodName := "wal-inflight-writer-pod"
+	writerPodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, writerPodName, node1, volumeID)
+
+	t.Logf("Creating writer pod on %s", node1)
+	h.KubectlApplyContent(writerPodName, writerPodYaml)
+	if err := h.WaitForPodReady(writerPodName, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Writer pod failed to start: %v", err)
+	}
+	defer deletePodBounded(t, h, writerPodName, "default", 3*time.Minute)
+
+	// Script running concurrent workers doing witness-level mutations (dd conv=fsync) in parallel
+	inflightScript := `#!/bin/sh
+set -e
+mkdir -p /tmp/manifest /tmp/src /data/inflight
+
+worker() {
+  id="$1"
+  for j in $(seq 1 15); do
+    src="/tmp/src/w_${id}_${j}.bin"
+    dst="/data/inflight/w_${id}_${j}.bin"
+    dd if=/dev/urandom of="$src" bs=4096 count=8 2>/dev/null
+    hash=$(sha256sum "$src" | awk '{print $1}')
+    dd if="$src" of="$dst" bs=4096 conv=fsync 2>/dev/null
+    echo "$hash" > "/tmp/manifest/w_${id}_${j}.sha"
+  done
+}
+
+worker 1 &
+p1=$!
+worker 2 &
+p2=$!
+worker 3 &
+p3=$!
+worker 4 &
+p4=$!
+
+wait $p1 && wait $p2 && wait $p3 && wait $p4
+echo 0 > /tmp/inflight.status
+`
+	_, err := h.RunInPod(writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/inflight.sh\n%s\nEOF\nchmod +x /tmp/inflight.sh", inflightScript))
+	if err != nil {
+		t.Fatalf("Failed to write in-flight script: %v", err)
+	}
+
+	runnerScript := `/tmp/inflight.sh > /tmp/inflight.log 2>&1 || echo $? > /tmp/inflight.status
+`
+	_, err = runInPodWithTimeout(t, h, writerPodName, "default", 3*time.Minute, "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/inflight_runner.sh\n%s\nEOF\nchmod +x /tmp/inflight_runner.sh\n/tmp/inflight_runner.sh </dev/null >/dev/null 2>&1 &", runnerScript))
+	if err != nil {
+		t.Fatalf("Failed to start in-flight workload in writer pod: %v", err)
+	}
+
+	// Give workers a brief moment to get mutations in flight
+	time.Sleep(300 * time.Millisecond)
+
+	sessionsBeforeKill := countControllerReplicationSessions(h)
+	streamCount := countDistinctControllerReplicationStreams(h)
+
+	t.Logf("Force-killing wal-buffer-0 while mutations are in flight (observed streams: %d)", streamCount)
+	h.RunCommand("kubectl", "delete", "pod", "wal-buffer-0", "-n", "default", "--force", "--grace-period=0")
+	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
+		t.Fatalf("wal-buffer failed to restart: %v", err)
+	}
+	readyTime := time.Now()
+	waitForControllerReplicationSessionIncrease(t, h, sessionsBeforeKill, streamCount, 30*time.Second)
+
+	// Assert: every in-flight fsync must complete within 15 seconds of new pod's readiness, and no fsync returns an error
+	bound := readyTime.Add(15 * time.Second)
+	completed := false
+	var exitCodeStr string
+	for time.Now().Before(bound) {
+		out, err := h.RunInPod(writerPodName, "default", "cat", "/tmp/inflight.status")
+		if err == nil && strings.TrimSpace(out) != "" {
+			exitCodeStr = strings.TrimSpace(out)
+			completed = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if !completed {
+		wLogs, _ := h.RunInPod(writerPodName, "default", "cat", "/tmp/inflight.log")
+		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		if walLogs := h.getContainerLogs("wal-buffer-0", "wal-buffer", "default", false); walLogs != "" {
+			t.Logf("WAL Buffer Logs:\n%s\n", walLogs)
+		}
+		t.Fatalf("In-flight fsyncs did not complete within 15s of wal-buffer readiness. Logs:\n%s", wLogs)
+	}
+
+	if exitCodeStr != "0" {
+		wLogs, _ := h.RunInPod(writerPodName, "default", "cat", "/tmp/inflight.log")
+		t.Fatalf("In-flight fsync workload failed with exit code %s. Logs:\n%s", exitCodeStr, wLogs)
+	}
+
+	// Verify all written files match manifest sha256 sums
+	manifestListRaw, err := h.RunInPod(writerPodName, "default", "/bin/sh", "-c", "for f in /tmp/manifest/*.sha; do [ -f \"$f\" ] || continue; echo \"$(cat \"$f\") $(basename \"$f\" .sha)\"; done")
+	if err != nil {
+		t.Fatalf("Failed to read manifest list from writer pod: %v", err)
+	}
+	manifestLines := strings.Split(strings.TrimSpace(manifestListRaw), "\n")
+	if len(manifestLines) == 0 || manifestLines[0] == "" {
+		t.Fatalf("No manifest files found")
+	}
+
+	for _, line := range manifestLines {
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		expectedHash := parts[0]
+		fileName := parts[1] + ".bin"
+		out, err := h.RunInPod(writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("sha256sum /data/inflight/%s | awk '{print $1}'", fileName))
+		if err != nil {
+			t.Fatalf("Failed to calculate sha256 for /data/inflight/%s: %v (out: %s)", fileName, err, out)
+		}
+		if strings.TrimSpace(out) != expectedHash {
+			t.Fatalf("Data mismatch for /data/inflight/%s: expected %s, got %s", fileName, expectedHash, strings.TrimSpace(out))
+		}
+	}
+
+	t.Logf("Successfully verified in-flight fsync across wal-buffer kill completed within 15s bound without error!")
+}
+
 // runInPodWithTimeout executes a command in a pod and aborts with a diagnostic dump if it exceeds timeout.
 func runInPodWithTimeout(t *testing.T, h *Harness, podName, namespace string, timeout time.Duration, cmd ...string) (string, error) {
 	t.Helper()
@@ -2467,6 +2616,26 @@ func deletePodBounded(t *testing.T, h *Harness, podName, namespace string, timeo
 		t.Logf("WAL Buffer Logs:\n%s\n", walLogs)
 	}
 	t.Fatalf("Timed out waiting %v for pod %s to be deleted", timeout, podName)
+}
+
+var controllerReplicationSessionRegex = regexp.MustCompile(`WAL client stream (\S+): replication session established`)
+
+// countDistinctControllerReplicationStreams parses the controller logs and returns
+// the number of distinct stream IDs that have established a replication session.
+// If no established sessions are found in the logs yet, it returns 1 as the default stream count.
+func countDistinctControllerReplicationStreams(h *Harness) int {
+	logs := h.GetPodLogsByName("objectfs-controller-0", "default")
+	matches := controllerReplicationSessionRegex.FindAllStringSubmatch(logs, -1)
+	streams := make(map[string]struct{})
+	for _, m := range matches {
+		if len(m) > 1 {
+			streams[m[1]] = struct{}{}
+		}
+	}
+	if len(streams) == 0 {
+		return 1
+	}
+	return len(streams)
 }
 
 // countControllerReplicationSessions returns the number of "replication session established"
