@@ -140,9 +140,6 @@ type inodeSyncLock struct {
 
 func (fs *ObjectFS) lockInodeSync(inode uint64) func() {
 	fs.inodeSyncMu.Lock()
-	if fs.inodeSyncLocks == nil {
-		fs.inodeSyncLocks = make(map[uint64]*inodeSyncLock)
-	}
 	l, ok := fs.inodeSyncLocks[inode]
 	if !ok {
 		l = &inodeSyncLock{}
@@ -2295,10 +2292,6 @@ func (fs *ObjectFS) syncAndFsyncLocked(ctx context.Context, inode uint64, blocki
 		fs.cache.InvalidateAllClean()
 	}
 	return nil
-}
-
-func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
-	return fs.syncAndFsync(ctx, inode, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED)
 }
 
 func (fs *ObjectFS) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
