@@ -57,6 +57,13 @@ const (
 	// MaxNameLength is the maximum allowed byte length for a path component name
 	// (matching the POSIX NAME_MAX limit of 255 bytes advertised by statfs).
 	MaxNameLength = 255
+
+	// closeCoalesceWindow is the short fixed floor window used to coalesce CLOSE-triggered
+	// syncs. When multiple files are closed in rapid succession (e.g. untarring an archive or
+	// compiler emit), this window batches their pack uploads and metadata commits into a
+	// single packfile rather than creating one pack per closed file, avoiding write amplification
+	// while bounding cross-node visibility latency for quiet files.
+	closeCoalesceWindow = 75 * time.Millisecond
 )
 
 type syncResult struct {
@@ -65,8 +72,9 @@ type syncResult struct {
 }
 
 type syncWaiter struct {
-	seq uint64
-	ch  chan syncResult
+	seq     uint64
+	inodeID uint64
+	ch      chan syncResult
 }
 
 type Volume struct {
@@ -93,6 +101,8 @@ type Volume struct {
 	coalesceTimer   *time.Timer
 	coalesceWaiters []*syncWaiter
 	coalesceWindow  time.Duration
+	closeTimer      *time.Timer
+	closeInodes     map[uint64]struct{}
 	syncTimeout     time.Duration
 	syncInProgress  bool
 	syncCond        *sync.Cond
@@ -506,7 +516,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	return v, nil
 }
 
-func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int][]byte, pos uint64) error {
+func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int][]byte, pos uint64, inodeFilter map[uint64]struct{}) error {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
 
@@ -535,7 +545,18 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 
 	var remainingWaiters []*syncWaiter
 	for _, w := range v.coalesceWaiters {
+		shouldComplete := false
 		if w.seq <= snapshotSeq {
+			if inodeFilter == nil {
+				shouldComplete = true
+			} else {
+				if _, ok := inodeFilter[w.inodeID]; ok {
+					shouldComplete = true
+				}
+			}
+		}
+
+		if shouldComplete {
 			w.ch <- syncResult{pos: pos, err: err}
 			close(w.ch)
 		} else {
@@ -546,6 +567,9 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 
 	if (len(remainingWaiters) > 0 || len(v.stagedChunks) > 0) && v.coalesceTimer == nil {
 		v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
+	}
+	if len(v.closeInodes) > 0 && v.closeTimer == nil {
+		v.closeTimer = time.AfterFunc(closeCoalesceWindow, v.triggerCloseSync)
 	}
 
 	v.syncCond.Broadcast()
@@ -559,14 +583,74 @@ func (v *Volume) triggerCoalesceSync() {
 		v.stagingMu.Unlock()
 		return
 	}
+	if len(v.stagedChunks) == 0 {
+		v.stagingMu.Unlock()
+		return
+	}
+	if v.closeTimer != nil {
+		v.closeTimer.Stop()
+		v.closeTimer = nil
+	}
+	v.closeInodes = nil
+
 	timeout := v.syncTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	if _, err := v.executeSyncLocked(ctx, true); err != nil {
+	if _, err := v.executeSyncLocked(ctx, true, nil); err != nil {
 		klog.Warningf("ObjectFS volume %s coalesce sync failed: %v", v.volumeID, err)
+	}
+}
+
+// syncInodesLocked executes a per-inode sync for targetInodes under stagingMu.
+// If any of targetInodes have staged chunks, it commits them; otherwise it
+// completes any waiters for targetInodes immediately.
+// Invariant: called with stagingMu held, always returns with stagingMu unlocked.
+func (v *Volume) syncInodesLocked(ctx context.Context, targetInodes map[uint64]struct{}) (uint64, error) {
+	hasStaged := false
+	for ino := range targetInodes {
+		if len(v.stagedChunks[ino]) > 0 {
+			hasStaged = true
+			break
+		}
+	}
+	if !hasStaged {
+		snapSeq := v.stagingSeq
+		pos := v.Position()
+		v.stagingMu.Unlock()
+		if err := v.finishSync(snapSeq, nil, nil, pos, targetInodes); err != nil {
+			klog.Warningf("ObjectFS volume %s close finishSync failed: %v", v.volumeID, err)
+			return pos, err
+		}
+		return pos, nil
+	}
+
+	return v.executeSyncLocked(ctx, true, targetInodes)
+}
+
+func (v *Volume) triggerCloseSync() {
+	v.stagingMu.Lock()
+	v.closeTimer = nil
+	for v.syncInProgress {
+		v.syncCond.Wait()
+	}
+	if len(v.closeInodes) == 0 {
+		v.stagingMu.Unlock()
+		return
+	}
+	targetInodes := v.closeInodes
+	v.closeInodes = make(map[uint64]struct{})
+
+	timeout := v.syncTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if _, err := v.syncInodesLocked(ctx, targetInodes); err != nil {
+		klog.Warningf("ObjectFS volume %s close sync failed: %v", v.volumeID, err)
 	}
 }
 
@@ -607,6 +691,11 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 			v.coalesceTimer.Stop()
 			v.coalesceTimer = nil
 		}
+		if v.closeTimer != nil {
+			v.closeTimer.Stop()
+			v.closeTimer = nil
+		}
+		v.closeInodes = nil
 
 		for v.syncInProgress {
 			v.syncCond.Wait()
@@ -624,48 +713,54 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 					return epoch, 0, err
 				}
 			}
-			return epoch, pos, v.finishSync(snapSeq, nil, nil, pos)
+			return epoch, pos, v.finishSync(snapSeq, nil, nil, pos, nil)
 		}
 
-		pos, err := v.executeSyncLocked(ctx, true)
+		pos, err := v.executeSyncLocked(ctx, true, nil)
 		return epoch, pos, err
 	}
 
 	// Non-blocking sync request
+	if trigger == pb.FsyncRequest_SYNC_TRIGGER_CLOSE {
+		if len(v.stagedChunks[inodeID]) == 0 {
+			pos := v.Position()
+			v.stagingMu.Unlock()
+			return epoch, pos, nil
+		}
+
+		if v.closeInodes == nil {
+			v.closeInodes = make(map[uint64]struct{})
+		}
+		v.closeInodes[inodeID] = struct{}{}
+
+		waitSeq := v.stagingSeq
+		waitCh := make(chan syncResult, 1)
+		v.coalesceWaiters = append(v.coalesceWaiters, &syncWaiter{seq: waitSeq, inodeID: inodeID, ch: waitCh})
+
+		if v.closeTimer == nil {
+			v.closeTimer = time.AfterFunc(closeCoalesceWindow, v.triggerCloseSync)
+		}
+
+		v.stagingMu.Unlock()
+
+		select {
+		case res := <-waitCh:
+			return epoch, res.pos, res.err
+		case <-ctx.Done():
+			return epoch, 0, ctx.Err()
+		}
+	}
+
+	// Periodic or unspecified non-blocking sync request
 	if len(v.stagedChunks) == 0 {
 		pos := v.Position()
 		v.stagingMu.Unlock()
 		return epoch, pos, nil
 	}
 
-	if trigger == pb.FsyncRequest_SYNC_TRIGGER_CLOSE {
-		if v.coalesceTimer != nil {
-			v.coalesceTimer.Stop()
-			v.coalesceTimer = nil
-		}
-
-		for v.syncInProgress {
-			v.syncCond.Wait()
-		}
-
-		if v.coalesceTimer != nil {
-			v.coalesceTimer.Stop()
-			v.coalesceTimer = nil
-		}
-
-		if len(v.stagedChunks) == 0 {
-			pos := v.Position()
-			v.stagingMu.Unlock()
-			return epoch, pos, nil
-		}
-
-		pos, err := v.executeSyncLocked(ctx, true)
-		return epoch, pos, err
-	}
-
 	waitSeq := v.stagingSeq
 	waitCh := make(chan syncResult, 1)
-	v.coalesceWaiters = append(v.coalesceWaiters, &syncWaiter{seq: waitSeq, ch: waitCh})
+	v.coalesceWaiters = append(v.coalesceWaiters, &syncWaiter{seq: waitSeq, inodeID: inodeID, ch: waitCh})
 
 	if v.coalesceTimer == nil {
 		v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
@@ -681,7 +776,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 	}
 }
 
-func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (uint64, error) {
+func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, inodeFilter map[uint64]struct{}) (uint64, error) {
 	// Must be called with v.stagingMu held.
 	// Invariant: ALWAYS returns with v.stagingMu UNLOCKED.
 	if len(v.stagedChunks) == 0 {
@@ -693,12 +788,17 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
 			}
 		}
-		return pos, v.finishSync(snapSeq, nil, nil, pos)
+		return pos, v.finishSync(snapSeq, nil, nil, pos, inodeFilter)
 	}
 
 	snapshotSeq := v.stagingSeq
-	snapshotChunks := make(map[uint64]map[int][]byte, len(v.stagedChunks))
+	snapshotChunks := make(map[uint64]map[int][]byte)
 	for ino, chunks := range v.stagedChunks {
+		if inodeFilter != nil {
+			if _, ok := inodeFilter[ino]; !ok {
+				continue
+			}
+		}
 		snapshotChunks[ino] = make(map[int][]byte, len(chunks))
 		for idx, data := range chunks {
 			cCopy := make([]byte, len(data))
@@ -706,13 +806,30 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 			snapshotChunks[ino][idx] = cCopy
 		}
 	}
-	snapshotSizes := make(map[uint64]int64, len(v.stagedSizes))
-	for ino, s := range v.stagedSizes {
-		snapshotSizes[ino] = s
+
+	if len(snapshotChunks) == 0 {
+		snapSeq := v.stagingSeq
+		pos := v.Position()
+		v.stagingMu.Unlock()
+		if v.stream != nil && v.stream.ReplicationLevel() == walclient.Permanent {
+			if err := v.stream.Flush(ctx); err != nil {
+				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
+			}
+		}
+		return pos, v.finishSync(snapSeq, nil, nil, pos, inodeFilter)
 	}
-	snapshotMtimes := make(map[uint64]time.Time, len(v.stagedMtimes))
-	for ino, m := range v.stagedMtimes {
-		snapshotMtimes[ino] = m
+
+	snapshotSizes := make(map[uint64]int64, len(snapshotChunks))
+	for ino := range snapshotChunks {
+		if s, ok := v.stagedSizes[ino]; ok {
+			snapshotSizes[ino] = s
+		}
+	}
+	snapshotMtimes := make(map[uint64]time.Time, len(snapshotChunks))
+	for ino := range snapshotChunks {
+		if m, ok := v.stagedMtimes[ino]; ok {
+			snapshotMtimes[ino] = m
+		}
 	}
 
 	v.syncInProgress = true
@@ -743,7 +860,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 			if currentBatchBytes+stream.Length() > maxPackCapBytes && len(currentBatch) > 0 {
 				if err := v.blobStore.PutBlobs(ctx, currentBatch); err != nil {
 					klog.Errorf("ObjectFS volume %s sync PutBlobs failed: %v", v.volumeID, err)
-					return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
+					return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 				}
 				currentBatch = make(map[string]blob.ByteStream)
 				currentBatchBytes = 0
@@ -754,7 +871,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 		if len(currentBatch) > 0 {
 			if err := v.blobStore.PutBlobs(ctx, currentBatch); err != nil {
 				klog.Errorf("ObjectFS volume %s sync PutBlobs failed: %v", v.volumeID, err)
-				return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
+				return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 			}
 		}
 	}
@@ -769,7 +886,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 		node, err := v.getOrLoadInodeLocked(ctx, tx, ino)
 		if err != nil {
 			v.mu.Unlock()
-			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
+			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 		}
 		nodes[ino] = node
 	}
@@ -807,7 +924,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 				InlineData: append([]byte(nil), inlineData...),
 			}); err != nil {
 				v.mu.Unlock()
-				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to log inline FileChunk: %w", err), snapshotChunks, 0)
+				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to log inline FileChunk: %w", err), snapshotChunks, 0, inodeFilter)
 			}
 
 			node.mutate(func(row *pb.Inode) {
@@ -833,7 +950,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 					Sha256: sha,
 				}); err != nil {
 					v.mu.Unlock()
-					return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to log FileChunk: %w", err), snapshotChunks, 0)
+					return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to log FileChunk: %w", err), snapshotChunks, 0, inodeFilter)
 				}
 			}
 
@@ -855,7 +972,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 			manifestBlob, mErr := blob.EncodeManifest(manifest)
 			if mErr != nil {
 				v.mu.Unlock()
-				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to encode manifest: %w", mErr), snapshotChunks, 0)
+				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to encode manifest: %w", mErr), snapshotChunks, 0, inodeFilter)
 			}
 			manifestHex := manifestBlob.SHA256Hex()
 
@@ -874,14 +991,14 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 
 		if _, err := tx.Update(ctx, node.Row); err != nil {
 			v.mu.Unlock()
-			return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to log inode update: %w", err), snapshotChunks, 0)
+			return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to log inode update: %w", err), snapshotChunks, 0, inodeFilter)
 		}
 	}
 
 	commitSeq, err := v.commitTxLocked(ctx, tx)
 	if err != nil {
 		v.mu.Unlock()
-		return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to commit sync transaction: %w", err), snapshotChunks, 0)
+		return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to commit sync transaction: %w", err), snapshotChunks, 0, inodeFilter)
 	}
 
 	for ino := range snapshotChunks {
@@ -896,17 +1013,17 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
+			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 		}
 	}
 	if v.stream != nil {
 		if requirePermanent && v.stream.ReplicationLevel() < walclient.Permanent {
 			err := fmt.Errorf("durability level permanent requested but %w", walclient.ErrDurabilityUnavailable)
-			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
+			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 		}
 		if v.stream.ReplicationLevel() == walclient.Permanent {
 			if err := v.stream.Flush(ctx); err != nil {
-				return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0)
+				return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 			}
 		}
 	}
@@ -920,7 +1037,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool) (
 		})
 	}
 
-	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq)
+	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
 }
 
 type memoryAppender struct {
@@ -1202,6 +1319,11 @@ func (v *Volume) Close() error {
 		v.coalesceTimer.Stop()
 		v.coalesceTimer = nil
 	}
+	if v.closeTimer != nil {
+		v.closeTimer.Stop()
+		v.closeTimer = nil
+	}
+	v.closeInodes = nil
 	for _, w := range v.coalesceWaiters {
 		w.ch <- syncResult{err: fmt.Errorf("volume closed")}
 		close(w.ch)
@@ -4449,7 +4571,7 @@ func (v *Volume) FlushToBackend(ctx context.Context) error {
 		v.syncCond.Wait()
 	}
 	if len(v.stagedChunks) > 0 {
-		if _, err := v.executeSyncLocked(ctx, false); err != nil {
+		if _, err := v.executeSyncLocked(ctx, false, nil); err != nil {
 			return err
 		}
 	} else {

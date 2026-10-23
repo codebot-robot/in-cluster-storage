@@ -29,6 +29,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -100,6 +101,8 @@ type ObjectFS struct {
 	syncOnClose            bool
 	backgroundSyncInterval time.Duration
 	syncTrigger            chan struct{}
+	closedInodesMu         sync.Mutex
+	closedInodes           map[uint64]struct{}
 	errMu                  sync.Mutex
 	lastLoggedErr          time.Time
 
@@ -158,6 +161,7 @@ func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string
 		syncOnClose:            true,
 		backgroundSyncInterval: 30 * time.Second,
 		syncTrigger:            make(chan struct{}, 1),
+		closedInodes:           make(map[uint64]struct{}),
 		manifests:              make(map[uint64]*fileManifest),
 		activePrefetches:       make(map[uint64]*prefetchHandle),
 		lastReadChunk:          make(map[uint64]int),
@@ -350,7 +354,7 @@ func (fs *ObjectFS) StartBackgroundSync(ctx context.Context) {
 				cancel()
 			case <-fs.syncTrigger:
 				syncCtx, cancel := context.WithTimeout(ctx, fs.syncTimeout)
-				if err := fs.syncVolumeNonBlocking(syncCtx, pb.FsyncRequest_SYNC_TRIGGER_CLOSE); err != nil {
+				if err := fs.syncClosedInodes(syncCtx); err != nil {
 					klog.Warningf("ObjectFS volume %s sync on close failed: %v", fs.volumeID, err)
 				}
 				cancel()
@@ -2032,10 +2036,123 @@ func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context, trigger pb.FsyncR
 	return nil
 }
 
-func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking bool) error {
+func (fs *ObjectFS) syncClosedInodes(ctx context.Context) error {
+	fs.closedInodesMu.Lock()
+	if len(fs.closedInodes) == 0 {
+		fs.closedInodesMu.Unlock()
+		return nil
+	}
+	inodes := make([]uint64, 0, len(fs.closedInodes))
+	for ino := range fs.closedInodes {
+		inodes = append(inodes, ino)
+	}
+	fs.closedInodes = make(map[uint64]struct{})
+	fs.closedInodesMu.Unlock()
+
+	type pendingFsync struct {
+		inode uint64
+		epoch int64
+		runs  [][]int
+		gens  map[int]Generation
+	}
+	var pending []pendingFsync
+	for _, ino := range inodes {
+		epoch, runs, gens, err := fs.pushDirtyChunksToStaging(ctx, ino)
+		if err != nil {
+			return err
+		}
+		if len(runs) > 0 {
+			pending = append(pending, pendingFsync{
+				inode: ino,
+				epoch: epoch,
+				runs:  runs,
+				gens:  gens,
+			})
+		}
+	}
+
+	if len(pending) == 0 {
+		return nil
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	for _, item := range pending {
+		item := item
+		g.Go(func() error {
+			resp, err := fs.client.Fsync(gctx, &pb.FsyncRequest{
+				VolumeId:     fs.volumeID,
+				Inode:        item.inode,
+				Blocking:     false,
+				StagingEpoch: item.epoch,
+				Trigger:      pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+			})
+			if err != nil {
+				fs.logRPCError("Fsync", err)
+				return err
+			}
+			if resp.GetError() == int32(syscall.ESTALE) || (resp.GetStagingEpoch() != 0 && item.epoch != 0 && resp.GetStagingEpoch() != item.epoch) {
+				// Controller restarted / staging epoch changed; re-push dirty chunks and retry Fsync
+				newEpoch, newRuns, newGens, reErr := fs.pushDirtyChunksToStaging(gctx, item.inode)
+				if reErr != nil {
+					return reErr
+				}
+				retryResp, rErr := fs.client.Fsync(gctx, &pb.FsyncRequest{
+					VolumeId:     fs.volumeID,
+					Inode:        item.inode,
+					Blocking:     false,
+					StagingEpoch: newEpoch,
+					Trigger:      pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+				})
+				if rErr != nil {
+					fs.logRPCError("Fsync(retry)", rErr)
+					return rErr
+				}
+				if retryResp.GetError() != 0 {
+					return syscall.Errno(retryResp.GetError())
+				}
+				for _, run := range newRuns {
+					for _, idx := range run {
+						fs.cache.MarkChunkClean(item.inode, idx, newGens[idx])
+					}
+				}
+				fs.invalidateManifest(item.inode)
+				if fs.cache != nil && retryResp.GetStreamPosition() > 0 {
+					fs.cache.RecordPosition(item.inode, retryResp.GetStreamPosition())
+				}
+				if fs.diskCache != nil {
+					fs.cache.InvalidateAllClean()
+				}
+				return nil
+			}
+			if resp.GetError() != 0 {
+				return syscall.Errno(resp.GetError())
+			}
+
+			for _, run := range item.runs {
+				for _, idx := range run {
+					fs.cache.MarkChunkClean(item.inode, idx, item.gens[idx])
+				}
+			}
+			fs.invalidateManifest(item.inode)
+			if fs.cache != nil && resp.GetStreamPosition() > 0 {
+				fs.cache.RecordPosition(item.inode, resp.GetStreamPosition())
+			}
+			if fs.diskCache != nil {
+				fs.cache.InvalidateAllClean()
+			}
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking bool, trigger pb.FsyncRequest_SyncTrigger) error {
 	epoch, runs, chunkGens, err := fs.pushDirtyChunksToStaging(ctx, inode)
 	if err != nil {
 		return err
+	}
+	if len(runs) == 0 && !blocking {
+		return nil
 	}
 
 	resp, err := fs.client.Fsync(ctx, &pb.FsyncRequest{
@@ -2043,6 +2160,7 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 		Inode:        inode,
 		Blocking:     blocking,
 		StagingEpoch: epoch,
+		Trigger:      trigger,
 	})
 	if err != nil {
 		fs.logRPCError("Fsync", err)
@@ -2059,6 +2177,7 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 			Inode:        inode,
 			Blocking:     blocking,
 			StagingEpoch: newEpoch,
+			Trigger:      trigger,
 		})
 		if rErr != nil {
 			fs.logRPCError("Fsync(retry)", rErr)
@@ -2101,7 +2220,7 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 }
 
 func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
-	return fs.syncAndFsync(ctx, inode, true)
+	return fs.syncAndFsync(ctx, inode, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED)
 }
 
 func (fs *ObjectFS) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
@@ -2119,7 +2238,7 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 	ctx, cancelFunc := fs.makeSyncContext(cancel)
 	defer cancelFunc()
 
-	if err := fs.syncAndFsync(ctx, input.NodeId, true); err != nil {
+	if err := fs.syncAndFsync(ctx, input.NodeId, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
 		return fs.grpcErrorToStatus("Fsync", err)
 	}
 	return fuse.OK
@@ -2138,6 +2257,9 @@ func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 
 	if fs.syncOnClose {
 		if fs.cache.IsInodeDirty(input.NodeId) {
+			fs.closedInodesMu.Lock()
+			fs.closedInodes[input.NodeId] = struct{}{}
+			fs.closedInodesMu.Unlock()
 			select {
 			case fs.syncTrigger <- struct{}{}:
 			default:

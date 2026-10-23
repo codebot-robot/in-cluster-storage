@@ -27,6 +27,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"golang.org/x/sync/errgroup"
 )
 
 type recordingBackend struct {
@@ -633,9 +634,9 @@ func TestStageAndSync_CloseTriggerStartsCoalescedSyncImmediately(t *testing.T) {
 	}
 }
 
-// TestStageAndSync_CloseTriggerPreemptsActiveWindow verifies that a CLOSE-triggered
-// non-blocking Fsync arriving during an active coalesce window preempts the window
-// immediately, uploading a single packfile containing writes from both callers.
+// TestStageAndSync_CloseTriggerPreemptsActiveWindow verifies that multiple CLOSE-triggered
+// non-blocking Fsyncs arriving during the short close coalesce floor window share a single
+// packfile and unblock promptly.
 func TestStageAndSync_CloseTriggerPreemptsActiveWindow(t *testing.T) {
 	ctx := t.Context()
 	rawBackend := NewMemoryBackend()
@@ -645,7 +646,7 @@ func TestStageAndSync_CloseTriggerPreemptsActiveWindow(t *testing.T) {
 	volumeID := "test-close-preempt-window-vol"
 	defer func() { _ = server.Close() }()
 
-	// File 1 writes and issues non-blocking periodic sync (arms 10s window)
+	// File 1 writes and issues non-blocking CLOSE sync (starts floor window)
 	cResp1, _ := testCreateFile(ctx, server, volumeID, "/file1.bin", 0644, nil, 0, 0)
 	ino1 := cResp1.GetAttr().GetInode().GetIno()
 	_, _ = server.WriteFile(ctx, &pb.WriteFileRequest{
@@ -655,23 +656,23 @@ func TestStageAndSync_CloseTriggerPreemptsActiveWindow(t *testing.T) {
 		Data:     bytes.Repeat([]byte("1"), 64*1024),
 	})
 
-	periodicDone := make(chan struct{})
+	closeDone1 := make(chan struct{})
 	go func() {
-		defer close(periodicDone)
+		defer close(closeDone1)
 		_, _ = server.Fsync(ctx, &pb.FsyncRequest{
 			VolumeId: volumeID,
 			Inode:    ino1,
 			Blocking: false,
-			Trigger:  pb.FsyncRequest_SYNC_TRIGGER_PERIODIC,
+			Trigger:  pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
 		})
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 	if backend.getPackCount() != 0 {
 		t.Fatalf("Packs uploaded too early before window flush")
 	}
 
-	// File 2 writes and issues non-blocking CLOSE-triggered sync
+	// File 2 writes and issues non-blocking CLOSE-triggered sync within floor window
 	cResp2, _ := testCreateFile(ctx, server, volumeID, "/file2.bin", 0644, nil, 0, 0)
 	ino2 := cResp2.GetAttr().GetInode().GetIno()
 	_, _ = server.WriteFile(ctx, &pb.WriteFileRequest{
@@ -697,16 +698,193 @@ func TestStageAndSync_CloseTriggerPreemptsActiveWindow(t *testing.T) {
 		t.Fatalf("Close-triggered Fsync waited for coalesce window instead of preempting: took %v", elapsed)
 	}
 
-	// File 1's periodic waiter should also have unblocked promptly
+	// File 1's close waiter should also have unblocked promptly
 	select {
-	case <-periodicDone:
+	case <-closeDone1:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("Periodic non-blocking waiter was not notified by preempting close sync")
+		t.Fatalf("Close-triggered waiter 1 was not notified by coalesced close sync")
 	}
 
 	// Exactly 1 packfile created containing writes from both files
 	if cnt := backend.getPackCount(); cnt != 1 {
 		t.Fatalf("Expected exactly 1 packfile containing both writes, got %d", cnt)
+	}
+}
+
+// TestStageAndSync_TenConcurrentCloseRequestsCoalesceIntoOnePack verifies that ten
+// CLOSE-triggered non-blocking Fsync requests in flight concurrently coalesce into a single packfile.
+func TestStageAndSync_TenConcurrentCloseRequestsCoalesceIntoOnePack(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	backend := newRecordingBackend(rawBackend)
+	server := NewServer(backend, WithServerSyncCoalesceWindow(10*time.Second))
+	volumeID := "test-ten-concurrent-close-vol"
+	defer func() { _ = server.Close() }()
+
+	const numFiles = 10
+	inodes := make([]uint64, numFiles)
+	for i := 0; i < numFiles; i++ {
+		fname := fmt.Sprintf("/c%d.bin", i)
+		cResp, err := testCreateFile(ctx, server, volumeID, fname, 0644, nil, 0, 0)
+		if err != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, err)
+		}
+		ino := cResp.GetAttr().GetInode().GetIno()
+		inodes[i] = ino
+		_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId: volumeID,
+			Inode:    ino,
+			Offset:   0,
+			Data:     bytes.Repeat([]byte{byte(i + 1)}, 64*1024),
+		})
+		if err != nil {
+			t.Fatalf("WriteFile %d failed: %v", i, err)
+		}
+	}
+
+	startBarrier := make(chan struct{})
+	g, gctx := errgroup.WithContext(ctx)
+	for _, ino := range inodes {
+		ino := ino
+		g.Go(func() error {
+			<-startBarrier
+			resp, err := server.Fsync(gctx, &pb.FsyncRequest{
+				VolumeId: volumeID,
+				Inode:    ino,
+				Blocking: false,
+				Trigger:  pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+			})
+			if err != nil {
+				return err
+			}
+			if !resp.GetSuccess() {
+				return fmt.Errorf("Fsync for inode %d returned success=false", ino)
+			}
+			return nil
+		})
+	}
+
+	close(startBarrier)
+	if err := g.Wait(); err != nil {
+		t.Fatalf("Concurrent close-triggered Fsyncs failed: %v", err)
+	}
+
+	if cnt := backend.getPackCount(); cnt != 1 {
+		t.Fatalf("Expected exactly 1 packfile for ten concurrent close requests, got %d", cnt)
+	}
+}
+
+// TestStageAndSync_CloseTriggerSyncsOnlyClosedInodeLeavesStagedWindow verifies that a
+// CLOSE-triggered sync with inode A staged alongside a large inode B commits A,
+// leaves B staged (with B's waiter not completed), and that the following window
+// sync commits B and completes B's waiter.
+func TestStageAndSync_CloseTriggerSyncsOnlyClosedInodeLeavesStagedWindow(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	backend := newRecordingBackend(rawBackend)
+	// 500ms coalesce window so the periodic window sync fires without a long delay
+	server := NewServer(backend, WithServerSyncCoalesceWindow(500*time.Millisecond))
+	volumeID := "test-close-per-inode-vol"
+	defer func() { _ = server.Close() }()
+
+	// 1. Inode B stages a large write (256 KiB) and issues non-blocking periodic Fsync
+	cRespB, _ := testCreateFile(ctx, server, volumeID, "/fileB.bin", 0644, nil, 0, 0)
+	inoB := cRespB.GetAttr().GetInode().GetIno()
+	dataB := bytes.Repeat([]byte("B"), 256*1024)
+	_, _ = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    inoB,
+		Offset:   0,
+		Data:     dataB,
+	})
+
+	waiterBDone := make(chan struct{})
+	go func() {
+		defer close(waiterBDone)
+		_, _ = server.Fsync(ctx, &pb.FsyncRequest{
+			VolumeId: volumeID,
+			Inode:    inoB,
+			Blocking: false,
+			Trigger:  pb.FsyncRequest_SYNC_TRIGGER_PERIODIC,
+		})
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	if backend.getPackCount() != 0 {
+		t.Fatalf("Packs uploaded before any sync fired")
+	}
+
+	// 2. Inode A stages a small write (64 KiB) and issues CLOSE-triggered Fsync
+	cRespA, _ := testCreateFile(ctx, server, volumeID, "/fileA.bin", 0644, nil, 0, 0)
+	inoA := cRespA.GetAttr().GetInode().GetIno()
+	dataA := bytes.Repeat([]byte("A"), 64*1024)
+	_, _ = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    inoA,
+		Offset:   0,
+		Data:     dataA,
+	})
+
+	start := time.Now()
+	respA, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    inoA,
+		Blocking: false,
+		Trigger:  pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+	})
+	elapsed := time.Since(start)
+
+	if err != nil || !respA.GetSuccess() {
+		t.Fatalf("Close-triggered Fsync for A failed: %v, resp=%v", err, respA)
+	}
+	if elapsed >= 400*time.Millisecond {
+		t.Fatalf("Close-triggered Fsync took too long: %v", elapsed)
+	}
+
+	// Inode A must be committed in exactly 1 packfile
+	if cnt := backend.getPackCount(); cnt != 1 {
+		t.Fatalf("Expected exactly 1 packfile after A's close sync, got %d", cnt)
+	}
+
+	// Inode A is durable on backend; Inode B is NOT yet durable on backend
+	rRespA, _ := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    inoA,
+		Offset:   0,
+		Size:     int64(len(dataA)),
+	})
+	if !bytes.Equal(rRespA.GetData(), dataA) {
+		t.Fatalf("ReadFile A on server did not match written data")
+	}
+
+	// Inode B's periodic waiter must NOT have completed yet
+	select {
+	case <-waiterBDone:
+		t.Fatalf("Waiter for inode B completed prematurely on inode A's close sync")
+	default:
+	}
+
+	// 3. Now wait for the coalesce window to fire for Inode B
+	select {
+	case <-waiterBDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Waiter for inode B did not complete on following coalesce window")
+	}
+
+	// Now exactly 2 packfiles must exist: one for A and one for B
+	if cnt := backend.getPackCount(); cnt != 2 {
+		t.Fatalf("Expected exactly 2 packfiles after window sync (1 for A, 1 for B), got %d", cnt)
+	}
+
+	// Inode B is now durable on backend
+	rRespB, _ := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    inoB,
+		Offset:   0,
+		Size:     int64(len(dataB)),
+	})
+	if !bytes.Equal(rRespB.GetData(), dataB) {
+		t.Fatalf("ReadFile B on server did not match written data after window sync")
 	}
 }
 
