@@ -2595,10 +2595,6 @@ func (s *fakeBlockingStream) Degraded() *walclient.DegradedError {
 	return nil
 }
 
-func (s *fakeBlockingStream) Dir() string {
-	return ""
-}
-
 func (s *fakeBlockingStream) Close() error {
 	return nil
 }
@@ -6473,56 +6469,19 @@ func TestControllerRepairVolume(t *testing.T) {
 
 	storage := NewMemoryBackend()
 	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
 
 	vol1ID := "repair-vol-1"
 	vol2ID := "healthy-vol-2"
-
-	walDir1 := filepath.Join(dir, "wal1")
 	streamID1 := StreamIDForVolume(vol1ID)
-	realStream1, err := walclient.Open(ctx, walDir1, streamID1, walTarget)
-	if err != nil {
-		t.Fatalf("Open realStream1 failed: %v", err)
-	}
-
-	walDir2 := filepath.Join(dir, "wal2")
 	streamID2 := StreamIDForVolume(vol2ID)
-	stream2, err := walclient.Open(ctx, walDir2, streamID2, walTarget)
-	if err != nil {
-		t.Fatalf("Open stream2 failed: %v", err)
-	}
-	defer stream2.Close()
-
-	faultStream1 := &faultInjectingStream{
-		Stream:   realStream1,
-		streamID: streamID1,
-	}
-
-	var mu sync.Mutex
-	reopened := false
 
 	server := NewServer(storage,
-		WithServerStreamFactory(func(volID string) (walclient.Stream, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			if volID == vol1ID {
-				if reopened {
-					newStream, err := walclient.Open(ctx, walDir1, streamID1, walTarget)
-					if err != nil {
-						return nil, err
-					}
-					return newStream, nil
-				}
-				return faultStream1, nil
-			}
-			if volID == vol2ID {
-				return stream2, nil
-			}
-			return nil, fmt.Errorf("unexpected volume %s", volID)
-		}),
+		WithServerWAL(walDir, walTarget, walclient.Witness),
 	)
 	defer server.Close()
 
-	// 1. Initialize data on both volumes
+	// 1. Initialize data on both volumes using shared walDir
 	init1, err := server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       vol1ID,
 		ParentInode:    1,
@@ -6543,15 +6502,39 @@ func TestControllerRepairVolume(t *testing.T) {
 		t.Fatalf("CreateFile vol2 failed: %v, resp: %v", err, init2)
 	}
 
-	wal2EntriesBefore, err := os.ReadDir(walDir2)
+	// Read entries in shared walDir before repair
+	walEntriesBefore, err := os.ReadDir(walDir)
 	if err != nil {
-		t.Fatalf("ReadDir walDir2 failed: %v", err)
+		t.Fatalf("ReadDir walDir failed: %v", err)
 	}
-	if len(wal2EntriesBefore) == 0 {
-		t.Fatalf("expected segment files in walDir2 before repair")
+	var vol2FilesBefore []string
+	var vol1FilesBefore []string
+	vol2Prefix := fmt.Sprintf("stream-%s-", streamID2.String())
+	vol1Prefix := fmt.Sprintf("stream-%s-", streamID1.String())
+	for _, e := range walEntriesBefore {
+		if strings.HasPrefix(e.Name(), vol2Prefix) {
+			vol2FilesBefore = append(vol2FilesBefore, e.Name())
+		}
+		if strings.HasPrefix(e.Name(), vol1Prefix) {
+			vol1FilesBefore = append(vol1FilesBefore, e.Name())
+		}
+	}
+	if len(vol2FilesBefore) == 0 {
+		t.Fatalf("expected segment files for vol2 in walDir before repair")
+	}
+	if len(vol1FilesBefore) == 0 {
+		t.Fatalf("expected segment files for vol1 in walDir before repair")
 	}
 
-	// 2. Degrade vol1
+	// 2. Degrade vol1 by wrapping its active stream with faultInjectingStream
+	vol1 := mustGetVolume(t, server, vol1ID)
+	faultStream1 := &faultInjectingStream{
+		Stream:   vol1.Stream(),
+		streamID: streamID1,
+	}
+	if err := vol1.ResetStream(faultStream1); err != nil {
+		t.Fatalf("ResetStream failed: %v", err)
+	}
 	faultStream1.degrade(fmt.Errorf("injected disk failure on vol1"))
 
 	vol1Stats, err := server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: vol1ID})
@@ -6579,11 +6562,16 @@ func TestControllerRepairVolume(t *testing.T) {
 		t.Fatalf("expected FailedPrecondition, got: %v", err)
 	}
 
-	// 4. RepairVolume on degraded vol1
-	mu.Lock()
-	reopened = true
-	mu.Unlock()
+	// Also verify RepairVolume on nonexistent volume returns NotFound
+	_, err = server.RepairVolume(ctx, &pb.RepairVolumeRequest{VolumeId: "nonexistent-vol", Force: false})
+	if err == nil {
+		t.Fatalf("expected RepairVolume on nonexistent volume to fail")
+	}
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound, got: %v", err)
+	}
 
+	// 4. RepairVolume on degraded vol1
 	repairResp, err := server.RepairVolume(ctx, &pb.RepairVolumeRequest{VolumeId: vol1ID, Force: false})
 	if err != nil {
 		t.Fatalf("RepairVolume vol1 failed: %v", err)
@@ -6593,24 +6581,49 @@ func TestControllerRepairVolume(t *testing.T) {
 	if !strings.HasSuffix(oldPath, ".degraded") {
 		t.Fatalf("expected oldPath to have suffix '.degraded', got: %s", oldPath)
 	}
+	if !strings.Contains(oldPath, fmt.Sprintf("stream-%s", streamID1.String())) {
+		t.Fatalf("expected oldPath to contain stream-%s, got: %s", streamID1.String(), oldPath)
+	}
 	if _, err := os.Stat(oldPath); err != nil {
 		t.Fatalf("expected moved segment directory %s to exist: %v", oldPath, err)
 	}
 
-	// 5. Verify other volume (vol2) was NEVER touched
-	wal2EntriesAfter, err := os.ReadDir(walDir2)
+	// Verify vol1's previous segment files are now inside oldPath
+	oldEntries, err := os.ReadDir(oldPath)
 	if err != nil {
-		t.Fatalf("ReadDir walDir2 after failed: %v", err)
+		t.Fatalf("ReadDir oldPath failed: %v", err)
 	}
-	if len(wal2EntriesAfter) != len(wal2EntriesBefore) {
-		t.Fatalf("expected walDir2 untouched (entries: %d vs %d)", len(wal2EntriesAfter), len(wal2EntriesBefore))
+	if len(oldEntries) == 0 {
+		t.Fatalf("expected moved segment files in %s, got 0", oldPath)
 	}
-	wal2DegradedMatches, _ := filepath.Glob(filepath.Join(dir, "wal2.*.degraded"))
-	if len(wal2DegradedMatches) > 0 {
-		t.Fatalf("walDir2 was moved aside during vol1 repair: %v", wal2DegradedMatches)
+	for _, e := range oldEntries {
+		if !strings.HasPrefix(e.Name(), vol1Prefix) {
+			t.Fatalf("unexpected file %s in degraded directory %s", e.Name(), oldPath)
+		}
 	}
 
-	// 6. Verify vol1 accepts an fsynced write afterwards
+	// 5. Verify other volume (vol2)'s files are STILL IN PLACE BY NAME
+	for _, name := range vol2FilesBefore {
+		p := filepath.Join(walDir, name)
+		if fi, err := os.Stat(p); err != nil || fi.IsDir() {
+			t.Fatalf("expected vol2 segment file %s to still be in place in %s: %v", name, walDir, err)
+		}
+	}
+	vol2DegradedMatches, _ := filepath.Glob(filepath.Join(walDir, fmt.Sprintf("stream-%s.*.degraded", streamID2.String())))
+	if len(vol2DegradedMatches) > 0 {
+		t.Fatalf("walDir files for vol2 were moved aside during vol1 repair: %v", vol2DegradedMatches)
+	}
+
+	// 6. Verify vol2 continues operating normally
+	read2, err := testReadFile(ctx, server, vol2ID, "/file2.txt", 0, 100)
+	if err != nil {
+		t.Fatalf("ReadFile on vol2 failed after vol1 repair: %v", err)
+	}
+	if string(read2.GetData()) != "content2" {
+		t.Fatalf("unexpected data on vol2: %s", string(read2.GetData()))
+	}
+
+	// 7. Verify vol1 accepts an fsynced write afterwards
 	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       vol1ID,
 		ParentInode:    1,

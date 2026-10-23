@@ -485,7 +485,7 @@ The gRPC contract between `objectfs-node-daemon` and `objectfs-controller` is de
 | | `CreateSnapshot` | Manually triggers an immediate EROFS snapshot compilation. |
 | | `Checkpoint` | Triggers an explicit checkpoint commit on an exclusive-local volume and waits for acknowledgement. |
 | | `AckCheckpoint` | Acknowledges completion of an explicit checkpoint commit by a node daemon. |
-| | `RepairVolume` | Moves degraded local segment directory aside and reopens stream from witness watermark. |
+| | `RepairVolume` | Moves volume's degraded segment files aside and reopens stream from witness watermark. |
 
 ---
 
@@ -542,8 +542,8 @@ objectfsctl --server <controller-addr> volumes repair <volume-id>
 
 This is backed by the `RepairVolume` RPC:
 1. Closes the volume's active WAL stream and segment store.
-2. Moves the volume's local segment directory aside as `<dir>.<unix-ts>.degraded` (never deletes files).
-3. Reopens the stream in a clean directory, resuming sequence numbering from the buffer's authoritative witness watermark.
+2. Moves the volume's local segment files aside into `<dir>/stream-<id>.<unix-ts>.degraded/` (never deletes files).
+3. Reopens the stream, resuming sequence numbering from the buffer's authoritative witness watermark.
 4. Clears the degraded state and restores full read-write availability.
 5. Leaves all other volumes on the controller untouched.
 

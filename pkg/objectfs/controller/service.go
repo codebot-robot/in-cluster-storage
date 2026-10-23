@@ -1484,7 +1484,7 @@ func (s *Server) GetExclusiveHold(ctx context.Context, req *pb.GetExclusiveHoldR
 }
 
 // RepairVolume repairs a degraded volume by closing its stream and segment store,
-// moving the local segment directory aside as <dir>.<unix-ts>.degraded, and reopening
+// moving the volume's local segment files aside as <dir>/stream-<id>.<unix-ts>.degraded, and reopening
 // the stream to resume from the buffer witness watermark.
 func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) (*pb.RepairVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
@@ -1492,9 +1492,11 @@ func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) 
 		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q", volumeID)
 	}
 
-	vol, err := s.getOrCreateVolume(volumeID)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "volume %s not found: %v", volumeID, err)
+	s.mu.RLock()
+	vol, ok := s.volumes[volumeID]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
 	}
 
 	if deg := vol.Degraded(); deg == nil && !req.GetForce() {
@@ -1506,37 +1508,20 @@ func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) 
 		return nil, status.Errorf(codes.FailedPrecondition, "volume %s has no WAL stream configured", volumeID)
 	}
 
-	dir := stream.Dir()
-	var oldPath string
-
 	if err := stream.Close(); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to close stream for volume %s: %v", volumeID, err)
 	}
 
-	if dir != "" {
-		if _, statErr := os.Stat(dir); statErr != nil {
-			if !errors.Is(statErr, os.ErrNotExist) {
-				return nil, status.Errorf(codes.Internal, "failed to stat segment directory for volume %s: %v", volumeID, statErr)
-			}
-		} else {
-			oldPath = fmt.Sprintf("%s.%d.degraded", dir, time.Now().Unix())
-			if _, existsErr := os.Stat(oldPath); existsErr != nil {
-				if !errors.Is(existsErr, os.ErrNotExist) {
-					return nil, status.Errorf(codes.Internal, "failed to check existing degraded directory for volume %s: %v", volumeID, existsErr)
-				}
-			} else {
-				oldPath = fmt.Sprintf("%s.%d.degraded", dir, time.Now().UnixNano())
-			}
-			if renErr := os.Rename(dir, oldPath); renErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to move segment directory aside for volume %s: %v", volumeID, renErr)
-			}
-			if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to recreate segment directory for volume %s: %v", volumeID, mkErr)
-			}
+	var oldPath string
+	if s.walDir != "" {
+		movedPath, err := walclient.MoveSegmentsAside(s.walDir, vol.StreamID())
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to move segment directory aside for volume %s: %v", volumeID, err)
 		}
+		oldPath = movedPath
 	}
 
-	newStream, err := s.openStreamForVolume(volumeID, dir)
+	newStream, err := s.openStreamForVolume(volumeID, s.walDir)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to reopen stream for volume %s: %v", volumeID, err)
 	}
