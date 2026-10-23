@@ -22,6 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -108,8 +111,6 @@ type Stream interface {
 	Tail(ctx context.Context, fromSeq uint64) (iter.Seq2[uint64, []byte], error)
 	// Degraded returns any fatal, unrecoverable stream error encountered by the stream.
 	Degraded() *DegradedError
-	// Dir returns the local directory where WAL segment files are stored.
-	Dir() string
 	Close() error
 }
 
@@ -627,11 +628,6 @@ func (s *streamImpl) RecoveredRecords() []*wal.ClientRecord {
 	recs := make([]*wal.ClientRecord, len(s.retainedRecords))
 	copy(recs, s.retainedRecords)
 	return recs
-}
-
-// Dir returns the local directory where WAL segment files are stored.
-func (s *streamImpl) Dir() string {
-	return s.dir
 }
 
 // Degraded returns any fatal, unrecoverable stream error encountered by the stream.
@@ -1179,4 +1175,51 @@ func TailStream(ctx context.Context, target string, streamID uuid.UUID, fromSeq 
 	}
 
 	return iterator, nil
+}
+
+// MoveSegmentsAside moves all segment files and any .recover backup files for streamID
+// in dir aside into a subdirectory named stream-<id>.<unix-ts>.degraded.
+// It returns the path to the degraded directory.
+func MoveSegmentsAside(dir string, streamID uuid.UUID) (string, error) {
+	if dir == "" {
+		return "", nil
+	}
+
+	targetDir := filepath.Join(dir, fmt.Sprintf("stream-%s.%d.degraded", streamID.String(), time.Now().Unix()))
+	if _, err := os.Stat(targetDir); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("failed to stat degraded directory %s: %w", targetDir, err)
+		}
+	} else {
+		targetDir = filepath.Join(dir, fmt.Sprintf("stream-%s.%d.degraded", streamID.String(), time.Now().UnixNano()))
+	}
+
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create degraded directory %s: %w", targetDir, err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return targetDir, nil
+		}
+		return "", fmt.Errorf("failed to read directory %s: %w", dir, err)
+	}
+
+	prefix := fmt.Sprintf("stream-%s-", streamID.String())
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, prefix) && (strings.HasSuffix(name, ".wal") || strings.Contains(name, ".recover")) {
+			src := filepath.Join(dir, name)
+			dst := filepath.Join(targetDir, name)
+			if err := os.Rename(src, dst); err != nil {
+				return "", fmt.Errorf("failed to move segment file %s aside to %s: %w", src, dst, err)
+			}
+		}
+	}
+
+	return targetDir, nil
 }
