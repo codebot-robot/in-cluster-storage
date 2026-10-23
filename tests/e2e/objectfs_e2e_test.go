@@ -1147,6 +1147,8 @@ spec:
 		walManifest := string(b)
 		walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
 		walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
+		walNodeSelectorNode1 := fmt.Sprintf("nodeSelector:\n        kubernetes.io/hostname: %s\n      tolerations:\n        - key: \"node-role.kubernetes.io/control-plane\"\n          operator: \"Exists\"\n          effect: \"NoSchedule\"\n      serviceAccountName: wal-buffer", sharedMultiNode1)
+		walManifest = strings.ReplaceAll(walManifest, "serviceAccountName: wal-buffer", walNodeSelectorNode1)
 
 		awsEnvWAL := `env:
             - name: AWS_ACCESS_KEY_ID
@@ -1241,6 +1243,9 @@ spec:
 		t.Logf("Warning: failed to query pvcs in default: %v", err)
 	} else {
 		for _, pvc := range strings.Fields(string(outPVC)) {
+			if strings.HasPrefix(pvc, "data-dir-wal-buffer") {
+				continue
+			}
 			if err := exec.Command("kubectl", "delete", "pvc", pvc, "-n", "default", "--ignore-not-found").Run(); err != nil {
 				t.Logf("Warning: failed to delete leftover pvc %s in default: %v", pvc, err)
 			}

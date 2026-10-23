@@ -88,11 +88,24 @@ spec:
           volumeMounts:
             - name: data-dir
               mountPath: /var/lib/objectfs/wal-buffer
-      volumes:
-        - name: data-dir
-          hostPath:
-            path: /var/lib/objectfs/wal-buffer
-            type: DirectoryOrCreate
+  # Persistent volume for WAL buffer segment storage.
+  # Uses the cluster's default StorageClass (e.g. standard).
+  # For local single-node development without dynamic volume provisioning (dev-only),
+  # volumeClaimTemplates can be omitted and replaced by a hostPath volume in spec.template.spec.volumes:
+  # volumes:
+  #   - name: data-dir
+  #     hostPath:
+  #       path: /var/lib/objectfs/wal-buffer
+  #       type: DirectoryOrCreate
+  volumeClaimTemplates:
+    - metadata:
+        name: data-dir
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
 
 ---
 
