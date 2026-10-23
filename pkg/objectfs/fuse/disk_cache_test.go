@@ -397,4 +397,3 @@ func TestDiskBlobCacheFetchCloseError(t *testing.T) {
 		t.Fatalf("subsequent FetchBlob returned unexpected data")
 	}
 }
-
