@@ -379,7 +379,7 @@ func newVolumesRepairCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("volume ID is required")
 			}
 
-			client, conn, err := dialServer(repairOpts.serverAddr)
+			client, conn, err := dialServer(repairOpts.options)
 			if err != nil {
 				return err
 			}
@@ -408,7 +408,7 @@ func newVolumesRepairCommand(opts *options) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&repairOpts.force, "force", false, "Force repair even if volume is not currently reported as degraded")
+	cmd.Flags().BoolVar(&repairOpts.force, "force", false, "Force repair even if volume is not currently reported as degraded (closes stream under in-flight operations, causing them to fail)")
 	return cmd
 }
 
