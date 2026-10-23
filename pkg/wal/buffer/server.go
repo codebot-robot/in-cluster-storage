@@ -212,6 +212,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 	// Populate initial streams state recovered from flushed segments
 	for sid, seq := range streamWatermarks {
+		klog.Infof("WAL buffer: recovered stream %s: watermark=%d", sid, seq)
 		s.streams[sid] = newStreamState(seq, seq)
 	}
 
@@ -321,6 +322,8 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	witnessSeq := st.witnessSeq
 	s3Seq := st.s3Seq
 	st.mu.Unlock()
+
+	klog.Infof("WAL buffer: Hello received for stream %s: witness watermark=%d, s3 watermark=%d", streamID, witnessSeq, s3Seq)
 
 	// Deduped / single sender channel to prevent concurrent stream.Send calls
 	outCh := make(chan *pb.AppendResponse, 64)
@@ -591,6 +594,10 @@ func (s *Server) commitItems(items []incomingItem) {
 	s.tailMu.Unlock()
 
 	// 3. Update stream witness watermarks and send results
+	streamCounts := make(map[string]int)
+	streamMinSeq := make(map[string]uint64)
+	streamMaxSeq := make(map[string]uint64)
+
 	for i, item := range items {
 		rec := recordsToStore[i]
 		sid := rec.StreamID.String()
@@ -611,10 +618,27 @@ func (s *Server) commitItems(items []incomingItem) {
 		sSeq := st.s3Seq
 		st.mu.Unlock()
 
+		streamCounts[sid]++
+		if _, ok := streamMinSeq[sid]; !ok || rec.StreamSeq < streamMinSeq[sid] {
+			streamMinSeq[sid] = rec.StreamSeq
+		}
+		if rec.StreamSeq > streamMaxSeq[sid] {
+			streamMaxSeq[sid] = rec.StreamSeq
+		}
+
 		item.ackChan <- ackResult{
 			witnessSeq: wSeq,
 			s3Seq:      sSeq,
 		}
+	}
+
+	for sid, count := range streamCounts {
+		st := s.streams[sid]
+		st.mu.Lock()
+		wSeq := st.witnessSeq
+		st.mu.Unlock()
+		klog.Infof("WAL buffer stream %s: accepted %d records (%d..%d, witness watermark=%d)",
+			sid, count, streamMinSeq[sid], streamMaxSeq[sid], wSeq)
 	}
 
 	if triggerFlush {

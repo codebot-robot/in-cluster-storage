@@ -726,6 +726,13 @@ func (s *streamImpl) runStreamSession() error {
 	}
 	s.retainedMu.RUnlock()
 
+	if len(recordsToReplay) > 0 {
+		klog.Infof("WAL client stream %s: replaying %d unacknowledged records (%d..%d)",
+			s.streamID, len(recordsToReplay), recordsToReplay[0].StreamSeq, recordsToReplay[len(recordsToReplay)-1].StreamSeq)
+	} else {
+		klog.Infof("WAL client stream %s: no unacknowledged records to replay", s.streamID)
+	}
+
 	for _, rec := range recordsToReplay {
 		if err := stream.Send(&pb.AppendRequest{
 			Msg: &pb.AppendRequest_Record{
@@ -738,6 +745,7 @@ func (s *streamImpl) runStreamSession() error {
 
 	// 4. Concurrently receive Acks and send newly appended records
 	recvErrCh := make(chan error, 1)
+	var firstAck sync.Once
 	go func() {
 		for {
 			ackResp, err := stream.Recv()
@@ -746,6 +754,10 @@ func (s *streamImpl) runStreamSession() error {
 				return
 			}
 			if ack := ackResp.GetAck(); ack != nil {
+				firstAck.Do(func() {
+					klog.Infof("WAL client stream %s: first ack after reconnect: witness=%d, s3=%d",
+						s.streamID, ack.WitnessAckedStreamSeq, ack.S3AckedStreamSeq)
+				})
 				s.handleAck(ack)
 			}
 		}
@@ -798,6 +810,8 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 	defer s.mu.Unlock()
 
 	witnessHead := helloAck.WitnessAckedStreamSeq
+	klog.Infof("WAL client stream %s: HelloAck received: witness watermark=%d, s3 watermark=%d (local head=%d)",
+		s.streamID, witnessHead, helloAck.S3AckedStreamSeq, s.localSeq)
 	if witnessHead > s.localSeq {
 		klog.Infof("Stream %s: buffer witness watermark (%d) is ahead of local stream head (%d); continuing sequence numbering from buffer head",
 			s.streamID, witnessHead, s.localSeq)
