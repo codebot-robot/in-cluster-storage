@@ -643,7 +643,7 @@ func (UnimplementedObjectFSControllerServer) GetExclusiveHold(context.Context, *
 	return nil, status.Error(codes.Unimplemented, "method GetExclusiveHold not implemented")
 }
 func (UnimplementedObjectFSControllerServer) RepairVolume(context.Context, *RepairVolumeRequest) (*RepairVolumeResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method RepairVolume not implemented")
+	return nil, status.Error(codes.Unimplemented, "method RepairVolume not implemented")
 }
 func (UnimplementedObjectFSControllerServer) mustEmbedUnimplementedObjectFSControllerServer() {}
 func (UnimplementedObjectFSControllerServer) testEmbeddedByValue()                            {}
