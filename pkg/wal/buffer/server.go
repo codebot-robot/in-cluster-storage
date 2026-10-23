@@ -166,7 +166,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	}
 
 	var allDiscoveredRecords []*wal.LogRecord
-	streamWatermarks := make(map[string]uint64)
+	backendWatermarks := make(map[string]uint64)
 	for _, segPath := range discoveredSegments {
 		records, err := ReadSegmentFromBackend(ctx, cfg.Backend, segPath, wal.WithAcceptUnversioned(cfg.AcceptUnversioned))
 		if err != nil {
@@ -176,44 +176,99 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		allDiscoveredRecords = append(allDiscoveredRecords, records...)
 		for _, rec := range records {
 			sid := rec.StreamID.String()
-			if rec.StreamSeq > streamWatermarks[sid] {
-				streamWatermarks[sid] = rec.StreamSeq
+			if rec.StreamSeq > backendWatermarks[sid] {
+				backendWatermarks[sid] = rec.StreamSeq
 			}
 		}
 	}
+
+	// 2. Setup local segment store and recover local segments
+	localStore, localRecords, err := wal.NewLogSegmentStore(dataDir, "log", cfg.FlushBytes, wal.WithAcceptUnversioned(cfg.AcceptUnversioned))
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize local segment store: %w", err)
+	}
+
+	localWatermarks := make(map[string]uint64)
+	localMaxPos := lastFlushedPos
+	for _, rec := range localRecords {
+		sid := rec.StreamID.String()
+		if rec.StreamSeq > localWatermarks[sid] {
+			localWatermarks[sid] = rec.StreamSeq
+		}
+		if rec.Position > localMaxPos {
+			localMaxPos = rec.Position
+		}
+	}
+
+	// Build combined stream watermarks across backend and local segments
+	allStreams := make(map[string]struct{})
+	for sid := range backendWatermarks {
+		allStreams[sid] = struct{}{}
+	}
+	for sid := range localWatermarks {
+		allStreams[sid] = struct{}{}
+	}
+
+	streamWatermarks := make(map[string]uint64)
+	for sid := range allStreams {
+		lHead := localWatermarks[sid]
+		fHead := backendWatermarks[sid]
+		watermark := lHead
+		if fHead > watermark {
+			watermark = fHead
+		}
+		streamWatermarks[sid] = watermark
+		klog.Infof("WAL buffer: recovered stream %s: local head=%d, flushed head=%d, resulting watermark=%d",
+			sid, lHead, fHead, watermark)
+	}
+
+	// StreamStore recovery includes all discovered records (backend + local)
+	allDiscoveredRecords = append(allDiscoveredRecords, localRecords...)
 	if err := streamStore.Recover(ctx, allDiscoveredRecords); err != nil {
 		klog.Warningf("Error during stream store recovery: %v", err)
 	}
 
-	nextPosition := lastFlushedPos + 1
+	nextPosition := localMaxPos + 1
 
-	klog.Infof("WAL Buffer initializing: assigning positions starting at %d (last_flushed_position=%d, segments=%d, streams=%d)", nextPosition, lastFlushedPos, len(discoveredSegments), len(streamWatermarks))
+	klog.Infof("WAL Buffer initializing: assigning positions starting at %d (last_flushed_position=%d, local_max_position=%d, segments=%d, streams=%d)",
+		nextPosition, lastFlushedPos, localMaxPos, len(discoveredSegments), len(streamWatermarks))
 
-	// 2. Setup local segment store with a fixed prefix
-	localStore, err := wal.NewLogSegmentStore(dataDir, "log", cfg.FlushBytes, wal.WithAcceptUnversioned(cfg.AcceptUnversioned))
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize local segment store: %w", err)
+	var unflushed []*wal.LogRecord
+	var unflushedBytes int64
+	for _, rec := range localRecords {
+		if rec.Position > lastFlushedPos {
+			unflushed = append(unflushed, rec)
+			unflushedBytes += int64(wal.LogHeaderSize + len(rec.Payload))
+		}
 	}
 
 	s := &Server{
 		cfg:                 cfg,
 		backend:             cfg.Backend,
-		lastPosition:        nextPosition - 1,
+		lastPosition:        localMaxPos,
 		lastFlushedPosition: lastFlushedPos,
 		flushedSegments:     discoveredSegments,
 		streams:             make(map[string]*streamState),
 		streamStore:         streamStore,
 		localStore:          localStore,
+		unflushedRecords:    unflushed,
+		unflushedBytes:      unflushedBytes,
 		incomingChan:        make(chan incomingItem, 1024),
 		tailWaiters:         make(map[chan struct{}]struct{}),
 		stopChan:            make(chan struct{}),
 	}
 	s.flushCond = sync.NewCond(&s.flushMu)
 
-	// Populate initial streams state recovered from flushed segments
-	for sid, seq := range streamWatermarks {
-		klog.Infof("WAL buffer: recovered stream %s: watermark=%d", sid, seq)
-		s.streams[sid] = newStreamState(seq, seq)
+	// Populate initial streams state
+	for sid, watermark := range streamWatermarks {
+		s.streams[sid] = newStreamState(watermark, backendWatermarks[sid])
+	}
+
+	// Flush the local-only tail before serving
+	if len(unflushed) > 0 {
+		if _, err := s.flushInternal(ctx); err != nil {
+			klog.Warningf("Failed to flush local-only tail during startup recovery: %v", err)
+		}
 	}
 
 	s.checkAggregatedSegmentGC(ctx)
