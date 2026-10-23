@@ -127,7 +127,38 @@ type ObjectFS struct {
 	dentries      map[uint64]map[string]struct{}
 	childDentries map[uint64]map[dentryKey]struct{}
 
+	inodeSyncMu    sync.Mutex
+	inodeSyncLocks map[uint64]*inodeSyncLock
+
 	notifyHook func(notifyEvent)
+}
+
+type inodeSyncLock struct {
+	mu       sync.Mutex
+	refCount int
+}
+
+func (fs *ObjectFS) lockInodeSync(inode uint64) func() {
+	fs.inodeSyncMu.Lock()
+	l, ok := fs.inodeSyncLocks[inode]
+	if !ok {
+		l = &inodeSyncLock{}
+		fs.inodeSyncLocks[inode] = l
+	}
+	l.refCount++
+	fs.inodeSyncMu.Unlock()
+
+	l.mu.Lock()
+
+	return func() {
+		l.mu.Unlock()
+		fs.inodeSyncMu.Lock()
+		l.refCount--
+		if l.refCount == 0 {
+			delete(fs.inodeSyncLocks, inode)
+		}
+		fs.inodeSyncMu.Unlock()
+	}
 }
 
 var _ fuse.RawFileSystem = (*ObjectFS)(nil)
@@ -162,6 +193,7 @@ func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string
 		backgroundSyncInterval: 30 * time.Second,
 		syncTrigger:            make(chan struct{}, 1),
 		closedInodes:           make(map[uint64]struct{}),
+		inodeSyncLocks:         make(map[uint64]*inodeSyncLock),
 		manifests:              make(map[uint64]*fileManifest),
 		activePrefetches:       make(map[uint64]*prefetchHandle),
 		lastReadChunk:          make(map[uint64]int),
@@ -775,30 +807,39 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 	var finalAttr *pb.EntryAttr
 
 	if input.Valid&fuse.FATTR_SIZE != 0 {
-		syncCtx, syncCancel := fs.makeSyncContext(cancel)
-		if err := fs.syncFileToService(syncCtx, input.NodeId); err != nil {
+		status := func() fuse.Status {
+			unlock := fs.lockInodeSync(input.NodeId)
+			defer unlock()
+
+			syncCtx, syncCancel := fs.makeSyncContext(cancel)
+			if err := fs.syncAndFsyncLocked(syncCtx, input.NodeId, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+				syncCancel()
+				return fs.grpcErrorToStatus("Truncate:Sync", err)
+			}
 			syncCancel()
-			return fs.grpcErrorToStatus("Truncate:Sync", err)
+			truncGen := fs.cache.Truncate(input.NodeId, int64(input.Size), time.Now())
+			resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
+				VolumeId: fs.volumeID,
+				Inode:    input.NodeId,
+				Size:     int64(input.Size),
+			})
+			if err != nil {
+				return fs.grpcErrorToStatus("TruncateFile", err)
+			}
+			if resp.GetError() != 0 {
+				return fuse.Status(resp.GetError())
+			}
+			if fs.cache != nil && resp.GetStreamPosition() > 0 {
+				fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+			}
+			fs.cache.MarkSizeClean(input.NodeId, truncGen)
+			fs.invalidateManifest(input.NodeId)
+			finalAttr = resp.GetAttr()
+			return fuse.OK
+		}()
+		if status != fuse.OK {
+			return status
 		}
-		syncCancel()
-		truncGen := fs.cache.Truncate(input.NodeId, int64(input.Size), time.Now())
-		resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
-			VolumeId: fs.volumeID,
-			Inode:    input.NodeId,
-			Size:     int64(input.Size),
-		})
-		if err != nil {
-			return fs.grpcErrorToStatus("TruncateFile", err)
-		}
-		if resp.GetError() != 0 {
-			return fuse.Status(resp.GetError())
-		}
-		if fs.cache != nil && resp.GetStreamPosition() > 0 {
-			fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
-		}
-		fs.cache.MarkSizeClean(input.NodeId, truncGen)
-		fs.invalidateManifest(input.NodeId)
-		finalAttr = resp.GetAttr()
 	}
 
 	hasOtherAttrs := input.Valid&(fuse.FATTR_MODE|fuse.FATTR_UID|fuse.FATTR_GID|fuse.FATTR_ATIME|fuse.FATTR_ATIME_NOW|fuse.FATTR_MTIME|fuse.FATTR_MTIME_NOW|fuse.FATTR_CTIME) != 0
@@ -908,37 +949,43 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 			punchKeepSize = true
 		}
 
-		syncCtx, syncCancel := fs.makeSyncContext(cancel)
-		if err := fs.syncFileToService(syncCtx, input.NodeId); err != nil {
+		status := func() fuse.Status {
+			unlock := fs.lockInodeSync(input.NodeId)
+			defer unlock()
+
+			syncCtx, syncCancel := fs.makeSyncContext(cancel)
+			if err := fs.syncAndFsyncLocked(syncCtx, input.NodeId, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+				syncCancel()
+				return fs.grpcErrorToStatus("PunchHole:Sync", err)
+			}
 			syncCancel()
-			return fs.grpcErrorToStatus("PunchHole:Sync", err)
-		}
-		syncCancel()
 
-		ctx, cancelFunc := fs.makeContext(cancel)
-		defer cancelFunc()
+			ctx, cancelFunc := fs.makeContext(cancel)
+			defer cancelFunc()
 
-		resp, err := fs.client.PunchHole(ctx, &pb.PunchHoleRequest{
-			VolumeId: fs.volumeID,
-			Inode:    input.NodeId,
-			Offset:   offset,
-			Length:   length,
-			KeepSize: punchKeepSize,
-		})
-		if err != nil {
-			return fs.grpcErrorToStatus("PunchHole", err)
-		}
-		if resp.GetError() != 0 {
-			return fuse.Status(resp.GetError())
-		}
-		if fs.cache != nil && resp.GetStreamPosition() > 0 {
-			fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
-		}
+			resp, err := fs.client.PunchHole(ctx, &pb.PunchHoleRequest{
+				VolumeId: fs.volumeID,
+				Inode:    input.NodeId,
+				Offset:   offset,
+				Length:   length,
+				KeepSize: punchKeepSize,
+			})
+			if err != nil {
+				return fs.grpcErrorToStatus("PunchHole", err)
+			}
+			if resp.GetError() != 0 {
+				return fuse.Status(resp.GetError())
+			}
+			if fs.cache != nil && resp.GetStreamPosition() > 0 {
+				fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+			}
 
-		punchGen := fs.cache.PunchHole(input.NodeId, offset, length, punchKeepSize, time.Now())
-		fs.invalidateManifest(input.NodeId)
-		fs.cache.MarkSizeClean(input.NodeId, punchGen)
-		return fuse.OK
+			punchGen := fs.cache.PunchHole(input.NodeId, offset, length, punchKeepSize, time.Now())
+			fs.invalidateManifest(input.NodeId)
+			fs.cache.MarkSizeClean(input.NodeId, punchGen)
+			return fuse.OK
+		}()
+		return status
 	}
 
 	// 3. FALLOC_FL_KEEP_SIZE alone: no-op (no pre-allocation reservation).
@@ -948,54 +995,60 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 
 	// 4. Mode 0 (allocate): extend file size to offset+len if target exceeds size (truncate-up with holes).
 	if input.Mode == fallocAllocRange {
-		syncCtx, syncCancel := fs.makeSyncContext(cancel)
-		if err := fs.syncFileToService(syncCtx, input.NodeId); err != nil {
+		status := func() fuse.Status {
+			unlock := fs.lockInodeSync(input.NodeId)
+			defer unlock()
+
+			syncCtx, syncCancel := fs.makeSyncContext(cancel)
+			if err := fs.syncAndFsyncLocked(syncCtx, input.NodeId, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+				syncCancel()
+				return fs.grpcErrorToStatus("Fallocate:Sync", err)
+			}
 			syncCancel()
-			return fs.grpcErrorToStatus("Fallocate:Sync", err)
-		}
-		syncCancel()
 
-		ctx, cancelFunc := fs.makeContext(cancel)
-		defer cancelFunc()
+			ctx, cancelFunc := fs.makeContext(cancel)
+			defer cancelFunc()
 
-		var curSize int64
-		if clientSize, hasSize := fs.cache.GetSize(input.NodeId); hasSize {
-			curSize = clientSize
-		} else {
-			attrResp, err := fs.client.GetAttr(ctx, &pb.GetAttrRequest{
-				VolumeId: fs.volumeID,
-				Inode:    input.NodeId,
-			})
-			if err != nil {
-				return fs.grpcErrorToStatus("Fallocate:GetAttr", err)
+			var curSize int64
+			if clientSize, hasSize := fs.cache.GetSize(input.NodeId); hasSize {
+				curSize = clientSize
+			} else {
+				attrResp, err := fs.client.GetAttr(ctx, &pb.GetAttrRequest{
+					VolumeId: fs.volumeID,
+					Inode:    input.NodeId,
+				})
+				if err != nil {
+					return fs.grpcErrorToStatus("Fallocate:GetAttr", err)
+				}
+				if attrResp.GetError() != 0 {
+					return fuse.Status(attrResp.GetError())
+				}
+				curSize = attrResp.GetAttr().GetInode().GetSize()
 			}
-			if attrResp.GetError() != 0 {
-				return fuse.Status(attrResp.GetError())
-			}
-			curSize = attrResp.GetAttr().GetInode().GetSize()
-		}
 
-		targetSize := offset + length
-		if targetSize > curSize {
-			truncGen := fs.cache.Truncate(input.NodeId, targetSize, time.Now())
-			resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
-				VolumeId: fs.volumeID,
-				Inode:    input.NodeId,
-				Size:     targetSize,
-			})
-			if err != nil {
-				return fs.grpcErrorToStatus("Fallocate:TruncateFile", err)
+			targetSize := offset + length
+			if targetSize > curSize {
+				truncGen := fs.cache.Truncate(input.NodeId, targetSize, time.Now())
+				resp, err := fs.client.TruncateFile(ctx, &pb.TruncateFileRequest{
+					VolumeId: fs.volumeID,
+					Inode:    input.NodeId,
+					Size:     targetSize,
+				})
+				if err != nil {
+					return fs.grpcErrorToStatus("Fallocate:TruncateFile", err)
+				}
+				if resp.GetError() != 0 {
+					return fuse.Status(resp.GetError())
+				}
+				if fs.cache != nil && resp.GetStreamPosition() > 0 {
+					fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+				}
+				fs.cache.MarkSizeClean(input.NodeId, truncGen)
+				fs.invalidateManifest(input.NodeId)
 			}
-			if resp.GetError() != 0 {
-				return fuse.Status(resp.GetError())
-			}
-			if fs.cache != nil && resp.GetStreamPosition() > 0 {
-				fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
-			}
-			fs.cache.MarkSizeClean(input.NodeId, truncGen)
-			fs.invalidateManifest(input.NodeId)
-		}
-		return fuse.OK
+			return fuse.OK
+		}()
+		return status
 	}
 
 	return fuse.Status(syscall.EOPNOTSUPP)
@@ -1921,7 +1974,11 @@ func (fs *ObjectFS) syncVolumeBlocking(ctx context.Context) error {
 	var lastEpoch int64
 
 	for _, entry := range entries {
-		epoch, runs, gens, err := fs.pushDirtyChunksToStaging(ctx, entry.Inode)
+		epoch, runs, gens, err := func() (int64, [][]int, map[int]Generation, error) {
+			unlock := fs.lockInodeSync(entry.Inode)
+			defer unlock()
+			return fs.pushDirtyChunksToStaging(ctx, entry.Inode)
+		}()
 		if err != nil {
 			return err
 		}
@@ -1983,7 +2040,11 @@ func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context, trigger pb.FsyncR
 	var lastEpoch int64
 
 	for _, entry := range entries {
-		epoch, runs, gens, err := fs.pushDirtyChunksToStaging(ctx, entry.Inode)
+		epoch, runs, gens, err := func() (int64, [][]int, map[int]Generation, error) {
+			unlock := fs.lockInodeSync(entry.Inode)
+			defer unlock()
+			return fs.pushDirtyChunksToStaging(ctx, entry.Inode)
+		}()
 		if err != nil {
 			return err
 		}
@@ -2057,7 +2118,11 @@ func (fs *ObjectFS) syncClosedInodes(ctx context.Context) error {
 	}
 	var pending []pendingFsync
 	for _, ino := range inodes {
-		epoch, runs, gens, err := fs.pushDirtyChunksToStaging(ctx, ino)
+		epoch, runs, gens, err := func() (int64, [][]int, map[int]Generation, error) {
+			unlock := fs.lockInodeSync(ino)
+			defer unlock()
+			return fs.pushDirtyChunksToStaging(ctx, ino)
+		}()
 		if err != nil {
 			return err
 		}
@@ -2092,7 +2157,11 @@ func (fs *ObjectFS) syncClosedInodes(ctx context.Context) error {
 			}
 			if resp.GetError() == int32(syscall.ESTALE) || (resp.GetStagingEpoch() != 0 && item.epoch != 0 && resp.GetStagingEpoch() != item.epoch) {
 				// Controller restarted / staging epoch changed; re-push dirty chunks and retry Fsync
-				newEpoch, newRuns, newGens, reErr := fs.pushDirtyChunksToStaging(gctx, item.inode)
+				newEpoch, newRuns, newGens, reErr := func() (int64, [][]int, map[int]Generation, error) {
+					unlock := fs.lockInodeSync(item.inode)
+					defer unlock()
+					return fs.pushDirtyChunksToStaging(gctx, item.inode)
+				}()
 				if reErr != nil {
 					return reErr
 				}
@@ -2147,6 +2216,12 @@ func (fs *ObjectFS) syncClosedInodes(ctx context.Context) error {
 }
 
 func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking bool, trigger pb.FsyncRequest_SyncTrigger) error {
+	unlock := fs.lockInodeSync(inode)
+	defer unlock()
+	return fs.syncAndFsyncLocked(ctx, inode, blocking, trigger)
+}
+
+func (fs *ObjectFS) syncAndFsyncLocked(ctx context.Context, inode uint64, blocking bool, trigger pb.FsyncRequest_SyncTrigger) error {
 	epoch, runs, chunkGens, err := fs.pushDirtyChunksToStaging(ctx, inode)
 	if err != nil {
 		return err
@@ -2219,13 +2294,12 @@ func (fs *ObjectFS) syncAndFsync(ctx context.Context, inode uint64, blocking boo
 	return nil
 }
 
-func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
-	return fs.syncAndFsync(ctx, inode, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED)
-}
-
 func (fs *ObjectFS) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
 	ctx, cancelFunc := fs.makeSyncContext(cancel)
 	defer cancelFunc()
+
+	unlock := fs.lockInodeSync(input.NodeId)
+	defer unlock()
 
 	_, _, _, err := fs.pushDirtyChunksToStaging(ctx, input.NodeId)
 	if err != nil {

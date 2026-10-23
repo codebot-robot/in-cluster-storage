@@ -2351,7 +2351,7 @@ func TestFUSESetAttrTruncateFailsWhenFlushFails(t *testing.T) {
 	const fileID = uint64(10)
 	cache.WriteAt(fileID, 0, []byte("dirty-data"), time.Now())
 
-	// SetAttr with FATTR_SIZE must fail because syncFileToService fails
+	// SetAttr with FATTR_SIZE must fail because pre-truncate sync fails
 	var setAttrOut fuse.AttrOut
 	status := fs.SetAttr(nil, &fuse.SetAttrIn{
 		SetAttrInCommon: fuse.SetAttrInCommon{
@@ -2362,7 +2362,7 @@ func TestFUSESetAttrTruncateFailsWhenFlushFails(t *testing.T) {
 	}, &setAttrOut)
 
 	if status == fuse.OK {
-		t.Fatalf("Expected SetAttr truncate to fail when syncFileToService fails, but got OK")
+		t.Fatalf("Expected SetAttr truncate to fail when pre-truncate sync fails, but got OK")
 	}
 }
 
@@ -2384,7 +2384,7 @@ func TestFUSEConcurrentOperationsRace(t *testing.T) {
 	fileID := createOut.EntryOut.NodeId
 
 	// Note: writers and truncaters synchronize via modelMu to maintain a deterministic
-	// ground-truth oracle; background flushers (syncFileToService) and readers race
+	// ground-truth oracle; background flushers (syncAndFsync) and readers race
 	// concurrently against those mutations without holding modelMu.
 	var modelMu sync.Mutex
 	model := make([]byte, 0)
@@ -2402,7 +2402,7 @@ func TestFUSEConcurrentOperationsRace(t *testing.T) {
 				return
 			default:
 				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-				_ = rawFS.syncFileToService(ctx, fileID)
+				_ = rawFS.syncAndFsync(ctx, fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED)
 				cancel()
 				runtime.Gosched()
 			}
@@ -2514,8 +2514,8 @@ func TestFUSEConcurrentOperationsRace(t *testing.T) {
 	// Final flush to ensure all acknowledged writes are flushed
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	if err := rawFS.syncFileToService(ctx, fileID); err != nil {
-		t.Fatalf("Final syncFileToService failed: %v", err)
+	if err := rawFS.syncAndFsync(ctx, fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+		t.Fatalf("Final syncAndFsync failed: %v", err)
 	}
 
 	modelMu.Lock()
@@ -2664,8 +2664,8 @@ func TestSyncFileToServiceCoalescesContiguousChunks(t *testing.T) {
 	cache.WriteAt(fileID, 0, data, time.Now())
 
 	ctx := t.Context()
-	if err := fs.syncFileToService(ctx, fileID); err != nil {
-		t.Fatalf("syncFileToService failed: %v", err)
+	if err := fs.syncAndFsync(ctx, fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+		t.Fatalf("syncAndFsync failed: %v", err)
 	}
 
 	rec.mu.Lock()
@@ -2717,8 +2717,8 @@ func TestSyncFileToServiceNonContiguousRuns(t *testing.T) {
 	cache.WriteAt(fileID, 7*cs, d78, time.Now())
 
 	ctx := t.Context()
-	if err := fs.syncFileToService(ctx, fileID); err != nil {
-		t.Fatalf("syncFileToService failed: %v", err)
+	if err := fs.syncAndFsync(ctx, fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+		t.Fatalf("syncAndFsync failed: %v", err)
 	}
 
 	rec.mu.Lock()
@@ -2773,8 +2773,8 @@ func TestSyncFileToServiceSplitsAt32ChunksAnd2MiB(t *testing.T) {
 	cache.WriteAt(fileID, 0, data, time.Now())
 
 	ctx := t.Context()
-	if err := fs.syncFileToService(ctx, fileID); err != nil {
-		t.Fatalf("syncFileToService failed: %v", err)
+	if err := fs.syncAndFsync(ctx, fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+		t.Fatalf("syncAndFsync failed: %v", err)
 	}
 
 	rec.mu.Lock()
@@ -2822,8 +2822,8 @@ func TestSyncFileToServicePartialChunkBoundary(t *testing.T) {
 	cache.WriteAt(fileID, cs, make([]byte, cs), time.Now())
 
 	ctx := t.Context()
-	if err := fs.syncFileToService(ctx, fileID); err != nil {
-		t.Fatalf("syncFileToService failed: %v", err)
+	if err := fs.syncAndFsync(ctx, fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+		t.Fatalf("syncAndFsync failed: %v", err)
 	}
 
 	rec.mu.Lock()
@@ -2866,9 +2866,9 @@ func TestSyncFileToServiceRPCFailureLeavesChunksDirty(t *testing.T) {
 	cache.WriteAt(fileID, 0, make([]byte, 2*cs), time.Now())
 
 	ctx := t.Context()
-	err := fs.syncFileToService(ctx, fileID)
+	err := fs.syncAndFsync(ctx, fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED)
 	if err == nil {
-		t.Fatalf("Expected syncFileToService to fail when WriteFile fails, got nil")
+		t.Fatalf("Expected syncAndFsync to fail when WriteFile fails, got nil")
 	}
 
 	// Verify both chunk 0 and chunk 1 remain dirty
@@ -2914,7 +2914,7 @@ func TestSyncFileToServiceConcurrentWritePreservesDirtyGeneration(t *testing.T) 
 
 	cache.WriteAt(fileID, 0, append(c0v1, c1v1...), time.Now())
 
-	// When WriteFile is invoked by syncFileToService, race a new write to chunk 1
+	// When WriteFile is invoked by syncAndFsync, race a new write to chunk 1
 	writeHook = func() {
 		// Mutate chunk 1 to version 2
 		cache.WriteAt(fileID, cs, c1v2, time.Now())
@@ -2922,8 +2922,8 @@ func TestSyncFileToServiceConcurrentWritePreservesDirtyGeneration(t *testing.T) 
 	}
 
 	ctx := t.Context()
-	if err := fs.syncFileToService(ctx, fileID); err != nil {
-		t.Fatalf("syncFileToService failed: %v", err)
+	if err := fs.syncAndFsync(ctx, fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+		t.Fatalf("syncAndFsync failed: %v", err)
 	}
 
 	// Chunk 0 was clean and should be cleared.
@@ -2967,8 +2967,8 @@ func TestSyncFileToServiceRetriesFailedTruncateAndClearsSizeGen(t *testing.T) {
 	// Write 100 bytes and sync cleanly
 	initialData := bytes.Repeat([]byte("A"), 100)
 	cache.WriteAt(fileID, 0, initialData, time.Now())
-	if err := fs.syncFileToService(t.Context(), fileID); err != nil {
-		t.Fatalf("Initial syncFileToService failed: %v", err)
+	if err := fs.syncAndFsync(t.Context(), fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+		t.Fatalf("Initial syncAndFsync failed: %v", err)
 	}
 
 	// First SetAttr with FATTR_SIZE fails because TruncateFile fails
@@ -2993,9 +2993,9 @@ func TestSyncFileToServiceRetriesFailedTruncateAndClearsSizeGen(t *testing.T) {
 		t.Fatalf("Expected entry to remain dirty while SizeGen is set")
 	}
 
-	// The next syncFileToService should retry TruncateFile and succeed
-	if err := fs.syncFileToService(t.Context(), fileID); err != nil {
-		t.Fatalf("Next syncFileToService failed: %v", err)
+	// The next syncAndFsync should retry TruncateFile and succeed
+	if err := fs.syncAndFsync(t.Context(), fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+		t.Fatalf("Next syncAndFsync failed: %v", err)
 	}
 
 	// Confirm SizeGen is cleared and entry is clean
@@ -3077,9 +3077,9 @@ func TestSyncFileToServiceOrderingDirtySizeBeforeChunksAndDropsBeyondEOF(t *test
 	rec.writeReqs = nil
 	rec.mu.Unlock()
 
-	// Run syncFileToService
-	if err := fs.syncFileToService(t.Context(), fileID); err != nil {
-		t.Fatalf("syncFileToService failed: %v", err)
+	// Run syncAndFsync
+	if err := fs.syncAndFsync(t.Context(), fileID, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
+		t.Fatalf("syncAndFsync failed: %v", err)
 	}
 
 	rec.mu.Lock()
