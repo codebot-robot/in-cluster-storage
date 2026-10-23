@@ -376,7 +376,7 @@ func newVolumesRepairCommand(opts *options) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&repairOpts.force, "force", false, "Force repair even if volume is not currently reported as degraded")
+	cmd.Flags().BoolVar(&repairOpts.force, "force", false, "Force repair even if volume is not currently reported as degraded (closes stream under in-flight operations, causing them to fail)")
 	return cmd
 }
 

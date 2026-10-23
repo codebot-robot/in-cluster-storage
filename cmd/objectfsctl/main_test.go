@@ -704,16 +704,15 @@ func TestVolumesRepairAndDegradedDisplay(t *testing.T) {
 	volRepair := "vol-repair"
 	volHealthy := "vol-healthy"
 
-	walDirRepair := filepath.Join(t.TempDir(), "wal-repair")
-	walDirHealthy := filepath.Join(t.TempDir(), "wal-healthy")
+	walDir := t.TempDir()
 
-	streamRepair, err := walclient.Open(ctx, walDirRepair, controller.StreamIDForVolume(volRepair), "")
+	streamRepair, err := walclient.Open(ctx, walDir, controller.StreamIDForVolume(volRepair), "")
 	if err != nil {
 		t.Fatalf("Open streamRepair failed: %v", err)
 	}
 	defer streamRepair.Close()
 
-	streamHealthy, err := walclient.Open(ctx, walDirHealthy, controller.StreamIDForVolume(volHealthy), "")
+	streamHealthy, err := walclient.Open(ctx, walDir, controller.StreamIDForVolume(volHealthy), "")
 	if err != nil {
 		t.Fatalf("Open streamHealthy failed: %v", err)
 	}
@@ -734,20 +733,23 @@ func TestVolumesRepairAndDegradedDisplay(t *testing.T) {
 	}
 	defer lis.Close()
 
-	server := controller.NewServer(backend, controller.WithServerStreamFactory(func(volID string) (walclient.Stream, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		if volID == volRepair {
-			if repaired {
-				return walclient.Open(ctx, walDirRepair, controller.StreamIDForVolume(volRepair), "")
+	server := controller.NewServer(backend,
+		controller.WithServerWAL(walDir, "", walclient.Local),
+		controller.WithServerStreamFactory(func(volID string) (walclient.Stream, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if volID == volRepair {
+				if repaired {
+					return walclient.Open(ctx, walDir, controller.StreamIDForVolume(volRepair), "")
+				}
+				return mockRepair, nil
 			}
-			return mockRepair, nil
-		}
-		if volID == volHealthy {
-			return streamHealthy, nil
-		}
-		return nil, fmt.Errorf("unknown volume %s", volID)
-	}))
+			if volID == volHealthy {
+				return streamHealthy, nil
+			}
+			return nil, fmt.Errorf("unknown volume %s", volID)
+		}),
+	)
 	defer server.Close()
 
 	grpcServer := grpc.NewServer()
