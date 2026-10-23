@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -108,22 +109,27 @@ func parseEndpoint(endpoint string) (string, string, error) {
 type controllerDownloader struct {
 	controllerAddress string
 	conn              *grpc.ClientConn
+	client            pb.AgentFSControllerClient
 	mu                sync.Mutex
+	wrapWriter        func(io.WriteCloser) io.WriteCloser
 }
 
 func (d *controllerDownloader) DownloadBlob(ctx context.Context, sha string, destPath string) error {
 	d.mu.Lock()
-	if d.conn == nil {
-		conn, err := grpc.Dial(d.controllerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			d.mu.Unlock()
-			return err
+	if d.client == nil {
+		if d.conn == nil {
+			conn, err := grpc.Dial(d.controllerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				d.mu.Unlock()
+				return err
+			}
+			d.conn = conn
 		}
-		d.conn = conn
+		d.client = pb.NewAgentFSControllerClient(d.conn)
 	}
+	client := d.client
 	d.mu.Unlock()
 
-	client := pb.NewAgentFSControllerClient(d.conn)
 	stream, err := client.DownloadBlob(ctx, &pb.DownloadBlobRequest{Sha256: sha})
 	if err != nil {
 		return err
@@ -151,28 +157,29 @@ func (d *controllerDownloader) DownloadBlob(ctx context.Context, sha string, des
 		}
 	}()
 
+	var writerCloser io.WriteCloser = tempFile
+	if d.wrapWriter != nil {
+		writerCloser = d.wrapWriter(tempFile)
+	}
+
 	for {
 		resp, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			if closeErr := tempFile.Close(); closeErr != nil {
-				klog.Warningf("Failed to close temporary file: %v", closeErr)
-			}
-			return fmt.Errorf("error receiving chunk: %v", err)
+			closeErr := writerCloser.Close()
+			return errors.Join(fmt.Errorf("error receiving chunk: %w", err), closeErr)
 		}
-		if _, err := tempFile.Write(resp.Content); err != nil {
-			if closeErr := tempFile.Close(); closeErr != nil {
-				klog.Warningf("Failed to close temporary file: %v", closeErr)
-			}
-			return fmt.Errorf("error writing to temporary file: %v", err)
+		if _, err := writerCloser.Write(resp.Content); err != nil {
+			closeErr := writerCloser.Close()
+			return errors.Join(fmt.Errorf("error writing to temporary file: %w", err), closeErr)
 		}
 	}
 
 	// Be careful to check for errors when calling close, which is a common mistake
-	if err := tempFile.Close(); err != nil {
-		return fmt.Errorf("failed to close temporary file: %v", err)
+	if err := writerCloser.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary file: %w", err)
 	}
 
 	// Atomically rename to destination path
