@@ -153,6 +153,7 @@ type Server struct {
 	syncCoalesceWindow       time.Duration
 	maxStagingBytes          int64
 	syncTimeout              time.Duration
+	openBarrierTimeout       time.Duration
 	acceptUnversioned        bool
 
 	flushTicker *time.Ticker
@@ -328,6 +329,15 @@ func WithServerSyncTimeout(d time.Duration) ServerOption {
 	}
 }
 
+// WithServerOpenBarrierTimeout sets the timeout duration for the open-side barrier on close-to-open volumes.
+func WithServerOpenBarrierTimeout(d time.Duration) ServerOption {
+	return func(s *Server) {
+		if d > 0 {
+			s.openBarrierTimeout = d
+		}
+	}
+}
+
 // WithServerAcceptUnversioned configures whether unversioned segments, streams, and snapshots are accepted.
 func WithServerAcceptUnversioned(accept bool) ServerOption {
 	return func(s *Server) {
@@ -449,6 +459,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if s.syncTimeout > 0 {
 			volOpts = append(volOpts, WithSyncTimeout(s.syncTimeout))
+		}
+		if s.openBarrierTimeout > 0 {
+			volOpts = append(volOpts, WithOpenBarrierTimeout(s.openBarrierTimeout))
 		}
 		if s.acceptUnversioned {
 			volOpts = append(volOpts, WithAcceptUnversioned(true))
@@ -870,11 +883,11 @@ func (s *Server) Open(ctx context.Context, req *pb.OpenRequest) (*pb.OpenRespons
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	fh, err := vol.Open(ctx, req.GetInode(), req.GetFlags())
+	fh, attr, pos, err := vol.Open(ctx, req.GetInode(), req.GetFlags())
 	if err != nil {
 		return &pb.OpenResponse{Error: volErrToSyscall(err)}, nil
 	}
-	return &pb.OpenResponse{Fh: fh}, nil
+	return &pb.OpenResponse{Fh: fh, Attr: attr, StreamPosition: pos}, nil
 }
 
 func (s *Server) Release(ctx context.Context, req *pb.ReleaseRequest) (*pb.ReleaseResponse, error) {
@@ -957,6 +970,25 @@ func (s *Server) Broadcaster() *EventBroadcaster {
 func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSController_WatchVolumeServer) error {
 	if !isValidVolumeID(req.GetVolumeId()) {
 		return status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", req.GetVolumeId())
+	}
+
+	if req.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+		vol, err := s.getOrCreateVolume(req.GetVolumeId())
+		if err != nil {
+			return volInitError(err)
+		}
+		currentMode := vol.ConsistencyMode()
+		clientMode := req.GetConsistencyMode()
+		if currentMode == pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+			if clientMode == pb.ConsistencyMode_CLOSE_TO_OPEN {
+				if err := vol.PersistConsistencyMode(stream.Context(), clientMode); err != nil {
+					klog.Warningf("WatchVolume %s: failed to persist consistency mode: %v", req.GetVolumeId(), err)
+				}
+			}
+		} else if clientMode != currentMode {
+			klog.Warningf("WatchVolume %s: client requested consistency mode %v but volume has %v; rejecting connection", req.GetVolumeId(), clientMode, currentMode)
+			return status.Errorf(codes.InvalidArgument, "consistency mode mismatch: volume is %v, client requested %v", currentMode, clientMode)
+		}
 	}
 
 	ch := s.broadcaster.Subscribe(req.GetVolumeId())
@@ -1137,7 +1169,9 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 	s.mu.RLock()
 	for _, id := range filtered {
 		var degraded *pb.Degraded
+		var consistencyMode pb.ConsistencyMode
 		if vol, ok := s.volumes[id]; ok {
+			consistencyMode = vol.ConsistencyMode()
 			if deg := vol.Degraded(); deg != nil {
 				degraded = &pb.Degraded{
 					Code:    pb.Degraded_WAL_STREAM_DEGRADED,
@@ -1147,8 +1181,9 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 			}
 		}
 		volInfos = append(volInfos, &pb.VolumeInfo{
-			VolumeId: id,
-			Degraded: degraded,
+			VolumeId:        id,
+			Degraded:        degraded,
+			ConsistencyMode: consistencyMode,
 		})
 	}
 	s.mu.RUnlock()

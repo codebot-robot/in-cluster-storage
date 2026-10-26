@@ -26,6 +26,7 @@ const (
 	InodeTypeName       = "objectfs.v1alpha1.Inode"
 	FileChunkTypeName   = "objectfs.v1alpha1.FileChunk"
 	VolumeStatsTypeName = "objectfs.v1alpha1.VolumeStats"
+	VolumeInfoTypeName  = "objectfs.v1alpha1.VolumeInfo"
 	VolumeStatsRowName  = "volume"
 )
 
@@ -154,7 +155,7 @@ func UpdateVolumeStats(stats, before, after proto.Message) error {
 
 	default:
 		typeName := string(target.ProtoReflect().Descriptor().FullName())
-		if typeName == VolumeStatsTypeName {
+		if typeName == VolumeStatsTypeName || typeName == VolumeInfoTypeName {
 			return nil
 		}
 		return fmt.Errorf("unexpected message type for stats update: %T (%s)", target, typeName)

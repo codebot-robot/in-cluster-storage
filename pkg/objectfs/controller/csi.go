@@ -18,8 +18,10 @@ package controller
 
 import (
 	"context"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -87,11 +89,23 @@ func (c *CSIController) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 	}
 
 	// Initialize the volume in the server
-	if _, err := c.server.getOrCreateVolume(volumeID); err != nil {
+	vol, err := c.server.getOrCreateVolume(volumeID)
+	if err != nil {
 		if _, ok := status.FromError(err); ok {
 			return nil, err
 		}
 		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
+	}
+
+	consistency := strings.ToLower(req.GetParameters()["consistency"])
+	if consistency == "close-to-open" {
+		if err := vol.PersistConsistencyMode(ctx, pb.ConsistencyMode_CLOSE_TO_OPEN); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to persist consistency mode: %v", err)
+		}
+	} else if consistency != "" {
+		if err := vol.PersistConsistencyMode(ctx, pb.ConsistencyMode_STANDARD); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to persist consistency mode: %v", err)
+		}
 	}
 
 	return &csi.CreateVolumeResponse{
