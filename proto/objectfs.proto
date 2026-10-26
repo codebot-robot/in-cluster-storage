@@ -79,6 +79,12 @@ enum WriteMode {
   EAGER_REPLICATION = 3;
 }
 
+enum ConsistencyMode {
+  CONSISTENCY_MODE_UNSPECIFIED = 0;
+  STANDARD = 1;
+  CLOSE_TO_OPEN = 2;
+}
+
 message EntryAttr {
   Inode inode = 1;
   string name = 2;
@@ -291,6 +297,7 @@ message FsyncResponse {
 message WatchVolumeRequest {
   string volume_id = 1;
   string node_id = 2;
+  ConsistencyMode consistency_mode = 3;
 }
 
 enum WatchEventType {
@@ -361,6 +368,8 @@ message OpenRequest {
 message OpenResponse {
   uint64 fh = 1;
   int32 error = 2;
+  EntryAttr attr = 3;
+  uint64 stream_position = 4;
 }
 
 message ReleaseRequest {
@@ -479,6 +488,7 @@ message VolumeInfo {
 
   string volume_id = 1;
   Degraded degraded = 3;
+  ConsistencyMode consistency_mode = 4;
 }
 
 message ListVolumesResponse {
