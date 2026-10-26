@@ -94,6 +94,7 @@ type ObjectFS struct {
 	client                 pb.ObjectFSControllerClient
 	volumeID               string
 	writeMode              pb.WriteMode
+	consistencyMode        pb.ConsistencyMode
 	cache                  *NodeCache
 	diskCache              *DiskBlobCache
 	server                 *fuse.Server
@@ -412,6 +413,16 @@ func (fs *ObjectFS) SetSyncTimeout(d time.Duration) {
 		d = DefaultSyncTimeout
 	}
 	fs.syncTimeout = d
+}
+
+// SetConsistencyMode sets the consistency mode for this filesystem mount.
+func (fs *ObjectFS) SetConsistencyMode(mode pb.ConsistencyMode) {
+	fs.consistencyMode = mode
+}
+
+// ConsistencyMode returns the consistency mode for this filesystem mount.
+func (fs *ObjectFS) ConsistencyMode() pb.ConsistencyMode {
+	return fs.consistencyMode
 }
 
 func (fs *ObjectFS) String() string {
@@ -1292,7 +1303,38 @@ func (fs *ObjectFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.O
 		return fuse.Status(resp.GetError())
 	}
 	out.Fh = resp.GetFh()
-	out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+
+	if fs.consistencyMode == pb.ConsistencyMode_CLOSE_TO_OPEN {
+		pos := resp.GetStreamPosition()
+		streamPosMoved := false
+		if pos > 0 {
+			if fs.cache != nil {
+				knownPos := fs.cache.KnownPosition(input.NodeId)
+				if pos > knownPos {
+					streamPosMoved = true
+				}
+			} else {
+				streamPosMoved = true
+			}
+		}
+
+		if streamPosMoved {
+			if fs.cache != nil {
+				fs.cache.InvalidateIfNotDirty(input.NodeId)
+				fs.cache.RecordPosition(input.NodeId, pos)
+			}
+			fs.invalidateManifest(input.NodeId)
+			// notifyInode is called synchronously inside the OPEN handler for the same inode.
+			// This cannot deadlock because the Linux kernel does not hold inode or page locks
+			// across FUSE_OPEN operations while dispatching to user space.
+			fs.notifyInode(input.NodeId, 0, -1)
+			fs.notifyInode(input.NodeId, -1, 0)
+		} else {
+			out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+		}
+	} else {
+		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+	}
 
 	if fs.diskCache != nil {
 		fs.startPrefetchOnOpen(input.NodeId, out.Fh)
@@ -2761,7 +2803,7 @@ func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*Object
 	}
 }
 
-func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, nodeID string, cache *NodeCache, fs ...*ObjectFS) {
+func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, nodeID string, consistency pb.ConsistencyMode, cache *NodeCache, fs ...*ObjectFS) {
 	go func() {
 		defer func() {
 			for _, f := range fs {
@@ -2785,8 +2827,9 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 			}
 
 			stream, err := client.WatchVolume(ctx, &pb.WatchVolumeRequest{
-				VolumeId: volumeID,
-				NodeId:   nodeID,
+				VolumeId:        volumeID,
+				NodeId:          nodeID,
+				ConsistencyMode: consistency,
 			})
 			if err != nil {
 				if !hasDisconnected {

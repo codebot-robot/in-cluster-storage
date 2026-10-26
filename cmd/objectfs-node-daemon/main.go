@@ -309,7 +309,11 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	}
 
 	mode := strings.ToLower(req.GetVolumeContext()["mode"])
+	consistencyStr := strings.ToLower(req.GetVolumeContext()["consistency"])
 	if mode == "exclusive-local" {
+		if consistencyStr != "" {
+			klog.Infof("exclusive-local volume %s ignores consistency parameter %q (close-to-open satisfied by construction)", volumeID, consistencyStr)
+		}
 		cap := req.GetVolumeCapability()
 		if cap == nil || cap.GetAccessMode() == nil || cap.GetAccessMode().GetMode() != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
 			return nil, status.Errorf(codes.InvalidArgument, "exclusive-local mode requires SINGLE_NODE_SINGLE_WRITER access mode (ReadWriteOncePod)")
@@ -317,10 +321,15 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return d.publishExclusiveLocal(ctx, req, volumeID)
 	}
 
+	consistencyMode := pb.ConsistencyMode_STANDARD
+	if consistencyStr == "close-to-open" {
+		consistencyMode = pb.ConsistencyMode_CLOSE_TO_OPEN
+	}
+
 	writeModeStr := req.GetVolumeContext()["writeMode"]
 	writeMode := parseWriteMode(writeModeStr)
 
-	klog.Infof("Publishing ObjectFS volume %s (writeMode=%v) to %s", volumeID, writeMode, targetPath)
+	klog.Infof("Publishing ObjectFS volume %s (writeMode=%v, consistency=%v) to %s", volumeID, writeMode, consistencyMode, targetPath)
 
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create target path %s: %w", targetPath, err)
@@ -335,6 +344,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	rawFS := objectfuse.NewObjectFSWithTimeouts(client, volumeID, writeMode, nodeCache, d.rpcTimeout, d.syncTimeout)
 	rawFS.SetSyncOnClose(d.syncOnClose)
 	rawFS.SetBackgroundSyncInterval(d.backgroundSyncInterval)
+	rawFS.SetConsistencyMode(consistencyMode)
 
 	if d.diskCache != nil {
 		rawFS.SetDiskBlobCache(d.diskCache)
@@ -362,7 +372,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	}
 
 	watchCtx, cancel := context.WithCancel(context.Background())
-	objectfuse.StartWatcher(watchCtx, client, volumeID, d.nodeID, nodeCache, rawFS)
+	objectfuse.StartWatcher(watchCtx, client, volumeID, d.nodeID, consistencyMode, nodeCache, rawFS)
 	rawFS.StartBackgroundSync(watchCtx)
 
 	d.mu.Lock()
