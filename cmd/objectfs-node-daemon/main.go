@@ -35,6 +35,7 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -44,6 +45,8 @@ var (
 	endpoint               = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
 	nodeID                 = flag.String("nodeid", "", "node id")
 	controllerAddress      = flag.String("controller-address", "objectfs-controller:50051", "ObjectFS Controller address")
+	clientCertDir          = flag.String("client-cert-dir", "/etc/objectfs/certs/client", "Directory containing tls.key, tls.crt, and trust/*.crt for mTLS")
+	insecureFlag           = flag.Bool("insecure", false, "Connect to ObjectFS controller using plaintext gRPC without TLS (dev only)")
 	cacheSizeMB            = flag.Int64("cache-size-mb", 128, "Local node in-memory cache size in MB (for dirty write buffers)")
 	diskCacheSizeMB        = flag.Int64("disk-cache-size-mb", 10240, "Local node on-disk blob cache size in MB (default 10 GiB)")
 	cacheDir               = flag.String("cache-dir", "/var/cache/objectfs", "Path to node-local on-disk blob cache directory")
@@ -81,7 +84,7 @@ func main() {
 
 	server := grpc.NewServer()
 
-	driver, err := newDriver(*nodeID, *controllerAddress, *cacheDir, *cacheSizeMB*1024*1024, *diskCacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval)
+	driver, err := newDriver(*nodeID, *controllerAddress, *cacheDir, *cacheSizeMB*1024*1024, *diskCacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval, *clientCertDir, *insecureFlag)
 	if err != nil {
 		klog.Fatalf("failed to initialize driver: %v", err)
 	}
@@ -139,6 +142,8 @@ type objectFSDriver struct {
 	syncTimeout            time.Duration
 	syncOnClose            bool
 	backgroundSyncInterval time.Duration
+	clientCertDir          string
+	insecure               bool
 	debug                  bool
 
 	clientConn *grpc.ClientConn
@@ -148,7 +153,7 @@ type objectFSDriver struct {
 	mounts map[string]*activeMount
 }
 
-func newDriver(nodeID, controllerAddress, cacheDir string, cacheBytes, diskCacheBytes int64, rpcTimeout, syncTimeout time.Duration, syncOnClose bool, backgroundSyncInterval time.Duration) (*objectFSDriver, error) {
+func newDriver(nodeID, controllerAddress, cacheDir string, cacheBytes, diskCacheBytes int64, rpcTimeout, syncTimeout time.Duration, syncOnClose bool, backgroundSyncInterval time.Duration, clientCertDir string, insecure bool) (*objectFSDriver, error) {
 	if rpcTimeout <= 0 {
 		rpcTimeout = 30 * time.Second
 	}
@@ -176,6 +181,8 @@ func newDriver(nodeID, controllerAddress, cacheDir string, cacheBytes, diskCache
 		syncTimeout:            syncTimeout,
 		syncOnClose:            syncOnClose,
 		backgroundSyncInterval: backgroundSyncInterval,
+		clientCertDir:          clientCertDir,
+		insecure:               insecure,
 		mounts:                 make(map[string]*activeMount),
 	}, nil
 }
@@ -197,9 +204,23 @@ func (d *objectFSDriver) getClient() (pb.ObjectFSControllerClient, error) {
 		return d.client, nil
 	}
 
+	var creds credentials.TransportCredentials
+	if d.insecure {
+		creds = insecure.NewCredentials()
+	} else {
+		if !grpcutil.DirExists(d.clientCertDir) {
+			return nil, fmt.Errorf("client certificate directory %s does not exist; pass --insecure for plaintext local dev", d.clientCertDir)
+		}
+		tlsCreds, err := grpcutil.NewClientTLSFromDir(d.clientCertDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client TLS credentials from %s: %w", d.clientCertDir, err)
+		}
+		creds = tlsCreds
+	}
+
 	conn, err := grpc.NewClient(d.controllerAddress,
 		grpcutil.DialOptions(
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithTransportCredentials(creds),
 			grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 		)...,
 	)

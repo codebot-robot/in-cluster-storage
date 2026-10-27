@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,7 +78,7 @@ func TestParseWriteMode(t *testing.T) {
 }
 
 func TestPluginInfo(t *testing.T) {
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second)
+	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true)
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -112,7 +113,7 @@ func TestNodeGetVolumeStats(t *testing.T) {
 	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second)
+	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true)
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -148,5 +149,23 @@ func TestNodeGetVolumeStats(t *testing.T) {
 	}
 	if inodesUsage.GetUsed() != 1 { // root directory inode
 		t.Errorf("expected 1 used inode, got %d", inodesUsage.GetUsed())
+	}
+}
+
+func TestNodeDaemonSecurityFlags(t *testing.T) {
+	// 1. Without insecure, non-existent client cert dir -> fails closed
+	nonExistentDir := "/nonexistent/test/certs/client"
+	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, nonExistentDir, false)
+	if err != nil {
+		t.Fatalf("newDriver failed: %v", err)
+	}
+	defer func() { _ = driver.Close() }()
+
+	_, err = driver.getClient()
+	if err == nil {
+		t.Fatalf("expected error from getClient with non-existent cert dir")
+	}
+	if !strings.Contains(err.Error(), nonExistentDir) {
+		t.Errorf("expected error to name nonexistent cert dir %s, got: %v", nonExistentDir, err)
 	}
 }
