@@ -320,11 +320,12 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	}
 
 	mountOpts := &gofuse.MountOptions{
-		AllowOther: true,
-		FsName:     "objectfs",
-		Name:       "objectfs",
-		Options:    []string{"default_permissions", "allow_other"},
-		Debug:      d.debug,
+		AllowOther:  true,
+		FsName:      "objectfs",
+		Name:        "objectfs",
+		Options:     []string{"default_permissions", "allow_other"},
+		Debug:       d.debug,
+		DirectMount: os.Geteuid() == 0,
 	}
 
 	server, err := gofuse.NewServer(rawFS, targetPath, mountOpts)
