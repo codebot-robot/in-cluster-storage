@@ -244,3 +244,75 @@ func TestE2EGroups_DriftGuardDetection(t *testing.T) {
 		t.Errorf("expected duplicate TestDuplicate in 2 groups, got %v", duplicates)
 	}
 }
+
+func TestNoCommittedPrivateKeys(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join(".", "..", ".."))
+
+	err := filepath.Walk(repoRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if info.Name() == ".git" || info.Name() == ".build" || info.Name() == "bin" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if strings.HasSuffix(path, ".key") {
+			t.Errorf("found private key file committed to repository: %s", path)
+		}
+
+		if strings.HasSuffix(path, ".pem") {
+			data, readErr := os.ReadFile(path)
+			if readErr == nil && strings.Contains(string(data), "PRIVATE KEY") {
+				t.Errorf("found PEM file containing private key committed to repository: %s", path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking repo: %v", err)
+	}
+}
+
+func TestRBAC_TLSInitSecurity(t *testing.T) {
+	manifestPath := filepath.Clean(filepath.Join(".", "..", "..", "k8s", "objectfs.yaml"))
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", manifestPath, err)
+	}
+	content := string(data)
+
+	// Verify certsigner Job runs under dedicated serviceAccountName: objectfs-certsigner
+	if !strings.Contains(content, "serviceAccountName: objectfs-certsigner") {
+		t.Errorf("objectfs-certsigner Job must run under dedicated serviceAccountName: objectfs-certsigner")
+	}
+
+	// Verify controller does not have secret write privileges
+	docs := strings.Split(content, "---")
+	for _, doc := range docs {
+		if strings.Contains(doc, "kind: Role") || strings.Contains(doc, "kind: ClusterRole") {
+			if strings.Contains(doc, "name: objectfs-controller") {
+				if strings.Contains(doc, "resources: [\"secrets\"]") || strings.Contains(doc, "\"secrets\"") {
+					t.Errorf("controller role must not grant permissions on secrets")
+				}
+			}
+		}
+		// Verify node daemon DaemonSet never mounts the server secret
+		if strings.Contains(doc, "kind: DaemonSet") && strings.Contains(doc, "name: objectfs-node-daemon") {
+			if strings.Contains(doc, "objectfs-controller-server") {
+				t.Errorf("objectfs-node-daemon DaemonSet must not mount objectfs-controller-server")
+			}
+			if !strings.Contains(doc, "objectfs-node-daemon-client") {
+				t.Errorf("objectfs-node-daemon DaemonSet must mount objectfs-node-daemon-client")
+			}
+		}
+		// Verify controller StatefulSet never mounts the admin client secret
+		if strings.Contains(doc, "kind: StatefulSet") && strings.Contains(doc, "name: objectfs-controller") {
+			if strings.Contains(doc, "objectfs-admin-client") {
+				t.Errorf("objectfs-controller StatefulSet must not mount objectfs-admin-client")
+			}
+		}
+	}
+}

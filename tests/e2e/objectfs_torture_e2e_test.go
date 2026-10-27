@@ -231,11 +231,13 @@ func setupObjectFSTortureCluster(t *testing.T, clusterName string) (*Harness, st
 	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/objectfs-node-daemon/Dockerfile"), experimentRoot)
 	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
 	h.DockerBuild("fakes3:e2e", filepath.Join(experimentRoot, "fakes3/images/fakes3/Dockerfile"), filepath.Join(experimentRoot, "fakes3"))
+	h.DockerBuild("certsigner:e2e", filepath.Join(experimentRoot, "certsigner/images/certsigner/Dockerfile"), filepath.Join(experimentRoot, "certsigner"))
 
 	h.KindLoad("objectfs-controller:e2e")
 	h.KindLoad("objectfs-node-daemon:e2e")
 	h.KindLoad("wal-buffer:e2e")
 	h.KindLoad("fakes3:e2e")
+	h.KindLoad("certsigner:e2e")
 
 	// Deploy FakeS3
 	fakes3Manifest := `
@@ -292,6 +294,7 @@ spec:
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
+	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: certsigner:latest", "image: certsigner:e2e\n          imagePullPolicy: Never")
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
 
 	// Enable --debug-mutation-check on controller
@@ -338,6 +341,8 @@ spec:
 	t.Logf("Deploying ObjectFS (on %s) and WAL Buffer with --debug-mutation-check and mounts --debug", node1)
 	h.KubectlApplyContent("objectfs", objectfsManifest)
 	h.KubectlApplyContent("wal-buffer", walManifest)
+
+	h.RunCommand("kubectl", "wait", "--for=condition=complete", "job/objectfs-certsigner", "-n", "default", "--timeout=60s")
 
 	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
 		t.Fatalf("WAL Buffer failed to start: %v", err)

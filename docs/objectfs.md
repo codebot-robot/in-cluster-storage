@@ -340,7 +340,55 @@ Each node daemon and controller maintains a local cache backed by memory and ded
 - **Dirty Write Buffering (`NodeCache`):** The in-memory cache holds only uncommitted dirty write buffers (`--cache-size-mb`, default 128 MB) until acknowledged by an `Fsync` RPC (#222/#245 generation protocol).
 - **Cache Invalidation & Kernel Notifications:** Subscribes to the controller's `WatchVolume` gRPC push notification stream. When another node modifies, renames, or deletes a file, the node daemon invalidates its local cache entries, file manifests, and pushes kernel invalidations via go-fuse (`InodeNotify`, `EntryNotify`, `DeleteNotify`). After a remote write, a process on another node that already has the file open sees the new size on its next `read(2)`, `stat`, or `open`; readers that use `sendfile`/`splice` on an existing descriptor keep the old EOF until one of those happens, because the kernel's splice path does not revalidate FUSE attributes (#274/#278). Reconnects invalidate all clean state, reset manifests, and sweep both `EntryNotify(parent, name)` for all tracked directory entries and `InodeNotify(ino, -1, 0)` over all kernel-held inodes. During a controller or watch-stream outage a node continues to serve cached data and names; it revalidates all of them (attributes, data, directory entries) as soon as the stream is re-established, so staleness is bounded by the outage length; a node resumes serving within a few seconds of the controller returning. Entry and attribute cache timeouts while healthy can be tuned via `--entry-timeout` and `--attr-timeout` (default 60s, e.g. in `objectfsctl mount`).
 
-### 3. Trying It Locally
+### 3. Security, TLS & Authentication
+
+ObjectFS enforces network isolation, transport encryption, and role-based mutual TLS (mTLS) authentication:
+
+1. **Network Isolation:**
+   - Ingress to the controller's gRPC port (`50051`) is restricted by a Kubernetes `NetworkPolicy` strictly to pods labeled `app: objectfs-node-daemon` and `app: objectfs-admin`. All other cluster traffic to the controller is dropped at the network layer.
+
+2. **Per-Directory Certificates & Transport Layer Security (mTLS):**
+   - The controller serves gRPC over mutual TLS (`tls.RequireAndVerifyClientCert`), requiring and validating client certificates against its mounted trust bundle.
+   - **Per-Directory Certificate Layout:** Every pod receives one directory per certificate it holds:
+     ```
+     <dir>/tls.key        private key (PEM)
+     <dir>/tls.crt        certificate for that key (PEM, leaf first)
+     <dir>/trust/*.crt    trust bundle: any number of PEM files; readers load all and dedupe
+     ```
+     - Server directory mounted at `/etc/objectfs/certs/server` (`--server-cert-dir`).
+     - Client directory mounted at `/etc/objectfs/certs/client` (`--client-cert-dir`).
+   - **Fail-Closed Security:** Plaintext gRPC is strictly disabled on both the controller and clients (`objectfs-node-daemon`, `objectfsctl`) unless explicitly opted into via `--insecure` (for local development). Missing or invalid certificate directories result in immediate client startup errors rather than falling back to plaintext.
+
+3. **Client Certificate Identity & Role-Based Authorization:**
+   - Client identity is derived directly from the client certificate's URI Subject Alternative Name (SAN), formatted as `objectfs://<role>/<namespace>/<serviceaccount>`.
+   - The controller maps the role from the URI SAN and enforces namespace scoping:
+     - **`node-daemon` Role (`objectfs://node-daemon/<namespace>/objectfs-node-daemon`):** Allowed to execute filesystem, volume, blob, and CSI operations (`GetAttr`, `ReadFile`, `WriteFile`, `Fsync`, `WatchVolume`, `AckCheckpoint`, `AcquireExclusive`, `GetBlob`, `ListBlobs`, etc.). Calls to administrative methods are rejected with `PermissionDenied`.
+     - **`admin` Role (`objectfs://admin/<namespace>/objectfs-admin`):** Allowed full access to all RPCs, including `CreateSnapshot`, `ListSnapshots`, `ListVolumes`, and `Checkpoint`.
+     - **Cross-tenant / Unprivileged Certificates:** Any certificate from another namespace or without a valid `objectfs://` URI SAN receives `RoleNone` and is rejected with `PermissionDenied` or `Unauthenticated`.
+
+4. **`certsigner` Module & Secret Issuance:**
+   - By default, `k8s/objectfs.yaml` runs a one-shot `objectfs-certsigner` Job under a dedicated `objectfs-certsigner` ServiceAccount (whose Role grants `create`/`get` strictly scoped to the three TLS Secrets).
+   - `certsigner` generates an in-memory self-signed CA (10-year validity, private key never stored on disk or in Secrets) and 1-year leaf certificates.
+   - It writes one Secret per directory (create-only, never updates existing Secrets):
+     - `objectfs-controller-server` (mounted at `/etc/objectfs/certs/server` on controller)
+     - `objectfs-node-daemon-client` (mounted at `/etc/objectfs/certs/client` on node daemon; never mounts server key)
+     - `objectfs-admin-client` (mounted at `/etc/objectfs/certs/client` on admin pods; never mounted on the controller)
+   - On initial deployment, node daemon pods may briefly log `secret "objectfs-node-daemon-client" not found` while the init Job completes; this is transient and resolves automatically once the Job creates the Secrets.
+   - The controller logs a warning at startup and daily when within 30 days of leaf expiration.
+   - **Rotation Procedure:** Because `certsigner` is create-only, to rotate certificates generated by the Job:
+     1. Delete the Secrets and completed Job: `kubectl delete job objectfs-certsigner -n kube-objectfs-system && kubectl delete secret objectfs-controller-server objectfs-node-daemon-client objectfs-admin-client -n kube-objectfs-system`
+     2. Re-apply the manifest (`kubectl apply -f k8s/objectfs.yaml`) to trigger a fresh Job run.
+     3. Restart controller StatefulSet and node daemon DaemonSet: `kubectl rollout restart statefulset objectfs-controller daemonset objectfs-node-daemon -n kube-objectfs-system`
+
+5. **Administrative Path for `objectfsctl`:**
+   - `objectfsctl` provides `--client-cert-dir` (also configurable via `OBJECTFS_CLIENT_CERT_DIR` environment variable, defaulting to `/etc/objectfs/certs/client`).
+   - For administrative operations from an admin pod mounting `objectfs-admin-client` at `/etc/objectfs/certs/client`:
+     ```bash
+     objectfsctl --server objectfs-controller:50051 volumes list
+     objectfsctl --server objectfs-controller:50051 checkpoint <volume_id>
+     ```
+
+### 4. Trying It Locally
 
 `dev/tasks/fuse-start` runs the whole stack on one machine with no cloud credentials: it starts `objectfs-controller` against a `file://` object store in a temp directory and mounts a volume there with `objectfsctl mount`. On Linux it runs natively; on macOS it cross-compiles Linux binaries and runs them in a Docker container with `/dev/fuse`, opening a shell inside the container where the mount is visible. See the header of the script for the environment variables it accepts (volume ID, write mode, data directory, extra `objectfsctl mount` flags such as `--debug`).
 

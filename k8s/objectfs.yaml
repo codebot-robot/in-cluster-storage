@@ -62,6 +62,107 @@ roleRef:
 
 ---
 
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: objectfs-admin
+  namespace: kube-objectfs-system
+
+---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: objectfs-certsigner
+  namespace: kube-objectfs-system
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: objectfs-certsigner-role
+  namespace: kube-objectfs-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - "objectfs-controller-server"
+      - "objectfs-node-daemon-client"
+      - "objectfs-admin-client"
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: objectfs-certsigner-binding
+  namespace: kube-objectfs-system
+subjects:
+  - kind: ServiceAccount
+    name: objectfs-certsigner
+    namespace: kube-objectfs-system
+roleRef:
+  kind: Role
+  name: objectfs-certsigner-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: objectfs-certsigner
+  namespace: kube-objectfs-system
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: objectfs-certsigner
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: objectfs-certsigner
+      containers:
+        - name: certsigner
+          image: certsigner:latest
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: objectfs-controller
+  namespace: kube-objectfs-system
+spec:
+  podSelector:
+    matchLabels:
+      app: objectfs-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: objectfs-node-daemon
+        - podSelector:
+            matchLabels:
+              app: objectfs-admin
+      ports:
+        - protocol: TCP
+          port: 50051
+
+---
+
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -107,6 +208,7 @@ spec:
             - "--nodeid=$(NODE_ID)"
             - "--controller-address=objectfs-controller:50051"
             - "--cache-dir=/var/cache/objectfs"
+            - "--client-cert-dir=/etc/objectfs/certs/client"
           env:
             - name: NODE_ID
               valueFrom:
@@ -120,6 +222,9 @@ spec:
               mountPropagation: "Bidirectional"
             - name: cache-dir
               mountPath: /var/cache/objectfs
+            - name: certs-client
+              mountPath: /etc/objectfs/certs/client
+              readOnly: true
       volumes:
         - name: socket-dir
           hostPath:
@@ -137,6 +242,16 @@ spec:
           hostPath:
             path: /var/cache/objectfs
             type: DirectoryOrCreate
+        - name: certs-client
+          secret:
+            secretName: objectfs-node-daemon-client
+            items:
+              - key: tls.key
+                path: tls.key
+              - key: tls.crt
+                path: tls.crt
+              - key: ca.crt
+                path: trust/ca.crt
 
 ---
 
@@ -258,12 +373,17 @@ spec:
             - "--metadata-dir=/var/lib/objectfs/controller/metadata"
             - "--wal-target=wal-buffer-client:50051"
             - "--wal-durability=witness"
+            - "--server-cert-dir=/etc/objectfs/certs/server"
           env:
             - name: OBJECT_STORAGE_BACKEND
               valueFrom:
                 configMapKeyRef:
                   name: objectfs-config
                   key: backend
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - containerPort: 50051
           volumeMounts:
@@ -271,6 +391,9 @@ spec:
               mountPath: /csi
             - name: data-dir
               mountPath: /var/lib/objectfs/controller
+            - name: certs-server
+              mountPath: /etc/objectfs/certs/server
+              readOnly: true
       volumes:
         - name: socket-dir
           emptyDir: {}
@@ -278,6 +401,16 @@ spec:
           hostPath:
             path: /var/lib/objectfs/controller
             type: DirectoryOrCreate
+        - name: certs-server
+          secret:
+            secretName: objectfs-controller-server
+            items:
+              - key: tls.key
+                path: tls.key
+              - key: tls.crt
+                path: tls.crt
+              - key: ca.crt
+                path: trust/ca.crt
 
 ---
 
