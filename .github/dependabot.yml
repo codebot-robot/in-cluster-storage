@@ -22,6 +22,7 @@ updates:
     directories:
       - "/"
       - "/cas"
+      - "/certsigner"
       - "/fakes3"
     schedule:
       interval: "weekly"
