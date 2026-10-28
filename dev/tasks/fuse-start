@@ -218,6 +218,7 @@ echo "Starting objectfs-controller on ${SERVER_ADDR} (backend file://${STORE_DIR
     --backend "file://${STORE_DIR}" \
     --metadata-index "${OBJECTFS_METADATA_INDEX:-sqlite}" \
     --flush-interval 1m \
+    --insecure \
     ${OBJECTFS_CONTROLLER_ARGS:-}
 ) >"${CONTROLLER_LOG}" 2>&1 &
 CONTROLLER_PID=$!
@@ -241,7 +242,7 @@ done
 echo "Mounting volume ${OBJECTFS_VOLUME} at ${MOUNT_DIR} (writeMode=${OBJECTFS_WRITE_MODE}, log ${MOUNT_LOG})"
 (
   trap '' INT
-  exec "${BIN_DIR}/objectfsctl" --server "${SERVER_ADDR}" mount \
+  exec "${BIN_DIR}/objectfsctl" --server "${SERVER_ADDR}" --insecure mount \
     --volume "${OBJECTFS_VOLUME}" \
     --write-mode "${OBJECTFS_WRITE_MODE}" \
     ${OBJECTFS_MOUNT_ARGS:-} \

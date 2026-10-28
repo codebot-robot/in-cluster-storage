@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"crypto/x509"
 	"flag"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -91,4 +93,29 @@ func TestControllerTableRegistration(t *testing.T) {
 	if !tableDB.DisableWAL() {
 		t.Errorf("tableDB.DisableWAL() = false, want true")
 	}
+}
+
+func TestCheckLeafExpiry(t *testing.T) {
+	now := time.Now()
+
+	t.Run("expired certificate", func(t *testing.T) {
+		cert := &x509.Certificate{
+			NotAfter: now.Add(-1 * time.Hour),
+		}
+		evaluateLeafExpiry(cert, now)
+	})
+
+	t.Run("warning when within 30 days of expiry (10 days left)", func(t *testing.T) {
+		cert := &x509.Certificate{
+			NotAfter: now.Add(10 * 24 * time.Hour),
+		}
+		evaluateLeafExpiry(cert, now)
+	})
+
+	t.Run("ok when well before 30-day window (200 days left)", func(t *testing.T) {
+		cert := &x509.Certificate{
+			NotAfter: now.Add(200 * 24 * time.Hour),
+		}
+		evaluateLeafExpiry(cert, now)
+	})
 }

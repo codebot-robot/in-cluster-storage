@@ -94,6 +94,26 @@ func executeCommand(args ...string) (string, error) {
 	buf := new(bytes.Buffer)
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
+	hasSecurity := false
+	for _, a := range args {
+		if a == "--insecure" || strings.HasPrefix(a, "--client-cert-dir") {
+			hasSecurity = true
+			break
+		}
+	}
+	if !hasSecurity {
+		args = append([]string{"--insecure"}, args...)
+	}
+	cmd.SetArgs(args)
+	err := cmd.Execute()
+	return buf.String(), err
+}
+
+func executeCommandRaw(args ...string) (string, error) {
+	cmd := NewRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
 	cmd.SetArgs(args)
 	err := cmd.Execute()
 	return buf.String(), err
@@ -682,5 +702,36 @@ func TestVolumesDescribeCommand(t *testing.T) {
 	}
 	if !strings.Contains(out, "Exclusive Hold: none") {
 		t.Errorf("expected 'Exclusive Hold: none' after release, got: %s", out)
+	}
+}
+
+func TestObjectfsctlSecurityFlags(t *testing.T) {
+	_, serverAddr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// 1. Without --insecure and without cert dir -> fails closed
+	_, err := executeCommandRaw("--server", serverAddr, "volumes", "list")
+	if err == nil {
+		t.Fatalf("expected error without --insecure or client cert dir")
+	}
+	if !strings.Contains(err.Error(), "client certificate directory is required") {
+		t.Errorf("expected client certificate directory is required error, got: %v", err)
+	}
+
+	// 2. Non-existent cert dir -> fails closed naming the path
+	nonExistentDir := "/nonexistent/test/certs/client"
+	_, err = executeCommandRaw("--server", serverAddr, "--client-cert-dir", nonExistentDir, "volumes", "list")
+	if err == nil {
+		t.Fatalf("expected error with nonexistent cert dir")
+	}
+	if !strings.Contains(err.Error(), nonExistentDir) {
+		t.Errorf("expected error to name nonexistent cert dir %s, got: %v", nonExistentDir, err)
+	}
+
+	// 3. OBJECTFS_CLIENT_CERT_DIR env var fallback
+	t.Setenv("OBJECTFS_CLIENT_CERT_DIR", nonExistentDir)
+	_, err = executeCommandRaw("--server", serverAddr, "volumes", "list")
+	if err == nil || !strings.Contains(err.Error(), nonExistentDir) {
+		t.Errorf("expected error naming OBJECTFS_CLIENT_CERT_DIR path %s, got: %v", nonExistentDir, err)
 	}
 }

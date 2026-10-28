@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"net"
@@ -31,6 +33,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -43,6 +46,9 @@ import (
 
 var (
 	port                      = flag.Int("port", 50051, "The server port")
+	serverCertDir             = flag.String("server-cert-dir", "/etc/objectfs/certs/server", "Directory containing tls.key, tls.crt, and trust/*.crt for mTLS")
+	insecure                  = flag.Bool("insecure", false, "Disable TLS and client certificate authentication (dev only)")
+	namespace                 = flag.String("namespace", "", "Kubernetes namespace for caller authorization (default from POD_NAMESPACE)")
 	csiEndpoint               = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
 	backendFlag               = flag.String("backend", "", "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
 	metadataDir               = flag.String("metadata-dir", "", "Local directory for persistent metadata indices (e.g. SQLite databases)")
@@ -63,6 +69,38 @@ var (
 	controllerSyncTimeout     = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
 )
+
+func evaluateLeafExpiry(cert *x509.Certificate, now time.Time) {
+	if cert == nil {
+		return
+	}
+	remaining := cert.NotAfter.Sub(now)
+	if remaining <= 0 {
+		klog.Errorf("TLS leaf certificate expired at %s (expired %s ago). Rotate secret and rollout restart controller and node daemons immediately!", cert.NotAfter.Format(time.RFC3339), (-remaining).Round(time.Second))
+	} else if remaining <= 30*24*time.Hour {
+		days := int(remaining.Hours() / 24)
+		klog.Warningf("TLS leaf certificate will expire in %d days (at %s). Rotate secret and rollout restart controller and node daemons to avoid outage!", days, cert.NotAfter.Format(time.RFC3339))
+	}
+}
+
+func checkLeafExpiry(certFile string, now time.Time) {
+	data, err := os.ReadFile(certFile)
+	if err != nil {
+		klog.Warningf("could not read leaf cert %s for expiry check: %v", certFile, err)
+		return
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		klog.Warningf("could not decode PEM in leaf cert %s", certFile)
+		return
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		klog.Warningf("could not parse leaf cert %s: %v", certFile, err)
+		return
+	}
+	evaluateLeafExpiry(cert, now)
+}
 
 func parseEndpoint(endpoint string) (string, string, error) {
 	parts := strings.SplitN(endpoint, "://", 2)
@@ -167,7 +205,53 @@ func main() {
 		klog.Warningf("objectfs-controller: no WAL stream configured (--wal-dir unset): fsync is NOT durable across controller restarts; volumes behave as ephemeral shared disks and metadata is persisted only by the periodic flush (--flush-interval=%s) and on shutdown", *flushInterval)
 	}
 
-	grpcServer := grpc.NewServer()
+	var grpcServer *grpc.Server
+	if *insecure {
+		klog.Warning("Serving plaintext gRPC without TLS or authentication (--insecure is set)")
+		grpcServer = grpc.NewServer()
+	} else {
+		if !grpcutil.DirExists(*serverCertDir) {
+			klog.Fatalf("server certificate directory %s does not exist; pass --insecure for plaintext local dev", *serverCertDir)
+		}
+
+		checkLeafExpiry(filepath.Join(*serverCertDir, "tls.crt"), time.Now())
+		go func() {
+			ticker := time.NewTicker(24 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case t := <-ticker.C:
+					checkLeafExpiry(filepath.Join(*serverCertDir, "tls.crt"), t)
+				}
+			}
+		}()
+
+		tlsCreds, err := grpcutil.NewServerTLSFromDir(*serverCertDir)
+		if err != nil {
+			klog.Fatalf("failed to load server TLS credentials from %s: %v", *serverCertDir, err)
+		}
+
+		ns := *namespace
+		if ns == "" {
+			ns = os.Getenv("POD_NAMESPACE")
+		}
+		if ns == "" {
+			ns = "kube-objectfs-system"
+		}
+
+		authInterceptor := controller.NewServerAuthInterceptor(&controller.AuthConfig{
+			Namespace: ns,
+			Insecure:  false,
+		})
+
+		grpcServer = grpc.NewServer(
+			grpc.Creds(tlsCreds),
+			grpc.UnaryInterceptor(authInterceptor.UnaryServerInterceptor()),
+			grpc.StreamInterceptor(authInterceptor.StreamServerInterceptor()),
+		)
+	}
 	server := controller.NewServer(backend, serverOpts...)
 	csiController := controller.NewCSIController(server)
 

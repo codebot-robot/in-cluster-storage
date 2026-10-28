@@ -61,11 +61,13 @@ func buildAndLoadE2EImages(h *Harness, gitRoot string) {
 	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(gitRoot, "images/objectfs-node-daemon/Dockerfile"), gitRoot)
 	h.DockerBuild("wal-buffer:e2e", filepath.Join(gitRoot, "images/wal-buffer/Dockerfile"), gitRoot)
 	h.DockerBuild("fakes3:e2e", filepath.Join(gitRoot, "fakes3/images/fakes3/Dockerfile"), filepath.Join(gitRoot, "fakes3"))
+	h.DockerBuild("certsigner:e2e", filepath.Join(gitRoot, "certsigner/images/certsigner/Dockerfile"), filepath.Join(gitRoot, "certsigner"))
 
 	h.KindLoad("objectfs-controller:e2e")
 	h.KindLoad("objectfs-node-daemon:e2e")
 	h.KindLoad("wal-buffer:e2e")
 	h.KindLoad("fakes3:e2e")
+	h.KindLoad("certsigner:e2e")
 }
 
 func setupSharedObjectFSCluster(t *testing.T) (*Harness, string) {
@@ -151,6 +153,7 @@ spec:
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: certsigner:latest", "image: certsigner:e2e\n          imagePullPolicy: Never")
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
 
 		awsEnvController := `env:
@@ -187,6 +190,8 @@ spec:
 		initH.KubectlApplyContent("wal-buffer", walManifest)
 		initH.KubectlApplyContent("objectfs", objectfsManifest)
 
+		initH.RunCommand("kubectl", "wait", "--for=condition=complete", "job/objectfs-certsigner", "-n", "default", "--timeout=60s")
+
 		if err := initH.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
 			sharedSingleNodeErr = fmt.Errorf("wal-buffer failed to start: %w", err)
 			return
@@ -197,6 +202,42 @@ spec:
 		}
 		if err := initH.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
 			sharedSingleNodeErr = fmt.Errorf("objectfs-node-daemon failed to start: %w", err)
+			return
+		}
+
+		adminPodYaml := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: objectfs-admin-pod
+  namespace: default
+  labels:
+    app: objectfs-admin
+spec:
+  containers:
+    - name: client
+      image: objectfs-controller:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 36000"]
+      volumeMounts:
+        - name: certs-client
+          mountPath: /etc/objectfs/certs/client
+          readOnly: true
+  volumes:
+    - name: certs-client
+      secret:
+        secretName: objectfs-admin-client
+        items:
+          - key: tls.key
+            path: tls.key
+          - key: tls.crt
+            path: tls.crt
+          - key: ca.crt
+            path: trust/ca.crt
+`
+		initH.KubectlApplyContent("objectfs-admin-pod", adminPodYaml)
+		if err := initH.WaitForPodReady("objectfs-admin-pod", "default", 2*time.Minute); err != nil {
+			sharedSingleNodeErr = fmt.Errorf("objectfs-admin-pod failed to start: %w", err)
 			return
 		}
 	})
@@ -357,7 +398,133 @@ spec:
 	}
 
 	h.DeletePod(pod3Name, ns)
-	t.Logf("Successfully verified ObjectFS multi-writer FUSE CSI driver!")
+	t.Logf("Successfully verified ObjectFS multi-writer FUSE CSI driver with node daemon authenticated via mTLS!")
+
+	// Step 4: Verify mTLS, certificate authorization, and NetworkPolicy
+	authClientPod := "objectfs-auth-test-pod"
+	authClientYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: default
+  labels:
+    app: objectfs-admin
+spec:
+  containers:
+    - name: client
+      image: objectfs-controller:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: admin-certs
+          mountPath: /etc/objectfs/certs/client
+          readOnly: true
+        - name: node-certs
+          mountPath: /etc/objectfs/certs/node
+          readOnly: true
+        - name: nocert-dir
+          mountPath: /etc/objectfs/certs/nocert
+  volumes:
+    - name: admin-certs
+      secret:
+        secretName: objectfs-admin-client
+        items:
+          - key: tls.key
+            path: tls.key
+          - key: tls.crt
+            path: tls.crt
+          - key: ca.crt
+            path: trust/ca.crt
+    - name: node-certs
+      secret:
+        secretName: objectfs-node-daemon-client
+        items:
+          - key: tls.key
+            path: tls.key
+          - key: tls.crt
+            path: tls.crt
+          - key: ca.crt
+            path: trust/ca.crt
+    - name: nocert-dir
+      emptyDir: {}
+`, authClientPod)
+
+	h.KubectlApplyContent(authClientPod, authClientYaml)
+	if err := h.WaitForPodReady(authClientPod, "default", 1*time.Minute); err != nil {
+		t.Fatalf("auth test pod failed to start: %v", err)
+	}
+
+	// 1. Pod with no certificate fails TLS handshake
+	noCertOut, noCertErr := h.RunInPod(authClientPod, "default", "objectfsctl", "--server", "objectfs-controller:50051", "--client-cert-dir", "/etc/objectfs/certs/nocert", "volumes", "list")
+	if noCertErr == nil {
+		t.Fatalf("expected call without client certificate to fail, but succeeded with output: %s", noCertOut)
+	}
+	t.Logf("Client without certificate correctly rejected: %v (%s)", noCertErr, strings.TrimSpace(noCertOut))
+
+	// 2. Pod with node-daemon client certificate calling admin RPC (volumes list) gets PermissionDenied
+	nodeCertOut, nodeCertErr := h.RunInPod(authClientPod, "default", "objectfsctl", "--server", "objectfs-controller:50051", "--client-cert-dir", "/etc/objectfs/certs/node", "volumes", "list")
+	if nodeCertErr == nil {
+		t.Fatalf("expected node-daemon certificate calling admin RPC to fail with PermissionDenied, but got: %s", nodeCertOut)
+	}
+	if !strings.Contains(nodeCertOut, "PermissionDenied") && !strings.Contains(fmt.Sprintf("%v", nodeCertErr), "PermissionDenied") {
+		t.Fatalf("expected PermissionDenied for node-daemon role, got: %v (out: %s)", nodeCertErr, nodeCertOut)
+	}
+	t.Logf("Node daemon certificate correctly denied for admin RPC: %s", strings.TrimSpace(nodeCertOut))
+
+	// 3. objectfsctl with admin directory succeeds
+	adminOut, adminErr := h.RunInPod(authClientPod, "default", "objectfsctl", "--server", "objectfs-controller:50051", "volumes", "list")
+	if adminErr != nil {
+		t.Fatalf("expected admin certificate to succeed, got error: %v (out: %s)", adminErr, adminOut)
+	}
+	t.Logf("Admin client certificate succeeded: %s", strings.TrimSpace(adminOut))
+
+	h.DeletePod(authClientPod, "default")
+
+	// 4. NetworkPolicy step: unprivileged pod without allowed label is dropped at network level
+	unauthPod := "objectfs-unauth-netpol-pod"
+	unauthYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: default
+  labels:
+    app: unprivileged-client
+spec:
+  containers:
+    - name: client
+      image: objectfs-controller:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: admin-certs
+          mountPath: /etc/objectfs/certs/client
+          readOnly: true
+  volumes:
+    - name: admin-certs
+      secret:
+        secretName: objectfs-admin-client
+        items:
+          - key: tls.key
+            path: tls.key
+          - key: tls.crt
+            path: tls.crt
+          - key: ca.crt
+            path: trust/ca.crt
+`, unauthPod)
+
+	h.KubectlApplyContent(unauthPod, unauthYaml)
+	if err := h.WaitForPodReady(unauthPod, "default", 1*time.Minute); err != nil {
+		t.Fatalf("unauth netpol pod failed to start: %v", err)
+	}
+
+	netpolOut, netpolErr := h.RunInPod(unauthPod, "default", "timeout", "5", "objectfsctl", "--server", "objectfs-controller:50051", "volumes", "list")
+	if netpolErr == nil {
+		t.Fatalf("expected NetworkPolicy to drop traffic from unlabelled pod, but command succeeded: %s", netpolOut)
+	}
+	h.DeletePod(unauthPod, "default")
+	t.Logf("NetworkPolicy correctly blocked unlabelled pod at network level: %v (%s)", netpolErr, strings.TrimSpace(netpolOut))
 }
 
 func TestObjectFSStatefulSetE2E(t *testing.T) {
@@ -805,6 +972,7 @@ spec:
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: certsigner:latest", "image: certsigner:e2e\n          imagePullPolicy: Never")
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
 
 		awsEnvController := `env:
@@ -845,6 +1013,8 @@ spec:
 		initH.KubectlApplyContent("objectfs", objectfsManifest)
 		initH.KubectlApplyContent("wal-buffer", walManifest)
 
+		initH.RunCommand("kubectl", "wait", "--for=condition=complete", "job/objectfs-certsigner", "-n", "default", "--timeout=60s")
+
 		if err := initH.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
 			sharedMultiNodeErr = fmt.Errorf("wal-buffer failed to start: %w", err)
 			return
@@ -855,6 +1025,42 @@ spec:
 		}
 		if err := initH.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
 			sharedMultiNodeErr = fmt.Errorf("objectfs-node-daemon failed to start: %w", err)
+			return
+		}
+
+		adminPodYaml := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: objectfs-admin-pod
+  namespace: default
+  labels:
+    app: objectfs-admin
+spec:
+  containers:
+    - name: client
+      image: objectfs-controller:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 36000"]
+      volumeMounts:
+        - name: certs-client
+          mountPath: /etc/objectfs/certs/client
+          readOnly: true
+  volumes:
+    - name: certs-client
+      secret:
+        secretName: objectfs-admin-client
+        items:
+          - key: tls.key
+            path: tls.key
+          - key: tls.crt
+            path: tls.crt
+          - key: ca.crt
+            path: trust/ca.crt
+`
+		initH.KubectlApplyContent("objectfs-admin-pod", adminPodYaml)
+		if err := initH.WaitForPodReady("objectfs-admin-pod", "default", 2*time.Minute); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("objectfs-admin-pod failed to start: %w", err)
 			return
 		}
 	})
@@ -873,7 +1079,8 @@ spec:
 		if !strings.HasPrefix(p, "fakes3") &&
 			!strings.HasPrefix(p, "objectfs-controller") &&
 			!strings.HasPrefix(p, "wal-buffer") &&
-			!strings.HasPrefix(p, "objectfs-node-daemon") {
+			!strings.HasPrefix(p, "objectfs-node-daemon") &&
+			!strings.HasPrefix(p, "objectfs-admin-pod") {
 			if err := exec.Command("kubectl", "delete", "pod", p, "-n", "default", "--force", "--grace-period=0", "--ignore-not-found").Run(); err != nil {
 				t.Logf("Warning: failed to delete leftover pod %s in default: %v", p, err)
 			}
@@ -2393,7 +2600,7 @@ spec:
 	}
 
 	t.Logf("Executing objectfsctl checkpoint for volume %s", actualVolumeID)
-	h.RunCommand("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "checkpoint", actualVolumeID)
+	h.RunCommand("kubectl", "exec", "objectfs-admin-pod", "-n", "default", "-c", "client", "--", "objectfsctl", "--server", "objectfs-controller:50051", "checkpoint", actualVolumeID)
 
 	// Pod A writes more files AFTER the checkpoint
 	t.Logf("Pod A writing files after checkpoint")
@@ -2680,7 +2887,7 @@ spec:
 
 	// Trigger explicit checkpoint via objectfsctl checkpoint <volume>
 	t.Logf("Executing objectfsctl checkpoint for volume %s", actualVolumeID)
-	h.RunCommand("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "checkpoint", actualVolumeID)
+	h.RunCommand("kubectl", "exec", "objectfs-admin-pod", "-n", "default", "-c", "client", "--", "objectfsctl", "--server", "objectfs-controller:50051", "checkpoint", actualVolumeID)
 
 	// Pod A writes post-checkpoint file
 	t.Logf("Pod A writing files after checkpoint")
