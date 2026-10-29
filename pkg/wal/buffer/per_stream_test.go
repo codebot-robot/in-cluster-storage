@@ -769,3 +769,69 @@ func TestAggregatedSegmentGCPreservedDuringUploadFailure(t *testing.T) {
 		t.Fatalf("expected aggregated segment %s to be deleted once upload succeeded", segPath)
 	}
 }
+
+func TestTailOnEmptyStreamReceivesSubsequentAppends(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+
+	backend := inmemorystorage.New()
+	_, addr, cleanup := startTestServer(t, backend, t.TempDir())
+	defer cleanup()
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewWalBufferClient(conn)
+	streamID := uuid.New()
+
+	// 1. Start Tail on empty stream before any appends occur
+	tailStream, err := client.Tail(ctx, &pb.TailRequest{
+		StreamId:      streamID[:],
+		FromStreamSeq: 0,
+	})
+	if err != nil {
+		t.Fatalf("Tail failed: %v", err)
+	}
+
+	// 2. Append first record to this stream
+	appendStream, err := client.Append(ctx)
+	if err != nil {
+		t.Fatalf("Append start failed: %v", err)
+	}
+	if err := appendStream.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{
+			Hello: &pb.Hello{StreamId: streamID[:]},
+		},
+	}); err != nil {
+		t.Fatalf("Hello send failed: %v", err)
+	}
+	if _, err := appendStream.Recv(); err != nil {
+		t.Fatalf("HelloAck recv failed: %v", err)
+	}
+
+	if err := appendStream.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Record{
+			Record: &pb.AppendRecord{
+				StreamSeq: 1,
+				Payload:   []byte("payload-1"),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Record send failed: %v", err)
+	}
+	if _, err := appendStream.Recv(); err != nil {
+		t.Fatalf("Ack recv failed: %v", err)
+	}
+
+	// 3. Tail stream must receive the record
+	resp, err := tailStream.Recv()
+	if err != nil {
+		t.Fatalf("TailStream Recv failed: %v", err)
+	}
+	if resp.GetRecord() == nil || resp.GetRecord().GetStreamSeq() != 1 {
+		t.Fatalf("unexpected record: %+v", resp.GetRecord())
+	}
+}
