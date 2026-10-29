@@ -17,6 +17,7 @@ limitations under the License.
 package certsigner
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -80,8 +81,9 @@ func DefaultConfig() Config {
 
 // GenerateCertificates generates an in-memory self-signed CA (10-year validity, key never stored)
 // and creates leaf certificates (1-year validity) for the controller server and node/admin clients.
-// If previousCA is provided, it is stored as ca-previous.crt to provide CA trust overlap during rotation;
-// if previousCA is empty, ca-previous.crt mirrors the active CA so volume projections succeed.
+// If previousCA is provided, the CA trust bundle (ca.crt) contains the current CA followed by
+// the previous CA (keeping two; dropping older); if previousCA is empty, ca.crt contains only
+// the current CA.
 func GenerateCertificates(cfg Config, previousCA []byte) ([]GeneratedSecret, error) {
 	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -200,37 +202,42 @@ func GenerateCertificates(cfg Config, previousCA []byte) ([]GeneratedSecret, err
 	adminPem := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: adminDer})
 	adminKeyPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(adminKey)})
 
-	previousCAPEM := string(caPem)
+	var caBundle bytes.Buffer
+	caBundle.Write(caPem)
+
 	if len(previousCA) > 0 {
-		previousCAPEM = string(previousCA)
+		block, _ := pem.Decode(previousCA)
+		if block != nil && block.Type == "CERTIFICATE" {
+			if !bytes.HasSuffix(caBundle.Bytes(), []byte("\n")) {
+				caBundle.WriteByte('\n')
+			}
+			caBundle.Write(pem.EncodeToMemory(block))
+		}
 	}
 
 	return []GeneratedSecret{
 		{
 			Name: cfg.ControllerSecret,
 			Data: map[string]string{
-				"tls.key":         string(serverKeyPem),
-				"tls.crt":         string(serverPem),
-				"ca.crt":          string(caPem),
-				"ca-previous.crt": previousCAPEM,
+				"tls.key": string(serverKeyPem),
+				"tls.crt": string(serverPem),
+				"ca.crt":  caBundle.String(),
 			},
 		},
 		{
 			Name: cfg.NodeDaemonSecret,
 			Data: map[string]string{
-				"tls.key":         string(nodeKeyPem),
-				"tls.crt":         string(nodePem),
-				"ca.crt":          string(caPem),
-				"ca-previous.crt": previousCAPEM,
+				"tls.key": string(nodeKeyPem),
+				"tls.crt": string(nodePem),
+				"ca.crt":  caBundle.String(),
 			},
 		},
 		{
 			Name: cfg.AdminSecret,
 			Data: map[string]string{
-				"tls.key":         string(adminKeyPem),
-				"tls.crt":         string(adminPem),
-				"ca.crt":          string(caPem),
-				"ca-previous.crt": previousCAPEM,
+				"tls.key": string(adminKeyPem),
+				"tls.crt": string(adminPem),
+				"ca.crt":  caBundle.String(),
 			},
 		},
 	}, nil
