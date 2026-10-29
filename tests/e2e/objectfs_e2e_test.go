@@ -37,6 +37,22 @@ var (
 
 const sharedSingleNodeClusterName = "objectfs-shared-single"
 
+// requireE2EGroup skips the test unless RUN_E2E is set and OBJECTFS_E2E_GROUP matches.
+// When OBJECTFS_E2E_GROUP is empty or unset, it matches only "core".
+func requireE2EGroup(t *testing.T, group string) {
+	t.Helper()
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("Skipping E2E test; RUN_E2E not set")
+	}
+	currentGroup := os.Getenv("OBJECTFS_E2E_GROUP")
+	if currentGroup == "" {
+		currentGroup = "core"
+	}
+	if currentGroup != group {
+		t.Skipf("Skipping test for group %q; OBJECTFS_E2E_GROUP is %q", group, currentGroup)
+	}
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 
@@ -266,9 +282,7 @@ spec:
 }
 
 func TestObjectFSE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "core")
 
 	h, ns := setupSharedObjectFSCluster(t)
 	volumeID := fmt.Sprintf("objectfs-test-vol-%s", ns)
@@ -528,9 +542,7 @@ spec:
 }
 
 func TestObjectFSStatefulSetE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS StatefulSet E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "core")
 
 	h, ns := setupSharedObjectFSCluster(t)
 
@@ -695,9 +707,7 @@ spec:
 }
 
 func TestObjectFSPersistentE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS Persistent E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "core")
 
 	h, ns := setupSharedObjectFSCluster(t)
 	volumeID := fmt.Sprintf("persistent-s3-test-vol-%s", ns)
@@ -1145,9 +1155,7 @@ func retryCatInPod(h *Harness, pod, path string, timeout time.Duration) (string,
 }
 
 func TestObjectFSMultiNodeFailoverE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS Multi-Node Failover E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "multinode")
 
 	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
 	t.Logf("Running 2-node failover test across Node 1 (%s) and Node 2 (%s)", node1, node2)
@@ -1326,9 +1334,7 @@ spec:
 }
 
 func TestObjectFSCrossNodeVisibilityE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS Cross-Node Visibility E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "multinode")
 
 	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
 	volumeID := "cross-node-vis-vol"
@@ -1642,9 +1648,7 @@ spec:
 }
 
 func TestObjectFSControllerCrashMidWriteE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS Controller Crash Mid-Write E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "chaos")
 
 	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
 	volumeID := "crash-midwrite-vol"
@@ -1870,9 +1874,7 @@ spec:
 }
 
 func TestObjectFSControllerOutageE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS Controller Outage E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "chaos")
 
 	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
 	volumeID := "outage-test-vol"
@@ -2043,9 +2045,7 @@ spec:
 }
 
 func TestObjectFSWalBufferRestartE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS WAL Buffer Restart E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "chaos")
 
 	h, node1, _ := setupObjectFSMultiNodeCluster(t)
 	volumeID := "wal-restart-vol"
@@ -2354,9 +2354,7 @@ func waitForControllerReplicationSessionIncrease(t *testing.T, h *Harness, initi
 }
 
 func TestObjectFSExclusiveLocalE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS Exclusive-Local E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "exclusive")
 
 	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
 	volumeID := "exclusive-local-e2e-vol"
@@ -2524,9 +2522,7 @@ spec:
 }
 
 func TestObjectFSExclusiveLocalKillE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS Exclusive-Local Kill E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "exclusive")
 
 	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
 	volumeID := "exclusive-kill-e2e-vol"
@@ -2664,9 +2660,7 @@ spec:
 }
 
 func TestObjectFSExclusiveLocalIntervalE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS Exclusive-Local Interval E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "exclusive")
 
 	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
 	volumeID := "exclusive-interval-e2e-vol"
@@ -2798,9 +2792,7 @@ spec:
 }
 
 func TestObjectFSExclusiveLocalDaemonKillE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping ObjectFS Exclusive-Local Daemon Kill E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "exclusive")
 
 	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
 	volumeID := "exclusive-daemonkill-e2e-vol"

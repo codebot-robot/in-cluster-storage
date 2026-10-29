@@ -15,51 +15,22 @@
 package e2e
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
-	"sort"
+	"strconv"
 	"strings"
 	"testing"
-)
-
-var (
-	coreGroup = map[string]bool{
-		"TestObjectFSE2E":            true,
-		"TestObjectFSStatefulSetE2E": true,
-		"TestObjectFSPersistentE2E":  true,
-		"TestWALE2E":                 true,
-		"TestWALS3E2E":               true,
-	}
-
-	multiNodeGroup = map[string]bool{
-		"TestObjectFSMultiNodeFailoverE2E":        true,
-		"TestObjectFSCrossNodeVisibilityE2E":      true,
-		"TestObjectFSExclusiveLocalE2E":           true, // #290
-		"TestObjectFSExclusiveLocalKillE2E":       true, // #288, #307
-		"TestObjectFSExclusiveLocalIntervalE2E":   true, // #288
-		"TestObjectFSExclusiveLocalDaemonKillE2E": true, // #307
-	}
-
-	chaosGroup = map[string]bool{
-		"TestObjectFSControllerCrashMidWriteE2E": true,
-		"TestObjectFSControllerOutageE2E":        true,
-		"TestObjectFSWalBufferRestartE2E":        true,
-	}
-
-	periodicGroup = map[string]bool{
-		"TestObjectFSTortureE2E": true, // #300
-	}
 )
 
 func findE2ETestFunctions(t *testing.T, dir string) (map[string]*ast.FuncDecl, *token.FileSet) {
 	t.Helper()
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
-		// Only check Go test files, excluding this test itself
+		// Only check Go test files, excluding this test itself. Non-e2e tests in this package must live in that file.
 		name := fi.Name()
 		return strings.HasSuffix(name, "_test.go") && name != "e2e_groups_test.go"
 	}, parser.ParseComments)
@@ -84,24 +55,52 @@ func findE2ETestFunctions(t *testing.T, dir string) (map[string]*ast.FuncDecl, *
 	return tests, fset
 }
 
-func checkTestAssignment(tests map[string]*ast.FuncDecl, groups map[string]map[string]bool) (missing []string, duplicates map[string][]string) {
-	duplicates = make(map[string][]string)
-	for testName := range tests {
-		var assigned []string
-		for groupName, groupSet := range groups {
-			if groupSet[testName] {
-				assigned = append(assigned, groupName)
+func inspectRequireE2EGroup(fn *ast.FuncDecl) (group string, err error) {
+	if fn.Body == nil || len(fn.Body.List) == 0 {
+		return "", fmt.Errorf("function has an empty body")
+	}
+
+	// Verify that the first statement is a call to requireE2EGroup
+	var firstCall *ast.CallExpr
+	if exprStmt, ok := fn.Body.List[0].(*ast.ExprStmt); ok {
+		if call, ok := exprStmt.X.(*ast.CallExpr); ok {
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "requireE2EGroup" {
+				firstCall = call
 			}
 		}
-		sort.Strings(assigned)
-		if len(assigned) == 0 {
-			missing = append(missing, testName)
-		} else if len(assigned) > 1 {
-			duplicates[testName] = assigned
-		}
 	}
-	sort.Strings(missing)
-	return missing, duplicates
+	if firstCall == nil {
+		return "", fmt.Errorf("must call requireE2EGroup as its first statement")
+	}
+
+	// Count all calls to requireE2EGroup in the function body
+	callCount := 0
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "requireE2EGroup" {
+				callCount++
+			}
+		}
+		return true
+	})
+	if callCount != 1 {
+		return "", fmt.Errorf("calls requireE2EGroup %d times; must be called exactly once", callCount)
+	}
+
+	// Verify argument to requireE2EGroup(t, "<group>")
+	if len(firstCall.Args) != 2 {
+		return "", fmt.Errorf("requireE2EGroup expected 2 arguments, got %d", len(firstCall.Args))
+	}
+	lit, ok := firstCall.Args[1].(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return "", fmt.Errorf("requireE2EGroup group argument must be a string literal")
+	}
+	val, err := strconv.Unquote(lit.Value)
+	if err != nil || val == "" {
+		return "", fmt.Errorf("requireE2EGroup group argument must be a non-empty string literal")
+	}
+
+	return val, nil
 }
 
 func TestE2EGroups_NoDrift(t *testing.T) {
@@ -110,138 +109,221 @@ func TestE2EGroups_NoDrift(t *testing.T) {
 		t.Fatal("no E2E tests found in tests/e2e")
 	}
 
-	groups := map[string]map[string]bool{
-		"core":      coreGroup,
-		"multinode": multiNodeGroup,
-		"chaos":     chaosGroup,
-		"periodic":  periodicGroup,
-	}
-
-	missing, duplicates := checkTestAssignment(tests, groups)
-	if len(missing) > 0 {
-		t.Errorf("found %d E2E test(s) not assigned to any group (must be added to core, multinode, chaos, or periodic): %v", len(missing), missing)
-	}
-	if len(duplicates) > 0 {
-		for testName, assigned := range duplicates {
-			t.Errorf("test %s is assigned to multiple groups: %v", testName, assigned)
-		}
-	}
-
-	// Periodic tests must never be listed in presubmit groups
-	for testName := range periodicGroup {
-		if coreGroup[testName] || multiNodeGroup[testName] || chaosGroup[testName] {
-			t.Errorf("periodic test %s must not be in presubmit groups", testName)
-		}
-	}
-
-	// Verify any present periodic tests are gated by OBJECTFS_TORTURE
-	for testName, fn := range tests {
-		if periodicGroup[testName] {
-			hasGating := false
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				if lit, ok := n.(*ast.BasicLit); ok && strings.Contains(lit.Value, "OBJECTFS_TORTURE") {
-					hasGating = true
-					return false
-				}
-				if id, ok := n.(*ast.Ident); ok && strings.Contains(id.Name, "OBJECTFS_TORTURE") {
-					hasGating = true
-					return false
-				}
-				return true
-			})
-			if !hasGating {
-				t.Errorf("periodic test %s must be gated by OBJECTFS_TORTURE=1", testName)
-			}
-		}
-	}
-}
-
-func extractRunPattern(t *testing.T, scriptPath string) string {
-	t.Helper()
-	content, err := os.ReadFile(scriptPath)
-	if err != nil {
-		t.Fatalf("failed to read script %s: %v", scriptPath, err)
-	}
-	re := regexp.MustCompile(`-run\s+'([^']+)'`)
-	matches := re.FindStringSubmatch(string(content))
-	if len(matches) < 2 {
-		t.Fatalf("could not find -run pattern in script %s", scriptPath)
-	}
-	return matches[1]
-}
-
-func TestE2EPresubmitScripts_MatchGroups(t *testing.T) {
 	repoRoot := filepath.Join("..", "..")
+	groups := make(map[string]bool)
 
-	scriptChecks := []struct {
-		scriptPath string
-		group      map[string]bool
-		name       string
-	}{
-		{
-			scriptPath: filepath.Join(repoRoot, "dev", "ci", "presubmits", "ap-e2e-core"),
-			group:      coreGroup,
-			name:       "core",
-		},
-		{
-			scriptPath: filepath.Join(repoRoot, "dev", "ci", "presubmits", "ap-e2e-multinode"),
-			group:      multiNodeGroup,
-			name:       "multinode",
-		},
-		{
-			scriptPath: filepath.Join(repoRoot, "dev", "ci", "presubmits", "ap-e2e-chaos"),
-			group:      chaosGroup,
-			name:       "chaos",
-		},
-		{
-			scriptPath: filepath.Join(repoRoot, "dev", "ci", "periodics", "ap-torture"),
-			group:      periodicGroup,
-			name:       "periodic",
-		},
+	for testName, fn := range tests {
+		grp, err := inspectRequireE2EGroup(fn)
+		if err != nil {
+			t.Errorf("test %s: %v", testName, err)
+			continue
+		}
+		groups[grp] = true
 	}
 
-	for _, sc := range scriptChecks {
-		pattern := extractRunPattern(t, sc.scriptPath)
-		re, err := regexp.Compile(pattern)
+	// Every non-core group must have a dev/ci/presubmits/ap-e2e-<group> or dev/ci/periodics/ap-<group> script
+	for grp := range groups {
+		if grp == "core" {
+			continue
+		}
+		presubmitScript := filepath.Join(repoRoot, "dev", "ci", "presubmits", "ap-e2e-"+grp)
+		periodicScript := filepath.Join(repoRoot, "dev", "ci", "periodics", "ap-"+grp)
+		_, errPre := os.Stat(presubmitScript)
+		_, errPer := os.Stat(periodicScript)
+		if os.IsNotExist(errPre) && os.IsNotExist(errPer) {
+			t.Errorf("group %q has no matching script (expected %s or %s)", grp, presubmitScript, periodicScript)
+		}
+	}
+}
+
+func checkScriptNoRunFlag(data []byte) error {
+	// Join escaped newlines so multi-line shell commands are evaluated as full invocations
+	fullCommands := strings.ReplaceAll(string(data), "\\\n", " ")
+	for _, line := range strings.Split(fullCommands, "\n") {
+		// Strip comments so innocent comments mentioning -run do not trigger a false positive
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "go test") && strings.Contains(trimmed, "-run") {
+			return fmt.Errorf("go test invocation must not contain -run list (%s); sharding is controlled by OBJECTFS_E2E_GROUP", trimmed)
+		}
+	}
+	return nil
+}
+
+func TestE2EScripts_NoRunLists(t *testing.T) {
+	repoRoot := filepath.Join("..", "..")
+	scriptDirs := []string{
+		filepath.Join(repoRoot, "dev", "ci", "presubmits"),
+		filepath.Join(repoRoot, "dev", "ci", "periodics"),
+	}
+
+	for _, dir := range scriptDirs {
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			t.Fatalf("invalid regex %q in %s: %v", pattern, sc.scriptPath, err)
+			t.Fatalf("failed to read dir %s: %v", dir, err)
 		}
-
-		for testName := range sc.group {
-			if !re.MatchString(testName) {
-				t.Errorf("script %s (%s) does not match assigned test %s with pattern %s", sc.scriptPath, sc.name, testName, pattern)
+		for _, e := range entries {
+			if !strings.HasPrefix(e.Name(), "ap-e2e") && !strings.HasPrefix(e.Name(), "ap-torture") {
+				continue
 			}
-		}
-
-		// Ensure presubmit scripts never match any periodic tests
-		if sc.name != "periodic" {
-			for pTest := range periodicGroup {
-				if re.MatchString(pTest) {
-					t.Errorf("presubmit script %s matches periodic test %s", sc.scriptPath, pTest)
-				}
+			scriptPath := filepath.Join(dir, e.Name())
+			data, err := os.ReadFile(scriptPath)
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", scriptPath, err)
+			}
+			if err := checkScriptNoRunFlag(data); err != nil {
+				t.Errorf("script %s: %v", scriptPath, err)
 			}
 		}
 	}
 }
 
 func TestE2EGroups_DriftGuardDetection(t *testing.T) {
-	// Verify that the assignment checker catches unassigned and duplicate tests
-	mockTests := map[string]*ast.FuncDecl{
-		"TestAssigned":   nil,
-		"TestUnassigned": nil,
-		"TestDuplicate":  nil,
-	}
-	mockGroups := map[string]map[string]bool{
-		"groupA": {"TestAssigned": true, "TestDuplicate": true},
-		"groupB": {"TestDuplicate": true},
+	cases := []struct {
+		name      string
+		code      string
+		wantErr   string
+		wantGroup string
+	}{
+		{
+			name: "valid core",
+			code: `package test
+func TestValid(t *testing.T) {
+	requireE2EGroup(t, "core")
+}`,
+			wantGroup: "core",
+		},
+		{
+			name: "valid multinode",
+			code: `package test
+func TestValidMulti(t *testing.T) {
+	requireE2EGroup(t, "multinode")
+}`,
+			wantGroup: "multinode",
+		},
+		{
+			name: "missing requireE2EGroup",
+			code: `package test
+func TestMissing(t *testing.T) {
+	t.Log("no gating")
+}`,
+			wantErr: "must call requireE2EGroup as its first statement",
+		},
+		{
+			name: "not first statement",
+			code: `package test
+func TestNotFirst(t *testing.T) {
+	t.Log("hello")
+	requireE2EGroup(t, "core")
+}`,
+			wantErr: "must call requireE2EGroup as its first statement",
+		},
+		{
+			name: "multiple calls",
+			code: `package test
+func TestMultiple(t *testing.T) {
+	requireE2EGroup(t, "core")
+	requireE2EGroup(t, "core")
+}`,
+			wantErr: "calls requireE2EGroup 2 times; must be called exactly once",
+		},
+		{
+			name: "non-literal argument first",
+			code: `package test
+func TestNonLit(t *testing.T) {
+	requireE2EGroup(t, someVar)
+}`,
+			wantErr: "requireE2EGroup group argument must be a string literal",
+		},
+		{
+			name: "empty string argument",
+			code: `package test
+func TestEmptyStr(t *testing.T) {
+	requireE2EGroup(t, "")
+}`,
+			wantErr: "requireE2EGroup group argument must be a non-empty string literal",
+		},
 	}
 
-	missing, duplicates := checkTestAssignment(mockTests, mockGroups)
-	if len(missing) != 1 || missing[0] != "TestUnassigned" {
-		t.Errorf("expected missing [TestUnassigned], got %v", missing)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "test.go", tc.code, 0)
+			if err != nil {
+				t.Fatalf("failed to parse test code: %v", err)
+			}
+			fn := file.Decls[0].(*ast.FuncDecl)
+			grp, err := inspectRequireE2EGroup(fn)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if grp != tc.wantGroup {
+					t.Fatalf("expected group %q, got %q", tc.wantGroup, grp)
+				}
+			}
+		})
 	}
-	if len(duplicates) != 1 || len(duplicates["TestDuplicate"]) != 2 {
-		t.Errorf("expected duplicate TestDuplicate in 2 groups, got %v", duplicates)
+
+	// Verify checkScriptNoRunFlag ignores innocent comments with -run and detects actual go test -run invocations
+	scriptCases := []struct {
+		name    string
+		script  string
+		wantErr bool
+	}{
+		{
+			name: "innocent comment with -run",
+			script: `#!/bin/bash
+# Note: we previously used -run '^(TestFoo)$' here
+RUN_E2E=1 go test -v -count=1 -timeout 15m -json ./tests/e2e/ | tee out.json
+`,
+			wantErr: false,
+		},
+		{
+			name: "inline comment with -run",
+			script: `#!/bin/bash
+RUN_E2E=1 go test -v -count=1 -timeout 15m -json ./tests/e2e/ # formerly had -run
+`,
+			wantErr: false,
+		},
+		{
+			name: "actual go test with -run flag",
+			script: `#!/bin/bash
+RUN_E2E=1 go test -v -count=1 -timeout 15m -run '^(TestFoo)$' -json ./tests/e2e/
+`,
+			wantErr: true,
+		},
+		{
+			name: "actual go test with multiline -run flag",
+			script: `#!/bin/bash
+RUN_E2E=1 go test -v -count=1 \
+  -timeout 15m \
+  -run '^(TestFoo)$' \
+  -json ./tests/e2e/
+`,
+			wantErr: true,
+		},
+	}
+
+	for _, sc := range scriptCases {
+		t.Run("script_"+sc.name, func(t *testing.T) {
+			err := checkScriptNoRunFlag([]byte(sc.script))
+			if sc.wantErr && err == nil {
+				t.Fatalf("expected error for script %q, got nil", sc.name)
+			}
+			if !sc.wantErr && err != nil {
+				t.Fatalf("unexpected error for script %q: %v", sc.name, err)
+			}
+		})
 	}
 }
 
