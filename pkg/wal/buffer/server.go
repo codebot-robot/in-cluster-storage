@@ -1064,20 +1064,22 @@ func (s *Server) tailPerStream(ctx context.Context, streamID uuid.UUID, req *pb.
 		latestOpenFrom := w.openFrom
 		w.mu.Unlock()
 
-		if latestOpenFrom != curOpenFrom && curOpenFrom > 0 {
-			sealedList = w.getSealedMetas(ctx, s.backend)
-			for _, sm := range sealedList {
-				if sm.FromSeq == curOpenFrom && sm.Path != "" {
-					recs, _, err := ReadRecordsFromOffset(sm.Path, openOffset)
-					if err != nil {
-						return fmt.Errorf("failed to read sealed stream file %s: %w", sm.Path, err)
-					}
-					for _, rec := range recs {
-						if err := sendRecord(rec); err != nil {
-							return err
+		if latestOpenFrom != curOpenFrom {
+			if curOpenFrom > 0 {
+				sealedList = w.getSealedMetas(ctx, s.backend)
+				for _, sm := range sealedList {
+					if sm.FromSeq == curOpenFrom && sm.Path != "" {
+						recs, _, err := ReadRecordsFromOffset(sm.Path, openOffset)
+						if err != nil {
+							return fmt.Errorf("failed to read sealed stream file %s: %w", sm.Path, err)
 						}
+						for _, rec := range recs {
+							if err := sendRecord(rec); err != nil {
+								return err
+							}
+						}
+						break
 					}
-					break
 				}
 			}
 			curOpenFrom = latestOpenFrom

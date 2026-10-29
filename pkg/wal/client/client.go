@@ -971,7 +971,10 @@ func TailStream(ctx context.Context, target string, streamID uuid.UUID, fromSeq 
 			grpcClient = pb.NewWalBufferClient(conn)
 		}
 
-		tailStream, err := grpcClient.Tail(ctx, &pb.TailRequest{
+		tailCtx, tailCancel := context.WithCancel(ctx)
+		defer tailCancel()
+
+		tailStream, err := grpcClient.Tail(tailCtx, &pb.TailRequest{
 			StreamId:      streamID[:],
 			FromStreamSeq: fromSeq,
 		})
