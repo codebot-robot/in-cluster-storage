@@ -96,16 +96,19 @@ GOTOOLCHAIN=auto go test -v ./...
 ```
 
 ### Running E2E Presubmit Groups
-The end-to-end test suite runs against local `kind` clusters and is divided into focused presubmit groups:
+The end-to-end test suite runs against local `kind` clusters and is divided into focused presubmit groups (which can also be run directly with `OBJECTFS_E2E_GROUP=<key> RUN_E2E=1 go test ./tests/e2e/`):
 ```bash
-# Core single-node ObjectFS and WAL tests
-GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-core
+# Core single-node ObjectFS and WAL tests (default when OBJECTFS_E2E_GROUP is unset)
+GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e
 
-# Multi-node failover, cross-node visibility, and exclusive-local checkpoint tests
+# Multi-node failover and cross-node visibility tests
 GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-multinode
 
 # Fault injection, crash mid-write, outage, and WAL restart tests
 GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-chaos
+
+# Exclusive-local checkpoint, unmount durability, interval, and daemon kill tests
+GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-exclusive
 ```
 
 ### Race Detection
