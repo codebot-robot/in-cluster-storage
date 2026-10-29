@@ -326,7 +326,8 @@ spec:
 	walManifest := string(b)
 	walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
 	walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
-	walManifest = strings.ReplaceAll(walManifest, "serviceAccountName: wal-buffer", "terminationGracePeriodSeconds: 5\n      serviceAccountName: wal-buffer")
+	walNodeSelectorNode1 := fmt.Sprintf("nodeSelector:\n        kubernetes.io/hostname: %s\n      terminationGracePeriodSeconds: 5\n      tolerations:\n        - key: \"node-role.kubernetes.io/control-plane\"\n          operator: \"Exists\"\n          effect: \"NoSchedule\"\n      serviceAccountName: wal-buffer", node1)
+	walManifest = strings.ReplaceAll(walManifest, "serviceAccountName: wal-buffer", walNodeSelectorNode1)
 
 	awsEnvWAL := `env:
             - name: AWS_ACCESS_KEY_ID
@@ -787,10 +788,7 @@ echo "$h1 $h2"
 	runStart := time.Now()
 	runDeadline := runStart.Add(duration)
 
-	streamCount := countControllerReplicationSessions(h)
-	if streamCount <= 0 {
-		streamCount = 1
-	}
+	streamCount := countDistinctControllerReplicationStreams(h)
 
 	nextWalBufferKill := runStart.Add(45 * time.Second) // offset from controller kills
 	nextControllerKill := runStart.Add(120 * time.Second)
@@ -835,6 +833,7 @@ disruptionLoop:
 			if now.After(nextWalBufferKill) {
 				t.Logf("[%s] DISRUPTION: Force-killing wal-buffer-0", now.Format("15:04:05"))
 				sessionsBeforeKill := countControllerReplicationSessions(h)
+				streamCount = countDistinctControllerReplicationStreams(h)
 				oldWalUID := getPodUID("wal-buffer-0", "default")
 				h.RunCommand("kubectl", "delete", "pod", "wal-buffer-0", "-n", "default", "--force", "--grace-period=0")
 				if err := waitForNewPodReady(t, h, "wal-buffer-0", "default", oldWalUID, 2*time.Minute); err != nil {
