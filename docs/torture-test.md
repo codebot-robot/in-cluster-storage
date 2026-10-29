@@ -62,7 +62,7 @@ A violation of any invariant results in an immediate test failure and triggers a
 
 ### Local Smoke Run (2 minutes)
 ```bash
-OBJECTFS_TORTURE=1 OBJECTFS_TORTURE_DURATION=2m go test -v ./tests/e2e -run TestObjectFSTortureE2E -timeout 40m
+OBJECTFS_E2E_GROUP=torture RUN_E2E=1 OBJECTFS_TORTURE_DURATION=2m go test -v ./tests/e2e -timeout 40m
 ```
 
 ### Nightly Periodic Run (10 minutes)
@@ -74,7 +74,7 @@ Run via the periodic CI runner:
 ### Bisect / Hang-Rate Measurement Mode
 Run a loop with multiple iterations to measure hang frequency:
 ```bash
-OBJECTFS_TORTURE=1 OBJECTFS_TORTURE_DURATION=2m go test -v -count=10 ./tests/e2e -run TestObjectFSTortureE2E -timeout 120m
+OBJECTFS_E2E_GROUP=torture RUN_E2E=1 OBJECTFS_TORTURE_DURATION=2m go test -v -count=10 ./tests/e2e -timeout 120m
 ```
 
 ---

@@ -358,10 +358,7 @@ spec:
 }
 
 func TestObjectFSTortureE2E(t *testing.T) {
-	// Gated by OBJECTFS_TORTURE environment variable so normal e2e skips it
-	if os.Getenv("OBJECTFS_TORTURE") == "" {
-		t.Skip("Skipping ObjectFS torture E2E test; OBJECTFS_TORTURE not set")
-	}
+	requireE2EGroup(t, "torture")
 
 	duration := 10 * time.Minute
 	if dStr := os.Getenv("OBJECTFS_TORTURE_DURATION"); dStr != "" {

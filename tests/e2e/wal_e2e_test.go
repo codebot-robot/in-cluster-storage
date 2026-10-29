@@ -131,9 +131,7 @@ func startFakeS3(t *testing.T, bucket string) string {
 }
 
 func TestWALE2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping WAL E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "core")
 
 	backend := inmemorystorage.New()
 	dataDir := t.TempDir()
@@ -277,9 +275,7 @@ func TestWALE2E(t *testing.T) {
 }
 
 func TestWALS3E2E(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping WAL S3 E2E test; RUN_E2E not set")
-	}
+	requireE2EGroup(t, "core")
 
 	endpoint := startFakeS3(t, "wal-bucket")
 
