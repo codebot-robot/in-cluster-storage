@@ -17,26 +17,26 @@ limitations under the License.
 package certsigner
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"log"
 	"math/big"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 // GeneratedSecret holds PEM-encoded TLS material destined for a Kubernetes Secret.
@@ -47,9 +47,6 @@ type GeneratedSecret struct {
 
 // Config specifies the configuration for issuing per-directory TLS Secrets.
 type Config struct {
-	APIServerURL     string
-	TokenPath        string
-	CACertPath       string
 	Namespace        string
 	ServiceName      string
 	ControllerSecret string
@@ -59,15 +56,6 @@ type Config struct {
 
 // DefaultConfig returns Config populated from standard in-cluster environment variables and paths.
 func DefaultConfig() Config {
-	apiServerURL := ""
-	host := os.Getenv("KUBERNETES_SERVICE_HOST")
-	port := os.Getenv("KUBERNETES_SERVICE_PORT")
-	if host != "" && port != "" {
-		apiServerURL = fmt.Sprintf("https://%s:%s", host, port)
-	} else {
-		apiServerURL = "https://kubernetes.default.svc"
-	}
-
 	ns := os.Getenv("POD_NAMESPACE")
 	if ns == "" {
 		data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
@@ -82,9 +70,6 @@ func DefaultConfig() Config {
 	}
 
 	return Config{
-		APIServerURL:     apiServerURL,
-		TokenPath:        "/var/run/secrets/kubernetes.io/serviceaccount/token",
-		CACertPath:       "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
 		Namespace:        ns,
 		ServiceName:      "objectfs-controller",
 		ControllerSecret: "objectfs-controller-server",
@@ -251,78 +236,37 @@ func GenerateCertificates(cfg Config, previousCA []byte) ([]GeneratedSecret, err
 	}, nil
 }
 
-type kubeSecret struct {
-	APIVersion string            `json:"apiVersion"`
-	Kind       string            `json:"kind"`
-	Metadata   kubeSecretMeta    `json:"metadata"`
-	Type       string            `json:"type"`
-	StringData map[string]string `json:"stringData"`
-}
-
-type kubeSecretMeta struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-}
-
-func closeAndLog(c io.Closer, what string) {
-	if c != nil {
-		if err := c.Close(); err != nil {
-			log.Printf("failed to close %s: %v", what, err)
-		}
-	}
-}
-
 // EnsureSecrets checks whether the required TLS Secrets exist in the configured namespace,
 // creating them if absent or rotating them in place if present while carrying forward previous CA
 // certificates in the trust bundle.
-func EnsureSecrets(ctx context.Context, cfg Config) error {
-	var rootCAs *x509.CertPool
-	if cfg.CACertPath != "" {
-		b, err := os.ReadFile(cfg.CACertPath)
-		if err == nil {
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(b) {
-				return fmt.Errorf("failed to parse CA certificate from %s", cfg.CACertPath)
-			}
-			rootCAs = pool
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to read CA certificate from %s: %w", cfg.CACertPath, err)
+func EnsureSecrets(ctx context.Context, client kubernetes.Interface, cfg Config) error {
+	if client == nil {
+		restConfig, err := rest.InClusterConfig()
+		if err != nil {
+			return fmt.Errorf("failed to build in-cluster config: %w", err)
+		}
+		client, err = kubernetes.NewForConfig(restConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create kubernetes client: %w", err)
 		}
 	}
 
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{RootCAs: rootCAs},
-		},
-		Timeout: 10 * time.Second,
-	}
-
-	var token string
-	if cfg.TokenPath != "" {
-		b, err := os.ReadFile(cfg.TokenPath)
-		if err == nil {
-			token = strings.TrimSpace(string(b))
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to read serviceaccount token from %s: %w", cfg.TokenPath, err)
-		}
-	}
-
-	apiServerURL := strings.TrimRight(cfg.APIServerURL, "/")
 	secretNames := []string{cfg.ControllerSecret, cfg.NodeDaemonSecret, cfg.AdminSecret}
 
 	var previousCA []byte
-	existingSecrets := make(map[string]bool)
+	existingSecrets := make(map[string]*corev1.Secret)
 
 	for _, name := range secretNames {
-		data, exists, err := getSecret(ctx, httpClient, apiServerURL, token, cfg.Namespace, name)
+		sec, err := client.CoreV1().Secrets(cfg.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return err
-		}
-		if exists {
-			existingSecrets[name] = true
-			if len(previousCA) == 0 && len(data["ca.crt"]) > 0 {
-				previousCA = data["ca.crt"]
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to get secret %s/%s: %w", cfg.Namespace, name, err)
 			}
+			continue
+		}
+		existingSecrets[name] = sec
+		if len(previousCA) == 0 && len(sec.Data["ca.crt"]) > 0 {
+			previousCA = sec.Data["ca.crt"]
 		}
 	}
 
@@ -332,158 +276,35 @@ func EnsureSecrets(ctx context.Context, cfg Config) error {
 	}
 
 	for _, sec := range secrets {
-		if existingSecrets[sec.Name] {
-			if err := updateSecret(ctx, httpClient, apiServerURL, token, cfg.Namespace, sec); err != nil {
-				return err
+		dataBytes := make(map[string][]byte, len(sec.Data))
+		for k, v := range sec.Data {
+			dataBytes[k] = []byte(v)
+		}
+
+		if existing, ok := existingSecrets[sec.Name]; ok {
+			existing.Data = dataBytes
+			existing.StringData = nil
+			if _, err := client.CoreV1().Secrets(cfg.Namespace).Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
+				return fmt.Errorf("failed to update secret %s/%s: %w", cfg.Namespace, sec.Name, err)
 			}
 			log.Printf("Successfully updated TLS Secret %s/%s (carried forward previous CA in trust bundle)", cfg.Namespace, sec.Name)
 		} else {
-			if err := createSecret(ctx, httpClient, apiServerURL, token, cfg.Namespace, sec); err != nil {
-				return err
+			secretObj := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sec.Name,
+					Namespace: cfg.Namespace,
+				},
+				Type: corev1.SecretTypeTLS,
+				Data: dataBytes,
+			}
+			if _, err := client.CoreV1().Secrets(cfg.Namespace).Create(ctx, secretObj, metav1.CreateOptions{}); err != nil {
+				if !apierrors.IsAlreadyExists(err) {
+					return fmt.Errorf("failed to create secret %s/%s: %w", cfg.Namespace, sec.Name, err)
+				}
 			}
 			log.Printf("Successfully created TLS Secret %s/%s", cfg.Namespace, sec.Name)
 		}
 	}
 
 	return nil
-}
-
-func getSecret(ctx context.Context, client *http.Client, apiServerURL, token, namespace, name string) (map[string][]byte, bool, error) {
-	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets/%s", apiServerURL, namespace, name)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to create GET request for secret %s: %w", name, err)
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to get secret %s/%s: %w", namespace, name, err)
-	}
-	defer closeAndLog(resp.Body, "secret get response body")
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, false, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return nil, false, fmt.Errorf("unexpected status %d getting secret %s/%s: %w", resp.StatusCode, namespace, name, readErr)
-		}
-		return nil, false, fmt.Errorf("unexpected status %d getting secret %s/%s: %s", resp.StatusCode, namespace, name, strings.TrimSpace(string(body)))
-	}
-
-	var secretResp struct {
-		Data       map[string]string `json:"data"`
-		StringData map[string]string `json:"stringData"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&secretResp); err != nil {
-		return nil, false, fmt.Errorf("failed to decode secret response for %s: %w", name, err)
-	}
-
-	decoded := make(map[string][]byte)
-	for k, v := range secretResp.Data {
-		b, decErr := base64.StdEncoding.DecodeString(v)
-		if decErr == nil {
-			decoded[k] = b
-		} else {
-			decoded[k] = []byte(v)
-		}
-	}
-	for k, v := range secretResp.StringData {
-		if _, ok := decoded[k]; !ok {
-			decoded[k] = []byte(v)
-		}
-	}
-	return decoded, true, nil
-}
-
-func updateSecret(ctx context.Context, client *http.Client, apiServerURL, token, namespace string, sec GeneratedSecret) error {
-	secretObj := kubeSecret{
-		APIVersion: "v1",
-		Kind:       "Secret",
-		Metadata: kubeSecretMeta{
-			Name:      sec.Name,
-			Namespace: namespace,
-		},
-		Type:       "kubernetes.io/tls",
-		StringData: sec.Data,
-	}
-
-	payload, err := json.Marshal(secretObj)
-	if err != nil {
-		return fmt.Errorf("failed to marshal secret json: %w", err)
-	}
-
-	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets/%s", apiServerURL, namespace, sec.Name)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("failed to create PUT request for secret %s: %w", sec.Name, err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to PUT secret %s/%s: %w", namespace, sec.Name, err)
-	}
-	defer closeAndLog(resp.Body, "secret update response body")
-
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-		return nil
-	}
-
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return fmt.Errorf("failed to update secret %s/%s: HTTP %d (failed to read body: %w)", namespace, sec.Name, resp.StatusCode, readErr)
-	}
-	return fmt.Errorf("failed to update secret %s/%s: HTTP %d: %s", namespace, sec.Name, resp.StatusCode, strings.TrimSpace(string(body)))
-}
-
-func createSecret(ctx context.Context, client *http.Client, apiServerURL, token, namespace string, sec GeneratedSecret) error {
-	secretObj := kubeSecret{
-		APIVersion: "v1",
-		Kind:       "Secret",
-		Metadata: kubeSecretMeta{
-			Name:      sec.Name,
-			Namespace: namespace,
-		},
-		Type:       "kubernetes.io/tls",
-		StringData: sec.Data,
-	}
-
-	payload, err := json.Marshal(secretObj)
-	if err != nil {
-		return fmt.Errorf("failed to marshal secret json: %w", err)
-	}
-
-	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets", apiServerURL, namespace)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("failed to create POST request for secret %s: %w", sec.Name, err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to POST secret %s/%s: %w", namespace, sec.Name, err)
-	}
-	defer closeAndLog(resp.Body, "secret create response body")
-
-	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusConflict {
-		return nil
-	}
-
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return fmt.Errorf("failed to create secret %s/%s: HTTP %d (failed to read body: %w)", namespace, sec.Name, resp.StatusCode, readErr)
-	}
-	return fmt.Errorf("failed to create secret %s/%s: HTTP %d: %s", namespace, sec.Name, resp.StatusCode, strings.TrimSpace(string(body)))
 }

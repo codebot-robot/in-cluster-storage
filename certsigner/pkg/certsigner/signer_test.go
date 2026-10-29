@@ -18,13 +18,12 @@ package certsigner
 
 import (
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"sync"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func parseCert(t *testing.T, pemData string) *x509.Certificate {
@@ -184,119 +183,59 @@ func TestGenerateCertificates_PreviousCA(t *testing.T) {
 }
 
 func TestEnsureSecrets_Rotate(t *testing.T) {
-	var mu sync.Mutex
-	secretsStore := make(map[string]map[string]string)
-
-	initialSecrets, err := GenerateCertificates(Config{
+	cfg := Config{
 		Namespace:        "test-ns",
 		ServiceName:      "test-controller",
 		ControllerSecret: "server-sec",
 		NodeDaemonSecret: "node-sec",
 		AdminSecret:      "admin-sec",
-	}, nil)
+	}
+
+	initialSecrets, err := GenerateCertificates(cfg, nil)
 	if err != nil {
 		t.Fatalf("initial cert generation failed: %v", err)
 	}
 	initialCA := initialSecrets[0].Data["ca.crt"]
+
+	client := fake.NewClientset()
 	for _, s := range initialSecrets {
-		secretsStore[s.Name] = s.Data
+		dataBytes := make(map[string][]byte, len(s.Data))
+		for k, v := range s.Data {
+			dataBytes[k] = []byte(v)
+		}
+		sec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      s.Name,
+				Namespace: cfg.Namespace,
+			},
+			Type: corev1.SecretTypeTLS,
+			Data: dataBytes,
+		}
+		if _, err := client.CoreV1().Secrets(cfg.Namespace).Create(t.Context(), sec, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("failed to seed initial secret %s: %v", s.Name, err)
+		}
 	}
 
-	putCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		if r.Method == http.MethodGet {
-			parts := strings.Split(r.URL.Path, "/")
-			name := parts[len(parts)-1]
-			data, ok := secretsStore[name]
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			resp := map[string]any{
-				"stringData": data,
-			}
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(resp)
-			return
-		}
-		if r.Method == http.MethodPut {
-			var sec kubeSecret
-			if err := json.NewDecoder(r.Body).Decode(&sec); err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			secretsStore[sec.Metadata.Name] = sec.StringData
-			putCount++
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		t.Errorf("unexpected %s request to %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	cfg := Config{
-		APIServerURL:     server.URL,
-		Namespace:        "test-ns",
-		ServiceName:      "test-controller",
-		ControllerSecret: "server-sec",
-		NodeDaemonSecret: "node-sec",
-		AdminSecret:      "admin-sec",
-	}
-
-	if err := EnsureSecrets(t.Context(), cfg); err != nil {
+	if err := EnsureSecrets(t.Context(), client, cfg); err != nil {
 		t.Fatalf("EnsureSecrets rotation failed: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	if putCount != 3 {
-		t.Errorf("expected 3 PUT requests to update existing secrets, got %d", putCount)
-	}
 	for _, name := range []string{"server-sec", "node-sec", "admin-sec"} {
-		sec := secretsStore[name]
-		if sec["ca-previous.crt"] != initialCA {
+		sec, err := client.CoreV1().Secrets(cfg.Namespace).Get(t.Context(), name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("failed to get rotated secret %s: %v", name, err)
+		}
+		if string(sec.Data["ca-previous.crt"]) != initialCA {
 			t.Errorf("secret %s did not carry forward previous CA in ca-previous.crt", name)
 		}
-		if sec["ca.crt"] == initialCA {
+		if string(sec.Data["ca.crt"]) == initialCA {
 			t.Errorf("secret %s has stale CA in ca.crt", name)
 		}
 	}
 }
 
 func TestEnsureSecrets_Create(t *testing.T) {
-	var mu sync.Mutex
-	createdSecrets := make(map[string]kubeSecret)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		if r.Method == http.MethodGet {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		if r.Method == http.MethodPost {
-			var sec kubeSecret
-			if err := json.NewDecoder(r.Body).Decode(&sec); err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			createdSecrets[sec.Metadata.Name] = sec
-			w.WriteHeader(http.StatusCreated)
-			return
-		}
-		t.Errorf("unexpected %s request to %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
 	cfg := Config{
-		APIServerURL:     server.URL,
 		Namespace:        "test-ns",
 		ServiceName:      "test-controller",
 		ControllerSecret: "server-sec",
@@ -304,22 +243,34 @@ func TestEnsureSecrets_Create(t *testing.T) {
 		AdminSecret:      "admin-sec",
 	}
 
-	if err := EnsureSecrets(t.Context(), cfg); err != nil {
+	client := fake.NewClientset()
+	if err := EnsureSecrets(t.Context(), client, cfg); err != nil {
 		t.Fatalf("EnsureSecrets failed: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
 	expected := []string{"server-sec", "node-sec", "admin-sec"}
 	for _, exp := range expected {
-		sec, ok := createdSecrets[exp]
-		if !ok {
-			t.Errorf("expected secret %s was not created", exp)
+		sec, err := client.CoreV1().Secrets(cfg.Namespace).Get(t.Context(), exp, metav1.GetOptions{})
+		if err != nil {
+			t.Errorf("expected secret %s was not created: %v", exp, err)
 			continue
 		}
-		if sec.StringData["tls.key"] == "" || sec.StringData["tls.crt"] == "" || sec.StringData["ca.crt"] == "" || sec.StringData["ca-previous.crt"] == "" {
+		if len(sec.Data["tls.key"]) == 0 || len(sec.Data["tls.crt"]) == 0 || len(sec.Data["ca.crt"]) == 0 || len(sec.Data["ca-previous.crt"]) == 0 {
 			t.Errorf("secret %s missing required keys (tls.key, tls.crt, ca.crt, ca-previous.crt)", exp)
 		}
+	}
+}
+
+func TestEnsureSecrets_NilClient(t *testing.T) {
+	cfg := Config{
+		Namespace:        "test-ns",
+		ServiceName:      "test-controller",
+		ControllerSecret: "server-sec",
+		NodeDaemonSecret: "node-sec",
+		AdminSecret:      "admin-sec",
+	}
+	err := EnsureSecrets(t.Context(), nil, cfg)
+	if err == nil {
+		t.Fatalf("expected error when running outside cluster with nil client, got nil")
 	}
 }

@@ -22,6 +22,9 @@ import (
 	"log"
 	"time"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
 	"github.com/gke-labs/in-cluster-storage/certsigner/pkg/certsigner"
 )
 
@@ -30,14 +33,22 @@ func main() {
 
 	flag.StringVar(&cfg.Namespace, "namespace", cfg.Namespace, "Kubernetes namespace for TLS secrets")
 	flag.StringVar(&cfg.ServiceName, "service-name", cfg.ServiceName, "Service name for controller server TLS SANs")
-	flag.StringVar(&cfg.APIServerURL, "apiserver-url", cfg.APIServerURL, "Kubernetes API server base URL")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	k8sConfig, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("failed to build in-cluster config: %v", err)
+	}
+	client, err := kubernetes.NewForConfig(k8sConfig)
+	if err != nil {
+		log.Fatalf("failed to create kubernetes client: %v", err)
+	}
+
 	log.Printf("Starting certsigner for namespace %s, service %s", cfg.Namespace, cfg.ServiceName)
-	if err := certsigner.EnsureSecrets(ctx, cfg); err != nil {
+	if err := certsigner.EnsureSecrets(ctx, client, cfg); err != nil {
 		log.Fatalf("certsigner failed: %v", err)
 	}
 	log.Println("certsigner completed successfully")
