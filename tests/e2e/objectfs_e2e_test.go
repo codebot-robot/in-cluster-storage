@@ -234,6 +234,8 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
+          - key: ca-previous.crt
+            path: trust/ca-previous.crt
 `
 		initH.KubectlApplyContent("objectfs-admin-pod", adminPodYaml)
 		if err := initH.WaitForPodReady("objectfs-admin-pod", "default", 2*time.Minute); err != nil {
@@ -436,6 +438,8 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
+          - key: ca-previous.crt
+            path: trust/ca-previous.crt
     - name: node-certs
       secret:
         secretName: objectfs-node-daemon-client
@@ -446,6 +450,8 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
+          - key: ca-previous.crt
+            path: trust/ca-previous.crt
     - name: nocert-dir
       emptyDir: {}
 `, authClientPod)
@@ -512,6 +518,8 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
+          - key: ca-previous.crt
+            path: trust/ca-previous.crt
 `, unauthPod)
 
 	h.KubectlApplyContent(unauthPod, unauthYaml)
@@ -525,6 +533,136 @@ spec:
 	}
 	h.DeletePod(unauthPod, "default")
 	t.Logf("NetworkPolicy correctly blocked unlabelled pod at network level: %v (%s)", netpolErr, strings.TrimSpace(netpolOut))
+
+	// Step 5: Live reload for certificate rotation without restart
+	controllerRestartsCmd := exec.Command("kubectl", "get", "pod", "objectfs-controller-0", "-n", "default", "-o", "jsonpath={.status.containerStatuses[0].restartCount}")
+	controllerRestartsBeforeOut, err := controllerRestartsCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to get controller restart count: %v (%s)", err, controllerRestartsBeforeOut)
+	}
+	controllerRestartsBefore := string(controllerRestartsBeforeOut)
+
+	origAdminCert, err := h.RunInPod("objectfs-admin-pod", "default", "cat", "/etc/objectfs/certs/client/tls.crt")
+	if err != nil {
+		t.Fatalf("failed to read admin cert before rotation: %v (%s)", err, origAdminCert)
+	}
+
+	// Delete completed Job (preserving existing Secrets so certsigner carries forward previous CA in trust bundle)
+	h.RunCommand("kubectl", "delete", "job", "objectfs-certsigner", "-n", "default")
+
+	// Re-run certsigner Job
+	certsignerJobYaml := `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: objectfs-certsigner
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: objectfs-certsigner
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: objectfs-certsigner
+      containers:
+        - name: certsigner
+          image: certsigner:e2e
+          imagePullPolicy: Never
+          env:
+            - name: POD_NAMESPACE
+              value: default
+`
+	h.KubectlApplyContent("objectfs-certsigner", certsignerJobYaml)
+	h.RunCommand("kubectl", "wait", "--for=condition=complete", "job/objectfs-certsigner", "-n", "default", "--timeout=60s")
+	t.Logf("Successfully re-ran certsigner Job to rotate TLS Secrets")
+
+	// Poll until kubelet syncs rotated certificate Secret into objectfs-admin-pod
+	deadline := time.Now().Add(2 * time.Minute)
+	var newAdminCert string
+	for time.Now().Before(deadline) {
+		out, err := h.RunInPod("objectfs-admin-pod", "default", "cat", "/etc/objectfs/certs/client/tls.crt")
+		if err == nil && strings.TrimSpace(out) != "" && strings.TrimSpace(out) != strings.TrimSpace(origAdminCert) {
+			newAdminCert = out
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if strings.TrimSpace(newAdminCert) == strings.TrimSpace(origAdminCert) {
+		t.Fatalf("kubelet did not sync rotated Secret into objectfs-admin-pod within timeout")
+	}
+	t.Logf("Observed rotated certificate in objectfs-admin-pod mount")
+
+	// Wait briefly for reloader to pick up file changes
+	time.Sleep(2 * time.Second)
+
+	// 1. Existing daemon keeps working: mount and write to volume via CSI driver
+	pod4Name := "objectfs-pod-rotation-verify"
+	pod4Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "echo 'post-rotation data' > /data/post-rotation.txt && cat /data/post-rotation.txt && sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod4Name, ns, volumeID)
+
+	t.Logf("Creating Pod 4 to verify existing node daemon continues to function")
+	h.KubectlApplyContent(pod4Name, pod4Yaml)
+	if err := h.WaitForPodReady(pod4Name, ns, 1*time.Minute); err != nil {
+		t.Fatalf("Test Pod 4 failed to start on existing daemon: %v", err)
+	}
+
+	out4, err := h.RunInPod(pod4Name, ns, "cat", "/data/post-rotation.txt")
+	if err != nil {
+		t.Fatalf("Failed to read post-rotation.txt in Pod 4: %v", err)
+	}
+	if !strings.Contains(out4, "post-rotation data") {
+		t.Fatalf("Expected post-rotation.txt content 'post-rotation data', got: %s", out4)
+	}
+	h.DeletePod(pod4Name, ns)
+	t.Logf("Existing daemon successfully processed I/O after certificate rotation without restart")
+
+	// 2. New connection from admin pod uses newly rotated certificate and succeeds.
+	// Poll with a deadline of two minutes to allow controller volume mount to sync.
+	deadlineConn := time.Now().Add(2 * time.Minute)
+	var adminOutAfter string
+	var adminErrAfter error
+	for time.Now().Before(deadlineConn) {
+		adminOutAfter, adminErrAfter = h.RunInPod("objectfs-admin-pod", "default", "objectfsctl", "--server", "objectfs-controller:50051", "volumes", "list")
+		if adminErrAfter == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if adminErrAfter != nil {
+		t.Fatalf("new connection with rotated admin certificate failed within 2m timeout: %v (%s)", adminErrAfter, adminOutAfter)
+	}
+	t.Logf("New connection successfully connected using rotated certificate: %s", strings.TrimSpace(adminOutAfter))
+
+	// Verify controller was not restarted
+	controllerRestartsAfterCmd := exec.Command("kubectl", "get", "pod", "objectfs-controller-0", "-n", "default", "-o", "jsonpath={.status.containerStatuses[0].restartCount}")
+	controllerRestartsAfterOut, err := controllerRestartsAfterCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to get controller restart count after rotation: %v (%s)", err, controllerRestartsAfterOut)
+	}
+	if strings.TrimSpace(controllerRestartsBefore) != strings.TrimSpace(string(controllerRestartsAfterOut)) {
+		t.Fatalf("controller restarted during rotation (before: %s, after: %s)", controllerRestartsBefore, string(controllerRestartsAfterOut))
+	}
 }
 
 func TestObjectFSStatefulSetE2E(t *testing.T) {
@@ -1057,6 +1195,8 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
+          - key: ca-previous.crt
+            path: trust/ca-previous.crt
 `
 		initH.KubectlApplyContent("objectfs-admin-pod", adminPodYaml)
 		if err := initH.WaitForPodReady("objectfs-admin-pod", "default", 2*time.Minute); err != nil {
