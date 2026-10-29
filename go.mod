@@ -10,6 +10,7 @@ require (
 	github.com/aws/smithy-go v1.28.5
 	github.com/cockroachdb/pebble/v2 v2.1.7
 	github.com/container-storage-interface/spec v1.13.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gke-labs/gke-labs-infra/ktesting v0.0.0-20260531174830-a88711ea19d3
 	github.com/google/uuid v1.6.0
 	github.com/hanwen/go-fuse/v2 v2.12.0

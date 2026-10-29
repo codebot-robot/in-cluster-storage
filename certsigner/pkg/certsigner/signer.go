@@ -24,6 +24,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -94,7 +95,9 @@ func DefaultConfig() Config {
 
 // GenerateCertificates generates an in-memory self-signed CA (10-year validity, key never stored)
 // and creates leaf certificates (1-year validity) for the controller server and node/admin clients.
-func GenerateCertificates(cfg Config) ([]GeneratedSecret, error) {
+// If previousCA is provided, it is stored as ca-previous.crt to provide CA trust overlap during rotation;
+// if previousCA is empty, ca-previous.crt mirrors the active CA so volume projections succeed.
+func GenerateCertificates(cfg Config, previousCA []byte) ([]GeneratedSecret, error) {
 	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate CA private key: %w", err)
@@ -121,19 +124,15 @@ func GenerateCertificates(cfg Config) ([]GeneratedSecret, error) {
 	// 1. Controller Server Certificate
 	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate controller server key: %w", err)
+		return nil, fmt.Errorf("failed to generate server key: %w", err)
 	}
 
 	dnsNames := []string{
 		cfg.ServiceName,
+		fmt.Sprintf("%s.%s", cfg.ServiceName, cfg.Namespace),
+		fmt.Sprintf("%s.%s.svc", cfg.ServiceName, cfg.Namespace),
+		fmt.Sprintf("%s.%s.svc.cluster.local", cfg.ServiceName, cfg.Namespace),
 		"localhost",
-	}
-	if cfg.Namespace != "" {
-		dnsNames = append(dnsNames,
-			fmt.Sprintf("%s.%s", cfg.ServiceName, cfg.Namespace),
-			fmt.Sprintf("%s.%s.svc", cfg.ServiceName, cfg.Namespace),
-			fmt.Sprintf("%s.%s.svc.cluster.local", cfg.ServiceName, cfg.Namespace),
-		)
 	}
 
 	serverTemplate := &x509.Certificate{
@@ -159,12 +158,12 @@ func GenerateCertificates(cfg Config) ([]GeneratedSecret, error) {
 	// 2. Node Daemon Client Certificate
 	nodeKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate node-daemon client key: %w", err)
+		return nil, fmt.Errorf("failed to generate node client key: %w", err)
 	}
 
 	nodeURI, err := url.Parse(fmt.Sprintf("objectfs://node-daemon/%s/objectfs-node-daemon", cfg.Namespace))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse node URI SAN: %w", err)
+		return nil, fmt.Errorf("failed to parse node daemon URI SAN: %w", err)
 	}
 
 	nodeTemplate := &x509.Certificate{
@@ -216,29 +215,37 @@ func GenerateCertificates(cfg Config) ([]GeneratedSecret, error) {
 	adminPem := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: adminDer})
 	adminKeyPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(adminKey)})
 
+	previousCAPEM := string(caPem)
+	if len(previousCA) > 0 {
+		previousCAPEM = string(previousCA)
+	}
+
 	return []GeneratedSecret{
 		{
 			Name: cfg.ControllerSecret,
 			Data: map[string]string{
-				"tls.key": string(serverKeyPem),
-				"tls.crt": string(serverPem),
-				"ca.crt":  string(caPem),
+				"tls.key":         string(serverKeyPem),
+				"tls.crt":         string(serverPem),
+				"ca.crt":          string(caPem),
+				"ca-previous.crt": previousCAPEM,
 			},
 		},
 		{
 			Name: cfg.NodeDaemonSecret,
 			Data: map[string]string{
-				"tls.key": string(nodeKeyPem),
-				"tls.crt": string(nodePem),
-				"ca.crt":  string(caPem),
+				"tls.key":         string(nodeKeyPem),
+				"tls.crt":         string(nodePem),
+				"ca.crt":          string(caPem),
+				"ca-previous.crt": previousCAPEM,
 			},
 		},
 		{
 			Name: cfg.AdminSecret,
 			Data: map[string]string{
-				"tls.key": string(adminKeyPem),
-				"tls.crt": string(adminPem),
-				"ca.crt":  string(caPem),
+				"tls.key":         string(adminKeyPem),
+				"tls.crt":         string(adminPem),
+				"ca.crt":          string(caPem),
+				"ca-previous.crt": previousCAPEM,
 			},
 		},
 	}, nil
@@ -266,9 +273,8 @@ func closeAndLog(c io.Closer, what string) {
 }
 
 // EnsureSecrets checks whether the required TLS Secrets exist in the configured namespace,
-// and creates them via the Kubernetes API if they do not exist.
-// EnsureSecrets is create-only and never updates existing Secrets. To rotate certificates,
-// delete the Secrets and completed Job, then rerun the Job.
+// creating them if absent or rotating them in place if present while carrying forward previous CA
+// certificates in the trust bundle.
 func EnsureSecrets(ctx context.Context, cfg Config) error {
 	var rootCAs *x509.CertPool
 	if cfg.CACertPath != "" {
@@ -304,50 +310,49 @@ func EnsureSecrets(ctx context.Context, cfg Config) error {
 	apiServerURL := strings.TrimRight(cfg.APIServerURL, "/")
 	secretNames := []string{cfg.ControllerSecret, cfg.NodeDaemonSecret, cfg.AdminSecret}
 
-	allExist := true
+	var previousCA []byte
+	existingSecrets := make(map[string]bool)
+
 	for _, name := range secretNames {
-		exists, err := checkSecretExists(ctx, httpClient, apiServerURL, token, cfg.Namespace, name)
+		data, exists, err := getSecret(ctx, httpClient, apiServerURL, token, cfg.Namespace, name)
 		if err != nil {
 			return err
 		}
-		if !exists {
-			allExist = false
+		if exists {
+			existingSecrets[name] = true
+			if len(previousCA) == 0 && len(data["ca.crt"]) > 0 {
+				previousCA = data["ca.crt"]
+			}
 		}
 	}
 
-	if allExist {
-		log.Printf("All TLS Secrets already exist in namespace %s; skipping generation (create-only)", cfg.Namespace)
-		return nil
-	}
-
-	secrets, err := GenerateCertificates(cfg)
+	secrets, err := GenerateCertificates(cfg, previousCA)
 	if err != nil {
 		return err
 	}
 
 	for _, sec := range secrets {
-		exists, err := checkSecretExists(ctx, httpClient, apiServerURL, token, cfg.Namespace, sec.Name)
-		if err != nil {
-			return err
+		if existingSecrets[sec.Name] {
+			if err := updateSecret(ctx, httpClient, apiServerURL, token, cfg.Namespace, sec); err != nil {
+				return err
+			}
+			log.Printf("Successfully updated TLS Secret %s/%s (carried forward previous CA in trust bundle)", cfg.Namespace, sec.Name)
+		} else {
+			if err := createSecret(ctx, httpClient, apiServerURL, token, cfg.Namespace, sec); err != nil {
+				return err
+			}
+			log.Printf("Successfully created TLS Secret %s/%s", cfg.Namespace, sec.Name)
 		}
-		if exists {
-			log.Printf("Secret %s/%s already exists; skipping", cfg.Namespace, sec.Name)
-			continue
-		}
-		if err := createSecret(ctx, httpClient, apiServerURL, token, cfg.Namespace, sec); err != nil {
-			return err
-		}
-		log.Printf("Successfully created TLS Secret %s/%s", cfg.Namespace, sec.Name)
 	}
 
 	return nil
 }
 
-func checkSecretExists(ctx context.Context, client *http.Client, apiServerURL, token, namespace, name string) (bool, error) {
+func getSecret(ctx context.Context, client *http.Client, apiServerURL, token, namespace, name string) (map[string][]byte, bool, error) {
 	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets/%s", apiServerURL, namespace, name)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return false, fmt.Errorf("failed to create GET request for secret %s: %w", name, err)
+		return nil, false, fmt.Errorf("failed to create GET request for secret %s: %w", name, err)
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -355,22 +360,88 @@ func checkSecretExists(ctx context.Context, client *http.Client, apiServerURL, t
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("failed to check secret %s/%s: %w", namespace, name, err)
+		return nil, false, fmt.Errorf("failed to get secret %s/%s: %w", namespace, name, err)
 	}
-	defer closeAndLog(resp.Body, "secret check response body")
+	defer closeAndLog(resp.Body, "secret get response body")
 
-	if resp.StatusCode == http.StatusOK {
-		return true, nil
-	}
 	if resp.StatusCode == http.StatusNotFound {
-		return false, nil
+		return nil, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, false, fmt.Errorf("unexpected status %d getting secret %s/%s: %w", resp.StatusCode, namespace, name, readErr)
+		}
+		return nil, false, fmt.Errorf("unexpected status %d getting secret %s/%s: %s", resp.StatusCode, namespace, name, strings.TrimSpace(string(body)))
+	}
+
+	var secretResp struct {
+		Data       map[string]string `json:"data"`
+		StringData map[string]string `json:"stringData"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&secretResp); err != nil {
+		return nil, false, fmt.Errorf("failed to decode secret response for %s: %w", name, err)
+	}
+
+	decoded := make(map[string][]byte)
+	for k, v := range secretResp.Data {
+		b, decErr := base64.StdEncoding.DecodeString(v)
+		if decErr == nil {
+			decoded[k] = b
+		} else {
+			decoded[k] = []byte(v)
+		}
+	}
+	for k, v := range secretResp.StringData {
+		if _, ok := decoded[k]; !ok {
+			decoded[k] = []byte(v)
+		}
+	}
+	return decoded, true, nil
+}
+
+func updateSecret(ctx context.Context, client *http.Client, apiServerURL, token, namespace string, sec GeneratedSecret) error {
+	secretObj := kubeSecret{
+		APIVersion: "v1",
+		Kind:       "Secret",
+		Metadata: kubeSecretMeta{
+			Name:      sec.Name,
+			Namespace: namespace,
+		},
+		Type:       "kubernetes.io/tls",
+		StringData: sec.Data,
+	}
+
+	payload, err := json.Marshal(secretObj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal secret json: %w", err)
+	}
+
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets/%s", apiServerURL, namespace, sec.Name)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("failed to create PUT request for secret %s: %w", sec.Name, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to PUT secret %s/%s: %w", namespace, sec.Name, err)
+	}
+	defer closeAndLog(resp.Body, "secret update response body")
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		return nil
 	}
 
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
-		return false, fmt.Errorf("unexpected status %d checking secret %s/%s; failed to read body: %w", resp.StatusCode, namespace, name, readErr)
+		return fmt.Errorf("failed to update secret %s/%s: HTTP %d (failed to read body: %w)", namespace, sec.Name, resp.StatusCode, readErr)
 	}
-	return false, fmt.Errorf("unexpected status %d checking secret %s/%s: %s", resp.StatusCode, namespace, name, strings.TrimSpace(string(body)))
+	return fmt.Errorf("failed to update secret %s/%s: HTTP %d: %s", namespace, sec.Name, resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
 func createSecret(ctx context.Context, client *http.Client, apiServerURL, token, namespace string, sec GeneratedSecret) error {

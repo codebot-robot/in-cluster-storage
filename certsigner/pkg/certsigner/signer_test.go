@@ -22,6 +22,7 @@ import (
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -48,7 +49,7 @@ func TestGenerateCertificates(t *testing.T) {
 		AdminSecret:      "test-admin-client",
 	}
 
-	secrets, err := GenerateCertificates(cfg)
+	secrets, err := GenerateCertificates(cfg, nil)
 	if err != nil {
 		t.Fatalf("GenerateCertificates failed: %v", err)
 	}
@@ -75,6 +76,9 @@ func TestGenerateCertificates(t *testing.T) {
 	}
 	if caCert.Subject.CommonName != "objectfs-ca" {
 		t.Errorf("expected CA CN objectfs-ca, got %q", caCert.Subject.CommonName)
+	}
+	if serverSec.Data["ca-previous.crt"] != serverSec.Data["ca.crt"] {
+		t.Errorf("expected ca-previous.crt to mirror ca.crt on initial generation")
 	}
 
 	if serverCert.Subject.CommonName != cfg.ServiceName {
@@ -133,11 +137,100 @@ func TestGenerateCertificates(t *testing.T) {
 	}
 }
 
-func TestEnsureSecrets_AllExist(t *testing.T) {
+func TestGenerateCertificates_PreviousCA(t *testing.T) {
+	cfg := Config{
+		Namespace:        "test-ns",
+		ServiceName:      "test-controller",
+		ControllerSecret: "test-controller-server",
+		NodeDaemonSecret: "test-node-daemon-client",
+		AdminSecret:      "test-admin-client",
+	}
+
+	initialSecrets, err := GenerateCertificates(cfg, nil)
+	if err != nil {
+		t.Fatalf("initial GenerateCertificates failed: %v", err)
+	}
+	initialCA := initialSecrets[0].Data["ca.crt"]
+
+	// Rotate with previous CA provided
+	rotatedSecrets, err := GenerateCertificates(cfg, []byte(initialCA))
+	if err != nil {
+		t.Fatalf("rotated GenerateCertificates failed: %v", err)
+	}
+
+	for _, sec := range rotatedSecrets {
+		newCA := sec.Data["ca.crt"]
+		prevCA := sec.Data["ca-previous.crt"]
+
+		if newCA == initialCA {
+			t.Errorf("expected fresh CA on rotation, got same CA")
+		}
+		if prevCA != initialCA {
+			t.Errorf("expected previous CA to be preserved in ca-previous.crt")
+		}
+
+		newCert := parseCert(t, newCA)
+		prevCert := parseCert(t, prevCA)
+
+		pool := x509.NewCertPool()
+		pool.AddCert(newCert)
+		pool.AddCert(prevCert)
+
+		leafCert := parseCert(t, sec.Data["tls.crt"])
+		if _, err := leafCert.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+			t.Errorf("leaf certificate failed verification against trust pool with new and previous CA: %v", err)
+		}
+	}
+}
+
+func TestEnsureSecrets_Rotate(t *testing.T) {
+	var mu sync.Mutex
+	secretsStore := make(map[string]map[string]string)
+
+	initialSecrets, err := GenerateCertificates(Config{
+		Namespace:        "test-ns",
+		ServiceName:      "test-controller",
+		ControllerSecret: "server-sec",
+		NodeDaemonSecret: "node-sec",
+		AdminSecret:      "admin-sec",
+	}, nil)
+	if err != nil {
+		t.Fatalf("initial cert generation failed: %v", err)
+	}
+	initialCA := initialSecrets[0].Data["ca.crt"]
+	for _, s := range initialSecrets {
+		secretsStore[s.Name] = s.Data
+	}
+
+	putCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
 		if r.Method == http.MethodGet {
+			parts := strings.Split(r.URL.Path, "/")
+			name := parts[len(parts)-1]
+			data, ok := secretsStore[name]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			resp := map[string]any{
+				"stringData": data,
+			}
 			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]string{"name": "test"})
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		if r.Method == http.MethodPut {
+			var sec kubeSecret
+			if err := json.NewDecoder(r.Body).Decode(&sec); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			secretsStore[sec.Metadata.Name] = sec.StringData
+			putCount++
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		t.Errorf("unexpected %s request to %s", r.Method, r.URL.Path)
@@ -155,7 +248,23 @@ func TestEnsureSecrets_AllExist(t *testing.T) {
 	}
 
 	if err := EnsureSecrets(t.Context(), cfg); err != nil {
-		t.Fatalf("EnsureSecrets failed: %v", err)
+		t.Fatalf("EnsureSecrets rotation failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if putCount != 3 {
+		t.Errorf("expected 3 PUT requests to update existing secrets, got %d", putCount)
+	}
+	for _, name := range []string{"server-sec", "node-sec", "admin-sec"} {
+		sec := secretsStore[name]
+		if sec["ca-previous.crt"] != initialCA {
+			t.Errorf("secret %s did not carry forward previous CA in ca-previous.crt", name)
+		}
+		if sec["ca.crt"] == initialCA {
+			t.Errorf("secret %s has stale CA in ca.crt", name)
+		}
 	}
 }
 
@@ -209,8 +318,8 @@ func TestEnsureSecrets_Create(t *testing.T) {
 			t.Errorf("expected secret %s was not created", exp)
 			continue
 		}
-		if sec.StringData["tls.key"] == "" || sec.StringData["tls.crt"] == "" || sec.StringData["ca.crt"] == "" {
-			t.Errorf("secret %s missing required keys (tls.key, tls.crt, ca.crt)", exp)
+		if sec.StringData["tls.key"] == "" || sec.StringData["tls.crt"] == "" || sec.StringData["ca.crt"] == "" || sec.StringData["ca-previous.crt"] == "" {
+			t.Errorf("secret %s missing required keys (tls.key, tls.crt, ca.crt, ca-previous.crt)", exp)
 		}
 	}
 }

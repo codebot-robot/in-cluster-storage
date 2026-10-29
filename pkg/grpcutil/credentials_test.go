@@ -282,6 +282,11 @@ func TestGRPCRoundTrip_MTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServerTLSFromDir failed: %v", err)
 	}
+	defer func() {
+		if cErr := CloseReloader(serverCreds); cErr != nil {
+			t.Logf("CloseReloader: %v", cErr)
+		}
+	}()
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -301,6 +306,11 @@ func TestGRPCRoundTrip_MTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClientTLSFromDir failed: %v", err)
 	}
+	defer func() {
+		if cErr := CloseReloader(clientCreds); cErr != nil {
+			t.Logf("CloseReloader: %v", cErr)
+		}
+	}()
 
 	conn, err := grpc.NewClient(lis.Addr().String(),
 		grpc.WithTransportCredentials(clientCreds),
