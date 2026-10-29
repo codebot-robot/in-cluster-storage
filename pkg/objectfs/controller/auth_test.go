@@ -292,6 +292,7 @@ func TestAuthMethodClassificationDriftGuard(t *testing.T) {
 		pb.ObjectFSController_ListSnapshots_FullMethodName:  RoleAdmin,
 		pb.ObjectFSController_CreateSnapshot_FullMethodName: RoleAdmin,
 		pb.ObjectFSController_Checkpoint_FullMethodName:     RoleAdmin,
+		pb.ObjectFSController_RepairVolume_FullMethodName:   RoleAdmin,
 	}
 
 	service := pb.ObjectFSController_ServiceDesc
