@@ -252,8 +252,6 @@ spec:
                 path: tls.crt
               - key: ca.crt
                 path: trust/ca.crt
-              - key: ca-previous.crt
-                path: trust/ca-previous.crt
 
 ---
 
@@ -413,8 +411,6 @@ spec:
                 path: tls.crt
               - key: ca.crt
                 path: trust/ca.crt
-              - key: ca-previous.crt
-                path: trust/ca-previous.crt
 
 ---
 

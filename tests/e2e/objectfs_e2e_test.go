@@ -250,8 +250,6 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
-          - key: ca-previous.crt
-            path: trust/ca-previous.crt
 `
 		initH.KubectlApplyContent("objectfs-admin-pod", adminPodYaml)
 		if err := initH.WaitForPodReady("objectfs-admin-pod", "default", 2*time.Minute); err != nil {
@@ -452,8 +450,6 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
-          - key: ca-previous.crt
-            path: trust/ca-previous.crt
     - name: node-certs
       secret:
         secretName: objectfs-node-daemon-client
@@ -464,8 +460,6 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
-          - key: ca-previous.crt
-            path: trust/ca-previous.crt
     - name: nocert-dir
       emptyDir: {}
 `, authClientPod)
@@ -532,8 +526,6 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
-          - key: ca-previous.crt
-            path: trust/ca-previous.crt
 `, unauthPod)
 
 	h.KubectlApplyContent(unauthPod, unauthYaml)
@@ -1205,8 +1197,6 @@ spec:
             path: tls.crt
           - key: ca.crt
             path: trust/ca.crt
-          - key: ca-previous.crt
-            path: trust/ca-previous.crt
 `
 		initH.KubectlApplyContent("objectfs-admin-pod", adminPodYaml)
 		if err := initH.WaitForPodReady("objectfs-admin-pod", "default", 2*time.Minute); err != nil {
