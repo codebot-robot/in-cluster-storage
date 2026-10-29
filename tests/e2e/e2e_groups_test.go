@@ -176,6 +176,9 @@ func TestE2EScripts_NoRunLists(t *testing.T) {
 			if err := checkScriptNoRunFlag(data); err != nil {
 				t.Errorf("script %s: %v", scriptPath, err)
 			}
+			if strings.Contains(string(data), "gotestsum@") {
+				t.Errorf("script %s contains gotestsum@ literal; gotestsum must be invoked via tools module", scriptPath)
+			}
 		}
 	}
 }

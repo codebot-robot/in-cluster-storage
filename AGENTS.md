@@ -84,6 +84,8 @@ GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-exclusive
 OBJECTFS_E2E_GROUP=exclusive RUN_E2E=1 go test ./tests/e2e/
 ```
 
+E2E test scripts format output via `gotestsum`, pinned via Go's `tool` directive in `tools/` and run by hand with `go -C tools tool gotestsum ...`.
+
 ### Race Detection Gate (`ap-test-race`)
 
 `dev/ci/presubmits/ap-test-race` is the race gate that runs unit and integration tests with the Go race detector enabled (`-race -count=1 -short`). Packages are added to it as they become race-clean (currently `pkg/sds/...`, `pkg/wal/...`, `pkg/objectfs/fuse/...`, `pkg/objectfs/blob/...`, and `pkg/objectfs/controller/...`). Always run `ap-test-race` locally (e.g., `GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-test-race`) before pushing changes to those packages.
