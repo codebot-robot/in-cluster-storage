@@ -4673,9 +4673,9 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 		WithServerMetadataDir(node2MetaDir),
 		WithServerMetadataIndex("sqlite"),
 	)
-	_, err = testCreateFile(ctx, server2, volumeID, "/authoritative_file.txt", 0644, []byte("authoritative-data"), 0, 0)
-	if err != nil {
-		t.Fatalf("Server 2 CreateFile failed: %v", err)
+	cfResp, err := testCreateFile(ctx, server2, volumeID, "/authoritative_file.txt", 0644, []byte("authoritative-data"), 0, 0)
+	if err != nil || cfResp.GetError() != 0 {
+		t.Fatalf("Server 2 CreateFile failed: %v (code %d)", err, cfResp.GetError())
 	}
 	_ = server2.Close()
 
@@ -4689,8 +4689,8 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 
 	// Authoritative file from wal-buffer must be present
 	authResp, err := testReadFile(ctx, server1Restarted, volumeID, "/authoritative_file.txt", 0, 1024)
-	if err != nil {
-		t.Fatalf("Failed to read /authoritative_file.txt on restarted server: %v", err)
+	if err != nil || authResp.GetError() != 0 {
+		t.Fatalf("Failed to read /authoritative_file.txt on restarted server: %v (code %d)", err, authResp.GetError())
 	}
 	if string(authResp.GetData()) != "authoritative-data" {
 		t.Fatalf("authoritative_file.txt mismatch: got %q", string(authResp.GetData()))
