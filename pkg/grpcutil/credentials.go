@@ -135,13 +135,18 @@ func ServerTLSConfigFromDir(dir string) (*tls.Config, error) {
 	}, nil
 }
 
-// NewServerTLSFromDir creates gRPC server TransportCredentials requiring client certificates.
+// NewServerTLSFromDir creates gRPC server TransportCredentials requiring client certificates,
+// backed by dynamic live reload of certificates and trust pools.
 func NewServerTLSFromDir(dir string) (credentials.TransportCredentials, error) {
-	tlsConfig, err := ServerTLSConfigFromDir(dir)
+	reloader, err := NewCertReloader(dir)
 	if err != nil {
 		return nil, err
 	}
-	return credentials.NewTLS(tlsConfig), nil
+	inner := credentials.NewTLS(reloader.ServerTLSConfig())
+	return &serverTransportCredentials{
+		TransportCredentials: inner,
+		reloader:             reloader,
+	}, nil
 }
 
 // ClientTLSConfigFromDir constructs a *tls.Config for a client from a certificate directory.
@@ -179,11 +184,12 @@ func ClientTLSConfigFromDir(dir string) (*tls.Config, error) {
 	}, nil
 }
 
-// NewClientTLSFromDir creates gRPC client TransportCredentials presenting client certificates.
+// NewClientTLSFromDir creates gRPC client TransportCredentials presenting client certificates,
+// backed by dynamic live reload of certificates and trust pools.
 func NewClientTLSFromDir(dir string) (credentials.TransportCredentials, error) {
-	tlsConfig, err := ClientTLSConfigFromDir(dir)
+	reloader, err := NewCertReloader(dir)
 	if err != nil {
 		return nil, err
 	}
-	return credentials.NewTLS(tlsConfig), nil
+	return NewClientTransportCredentials(reloader), nil
 }
