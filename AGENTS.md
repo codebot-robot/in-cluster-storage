@@ -160,7 +160,7 @@ For closing `io.Closer` resources without dropping errors, use the helpers in `p
 
 ## 5. Commit Messages and PR Descriptions
 
-**The code and its commit history must stand on their own.** PR descriptions do not become part of the repository; commit messages do. Anything a future reader needs to understand a change belongs in the commit messages, and the PR description should simply repeat them.
+**The code and its commit history must stand on their own.** PR descriptions do not become part of the repository; commit messages do. Anything a future reader needs to understand a change belongs in the commit messages, and the PR description carries only the issue reference.
 
 - **Subject line:** `area: imperative summary`, about 72 characters at most, where `area` is the package or component touched (for example `objectfs`, `objectfs/fuse`, `sds/view`, `proto/objectfs`, `ci/posix`, `docs`).
 - **Body: explain why, not just what.** Include whatever the diff alone doesn't make obvious:
@@ -171,7 +171,7 @@ For closing `io.Closer` resources without dropping errors, use the helpers in `p
 - **One logical change per commit**, each building and passing tests where practical (for example: proto changes, then implementation, then tests or CI).
 - **Keep messages true to the final code.** When review changes the approach, make sure the commit messages describe what the code does now, not the history of attempts. Either amend the original commit, or add `fixup!` commits and leave them in place: do not squash them. The fixups are useful history, because code that needed many rounds of tweaking is also the code most likely to still hold bugs, and the record shows where that was. A `fixup!` commit whose diff speaks for itself needs no body; one that changes behaviour or reverses a decision gets a body saying what changed and why. Whichever route you take, never leave a message describing code that was later removed.
 - **Reference issues** in the commit body: `Fixes #N` for the commit that completes an issue, `Part of #N` otherwise.
-- **PR description = the commit messages**, in order, for multi-commit PRs. If a reviewer would need information that isn't in the commits, add it to the commits rather than only to the PR description.
+- **Keep the PR description to bookkeeping:** normally just `Fixes #N` or `Part of #N`. Do not summarise or sell the change, do not paste the commit messages, and do not maintain a changelog of review revisions in the description. The code and the commits stand on their own; a reviewer who needs more should find it in the commit messages, and if it is missing there, add it to the commits.
 
 ---
 
