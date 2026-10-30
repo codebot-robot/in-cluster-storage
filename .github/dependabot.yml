@@ -24,6 +24,7 @@ updates:
       - "/cas"
       - "/certsigner"
       - "/fakes3"
+      - "/tools"
     schedule:
       interval: "weekly"
       day: "monday"
