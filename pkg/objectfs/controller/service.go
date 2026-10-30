@@ -891,6 +891,64 @@ func (s *Server) Release(ctx context.Context, req *pb.ReleaseRequest) (*pb.Relea
 	return &pb.ReleaseResponse{}, nil
 }
 
+func (s *Server) GetXAttr(ctx context.Context, req *pb.GetXAttrRequest) (*pb.GetXAttrResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, volInitError(err)
+	}
+	val, err := vol.GetXAttr(ctx, req.GetInode(), req.GetName())
+	if err != nil {
+		return &pb.GetXAttrResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.GetXAttrResponse{Value: val}, nil
+}
+
+func (s *Server) SetXAttr(ctx context.Context, req *pb.SetXAttrRequest) (*pb.SetXAttrResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, volInitError(err)
+	}
+	if err := vol.SetXAttr(ctx, req.GetInode(), req.GetName(), req.GetValue(), req.GetFlags()); err != nil {
+		return &pb.SetXAttrResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.SetXAttrResponse{}, nil
+}
+
+func (s *Server) ListXAttr(ctx context.Context, req *pb.ListXAttrRequest) (*pb.ListXAttrResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, volInitError(err)
+	}
+	xattrs, err := vol.ListXAttr(ctx, req.GetInode())
+	if err != nil {
+		return &pb.ListXAttrResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.ListXAttrResponse{Xattrs: xattrs}, nil
+}
+
+func (s *Server) RemoveXAttr(ctx context.Context, req *pb.RemoveXAttrRequest) (*pb.RemoveXAttrResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, volInitError(err)
+	}
+	if err := vol.RemoveXAttr(ctx, req.GetInode(), req.GetName()); err != nil {
+		return &pb.RemoveXAttrResponse{Error: volErrToSyscall(err)}, nil
+	}
+	return &pb.RemoveXAttrResponse{}, nil
+}
+
 // Broadcaster returns the EventBroadcaster for the server.
 func (s *Server) Broadcaster() *EventBroadcaster {
 	return s.broadcaster

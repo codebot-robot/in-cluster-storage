@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -29,6 +31,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
@@ -2598,6 +2602,360 @@ func TestFUSEConcurrentOperationsRace(t *testing.T) {
 		if !bytes.Equal(readBytes, expected) {
 			t.Fatalf("FUSE read data mismatch: len(got)=%d len(want)=%d", len(readBytes), len(expected))
 		}
+	}
+}
+
+func TestFUSEMountXAttr(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping mount-level xattr test on non-linux OS")
+	}
+
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	volumeID := "vol-xattr-mount"
+	cache := NewNodeCache(4 * 1024 * 1024)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	mountDir := t.TempDir()
+	mountOpts := &fuse.MountOptions{
+		DirectMount: os.Geteuid() == 0,
+	}
+	server, err := fuse.NewServer(rawFS, mountDir, mountOpts)
+	if err != nil {
+		t.Skipf("cannot mount FUSE in test environment: %v", err)
+	}
+	go server.Serve()
+	if err := server.WaitMount(); err != nil {
+		if uErr := server.Unmount(); uErr != nil {
+			t.Logf("server.Unmount failed during cleanup: %v", uErr)
+		}
+		t.Skipf("cannot wait for FUSE mount in test environment: %v", err)
+	}
+	defer func() {
+		if uErr := server.Unmount(); uErr != nil {
+			t.Logf("server.Unmount failed: %v", uErr)
+		}
+	}()
+
+	testFile := filepath.Join(mountDir, "xattr_test.txt")
+	if err := os.WriteFile(testFile, []byte("hello xattr mount"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	attrName := "user.testattr"
+	attrVal := []byte("hello world xattr value")
+
+	// 1. Setxattr
+	if err := unix.Setxattr(testFile, attrName, attrVal, 0); err != nil {
+		t.Fatalf("unix.Setxattr failed: %v", err)
+	}
+
+	// 2. Flags: XATTR_CREATE on existing should fail with EEXIST
+	if err := unix.Setxattr(testFile, attrName, []byte("newval"), unix.XATTR_CREATE); err != unix.EEXIST {
+		t.Fatalf("expected EEXIST for XATTR_CREATE on existing, got: %v", err)
+	}
+
+	// 3. Flags: XATTR_REPLACE on missing should fail with ENODATA
+	if err := unix.Setxattr(testFile, "user.nonexistent", []byte("val"), unix.XATTR_REPLACE); err != unix.ENODATA {
+		t.Fatalf("expected ENODATA for XATTR_REPLACE on missing, got: %v", err)
+	}
+
+	// 4. Flags: XATTR_REPLACE on existing should succeed
+	if err := unix.Setxattr(testFile, attrName, attrVal, unix.XATTR_REPLACE); err != nil {
+		t.Fatalf("unix.Setxattr with XATTR_REPLACE failed: %v", err)
+	}
+
+	// 5. Getxattr size probe (dest is nil or empty)
+	sz, err := unix.Getxattr(testFile, attrName, nil)
+	if err != nil {
+		t.Fatalf("unix.Getxattr size probe failed: %v", err)
+	}
+	if sz != len(attrVal) {
+		t.Fatalf("expected size %d, got %d", len(attrVal), sz)
+	}
+
+	// 6. Getxattr with buffer too small (ERANGE probe)
+	smallBuf := make([]byte, len(attrVal)-1)
+	if _, err := unix.Getxattr(testFile, attrName, smallBuf); err != unix.ERANGE {
+		t.Fatalf("expected ERANGE for small buffer, got: %v", err)
+	}
+
+	// 7. Getxattr with sufficient buffer
+	fullBuf := make([]byte, len(attrVal)+10)
+	sz, err = unix.Getxattr(testFile, attrName, fullBuf)
+	if err != nil {
+		t.Fatalf("unix.Getxattr failed: %v", err)
+	}
+	if sz != len(attrVal) || !bytes.Equal(fullBuf[:sz], attrVal) {
+		t.Fatalf("expected %q, got %q", string(attrVal), string(fullBuf[:sz]))
+	}
+
+	// 8. Listxattr size probe
+	listSz, err := unix.Listxattr(testFile, nil)
+	if err != nil {
+		t.Fatalf("unix.Listxattr size probe failed: %v", err)
+	}
+	if listSz < len(attrName)+1 {
+		t.Fatalf("expected list size >= %d, got %d", len(attrName)+1, listSz)
+	}
+
+	// 9. Listxattr with buffer too small (ERANGE probe)
+	smallListBuf := make([]byte, listSz-1)
+	if _, err := unix.Listxattr(testFile, smallListBuf); err != unix.ERANGE {
+		t.Fatalf("expected ERANGE for small list buffer, got: %v", err)
+	}
+
+	// 10. Listxattr with sufficient buffer
+	listBuf := make([]byte, listSz+10)
+	listSz, err = unix.Listxattr(testFile, listBuf)
+	if err != nil {
+		t.Fatalf("unix.Listxattr failed: %v", err)
+	}
+	names := strings.Split(strings.TrimRight(string(listBuf[:listSz]), "\x00"), "\x00")
+	found := false
+	for _, n := range names {
+		if n == attrName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected attribute %q in list %v", attrName, names)
+	}
+
+	// 11. Removexattr
+	if err := unix.Removexattr(testFile, attrName); err != nil {
+		t.Fatalf("unix.Removexattr failed: %v", err)
+	}
+
+	// 12. Getxattr after removal returns ENODATA
+	if _, err := unix.Getxattr(testFile, attrName, fullBuf); err != unix.ENODATA {
+		t.Fatalf("expected ENODATA after Removexattr, got: %v", err)
+	}
+}
+
+func TestRawFileSystemXAttrOperations(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, "vol-raw-xattr", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Create a test file
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "xattr_file.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileIno := createOut.NodeId
+
+	attrName := "user.comment"
+	attrVal := []byte("raw-test-value")
+
+	// 1. SetXAttr
+	if status := rawFS.SetXAttr(nil, &fuse.SetXAttrIn{
+		InHeader: fuse.InHeader{NodeId: fileIno},
+		Flags:    0,
+	}, attrName, attrVal); status != fuse.OK {
+		t.Fatalf("SetXAttr failed: %v", status)
+	}
+
+	// 2. SetXAttr with CREATE flag on existing -> EEXIST
+	if status := rawFS.SetXAttr(nil, &fuse.SetXAttrIn{
+		InHeader: fuse.InHeader{NodeId: fileIno},
+		Flags:    unix.XATTR_CREATE,
+	}, attrName, []byte("another")); status != fuse.Status(syscall.EEXIST) {
+		t.Fatalf("expected EEXIST for CREATE on existing, got: %v", status)
+	}
+
+	// 3. SetXAttr with REPLACE flag on missing -> ENODATA
+	if status := rawFS.SetXAttr(nil, &fuse.SetXAttrIn{
+		InHeader: fuse.InHeader{NodeId: fileIno},
+		Flags:    unix.XATTR_REPLACE,
+	}, "user.missing", []byte("another")); status != fuse.Status(syscall.ENODATA) {
+		t.Fatalf("expected ENODATA for REPLACE on missing, got: %v", status)
+	}
+
+	// 4. GetXAttr size probe (dest is empty)
+	sz, status := rawFS.GetXAttr(nil, &fuse.InHeader{NodeId: fileIno}, attrName, nil)
+	if status != fuse.OK || sz != uint32(len(attrVal)) {
+		t.Fatalf("GetXAttr size probe failed: status=%v sz=%d want=%d", status, sz, len(attrVal))
+	}
+
+	// 5. GetXAttr with buffer too small -> ERANGE
+	smallBuf := make([]byte, len(attrVal)-1)
+	sz, status = rawFS.GetXAttr(nil, &fuse.InHeader{NodeId: fileIno}, attrName, smallBuf)
+	if status != fuse.ERANGE || sz != uint32(len(attrVal)) {
+		t.Fatalf("GetXAttr small buffer expected ERANGE, got: status=%v sz=%d", status, sz)
+	}
+
+	// 6. GetXAttr with adequate buffer -> OK and matches
+	fullBuf := make([]byte, len(attrVal)+10)
+	sz, status = rawFS.GetXAttr(nil, &fuse.InHeader{NodeId: fileIno}, attrName, fullBuf)
+	if status != fuse.OK || sz != uint32(len(attrVal)) || !bytes.Equal(fullBuf[:sz], attrVal) {
+		t.Fatalf("GetXAttr failed: status=%v sz=%d val=%q", status, sz, string(fullBuf[:sz]))
+	}
+
+	// 7. ListXAttr size probe (dest is empty)
+	expectedEncoded := append([]byte(attrName), 0)
+	listSz, status := rawFS.ListXAttr(nil, &fuse.InHeader{NodeId: fileIno}, nil)
+	if status != fuse.OK || listSz != uint32(len(expectedEncoded)) {
+		t.Fatalf("ListXAttr size probe failed: status=%v sz=%d want=%d", status, listSz, len(expectedEncoded))
+	}
+
+	// 8. ListXAttr with buffer too small -> ERANGE
+	smallListBuf := make([]byte, listSz-1)
+	listSz, status = rawFS.ListXAttr(nil, &fuse.InHeader{NodeId: fileIno}, smallListBuf)
+	if status != fuse.ERANGE || listSz != uint32(len(expectedEncoded)) {
+		t.Fatalf("ListXAttr small buffer expected ERANGE, got: status=%v sz=%d", status, listSz)
+	}
+
+	// 9. ListXAttr with adequate buffer
+	fullListBuf := make([]byte, listSz+10)
+	listSz, status = rawFS.ListXAttr(nil, &fuse.InHeader{NodeId: fileIno}, fullListBuf)
+	if status != fuse.OK || !bytes.Equal(fullListBuf[:listSz], expectedEncoded) {
+		t.Fatalf("ListXAttr failed: status=%v sz=%d val=%q", status, listSz, string(fullListBuf[:listSz]))
+	}
+
+	// 10. RemoveXAttr
+	if status := rawFS.RemoveXAttr(nil, &fuse.InHeader{NodeId: fileIno}, attrName); status != fuse.OK {
+		t.Fatalf("RemoveXAttr failed: %v", status)
+	}
+
+	// 11. GetXAttr after remove -> ENODATA
+	_, status = rawFS.GetXAttr(nil, &fuse.InHeader{NodeId: fileIno}, attrName, fullBuf)
+	if status != fuse.Status(syscall.ENODATA) {
+		t.Fatalf("expected ENODATA after remove, got: %v", status)
+	}
+}
+
+type xattrCountingClient struct {
+	pb.ObjectFSControllerClient
+	getXAttrCalls  int
+	listXAttrCalls int
+}
+
+func (c *xattrCountingClient) GetXAttr(ctx context.Context, in *pb.GetXAttrRequest, opts ...grpc.CallOption) (*pb.GetXAttrResponse, error) {
+	c.getXAttrCalls++
+	return c.ObjectFSControllerClient.GetXAttr(ctx, in, opts...)
+}
+
+func (c *xattrCountingClient) ListXAttr(ctx context.Context, in *pb.ListXAttrRequest, opts ...grpc.CallOption) (*pb.ListXAttrResponse, error) {
+	c.listXAttrCalls++
+	return c.ObjectFSControllerClient.ListXAttr(ctx, in, opts...)
+}
+
+func TestFUSEHandlerXAttrCountShortcut(t *testing.T) {
+	realClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	countingClient := &xattrCountingClient{ObjectFSControllerClient: realClient}
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(countingClient, "vol-xattr-shortcut", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// 1. Create a file. Create populates inode in cache with XattrCount == 0
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "shortcut_file.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileIno := createOut.NodeId
+
+	// Ensure inode is cached and has XattrCount == 0
+	if !rawFS.isXattrCountZero(fileIno) {
+		t.Fatalf("expected fileIno %d to have xattr_count zero", fileIno)
+	}
+
+	// 2. Call GetXAttr: must return ENODATA without an RPC!
+	dest := make([]byte, 100)
+	_, status := rawFS.GetXAttr(nil, &fuse.InHeader{NodeId: fileIno}, "user.anything", dest)
+	if status != fuse.Status(syscall.ENODATA) {
+		t.Fatalf("expected ENODATA from shortcut, got: %v", status)
+	}
+	if countingClient.getXAttrCalls != 0 {
+		t.Fatalf("expected 0 GetXAttr RPC calls, got: %d", countingClient.getXAttrCalls)
+	}
+
+	// 3. Call ListXAttr: must return empty list without an RPC!
+	listSz, status := rawFS.ListXAttr(nil, &fuse.InHeader{NodeId: fileIno}, dest)
+	if status != fuse.OK || listSz != 0 {
+		t.Fatalf("expected OK and 0 bytes from ListXAttr shortcut, got: status=%v sz=%d", status, listSz)
+	}
+	if countingClient.listXAttrCalls != 0 {
+		t.Fatalf("expected 0 ListXAttr RPC calls, got: %d", countingClient.listXAttrCalls)
+	}
+
+	// 4. Test unset count (XattrCount == nil): must ask the controller via RPC!
+	rawFS.inodeAttrsMu.Lock()
+	rawFS.inodeAttrs[fileIno].XattrCount = nil
+	rawFS.inodeAttrsMu.Unlock()
+
+	if rawFS.isXattrCountZero(fileIno) {
+		t.Fatalf("expected isXattrCountZero to return false when XattrCount is nil (unknown)")
+	}
+
+	_, _ = rawFS.GetXAttr(nil, &fuse.InHeader{NodeId: fileIno}, "user.anything", dest)
+	if countingClient.getXAttrCalls != 1 {
+		t.Fatalf("expected 1 GetXAttr RPC call when count is unset, got: %d", countingClient.getXAttrCalls)
+	}
+
+	_, _ = rawFS.ListXAttr(nil, &fuse.InHeader{NodeId: fileIno}, dest)
+	if countingClient.listXAttrCalls != 1 {
+		t.Fatalf("expected 1 ListXAttr RPC call when count is unset, got: %d", countingClient.listXAttrCalls)
+	}
+}
+
+func TestFUSEHandlerXAttrCountInvalidationAndPruning(t *testing.T) {
+	realClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(realClient, "vol-xattr-invalidate", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Create file, which records XattrCount == 0 in inodeAttrs and sets lookup count to 1
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "watch_file.txt", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileIno := createOut.NodeId
+
+	if !rawFS.isXattrCountZero(fileIno) {
+		t.Fatalf("expected isXattrCountZero to be true initially")
+	}
+
+	// 1. Feed an EVENT_MODIFIED for the inode: must invalidate inodeAttrs so isXattrCountZero becomes false
+	ev := &pb.WatchVolumeResponse{
+		EventType: pb.WatchEventType_EVENT_MODIFIED,
+		Inode:     fileIno,
+	}
+	handleWatchEvent(ev, cache, []*ObjectFS{rawFS})
+
+	if rawFS.isXattrCountZero(fileIno) {
+		t.Fatalf("expected isXattrCountZero to be false after EVENT_MODIFIED watch event")
+	}
+
+	// 2. Re-record count 0 and verify Forget prunes it when lookup count reaches 0
+	rawFS.recordInodeAttr(&pb.Inode{
+		Ino:        proto.Uint64(fileIno),
+		XattrCount: proto.Uint32(0),
+	})
+	if !rawFS.isXattrCountZero(fileIno) {
+		t.Fatalf("expected isXattrCountZero to be true after recordInodeAttr")
+	}
+
+	// Inode has lookup count 1 from Create. Forget it.
+	rawFS.Forget(fileIno, 1)
+
+	if rawFS.isXattrCountZero(fileIno) {
+		t.Fatalf("expected isXattrCountZero to be false after Forget drops entry")
 	}
 }
 

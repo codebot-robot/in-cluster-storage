@@ -23,7 +23,7 @@ RUN CGO_ENABLED=0 go build -o objectfs-node-daemon ./cmd/objectfs-node-daemon
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y mount fuse3 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y mount fuse3 ca-certificates attr && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/objectfs-node-daemon /usr/local/bin/objectfs-node-daemon
 

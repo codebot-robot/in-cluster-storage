@@ -30,6 +30,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -130,6 +131,9 @@ type ObjectFS struct {
 	inodeSyncMu    sync.Mutex
 	inodeSyncLocks map[uint64]*inodeSyncLock
 
+	inodeAttrsMu sync.RWMutex
+	inodeAttrs   map[uint64]*pb.Inode
+
 	notifyHook func(notifyEvent)
 }
 
@@ -204,6 +208,7 @@ func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string
 		lookups:                make(map[uint64]uint64),
 		dentries:               make(map[uint64]map[string]struct{}),
 		childDentries:          make(map[uint64]map[dentryKey]struct{}),
+		inodeAttrs:             make(map[uint64]*pb.Inode),
 	}
 	fs.lookups[fuse.FUSE_ROOT_ID] = 1
 	return fs
@@ -532,6 +537,7 @@ func (fs *ObjectFS) Forget(nodeid, nlookup uint64) {
 				delete(fs.childDentries, nodeid)
 			}
 		}
+		fs.removeInodeAttr(nodeid)
 	} else {
 		fs.lookups[nodeid] = cur - nlookup
 	}
@@ -728,6 +734,42 @@ func (fs *ObjectFS) fillAttrOut(attr *pb.EntryAttr, out *fuse.Attr) {
 			out.Ctimensec = out.Mtimensec
 		}
 	}
+	if attr != nil && attr.GetInode() != nil {
+		fs.recordInodeAttr(attr.GetInode())
+	}
+}
+
+func (fs *ObjectFS) recordInodeAttr(ino *pb.Inode) {
+	if ino == nil || ino.GetIno() == 0 {
+		return
+	}
+	fs.inodeAttrsMu.Lock()
+	defer fs.inodeAttrsMu.Unlock()
+	if fs.inodeAttrs == nil {
+		fs.inodeAttrs = make(map[uint64]*pb.Inode)
+	}
+	fs.inodeAttrs[ino.GetIno()] = proto.Clone(ino).(*pb.Inode)
+}
+
+func (fs *ObjectFS) removeInodeAttr(inodeID uint64) {
+	fs.inodeAttrsMu.Lock()
+	defer fs.inodeAttrsMu.Unlock()
+	if fs.inodeAttrs != nil {
+		delete(fs.inodeAttrs, inodeID)
+	}
+}
+
+func (fs *ObjectFS) isXattrCountZero(inodeID uint64) bool {
+	fs.inodeAttrsMu.RLock()
+	defer fs.inodeAttrsMu.RUnlock()
+	if fs.inodeAttrs == nil {
+		return false
+	}
+	ino, ok := fs.inodeAttrs[inodeID]
+	if !ok || ino == nil {
+		return false
+	}
+	return ino.XattrCount != nil && ino.GetXattrCount() == 0
 }
 
 func (fs *ObjectFS) fillEntryOut(attr *pb.EntryAttr, out *fuse.EntryOut, parent uint64, name string) {
@@ -1418,6 +1460,126 @@ func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename st
 		fs.cache.RecordPosition(input.Oldnodeid, pos)
 	}
 	fs.fillEntryOut(attr, out, input.NodeId, filename)
+	return fuse.OK
+}
+
+func (fs *ObjectFS) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string, dest []byte) (uint32, fuse.Status) {
+	if fs.isXattrCountZero(header.NodeId) {
+		return 0, fuse.Status(syscall.ENODATA)
+	}
+
+	ctx, cancelFunc := fs.makeContext(cancel)
+	defer cancelFunc()
+
+	resp, err := fs.client.GetXAttr(ctx, &pb.GetXAttrRequest{
+		VolumeId: fs.volumeID,
+		Inode:    header.NodeId,
+		Name:     attr,
+	})
+	if err != nil {
+		return 0, fs.grpcErrorToStatus("GetXAttr", err)
+	}
+	if resp.GetError() != 0 {
+		return 0, fuse.Status(resp.GetError())
+	}
+
+	val := resp.GetValue()
+	needed := uint32(len(val))
+	if len(dest) == 0 {
+		return needed, fuse.OK
+	}
+	if len(dest) < len(val) {
+		return needed, fuse.ERANGE
+	}
+	copy(dest, val)
+	return needed, fuse.OK
+}
+
+func (fs *ObjectFS) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, dest []byte) (uint32, fuse.Status) {
+	if fs.isXattrCountZero(header.NodeId) {
+		return 0, fuse.OK
+	}
+
+	ctx, cancelFunc := fs.makeContext(cancel)
+	defer cancelFunc()
+
+	resp, err := fs.client.ListXAttr(ctx, &pb.ListXAttrRequest{
+		VolumeId: fs.volumeID,
+		Inode:    header.NodeId,
+	})
+	if err != nil {
+		return 0, fs.grpcErrorToStatus("ListXAttr", err)
+	}
+	if resp.GetError() != 0 {
+		return 0, fuse.Status(resp.GetError())
+	}
+
+	var encoded []byte
+	for _, x := range resp.GetXattrs() {
+		encoded = append(encoded, x.GetName()...)
+		encoded = append(encoded, 0)
+	}
+
+	needed := uint32(len(encoded))
+	if len(dest) == 0 {
+		return needed, fuse.OK
+	}
+	if len(dest) < len(encoded) {
+		return needed, fuse.ERANGE
+	}
+	copy(dest, encoded)
+	return needed, fuse.OK
+}
+
+func (fs *ObjectFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr string, data []byte) fuse.Status {
+	ctx, cancelFunc := fs.makeContext(cancel)
+	defer cancelFunc()
+
+	var flags pb.SetXAttrRequest_Flags
+	switch input.Flags {
+	case 0:
+		flags = pb.SetXAttrRequest_FLAGS_NONE
+	case unix.XATTR_CREATE:
+		flags = pb.SetXAttrRequest_FLAGS_CREATE
+	case unix.XATTR_REPLACE:
+		flags = pb.SetXAttrRequest_FLAGS_REPLACE
+	default:
+		return fuse.EINVAL
+	}
+
+	resp, err := fs.client.SetXAttr(ctx, &pb.SetXAttrRequest{
+		VolumeId: fs.volumeID,
+		Inode:    input.NodeId,
+		Name:     attr,
+		Value:    data,
+		Flags:    flags,
+	})
+	if err != nil {
+		return fs.grpcErrorToStatus("SetXAttr", err)
+	}
+	if resp.GetError() != 0 {
+		return fuse.Status(resp.GetError())
+	}
+	fs.removeInodeAttr(input.NodeId)
+	return fuse.OK
+}
+
+func (fs *ObjectFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string) fuse.Status {
+	ctx, cancelFunc := fs.makeContext(cancel)
+	defer cancelFunc()
+
+	resp, err := fs.client.RemoveXAttr(ctx, &pb.RemoveXAttrRequest{
+		VolumeId: fs.volumeID,
+		Inode:    header.NodeId,
+		Name:     attr,
+	})
+	if err != nil {
+		return fs.grpcErrorToStatus("RemoveXAttr", err)
+	}
+	if resp.GetError() != 0 {
+		return fuse.Status(resp.GetError())
+	}
+	fs.removeInodeAttr(header.NodeId)
 	return fuse.OK
 }
 
@@ -2517,6 +2679,24 @@ func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*Object
 
 	klog.V(4).Infof("handleWatchEvent: event_type=%v, inode=%d, parent=%d, name=%q, old_parent=%d, old_name=%q, pos=%d, dirty_skip=%v, pos_skip=%v",
 		ev.GetEventType(), ino, ev.GetParentInode(), ev.GetName(), ev.GetOldParentInode(), ev.GetOldName(), eventPos, isDirty, skip)
+
+	for _, f := range fs {
+		if f == nil {
+			continue
+		}
+		if ino != 0 {
+			f.removeInodeAttr(ino)
+		}
+		if ev.GetEventType() == pb.WatchEventType_EVENT_RENAMED {
+			if oldParent := ev.GetOldParentInode(); oldParent != 0 {
+				f.removeInodeAttr(oldParent)
+			}
+			if parent := ev.GetParentInode(); parent != 0 {
+				f.removeInodeAttr(parent)
+			}
+		}
+	}
+
 	// Skip notifications for inodes the local cache holds dirty (the local writer wins locally; the #222/#263 rules)
 	// or when event.position <= KnownPosition(ino) for every inode the event targets.
 	if isDirty || skip {
