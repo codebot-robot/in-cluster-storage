@@ -148,6 +148,10 @@ func UpdateVolumeStats(stats, before, after proto.Message) error {
 		// DirEntry row changes do not affect VolumeStats
 		return nil
 
+	case *pb.XAttr:
+		// XAttr row changes do not affect VolumeStats
+		return nil
+
 	default:
 		typeName := string(target.ProtoReflect().Descriptor().FullName())
 		if typeName == VolumeStatsTypeName {

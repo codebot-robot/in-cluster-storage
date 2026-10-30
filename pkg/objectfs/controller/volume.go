@@ -58,6 +58,12 @@ const (
 	// (matching the POSIX NAME_MAX limit of 255 bytes advertised by statfs).
 	MaxNameLength = 255
 
+	// MaxXAttrNameLength is the maximum allowed byte length for an extended attribute name (Linux XATTR_NAME_MAX)
+	MaxXAttrNameLength = 255
+
+	// MaxXAttrValueLength is the maximum allowed byte length for an extended attribute value (Linux XATTR_SIZE_MAX)
+	MaxXAttrValueLength = 64 * 1024
+
 	// closeCoalesceWindow is the short fixed floor window used to coalesce CLOSE-triggered
 	// syncs. When multiple files are closed in rapid succession (e.g. untarring an archive or
 	// compiler emit), this window batches their pack uploads and metadata commits into a
@@ -472,11 +478,12 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 	if !ok || msg == nil {
 		rootInodeMsg := &pb.Inode{
-			Ino:   proto.Uint64(1),
-			Mode:  0755 | syscall.S_IFDIR,
-			Mtime: timestamppb.Now(),
-			IsDir: true,
-			Nlink: 2,
+			Ino:        proto.Uint64(1),
+			Mode:       0755 | syscall.S_IFDIR,
+			Mtime:      timestamppb.Now(),
+			IsDir:      true,
+			Nlink:      2,
+			XattrCount: proto.Uint32(0),
 		}
 		keyBytes, valBytes, err := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
 		if err != nil {
@@ -1118,6 +1125,9 @@ func (v *Volume) initMetadataStreamLocked() error {
 	if _, err := w.RegisterType(&pb.VolumeStats{}, 1); err != nil {
 		return fmt.Errorf("failed to register VolumeStats type: %w", err)
 	}
+	if _, err := w.RegisterType(&pb.XAttr{}, 1, 2); err != nil {
+		return fmt.Errorf("failed to register XAttr type: %w", err)
+	}
 	v.metadataStream = w
 	return nil
 }
@@ -1477,6 +1487,7 @@ var (
 	pkInode     = sds.NewPrimaryKey(1)
 	pkDirEntry  = sds.NewPrimaryKey(1, 2)
 	pkFileChunk = sds.NewPrimaryKey(1, 2)
+	pkXAttr     = sds.NewPrimaryKey(1, 2)
 )
 
 // VolumeStats contains aggregated operational and cache metrics for a Volume.
@@ -1714,6 +1725,8 @@ func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, tx *sds.Tx, type
 				pk = pkDirEntry
 			case "objectfs.v1alpha1.FileChunk":
 				pk = pkFileChunk
+			case "objectfs.v1alpha1.XAttr":
+				pk = pkXAttr
 			}
 			if pk != nil {
 				k, err := pk.Extract(msg)
@@ -1818,6 +1831,46 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
 			return fmt.Errorf("failed to wait for orphan deletion sync: %w", err)
+		}
+	}
+	return nil
+}
+
+// deleteInodeRowsLocked deletes the Inode row, all FileChunk rows, and all XAttr rows
+// associated with ino. Reads (scans) are performed before any deletion is buffered in tx
+// to preserve the transactional reads-before-writes assertion.
+func (v *Volume) deleteInodeRowsLocked(ctx context.Context, tx *sds.Tx, ino uint64) error {
+	chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(ino)}, 1)
+	if err != nil {
+		return fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", ino, err)
+	}
+	chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
+	if err != nil {
+		return fmt.Errorf("failed to scan chunk rows for inode %d: %w", ino, err)
+	}
+
+	xattrPrefix, err := sds.EncodeKeyPrefix(&pb.XAttr{Ino: proto.Uint64(ino)}, 1)
+	if err != nil {
+		return fmt.Errorf("failed to encode xattr key prefix for inode %d: %w", ino, err)
+	}
+	xattrMsgs, err := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.XAttr", xattrPrefix)
+	if err != nil {
+		return fmt.Errorf("failed to scan xattr rows for inode %d: %w", ino, err)
+	}
+
+	if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(ino)}); err != nil {
+		return fmt.Errorf("failed to log inode %d deletion: %w", ino, err)
+	}
+	for _, cMsg := range chunkMsgs {
+		c := cMsg.(*pb.FileChunk)
+		if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(ino), Index: proto.Uint32(c.GetIndex())}); err != nil {
+			return fmt.Errorf("failed to log chunk deletion for inode %d: %w", ino, err)
+		}
+	}
+	for _, xMsg := range xattrMsgs {
+		x := xMsg.(*pb.XAttr)
+		if _, err := tx.Delete(ctx, &pb.XAttr{Ino: proto.Uint64(ino), Name: proto.String(x.GetName())}); err != nil {
+			return fmt.Errorf("failed to log xattr deletion for inode %d: %w", ino, err)
 		}
 	}
 	return nil
@@ -2041,6 +2094,260 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 	return attr, nil
 }
 
+// GetXAttr reads the value of the named extended attribute on inodeID.
+func (v *Volume) GetXAttr(ctx context.Context, inodeID uint64, name string) ([]byte, error) {
+	if len(name) > MaxXAttrNameLength {
+		return nil, fmt.Errorf("xattr name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+	}
+	if strings.HasPrefix(name, "system.") {
+		return nil, fmt.Errorf("system xattrs not supported: %w", syscall.ENOTSUP)
+	}
+
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	inodeID = v.normalizeInodeID(inodeID)
+	if _, err := v.getOrLoadInodeLocked(ctx, nil, inodeID); err != nil {
+		return nil, err
+	}
+
+	key, err := pkXAttr.Extract(&pb.XAttr{
+		Ino:  proto.Uint64(inodeID),
+		Name: proto.String(name),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	msg, ok, err := v.getSQLiteRowLocked(ctx, nil, "objectfs.v1alpha1.XAttr", key)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("xattr %q not found on inode %d: %w", name, inodeID, syscall.ENODATA)
+	}
+
+	xattr := msg.(*pb.XAttr)
+	return append([]byte(nil), xattr.GetValue()...), nil
+}
+
+// SetXAttr sets the value of the named extended attribute on inodeID.
+func (v *Volume) SetXAttr(ctx context.Context, inodeID uint64, name string, value []byte, flags pb.SetXAttrRequest_Flags) error {
+	if len(name) > MaxXAttrNameLength {
+		return fmt.Errorf("xattr name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+	}
+	if strings.HasPrefix(name, "system.") {
+		return fmt.Errorf("system xattrs not supported: %w", syscall.ENOTSUP)
+	}
+	if len(value) > MaxXAttrValueLength {
+		return fmt.Errorf("xattr value length %d exceeds maximum length %d: %w", len(value), MaxXAttrValueLength, syscall.E2BIG)
+	}
+
+	waitFn, attr, err := func() (func(context.Context) error, *pb.EntryAttr, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+
+		tx := v.beginTxLocked("SetXAttr")
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, nil, err
+		}
+
+		inodeID = v.normalizeInodeID(inodeID)
+		node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		key, err := pkXAttr.Extract(&pb.XAttr{
+			Ino:  proto.Uint64(inodeID),
+			Name: proto.String(name),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+
+		_, exists, err := v.getSQLiteRowLocked(ctx, tx, "objectfs.v1alpha1.XAttr", key)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if flags == pb.SetXAttrRequest_FLAGS_CREATE && exists {
+			return nil, nil, fmt.Errorf("xattr %q already exists: %w", name, syscall.EEXIST)
+		}
+		if flags == pb.SetXAttrRequest_FLAGS_REPLACE && !exists {
+			return nil, nil, fmt.Errorf("xattr %q does not exist: %w", name, syscall.ENODATA)
+		}
+
+		now := time.Now()
+		node.mutate(func(row *pb.Inode) {
+			row.Ctime = timestamppb.New(now)
+			if !exists {
+				count := row.GetXattrCount() + 1
+				row.XattrCount = &count
+			}
+		})
+
+		xattrMsg := &pb.XAttr{
+			Ino:   proto.Uint64(inodeID),
+			Name:  proto.String(name),
+			Value: append([]byte(nil), value...),
+		}
+		if exists {
+			if _, err := tx.Update(ctx, xattrMsg); err != nil {
+				return nil, nil, fmt.Errorf("failed to log xattr update: %w", err)
+			}
+		} else {
+			if _, err := tx.Insert(ctx, xattrMsg); err != nil {
+				return nil, nil, fmt.Errorf("failed to log xattr insert: %w", err)
+			}
+		}
+
+		if _, err := tx.Update(ctx, node.Row); err != nil {
+			return nil, nil, fmt.Errorf("failed to log inode ctime update: %w", err)
+		}
+
+		commitSeq, err := v.commitTxLocked(ctx, tx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to commit setxattr transaction: %w", err)
+		}
+
+		waitFn := v.makeWaitFn(commitSeq, nil)
+		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
+		return waitFn, attr, nil
+	}()
+	if err != nil {
+		return err
+	}
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return err
+		}
+	}
+	if v.broadcaster != nil {
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType:      pb.WatchEventType_EVENT_MODIFIED,
+			Attr:           attr,
+			Inode:          attr.GetInode().GetIno(),
+			StreamPosition: attr.GetStreamPosition(),
+		})
+	}
+	return nil
+}
+
+// ListXAttr returns all extended attributes set on inodeID as name and value pairs.
+func (v *Volume) ListXAttr(ctx context.Context, inodeID uint64) ([]*pb.XAttr, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	inodeID = v.normalizeInodeID(inodeID)
+	if _, err := v.getOrLoadInodeLocked(ctx, nil, inodeID); err != nil {
+		return nil, err
+	}
+
+	prefixBytes, err := sds.EncodeKeyPrefix(&pb.XAttr{Ino: proto.Uint64(inodeID)}, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode xattr key prefix for inode %d: %w", inodeID, err)
+	}
+
+	msgs, err := v.scanSQLiteRowsLocked(ctx, nil, "objectfs.v1alpha1.XAttr", prefixBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan xattr rows for inode %d: %w", inodeID, err)
+	}
+
+	xattrs := make([]*pb.XAttr, 0, len(msgs))
+	for _, msg := range msgs {
+		xattrs = append(xattrs, msg.(*pb.XAttr))
+	}
+	return xattrs, nil
+}
+
+// RemoveXAttr removes the named extended attribute from inodeID.
+func (v *Volume) RemoveXAttr(ctx context.Context, inodeID uint64, name string) error {
+	if len(name) > MaxXAttrNameLength {
+		return fmt.Errorf("xattr name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
+	}
+	if strings.HasPrefix(name, "system.") {
+		return fmt.Errorf("system xattrs not supported: %w", syscall.ENOTSUP)
+	}
+
+	waitFn, attr, err := func() (func(context.Context) error, *pb.EntryAttr, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+
+		tx := v.beginTxLocked("RemoveXAttr")
+		if err := v.checkBackpressureLocked(ctx); err != nil {
+			return nil, nil, err
+		}
+
+		inodeID = v.normalizeInodeID(inodeID)
+		node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		key, err := pkXAttr.Extract(&pb.XAttr{
+			Ino:  proto.Uint64(inodeID),
+			Name: proto.String(name),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+
+		_, exists, err := v.getSQLiteRowLocked(ctx, tx, "objectfs.v1alpha1.XAttr", key)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !exists {
+			return nil, nil, fmt.Errorf("xattr %q not found on inode %d: %w", name, inodeID, syscall.ENODATA)
+		}
+
+		now := time.Now()
+		node.mutate(func(row *pb.Inode) {
+			row.Ctime = timestamppb.New(now)
+			if row.GetXattrCount() > 0 {
+				count := row.GetXattrCount() - 1
+				row.XattrCount = &count
+			} else {
+				row.XattrCount = proto.Uint32(0)
+			}
+		})
+
+		if _, err := tx.Delete(ctx, &pb.XAttr{Ino: proto.Uint64(inodeID), Name: proto.String(name)}); err != nil {
+			return nil, nil, fmt.Errorf("failed to log xattr deletion: %w", err)
+		}
+
+		if _, err := tx.Update(ctx, node.Row); err != nil {
+			return nil, nil, fmt.Errorf("failed to log inode ctime update: %w", err)
+		}
+
+		commitSeq, err := v.commitTxLocked(ctx, tx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to commit removexattr transaction: %w", err)
+		}
+
+		waitFn := v.makeWaitFn(commitSeq, nil)
+		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
+		return waitFn, attr, nil
+	}()
+	if err != nil {
+		return err
+	}
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return err
+		}
+	}
+	if v.broadcaster != nil {
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType:      pb.WatchEventType_EVENT_MODIFIED,
+			Attr:           attr,
+			Inode:          attr.GetInode().GetIno(),
+			StreamPosition: attr.GetStreamPosition(),
+		})
+	}
+	return nil
+}
+
 func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) (*pb.EntryAttr, error) {
 	if len(name) > MaxNameLength {
 		return nil, fmt.Errorf("name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
@@ -2233,17 +2540,18 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		v.dirParents[childInodeID] = parentInodeID
 
 		childInodeMsg := &pb.Inode{
-			Ino:       proto.Uint64(childInodeID),
-			Mode:      mode,
-			Size:      0,
-			Mtime:     timestamppb.New(now),
-			Atime:     timestamppb.New(now),
-			Ctime:     timestamppb.New(now),
-			Uid:       uid,
-			Gid:       gid,
-			IsDir:     true,
-			Nlink:     2,
-			ParentIno: proto.Uint64(parentInodeID),
+			Ino:        proto.Uint64(childInodeID),
+			Mode:       mode,
+			Size:       0,
+			Mtime:      timestamppb.New(now),
+			Atime:      timestamppb.New(now),
+			Ctime:      timestamppb.New(now),
+			Uid:        uid,
+			Gid:        gid,
+			IsDir:      true,
+			Nlink:      2,
+			ParentIno:  proto.Uint64(parentInodeID),
+			XattrCount: proto.Uint32(0),
 		}
 		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
 			delete(v.dirParents, childInodeID)
@@ -2533,6 +2841,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				ChunkSize:     effectiveChunkSize,
 				Rdev:          rdev,
 				ContentSha256: hashStr,
+				XattrCount:    proto.Uint32(0),
 			},
 		}
 
@@ -2687,6 +2996,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 				IsDir:         false,
 				Nlink:         1,
 				SymlinkTarget: target,
+				XattrCount:    proto.Uint32(0),
 			},
 		}
 
@@ -3974,38 +4284,19 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			row.Ctime = timestamppb.New(now)
 		})
 
-		// Reads before writes: scan chunk rows before buffering any deletions into tx.
-		var chunkMsgs []proto.Message
-		if childInode.Row.GetNlink() == 0 && !v.hasOpenHandlesLocked(childInodeID) {
-			chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(childInodeID)}, 1)
-			if err != nil {
-				return nil, 0, fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", childInodeID, err)
-			}
-			chunkMsgs, err = v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
-			if err != nil {
-				return nil, 0, fmt.Errorf("failed to scan chunk rows for inode %d: %w", childInodeID, err)
-			}
-		}
-
 		var commitSeq uint64
-		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
-			return nil, 0, fmt.Errorf("failed to log dir entry deletion: %w", err)
-		}
-
-		if childInode.Row.GetNlink() > 0 || v.hasOpenHandlesLocked(childInodeID) {
+		if childInode.Row.GetNlink() == 0 && !v.hasOpenHandlesLocked(childInodeID) {
+			if err := v.deleteInodeRowsLocked(ctx, tx, childInodeID); err != nil {
+				return nil, 0, err
+			}
+		} else {
 			if _, err := tx.Update(ctx, childInode.Row); err != nil {
 				return nil, 0, fmt.Errorf("failed to log child inode update: %w", err)
 			}
-		} else {
-			if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInodeID)}); err != nil {
-				return nil, 0, fmt.Errorf("failed to log child inode deletion: %w", err)
-			}
-			for _, cMsg := range chunkMsgs {
-				c := cMsg.(*pb.FileChunk)
-				if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(childInodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
-					return nil, 0, fmt.Errorf("failed to log chunk deletion for inode %d: %w", childInodeID, err)
-				}
-			}
+		}
+
+		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
+			return nil, 0, fmt.Errorf("failed to log dir entry deletion: %w", err)
 		}
 
 		if parentInode != nil {
@@ -4103,12 +4394,12 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (
 			row.Ctime = timestamppb.New(now)
 		})
 
+		if err := v.deleteInodeRowsLocked(ctx, tx, childInodeID); err != nil {
+			return nil, 0, err
+		}
 		var commitSeq uint64
 		if _, err = tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(parentInodeID), Name: proto.String(name)}); err != nil {
 			return nil, 0, fmt.Errorf("failed to log dir entry deletion: %w", err)
-		}
-		if _, err = tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(childInodeID)}); err != nil {
-			return nil, 0, fmt.Errorf("failed to log inode deletion: %w", err)
 		}
 		if parentInode != nil {
 			if _, err = tx.Update(ctx, parentInode.Row); err != nil {
@@ -4494,23 +4785,8 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 	}
 
 	if !node.Row.GetIsDir() && node.Row.GetNlink() == 0 {
-		chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(inodeID)}, 1)
-		if err != nil {
-			return fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", inodeID, err)
-		}
-		chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
-		if err != nil {
-			return fmt.Errorf("failed to scan chunk rows for inode %d: %w", inodeID, err)
-		}
-
-		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(inodeID)}); err != nil {
-			return fmt.Errorf("failed to log orphan inode deletion: %w", err)
-		}
-		for _, cMsg := range chunkMsgs {
-			c := cMsg.(*pb.FileChunk)
-			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(inodeID), Index: proto.Uint32(c.GetIndex())}); err != nil {
-				return fmt.Errorf("failed to log chunk deletion for inode %d: %w", inodeID, err)
-			}
+		if err := v.deleteInodeRowsLocked(ctx, tx, inodeID); err != nil {
+			return err
 		}
 		commitSeq, err := v.commitTxLocked(ctx, tx)
 		if err != nil {

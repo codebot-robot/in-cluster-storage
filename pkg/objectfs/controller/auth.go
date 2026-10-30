@@ -67,6 +67,10 @@ var nodeAllowedMethods = map[string]bool{
 	"/objectfs.v1alpha1.ObjectFSController/Link":         true,
 	"/objectfs.v1alpha1.ObjectFSController/Open":         true,
 	"/objectfs.v1alpha1.ObjectFSController/Release":      true,
+	"/objectfs.v1alpha1.ObjectFSController/GetXAttr":     true,
+	"/objectfs.v1alpha1.ObjectFSController/SetXAttr":     true,
+	"/objectfs.v1alpha1.ObjectFSController/ListXAttr":    true,
+	"/objectfs.v1alpha1.ObjectFSController/RemoveXAttr":  true,
 
 	// Volume metadata, statistics, and sync (materialisation and health monitoring)
 	"/objectfs.v1alpha1.ObjectFSController/GetManifest":    true,

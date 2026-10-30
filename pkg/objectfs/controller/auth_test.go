@@ -268,6 +268,10 @@ func TestAuthMethodClassificationDriftGuard(t *testing.T) {
 		pb.ObjectFSController_Link_FullMethodName:         RoleNode,
 		pb.ObjectFSController_Open_FullMethodName:         RoleNode,
 		pb.ObjectFSController_Release_FullMethodName:      RoleNode,
+		pb.ObjectFSController_GetXAttr_FullMethodName:     RoleNode,
+		pb.ObjectFSController_SetXAttr_FullMethodName:     RoleNode,
+		pb.ObjectFSController_ListXAttr_FullMethodName:    RoleNode,
+		pb.ObjectFSController_RemoveXAttr_FullMethodName:  RoleNode,
 
 		// Volume metadata, statistics, and sync (materialisation and health monitoring)
 		pb.ObjectFSController_GetManifest_FullMethodName:    RoleNode,
