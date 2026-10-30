@@ -3614,3 +3614,148 @@ spec:
 	}
 	t.Logf("Pod B confirmed post_checkpoint.txt does not exist (contract verified: uncheckpointed data lost on node death)!")
 }
+
+func TestObjectFSExclusiveLocalXAttrE2E(t *testing.T) {
+	requireE2EGroup(t, "exclusive")
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
+	volumeID := "exclusive-local-xattr-vol"
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+			t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		}
+	})
+
+	// Setup PVC with storageClassName: objectfs-exclusive-local and ReadWriteOncePod
+	pvcYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s-pvc
+spec:
+  accessModes:
+    - ReadWriteOncePod
+  storageClassName: objectfs-exclusive-local
+  resources:
+    requests:
+      storage: 1Gi
+`, volumeID)
+
+	t.Logf("Creating PVC for exclusive-local xattr volume")
+	h.KubectlApplyContent("exclusive-xattr-pvc", pvcYaml)
+
+	// Step 1: Deploy Pod A on Node 1 in exclusive-local mode
+	podAName := "exclusive-xattr-pod-a"
+	podAYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: objectfs-node-daemon:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: %s-pvc
+`, podAName, node1, volumeID)
+
+	t.Logf("Starting Pod A on Node 1 (%s)", node1)
+	h.KubectlApplyContent(podAName, podAYaml)
+	if err := h.WaitForPodReady(podAName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Pod A failed to start: %v", err)
+	}
+
+	// In Pod A: write file and directory, set xattrs, then remove one xattr before checkpoint
+	t.Logf("Pod A setting and removing extended attributes")
+	_, err := h.RunInPod(podAName, "default", "/bin/sh", "-c", `
+echo 'file-xattr-content' > /data/test_xattr.txt
+mkdir /data/xattr_dir
+setfattr -n user.preserved -v 'hello-xattr-world' /data/test_xattr.txt
+setfattr -n user.removed -v 'should-not-exist' /data/test_xattr.txt
+setfattr -x user.removed /data/test_xattr.txt
+setfattr -n user.dir_attr -v 'dir-xattr-value' /data/xattr_dir
+sync
+`)
+	if err != nil {
+		t.Fatalf("Failed to set xattrs in Pod A: %v", err)
+	}
+
+	// Verify in Pod A
+	outPreservedA, err := h.RunInPod(podAName, "default", "getfattr", "--absolute-names", "-n", "user.preserved", "--only-values", "/data/test_xattr.txt")
+	if err != nil || strings.TrimSpace(outPreservedA) != "hello-xattr-world" {
+		t.Fatalf("Pod A getfattr user.preserved failed: %v, out=%s", err, outPreservedA)
+	}
+	_, err = h.RunInPod(podAName, "default", "getfattr", "--absolute-names", "-n", "user.removed", "/data/test_xattr.txt")
+	if err == nil {
+		t.Fatalf("Pod A expected user.removed to be deleted before checkpoint, but getfattr succeeded")
+	}
+
+	// Step 2: Delete Pod A (triggers unmount checkpoint)
+	t.Logf("Deleting Pod A on Node 1 to trigger unmount checkpoint")
+	deletePodBounded(t, h, podAName, "default", 3*time.Minute)
+
+	// Step 3: Deploy Pod B on Node 2 in exclusive-local mode
+	podBName := "exclusive-xattr-pod-b"
+	podBYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: objectfs-node-daemon:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: %s-pvc
+`, podBName, node2, volumeID)
+
+	t.Logf("Starting Pod B on Node 2 (%s) mounting the checkpointed volume", node2)
+	h.KubectlApplyContent(podBName, podBYaml)
+	if err := h.WaitForPodReady(podBName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Pod B failed to start: %v", err)
+	}
+
+	// Step 4: Verify extended attributes in Pod B on Node 2
+	t.Logf("Pod B verifying preserved and removed extended attributes across remount")
+	outPreservedB, err := h.RunInPod(podBName, "default", "getfattr", "--absolute-names", "-n", "user.preserved", "--only-values", "/data/test_xattr.txt")
+	if err != nil || strings.TrimSpace(outPreservedB) != "hello-xattr-world" {
+		t.Fatalf("Pod B did not see preserved xattr: err=%v, out=%s", err, outPreservedB)
+	}
+
+	_, err = h.RunInPod(podBName, "default", "getfattr", "--absolute-names", "-n", "user.removed", "/data/test_xattr.txt")
+	if err == nil {
+		t.Fatalf("Pod B expected user.removed to stay removed after checkpoint, but getfattr succeeded")
+	}
+
+	outDirB, err := h.RunInPod(podBName, "default", "getfattr", "--absolute-names", "-n", "user.dir_attr", "--only-values", "/data/xattr_dir")
+	if err != nil || strings.TrimSpace(outDirB) != "dir-xattr-value" {
+		t.Fatalf("Pod B did not see directory xattr: err=%v, out=%s", err, outDirB)
+	}
+
+	t.Logf("Pod B on Node 2 successfully verified xattrs across checkpoint and materialisation!")
+
+	// Delete Pod B
+	t.Logf("Deleting Pod B on Node 2")
+	h.DeletePod(podBName, "default")
+}

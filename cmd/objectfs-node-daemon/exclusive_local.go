@@ -292,7 +292,9 @@ func (d *objectFSDriver) startExclusiveLocalSync(
 		if err != nil {
 			return 0, fmt.Errorf("replay operations: %w", err)
 		}
-		UpdateCheckpointManifest(manifest, upperPath, opList)
+		if err := UpdateCheckpointManifest(manifest, upperPath, opList); err != nil {
+			return 0, fmt.Errorf("update checkpoint manifest: %w", err)
+		}
 		if err := SaveCheckpointManifest(manifestPath, manifest); err != nil {
 			klog.Warningf("exclusive-local [%s]: failed to save checkpoint manifest: %v", volumeID, err)
 		}
@@ -494,6 +496,11 @@ func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.N
 	if _, err := ReplayOperations(ctx, client, volumeID, opList); err != nil {
 		klog.Errorf("Failed to replay checkpoint operations for volume %s: %v. Leaving upper layer intact.", volumeID, err)
 		return nil, fmt.Errorf("checkpoint replay failed: %w", err)
+	}
+
+	if err := UpdateCheckpointManifest(manifest, upperPath, opList); err != nil {
+		klog.Errorf("Failed to update checkpoint manifest for volume %s: %v. Leaving upper layer intact.", volumeID, err)
+		return nil, fmt.Errorf("checkpoint manifest update failed: %w", err)
 	}
 
 	// 6. On SUCCESS only, clean up volumeDir
