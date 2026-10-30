@@ -33,28 +33,57 @@ import (
 )
 
 type dirMeta struct {
-	path  string
-	mode  uint32
-	mtime time.Time
-	uid   uint32
-	gid   uint32
+	path       string
+	inode      uint64
+	mode       uint32
+	mtime      time.Time
+	uid        uint32
+	gid        uint32
+	xattrCount *uint32
 }
 
 type symlinkMeta struct {
-	path   string
-	target string
+	path       string
+	target     string
+	inode      uint64
+	xattrCount *uint32
 }
 
 type fileMeta struct {
-	path      string
-	relPath   string
-	inode     uint64
-	size      int64
-	mode      uint32
-	mtime     time.Time
-	uid       uint32
-	gid       uint32
-	chunkSize uint32
+	path       string
+	relPath    string
+	inode      uint64
+	size       int64
+	mode       uint32
+	mtime      time.Time
+	uid        uint32
+	gid        uint32
+	chunkSize  uint32
+	xattrCount *uint32
+}
+
+func applyXAttrs(ctx context.Context, client pb.ObjectFSControllerClient, volumeID string, ino uint64, path string, xattrCount *uint32) error {
+	if xattrCount != nil && *xattrCount == 0 {
+		return nil
+	}
+	resp, err := client.ListXAttr(ctx, &pb.ListXAttrRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+	})
+	if err != nil {
+		return fmt.Errorf("ListXAttr %s (ino %d): %w", path, ino, err)
+	}
+	if resp.GetError() != 0 {
+		return fmt.Errorf("ListXAttr %s (ino %d) returned error: %d", path, ino, resp.GetError())
+	}
+	for _, x := range resp.GetXattrs() {
+		name := x.GetName()
+		val := x.GetValue()
+		if err := unixLsetxattr(path, name, val, 0); err != nil {
+			return fmt.Errorf("setxattr %s %s: %w", path, name, err)
+		}
+	}
+	return nil
 }
 
 func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, lowerPath string) error {
@@ -76,11 +105,13 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 	if err == nil && rootAttrResp.GetError() == 0 && rootAttrResp.GetAttr() != nil && rootAttrResp.GetAttr().GetInode() != nil {
 		rootIno := rootAttrResp.GetAttr().GetInode()
 		dirs = append(dirs, dirMeta{
-			path:  lowerPath,
-			mode:  rootIno.GetMode(),
-			mtime: rootIno.GetMtime().AsTime(),
-			uid:   rootIno.GetUid(),
-			gid:   rootIno.GetGid(),
+			path:       lowerPath,
+			inode:      1,
+			mode:       rootIno.GetMode(),
+			mtime:      rootIno.GetMtime().AsTime(),
+			uid:        rootIno.GetUid(),
+			gid:        rootIno.GetGid(),
+			xattrCount: rootIno.XattrCount,
 		})
 	}
 
@@ -118,11 +149,13 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 					return fmt.Errorf("mkdir %s: %w", childFull, err)
 				}
 				dirs = append(dirs, dirMeta{
-					path:  childFull,
-					mode:  ino.GetMode(),
-					mtime: ino.GetMtime().AsTime(),
-					uid:   ino.GetUid(),
-					gid:   ino.GetGid(),
+					path:       childFull,
+					inode:      ino.GetIno(),
+					mode:       ino.GetMode(),
+					mtime:      ino.GetMtime().AsTime(),
+					uid:        ino.GetUid(),
+					gid:        ino.GetGid(),
+					xattrCount: ino.XattrCount,
 				})
 				queue = append(queue, dirQueueItem{ino: ino.GetIno(), relPath: childRel})
 			} else if fileType == uint32(syscall.S_IFLNK) || ino.GetSymlinkTarget() != "" {
@@ -141,8 +174,10 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 					target = rlResp.GetTarget()
 				}
 				symlinks = append(symlinks, symlinkMeta{
-					path:   childFull,
-					target: target,
+					path:       childFull,
+					target:     target,
+					inode:      ino.GetIno(),
+					xattrCount: ino.XattrCount,
 				})
 			} else if fileType == uint32(syscall.S_IFREG) || fileType == 0 {
 				// Regular file (hard links are materialised as independent copies)
@@ -151,15 +186,16 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 					cs = 64 * 1024
 				}
 				files = append(files, fileMeta{
-					path:      childFull,
-					relPath:   childRel,
-					inode:     ino.GetIno(),
-					size:      ino.GetSize(),
-					mode:      ino.GetMode(),
-					mtime:     ino.GetMtime().AsTime(),
-					uid:       ino.GetUid(),
-					gid:       ino.GetGid(),
-					chunkSize: cs,
+					path:       childFull,
+					relPath:    childRel,
+					inode:      ino.GetIno(),
+					size:       ino.GetSize(),
+					mode:       ino.GetMode(),
+					mtime:      ino.GetMtime().AsTime(),
+					uid:        ino.GetUid(),
+					gid:        ino.GetGid(),
+					chunkSize:  cs,
+					xattrCount: ino.XattrCount,
 				})
 				totalBytes += ino.GetSize()
 			} else {
@@ -179,6 +215,9 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 		}
 		if err := os.Symlink(sl.target, sl.path); err != nil {
 			return fmt.Errorf("symlink %s -> %s: %w", sl.path, sl.target, err)
+		}
+		if err := applyXAttrs(ctx, client, volumeID, sl.inode, sl.path, sl.xattrCount); err != nil {
+			return err
 		}
 	}
 
@@ -228,9 +267,12 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 	klog.Infof("Completed materialisation of volume %s into %s: %d files (%d bytes)",
 		volumeID, lowerPath, filesDone.Load(), bytesDone.Load())
 
-	// Apply directory modes, ownership, and mtimes bottom-up
+	// Apply directory modes, ownership, mtimes, and xattrs bottom-up
 	for i := len(dirs) - 1; i >= 0; i-- {
 		dm := dirs[i]
+		if err := applyXAttrs(ctx, client, volumeID, dm.inode, dm.path, dm.xattrCount); err != nil {
+			return err
+		}
 		if dm.mode != 0 {
 			if err := os.Chmod(dm.path, os.FileMode(dm.mode&07777)); err != nil {
 				klog.Warningf("chmod %s: %v", dm.path, err)
@@ -298,6 +340,12 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 			if chtimesErr := os.Chtimes(tmpPath, f.mtime, f.mtime); chtimesErr != nil {
 				klog.Warningf("chtimes %s: %v", tmpPath, chtimesErr)
 			}
+		}
+		if err := applyXAttrs(ctx, client, volumeID, f.inode, tmpPath, f.xattrCount); err != nil {
+			if remErr := os.Remove(tmpPath); remErr != nil && !os.IsNotExist(remErr) {
+				klog.V(4).Infof("remove temp file %s: %v", tmpPath, remErr)
+			}
+			return err
 		}
 		if renameErr := os.Rename(tmpPath, f.path); renameErr != nil {
 			return fmt.Errorf("rename empty temp file %s to %s: %w", tmpPath, f.path, renameErr)
@@ -421,6 +469,13 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 			klog.V(4).Infof("remove temp file %s: %v", tmpPath, remErr)
 		}
 		return fmt.Errorf("close temp file %s: %w", tmpPath, closeErr)
+	}
+
+	if err := applyXAttrs(ctx, client, volumeID, f.inode, tmpPath, f.xattrCount); err != nil {
+		if remErr := os.Remove(tmpPath); remErr != nil && !os.IsNotExist(remErr) {
+			klog.V(4).Infof("remove temp file %s: %v", tmpPath, remErr)
+		}
+		return err
 	}
 
 	// Atomically rename into final path
