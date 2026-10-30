@@ -20,14 +20,18 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
@@ -869,5 +873,161 @@ func TestVolume_ReadsBeforeWritesAssertionPanicsInAllModes(t *testing.T) {
 
 	if !didPanicLimit {
 		t.Fatal("expected panic on scanLimitSQLiteRowsLocked after transaction buffered write in all modes, but did not panic")
+	}
+}
+
+func TestVolume_MemoryAppenderSequenceNumberContinuityAcrossRestart(t *testing.T) {
+	ctx := t.Context()
+	storage := inmemorystorage.New()
+	dir := t.TempDir()
+	localDir := filepath.Join(dir, "local")
+
+	volumeID := "test-seq-continuity-vol"
+
+	// Session 1: Create several files in no-WAL (memory appender) mode
+	var session1Pos uint64
+	{
+		server1 := NewServer(storage,
+			WithServerMetadataIndex("sqlite"),
+			WithServerLocalStorageDir(localDir),
+		)
+		vol1, err := server1.getOrCreateVolume(volumeID)
+		if err != nil {
+			t.Fatalf("getOrCreateVolume session 1 failed: %v", err)
+		}
+
+		for i := 0; i < 5; i++ {
+			resp, err := server1.CreateFile(ctx, &pb.CreateFileRequest{
+				VolumeId:    volumeID,
+				ParentInode: 1,
+				Name:        fmt.Sprintf("file_%d.txt", i),
+				Mode:        0644,
+			})
+			if err != nil || resp.GetError() != 0 {
+				t.Fatalf("CreateFile %d failed: err=%v, resp=%v", i, err, resp)
+			}
+			relResp, err := server1.Release(ctx, &pb.ReleaseRequest{
+				VolumeId: volumeID,
+				Inode:    resp.GetAttr().GetInode().GetIno(),
+				Fh:       resp.GetFh(),
+			})
+			if err != nil || relResp.GetError() != 0 {
+				t.Fatalf("Release %d failed: err=%v, resp=%v", i, err, relResp)
+			}
+		}
+
+		if err := vol1.FlushToBackend(ctx); err != nil {
+			t.Fatalf("FlushToBackend session 1 failed: %v", err)
+		}
+		session1Pos = vol1.Position()
+		if session1Pos == 0 {
+			t.Fatal("expected session 1 position > 0")
+		}
+		if err := server1.Close(); err != nil {
+			t.Fatalf("server1.Close failed: %v", err)
+		}
+	}
+
+	// Session 2: Reopen volume on the same local directory in memory (no-WAL) mode
+	{
+		var holdApplier atomic.Bool
+		applierStarted := make(chan struct{}, 1)
+		releaseApplier := make(chan struct{})
+
+		server2 := NewServer(storage,
+			WithServerMetadataIndex("sqlite"),
+			WithServerLocalStorageDir(localDir),
+			WithServerViewOptions(view.WithFaultHook(func() error {
+				if holdApplier.Load() {
+					select {
+					case applierStarted <- struct{}{}:
+					default:
+					}
+					<-releaseApplier
+				}
+				return nil
+			})),
+		)
+		vol2, err := server2.getOrCreateVolume(volumeID)
+		if err != nil {
+			t.Fatalf("getOrCreateVolume session 2 failed: %v", err)
+		}
+		var releaseOnce sync.Once
+		unblockApplier := func() {
+			releaseOnce.Do(func() {
+				close(releaseApplier)
+			})
+		}
+		defer func() {
+			unblockApplier()
+			if err := server2.Close(); err != nil {
+				t.Errorf("server2.Close failed: %v", err)
+			}
+		}()
+
+		holdApplier.Store(true)
+
+		// Create another file in session 2
+		resp, err := server2.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        "session2_file.txt",
+			Mode:        0644,
+		})
+		if err != nil || resp.GetError() != 0 {
+			t.Fatalf("CreateFile session 2 failed: err=%v, resp=%v", err, resp)
+		}
+		newIno := resp.GetAttr().GetInode().GetIno()
+
+		// Wait until applier picks up the batch and holds it in faultHook
+		select {
+		case <-applierStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for applier to start processing batch")
+		}
+
+		targetSeq := vol2.Position()
+		if targetSeq <= session1Pos {
+			t.Errorf("sequence numbers restarted: targetSeq (%d) <= session1Pos (%d)", targetSeq, session1Pos)
+		}
+
+		// FlushTo(lastCommitSeq) must wait for the new changes to be applied to the index
+		flushDone := make(chan error, 1)
+		go func() {
+			flushDone <- vol2.View().FlushTo(ctx, targetSeq)
+		}()
+
+		// Verify FlushTo does NOT return immediately while the applier is still holding the batch
+		select {
+		case <-flushDone:
+			t.Fatal("FlushTo returned immediately without waiting for applier (position wait is a no-op!)")
+		case <-time.After(50 * time.Millisecond):
+			// Expected: FlushTo is waiting for the applier
+		}
+
+		// Unblock the applier so FlushTo can complete
+		unblockApplier()
+
+		select {
+		case err := <-flushDone:
+			if err != nil {
+				t.Fatalf("FlushTo failed: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("FlushTo timed out waiting for applier")
+		}
+
+		// Stats from the underlying index/view must reflect the new inode immediately after FlushTo returns, no polling
+		stMsg := vol2.View().Stats()
+		if stMsg == nil {
+			t.Fatal("vol2.View().Stats() returned nil")
+		}
+		vs, ok := stMsg.(*pb.VolumeStats)
+		if !ok {
+			t.Fatalf("unexpected stats type %T", stMsg)
+		}
+		if vs.GetMaxIno() != newIno {
+			t.Fatalf("MaxIno immediately after FlushTo: got %d, want %d (FlushTo was likely a no-op)", vs.GetMaxIno(), newIno)
+		}
 	}
 }
