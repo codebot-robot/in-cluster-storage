@@ -22,10 +22,12 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type testMemoryBackend struct {
@@ -504,5 +506,152 @@ func TestStoreChunkedManifestInPacks(t *testing.T) {
 	c1Read, _ := io.ReadAll(c1Stream)
 	if !bytes.Equal(c1Read, c1Data) {
 		t.Fatalf("c1 content mismatch: %q vs %q", string(c1Read), string(c1Data))
+	}
+}
+
+func generateHighEntropyData(prefix []byte, totalSize int, seed int64) []byte {
+	buf := make([]byte, totalSize)
+	copy(buf, prefix)
+	r := rand.New(rand.NewSource(seed))
+	_, _ = r.Read(buf[len(prefix):])
+	return buf
+}
+
+func TestAdaptiveCompressionByContentKind(t *testing.T) {
+	tests := []struct {
+		name             string
+		data             []byte
+		expectedEncoding uint32
+	}{
+		{
+			name:             "text-repetitive",
+			data:             []byte(strings.Repeat("Package blob implements content-addressable storage for objectfs. It compresses data adaptively. ", 500)),
+			expectedEncoding: EncodingCompressed,
+		},
+		{
+			name: "audio-incompressible-random",
+			// Incompressible random bytes with MP3 sync word (0xFFFB) standing in for pre-compressed audio
+			data:             generateHighEntropyData([]byte{0xFF, 0xFB, 0x90, 0x64}, 64*1024, 1001),
+			expectedEncoding: EncodingRaw,
+		},
+		{
+			name: "video-incompressible-random",
+			// Incompressible random bytes with MP4 ftyp box standing in for pre-compressed video
+			data:             generateHighEntropyData([]byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'm', 'p', '4', '2'}, 64*1024, 2002),
+			expectedEncoding: EncodingRaw,
+		},
+		{
+			name: "images-incompressible-random",
+			// Incompressible random bytes with JPEG SOI/APP0 marker standing in for pre-compressed images
+			data:             generateHighEntropyData([]byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F'}, 64*1024, 3003),
+			expectedEncoding: EncodingRaw,
+		},
+		{
+			name: "archives-incompressible-random",
+			// Incompressible random bytes with ZIP header standing in for pre-compressed archives
+			data:             generateHighEntropyData([]byte{'P', 'K', 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00}, 64*1024, 4004),
+			expectedEncoding: EncodingRaw,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := NewByteStreamFromBytes(tc.data)
+			start := time.Now()
+			encoded, err := EncodeBlob(stream, true)
+			encodeElapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("EncodeBlob failed: %v", err)
+			}
+			defer func() { _ = encoded.Close() }()
+
+			if encoded.Encoding != tc.expectedEncoding {
+				t.Errorf("%s: expected encoding %d, got %d (rawLen=%d, storedLen=%d, ratio=%.2f%%)",
+					tc.name, tc.expectedEncoding, encoded.Encoding, len(tc.data), encoded.StoredLength,
+					float64(encoded.StoredLength)*100.0/float64(len(tc.data)))
+			}
+
+			// Verify decode
+			readStart := time.Now()
+			decStream, err := decodePayloadToByteStream(encoded.Stream, encoded.Encoding, int64(encoded.FinalLength))
+			if err != nil {
+				t.Fatalf("%s: decode failed: %v", tc.name, err)
+			}
+			defer func() { _ = decStream.Close() }()
+
+			decoded, err := io.ReadAll(decStream)
+			readElapsed := time.Since(readStart)
+			if err != nil {
+				t.Fatalf("%s: ReadAll failed: %v", tc.name, err)
+			}
+			if !bytes.Equal(decoded, tc.data) {
+				t.Fatalf("%s: decoded data mismatch", tc.name)
+			}
+
+			ratio := float64(encoded.StoredLength) * 100.0 / float64(len(tc.data))
+			savings := 100.0 - ratio
+			t.Logf("%-10s: raw=%6d B, stored=%6d B, savings=%6.2f%%, encoding=%d, encode_cpu=%v, read_cpu=%v",
+				tc.name, len(tc.data), encoded.StoredLength, savings, encoded.Encoding, encodeElapsed, readElapsed)
+		})
+	}
+}
+
+func BenchmarkAdaptiveCompressionByContentKind(b *testing.B) {
+	kinds := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "text-repetitive",
+			data: []byte(strings.Repeat("Package blob implements content-addressable storage for objectfs. It compresses data adaptively. ", 500)),
+		},
+		{
+			name: "audio-incompressible-random",
+			data: generateHighEntropyData([]byte{0xFF, 0xFB, 0x90, 0x64}, 64*1024, 1001),
+		},
+		{
+			name: "video-incompressible-random",
+			data: generateHighEntropyData([]byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'm', 'p', '4', '2'}, 64*1024, 2002),
+		},
+		{
+			name: "images-incompressible-random",
+			data: generateHighEntropyData([]byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F'}, 64*1024, 3003),
+		},
+		{
+			name: "archives-incompressible-random",
+			data: generateHighEntropyData([]byte{'P', 'K', 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00}, 64*1024, 4004),
+		},
+	}
+
+	for _, k := range kinds {
+		b.Run(k.name+"/encode", func(b *testing.B) {
+			stream := NewByteStreamFromBytes(k.data)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				enc, err := EncodeBlob(stream, true)
+				if err != nil {
+					b.Fatalf("EncodeBlob failed: %v", err)
+				}
+				_ = enc.Close()
+			}
+		})
+		b.Run(k.name+"/read", func(b *testing.B) {
+			stream := NewByteStreamFromBytes(k.data)
+			enc, err := EncodeBlob(stream, true)
+			if err != nil {
+				b.Fatalf("EncodeBlob failed: %v", err)
+			}
+			defer func() { _ = enc.Close() }()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = enc.Stream.Rewind()
+				dec, err := decodePayloadToByteStream(enc.Stream, enc.Encoding, int64(enc.FinalLength))
+				if err != nil {
+					b.Fatalf("decode failed: %v", err)
+				}
+				_, _ = io.Copy(io.Discard, dec)
+				_ = dec.Close()
+			}
+		})
 	}
 }

@@ -91,6 +91,10 @@ const (
 	// Larger inputs use temporary files on disk to prevent unbounded memory consumption.
 	MemoryThreshold int64 = 256 * 1024
 
+	// CompressionSavingsThreshold is the minimum fraction of size savings required
+	// to keep a blob compressed (at least 10% smaller than raw uncompressed data).
+	CompressionSavingsThreshold float64 = 0.10
+
 	// DefaultLargeBlobThreshold is 64MB (blobs larger than 64MB are stored as standalone loose blobs).
 	DefaultLargeBlobThreshold int64 = 64 * 1024 * 1024
 )
@@ -395,8 +399,9 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 		outputLen = int64(outputMem.Len())
 	}
 
-	if outputLen < rawLen {
-		// Compression is a win
+	savings := float64(rawLen-outputLen) / float64(rawLen)
+	if savings >= CompressionSavingsThreshold {
+		// Compression is a win (at least 10% smaller than raw)
 		if useTemp {
 			if _, err := outputTempFile.Seek(0, io.SeekStart); err != nil {
 				errutil.CloseAndLog(outputTempFile, "temp compression file")
