@@ -22,15 +22,19 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 )
 
 // TestCheckpointAppendPrefixAndRest verifies the contract:
@@ -108,7 +112,9 @@ func TestCheckpointAppendPrefixAndRest(t *testing.T) {
 	}
 	t.Logf("Checkpoint 1 pos: %d", pos1)
 
-	UpdateCheckpointManifest(manifest, upperDir, ops1)
+	if err := UpdateCheckpointManifest(manifest, upperDir, ops1); err != nil {
+		t.Fatalf("UpdateCheckpointManifest checkpoint 1 failed: %v", err)
+	}
 	if err := SaveCheckpointManifest(manifestPath, manifest); err != nil {
 		t.Fatalf("SaveCheckpointManifest failed: %v", err)
 	}
@@ -193,7 +199,9 @@ func TestCheckpointAppendPrefixAndRest(t *testing.T) {
 	}
 	t.Logf("Checkpoint 2 pos: %d", pos2)
 
-	UpdateCheckpointManifest(manifest, upperDir, ops2)
+	if err := UpdateCheckpointManifest(manifest, upperDir, ops2); err != nil {
+		t.Fatalf("UpdateCheckpointManifest checkpoint 2 failed: %v", err)
+	}
 	if err := SaveCheckpointManifest(manifestPath, manifest); err != nil {
 		t.Fatalf("SaveCheckpointManifest failed: %v", err)
 	}
@@ -509,5 +517,341 @@ func TestScanUpperLayer_UnpublishWithNoManifestMatchesPR290(t *testing.T) {
 
 	if !foundNew || !foundMod || !foundMkdirSub || !foundMkdirSubDir || !foundNested {
 		t.Fatalf("expected PR #290 operations missing in unpublish scan without manifest: %+v", opsDefault)
+	}
+}
+
+func TestScanUpperLayer_XAttrs(t *testing.T) {
+	tempDir := t.TempDir()
+	lowerDir := filepath.Join(tempDir, "lower")
+	upperDir := filepath.Join(tempDir, "upper")
+	_ = os.MkdirAll(lowerDir, 0755)
+	_ = os.MkdirAll(upperDir, 0755)
+
+	// 1. Lower file with xattr that will be removed in upper
+	lowerFile := filepath.Join(lowerDir, "existing.txt")
+	if err := os.WriteFile(lowerFile, []byte("lower-content"), 0644); err != nil {
+		t.Fatalf("write lowerFile: %v", err)
+	}
+	if err := unix.Lsetxattr(lowerFile, "user.removed_attr", []byte("remove-me"), 0); err != nil {
+		t.Fatalf("set lower xattr: %v", err)
+	}
+
+	// 2. Upper file with xattr set, lower xattr removed, and overlay-internal xattr set
+	upperFile := filepath.Join(upperDir, "existing.txt")
+	if err := os.WriteFile(upperFile, []byte("upper-content"), 0644); err != nil {
+		t.Fatalf("write upperFile: %v", err)
+	}
+	if err := unix.Lsetxattr(upperFile, "user.new_attr", []byte("new-val"), 0); err != nil {
+		t.Fatalf("set upper xattr: %v", err)
+	}
+	if err := unix.Lsetxattr(upperFile, "user.overlay.test", []byte("internal-overlay"), 0); err != nil {
+		t.Fatalf("set overlay internal xattr: %v", err)
+	}
+
+	// 3. Upper new file with xattrs
+	newUpperFile := filepath.Join(upperDir, "new.txt")
+	if err := os.WriteFile(newUpperFile, []byte("new-file"), 0644); err != nil {
+		t.Fatalf("write newUpperFile: %v", err)
+	}
+	if err := unix.Lsetxattr(newUpperFile, "user.custom", []byte("custom-val"), 0); err != nil {
+		t.Fatalf("set new upper xattr: %v", err)
+	}
+
+	ops, err := ScanUpperLayer(lowerDir, upperDir)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer failed: %v", err)
+	}
+
+	var foundSetExisting, foundRemoveExisting, foundSetNew bool
+	for _, op := range ops {
+		// Verify no overlay-internal xattr is emitted
+		if strings.HasPrefix(op.Name, "trusted.overlay.") || strings.HasPrefix(op.Name, "user.overlay.") {
+			t.Fatalf("unexpected overlay-internal xattr op emitted: %+v", op)
+		}
+
+		if op.Path == "existing.txt" && op.Type == OpSetXAttr && op.Name == "user.new_attr" && string(op.Value) == "new-val" {
+			foundSetExisting = true
+		}
+		if op.Path == "existing.txt" && op.Type == OpRemoveXAttr && op.Name == "user.removed_attr" {
+			foundRemoveExisting = true
+		}
+		if op.Path == "new.txt" && op.Type == OpSetXAttr && op.Name == "user.custom" && string(op.Value) == "custom-val" {
+			foundSetNew = true
+		}
+	}
+
+	if !foundSetExisting {
+		t.Errorf("missing OpSetXAttr for existing.txt")
+	}
+	if !foundRemoveExisting {
+		t.Errorf("missing OpRemoveXAttr for existing.txt")
+	}
+	if !foundSetNew {
+		t.Errorf("missing OpSetXAttr for new.txt")
+	}
+}
+
+func TestScanUpperLayer_FailingGetFailsScan(t *testing.T) {
+	tempDir := t.TempDir()
+	lowerDir := filepath.Join(tempDir, "lower")
+	upperDir := filepath.Join(tempDir, "upper")
+	_ = os.MkdirAll(lowerDir, 0755)
+	_ = os.MkdirAll(upperDir, 0755)
+
+	upperFile := filepath.Join(upperDir, "file.txt")
+	if err := os.WriteFile(upperFile, []byte("content"), 0644); err != nil {
+		t.Fatalf("write upperFile: %v", err)
+	}
+	if err := unix.Lsetxattr(upperFile, "user.test", []byte("val"), 0); err != nil {
+		t.Fatalf("setxattr failed: %v", err)
+	}
+
+	origGet := unixLgetxattr
+	t.Cleanup(func() { unixLgetxattr = origGet })
+	unixLgetxattr = func(path string, attr string, dest []byte) (sz int, err error) {
+		return 0, syscall.EIO
+	}
+
+	_, err := ScanUpperLayer(lowerDir, upperDir)
+	if err == nil {
+		t.Fatalf("expected ScanUpperLayer to fail when getxattr fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "getxattr") {
+		t.Errorf("expected error to mention getxattr, got: %v", err)
+	}
+}
+
+func TestScanUpperLayer_ManifestIncrementalXAttrs(t *testing.T) {
+	tempDir := t.TempDir()
+	lowerDir := filepath.Join(tempDir, "lower")
+	upperDir := filepath.Join(tempDir, "upper")
+	_ = os.MkdirAll(lowerDir, 0755)
+	_ = os.MkdirAll(upperDir, 0755)
+
+	manifest := NewCheckpointManifest()
+
+	// 1. Lower file with an xattr: user.removable
+	lowerFile := filepath.Join(lowerDir, "file.txt")
+	if err := os.WriteFile(lowerFile, []byte("content"), 0644); err != nil {
+		t.Fatalf("write lowerFile: %v", err)
+	}
+	if err := unix.Lsetxattr(lowerFile, "user.removable", []byte("val1"), 0); err != nil {
+		t.Fatalf("set lower xattr: %v", err)
+	}
+
+	// 2. In upper: file has user.added, and user.removable is absent (removed)
+	upperFile := filepath.Join(upperDir, "file.txt")
+	if err := os.WriteFile(upperFile, []byte("content"), 0644); err != nil {
+		t.Fatalf("write upperFile: %v", err)
+	}
+	if err := unix.Lsetxattr(upperFile, "user.added", []byte("val2"), 0); err != nil {
+		t.Fatalf("set upper xattr: %v", err)
+	}
+
+	// Scan 1 (first checkpoint after mount):
+	// user.added should be emitted as OpSetXAttr
+	// user.removable should be emitted as OpRemoveXAttr
+	ops1, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer checkpoint 1 failed: %v", err)
+	}
+
+	var foundSetAdded, foundRemoveRemovable bool
+	for _, op := range ops1 {
+		if op.Type == OpSetXAttr && op.Name == "user.added" && string(op.Value) == "val2" {
+			foundSetAdded = true
+		}
+		if op.Type == OpRemoveXAttr && op.Name == "user.removable" {
+			foundRemoveRemovable = true
+		}
+	}
+	if !foundSetAdded {
+		t.Errorf("checkpoint 1: expected OpSetXAttr for user.added, got: %+v", ops1)
+	}
+	if !foundRemoveRemovable {
+		t.Errorf("checkpoint 1: expected OpRemoveXAttr for user.removable, got: %+v", ops1)
+	}
+
+	// Update manifest with checkpoint 1 ops
+	if err := UpdateCheckpointManifest(manifest, upperDir, ops1); err != nil {
+		t.Fatalf("checkpoint 1: UpdateCheckpointManifest failed: %v", err)
+	}
+
+	// Scan 2 (consecutive scan with shared manifest without modifications):
+	// Must emit nothing (removal emitted once and not again; unchanged set not re-emitted)
+	ops2, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer checkpoint 2 failed: %v", err)
+	}
+	if len(ops2) != 0 {
+		t.Fatalf("checkpoint 2: expected 0 operations, got %d ops: %+v", len(ops2), ops2)
+	}
+
+	// Value change in upper: modify user.added value to val3
+	if err := unix.Lsetxattr(upperFile, "user.added", []byte("val3"), 0); err != nil {
+		t.Fatalf("set upper xattr modified: %v", err)
+	}
+
+	// Scan 3:
+	// A value change that is emitted as a set
+	ops3, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer checkpoint 3 failed: %v", err)
+	}
+
+	var foundModifiedSet bool
+	for _, op := range ops3 {
+		if op.Type == OpSetXAttr && op.Name == "user.added" && string(op.Value) == "val3" {
+			foundModifiedSet = true
+		}
+		if op.Type == OpRemoveXAttr {
+			t.Errorf("checkpoint 3: unexpected OpRemoveXAttr: %+v", op)
+		}
+	}
+	if !foundModifiedSet {
+		t.Fatalf("checkpoint 3: expected OpSetXAttr with val3 for user.added, got: %+v", ops3)
+	}
+
+	// Update manifest and verify subsequent scan is clean again
+	if err := UpdateCheckpointManifest(manifest, upperDir, ops3); err != nil {
+		t.Fatalf("checkpoint 3: UpdateCheckpointManifest failed: %v", err)
+	}
+	ops4, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer checkpoint 4 failed: %v", err)
+	}
+	if len(ops4) != 0 {
+		t.Fatalf("checkpoint 4: expected 0 operations, got %d ops: %+v", len(ops4), ops4)
+	}
+
+	// 4. Test sequence for unchanged-xattr copy-up, checkpoint, remove, checkpoint:
+	// Setup lower file with user.copyup_attr
+	copyUpLower := filepath.Join(lowerDir, "copyup.txt")
+	if err := os.WriteFile(copyUpLower, []byte("orig-content"), 0644); err != nil {
+		t.Fatalf("write copyUpLower: %v", err)
+	}
+	if err := unix.Lsetxattr(copyUpLower, "user.copyup_attr", []byte("orig-val"), 0); err != nil {
+		t.Fatalf("set copyUpLower xattr: %v", err)
+	}
+
+	// In upper: file is copied up and modified in content, but xattr user.copyup_attr is unchanged
+	copyUpUpper := filepath.Join(upperDir, "copyup.txt")
+	if err := os.WriteFile(copyUpUpper, []byte("modified-content"), 0644); err != nil {
+		t.Fatalf("write copyUpUpper: %v", err)
+	}
+	if err := unix.Lsetxattr(copyUpUpper, "user.copyup_attr", []byte("orig-val"), 0); err != nil {
+		t.Fatalf("set copyUpUpper xattr: %v", err)
+	}
+
+	// Checkpoint 5:
+	// copyup.txt has content ops and SetAttr, but NO xattr ops (unchanged relative to lower)
+	ops5, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer checkpoint 5 failed: %v", err)
+	}
+	for _, op := range ops5 {
+		if op.Path == "copyup.txt" && (op.Type == OpSetXAttr || op.Type == OpRemoveXAttr) {
+			t.Fatalf("checkpoint 5: unexpected xattr op for unchanged copyup.txt: %+v", op)
+		}
+	}
+
+	// Update manifest with checkpoint 5
+	if err := UpdateCheckpointManifest(manifest, upperDir, ops5); err != nil {
+		t.Fatalf("checkpoint 5: UpdateCheckpointManifest failed: %v", err)
+	}
+
+	// Remove user.copyup_attr in upper
+	if err := unix.Lremovexattr(copyUpUpper, "user.copyup_attr"); err != nil {
+		t.Fatalf("remove user.copyup_attr: %v", err)
+	}
+
+	// Checkpoint 6:
+	// Must emit exactly one OpRemoveXAttr for copyup.txt
+	ops6, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer checkpoint 6 failed: %v", err)
+	}
+
+	var removeCount int
+	for _, op := range ops6 {
+		if op.Path == "copyup.txt" && op.Type == OpRemoveXAttr && op.Name == "user.copyup_attr" {
+			removeCount++
+		} else if op.Type == OpSetXAttr || op.Type == OpRemoveXAttr {
+			t.Fatalf("checkpoint 6: unexpected xattr op: %+v", op)
+		}
+	}
+	if removeCount != 1 {
+		t.Fatalf("checkpoint 6: expected exactly one OpRemoveXAttr for user.copyup_attr, got %d (ops: %+v)", removeCount, ops6)
+	}
+
+	// Update manifest and verify subsequent scan is clean
+	if err := UpdateCheckpointManifest(manifest, upperDir, ops6); err != nil {
+		t.Fatalf("checkpoint 6: UpdateCheckpointManifest failed: %v", err)
+	}
+	ops7, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer checkpoint 7 failed: %v", err)
+	}
+	if len(ops7) != 0 {
+		t.Fatalf("checkpoint 7: expected 0 operations, got %d ops: %+v", len(ops7), ops7)
+	}
+}
+
+type fakeRemoveXAttrClient struct {
+	pb.ObjectFSControllerClient
+	errCode int32
+}
+
+func (f *fakeRemoveXAttrClient) Lookup(ctx context.Context, in *pb.LookupRequest, opts ...grpc.CallOption) (*pb.LookupResponse, error) {
+	return &pb.LookupResponse{
+		Attr: &pb.EntryAttr{
+			Inode: &pb.Inode{
+				Ino: proto.Uint64(10),
+			},
+		},
+	}, nil
+}
+
+func (f *fakeRemoveXAttrClient) RemoveXAttr(ctx context.Context, in *pb.RemoveXAttrRequest, opts ...grpc.CallOption) (*pb.RemoveXAttrResponse, error) {
+	return &pb.RemoveXAttrResponse{
+		Error: f.errCode,
+	}, nil
+}
+
+func (f *fakeRemoveXAttrClient) Fsync(ctx context.Context, in *pb.FsyncRequest, opts ...grpc.CallOption) (*pb.FsyncResponse, error) {
+	return &pb.FsyncResponse{
+		StreamPosition: 42,
+	}, nil
+}
+
+func TestReplayOperations_RemoveXAttrENODATA(t *testing.T) {
+	ctx := t.Context()
+
+	// 1. When RemoveXAttr returns ENODATA (already removed), ReplayOperations succeeds
+	fakeOK := &fakeRemoveXAttrClient{
+		errCode: int32(syscall.ENODATA),
+	}
+	ops := []FileOp{
+		{
+			Type: OpRemoveXAttr,
+			Path: "file.txt",
+			Name: "user.missing",
+		},
+	}
+	pos, err := ReplayOperations(ctx, fakeOK, "test-vol", ops)
+	if err != nil {
+		t.Fatalf("expected ReplayOperations to treat ENODATA on RemoveXAttr as already removed, got error: %v", err)
+	}
+	if pos != 42 {
+		t.Fatalf("expected stream position 42, got %d", pos)
+	}
+
+	// 2. When RemoveXAttr returns another error (e.g. EPERM), ReplayOperations fails loudly
+	fakeFail := &fakeRemoveXAttrClient{
+		errCode: int32(syscall.EPERM),
+	}
+	_, err = ReplayOperations(ctx, fakeFail, "test-vol", ops)
+	if err == nil {
+		t.Fatalf("expected ReplayOperations to fail on non-ENODATA error, got nil")
 	}
 }

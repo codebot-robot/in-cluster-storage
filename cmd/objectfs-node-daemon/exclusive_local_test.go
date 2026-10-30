@@ -1297,3 +1297,176 @@ func TestUnpublishExclusiveLocal_ReplayFailurePreservesHoldUntilRetrySucceeds(t 
 		t.Errorf("Expected renewCtx to be canceled after successful unpublish")
 	}
 }
+
+func TestMaterialiseVolume_XAttrs(t *testing.T) {
+	ctx := t.Context()
+	server := controller.NewServer(nil)
+	volumeID := "test-mat-xattr-vol"
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient failed: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewObjectFSControllerClient(conn)
+
+	// Create /file.txt and /dir
+	fileResp, err := client.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		ParentInode:    1,
+		Name:           "file.txt",
+		Mode:           0644,
+		InitialContent: []byte("content"),
+	})
+	if err != nil || fileResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v, resp: %v", err, fileResp)
+	}
+	fileIno := fileResp.GetAttr().GetInode().GetIno()
+
+	dirResp, err := client.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "dir",
+		Mode:        0755,
+	})
+	if err != nil || dirResp.GetError() != 0 {
+		t.Fatalf("Mkdir failed: %v, resp: %v", err, dirResp)
+	}
+	dirIno := dirResp.GetAttr().GetInode().GetIno()
+
+	// Set extended attributes on file and dir
+	_, err = client.SetXAttr(ctx, &pb.SetXAttrRequest{
+		VolumeId: volumeID,
+		Inode:    fileIno,
+		Name:     "user.file_meta",
+		Value:    []byte("file_val_123"),
+		Flags:    pb.SetXAttrRequest_FLAGS_NONE,
+	})
+	if err != nil {
+		t.Fatalf("SetXAttr on file failed: %v", err)
+	}
+
+	_, err = client.SetXAttr(ctx, &pb.SetXAttrRequest{
+		VolumeId: volumeID,
+		Inode:    dirIno,
+		Name:     "user.dir_meta",
+		Value:    []byte("dir_val_456"),
+		Flags:    pb.SetXAttrRequest_FLAGS_NONE,
+	})
+	if err != nil {
+		t.Fatalf("SetXAttr on dir failed: %v", err)
+	}
+
+	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true)
+	if err != nil {
+		t.Fatalf("newDriver failed: %v", err)
+	}
+	defer func() { _ = driver.Close() }()
+
+	lowerPath := filepath.Join(t.TempDir(), "lower")
+	_ = os.MkdirAll(lowerPath, 0755)
+
+	if err := driver.materialiseVolume(ctx, client, volumeID, lowerPath); err != nil {
+		t.Fatalf("materialiseVolume failed: %v", err)
+	}
+
+	// Verify xattrs in lowerPath
+	fileBuf := make([]byte, 64)
+	sz, err := unix.Lgetxattr(filepath.Join(lowerPath, "file.txt"), "user.file_meta", fileBuf)
+	if err != nil {
+		t.Fatalf("getxattr on materialised file.txt failed: %v", err)
+	}
+	if string(fileBuf[:sz]) != "file_val_123" {
+		t.Errorf("file.txt xattr mismatch: got %q, expected %q", string(fileBuf[:sz]), "file_val_123")
+	}
+
+	dirBuf := make([]byte, 64)
+	sz, err = unix.Lgetxattr(filepath.Join(lowerPath, "dir"), "user.dir_meta", dirBuf)
+	if err != nil {
+		t.Fatalf("getxattr on materialised dir failed: %v", err)
+	}
+	if string(dirBuf[:sz]) != "dir_val_456" {
+		t.Errorf("dir xattr mismatch: got %q, expected %q", string(dirBuf[:sz]), "dir_val_456")
+	}
+}
+
+func TestMaterialiseVolume_FailingSetXAttrReturnsError(t *testing.T) {
+	ctx := t.Context()
+	server := controller.NewServer(nil)
+	volumeID := "test-mat-fail-xattr-vol"
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient failed: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewObjectFSControllerClient(conn)
+
+	fileResp, err := client.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		ParentInode:    1,
+		Name:           "file.txt",
+		Mode:           0644,
+		InitialContent: []byte("content"),
+	})
+	if err != nil || fileResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v, resp: %v", err, fileResp)
+	}
+	fileIno := fileResp.GetAttr().GetInode().GetIno()
+
+	_, err = client.SetXAttr(ctx, &pb.SetXAttrRequest{
+		VolumeId: volumeID,
+		Inode:    fileIno,
+		Name:     "user.test_attr",
+		Value:    []byte("val"),
+		Flags:    pb.SetXAttrRequest_FLAGS_NONE,
+	})
+	if err != nil {
+		t.Fatalf("SetXAttr failed: %v", err)
+	}
+
+	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true)
+	if err != nil {
+		t.Fatalf("newDriver failed: %v", err)
+	}
+	defer func() { _ = driver.Close() }()
+
+	lowerPath := filepath.Join(t.TempDir(), "lower")
+	_ = os.MkdirAll(lowerPath, 0755)
+
+	origSet := unixLsetxattr
+	t.Cleanup(func() { unixLsetxattr = origSet })
+	unixLsetxattr = func(path string, attr string, data []byte, flags int) error {
+		return syscall.EPERM
+	}
+
+	err = driver.materialiseVolume(ctx, client, volumeID, lowerPath)
+	if err == nil {
+		t.Fatalf("expected materialiseVolume to fail when setxattr fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "setxattr") || !strings.Contains(err.Error(), "user.test_attr") || !strings.Contains(err.Error(), "file.txt") {
+		t.Errorf("expected error naming path and attribute, got: %v", err)
+	}
+}
