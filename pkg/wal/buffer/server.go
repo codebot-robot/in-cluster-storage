@@ -353,16 +353,28 @@ func (s *Server) LastFlushedPosition() uint64 {
 	return s.lastFlushedPosition
 }
 
-func (s *Server) getOrCreateStream(streamID uuid.UUID) *streamState {
+func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *streamState {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	sid := streamID.String()
 	st, exists := s.streams[sid]
 	if !exists {
 		st = newStreamState(0, 0)
 		s.streams[sid] = st
 	}
+	s.mu.Unlock()
+
+	if s.streamStore != nil {
+		uploadedTo := s.streamStore.EnsureDiscovered(ctx, streamID)
+		st.mu.Lock()
+		if uploadedTo > st.witnessSeq {
+			st.witnessSeq = uploadedTo
+		}
+		if uploadedTo > st.s3Seq {
+			st.s3Seq = uploadedTo
+		}
+		st.mu.Unlock()
+	}
+
 	return st
 }
 
@@ -386,7 +398,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	var streamID uuid.UUID
 	copy(streamID[:], hello.StreamId)
 
-	st := s.getOrCreateStream(streamID)
+	st := s.getOrCreateStream(ctx, streamID)
 
 	st.mu.Lock()
 	witnessSeq := st.witnessSeq
@@ -1045,6 +1057,7 @@ func (s *Server) SealStreams(ctx context.Context) error {
 
 // SealStream seals and uploads a specific stream with records.
 func (s *Server) SealStream(ctx context.Context, streamID uuid.UUID) error {
+	_ = s.getOrCreateStream(ctx, streamID)
 	_, err := s.streamStore.SealStream(ctx, streamID)
 	s.checkAggregatedSegmentGC(ctx)
 	return err
@@ -1056,6 +1069,7 @@ func (s *Server) TrimStreamHistory(ctx context.Context, streamID uuid.UUID, trim
 }
 
 func (s *Server) tailPerStream(ctx context.Context, streamID uuid.UUID, req *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
+	_ = s.getOrCreateStream(ctx, streamID)
 	fromSeq := req.FromStreamSeq
 	fromPos := req.FromPosition
 	firstSent := false

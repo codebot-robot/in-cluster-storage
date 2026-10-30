@@ -962,8 +962,8 @@ func TestBufferRestart_ReadsOnlyUncoveredSegments(t *testing.T) {
 	if srv2.lastFlushedPosition != 120 {
 		t.Errorf("expected lastFlushedPosition 120, got %d", srv2.lastFlushedPosition)
 	}
-	if srv2.streams[streamIDA.String()].witnessSeq != 100 {
-		t.Errorf("expected stream A witnessSeq 100, got %d", srv2.streams[streamIDA.String()].witnessSeq)
+	if stA := srv2.getOrCreateStream(ctx, streamIDA); stA.witnessSeq != 100 {
+		t.Errorf("expected stream A witnessSeq 100, got %d", stA.witnessSeq)
 	}
 	if srv2.streams[streamIDB.String()].witnessSeq != 20 {
 		t.Errorf("expected stream B witnessSeq 20, got %d", srv2.streams[streamIDB.String()].witnessSeq)

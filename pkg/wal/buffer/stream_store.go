@@ -66,6 +66,7 @@ type streamWriter struct {
 	sealed      []*StreamMeta
 	uploadedTo  uint64
 	uploadedPos uint64
+	discovered  bool
 }
 
 func (w *streamWriter) appendRecords(records []*wal.LogRecord) {
@@ -219,6 +220,35 @@ func (w *streamWriter) uploadPendingSealedLocked(ctx context.Context, backend ob
 }
 
 func (w *streamWriter) discoverRemoteSealedLocked(ctx context.Context, backend objectstore.Backend) {
+	w.discovered = true
+	if entries, err := os.ReadDir(w.dir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			from, to, sealed, err := wal.ParseStreamPath(e.Name())
+			if err != nil || !sealed {
+				continue
+			}
+			filePath := filepath.Join(w.dir, e.Name())
+			found := false
+			for _, sm := range w.sealed {
+				if sm.FromSeq == from && sm.ToSeq == to {
+					if sm.Path == "" {
+						sm.Path = filePath
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				w.sealed = append(w.sealed, &StreamMeta{FromSeq: from, ToSeq: to, Path: filePath})
+			}
+			if to > w.lastSeq {
+				w.lastSeq = to
+			}
+		}
+	}
 	if backend == nil {
 		return
 	}
@@ -260,7 +290,9 @@ func (w *streamWriter) discoverRemoteSealedLocked(ctx context.Context, backend o
 func (w *streamWriter) getSealedMetas(ctx context.Context, backend objectstore.Backend) []*StreamMeta {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.discoverRemoteSealedLocked(ctx, backend)
+	if !w.discovered {
+		w.discoverRemoteSealedLocked(ctx, backend)
+	}
 	res := make([]*StreamMeta, len(w.sealed))
 	copy(res, w.sealed)
 	return res
@@ -479,6 +511,9 @@ func (s *StreamStore) flushAllPending() {
 func (s *StreamStore) checkSealsAndGC(ctx context.Context) {
 	for _, w := range s.allWriters() {
 		w.mu.Lock()
+		if !w.discovered && len(w.sealed) == 0 && w.uploadedTo == 0 {
+			w.discoverRemoteSealedLocked(ctx, s.backend)
+		}
 		if err := w.flushPendingLocked(); err != nil {
 			klog.Warningf("Failed to flush pending records for stream %s: %v", w.streamID, err)
 		}
@@ -497,6 +532,18 @@ func (s *StreamStore) checkSealsAndGC(ctx context.Context) {
 		klog.Warningf("Failed to run aggregated segment GC: %v", err)
 	}
 	s.saveCoverage()
+}
+
+// EnsureDiscovered discovers sealed objects from backend if the stream writer
+// has no sealed state yet, returning the highest sealed and uploaded sequence.
+func (s *StreamStore) EnsureDiscovered(ctx context.Context, streamID uuid.UUID) uint64 {
+	w := s.getOrCreateStream(streamID)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.discovered && len(w.sealed) == 0 && w.uploadedTo == 0 {
+		w.discoverRemoteSealedLocked(ctx, s.backend)
+	}
+	return w.uploadedTo
 }
 
 func (s *StreamStore) getOrCreateStream(streamID uuid.UUID) *streamWriter {
@@ -546,6 +593,9 @@ func (s *StreamStore) AppendRecords(records []*wal.LogRecord) {
 func (s *StreamStore) SealStream(ctx context.Context, streamID uuid.UUID) (*StreamMeta, error) {
 	w := s.getOrCreateStream(streamID)
 	w.mu.Lock()
+	if !w.discovered && len(w.sealed) == 0 && w.uploadedTo == 0 {
+		w.discoverRemoteSealedLocked(ctx, s.backend)
+	}
 	if err := w.uploadPendingSealedLocked(ctx, s.backend); err != nil {
 		klog.Warningf("Failed to upload pending sealed files for stream %s: %v", streamID, err)
 	}
@@ -561,6 +611,9 @@ func (s *StreamStore) SealAll(ctx context.Context) ([]*StreamMeta, error) {
 	var errs []error
 	for _, w := range s.allWriters() {
 		w.mu.Lock()
+		if !w.discovered && len(w.sealed) == 0 && w.uploadedTo == 0 {
+			w.discoverRemoteSealedLocked(ctx, s.backend)
+		}
 		if err := w.uploadPendingSealedLocked(ctx, s.backend); err != nil {
 			errs = append(errs, err)
 		}
@@ -685,9 +738,10 @@ func (s *StreamStore) CheckSegmentGC(ctx context.Context) ([]string, error) {
 				break
 			}
 			w.mu.Lock()
+			discovered := w.discovered
 			upTo := w.uploadedTo
 			w.mu.Unlock()
-			if upTo < maxSeq {
+			if !discovered || upTo < maxSeq {
 				allCovered = false
 				break
 			}
