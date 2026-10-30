@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,13 +49,15 @@ const (
 	OpUnlink       OpType = "unlink"
 	OpRmdir        OpType = "rmdir"
 	OpSetAttr      OpType = "set_attr"
+	OpSetXAttr     OpType = "set_xattr"
+	OpRemoveXAttr  OpType = "remove_xattr"
 )
 
 type FileOp struct {
 	Type   OpType
 	Path   string // relative path from volume root (e.g. "dir/file.txt")
 	Parent string // relative path of parent dir (e.g. "dir" or "")
-	Name   string // base name (e.g. "file.txt")
+	Name   string // base name (e.g. "file.txt") or xattr name
 	Mode   uint32
 	Size   int64
 	Mtime  time.Time
@@ -62,7 +66,14 @@ type FileOp struct {
 	Target string // for symlink
 	Data   []byte // for create or write
 	Offset int64  // for write
+	Value  []byte // for set_xattr
 }
+
+var (
+	unixLlistxattr = unix.Llistxattr
+	unixLgetxattr  = unix.Lgetxattr
+	unixLsetxattr  = unix.Lsetxattr
+)
 
 func isWhiteout(path string, info os.FileInfo) bool {
 	sys, ok := info.Sys().(*syscall.Stat_t)
@@ -113,6 +124,150 @@ func pathDepth(p string) int {
 	return strings.Count(clean, string(filepath.Separator)) + 1
 }
 
+func isOverlayInternalXattr(name string) bool {
+	return strings.HasPrefix(name, "trusted.overlay.") || strings.HasPrefix(name, "user.overlay.")
+}
+
+func listXAttrNames(path string) ([]string, error) {
+	sz, err := unixLlistxattr(path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if sz <= 0 {
+		return nil, nil
+	}
+	buf := make([]byte, sz)
+	for {
+		sz, err = unixLlistxattr(path, buf)
+		if err == unix.ERANGE {
+			buf = make([]byte, len(buf)*2)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		break
+	}
+	var names []string
+	start := 0
+	for i := 0; i < sz; i++ {
+		if buf[i] == 0 {
+			if i > start {
+				names = append(names, string(buf[start:i]))
+			}
+			start = i + 1
+		}
+	}
+	return names, nil
+}
+
+func getXAttr(path, name string) ([]byte, error) {
+	sz, err := unixLgetxattr(path, name, nil)
+	if err != nil {
+		return nil, err
+	}
+	if sz <= 0 {
+		return []byte{}, nil
+	}
+	buf := make([]byte, sz)
+	for {
+		sz, err = unixLgetxattr(path, name, buf)
+		if err == unix.ERANGE {
+			buf = make([]byte, len(buf)*2)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		break
+	}
+	return buf[:sz], nil
+}
+
+func scanXAttrs(lowerDir, upperDir, relPath string, existsInLower bool, prevEntry *ManifestEntry) ([]FileOp, error) {
+	upperPath := filepath.Join(upperDir, relPath)
+	upperNames, err := listXAttrNames(upperPath)
+	if err != nil {
+		return nil, fmt.Errorf("listxattr %s: %w", upperPath, err)
+	}
+
+	upperMap := make(map[string][]byte)
+	upperShaMap := make(map[string]string)
+	for _, name := range upperNames {
+		if isOverlayInternalXattr(name) {
+			continue
+		}
+		val, err := getXAttr(upperPath, name)
+		if err != nil {
+			return nil, fmt.Errorf("getxattr %s %s: %w", upperPath, name, err)
+		}
+		upperMap[name] = val
+		h := sha256.Sum256(val)
+		upperShaMap[name] = hex.EncodeToString(h[:])
+	}
+
+	baselineShaMap := make(map[string]string)
+	if prevEntry != nil {
+		for k, v := range prevEntry.Xattrs {
+			baselineShaMap[k] = v
+		}
+	} else if existsInLower {
+		lowerPath := filepath.Join(lowerDir, relPath)
+		lowerNames, err := listXAttrNames(lowerPath)
+		if err != nil {
+			return nil, fmt.Errorf("listxattr %s: %w", lowerPath, err)
+		}
+		for _, name := range lowerNames {
+			// Drop OverlayFS-internal names so local overlay bookkeeping on the lower layer is never emitted as a removal.
+			if isOverlayInternalXattr(name) {
+				continue
+			}
+			val, err := getXAttr(lowerPath, name)
+			if err != nil {
+				return nil, fmt.Errorf("getxattr %s %s: %w", lowerPath, name, err)
+			}
+			h := sha256.Sum256(val)
+			baselineShaMap[name] = hex.EncodeToString(h[:])
+		}
+	}
+
+	var setOps []FileOp
+	var setNames []string
+	for name, upperSha := range upperShaMap {
+		baseSha, ok := baselineShaMap[name]
+		if !ok || baseSha != upperSha {
+			setNames = append(setNames, name)
+		}
+	}
+	sort.Strings(setNames)
+	for _, name := range setNames {
+		setOps = append(setOps, FileOp{
+			Type:  OpSetXAttr,
+			Path:  relPath,
+			Name:  name,
+			Value: upperMap[name],
+		})
+	}
+
+	var removeOps []FileOp
+	var removeNames []string
+	for name := range baselineShaMap {
+		if _, ok := upperMap[name]; !ok {
+			removeNames = append(removeNames, name)
+		}
+	}
+	sort.Strings(removeNames)
+	for _, name := range removeNames {
+		removeOps = append(removeOps, FileOp{
+			Type: OpRemoveXAttr,
+			Path: relPath,
+			Name: name,
+		})
+	}
+
+	return append(setOps, removeOps...), nil
+}
+
 // ScanUpperLayer compares lowerDir and upperDir (optionally diffing against an existing CheckpointManifest)
 // and produces an ordered list of FileOps.
 // Renames appear as unlink+create; hard links are scanned as independent files.
@@ -150,8 +305,8 @@ func ScanUpperLayer(lowerDir, upperDir string, manifests ...*CheckpointManifest)
 		return pathDepth(creations[i].Path) < pathDepth(creations[j].Path)
 	})
 
-	// Sort attrs: deepest directories last (bottom-up)
-	sort.Slice(attrs, func(i, j int) bool {
+	// Sort attrs: deepest directories last (bottom-up), preserving SetAttr before SetXAttr/RemoveXAttr per path
+	sort.SliceStable(attrs, func(i, j int) bool {
 		return pathDepth(attrs[i].Path) > pathDepth(attrs[j].Path)
 	})
 
@@ -374,8 +529,12 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 
 		if info.IsDir() {
 			var inManifest bool
+			var prevEntry *ManifestEntry
 			if manifest != nil && manifest.Files != nil {
-				_, inManifest = manifest.Files[relPath]
+				if e, ok := manifest.Files[relPath]; ok {
+					prevEntry = &e
+					inManifest = true
+				}
 			}
 			if !existsInLower && !inManifest {
 				creations = append(creations, FileOp{
@@ -398,6 +557,11 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 				Uid:    uid,
 				Gid:    gid,
 			})
+			xattrOps, xErr := scanXAttrs(lowerDir, upperDir, relPath, existsInLower, prevEntry)
+			if xErr != nil {
+				return xErr
+			}
+			attrs = append(attrs, xattrOps...)
 			return nil
 		}
 
@@ -407,28 +571,36 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 				return fmt.Errorf("readlink %s: %w", path, rErr)
 			}
 			var inManifest bool
+			var prevEntry *ManifestEntry
 			if manifest != nil && manifest.Files != nil {
-				_, inManifest = manifest.Files[relPath]
-			}
-			if inManifest {
-				return nil
-			}
-			if existsInLower {
-				if lStat.IsDir() {
-					creations = append(creations, FileOp{Type: OpRmdir, Path: relPath, Parent: parent, Name: name})
-				} else {
-					creations = append(creations, FileOp{Type: OpUnlink, Path: relPath, Parent: parent, Name: name})
+				if e, ok := manifest.Files[relPath]; ok {
+					prevEntry = &e
+					inManifest = true
 				}
 			}
-			creations = append(creations, FileOp{
-				Type:   OpSymlink,
-				Path:   relPath,
-				Parent: parent,
-				Name:   name,
-				Target: target,
-				Uid:    uid,
-				Gid:    gid,
-			})
+			if !inManifest {
+				if existsInLower {
+					if lStat.IsDir() {
+						creations = append(creations, FileOp{Type: OpRmdir, Path: relPath, Parent: parent, Name: name})
+					} else {
+						creations = append(creations, FileOp{Type: OpUnlink, Path: relPath, Parent: parent, Name: name})
+					}
+				}
+				creations = append(creations, FileOp{
+					Type:   OpSymlink,
+					Path:   relPath,
+					Parent: parent,
+					Name:   name,
+					Target: target,
+					Uid:    uid,
+					Gid:    gid,
+				})
+			}
+			xattrOps, xErr := scanXAttrs(lowerDir, upperDir, relPath, existsInLower, prevEntry)
+			if xErr != nil {
+				return xErr
+			}
+			attrs = append(attrs, xattrOps...)
 			return nil
 		}
 
@@ -468,8 +640,26 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 				creations = append(creations, FileOp{Type: OpRmdir, Path: relPath, Parent: parent, Name: name})
 			}
 
+			xattrOps, xErr := scanXAttrs(lowerDir, upperDir, relPath, existsInLower, &prevEntry)
+			if xErr != nil {
+				return xErr
+			}
+
 			if fileSize == prevEntry.Size && mtimeNano == prevEntry.Mtime {
-				// Unchanged since previous checkpoint; skip
+				// Unchanged content since previous checkpoint
+				if len(xattrOps) > 0 {
+					attrs = append(attrs, FileOp{
+						Type:   OpSetAttr,
+						Path:   relPath,
+						Parent: parent,
+						Name:   name,
+						Mode:   mode,
+						Mtime:  info.ModTime(),
+						Uid:    uid,
+						Gid:    gid,
+					})
+					attrs = append(attrs, xattrOps...)
+				}
 				return nil
 			}
 
@@ -519,6 +709,19 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 				}
 			}
 			errutil.CloseAndLog(f, "upper file")
+
+			attrs = append(attrs, FileOp{
+				Type:   OpSetAttr,
+				Path:   relPath,
+				Parent: parent,
+				Name:   name,
+				Mode:   mode,
+				Mtime:  info.ModTime(),
+				Uid:    uid,
+				Gid:    gid,
+			})
+			attrs = append(attrs, xattrOps...)
+			return nil
 		} else if !existsInLower || (lStat != nil && lStat.IsDir()) {
 			if existsInLower && lStat.IsDir() {
 				creations = append(creations, FileOp{Type: OpRmdir, Path: relPath, Parent: parent, Name: name})
@@ -577,10 +780,45 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 				}
 			}
 			errutil.CloseAndLog(f, "upper file")
+
+			attrs = append(attrs, FileOp{
+				Type:   OpSetAttr,
+				Path:   relPath,
+				Parent: parent,
+				Name:   name,
+				Mode:   mode,
+				Mtime:  info.ModTime(),
+				Uid:    uid,
+				Gid:    gid,
+			})
+			xattrOps, xErr := scanXAttrs(lowerDir, upperDir, relPath, existsInLower, nil)
+			if xErr != nil {
+				return xErr
+			}
+			attrs = append(attrs, xattrOps...)
+			return nil
 		} else {
 			// Modified file from lower layer before any checkpoint
+			xattrOps, xErr := scanXAttrs(lowerDir, upperDir, relPath, existsInLower, nil)
+			if xErr != nil {
+				return xErr
+			}
+
 			if lStat.Size() == fileSize && lStat.ModTime().Equal(info.ModTime()) {
-				// Identical to lower layer
+				// Unchanged content relative to lower layer
+				if len(xattrOps) > 0 {
+					attrs = append(attrs, FileOp{
+						Type:   OpSetAttr,
+						Path:   relPath,
+						Parent: parent,
+						Name:   name,
+						Mode:   mode,
+						Mtime:  info.ModTime(),
+						Uid:    uid,
+						Gid:    gid,
+					})
+					attrs = append(attrs, xattrOps...)
+				}
 				return nil
 			}
 
@@ -622,20 +860,20 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 				}
 			}
 			errutil.CloseAndLog(f, "upper file")
+
+			attrs = append(attrs, FileOp{
+				Type:   OpSetAttr,
+				Path:   relPath,
+				Parent: parent,
+				Name:   name,
+				Mode:   mode,
+				Mtime:  info.ModTime(),
+				Uid:    uid,
+				Gid:    gid,
+			})
+			attrs = append(attrs, xattrOps...)
+			return nil
 		}
-
-		attrs = append(attrs, FileOp{
-			Type:   OpSetAttr,
-			Path:   relPath,
-			Parent: parent,
-			Name:   name,
-			Mode:   mode,
-			Mtime:  info.ModTime(),
-			Uid:    uid,
-			Gid:    gid,
-		})
-
-		return nil
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("walk upper for modifications: %w", err)
@@ -894,6 +1132,48 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				return 0, fmt.Errorf("setAttr %s returned error: %d", op.Path, resp.GetError())
 			}
 			touchedInodes[ino] = true
+
+		case OpSetXAttr:
+			ino, err := resolveInode(ctx, client, volumeID, pathInodes, op.Path)
+			if err != nil {
+				return 0, fmt.Errorf("resolve inode for setXAttr %s: %w", op.Path, err)
+			}
+			resp, err := client.SetXAttr(ctx, &pb.SetXAttrRequest{
+				VolumeId: volumeID,
+				Inode:    ino,
+				Name:     op.Name,
+				Value:    op.Value,
+				Flags:    pb.SetXAttrRequest_FLAGS_NONE,
+			})
+			if err != nil {
+				return 0, fmt.Errorf("setXAttr %s (%s): %w", op.Path, op.Name, err)
+			}
+			if resp.GetError() != 0 {
+				return 0, fmt.Errorf("setXAttr %s (%s) returned error: %d", op.Path, op.Name, resp.GetError())
+			}
+			touchedInodes[ino] = true
+
+		case OpRemoveXAttr:
+			ino, err := resolveInode(ctx, client, volumeID, pathInodes, op.Path)
+			if err != nil {
+				return 0, fmt.Errorf("resolve inode for removeXAttr %s: %w", op.Path, err)
+			}
+			resp, err := client.RemoveXAttr(ctx, &pb.RemoveXAttrRequest{
+				VolumeId: volumeID,
+				Inode:    ino,
+				Name:     op.Name,
+			})
+			if err != nil {
+				return 0, fmt.Errorf("removeXAttr %s (%s): %w", op.Path, op.Name, err)
+			}
+			if resp.GetError() != 0 {
+				if resp.GetError() == int32(syscall.ENODATA) {
+					klog.V(2).Infof("removeXAttr %s (%s): attribute already removed on inode %d", op.Path, op.Name, ino)
+				} else {
+					return 0, fmt.Errorf("removeXAttr %s (%s) returned error: %d", op.Path, op.Name, resp.GetError())
+				}
+			}
+			touchedInodes[ino] = true
 		}
 	}
 
@@ -931,8 +1211,9 @@ type CheckpointManifest struct {
 }
 
 type ManifestEntry struct {
-	Size  int64 `json:"size"`
-	Mtime int64 `json:"mtime_unix_nano"`
+	Size   int64             `json:"size"`
+	Mtime  int64             `json:"mtime_unix_nano"`
+	Xattrs map[string]string `json:"xattrs,omitempty"` // attr name -> sha256 hex of value
 }
 
 // NewCheckpointManifest creates an empty CheckpointManifest.
@@ -985,28 +1266,53 @@ func SaveCheckpointManifest(path string, m *CheckpointManifest) error {
 	return nil
 }
 
+func getUpperXattrs(upperPath string) (map[string]string, error) {
+	names, err := listXAttrNames(upperPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listxattr %s: %w", upperPath, err)
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	xattrs := make(map[string]string)
+	for _, name := range names {
+		if isOverlayInternalXattr(name) {
+			continue
+		}
+		val, err := getXAttr(upperPath, name)
+		if err != nil {
+			return nil, fmt.Errorf("getxattr %s %s: %w", upperPath, name, err)
+		}
+		h := sha256.Sum256(val)
+		xattrs[name] = hex.EncodeToString(h[:])
+	}
+	if len(xattrs) == 0 {
+		return nil, nil
+	}
+	return xattrs, nil
+}
+
 // UpdateCheckpointManifest records the newly committed operations into the in-memory manifest.
-func UpdateCheckpointManifest(m *CheckpointManifest, upperDir string, ops []FileOp) {
+func UpdateCheckpointManifest(m *CheckpointManifest, upperDir string, ops []FileOp) error {
 	if m == nil {
-		return
+		return nil
 	}
 	for _, op := range ops {
 		switch op.Type {
-		case OpUnlink:
+		case OpUnlink, OpRmdir:
 			m.Whiteouts[op.Path] = true
 			delete(m.Files, op.Path)
-		case OpRmdir:
-			m.Whiteouts[op.Path] = true
-			delete(m.Files, op.Path)
+
 		case OpCreateFile, OpWriteFile, OpTruncateFile, OpSetAttr:
 			upperPath := filepath.Join(upperDir, op.Path)
+			entry := m.Files[op.Path]
 			if uInfo, err := os.Lstat(upperPath); err == nil && !isWhiteout(upperPath, uInfo) && !uInfo.IsDir() {
-				m.Files[op.Path] = ManifestEntry{
-					Size:  uInfo.Size(),
-					Mtime: uInfo.ModTime().UnixNano(),
-				}
+				entry.Size = uInfo.Size()
+				entry.Mtime = uInfo.ModTime().UnixNano()
 			} else {
-				entry := m.Files[op.Path]
 				if op.Type == OpCreateFile {
 					entry.Size = op.Size
 				} else if op.Type == OpWriteFile {
@@ -1020,12 +1326,35 @@ func UpdateCheckpointManifest(m *CheckpointManifest, upperDir string, ops []File
 				if !op.Mtime.IsZero() {
 					entry.Mtime = op.Mtime.UnixNano()
 				}
-				m.Files[op.Path] = entry
 			}
+			xa, err := getUpperXattrs(upperPath)
+			if err != nil {
+				return err
+			}
+			entry.Xattrs = xa
+			m.Files[op.Path] = entry
+
 		case OpMkdir, OpSymlink:
-			m.Files[op.Path] = ManifestEntry{
-				Size: 0,
+			upperPath := filepath.Join(upperDir, op.Path)
+			entry := m.Files[op.Path]
+			entry.Size = 0
+			xa, err := getUpperXattrs(upperPath)
+			if err != nil {
+				return err
 			}
+			entry.Xattrs = xa
+			m.Files[op.Path] = entry
+
+		case OpSetXAttr, OpRemoveXAttr:
+			upperPath := filepath.Join(upperDir, op.Path)
+			entry := m.Files[op.Path]
+			xa, err := getUpperXattrs(upperPath)
+			if err != nil {
+				return err
+			}
+			entry.Xattrs = xa
+			m.Files[op.Path] = entry
 		}
 	}
+	return nil
 }
