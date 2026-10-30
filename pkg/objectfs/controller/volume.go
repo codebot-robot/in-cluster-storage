@@ -389,9 +389,6 @@ func (v *Volume) initMetadataViewLocked(ctx context.Context, customIndex sds.Loc
 	viewOpts = append(viewOpts, view.WithRebuildFunc(v.rebuildIndex))
 	viewOpts = append(viewOpts, view.WithBatchAppliedHook(v.checkStatsOnBatchApplied))
 	if v.metadataStream != nil {
-		if _, err := v.metadataStream.Registry().RegisterMessage(initialStats, 1); err != nil {
-			return fmt.Errorf("failed to register VolumeStats message: %w", err)
-		}
 		viewOpts = append(viewOpts, view.WithRegistry(v.metadataStream.Registry()))
 	}
 
@@ -1075,6 +1072,15 @@ func (m *memoryAppender) StartSeq() uint64 {
 	return m.startSeq
 }
 
+func (m *memoryAppender) seed(pos uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if pos > m.count {
+		m.count = pos
+		m.startSeq = pos + 1
+	}
+}
+
 func (v *Volume) initMetadataStreamLocked() error {
 	var appender record.Appender
 	var writerOpts []record.WriterOption
@@ -1108,6 +1114,9 @@ func (v *Volume) initMetadataStreamLocked() error {
 	}
 	if _, err := w.RegisterType(&pb.Content{}, 1); err != nil {
 		return fmt.Errorf("failed to register Content type: %w", err)
+	}
+	if _, err := w.RegisterType(&pb.VolumeStats{}, 1); err != nil {
+		return fmt.Errorf("failed to register VolumeStats type: %w", err)
 	}
 	v.metadataStream = w
 	return nil
@@ -5296,6 +5305,20 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	if snapPos > v.lastCommitSeq {
 		v.lastCommitSeq = snapPos
 	}
+	if v.stream == nil && v.memAppender != nil && v.lastCommitSeq > 0 {
+		v.memAppender.seed(v.lastCommitSeq)
+		if err := v.initMetadataStreamLocked(); err != nil {
+			return fmt.Errorf("failed to reinit metadata stream: %w", err)
+		}
+		if v.metadataView != nil {
+			// The view retains its pre-re-init registry object; SyncRegistry imports the new
+			// writer's types into it. This relies on initMetadataStreamLocked registering the
+			// same types in the same order so assigned type IDs match.
+			if err := v.metadataView.SyncRegistry(ctx, v.metadataStream.Registry()); err != nil {
+				return fmt.Errorf("failed to sync registry with metadata view: %w", err)
+			}
+		}
+	}
 
 	// Replay stream from snapPos
 	var highestReplayedIno uint64
@@ -5677,6 +5700,9 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) error
 		return fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
 	}
 	v.lastCommitSeq = restoreSeq
+	if v.stream == nil && v.memAppender != nil && restoreSeq > 0 {
+		v.memAppender.seed(restoreSeq)
+	}
 
 	v.metadataView.ClearCache()
 	v.dirParents = make(map[uint64]uint64)
