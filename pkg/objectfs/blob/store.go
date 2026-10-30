@@ -82,6 +82,30 @@ func (s *Store) packKey(packID string, count int) string {
 	return path.Join("blobs", fmt.Sprintf("%s-%d.pack", packID, count))
 }
 
+// PackKey returns the object storage key for a packfile with the given ID and item count.
+func (s *Store) PackKey(packID string, count int) string {
+	return s.packKey(packID, count)
+}
+
+// PutPackFile uploads an already-constructed packfile stream to object storage at packKey and indexes its entries.
+func (s *Store) PutPackFile(ctx context.Context, packKey string, stream ByteStream, entries []BlobEntry) error {
+	if _, err := s.backend.PutObject(ctx, "", packKey, stream); err != nil {
+		return fmt.Errorf("failed to write packfile %s to backend: %w", packKey, err)
+	}
+	s.mu.Lock()
+	s.packIndexes[packKey] = entries
+	for _, entry := range entries {
+		s.shaToLocation[entry.SHA256Hex()] = BlobLocation{
+			IsStandalone: false,
+			PackKey:      packKey,
+			PackVersion:  VersionV2,
+			Entry:        entry,
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
 // PutBlobs writes a batch of blobs: large blobs are written standalone loose blobs and smaller blobs are grouped into a packfile.
 func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error {
 	if len(blobs) == 0 {
