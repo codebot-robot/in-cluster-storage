@@ -53,6 +53,10 @@ const (
 	ObjectFSController_Link_FullMethodName             = "/objectfs.v1alpha1.ObjectFSController/Link"
 	ObjectFSController_Open_FullMethodName             = "/objectfs.v1alpha1.ObjectFSController/Open"
 	ObjectFSController_Release_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Release"
+	ObjectFSController_GetXAttr_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/GetXAttr"
+	ObjectFSController_SetXAttr_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/SetXAttr"
+	ObjectFSController_ListXAttr_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/ListXAttr"
+	ObjectFSController_RemoveXAttr_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/RemoveXAttr"
 	ObjectFSController_ListBlobs_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/ListBlobs"
 	ObjectFSController_GetBlob_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/GetBlob"
 	ObjectFSController_GetManifest_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/GetManifest"
@@ -93,6 +97,10 @@ type ObjectFSControllerClient interface {
 	Link(ctx context.Context, in *LinkRequest, opts ...grpc.CallOption) (*LinkResponse, error)
 	Open(ctx context.Context, in *OpenRequest, opts ...grpc.CallOption) (*OpenResponse, error)
 	Release(ctx context.Context, in *ReleaseRequest, opts ...grpc.CallOption) (*ReleaseResponse, error)
+	GetXAttr(ctx context.Context, in *GetXAttrRequest, opts ...grpc.CallOption) (*GetXAttrResponse, error)
+	SetXAttr(ctx context.Context, in *SetXAttrRequest, opts ...grpc.CallOption) (*SetXAttrResponse, error)
+	ListXAttr(ctx context.Context, in *ListXAttrRequest, opts ...grpc.CallOption) (*ListXAttrResponse, error)
+	RemoveXAttr(ctx context.Context, in *RemoveXAttrRequest, opts ...grpc.CallOption) (*RemoveXAttrResponse, error)
 	ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error)
 	GetBlob(ctx context.Context, in *GetBlobRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetBlobResponse], error)
 	GetManifest(ctx context.Context, in *GetManifestRequest, opts ...grpc.CallOption) (*GetManifestResponse, error)
@@ -336,6 +344,46 @@ func (c *objectFSControllerClient) Release(ctx context.Context, in *ReleaseReque
 	return out, nil
 }
 
+func (c *objectFSControllerClient) GetXAttr(ctx context.Context, in *GetXAttrRequest, opts ...grpc.CallOption) (*GetXAttrResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetXAttrResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_GetXAttr_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) SetXAttr(ctx context.Context, in *SetXAttrRequest, opts ...grpc.CallOption) (*SetXAttrResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetXAttrResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_SetXAttr_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) ListXAttr(ctx context.Context, in *ListXAttrRequest, opts ...grpc.CallOption) (*ListXAttrResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListXAttrResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_ListXAttr_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) RemoveXAttr(ctx context.Context, in *RemoveXAttrRequest, opts ...grpc.CallOption) (*RemoveXAttrResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveXAttrResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_RemoveXAttr_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *objectFSControllerClient) ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListBlobsResponse)
@@ -509,6 +557,10 @@ type ObjectFSControllerServer interface {
 	Link(context.Context, *LinkRequest) (*LinkResponse, error)
 	Open(context.Context, *OpenRequest) (*OpenResponse, error)
 	Release(context.Context, *ReleaseRequest) (*ReleaseResponse, error)
+	GetXAttr(context.Context, *GetXAttrRequest) (*GetXAttrResponse, error)
+	SetXAttr(context.Context, *SetXAttrRequest) (*SetXAttrResponse, error)
+	ListXAttr(context.Context, *ListXAttrRequest) (*ListXAttrResponse, error)
+	RemoveXAttr(context.Context, *RemoveXAttrRequest) (*RemoveXAttrResponse, error)
 	ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error)
 	GetBlob(*GetBlobRequest, grpc.ServerStreamingServer[GetBlobResponse]) error
 	GetManifest(context.Context, *GetManifestRequest) (*GetManifestResponse, error)
@@ -602,6 +654,18 @@ func (UnimplementedObjectFSControllerServer) Open(context.Context, *OpenRequest)
 }
 func (UnimplementedObjectFSControllerServer) Release(context.Context, *ReleaseRequest) (*ReleaseResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Release not implemented")
+}
+func (UnimplementedObjectFSControllerServer) GetXAttr(context.Context, *GetXAttrRequest) (*GetXAttrResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetXAttr not implemented")
+}
+func (UnimplementedObjectFSControllerServer) SetXAttr(context.Context, *SetXAttrRequest) (*SetXAttrResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetXAttr not implemented")
+}
+func (UnimplementedObjectFSControllerServer) ListXAttr(context.Context, *ListXAttrRequest) (*ListXAttrResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListXAttr not implemented")
+}
+func (UnimplementedObjectFSControllerServer) RemoveXAttr(context.Context, *RemoveXAttrRequest) (*RemoveXAttrResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveXAttr not implemented")
 }
 func (UnimplementedObjectFSControllerServer) ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListBlobs not implemented")
@@ -1019,6 +1083,78 @@ func _ObjectFSController_Release_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ObjectFSController_GetXAttr_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetXAttrRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).GetXAttr(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_GetXAttr_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).GetXAttr(ctx, req.(*GetXAttrRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_SetXAttr_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetXAttrRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).SetXAttr(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_SetXAttr_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).SetXAttr(ctx, req.(*SetXAttrRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_ListXAttr_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListXAttrRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).ListXAttr(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_ListXAttr_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).ListXAttr(ctx, req.(*ListXAttrRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_RemoveXAttr_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveXAttrRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).RemoveXAttr(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_RemoveXAttr_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).RemoveXAttr(ctx, req.(*RemoveXAttrRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ObjectFSController_ListBlobs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListBlobsRequest)
 	if err := dec(in); err != nil {
@@ -1346,6 +1482,22 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Release",
 			Handler:    _ObjectFSController_Release_Handler,
+		},
+		{
+			MethodName: "GetXAttr",
+			Handler:    _ObjectFSController_GetXAttr_Handler,
+		},
+		{
+			MethodName: "SetXAttr",
+			Handler:    _ObjectFSController_SetXAttr_Handler,
+		},
+		{
+			MethodName: "ListXAttr",
+			Handler:    _ObjectFSController_ListXAttr_Handler,
+		},
+		{
+			MethodName: "RemoveXAttr",
+			Handler:    _ObjectFSController_RemoveXAttr_Handler,
 		},
 		{
 			MethodName: "ListBlobs",

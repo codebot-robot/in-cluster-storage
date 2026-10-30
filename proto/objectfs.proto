@@ -41,6 +41,10 @@ service ObjectFSController {
   rpc Link(LinkRequest) returns (LinkResponse);
   rpc Open(OpenRequest) returns (OpenResponse);
   rpc Release(ReleaseRequest) returns (ReleaseResponse);
+  rpc GetXAttr(GetXAttrRequest) returns (GetXAttrResponse);
+  rpc SetXAttr(SetXAttrRequest) returns (SetXAttrResponse);
+  rpc ListXAttr(ListXAttrRequest) returns (ListXAttrResponse);
+  rpc RemoveXAttr(RemoveXAttrRequest) returns (RemoveXAttrResponse);
 
   rpc ListBlobs(ListBlobsRequest) returns (ListBlobsResponse);
   rpc GetBlob(GetBlobRequest) returns (stream GetBlobResponse);
@@ -369,6 +373,55 @@ message ReleaseResponse {
   int32 error = 1;
 }
 
+message GetXAttrRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+  string name = 3;
+}
+
+message GetXAttrResponse {
+  bytes value = 1;
+  int32 error = 2;
+}
+
+message SetXAttrRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+  string name = 3;
+  bytes value = 4;
+
+  enum Flags {
+    FLAGS_NONE = 0;
+    FLAGS_CREATE = 1;
+    FLAGS_REPLACE = 2;
+  }
+  Flags flags = 5;
+}
+
+message SetXAttrResponse {
+  int32 error = 1;
+}
+
+message ListXAttrRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+}
+
+message ListXAttrResponse {
+  repeated XAttr xattrs = 1;
+  int32 error = 2;
+}
+
+message RemoveXAttrRequest {
+  string volume_id = 1;
+  uint64 inode = 2;
+  string name = 3;
+}
+
+message RemoveXAttrResponse {
+  int32 error = 1;
+}
+
 message ListBlobsRequest {
   string from_sha = 1;
   int32 limit = 2;
@@ -576,6 +629,7 @@ message Inode {
   string symlink_target = 16;
   uint32 rdev = 17;
   optional uint64 parent_ino = 18;
+  optional uint32 xattr_count = 19;
 }
 
 message DirEntry {
@@ -596,6 +650,12 @@ message FileChunk {
   optional uint32 index = 2;
   string sha256 = 3;
   bytes inline_data = 4;
+}
+
+message XAttr {
+  optional uint64 ino = 1;
+  optional string name = 2;
+  bytes value = 3;
 }
 
 message RepairVolumeRequest {
