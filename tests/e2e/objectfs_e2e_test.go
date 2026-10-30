@@ -2355,6 +2355,144 @@ spec:
 	t.Logf("Successfully verified ObjectFS controller crash mid-write data integrity across restarts and node failovers!")
 }
 
+func TestObjectFSControllerKillWithStagedDataE2E(t *testing.T) {
+	requireE2EGroup(t, "chaos")
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
+	volumeID := "kill-staged-data-vol"
+
+	writerPodName := "kill-staged-writer-pod"
+	writerPodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, writerPodName, node1, volumeID)
+
+	t.Logf("Creating writer pod on %s", node1)
+	h.KubectlApplyContent(writerPodName, writerPodYaml)
+	if err := h.WaitForPodReady(writerPodName, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Writer pod failed to start: %v", err)
+	}
+
+	t.Cleanup(func() {
+		h.DeletePod(writerPodName, "default")
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+		}
+	})
+
+	// Step 1: Write data in the writer pod that gets pushed to controller staging.
+	// We write a known payload and close it, so dirty chunks are pushed to controller staging
+	// (within the 1s coalesce window, before the background coalesce sync commits to object storage).
+	t.Logf("Writing staged data in writer pod")
+	expectedContent := "durable staged data surviving controller kill and daemon restart"
+	cmd := fmt.Sprintf("echo -n %q > /data/staged.txt", expectedContent)
+	if _, err := h.RunInPod(writerPodName, "default", "/bin/sh", "-c", cmd); err != nil {
+		t.Fatalf("Failed to write staged.txt: %v", err)
+	}
+
+	// Step 2: Force-kill the controller pod AND restart the node-daemon pod on node1.
+	// Restarting the daemon guarantees its in-memory cache is wiped, ensuring data cannot
+	// be re-pushed from daemon memory and must be recovered from the controller's on-disk staging log.
+	t.Logf("Force-killing objectfs-controller-0 and node daemon on %s", node1)
+	h.RunCommand("kubectl", "delete", "pod", "objectfs-controller-0", "-n", "default", "--force", "--grace-period=0")
+
+	// Find daemon pod on node1 and delete it
+	var daemonPodNode1 string
+	for _, pod := range h.getPodNames("app=objectfs-node-daemon", "default") {
+		logs := h.getContainerLogs(pod, "objectfs-node-daemon", "default", false)
+		if strings.Contains(logs, "node "+node1) {
+			daemonPodNode1 = pod
+			break
+		}
+	}
+	if daemonPodNode1 != "" {
+		t.Logf("Deleting daemon pod %s on %s", daemonPodNode1, node1)
+		h.RunCommand("kubectl", "delete", "pod", daemonPodNode1, "-n", "default", "--force", "--grace-period=0")
+	}
+
+	// Wait for controller and daemonset to recover
+	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
+		t.Fatalf("Controller failed to recover: %v", err)
+	}
+	if err := h.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
+		t.Fatalf("Node daemon failed to recover: %v", err)
+	}
+
+	// Create a reader pod on node2 to verify visibility after recovery and sync
+	readerPodName := "kill-staged-reader-pod"
+	readerPodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, readerPodName, node2, volumeID)
+
+	t.Logf("Creating reader pod on %s to verify data visibility after recovery", node2)
+	h.KubectlApplyContent(readerPodName, readerPodYaml)
+	if err := h.WaitForPodReady(readerPodName, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Reader pod failed to start: %v", err)
+	}
+	t.Cleanup(func() {
+		h.DeletePod(readerPodName, "default")
+	})
+
+	// Poll until the data is visible and matches golden content
+	t.Logf("Waiting for recovered staged data to be visible in reader pod")
+	deadline := time.Now().Add(60 * time.Second)
+	var lastContent string
+	var lastErr error
+	recovered := false
+	for time.Now().Before(deadline) {
+		out, err := h.RunInPod(readerPodName, "default", "cat", "/data/staged.txt")
+		if err == nil && strings.TrimSpace(out) == expectedContent {
+			recovered = true
+			break
+		}
+		lastContent = strings.TrimSpace(out)
+		lastErr = err
+		time.Sleep(1 * time.Second)
+	}
+
+	if !recovered {
+		t.Fatalf("Recovered staged data not visible: err=%v, content=%q, expected=%q", lastErr, lastContent, expectedContent)
+	}
+	t.Logf("Successfully verified staged data visibility after controller kill, daemon restart, and recovery sync!")
+}
+
 func TestObjectFSControllerOutageE2E(t *testing.T) {
 	requireE2EGroup(t, "chaos")
 
