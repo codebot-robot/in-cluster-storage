@@ -528,7 +528,7 @@ func TestTailMemoryBounded(t *testing.T) {
 	defer srv.Close()
 
 	streamID := uuid.New()
-	st := srv.getOrCreateStream(streamID)
+	st := srv.getOrCreateStream(ctx, streamID)
 
 	const recordCount = 2000
 	errCh := make(chan error, 1)

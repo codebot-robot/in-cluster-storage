@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -962,8 +963,8 @@ func TestBufferRestart_ReadsOnlyUncoveredSegments(t *testing.T) {
 	if srv2.lastFlushedPosition != 120 {
 		t.Errorf("expected lastFlushedPosition 120, got %d", srv2.lastFlushedPosition)
 	}
-	if srv2.streams[streamIDA.String()].witnessSeq != 100 {
-		t.Errorf("expected stream A witnessSeq 100, got %d", srv2.streams[streamIDA.String()].witnessSeq)
+	if stA := srv2.getOrCreateStream(ctx, streamIDA); stA.witnessSeq != 100 {
+		t.Errorf("expected stream A witnessSeq 100, got %d", stA.witnessSeq)
 	}
 	if srv2.streams[streamIDB.String()].witnessSeq != 20 {
 		t.Errorf("expected stream B witnessSeq 20, got %d", srv2.streams[streamIDB.String()].witnessSeq)
@@ -1180,8 +1181,6 @@ func TestStartup_10kSegments(t *testing.T) {
 	// 2. Seed sealed per-stream file covering 1..9990 and persist coverage.json
 	dataDir := t.TempDir()
 	cov := StreamCoverage{
-		Streams:    map[string]uint64{streamID.String(): uint64(coveredSegments)},
-		Positions:  map[string]uint64{streamID.String(): uint64(coveredSegments)},
 		CoveredPos: uint64(coveredSegments),
 	}
 	covData, err := json.Marshal(cov)
@@ -1259,8 +1258,6 @@ func BenchmarkStartup_10kSegments(b *testing.B) {
 
 	dataDir := b.TempDir()
 	cov := StreamCoverage{
-		Streams:    map[string]uint64{streamID.String(): uint64(coveredSegments)},
-		Positions:  map[string]uint64{streamID.String(): uint64(coveredSegments)},
 		CoveredPos: uint64(coveredSegments),
 	}
 	covData, err := json.Marshal(cov)
@@ -1283,4 +1280,424 @@ func BenchmarkStartup_10kSegments(b *testing.B) {
 		}
 		_ = srv.Close()
 	}
+}
+
+// TestCoverage_IndependentOfStreamCount verifies that coverage.json file size
+// does not grow with the number of streams seen, and startup does not materialize
+// streamWriter instances for idle/covered streams.
+func TestCoverage_IndependentOfStreamCount(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	const totalStreams = 20
+	streamIDs := make([]uuid.UUID, totalStreams)
+	for i := 0; i < totalStreams; i++ {
+		streamIDs[i] = uuid.New()
+	}
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	// Append records to all N streams and flush them
+	for _, sid := range streamIDs {
+		ackChan := make(chan ackResult, 1)
+		srv.incomingChan <- incomingItem{
+			streamID:  sid,
+			streamSeq: 1,
+			payload:   []byte("test-payload"),
+			ackChan:   ackChan,
+		}
+		res := <-ackChan
+		if res.err != nil {
+			t.Fatalf("append failed: %v", res.err)
+		}
+	}
+
+	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	// Seal all N streams
+	for _, sid := range streamIDs {
+		if err := srv.SealStream(ctx, sid); err != nil {
+			t.Fatalf("SealStream failed: %v", err)
+		}
+	}
+
+	// Append unsealed record to only the first stream (streamIDs[0])
+	activeID := streamIDs[0]
+	ackChan := make(chan ackResult, 1)
+	srv.incomingChan <- incomingItem{
+		streamID:  activeID,
+		streamSeq: 2,
+		payload:   []byte("active-unsealed-record"),
+		ackChan:   ackChan,
+	}
+	res := <-ackChan
+	if res.err != nil {
+		t.Fatalf("append active record failed: %v", res.err)
+	}
+
+	// Run seal passes: first pass marks idle streams, second pass evicts them
+	srv.streamStore.checkSealsAndGC(ctx)
+	srv.streamStore.checkSealsAndGC(ctx)
+
+	// Check coverage.json file size on disk: must be small scalar JSON (< 50 bytes), independent of N
+	covPath := filepath.Join(dataDir, "coverage.json")
+	covData, err := os.ReadFile(covPath)
+	if err != nil {
+		t.Fatalf("failed to read coverage.json: %v", err)
+	}
+	if len(covData) > 50 {
+		t.Errorf("expected coverage.json size < 50 bytes for scalar coverage, got %d bytes: %s", len(covData), string(covData))
+	}
+
+	var rawMap map[string]any
+	if err := json.Unmarshal(covData, &rawMap); err != nil {
+		t.Fatalf("failed to unmarshal coverage: %v", err)
+	}
+	if _, hasStreams := rawMap["streams"]; hasStreams {
+		t.Errorf("coverage.json must not persist per-stream map")
+	}
+	if _, hasPositions := rawMap["positions"]; hasPositions {
+		t.Errorf("coverage.json must not persist per-stream positions")
+	}
+
+	// Verify in-memory writer count is bounded by active streams (only activeID has records/open file)
+	writers := srv.streamStore.allWriters()
+	if len(writers) != 1 {
+		t.Errorf("expected exactly 1 active stream writer in memory, got %d", len(writers))
+	}
+
+	if err := srv.Close(); err != nil {
+		t.Fatalf("server close failed: %v", err)
+	}
+
+	// Verify startup with coverage.json and N streams in backend creates no writers for covered streams
+	dataDir2 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dataDir2, "coverage.json"), covData, 0644); err != nil {
+		t.Fatalf("failed to write coverage.json to dataDir2: %v", err)
+	}
+	srvFresh, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir2,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to start server on dataDir2: %v", err)
+	}
+	defer srvFresh.Close()
+
+	freshWriters := srvFresh.streamStore.allWriters()
+	if len(freshWriters) != 1 {
+		t.Errorf("expected startup to create exactly 1 writer for unsealed stream among %d streams, got %d", totalStreams, len(freshWriters))
+	}
+
+	// On restart on dataDir2:
+	// Verify that contacting an idle stream discovers its sealed state
+	idleID := streamIDs[1]
+	st := srvFresh.getOrCreateStream(ctx, idleID)
+	if st.witnessSeq != 1 {
+		t.Errorf("expected idle stream witnessSeq 1 after discovery, got %d", st.witnessSeq)
+	}
+}
+
+// TestSegmentGC_UnknownStreamNotDeletedUntilDiscovery verifies that CheckSegmentGC does
+// not delete an aggregated segment on the strength of a stream it has not yet rebuilt,
+// treating an unknown stream as not covered until its state is discovered.
+func TestSegmentGC_UnknownStreamNotDeletedUntilDiscovery(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	streamX := uuid.New()
+
+	// 1. Put an aggregated segment in backend containing records for Stream X
+	segPath := fmt.Sprintf("%s%012d-%012d.wal", SegmentsPrefix, 1, 10)
+	var segRecords []*wal.LogRecord
+	for i := uint64(1); i <= 10; i++ {
+		segRecords = append(segRecords, &wal.LogRecord{
+			Position:  i,
+			StreamID:  streamX,
+			StreamSeq: i,
+			Payload:   []byte(fmt.Sprintf("record-%d", i)),
+		})
+	}
+	var segBuf bytes.Buffer
+	segBuf.Write(wal.DefaultSegmentHeader().Encode())
+	for _, r := range segRecords {
+		segBuf.Write(r.Encode())
+	}
+	if _, err := backend.PutObject(ctx, "", segPath, blob.NewByteStreamFromBytes(segBuf.Bytes())); err != nil {
+		t.Fatalf("failed to put aggregated segment: %v", err)
+	}
+
+	// 2. Put a sealed per-stream file in backend covering Stream X (seq 1..10)
+	streamObjKey := wal.FormatStreamObjectKey(streamX, 1, 10)
+	var streamBuf bytes.Buffer
+	streamBuf.Write(wal.DefaultSegmentHeader().Encode())
+	for _, r := range segRecords {
+		streamBuf.Write(r.Encode())
+	}
+	if _, err := backend.PutObject(ctx, "", streamObjKey, blob.NewByteStreamFromBytes(streamBuf.Bytes())); err != nil {
+		t.Fatalf("failed to put stream segment: %v", err)
+	}
+
+	store := NewStreamStore(dataDir, backend, time.Hour, DefaultStreamSealBytes)
+	defer func() { _ = store.Close(ctx) }()
+
+	// Track the segment requirements on the store
+	store.TrackSegmentCoverage(segPath, segRecords)
+
+	// Stream X is unknown in store (not yet materialized/discovered)
+	if store.getStream(streamX) != nil {
+		t.Fatalf("expected stream X to be unknown in store initially")
+	}
+
+	// Run CheckSegmentGC: segment must NOT be deleted because stream X is unknown
+	deleted, err := store.CheckSegmentGC(ctx)
+	if err != nil {
+		t.Fatalf("CheckSegmentGC failed: %v", err)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("expected no segments deleted for unknown stream, got: %v", deleted)
+	}
+	if err := backend.GetObject(ctx, "", segPath, 0, 0, io.Discard); err != nil {
+		t.Fatalf("expected aggregated segment to still exist in backend: %v", err)
+	}
+
+	// Now discover Stream X
+	upTo := store.EnsureDiscovered(ctx, streamX)
+	if upTo != 10 {
+		t.Errorf("expected uploadedTo 10 after discovery, got %d", upTo)
+	}
+
+	// Run CheckSegmentGC again: now segment should be deleted
+	deleted, err = store.CheckSegmentGC(ctx)
+	if err != nil {
+		t.Fatalf("CheckSegmentGC failed after discovery: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != segPath {
+		t.Fatalf("expected %s deleted after discovery, got: %v", segPath, deleted)
+	}
+	if err := backend.GetObject(ctx, "", segPath, 0, 0, io.Discard); err == nil {
+		t.Fatalf("expected aggregated segment to be deleted from backend")
+	}
+}
+
+// TestTail_SurvivesWriterEvictionAndReseal verifies that an already-open Tail does not stall
+// when its writer is evicted and subsequently resealed on new appends.
+func TestTail_SurvivesWriterEvictionAndReseal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Close()
+
+	streamID := uuid.New()
+
+	appendRecords := func(from, to uint64) {
+		for seq := from; seq <= to; seq++ {
+			ackChan := make(chan ackResult, 1)
+			srv.incomingChan <- incomingItem{
+				streamID:  streamID,
+				streamSeq: seq,
+				payload:   []byte(fmt.Sprintf("rec-%d", seq)),
+				ackChan:   ackChan,
+			}
+			res := <-ackChan
+			if res.err != nil {
+				t.Fatalf("append %d failed: %v", seq, res.err)
+			}
+		}
+		if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+			t.Fatalf("flush failed: %v", err)
+		}
+	}
+
+	// 1. Initial records 1..5, sealed
+	appendRecords(1, 5)
+	if err := srv.SealStream(ctx, streamID); err != nil {
+		t.Fatalf("SealStream failed: %v", err)
+	}
+
+	// 2. Open tail on the sealed idle stream
+	var mu sync.Mutex
+	var received []uint64
+	receivedChan := make(chan uint64, 20)
+	tailCtx, cancelTail := context.WithCancel(ctx)
+	defer cancelTail()
+
+	mockStream := &mockCollectingTailServer{
+		ctx: tailCtx,
+		onSend: func(resp *pb.TailResponse) {
+			if rec := resp.GetRecord(); rec != nil {
+				mu.Lock()
+				received = append(received, rec.StreamSeq)
+				mu.Unlock()
+				receivedChan <- rec.StreamSeq
+			}
+		},
+	}
+
+	tailErrCh := make(chan error, 1)
+	go func() {
+		tailErrCh <- srv.tailPerStream(tailCtx, streamID, &pb.TailRequest{FromStreamSeq: 0}, mockStream)
+	}()
+
+	waitForSeqs := func(target uint64) {
+		for {
+			mu.Lock()
+			count := len(received)
+			var last uint64
+			if count > 0 {
+				last = received[count-1]
+			}
+			mu.Unlock()
+			if last >= target {
+				return
+			}
+			select {
+			case <-receivedChan:
+			case err := <-tailErrCh:
+				t.Fatalf("tailPerStream exited unexpectedly: %v", err)
+			case <-ctx.Done():
+				mu.Lock()
+				t.Fatalf("timed out waiting for seq %d, received so far: %v", target, received)
+				mu.Unlock()
+			}
+		}
+	}
+
+	// Tail should deliver 1..5
+	waitForSeqs(5)
+
+	// 3. Run two seal passes: writer becomes idle and is evicted
+	srv.streamStore.checkSealsAndGC(ctx)
+	srv.streamStore.checkSealsAndGC(ctx)
+
+	if w := srv.streamStore.getStream(streamID); w != nil {
+		t.Fatalf("expected stream writer to be evicted after two idle passes")
+	}
+
+	// 4. Append 6..8 and flush: new writer created
+	appendRecords(6, 8)
+	waitForSeqs(8)
+
+	// 5. Seal stream again
+	if err := srv.SealStream(ctx, streamID); err != nil {
+		t.Fatalf("SealStream 2 failed: %v", err)
+	}
+
+	// 6. Append 9..11 and flush: another new writer created
+	appendRecords(9, 11)
+	waitForSeqs(11)
+
+	// 7. Verify all 1..11 delivered in order
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 11 {
+		t.Fatalf("expected 11 records, got %d: %v", len(received), received)
+	}
+	for i := 0; i < 11; i++ {
+		expected := uint64(i + 1)
+		if received[i] != expected {
+			t.Errorf("record at index %d = %d, want %d", i, received[i], expected)
+		}
+	}
+}
+
+func TestMeasurement_SealPass1kStreams(t *testing.T) {
+	if os.Getenv("OBJECTFS_BENCH") == "" {
+		t.Skip("skipping 1k streams seal-pass measurement (set OBJECTFS_BENCH=1)")
+	}
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	const totalStreams = 1000
+	streamIDs := make([]uuid.UUID, totalStreams)
+	for i := 0; i < totalStreams; i++ {
+		streamIDs[i] = uuid.New()
+	}
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Close()
+
+	// Append and seal all 1000 streams
+	for _, sid := range streamIDs {
+		ackChan := make(chan ackResult, 1)
+		srv.incomingChan <- incomingItem{
+			streamID:  sid,
+			streamSeq: 1,
+			payload:   []byte("payload"),
+			ackChan:   ackChan,
+		}
+		if res := <-ackChan; res.err != nil {
+			t.Fatalf("append failed: %v", res.err)
+		}
+	}
+	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+	for _, sid := range streamIDs {
+		if err := srv.SealStream(ctx, sid); err != nil {
+			t.Fatalf("seal failed: %v", err)
+		}
+	}
+
+	// 1 active stream keeps appending
+	activeID := streamIDs[0]
+	ackChan := make(chan ackResult, 1)
+	srv.incomingChan <- incomingItem{
+		streamID:  activeID,
+		streamSeq: 2,
+		payload:   []byte("payload-2"),
+		ackChan:   ackChan,
+	}
+	if res := <-ackChan; res.err != nil {
+		t.Fatalf("append active failed: %v", res.err)
+	}
+
+	// Measure pass 1 (before eviction: all 1,000 writers in memory)
+	start1 := time.Now()
+	srv.streamStore.checkSealsAndGC(ctx)
+	durBefore := time.Since(start1)
+
+	// Measure pass 2 (after eviction: only 1 active writer in memory)
+	start2 := time.Now()
+	srv.streamStore.checkSealsAndGC(ctx)
+	durAfter := time.Since(start2)
+
+	activeWriters := len(srv.streamStore.allWriters())
+	t.Logf("Measured 1,000 streams seal-pass: before_eviction (%d writers)=%v vs after_eviction (%d writers)=%v (speedup: %.1fx)",
+		totalStreams, durBefore, activeWriters, durAfter, float64(durBefore)/float64(durAfter))
 }
