@@ -23,9 +23,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestController_UnversionedUpgrade(t *testing.T) {
@@ -73,5 +75,96 @@ func TestController_UnversionedUpgrade(t *testing.T) {
 
 	if vol.VolumeID() != "vol-legacy" {
 		t.Errorf("vol.VolumeID = %q, want vol-legacy", vol.VolumeID())
+	}
+}
+
+func TestVolumeMetadataPinnedTypeIDs(t *testing.T) {
+	vol := MustNewVolume(t, "test-pinned-ids", nil, NewEventBroadcaster())
+	defer func() {
+		if err := vol.Close(); err != nil {
+			t.Errorf("vol.Close failed: %v", err)
+		}
+	}()
+
+	reg := vol.metadataStream.Registry()
+	expectedPinned := []struct {
+		name string
+		id   uint32
+	}{
+		{name: "objectfs.v1alpha1.Inode", id: 16},
+		{name: "objectfs.v1alpha1.DirEntry", id: 17},
+		{name: "objectfs.v1alpha1.FileChunk", id: 18},
+		{name: "objectfs.v1alpha1.Content", id: 19},
+		{name: "objectfs.v1alpha1.VolumeStats", id: 20},
+	}
+
+	for _, tc := range expectedPinned {
+		def, _, ok := reg.LookupByName(tc.name)
+		if !ok {
+			t.Fatalf("required table %q not registered in metadata stream registry", tc.name)
+		}
+		if def.GetId() != tc.id {
+			t.Errorf("table %q has ID %d, want pinned ID %d (reordering breaks existing volumes)",
+				tc.name, def.GetId(), tc.id)
+		}
+
+		defByID, _, okByID := reg.LookupByID(tc.id)
+		if !okByID {
+			t.Errorf("pinned ID %d not found in registry", tc.id)
+		} else if defByID.GetName() != tc.name {
+			t.Errorf("pinned ID %d maps to name %q, want %q", tc.id, defByID.GetName(), tc.name)
+		}
+	}
+
+	// Verify all registered types: pinned types must have their exact IDs,
+	// and any future additions must be appended after VolumeStats (ID >= 21).
+	for _, def := range reg.Export().GetTypes() {
+		if def.GetId() <= 20 {
+			var found bool
+			for _, tc := range expectedPinned {
+				if tc.id == def.GetId() && tc.name == def.GetName() {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("unexpected type ID %d (%q) in pinned range [16..20]", def.GetId(), def.GetName())
+			}
+		} else if def.GetId() < 21 {
+			t.Errorf("new table %q must be appended with ID >= 21, got %d", def.GetName(), def.GetId())
+		}
+	}
+
+	// Verify that a volume index holding a conflicting / reordered registration order
+	// fails to sync with the writer's registry.
+	conflictingReg := record.NewRegistry()
+	for _, tc := range expectedPinned {
+		if tc.id < 19 {
+			def, _, ok := reg.LookupByID(tc.id)
+			if !ok {
+				t.Fatalf("missing baseline ID %d", tc.id)
+			}
+			if err := conflictingReg.Register(def); err != nil {
+				t.Fatalf("failed registering baseline type %d: %v", tc.id, err)
+			}
+		}
+	}
+
+	// Simulate an older volume index where VolumeStats was registered at ID 19
+	// (e.g. before Content was introduced or due to a reordering).
+	statsDef, _, ok := reg.LookupByName("objectfs.v1alpha1.VolumeStats")
+	if !ok {
+		t.Fatalf("VolumeStats not found")
+	}
+	conflictingStats := proto.Clone(statsDef).(*sdsv1.TypeDefinition)
+	conflictingStats.Id = 19
+	if err := conflictingReg.Register(conflictingStats); err != nil {
+		t.Fatalf("failed registering conflicting type: %v", err)
+	}
+
+	// Syncing (Import) the metadata stream's registry into the conflicting index must fail.
+	err := conflictingReg.Import(reg.Export())
+	if !errors.Is(err, record.ErrTypeConflict) {
+		t.Fatalf("expected ErrTypeConflict when importing into index with reordered types, got: %v", err)
 	}
 }

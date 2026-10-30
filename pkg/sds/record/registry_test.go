@@ -611,3 +611,186 @@ func TestRegistryInternedTypeDefinitionDifferentIDs(t *testing.T) {
 			lookup1.GetDescriptors(), lookup2.GetDescriptors())
 	}
 }
+
+func TestRegistryConflictRejection(t *testing.T) {
+	makeDef := func(name string, id uint32) *sdsv1.TypeDefinition {
+		d := makeTestTypeDef(name, []*descriptorpb.FieldDescriptorProto{
+			field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		}, nil, nil, []int32{1}, nil)
+		d.Id = id
+		return d
+	}
+
+	// 1. Same ID different name is rejected
+	t.Run("SameIDDifferentName", func(t *testing.T) {
+		reg := NewRegistry()
+		defA := makeDef("TypeA", 16)
+		if err := reg.Register(defA); err != nil {
+			t.Fatalf("Register defA failed: %v", err)
+		}
+
+		defB := makeDef("TypeB", 16)
+		err := reg.Register(defB)
+		if err == nil {
+			t.Fatalf("expected error registering different name with same ID, got nil")
+		}
+		if !errors.Is(err, ErrTypeConflict) {
+			t.Errorf("expected ErrTypeConflict, got: %v", err)
+		}
+		var conflictErr *TypeConflictError
+		if !errors.As(err, &conflictErr) {
+			t.Errorf("expected *TypeConflictError, got: %T", err)
+		} else if conflictErr.ExistingID != 16 || conflictErr.ExistingName != "testpkg.TypeA" ||
+			conflictErr.IncomingID != 16 || conflictErr.IncomingName != "testpkg.TypeB" {
+			t.Errorf("unexpected conflict error details: %+v", conflictErr)
+		}
+
+		// Also verify via Import
+		regImport := NewRegistry()
+		if err := regImport.Register(defA); err != nil {
+			t.Fatalf("Register defA failed: %v", err)
+		}
+		if err := regImport.Import(&sdsv1.Registry{Types: []*sdsv1.TypeDefinition{defB}}); !errors.Is(err, ErrTypeConflict) {
+			t.Errorf("expected ErrTypeConflict on Import, got: %v", err)
+		}
+	})
+
+	// 2. Same name different ID is rejected
+	t.Run("SameNameDifferentID", func(t *testing.T) {
+		reg := NewRegistry()
+		defA := makeDef("TypeA", 16)
+		if err := reg.Register(defA); err != nil {
+			t.Fatalf("Register defA failed: %v", err)
+		}
+
+		defA2 := makeDef("TypeA", 17)
+		err := reg.Register(defA2)
+		if err == nil {
+			t.Fatalf("expected error registering same name with different ID, got nil")
+		}
+		if !errors.Is(err, ErrTypeConflict) {
+			t.Errorf("expected ErrTypeConflict, got: %v", err)
+		}
+		var conflictErr *TypeConflictError
+		if !errors.As(err, &conflictErr) {
+			t.Errorf("expected *TypeConflictError, got: %T", err)
+		} else if conflictErr.ExistingID != 16 || conflictErr.ExistingName != "testpkg.TypeA" ||
+			conflictErr.IncomingID != 17 || conflictErr.IncomingName != "testpkg.TypeA" {
+			t.Errorf("unexpected conflict error details: %+v", conflictErr)
+		}
+
+		// Also verify via Import
+		regImport := NewRegistry()
+		if err := regImport.Register(defA); err != nil {
+			t.Fatalf("Register defA failed: %v", err)
+		}
+		if err := regImport.Import(&sdsv1.Registry{Types: []*sdsv1.TypeDefinition{defA2}}); !errors.Is(err, ErrTypeConflict) {
+			t.Errorf("expected ErrTypeConflict on Import, got: %v", err)
+		}
+	})
+
+	// 3. Same ID and name with compatible evolution is accepted
+	t.Run("SameIDAndNameCompatibleEvolution", func(t *testing.T) {
+		reg := NewRegistry()
+		fieldsV1 := []*descriptorpb.FieldDescriptorProto{
+			field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		}
+		defV1 := makeTestTypeDef("Order", fieldsV1, nil, nil, []int32{1}, nil)
+		defV1.Id = 16
+
+		if err := reg.Register(defV1); err != nil {
+			t.Fatalf("Register defV1 failed: %v", err)
+		}
+
+		fieldsV2 := []*descriptorpb.FieldDescriptorProto{
+			field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+			field("note", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		}
+		defV2 := makeTestTypeDef("Order", fieldsV2, nil, nil, []int32{1}, nil)
+		defV2.Id = 16
+
+		// Register directly
+		if err := reg.Register(defV2); err != nil {
+			t.Fatalf("compatible Register defV2 failed: %v", err)
+		}
+
+		// Import into another registry with defV1
+		reg2 := NewRegistry()
+		if err := reg2.Register(defV1); err != nil {
+			t.Fatalf("reg2 Register defV1 failed: %v", err)
+		}
+		if err := reg2.Import(&sdsv1.Registry{Types: []*sdsv1.TypeDefinition{defV2}}); err != nil {
+			t.Fatalf("compatible Import defV2 failed: %v", err)
+		}
+
+		lookup, _, ok := reg2.LookupByID(16)
+		if !ok || !bytes.Equal(lookup.GetFingerprint(), defV2.GetFingerprint()) {
+			t.Errorf("reg2 lookup fingerprint does not match V2")
+		}
+	})
+
+	// 4. Idempotent re-import is a no-op
+	t.Run("IdempotentReImport", func(t *testing.T) {
+		reg := NewRegistry()
+		defA := makeDef("TypeA", 16)
+		defB := makeDef("TypeB", 17)
+
+		if err := reg.Register(defA); err != nil {
+			t.Fatalf("Register defA failed: %v", err)
+		}
+		if err := reg.Register(defB); err != nil {
+			t.Fatalf("Register defB failed: %v", err)
+		}
+
+		exp := reg.Export()
+
+		// Re-import into same registry
+		for i := 0; i < 3; i++ {
+			if err := reg.Import(exp); err != nil {
+				t.Fatalf("re-import %d failed: %v", i, err)
+			}
+		}
+
+		expAfter := reg.Export()
+		if len(expAfter.GetTypes()) != 2 {
+			t.Errorf("len(GetTypes()) = %d, want 2", len(expAfter.GetTypes()))
+		}
+	})
+
+	// 5. byName never ends with two IDs for one name
+	t.Run("ByNameNeverHasTwoIDsForOneName", func(t *testing.T) {
+		reg := NewRegistry()
+		def1 := makeDef("UniqueType", 16)
+		if err := reg.Register(def1); err != nil {
+			t.Fatalf("Register def1 failed: %v", err)
+		}
+
+		def2 := makeDef("UniqueType", 17)
+		if err := reg.Register(def2); !errors.Is(err, ErrTypeConflict) {
+			t.Fatalf("expected ErrTypeConflict, got %v", err)
+		}
+
+		// LookupByName must return ID 16
+		lookupDef, _, ok := reg.LookupByName("testpkg.UniqueType")
+		if !ok || lookupDef.GetId() != 16 {
+			t.Errorf("LookupByName returned ID %d, want 16", lookupDef.GetId())
+		}
+
+		// ID 17 must not exist
+		if _, _, ok := reg.LookupByID(17); ok {
+			t.Errorf("ID 17 unexpectedly found in registry")
+		}
+
+		// Also test atomic import of conflicting batch: registry must remain unmodified
+		regBatch := NewRegistry()
+		batch := &sdsv1.Registry{
+			Types: []*sdsv1.TypeDefinition{def1, def2},
+		}
+		if err := regBatch.Import(batch); !errors.Is(err, ErrTypeConflict) {
+			t.Errorf("expected ErrTypeConflict importing batch with duplicate name, got: %v", err)
+		}
+		if len(regBatch.Export().GetTypes()) != 0 {
+			t.Errorf("failed import should not leave partial registrations, got %d types", len(regBatch.Export().GetTypes()))
+		}
+	})
+}

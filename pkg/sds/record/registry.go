@@ -43,12 +43,36 @@ var (
 	ErrMissingDescriptors = errors.New("missing FileDescriptorSet for new type registration")
 	// ErrTypeIDTooLow is returned when an application type definition uses an ID < 16.
 	ErrTypeIDTooLow = errors.New("application type ID must be >= 16")
+	// ErrTypeConflict is returned when an incoming type registration conflicts with an existing type ID or name.
+	ErrTypeConflict = errors.New("conflicting type registration")
 
 	compiledFPCache   sync.Map // protoreflect.FullName -> []byte
 	dynamicFilesMu    sync.RWMutex
 	dynamicFilesCache = make(map[[32]byte]*protoregistry.Files)
 	typeDefCache      sync.Map // typeDefKey -> *sdsv1.TypeDefinition
 )
+
+// TypeConflictError describes a conflict where an incoming type registration's ID or name
+// disagrees with an existing registration in the registry.
+type TypeConflictError struct {
+	ExistingID   uint32
+	ExistingName string
+	IncomingID   uint32
+	IncomingName string
+}
+
+func (e *TypeConflictError) Error() string {
+	if e.ExistingID == e.IncomingID {
+		return fmt.Sprintf("conflicting type registration: type ID %d already registered as %q, incoming is %q",
+			e.ExistingID, e.ExistingName, e.IncomingName)
+	}
+	return fmt.Sprintf("conflicting type registration: type name %q already registered with ID %d, incoming is ID %d",
+		e.IncomingName, e.ExistingID, e.IncomingID)
+}
+
+func (e *TypeConflictError) Unwrap() error {
+	return ErrTypeConflict
+}
 
 func internOrCloneTypeDef(def *sdsv1.TypeDefinition) *sdsv1.TypeDefinition {
 	if def == nil {
@@ -221,6 +245,23 @@ func registerIntoSnapshot(s *registrySnapshot, def *sdsv1.TypeDefinition) error 
 	}
 	if len(def.GetFingerprint()) == 0 {
 		return fmt.Errorf("empty fingerprint in TypeDefinition")
+	}
+
+	if existing, ok := s.types[def.GetId()]; ok && existing.def.GetName() != def.GetName() {
+		return &TypeConflictError{
+			ExistingID:   existing.id,
+			ExistingName: existing.def.GetName(),
+			IncomingID:   def.GetId(),
+			IncomingName: def.GetName(),
+		}
+	}
+	if existingID, ok := s.byName[def.GetName()]; ok && existingID != def.GetId() {
+		return &TypeConflictError{
+			ExistingID:   existingID,
+			ExistingName: def.GetName(),
+			IncomingID:   def.GetId(),
+			IncomingName: def.GetName(),
+		}
 	}
 
 	existing, ok := s.types[def.GetId()]
