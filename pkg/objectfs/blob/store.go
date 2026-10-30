@@ -20,12 +20,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +47,7 @@ type ObjectStorageBackend interface {
 type BlobLocation struct {
 	IsStandalone bool
 	PackKey      string
+	PackVersion  uint8
 	Entry        BlobEntry
 }
 
@@ -173,6 +174,7 @@ func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error
 		s.shaToLocation[entry.SHA256Hex()] = BlobLocation{
 			IsStandalone: false,
 			PackKey:      packFileKey,
+			PackVersion:  packFile.Version,
 			Entry:        entry,
 		}
 	}
@@ -199,43 +201,39 @@ func (s *Store) RefreshIndexes(ctx context.Context) error {
 				continue
 			}
 
-			// Smuggle count from filename format: <packID>-<count>.pack
-			baseName := strings.TrimSuffix(path.Base(obj), ".pack")
-			var count int
-			if idx := strings.LastIndex(baseName, "-"); idx != -1 {
-				if parsed, err := strconv.Atoi(baseName[idx+1:]); err == nil && parsed > 0 {
-					count = parsed
-				}
+			// Read at least PackV1HeaderSize (16 bytes) to inspect base header and version
+			var hdrBuf bytes.Buffer
+			if err := s.backend.GetObject(ctx, "", obj, 0, int64(PackV1HeaderSize), &hdrBuf); err != nil || hdrBuf.Len() < PackV1HeaderSize {
+				klog.Warningf("Failed reading header for packfile %s: %v", obj, err)
+				continue
 			}
 
-			var tableData []byte
-			if count > 0 {
-				tableSize := int64(PackHeaderSize + count*32 + (count+1)*4)
-				var buf bytes.Buffer
-				if err := s.backend.GetObject(ctx, "", obj, 0, tableSize, &buf); err == nil && int64(buf.Len()) >= tableSize {
-					tableData = buf.Bytes()
-				}
+			rawHdr := hdrBuf.Bytes()
+			baseHdr, err := ParseFileHeader(rawHdr[0:8])
+			if err != nil || baseHdr.FileType != FileTypePack {
+				klog.Warningf("Invalid packfile header for %s: %v", obj, err)
+				continue
 			}
 
-			if len(tableData) == 0 {
-				var hdrBuf bytes.Buffer
-				if err := s.backend.GetObject(ctx, "", obj, 0, int64(PackHeaderSize), &hdrBuf); err != nil || hdrBuf.Len() < PackHeaderSize {
-					klog.Warningf("Failed reading header for packfile %s: %v", obj, err)
-					continue
-				}
-				rawHdr := hdrBuf.Bytes()
-				entriesCount := int(rawHdr[8])<<24 | int(rawHdr[9])<<16 | int(rawHdr[10])<<8 | int(rawHdr[11])
-				totalTableSize := int64(PackHeaderSize + entriesCount*32 + (entriesCount+1)*4)
-
-				var totalBuf bytes.Buffer
-				if err := s.backend.GetObject(ctx, "", obj, 0, totalTableSize, &totalBuf); err != nil || int64(totalBuf.Len()) < totalTableSize {
-					klog.Warningf("Failed reading tables for packfile %s: %v", obj, err)
-					continue
-				}
-				tableData = totalBuf.Bytes()
+			var totalTableSize int64
+			if baseHdr.Version == VersionV1 {
+				entriesCount := int(binary.BigEndian.Uint32(rawHdr[8:12]))
+				totalTableSize = int64(PackV1HeaderSize + entriesCount*32 + (entriesCount+1)*4)
+			} else if baseHdr.Version == VersionV2 {
+				slotsCount := int(binary.BigEndian.Uint32(rawHdr[8:12]))
+				totalTableSize = int64(PackV2HeaderSize + slotsCount*int(PackV2SlotSize))
+			} else {
+				klog.Warningf("Unsupported packfile version %d for %s", baseHdr.Version, obj)
+				continue
 			}
 
-			packFile, err := DecodePackTable(bytes.NewReader(tableData))
+			var totalBuf bytes.Buffer
+			if err := s.backend.GetObject(ctx, "", obj, 0, totalTableSize, &totalBuf); err != nil || int64(totalBuf.Len()) < totalTableSize {
+				klog.Warningf("Failed reading tables for packfile %s: %v", obj, err)
+				continue
+			}
+
+			packFile, err := DecodePackTable(bytes.NewReader(totalBuf.Bytes()))
 			if err != nil {
 				klog.Warningf("Failed to decode table for packfile %s: %v", obj, err)
 				continue
@@ -247,6 +245,7 @@ func (s *Store) RefreshIndexes(ctx context.Context) error {
 				s.shaToLocation[entry.SHA256Hex()] = BlobLocation{
 					IsStandalone: false,
 					PackKey:      obj,
+					PackVersion:  packFile.Version,
 					Entry:        entry,
 				}
 			}
@@ -325,7 +324,32 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 		if err := s.backend.GetObject(ctx, "", loc.PackKey, int64(loc.Entry.DataOffset), int64(loc.Entry.StoredLength), &buf); err != nil {
 			return nil, fmt.Errorf("failed to read blob slice from pack %s: %w", loc.PackKey, err)
 		}
-		return DecodeBlobFromPayload(&buf, loc.Entry)
+		if loc.PackVersion == VersionV1 {
+			return DecodeBlobFromPayload(&buf, loc.Entry)
+		}
+		if int64(buf.Len()) != int64(loc.Entry.StoredLength) {
+			return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: expected stored length %d, got %d",
+				loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, loc.Entry.StoredLength, buf.Len())
+		}
+		stream, err := decodePayloadToByteStream(&buf, loc.Entry.Encoding, int64(loc.Entry.FinalLength))
+		if err != nil {
+			return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: %w",
+				loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, err)
+		}
+		if loc.Entry.SHA256 != [32]byte{} {
+			actualSHA, err := computeStreamSHA256(stream)
+			if err != nil {
+				errutil.CloseAndLog(stream, "decoded stream")
+				return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: %w",
+					loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, err)
+			}
+			if actualSHA != loc.Entry.SHA256 {
+				errutil.CloseAndLog(stream, "decoded stream")
+				return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: checksum mismatch: got %x, expected %x",
+					loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, actualSHA, loc.Entry.SHA256)
+			}
+		}
+		return stream, nil
 	}
 
 	// 1. Try standalone loose blob directly
@@ -358,7 +382,32 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 		if err := s.backend.GetObject(ctx, "", loc.PackKey, int64(loc.Entry.DataOffset), int64(loc.Entry.StoredLength), &buf); err != nil {
 			return nil, fmt.Errorf("failed to read blob from pack %s: %w", loc.PackKey, err)
 		}
-		return DecodeBlobFromPayload(&buf, loc.Entry)
+		if loc.PackVersion == VersionV1 {
+			return DecodeBlobFromPayload(&buf, loc.Entry)
+		}
+		if int64(buf.Len()) != int64(loc.Entry.StoredLength) {
+			return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: expected stored length %d, got %d",
+				loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, loc.Entry.StoredLength, buf.Len())
+		}
+		stream, err := decodePayloadToByteStream(&buf, loc.Entry.Encoding, int64(loc.Entry.FinalLength))
+		if err != nil {
+			return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: %w",
+				loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, err)
+		}
+		if loc.Entry.SHA256 != [32]byte{} {
+			actualSHA, err := computeStreamSHA256(stream)
+			if err != nil {
+				errutil.CloseAndLog(stream, "decoded stream")
+				return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: %w",
+					loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, err)
+			}
+			if actualSHA != loc.Entry.SHA256 {
+				errutil.CloseAndLog(stream, "decoded stream")
+				return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: checksum mismatch: got %x, expected %x",
+					loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, actualSHA, loc.Entry.SHA256)
+			}
+		}
+		return stream, nil
 	}
 
 	return nil, fmt.Errorf("blob %s not found", sha256Hex)
