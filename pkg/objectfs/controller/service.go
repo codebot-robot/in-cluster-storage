@@ -152,6 +152,8 @@ type Server struct {
 	streamFactory            func(volumeID string) (walclient.Stream, error)
 	syncCoalesceWindow       time.Duration
 	maxStagingBytes          int64
+	stagingMaxBytes          int64
+	stagingBudget            *StagingBudget
 	syncTimeout              time.Duration
 	openBarrierTimeout       time.Duration
 	acceptUnversioned        bool
@@ -166,6 +168,66 @@ type Server struct {
 	exclusiveHoldsMu  sync.RWMutex
 	exclusiveHolds    map[string]*ExclusiveHold
 	exclusiveLeaseTTL time.Duration
+}
+
+// StagingBudget tracks controller-wide open-pack staged bytes on disk across all volumes.
+type StagingBudget struct {
+	mu           sync.Mutex
+	cond         *sync.Cond
+	maxBytes     int64
+	currentBytes int64
+	syncTrigger  func(ctx context.Context, neededBytes int64) error
+}
+
+// NewStagingBudget creates a new StagingBudget with the given byte cap.
+func NewStagingBudget(maxBytes int64) *StagingBudget {
+	sb := &StagingBudget{maxBytes: maxBytes}
+	sb.cond = sync.NewCond(&sb.mu)
+	return sb
+}
+
+// WouldOverflow returns true if adding addBytes would exceed maxBytes.
+func (b *StagingBudget) WouldOverflow(addBytes int64) bool {
+	if b == nil || b.maxBytes <= 0 {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.currentBytes+addBytes > b.maxBytes
+}
+
+// Add adds bytes to the current staged total.
+func (b *StagingBudget) Add(bytes int64) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.currentBytes += bytes
+	b.mu.Unlock()
+}
+
+// Sub subtracts bytes from the current staged total and notifies waiters.
+func (b *StagingBudget) Sub(bytes int64) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.currentBytes -= bytes
+	if b.currentBytes < 0 {
+		b.currentBytes = 0
+	}
+	b.cond.Broadcast()
+	b.mu.Unlock()
+}
+
+// Current returns the current staged byte total.
+func (b *StagingBudget) Current() int64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.currentBytes
 }
 
 // ExclusiveHold tracks an active exclusive-local hold on a volume.
@@ -313,7 +375,20 @@ func WithServerSyncCoalesceWindow(d time.Duration) ServerOption {
 	}
 }
 
-// WithServerMaxStagingBytes sets the maximum byte bound for in-memory staged writes across all volumes.
+// WithServerStagingMaxBytes sets the controller-wide maximum byte size of staged writes on disk across all volumes.
+func WithServerStagingMaxBytes(b int64) ServerOption {
+	return func(s *Server) {
+		s.stagingMaxBytes = b
+		if s.stagingBudget != nil {
+			s.stagingBudget.mu.Lock()
+			s.stagingBudget.maxBytes = b
+			s.stagingBudget.cond.Broadcast()
+			s.stagingBudget.mu.Unlock()
+		}
+	}
+}
+
+// WithServerMaxStagingBytes sets the maximum byte bound for staged writes per volume before triggering a sync.
 func WithServerMaxStagingBytes(b int64) ServerOption {
 	return func(s *Server) {
 		s.maxStagingBytes = b
@@ -359,6 +434,31 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		exclusiveLeaseTTL: 30 * time.Second,
 		syncTimeout:       10 * time.Minute,
 		defaultDurability: walclient.Local,
+		maxStagingBytes:   64 * 1024 * 1024,
+		stagingMaxBytes:   4 * 1024 * 1024 * 1024,
+	}
+	s.stagingBudget = NewStagingBudget(s.stagingMaxBytes)
+	s.stagingBudget.syncTrigger = func(ctx context.Context, neededBytes int64) error {
+		s.mu.RLock()
+		var topVol *Volume
+		var maxStaged int64
+		for _, v := range s.volumes {
+			staged := v.StagedBytesOnDisk()
+			if staged > maxStaged {
+				maxStaged = staged
+				topVol = v
+			}
+		}
+		s.mu.RUnlock()
+
+		if topVol != nil && maxStaged > 0 {
+			syncCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+			defer cancel()
+			if err := topVol.Fsync(syncCtx, 0); err != nil {
+				return fmt.Errorf("staging budget sync failed on volume %s: %w", topVol.volumeID, err)
+			}
+		}
+		return nil
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -429,6 +529,11 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 				return nil, fmt.Errorf("failed to create metadata dir %s for volume %s: %w", volDir, volumeID, err)
 			}
 			volOpts = append(volOpts, WithLocalStorageDir(volDir))
+			stagingDir := filepath.Join(s.metadataDir, "staging", volumeID)
+			volOpts = append(volOpts, WithStagingDir(stagingDir))
+		} else if s.localStorageDir != "" {
+			stagingDir := filepath.Join(s.localStorageDir, "staging", volumeID)
+			volOpts = append(volOpts, WithStagingDir(stagingDir))
 		}
 		if s.metadataCacheEntries > 0 || s.metadataCacheBytes > 0 {
 			volOpts = append(volOpts, WithMetadataCacheLimits(s.metadataCacheEntries, s.metadataCacheBytes))
@@ -456,6 +561,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if s.maxStagingBytes > 0 {
 			volOpts = append(volOpts, WithMaxStagingBytes(s.maxStagingBytes))
+		}
+		if s.stagingBudget != nil {
+			volOpts = append(volOpts, WithSharedStagingBudget(s.stagingBudget))
 		}
 		if s.syncTimeout > 0 {
 			volOpts = append(volOpts, WithSyncTimeout(s.syncTimeout))
@@ -729,6 +837,7 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 	}
 	bytesWritten, newSize, modTime, stagingEpoch, err := vol.WriteFileWithEpoch(ctx, req.GetInode(), req.GetOffset(), req.GetData(), req.GetWriteMode())
 	if err != nil {
+		klog.Warningf("WriteFile failed on volume %s for inode %d: %v", req.GetVolumeId(), req.GetInode(), err)
 		return &pb.WriteFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.WriteFileResponse{

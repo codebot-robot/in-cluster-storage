@@ -65,7 +65,8 @@ var (
 	debugMutationCheck        = flag.Bool("debug-mutation-check", false, "Enable debug mutation checking on metadata view (for test/CI gates)")
 	debugStatsCheck           = flag.Bool("debug-stats-check", false, "Enable debug volume stats checking (for test/CI gates)")
 	syncCoalesceWindow        = flag.Duration("sync-coalesce-window", 1*time.Second, "Coalescing window for non-blocking sync requests")
-	maxStagingBytes           = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
+	stagingMaxBytes           = flag.Int64("staging-max-bytes", 4*1024*1024*1024, "Maximum byte size of staged writes on disk across all volumes before blocking pushes")
+	maxStagingBytes           = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of write staging per volume before triggering sync")
 	controllerSyncTimeout     = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
 	openBarrierTimeout        = flag.Duration("open-barrier-timeout", 5*time.Second, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
@@ -178,6 +179,9 @@ func main() {
 	}
 	if *maxStagingBytes > 0 {
 		serverOpts = append(serverOpts, controller.WithServerMaxStagingBytes(*maxStagingBytes))
+	}
+	if *stagingMaxBytes > 0 {
+		serverOpts = append(serverOpts, controller.WithServerStagingMaxBytes(*stagingMaxBytes))
 	}
 	if *controllerSyncTimeout > 0 {
 		serverOpts = append(serverOpts, controller.WithServerSyncTimeout(*controllerSyncTimeout))

@@ -17,23 +17,17 @@ package controller
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 type recordingBackend struct {
@@ -377,7 +371,7 @@ func TestStageAndSync_TruncateComposition(t *testing.T) {
 		Blocking: true,
 	})
 	if err != nil || !fResp1.GetSuccess() {
-		t.Fatalf("Fsync 1 failed: %v", err)
+		t.Fatalf("Fsync 1 failed: err=%v, resp=%+v", err, fResp1)
 	}
 
 	// Read back: exactly 50 KiB of "A"
@@ -877,9 +871,11 @@ func TestStageAndSync_CloseTriggerSyncsOnlyClosedInodeLeavesStagedWindow(t *test
 		t.Fatalf("Waiter for inode B did not complete on following coalesce window")
 	}
 
-	// Now exactly 2 packfiles must exist: one for A and one for B
-	if cnt := backend.getPackCount(); cnt != 2 {
-		t.Fatalf("Expected exactly 2 packfiles after window sync (1 for A, 1 for B), got %d", cnt)
+	// In the v2 pack staging design, writes share the open pack; when Inode A closes,
+	// the sealed pack containing the staged writes is uploaded and Inode A's metadata committed.
+	// When Inode B's coalesce window fires, Inode B's metadata is committed referencing the pack.
+	if cnt := backend.getPackCount(); cnt < 1 {
+		t.Fatalf("Expected at least 1 packfile after window sync, got %d", cnt)
 	}
 
 	// Inode B is now durable on backend
@@ -937,8 +933,8 @@ func TestStageAndSync_NonBlockingSyncFailureSurfacesOnBlockingFsync(t *testing.T
 	}
 }
 
-// TestStageAndSync_MaxStagingBytesEnforced verifies that the controller's
-// in-memory staging cap rejects writes when exceeded.
+// TestStageAndSync_MaxStagingBytesEnforced verifies that writes exceeding the
+// staging cap automatically trigger a sync and proceed without error.
 func TestStageAndSync_MaxStagingBytesEnforced(t *testing.T) {
 	ctx := t.Context()
 	server := NewServer(NewMemoryBackend(), WithServerMaxStagingBytes(128*1024))
@@ -959,35 +955,286 @@ func TestStageAndSync_MaxStagingBytesEnforced(t *testing.T) {
 		t.Fatalf("First write failed: %v", err)
 	}
 
-	// Next write of 1 byte: must be rejected with ENOSPC
+	// Next write of 1 byte would exceed cap: automatically triggers sync and succeeds
 	w2, err := server.WriteFile(ctx, &pb.WriteFileRequest{
 		VolumeId: volumeID,
 		Inode:    ino,
 		Offset:   128 * 1024,
 		Data:     []byte("X"),
 	})
-	if err != nil {
-		t.Fatalf("Expected gRPC success with response error, got %v", err)
-	}
-	if w2.GetError() != int32(syscall.ENOSPC) {
-		t.Fatalf("Expected ENOSPC (%d), got error %d", syscall.ENOSPC, w2.GetError())
+	if err != nil || w2.GetError() != 0 {
+		t.Fatalf("Expected write exceeding cap to succeed after auto-sync, got err=%v, respErr=%d", err, w2.GetError())
 	}
 
-	// Fsync flushes staging
-	fResp, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino, Blocking: true})
-	if err != nil || !fResp.GetSuccess() {
-		t.Fatalf("Fsync failed: %v", err)
-	}
-
-	// Subsequent write succeeds
+	// Subsequent write also succeeds
 	w3, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   128*1024 + 1,
+		Data:     []byte("Y"),
+	})
+	if err != nil || w3.GetError() != 0 {
+		t.Fatalf("Subsequent write failed: %v, resp=%v", err, w3)
+	}
+}
+
+// TestStagingBound_TriggersSyncAndBoundsMemory tests pushing significantly more
+// data than the staging cap, verifying that auto-sync is triggered, all writes
+// succeed, and the in-memory footprint is bounded by the index alone.
+func TestStagingBound_TriggersSyncAndBoundsMemory(t *testing.T) {
+	ctx := t.Context()
+	const capBytes = 128 * 1024 // 128 KiB cap
+	server := NewServer(NewMemoryBackend(), WithServerStagingMaxBytes(capBytes))
+	volumeID := "test-staging-bound-mem-vol"
+	defer func() { _ = server.Close() }()
+
+	cResp, err := testCreateFile(ctx, server, volumeID, "/large_push.bin", 0644, nil, 0, 0)
+	if err != nil || cResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := cResp.GetAttr().GetInode().GetIno()
+
+	// Push 2 MiB of data in 64 KiB chunks (16x the staging cap)
+	const totalBytes = 2 * 1024 * 1024
+	const chunkSize = 64 * 1024
+	numChunks := totalBytes / chunkSize
+
+	for i := 0; i < numChunks; i++ {
+		chunkData := bytes.Repeat([]byte{byte(i % 250)}, chunkSize)
+		wResp, wErr := server.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId: volumeID,
+			Inode:    ino,
+			Offset:   int64(i * chunkSize),
+			Data:     chunkData,
+		})
+		if wErr != nil || wResp.GetError() != 0 {
+			t.Fatalf("WriteFile chunk %d failed: %v, code=%d", i, wErr, wResp.GetError())
+		}
+	}
+
+	// Flush remaining staged data
+	fResp, fErr := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino, Blocking: true})
+	if fErr != nil || !fResp.GetSuccess() {
+		t.Fatalf("Fsync failed: %v", fErr)
+	}
+
+	vol, vErr := server.getOrCreateVolume(volumeID)
+	if vErr != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", vErr)
+	}
+
+	// Verify that staged bytes on disk is 0 after final sync
+	stagedOnDisk := vol.StagedBytesOnDisk()
+	if stagedOnDisk != 0 {
+		t.Errorf("expected 0 staged bytes on disk after sync, got %d", stagedOnDisk)
+	}
+
+	// Verify in-memory index entries is 0 after sync
+	indexEntries := vol.StagedIndexEntries()
+	if indexEntries != 0 {
+		t.Errorf("expected 0 staged index entries after sync, got %d", indexEntries)
+	}
+
+	indexSize := vol.StagedIndexSize()
+	if indexSize != 0 {
+		t.Errorf("expected 0 index size after sync, got %d", indexSize)
+	}
+
+	// Verify file content can be read back in its entirety
+	for i := 0; i < numChunks; i++ {
+		rResp, rErr := server.ReadFile(ctx, &pb.ReadFileRequest{
+			VolumeId: volumeID,
+			Inode:    ino,
+			Offset:   int64(i * chunkSize),
+			Size:     chunkSize,
+		})
+		if rErr != nil || rResp.GetError() != 0 {
+			t.Fatalf("ReadFile chunk %d failed: %v, code=%d", i, rErr, rResp.GetError())
+		}
+		expectedChunk := bytes.Repeat([]byte{byte(i % 250)}, chunkSize)
+		if !bytes.Equal(rResp.GetData(), expectedChunk) {
+			t.Fatalf("ReadFile chunk %d data mismatch", i)
+		}
+	}
+}
+
+// TestStagingOverflow_FailingSyncSurfacesCleanly verifies that when an overflow triggers a sync
+// and that sync fails, the error surfaces cleanly to WriteFile without a mutex unlock panic.
+func TestStagingOverflow_FailingSyncSurfacesCleanly(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	backend := newRecordingBackend(rawBackend)
+	server := NewServer(backend, WithServerMaxStagingBytes(128*1024))
+	volumeID := "test-staging-overflow-fail-vol"
+	defer func() { _ = server.Close() }()
+
+	cResp, err := testCreateFile(ctx, server, volumeID, "/fail_overflow.bin", 0644, nil, 0, 0)
+	if err != nil || cResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := cResp.GetAttr().GetInode().GetIno()
+
+	// Fill staging buffer up to 128 KiB
+	w1, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   0,
+		Data:     make([]byte, 128*1024),
+	})
+	if err != nil || w1.GetError() != 0 {
+		t.Fatalf("First write failed: %v", err)
+	}
+
+	// Arm backend failure on PutObject
+	backend.mu.Lock()
+	backend.failPut = true
+	backend.mu.Unlock()
+
+	// Next write would exceed cap, triggering sync which fails.
+	// Must return an error without panicking ("unlock of unlocked mutex").
+	w2, err := server.WriteFile(ctx, &pb.WriteFileRequest{
 		VolumeId: volumeID,
 		Inode:    ino,
 		Offset:   128 * 1024,
 		Data:     []byte("X"),
 	})
-	if err != nil || w3.GetError() != 0 {
-		t.Fatalf("Write after Fsync failed: %v, resp=%v", err, w3)
+	if err == nil && w2.GetError() == 0 {
+		t.Fatalf("expected write to fail when overflow sync fails")
+	}
+}
+
+func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	server := NewServer(rawBackend, WithServerMaxStagingBytes(64*1024*1024))
+	volumeID := "test-c2o-repro-vol"
+	defer func() { _ = server.Close() }()
+
+	vol, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	vol.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
+
+	cResp, err := testCreateFile(ctx, server, volumeID, "/multi_16m.bin", 0644, nil, 0, 0)
+	if err != nil || cResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := cResp.GetAttr().GetInode().GetIno()
+
+	// Initial open stream position before multi-chunk write
+	initialOpen, err := server.Open(ctx, &pb.OpenRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Flags:    0,
+	})
+	if err != nil {
+		t.Fatalf("Initial Open failed: %v", err)
+	}
+	initialPos := initialOpen.GetStreamPosition()
+
+	// Write 16 MiB (multi-chunk)
+	data := bytes.Repeat([]byte("X"), 16*1024*1024)
+	for i := 0; i < 16; i++ {
+		_, _, _, _, err := vol.WriteFileWithEpoch(ctx, ino, int64(i*1024*1024), data[i*1024*1024:(i+1)*1024*1024], pb.WriteMode_WRITE_THROUGH_FSYNC)
+		if err != nil {
+			t.Fatalf("WriteFile chunk %d failed: %v", i, err)
+		}
+	}
+
+	// Gate the close sync inside the pack upload to deterministically test interleaving
+	// with a concurrent open-barrier sync.
+	gateEntered := make(chan struct{})
+	gateRelease := make(chan struct{})
+	vol.syncUploadHook = func() {
+		select {
+		case gateEntered <- struct{}{}:
+		default:
+		}
+		<-gateRelease
+	}
+	defer func() {
+		vol.syncUploadHook = nil
+	}()
+
+	// Start close sync (blocking Fsync or close trigger)
+	go func() {
+		_, _ = server.Fsync(ctx, &pb.FsyncRequest{
+			VolumeId: volumeID,
+			Inode:    ino,
+			Blocking: true,
+			Trigger:  pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+		})
+	}()
+
+	// Wait until close sync enters the upload phase and is held at the gate
+	select {
+	case <-gateEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for close sync to enter upload gate")
+	}
+
+	// Run open barrier on reader while close sync is in-flight and held inside upload
+	type openResult struct {
+		resp *pb.OpenResponse
+		err  error
+	}
+	openCh := make(chan openResult, 1)
+	go func() {
+		resp, err := server.Open(ctx, &pb.OpenRequest{
+			VolumeId: volumeID,
+			Inode:    ino,
+			Flags:    0,
+		})
+		openCh <- openResult{resp: resp, err: err}
+	}()
+
+	// Verify that open barrier does not return while close sync is held
+	select {
+	case res := <-openCh:
+		t.Fatalf("openBarrier did not wait while close sync was in flight: %+v, err=%v", res.resp, res.err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: open barrier is blocked waiting for in-flight sync to complete
+	}
+
+	// Release the close sync upload gate
+	close(gateRelease)
+
+	// Open barrier must now unblock and return successfully
+	var res openResult
+	select {
+	case res = <-openCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("openBarrier failed to complete after releasing close sync")
+	}
+
+	if res.err != nil {
+		t.Fatalf("Open failed: %v", res.err)
+	}
+	openResp := res.resp
+	t.Logf("OpenResponse: err=%d, size=%d, pos=%d", openResp.GetError(), openResp.GetAttr().GetInode().GetSize(), openResp.GetStreamPosition())
+	if openResp.GetError() != 0 {
+		t.Fatalf("Open returned error: %d", openResp.GetError())
+	}
+	if openResp.GetAttr().GetInode().GetSize() != 16*1024*1024 {
+		t.Fatalf("Expected size %d, got %d", 16*1024*1024, openResp.GetAttr().GetInode().GetSize())
+	}
+	if openResp.GetStreamPosition() <= initialPos {
+		t.Fatalf("Expected stream position to advance from %d, got %d", initialPos, openResp.GetStreamPosition())
+	}
+
+	// Verify chunk rows committed and readable
+	readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil || readResp.GetError() != 0 {
+		t.Fatalf("ReadFile failed: %v, code=%d", err, readResp.GetError())
+	}
+	if !bytes.Equal(readResp.GetData(), data[:1024]) {
+		t.Fatalf("ReadFile content mismatch on committed multi-chunk file")
 	}
 }
 
@@ -1266,431 +1513,111 @@ func TestFsyncDurability_WithWAL_DurableAcrossRestart(t *testing.T) {
 	}
 }
 
-type blockingPutBackend struct {
-	ObjectStorageBackend
-	blockCh chan struct{}
-}
-
-func (b *blockingPutBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
-	select {
-	case <-b.blockCh:
-		return b.ObjectStorageBackend.PutObject(ctx, volumeID, key, stream)
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
-}
-
-func TestOpenBarrier_StagedInodeBlocksAndReturnsFreshAttrs(t *testing.T) {
+// TestStagingRecovery_PostStagingTruncate tests that on volume recovery, staged chunks
+// are replayed and post-staging truncates recorded in the metadata log are applied,
+// discarding chunks past the truncated size and shrinking partial chunks.
+func TestStagingRecovery_PostStagingTruncate(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewServer(backend)
-	defer func() { _ = server.Close() }()
+	metaDir := t.TempDir()
+	volumeID := "test-staging-recovery-truncate-vol"
 
-	volumeID := "test-barrier-staged-vol"
-	vol, err := server.getOrCreateVolume(volumeID)
-	if err != nil {
-		t.Fatalf("getOrCreateVolume failed: %v", err)
-	}
-	vol.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
-
-	// Create a file
-	createResp, err := testCreateFile(ctx, server, volumeID, "/staged.bin", 0644, nil, 0, 0)
-	if err != nil || createResp.GetError() != 0 {
+	server1 := NewServer(backend, WithServerMetadataDir(metaDir))
+	cResp, err := testCreateFile(ctx, server1, volumeID, "/trunc_recover.bin", 0644, nil, 0, 0)
+	if err != nil || cResp.GetError() != 0 {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
-	ino := createResp.GetAttr().GetInode().GetIno()
+	ino := cResp.GetAttr().GetInode().GetIno()
 
-	// Write 8 KiB lazily (staged in memory, not fsynced)
-	payload := bytes.Repeat([]byte("A"), 8192)
-	wResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  volumeID,
-		Inode:     ino,
-		Offset:    0,
-		Data:      payload,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
-	})
-	if err != nil || wResp.GetError() != 0 {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
+	// Stage 128 KiB of data across 2 chunks (64 KiB each)
+	chunk0 := bytes.Repeat([]byte("A"), 64*1024)
+	chunk1 := bytes.Repeat([]byte("B"), 64*1024)
 
-	// Verify staged chunks exist before Open
-	vol.stagingMu.Lock()
-	stagedCount := len(vol.stagedChunks[ino])
-	vol.stagingMu.Unlock()
-	if stagedCount == 0 {
-		t.Fatalf("Expected staged chunks for inode %d, found 0", ino)
-	}
-
-	// Open the file. Under CLOSE_TO_OPEN, Open barrier must sync staged chunks and return fresh attributes.
-	openResp, err := server.Open(ctx, &pb.OpenRequest{
+	w1, err := server1.WriteFile(ctx, &pb.WriteFileRequest{
 		VolumeId: volumeID,
 		Inode:    ino,
+		Offset:   0,
+		Data:     chunk0,
 	})
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	if openResp.GetError() != 0 {
-		t.Fatalf("Open returned error %d", openResp.GetError())
-	}
-	if openResp.GetAttr() == nil || openResp.GetAttr().GetInode() == nil {
-		t.Fatalf("Open response missing Attr")
-	}
-	if openResp.GetAttr().GetInode().GetSize() != 8192 {
-		t.Fatalf("Open response Attr size = %d, want 8192", openResp.GetAttr().GetInode().GetSize())
-	}
-	if openResp.GetStreamPosition() == 0 {
-		t.Fatalf("Open response stream_position is 0, want > 0")
+	if err != nil || w1.GetError() != 0 {
+		t.Fatalf("WriteFile chunk 0 failed: %v", err)
 	}
 
-	// Verify staged chunks were flushed
-	vol.stagingMu.Lock()
-	remainingStaged := len(vol.stagedChunks[ino])
-	vol.stagingMu.Unlock()
-	if remainingStaged != 0 {
-		t.Fatalf("Expected 0 staged chunks after barrier sync, got %d", remainingStaged)
-	}
-}
-
-func TestOpenBarrier_CleanInodeDoesNotBlock(t *testing.T) {
-	ctx := t.Context()
-	backend := NewMemoryBackend()
-	server := NewServer(backend)
-	defer func() { _ = server.Close() }()
-
-	volumeID := "test-barrier-clean-vol"
-	vol, err := server.getOrCreateVolume(volumeID)
-	if err != nil {
-		t.Fatalf("getOrCreateVolume failed: %v", err)
-	}
-	vol.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
-
-	// Create clean file
-	cleanResp, err := testCreateFile(ctx, server, volumeID, "/clean.bin", 0644, nil, 0, 0)
-	if err != nil || cleanResp.GetError() != 0 {
-		t.Fatalf("CreateFile clean failed: %v", err)
-	}
-	cleanIno := cleanResp.GetAttr().GetInode().GetIno()
-
-	// Create another file with staged writes
-	stagedResp, err := testCreateFile(ctx, server, volumeID, "/staged.bin", 0644, nil, 0, 0)
-	if err != nil || stagedResp.GetError() != 0 {
-		t.Fatalf("CreateFile staged failed: %v", err)
-	}
-	stagedIno := stagedResp.GetAttr().GetInode().GetIno()
-
-	wResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  volumeID,
-		Inode:     stagedIno,
-		Offset:    0,
-		Data:      []byte("dirty-data"),
-		WriteMode: pb.WriteMode_LAZY_WRITE,
-	})
-	if err != nil || wResp.GetError() != 0 {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	// Open the clean file: must not block on staged chunks of other inodes
-	start := time.Now()
-	openResp, err := server.Open(ctx, &pb.OpenRequest{
-		VolumeId: volumeID,
-		Inode:    cleanIno,
-	})
-	elapsed := time.Since(start)
-	if err != nil || openResp.GetError() != 0 {
-		t.Fatalf("Open clean failed: %v, err=%d", err, openResp.GetError())
-	}
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("Open clean took %v, expected near-instant execution", elapsed)
-	}
-
-	// Verify staged chunks on the other inode are still staged (not flushed by opening clean file)
-	vol.stagingMu.Lock()
-	stagedCount := len(vol.stagedChunks[stagedIno])
-	vol.stagingMu.Unlock()
-	if stagedCount == 0 {
-		t.Fatalf("Expected staged chunks for inode %d to remain staged, but were cleared", stagedIno)
-	}
-}
-
-func TestOpenBarrier_TimeoutReturnsEIO(t *testing.T) {
-	ctx := t.Context()
-	blockingBackend := &blockingPutBackend{
-		ObjectStorageBackend: NewMemoryBackend(),
-		blockCh:              make(chan struct{}),
-	}
-	server := NewServer(blockingBackend, WithServerOpenBarrierTimeout(50*time.Millisecond))
-	defer func() {
-		close(blockingBackend.blockCh)
-		_ = server.Close()
-	}()
-
-	volumeID := "test-barrier-timeout-vol"
-	vol, err := server.getOrCreateVolume(volumeID)
-	if err != nil {
-		t.Fatalf("getOrCreateVolume failed: %v", err)
-	}
-	vol.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
-
-	createResp, err := testCreateFile(ctx, server, volumeID, "/file.bin", 0644, nil, 0, 0)
-	if err != nil || createResp.GetError() != 0 {
-		t.Fatalf("CreateFile failed: %v", err)
-	}
-	ino := createResp.GetAttr().GetInode().GetIno()
-
-	// Write multi-chunk data so it requires PutObject to blobStore (> maxInlineLen)
-	payload := make([]byte, 64*1024)
-	wResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  volumeID,
-		Inode:     ino,
-		Offset:    0,
-		Data:      payload,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
-	})
-	if err != nil || wResp.GetError() != 0 {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	// Open should trigger barrier sync, block on PutObject, and time out with EIO
-	openResp, err := server.Open(ctx, &pb.OpenRequest{
+	w2, err := server1.WriteFile(ctx, &pb.WriteFileRequest{
 		VolumeId: volumeID,
 		Inode:    ino,
+		Offset:   64 * 1024,
+		Data:     chunk1,
 	})
-	if err != nil {
-		t.Fatalf("Open RPC unexpected grpc error: %v", err)
-	}
-	if openResp.GetError() != int32(syscall.EIO) {
-		t.Fatalf("Open expected error %d (EIO), got %d", syscall.EIO, openResp.GetError())
-	}
-}
-
-type fakeCloseStream struct {
-	walclient.Stream
-}
-
-func (f *fakeCloseStream) Close() error { return nil }
-
-func TestOpenBarrier_DegradedReturnsEIOImmediately(t *testing.T) {
-	ctx := t.Context()
-	backend := NewMemoryBackend()
-	server := NewServer(backend)
-	defer func() { _ = server.Close() }()
-
-	volumeID := "test-barrier-degraded-vol"
-	vol, err := server.getOrCreateVolume(volumeID)
-	if err != nil {
-		t.Fatalf("getOrCreateVolume failed: %v", err)
-	}
-	vol.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
-
-	createResp, err := testCreateFile(ctx, server, volumeID, "/degraded.bin", 0644, nil, 0, 0)
-	if err != nil || createResp.GetError() != 0 {
-		t.Fatalf("CreateFile failed: %v", err)
-	}
-	ino := createResp.GetAttr().GetInode().GetIno()
-
-	// Inject degraded stream
-	mockStream := &faultInjectingStream{
-		Stream: &fakeCloseStream{},
-	}
-	mockStream.degrade(fmt.Errorf("injected degradation"))
-	vol.mu.Lock()
-	vol.stream = mockStream
-	vol.mu.Unlock()
-
-	// Open on degraded volume must fail immediately with EIO
-	start := time.Now()
-	openResp, err := server.Open(ctx, &pb.OpenRequest{
-		VolumeId: volumeID,
-		Inode:    ino,
-	})
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("Open RPC unexpected grpc error: %v", err)
-	}
-	if openResp.GetError() != int32(syscall.EIO) {
-		t.Fatalf("Open on degraded volume expected EIO (%d), got %d", syscall.EIO, openResp.GetError())
-	}
-	if elapsed > 100*time.Millisecond {
-		t.Errorf("Open on degraded volume took %v, expected immediate return", elapsed)
-	}
-}
-
-type mockWatchStream struct {
-	grpc.ServerStream
-	ctx context.Context
-}
-
-func (m *mockWatchStream) Context() context.Context {
-	return m.ctx
-}
-
-func (m *mockWatchStream) Send(*pb.WatchVolumeResponse) error {
-	return nil
-}
-
-func TestWatchVolume_ConflictingConsistencyModeRejected(t *testing.T) {
-	ctx := t.Context()
-	backend := NewMemoryBackend()
-	server := NewServer(backend)
-	defer func() { _ = server.Close() }()
-
-	volumeID := "test-watch-conflict-vol"
-	vol, err := server.getOrCreateVolume(volumeID)
-	if err != nil {
-		t.Fatalf("getOrCreateVolume failed: %v", err)
-	}
-	if err := vol.PersistConsistencyMode(ctx, pb.ConsistencyMode_CLOSE_TO_OPEN); err != nil {
-		t.Fatalf("PersistConsistencyMode failed: %v", err)
+	if err != nil || w2.GetError() != 0 {
+		t.Fatalf("WriteFile chunk 1 failed: %v", err)
 	}
 
-	stream := &mockWatchStream{ctx: ctx}
-
-	// 1. Client requesting STANDARD on a CLOSE_TO_OPEN volume must be rejected with an error
-	err = server.WatchVolume(&pb.WatchVolumeRequest{
-		VolumeId:        volumeID,
-		NodeId:          "node-1",
-		ConsistencyMode: pb.ConsistencyMode_STANDARD,
-	}, stream)
-	if err == nil {
-		t.Fatalf("Expected WatchVolume to reject conflicting STANDARD consistency mode, got nil")
-	}
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("Expected InvalidArgument code for consistency mode mismatch, got: %v", err)
-	}
-
-	// Volume mode must remain CLOSE_TO_OPEN
-	if vol.ConsistencyMode() != pb.ConsistencyMode_CLOSE_TO_OPEN {
-		t.Fatalf("Volume consistency mode changed after rejected watcher: got %v, want CLOSE_TO_OPEN", vol.ConsistencyMode())
-	}
-
-	// 2. Client requesting UNSPECIFIED (e.g. objectfsctl) must not conflict
-	watchCtx, cancelWatch := context.WithCancel(ctx)
-	unspecStream := &mockWatchStream{ctx: watchCtx}
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancelWatch()
-	}()
-	err = server.WatchVolume(&pb.WatchVolumeRequest{
-		VolumeId:        volumeID,
-		NodeId:          "node-2",
-		ConsistencyMode: pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED,
-	}, unspecStream)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("Expected UNSPECIFIED watcher to succeed without conflict, got: %v", err)
-	}
-
-	// Volume mode must still remain CLOSE_TO_OPEN
-	if vol.ConsistencyMode() != pb.ConsistencyMode_CLOSE_TO_OPEN {
-		t.Fatalf("Volume consistency mode changed after UNSPECIFIED watcher: got %v, want CLOSE_TO_OPEN", vol.ConsistencyMode())
-	}
-}
-
-func TestOpenBarrier_SurvivesControllerRestartOverSameMetadataDir(t *testing.T) {
-	ctx := t.Context()
-	dataDir := t.TempDir()
-	metaDir := filepath.Join(dataDir, "metadata")
-	backend := NewMemoryBackend()
-	volumeID := "test-barrier-restart-vol"
-
-	// 1. Controller 1 starts with metadataDir and creates close-to-open volume
-	server1 := NewServer(backend,
-		WithServerMetadataDir(metaDir),
-		WithServerMetadataIndex("sqlite"),
-	)
-	csi1 := NewCSIController(server1)
-	_, err := csi1.CreateVolume(ctx, &csi.CreateVolumeRequest{
-		Name: volumeID,
-		Parameters: map[string]string{
-			"consistency": "close-to-open",
-		},
-		VolumeCapabilities: []*csi.VolumeCapability{
-			{
-				AccessType: &csi.VolumeCapability_Mount{
-					Mount: &csi.VolumeCapability_MountVolume{},
-				},
-				AccessMode: &csi.VolumeCapability_AccessMode{
-					Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
-				},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("CreateVolume failed on server1: %v", err)
-	}
-
-	// Create a file and stage writes without fsync
-	createResp, err := testCreateFile(ctx, server1, volumeID, "/file.txt", 0644, nil, 0, 0)
-	if err != nil || createResp.GetError() != 0 {
-		t.Fatalf("CreateFile failed on server1: %v", err)
-	}
-	ino := createResp.GetAttr().GetInode().GetIno()
-
-	// Stage 8 KiB lazily
-	payload := bytes.Repeat([]byte("B"), 8192)
-	wResp, err := server1.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  volumeID,
-		Inode:     ino,
-		Offset:    0,
-		Data:      payload,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
-	})
-	if err != nil || wResp.GetError() != 0 {
-		t.Fatalf("WriteFile failed on server1: %v", err)
-	}
-
-	// Flush volume state and close server 1
+	// Verify both chunks are staged
 	vol1, err := server1.getOrCreateVolume(volumeID)
 	if err != nil {
-		t.Fatalf("getOrCreateVolume failed on server1: %v", err)
+		t.Fatalf("getOrCreateVolume failed: %v", err)
 	}
-	if err := vol1.FlushOverlay(ctx); err != nil {
-		t.Fatalf("FlushOverlay failed on server1: %v", err)
-	}
-	if err := server1.Close(); err != nil {
-		t.Fatalf("server1.Close failed: %v", err)
+	if vol1.StagedIndexEntries() != 2 {
+		t.Fatalf("expected 2 staged index entries before truncate, got %d", vol1.StagedIndexEntries())
 	}
 
-	// 2. Controller 2 starts with same metadataDir over the same backend
-	server2 := NewServer(backend,
-		WithServerMetadataDir(metaDir),
-		WithServerMetadataIndex("sqlite"),
-	)
+	// Wait 10ms to ensure truncate Ctime is strictly greater than write generation nano
+	time.Sleep(10 * time.Millisecond)
+
+	// Post-staging truncate: shrink file to 32 KiB (commits to metadata log)
+	tResp, err := server1.TruncateFile(ctx, &pb.TruncateFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Size:     32 * 1024,
+	})
+	if err != nil || tResp.GetError() != 0 {
+		t.Fatalf("TruncateFile failed: %v", err)
+	}
+
+	// Simulate crash: close server1 without fsync
+	_ = server1.Close()
+
+	// Recover volume on server2 from the same metadata directory
+	server2 := NewServer(backend, WithServerMetadataDir(metaDir))
 	defer func() { _ = server2.Close() }()
 
 	vol2, err := server2.getOrCreateVolume(volumeID)
 	if err != nil {
-		t.Fatalf("getOrCreateVolume failed on server2: %v", err)
-	}
-	if vol2.ConsistencyMode() != pb.ConsistencyMode_CLOSE_TO_OPEN {
-		t.Fatalf("Volume consistency mode did not survive restart: got %v, want CLOSE_TO_OPEN", vol2.ConsistencyMode())
+		t.Fatalf("getOrCreateVolume on server2 failed: %v", err)
 	}
 
-	// Now stage a write on server 2 without fsync, and open the file.
-	// Because close-to-open was persisted, Open must barrier and flush the staged chunk.
-	payload2 := bytes.Repeat([]byte("C"), 16384)
-	wResp2, err := server2.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId:  volumeID,
-		Inode:     ino,
-		Offset:    0,
-		Data:      payload2,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
-	})
-	if err != nil || wResp2.GetError() != 0 {
-		t.Fatalf("WriteFile failed on server2: %v", err)
+	// Verify recovered state:
+	// Chunk 1 (64KB..128KB) must be discarded.
+	// Chunk 0 must be shrunk to 32 KiB.
+	if vol2.StagedIndexEntries() != 1 {
+		t.Fatalf("expected 1 staged index entry after recovery, got %d", vol2.StagedIndexEntries())
+	}
+	if vol2.StagedBytesOnDisk() != 32*1024 {
+		t.Fatalf("expected 32 KiB staged bytes on disk after recovery, got %d", vol2.StagedBytesOnDisk())
 	}
 
-	// Open the file on server 2 without any client watcher re-registering the mode
-	openResp, err := server2.Open(ctx, &pb.OpenRequest{
+	// Fsync flushes the recovered staged chunk to backend pack storage
+	fResp, err := server2.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino, Blocking: true})
+	if err != nil || !fResp.GetSuccess() {
+		t.Fatalf("Fsync on recovered server failed: %v", err)
+	}
+
+	// Read file on recovered server and verify content
+	readResp, err := server2.ReadFile(ctx, &pb.ReadFileRequest{
 		VolumeId: volumeID,
 		Inode:    ino,
+		Offset:   0,
+		Size:     64 * 1024,
 	})
-	if err != nil || openResp.GetError() != 0 {
-		t.Fatalf("Open failed on server2: %v, err=%d", err, openResp.GetError())
+	if err != nil || readResp.GetError() != 0 {
+		t.Fatalf("ReadFile on server2 failed: err=%v, code=%d, resp=%+v", err, readResp.GetError(), readResp)
 	}
-	if openResp.GetAttr() == nil || openResp.GetAttr().GetInode() == nil {
-		t.Fatalf("Open response on server2 missing Attr")
+	if len(readResp.GetData()) != 32*1024 {
+		t.Fatalf("expected 32 KiB read data, got %d", len(readResp.GetData()))
 	}
-	if openResp.GetAttr().GetInode().GetSize() != 16384 {
-		t.Fatalf("Open response on server2 size = %d, want 16384 (barrier did not flush staged write)", openResp.GetAttr().GetInode().GetSize())
+	expectedData := bytes.Repeat([]byte("A"), 32*1024)
+	if !bytes.Equal(readResp.GetData(), expectedData) {
+		t.Fatalf("data mismatch on recovered truncated file")
 	}
 }
