@@ -144,14 +144,7 @@ func (w *streamWriter) flushPendingLocked() error {
 }
 
 func (w *streamWriter) uploadSealedMetaLocked(ctx context.Context, backend objectstore.Backend, m *StreamMeta) error {
-	if backend == nil {
-		if m.ToSeq > w.uploadedTo {
-			w.uploadedTo = m.ToSeq
-			w.uploadedPos = m.ToPos
-		}
-		return nil
-	}
-	if m.Key != "" || m.Path == "" {
+	if backend == nil || m.Key != "" || m.Path == "" {
 		return nil
 	}
 	data, err := os.ReadFile(m.Path)
@@ -594,11 +587,7 @@ func (s *StreamStore) canEvictStream(streamID uuid.UUID, witnessSeq, s3Seq uint6
 	if len(w.pending) > 0 || w.recCount > 0 || w.sealedSinceLastPass || w.hasPendingSealedUploadsLocked() {
 		return false
 	}
-	uploadedTo := w.uploadedTo
-	if s.backend == nil && w.lastSeq > uploadedTo {
-		uploadedTo = w.lastSeq
-	}
-	return witnessSeq <= uploadedTo && s3Seq <= uploadedTo
+	return witnessSeq <= w.uploadedTo && s3Seq <= w.uploadedTo
 }
 
 func (s *StreamStore) evictIdleWritersLocked() {
@@ -623,9 +612,6 @@ func (s *StreamStore) EnsureDiscovered(ctx context.Context, streamID uuid.UUID) 
 	defer w.mu.Unlock()
 	if !w.discovered && len(w.sealed) == 0 && w.uploadedTo == 0 {
 		w.discoverRemoteSealedLocked(ctx, s.backend)
-	}
-	if s.backend == nil && w.lastSeq > w.uploadedTo {
-		return w.lastSeq
 	}
 	return w.uploadedTo
 }

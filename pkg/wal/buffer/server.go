@@ -73,11 +73,12 @@ type ackResult struct {
 }
 
 type streamState struct {
-	mu         sync.Mutex
-	cond       *sync.Cond
-	witnessSeq uint64
-	s3Seq      uint64
-	waiters    int
+	mu          sync.Mutex
+	cond        *sync.Cond
+	witnessSeq  uint64
+	s3Seq       uint64
+	attachments int
+	waiters     int
 }
 
 func newStreamState(witnessSeq, s3Seq uint64) *streamState {
@@ -368,12 +369,12 @@ func (s *Server) evictIdleStreams() {
 
 	for sid, st := range s.streams {
 		st.mu.Lock()
-		waiters := st.waiters
+		attached := st.attachments > 0 || st.waiters > 0
 		witnessSeq := st.witnessSeq
 		s3Seq := st.s3Seq
 		st.mu.Unlock()
 
-		if waiters > 0 {
+		if attached {
 			continue
 		}
 
@@ -448,9 +449,16 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	st := s.getOrCreateStream(ctx, streamID)
 
 	st.mu.Lock()
+	st.attachments++
 	witnessSeq := st.witnessSeq
 	s3Seq := st.s3Seq
 	st.mu.Unlock()
+	defer func() {
+		st.mu.Lock()
+		st.attachments--
+		st.cond.Broadcast()
+		st.mu.Unlock()
+	}()
 
 	klog.Infof("WAL buffer: Hello received for stream %s: witness watermark=%d, s3 watermark=%d", streamID, witnessSeq, s3Seq)
 
@@ -503,11 +511,6 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		st.mu.Unlock()
 	})
 	defer stopCtxWatcher()
-	defer func() {
-		st.mu.Lock()
-		st.cond.Broadcast()
-		st.mu.Unlock()
-	}()
 
 	// Forward S3 acks notifications to outCh
 	go func() {

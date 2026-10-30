@@ -1865,6 +1865,211 @@ func TestServerStreams_BlockedWaiterPinsEntry(t *testing.T) {
 	}
 }
 
+// TestServerStreams_AttachedHandlerPinsEntry verifies that an attached handler
+// (attachments > 0) that is not in Wait (waiters == 0) pins its streamState
+// entry against idle eviction across multiple idle passes; after it detaches,
+// the next pass evicts.
+func TestServerStreams_AttachedHandlerPinsEntry(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Close()
+
+	streamID := uuid.New()
+	ackChan := make(chan ackResult, 1)
+	srv.incomingChan <- incomingItem{
+		streamID:  streamID,
+		streamSeq: 1,
+		payload:   []byte("data"),
+		ackChan:   ackChan,
+	}
+	if res := <-ackChan; res.err != nil {
+		t.Fatalf("append failed: %v", res.err)
+	}
+	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+	if err := srv.SealStream(ctx, streamID); err != nil {
+		t.Fatalf("seal failed: %v", err)
+	}
+
+	st := srv.getOrCreateStream(ctx, streamID)
+
+	// Attach handler without any goroutine in Wait (waiters == 0)
+	st.mu.Lock()
+	st.attachments++
+	waiters := st.waiters
+	st.mu.Unlock()
+
+	if waiters != 0 {
+		t.Fatalf("expected waiters == 0, got %d", waiters)
+	}
+
+	// Run two idle passes: stream has no pending records and is uploaded,
+	// but must be pinned by the attached handler
+	srv.streamStore.checkSealsAndGC(ctx)
+	srv.streamStore.checkSealsAndGC(ctx)
+
+	if count := srv.StreamCount(); count != 1 {
+		t.Fatalf("expected stream to remain pinned while handler is attached, got stream count %d", count)
+	}
+
+	// Detach handler
+	st.mu.Lock()
+	st.attachments--
+	st.mu.Unlock()
+
+	// After detaching (attachments == 0, waiters == 0), the next idle pass must evict it
+	srv.streamStore.checkSealsAndGC(ctx)
+	if count := srv.StreamCount(); count != 0 {
+		t.Fatalf("expected stream to be evicted once handler detached, got stream count %d", count)
+	}
+}
+
+// TestServerStreams_ConnectedAppendSurvivesIdlePasses verifies that an active Append
+// connection pins its streamState so that subsequent appends and flushes after
+// multiple idle passes continue to advance s3Seq and deliver acks on the same streamState.
+func TestServerStreams_ConnectedAppendSurvivesIdlePasses(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	srv, addr, cleanup := startTestServer(t, backend, dataDir)
+	defer cleanup()
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewWalBufferClient(conn)
+
+	streamID := uuid.New()
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	appendStream, err := client.Append(streamCtx)
+	if err != nil {
+		t.Fatalf("append failed: %v", err)
+	}
+
+	if err := appendStream.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{Hello: &pb.Hello{StreamId: streamID[:]}},
+	}); err != nil {
+		t.Fatalf("send Hello failed: %v", err)
+	}
+	resp, err := appendStream.Recv()
+	if err != nil {
+		t.Fatalf("recv HelloAck failed: %v", err)
+	}
+	if resp.GetHelloAck() == nil {
+		t.Fatalf("expected HelloAck, got %v", resp)
+	}
+
+	// Append seq 1..5
+	for seq := uint64(1); seq <= 5; seq++ {
+		if err := appendStream.Send(&pb.AppendRequest{
+			Msg: &pb.AppendRequest_Record{
+				Record: &pb.AppendRecord{StreamSeq: seq, Payload: []byte(fmt.Sprintf("data-%d", seq))},
+			},
+		}); err != nil {
+			t.Fatalf("send record %d failed: %v", seq, err)
+		}
+		ack, err := appendStream.Recv()
+		if err != nil {
+			t.Fatalf("recv ack %d failed: %v", seq, err)
+		}
+		if ack.GetAck() == nil || ack.GetAck().WitnessAckedStreamSeq != seq {
+			t.Fatalf("unexpected ack %v for seq %d", ack, seq)
+		}
+	}
+
+	// Flush and seal
+	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+	if err := srv.SealStream(ctx, streamID); err != nil {
+		t.Fatalf("seal failed: %v", err)
+	}
+
+	// Receive the S3 ack for seq 5
+	s3Ack, err := appendStream.Recv()
+	if err != nil {
+		t.Fatalf("recv s3Ack failed: %v", err)
+	}
+	if s3Ack.GetAck() == nil || s3Ack.GetAck().S3AckedStreamSeq != 5 {
+		t.Fatalf("expected s3Ack 5, got %v", s3Ack)
+	}
+
+	// Run two idle passes while connection is still open
+	srv.streamStore.checkSealsAndGC(ctx)
+	srv.streamStore.checkSealsAndGC(ctx)
+
+	// Stream must be pinned because the connection is alive
+	if count := srv.StreamCount(); count != 1 {
+		t.Fatalf("expected stream to remain pinned while connection is open, got %d", count)
+	}
+
+	// Now append seq 6: it must be served on the same streamState, flush, and receive S3 ack 6
+	if err := appendStream.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Record{
+			Record: &pb.AppendRecord{StreamSeq: 6, Payload: []byte("data-6")},
+		},
+	}); err != nil {
+		t.Fatalf("send record 6 failed: %v", err)
+	}
+	witnessAck6, err := appendStream.Recv()
+	if err != nil {
+		t.Fatalf("recv witnessAck 6 failed: %v", err)
+	}
+	if witnessAck6.GetAck() == nil || witnessAck6.GetAck().WitnessAckedStreamSeq != 6 {
+		t.Fatalf("expected witnessAck 6, got %v", witnessAck6)
+	}
+
+	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	s3Ack6, err := appendStream.Recv()
+	if err != nil {
+		t.Fatalf("recv s3Ack 6 failed: %v", err)
+	}
+	if s3Ack6.GetAck() == nil || s3Ack6.GetAck().S3AckedStreamSeq != 6 {
+		t.Fatalf("expected s3Ack 6, got %v", s3Ack6)
+	}
+
+	// Now seal, flush, and close connection
+	if err := srv.SealStream(ctx, streamID); err != nil {
+		t.Fatalf("seal failed: %v", err)
+	}
+	cancelStream()
+
+	// Wait briefly for connection handler to exit and detach
+	var detachedCount int
+	for i := 0; i < 50; i++ {
+		time.Sleep(10 * time.Millisecond)
+		srv.streamStore.checkSealsAndGC(ctx)
+		detachedCount = srv.StreamCount()
+		if detachedCount == 0 {
+			break
+		}
+	}
+	if detachedCount != 0 {
+		t.Fatalf("expected stream to be evicted after connection closed, got count %d", detachedCount)
+	}
+}
+
 // TestServerStreams_ReconnectAfterEvictionReportsWatermarks verifies that contacting
 // an evicted stream seeds watermarks from discovered sealed state equal to pre-eviction watermarks.
 func TestServerStreams_ReconnectAfterEvictionReportsWatermarks(t *testing.T) {
