@@ -304,15 +304,14 @@ All loose blob files and packfiles share the `OBJB` binary format (big-endian in
 #### 3. Packfile Format (`.pack`)
 ```
 +-----------------------------------------------------------------------------------+
-| Base Header (8B) | Count N (4B) | Reserved (4B)                                   |
+| Base Header (8B) | Slots S (4B) | Used N (4B) | Flags (4B) | Reserved (12B)       |
 +-----------------------------------------------------------------------------------+
-| Table 1: Sorted SHA256 Array (N * 32 Bytes)                                       |
-| [ SHA_0 (32B) ] [ SHA_1 (32B) ] ... [ SHA_N-1 (32B) ]                             |
+| Table: S Fixed-Size Slots (S * 48 Bytes)                                          |
+| First N sorted by SHA256, remaining S - N zeroed:                                 |
+| [ SHA256 (32B) | Start (4B) | StoredLength (4B) | FinalLength (4B) | Encoding (4B)|
+| ...                                                                               |
 +-----------------------------------------------------------------------------------+
-| Table 2: Data Offset Table ((N + 1) * 4 Bytes)                                    |
-| [ Offset_0 (4B) ] [ Offset_1 (4B) ] ... [ Offset_N (4B = EOF Offset) ]           |
-+-----------------------------------------------------------------------------------+
-| Data Payload Section (Contiguous Blob Items)                                      |
+| Data Payload Section (Blob Items in arrival order)                                |
 |   +-----------------------------------------------------------------------------+ |
 |   | Item 0: Encoding (4B) | FinalLen (4B) | Reserved (8B) | Payload Data ...    | |
 |   +-----------------------------------------------------------------------------+ |
@@ -321,7 +320,9 @@ All loose blob files and packfiles share the `OBJB` binary format (big-endian in
 +-----------------------------------------------------------------------------------+
 ```
 
-- **Two-Phase Binary Search:** To read a blob from a packfile, ObjectFS reads only the index tables (Header + Table 1 + Table 2), executes binary search over the sorted SHA array to locate the item index `i`, retrieves the exact byte range `[Offset_i, Offset_{i+1})`, and streams only the requested payload.
+- **Explicit Lengths & Reserved Slots (v2):** Packfile format version 2 decouples data payload order from table order. The pack reserves $S$ fixed-size slots up front (default $S = 1024$), with the first $N$ slots sorted by SHA-256 for $O(\log N)$ binary search and remaining slots zeroed. Each slot explicitly records `start`, `stored_length`, `final_length`, and `encoding`. Readers binary-search the first $N$ entries and range-read `[start, start+stored_length)` to retrieve the payload directly, sizing decode buffers and selecting the decoder without touching the item header. The 16-byte item header precedes each payload on disk so items remain self-describing for disaster recovery. Data items are written in arrival order rather than SHA-256 order, enabling packs to be built incrementally. Bit 0 of `Flags` marks a pack as sealed (`0x00000001`). Per-item compression is adaptive: payloads are stored compressed only when compression saves at least 10% in size; incompressible or already-compressed media (audio, video, images, archives) is stored as raw binary to eliminate decompression CPU.
+
+Packfiles written in format version 1 (`OBJB` version byte `0x01`, with $N$ sorted hashes and $(N+1)$ offset deltas) remain supported and readable forever without requiring rewrites or migrations of existing packs; the version byte in the 8-byte base header selects the appropriate parser.
 
 ---
 
@@ -601,7 +602,7 @@ Artefacts in ObjectFS are categorized as either **Derived** or **Only Copy**:
 
 | Artefact | Category | Storage Location | Recovery / Resilience Guarantee |
 |---|---|---|---|
-| **Data Blobs** (Loose & Packfiles) | **Only Copy** | Cloud Object Storage (`blobs/`) | Authoritative content-addressable file payload data. Cannot be re-derived if deleted. Versioned with `OBJB` magic and format version `1`. |
+| **Data Blobs** (Loose & Packfiles) | **Only Copy** | Cloud Object Storage (`blobs/`) | Authoritative content-addressable file payload data. Cannot be re-derived if deleted. Versioned with `OBJB` magic and format versions `1` and `2`. |
 | **Streams** (Log segments & sealed files) | **Only Copy** | Cloud Object Storage & Local WAL (`streams/`) | Authoritative change-log of metadata mutations and transaction events. Cannot be re-derived if deleted. Versioned with `OFWL` magic, format version `1`, and `StreamHeader` record. |
 | **Snapshots past trim point** | **Only Copy** | Cloud Object Storage (`snapshots/`) | When change-log stream history has been trimmed or garbage-collected past the snapshot position, the snapshot is the sole authoritative copy of the base filesystem state. Format-versioned (`_meta` table in SQLite, `\x00format_version` in table snapshots). |
 | **Snapshots with stream retained** | **Derived** | Cloud Object Storage (`snapshots/`) | Point-in-time index images that can be regenerated from scratch by replaying the change-log stream from sequence 1 (or a prior retained snapshot). |
