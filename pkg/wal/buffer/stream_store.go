@@ -52,17 +52,17 @@ type StreamMeta struct {
 }
 
 type streamWriter struct {
-	mu          sync.Mutex
-	streamID    uuid.UUID
-	dir         string
-	openFrom    uint64
-	lastSeq     uint64
-	firstPos    uint64
-	lastPos     uint64
-	recCount    int
-	fileSize    int64
-	openTime    time.Time
-	pending     []*wal.LogRecord
+	mu                  sync.Mutex
+	streamID            uuid.UUID
+	dir                 string
+	openFrom            uint64
+	lastSeq             uint64
+	firstPos            uint64
+	lastPos             uint64
+	recCount            int
+	fileSize            int64
+	openTime            time.Time
+	pending             []*wal.LogRecord
 	sealed              []*StreamMeta
 	uploadedTo          uint64
 	uploadedPos         uint64
@@ -231,7 +231,6 @@ func (w *streamWriter) uploadPendingSealedLocked(ctx context.Context, backend ob
 }
 
 func (w *streamWriter) discoverRemoteSealedLocked(ctx context.Context, backend objectstore.Backend) {
-	w.discovered = true
 	entries, err := os.ReadDir(w.dir)
 	if err != nil && !os.IsNotExist(err) {
 		klog.Warningf("Failed to read stream directory %s for local sealed discovery: %v", w.dir, err)
@@ -263,39 +262,40 @@ func (w *streamWriter) discoverRemoteSealedLocked(ctx context.Context, backend o
 			}
 		}
 	}
-	if backend == nil {
-		return
-	}
-	prefix := fmt.Sprintf("streams/%s/", w.streamID.String())
-	keys, err := backend.ListObjects(ctx, "", prefix)
-	if err != nil {
-		return
-	}
-	for _, k := range keys {
-		from, to, sealed, err := wal.ParseStreamPath(k)
-		if err != nil || !sealed {
-			continue
+	if backend != nil {
+		prefix := fmt.Sprintf("streams/%s/", w.streamID.String())
+		keys, err := backend.ListObjects(ctx, "", prefix)
+		if err != nil {
+			klog.Warningf("Failed to list remote sealed objects for stream %s: %v", w.streamID, err)
+			return
 		}
-		if to > w.uploadedTo {
-			w.uploadedTo = to
-		}
-		if to > w.lastSeq {
-			w.lastSeq = to
-		}
-		found := false
-		for _, sm := range w.sealed {
-			if sm.FromSeq == from && sm.ToSeq == to {
-				if sm.Key == "" {
-					sm.Key = k
+		for _, k := range keys {
+			from, to, sealed, err := wal.ParseStreamPath(k)
+			if err != nil || !sealed {
+				continue
+			}
+			if to > w.uploadedTo {
+				w.uploadedTo = to
+			}
+			if to > w.lastSeq {
+				w.lastSeq = to
+			}
+			found := false
+			for _, sm := range w.sealed {
+				if sm.FromSeq == from && sm.ToSeq == to {
+					if sm.Key == "" {
+						sm.Key = k
+					}
+					found = true
+					break
 				}
-				found = true
-				break
+			}
+			if !found {
+				w.sealed = append(w.sealed, &StreamMeta{FromSeq: from, ToSeq: to, Key: k})
 			}
 		}
-		if !found {
-			w.sealed = append(w.sealed, &StreamMeta{FromSeq: from, ToSeq: to, Key: k})
-		}
 	}
+	w.discovered = true
 	sort.Slice(w.sealed, func(i, j int) bool {
 		return w.sealed[i].FromSeq < w.sealed[j].FromSeq
 	})
