@@ -165,9 +165,23 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to list segments from backend: %w", err)
 	}
 
+	coveredTo, minCoveredPos, err := streamStore.LoadOrDeriveCoverage(ctx)
+	if err != nil {
+		klog.Warningf("Failed to recover stream coverage: %v", err)
+	}
+
 	var allDiscoveredRecords []*wal.LogRecord
 	backendWatermarks := make(map[string]uint64)
+	for sid, seq := range coveredTo {
+		backendWatermarks[sid] = seq
+	}
+
 	for _, segPath := range discoveredSegments {
+		_, segLast, err := wal.ParseSegmentPath(segPath)
+		if err == nil && segLast <= minCoveredPos {
+			// Segment is fully covered by sealed per-stream files; skip reading from backend
+			continue
+		}
 		records, err := ReadSegmentFromBackend(ctx, cfg.Backend, segPath, wal.WithAcceptUnversioned(cfg.AcceptUnversioned))
 		if err != nil {
 			return nil, fmt.Errorf("failed to recover stream watermarks from segment %s: %w", segPath, err)
