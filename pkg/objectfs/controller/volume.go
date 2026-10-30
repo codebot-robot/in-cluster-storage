@@ -104,14 +104,17 @@ type Volume struct {
 	maxStagingBytes int64
 	lastSyncError   map[uint64]error
 
-	coalesceTimer   *time.Timer
-	coalesceWaiters []*syncWaiter
-	coalesceWindow  time.Duration
-	closeTimer      *time.Timer
-	closeInodes     map[uint64]struct{}
-	syncTimeout     time.Duration
-	syncInProgress  bool
-	syncCond        *sync.Cond
+	coalesceTimer      *time.Timer
+	coalesceWaiters    []*syncWaiter
+	coalesceWindow     time.Duration
+	closeTimer         *time.Timer
+	closeInodes        map[uint64]struct{}
+	syncingInodes      map[uint64]struct{}
+	syncTimeout        time.Duration
+	openBarrierTimeout time.Duration
+	consistencyMode    pb.ConsistencyMode
+	syncInProgress     bool
+	syncCond           *sync.Cond
 
 	stream     walclient.Stream
 	durability walclient.Level
@@ -181,6 +184,22 @@ func WithSyncTimeout(d time.Duration) VolumeOption {
 		if d > 0 {
 			v.syncTimeout = d
 		}
+	}
+}
+
+// WithOpenBarrierTimeout sets the timeout duration for the open-side barrier on close-to-open volumes.
+func WithOpenBarrierTimeout(d time.Duration) VolumeOption {
+	return func(v *Volume) {
+		if d > 0 {
+			v.openBarrierTimeout = d
+		}
+	}
+}
+
+// WithConsistencyMode sets the consistency mode for the volume.
+func WithConsistencyMode(mode pb.ConsistencyMode) VolumeOption {
+	return func(v *Volume) {
+		v.consistencyMode = mode
 	}
 }
 
@@ -425,29 +444,31 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 
 	v := &Volume{
-		volumeID:        volumeID,
-		rootInodeID:     1,
-		nextInode:       erofs.DefaultInodeStride,
-		backend:         backend,
-		blobStore:       blobStore,
-		broadcaster:     broadcaster,
-		maxInlineLen:    4096,      // 4KB default inline threshold for tiny files
-		chunkSize:       64 * 1024, // 64KB default chunk size
-		durability:      walclient.Local,
-		indexFactory:    f,
-		streamID:        StreamIDForVolume(volumeID),
-		closedCh:        make(chan struct{}),
-		dirParents:      make(map[uint64]uint64),
-		handles:         make(map[uint64]uint64),
-		openInodes:      make(map[uint64]int),
-		stagingEpoch:    time.Now().UnixNano(),
-		stagedChunks:    make(map[uint64]map[int][]byte),
-		stagedSizes:     make(map[uint64]int64),
-		stagedMtimes:    make(map[uint64]time.Time),
-		lastSyncError:   make(map[uint64]error),
-		maxStagingBytes: 64 * 1024 * 1024,
-		coalesceWindow:  1 * time.Second,
-		syncTimeout:     10 * time.Minute,
+		volumeID:           volumeID,
+		rootInodeID:        1,
+		nextInode:          erofs.DefaultInodeStride,
+		backend:            backend,
+		blobStore:          blobStore,
+		broadcaster:        broadcaster,
+		maxInlineLen:       4096,      // 4KB default inline threshold for tiny files
+		chunkSize:          64 * 1024, // 64KB default chunk size
+		durability:         walclient.Local,
+		indexFactory:       f,
+		streamID:           StreamIDForVolume(volumeID),
+		closedCh:           make(chan struct{}),
+		dirParents:         make(map[uint64]uint64),
+		handles:            make(map[uint64]uint64),
+		openInodes:         make(map[uint64]int),
+		stagingEpoch:       time.Now().UnixNano(),
+		stagedChunks:       make(map[uint64]map[int][]byte),
+		stagedSizes:        make(map[uint64]int64),
+		stagedMtimes:       make(map[uint64]time.Time),
+		lastSyncError:      make(map[uint64]error),
+		maxStagingBytes:    64 * 1024 * 1024,
+		coalesceWindow:     1 * time.Second,
+		syncTimeout:        10 * time.Minute,
+		openBarrierTimeout: 5 * time.Second,
+		syncingInodes:      make(map[uint64]struct{}),
 	}
 	v.syncCond = sync.NewCond(&v.stagingMu)
 	v.batchCheckCond = sync.NewCond(&v.batchCheckMu)
@@ -501,6 +522,25 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 				Row:      rootInodeMsg,
 			},
 		}
+		if v.consistencyMode != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+			volInfoMsg := &pb.VolumeInfo{
+				VolumeId:        v.volumeID,
+				ConsistencyMode: v.consistencyMode,
+			}
+			viKeyBytes, viValBytes, viErr := sds.SplitKeyAndNonKey(volInfoMsg, []int32{1})
+			if viErr != nil {
+				return nil, fmt.Errorf("failed to split key for VolumeInfo: %w", viErr)
+			}
+			initChanges = append(initChanges, sds.Change{
+				Seq:      0,
+				TypeName: VolumeInfoTypeName,
+				Op:       sds.OpCreate,
+				Key:      sds.NewKeyFromBytes(viKeyBytes),
+				RawKey:   viKeyBytes,
+				RawVal:   viValBytes,
+				Row:      volInfoMsg,
+			})
+		}
 		if err := v.metadataView.ApplyChangesSync(context.Background(), initChanges); err != nil {
 			return nil, fmt.Errorf("failed to apply root inode change: %w", err)
 		}
@@ -525,6 +565,9 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 	defer v.stagingMu.Unlock()
 
 	v.syncInProgress = false
+	for sIno := range snapshotChunks {
+		delete(v.syncingInodes, sIno)
+	}
 
 	if err != nil {
 		for sIno := range snapshotChunks {
@@ -837,6 +880,12 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 	}
 
 	v.syncInProgress = true
+	if v.syncingInodes == nil {
+		v.syncingInodes = make(map[uint64]struct{})
+	}
+	for ino := range snapshotChunks {
+		v.syncingInodes[ino] = struct{}{}
+	}
 	v.stagingMu.Unlock()
 
 	chunkShas := make(map[uint64]map[int]string, len(snapshotChunks))
@@ -1128,6 +1177,9 @@ func (v *Volume) initMetadataStreamLocked() error {
 	if _, err := w.RegisterType(&pb.XAttr{}, 1, 2); err != nil {
 		return fmt.Errorf("failed to register XAttr type: %w", err)
 	}
+	if _, err := w.RegisterType(&pb.VolumeInfo{}, 1); err != nil {
+		return fmt.Errorf("failed to register VolumeInfo type: %w", err)
+	}
 	v.metadataStream = w
 	return nil
 }
@@ -1330,6 +1382,72 @@ func (v *Volume) ResetStream(stream walclient.Stream) error {
 	return v.initMetadataStreamLocked()
 }
 
+// ConsistencyMode returns the configured consistency mode for this volume.
+func (v *Volume) ConsistencyMode() pb.ConsistencyMode {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.consistencyMode
+}
+
+// SetConsistencyMode updates the consistency mode for this volume.
+func (v *Volume) SetConsistencyMode(mode pb.ConsistencyMode) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.consistencyMode = mode
+}
+
+// PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store.
+func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.consistencyMode = mode
+
+	volInfo := &pb.VolumeInfo{
+		VolumeId:        v.volumeID,
+		ConsistencyMode: mode,
+	}
+
+	volInfoKey, err := pkVolumeInfo.Extract(volInfo)
+	if err != nil {
+		return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
+	}
+
+	var beforeMsg proto.Message
+	exists := false
+	if v.metadataView != nil {
+		msg, ok, err := v.metadataView.Get(ctx, VolumeInfoTypeName, volInfoKey)
+		if err != nil {
+			return fmt.Errorf("failed to get VolumeInfo: %w", err)
+		}
+		if ok && msg != nil {
+			beforeMsg = msg
+			exists = true
+		}
+	}
+
+	tx := v.beginTxLocked("PersistConsistencyMode")
+	if tx != nil {
+		v.recordReadLocked(tx, VolumeInfoTypeName, volInfoKey, beforeMsg)
+		if exists {
+			if _, err := tx.Update(ctx, volInfo); err != nil {
+				return fmt.Errorf("failed to update VolumeInfo: %w", err)
+			}
+		} else {
+			if _, err := tx.Insert(ctx, volInfo); err != nil {
+				return fmt.Errorf("failed to insert VolumeInfo: %w", err)
+			}
+		}
+		if _, err := v.commitTxLocked(ctx, tx); err != nil {
+			return fmt.Errorf("failed to commit VolumeInfo transaction: %w", err)
+		}
+		if err := v.flushOverlayLocked(ctx); err != nil {
+			return fmt.Errorf("failed to flush overlay for VolumeInfo: %w", err)
+		}
+	}
+	return nil
+}
+
 func (v *Volume) commitTxLocked(ctx context.Context, tx *sds.Tx) (uint64, error) {
 	commitSeq, err := tx.Commit(ctx)
 	if err != nil {
@@ -1484,10 +1602,11 @@ func cleanPath(p string) string {
 }
 
 var (
-	pkInode     = sds.NewPrimaryKey(1)
-	pkDirEntry  = sds.NewPrimaryKey(1, 2)
-	pkFileChunk = sds.NewPrimaryKey(1, 2)
-	pkXAttr     = sds.NewPrimaryKey(1, 2)
+	pkInode      = sds.NewPrimaryKey(1)
+	pkDirEntry   = sds.NewPrimaryKey(1, 2)
+	pkFileChunk  = sds.NewPrimaryKey(1, 2)
+	pkXAttr      = sds.NewPrimaryKey(1, 2)
+	pkVolumeInfo = sds.NewPrimaryKey(1)
 )
 
 // VolumeStats contains aggregated operational and cache metrics for a Volume.
@@ -1727,6 +1846,8 @@ func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, tx *sds.Tx, type
 				pk = pkFileChunk
 			case "objectfs.v1alpha1.XAttr":
 				pk = pkXAttr
+			case VolumeInfoTypeName:
+				pk = pkVolumeInfo
 			}
 			if pk != nil {
 				k, err := pk.Extract(msg)
@@ -4739,19 +4860,102 @@ func (v *Volume) hasOpenHandlesLocked(inodeID uint64) bool {
 	return v.openInodes != nil && v.openInodes[inodeID] > 0
 }
 
-func (v *Volume) Open(ctx context.Context, inodeID uint64, flags uint32) (uint64, error) {
+func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
+	if deg := v.Degraded(); deg != nil {
+		return syscall.EIO
+	}
+
+	timeout := v.openBarrierTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	barrierCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+
+	stopTimer := context.AfterFunc(barrierCtx, func() {
+		v.stagingMu.Lock()
+		v.syncCond.Broadcast()
+		v.stagingMu.Unlock()
+	})
+	defer stopTimer()
+
+	for {
+		if deg := v.Degraded(); deg != nil {
+			return syscall.EIO
+		}
+		if barrierCtx.Err() != nil {
+			return syscall.EIO
+		}
+
+		hasStaged := len(v.stagedChunks[inodeID]) > 0
+		inFlight := false
+		if v.syncingInodes != nil {
+			_, inFlight = v.syncingInodes[inodeID]
+		}
+
+		if !hasStaged && !inFlight {
+			return nil
+		}
+
+		if inFlight || v.syncInProgress {
+			v.syncCond.Wait()
+			continue
+		}
+
+		if v.closeInodes != nil {
+			delete(v.closeInodes, inodeID)
+			if len(v.closeInodes) == 0 && v.closeTimer != nil {
+				v.closeTimer.Stop()
+				v.closeTimer = nil
+			}
+		}
+
+		_, err := v.syncInodesLocked(barrierCtx, map[uint64]struct{}{inodeID: {}})
+		v.stagingMu.Lock()
+		if err != nil {
+			return syscall.EIO
+		}
+		if deg := v.Degraded(); deg != nil {
+			return syscall.EIO
+		}
+		if barrierCtx.Err() != nil {
+			return syscall.EIO
+		}
+		return nil
+	}
+}
+
+func (v *Volume) Open(ctx context.Context, inodeID uint64, flags uint32) (uint64, *pb.EntryAttr, uint64, error) {
 	v.mu.RLock()
 	inodeID = v.normalizeInodeID(inodeID)
-	node, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
+	isCloseToOpen := v.consistencyMode == pb.ConsistencyMode_CLOSE_TO_OPEN
 	v.mu.RUnlock()
+
+	if isCloseToOpen {
+		if err := v.openBarrier(ctx, inodeID); err != nil {
+			return 0, nil, 0, err
+		}
+	}
+
+	v.mu.RLock()
+	node, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
 	if err != nil {
-		return 0, err
+		v.mu.RUnlock()
+		return 0, nil, 0, err
 	}
 	if node == nil {
-		return 0, syscall.ENOENT
+		v.mu.RUnlock()
+		return 0, nil, 0, syscall.ENOENT
 	}
+	attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
+	pos := v.lastCommitSeq
+	v.mu.RUnlock()
+
 	fh := v.AllocFh(inodeID)
-	return fh, nil
+	return fh, attr, pos, nil
 }
 
 func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
@@ -5620,6 +5824,11 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 						highestReplayedIno = in.GetIno()
 					}
 				}
+				if ch.TypeName == VolumeInfoTypeName {
+					if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+						v.consistencyMode = vi.GetConsistencyMode()
+					}
+				}
 			}
 			return nil
 		}
@@ -5716,6 +5925,19 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 
 	if v.metadataView != nil {
 		v.metadataView.ClearCache()
+		volInfoKey, err := pkVolumeInfo.Extract(&pb.VolumeInfo{VolumeId: v.volumeID})
+		if err != nil {
+			return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
+		}
+		msg, ok, err := v.metadataView.Get(ctx, VolumeInfoTypeName, volInfoKey)
+		if err != nil {
+			return fmt.Errorf("failed to get VolumeInfo: %w", err)
+		}
+		if ok && msg != nil {
+			if vi, ok := msg.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+				v.consistencyMode = vi.GetConsistencyMode()
+			}
+		}
 	}
 
 	v.initLiveStatsLocked()

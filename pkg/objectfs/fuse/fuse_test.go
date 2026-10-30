@@ -2140,7 +2140,7 @@ func TestStartWatcherReconnectResync(t *testing.T) {
 	watchCtx, cancelWatch := context.WithCancel(t.Context())
 	defer cancelWatch()
 
-	StartWatcher(watchCtx, client, volumeID, "node-1", cache)
+	StartWatcher(watchCtx, client, volumeID, "node-1", pb.ConsistencyMode_STANDARD, cache)
 	time.Sleep(100 * time.Millisecond)
 
 	// Stop grpc server to simulate controller restart / disconnection
@@ -2176,7 +2176,7 @@ func TestStartWatcherReconnectResync(t *testing.T) {
 	defer cancelWatch2()
 
 	// Reconnect watcher with client2
-	StartWatcher(watchCtx2, client2, volumeID, "node-1", cache)
+	StartWatcher(watchCtx2, client2, volumeID, "node-1", pb.ConsistencyMode_STANDARD, cache)
 	time.Sleep(200 * time.Millisecond)
 
 	// InvalidateAllClean should ensure clean entry 100 was invalidated on reconnect, but dirty entry 200 preserved
@@ -4398,7 +4398,7 @@ func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
 	// Start watcher on fsA for node-A
 	watchCtx, cancelWatch := context.WithCancel(t.Context())
 	defer cancelWatch()
-	StartWatcher(watchCtx, clientA, volumeID, "node-A", cacheA, fsA)
+	StartWatcher(watchCtx, clientA, volumeID, "node-A", pb.ConsistencyMode_STANDARD, cacheA, fsA)
 
 	// Client A creates and writes initial version
 	var createOut fuse.CreateOut
@@ -5626,7 +5626,16 @@ func TestCrossNodeWatchVolumeKernelNotifications(t *testing.T) {
 	// Start watcher on fsB
 	watchCtx, cancelWatch := context.WithCancel(t.Context())
 	defer cancelWatch()
-	StartWatcher(watchCtx, clientB, volumeID, "node-B", cacheB, fsB)
+	StartWatcher(watchCtx, clientB, volumeID, "node-B", pb.ConsistencyMode_STANDARD, cacheB, fsB)
+
+	// Poll until fsB watcher connects
+	deadlineWait := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadlineWait) {
+		if fsB.IsWatcherConnected() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	// Client A creates a file: triggers EVENT_CREATED
 	var createOut fuse.CreateOut
@@ -6129,8 +6138,8 @@ func TestTwoClientNoSelfInvalidation(t *testing.T) {
 
 	watchCtx, cancelWatch := context.WithCancel(t.Context())
 	defer cancelWatch()
-	StartWatcher(watchCtx, clientA, volumeID, "node-A", cacheA, fsA)
-	StartWatcher(watchCtx, clientB, volumeID, "node-B", cacheB, fsB)
+	StartWatcher(watchCtx, clientA, volumeID, "node-A", pb.ConsistencyMode_STANDARD, cacheA, fsA)
+	StartWatcher(watchCtx, clientB, volumeID, "node-B", pb.ConsistencyMode_STANDARD, cacheB, fsB)
 
 	// Short settle delay for watcher subscriptions
 	time.Sleep(50 * time.Millisecond)
@@ -6775,7 +6784,7 @@ func TestStartWatcherHealthAndSweep(t *testing.T) {
 	watchCtx, cancelWatch := context.WithCancel(t.Context())
 	defer cancelWatch()
 
-	StartWatcher(watchCtx, client, volumeID, "test-node", cache, rawFS)
+	StartWatcher(watchCtx, client, volumeID, "test-node", pb.ConsistencyMode_STANDARD, cache, rawFS)
 
 	// Poll until IsWatcherConnected becomes true
 	deadline := time.Now().Add(2 * time.Second)
@@ -7086,4 +7095,289 @@ func TestSyncClosedInodes_TenClosedInodesOverlapInTime(t *testing.T) {
 	if maxConcurrent != numFiles {
 		t.Fatalf("Expected all %d close-triggered Fsync requests to overlap in time, got max concurrency %d", numFiles, maxConcurrent)
 	}
+}
+
+func TestOpen_ReaderCacheInvalidationOnMovedStreamPosition(t *testing.T) {
+	ctx := t.Context()
+	ctrlServer := controller.NewServer(nil)
+	vol, err := ctrlServer.GetVolume("test-open-inval-vol")
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
+	vol.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, ctrlServer)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet-open-inval",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("Failed to dial bufnet: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewObjectFSControllerClient(conn)
+	cache := NewNodeCache(64 * 1024 * 1024)
+	rawFS := NewObjectFS(client, "test-open-inval-vol", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
+
+	var notifyMu sync.Mutex
+	var notifyEvents []notifyEvent
+	rawFS.notifyHook = func(e notifyEvent) {
+		notifyMu.Lock()
+		notifyEvents = append(notifyEvents, e)
+		notifyMu.Unlock()
+	}
+
+	// Create file via controller
+	createResp, err := ctrlServer.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    "test-open-inval-vol",
+		ParentInode: 1,
+		Name:        "file.txt",
+		Mode:        0644,
+	})
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := createResp.GetAttr().GetInode().GetIno()
+
+	// Verify that standard mode keeps FOPEN_KEEP_CACHE and does not purge
+	stdFS := NewObjectFS(client, "test-open-inval-vol", pb.WriteMode_WRITE_THROUGH_FSYNC, NewNodeCache(64*1024*1024))
+	stdFS.SetConsistencyMode(pb.ConsistencyMode_STANDARD)
+	var stdOut fuse.OpenOut
+	if st := stdFS.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: ino}}, &stdOut); st != fuse.OK {
+		t.Fatalf("stdFS Open failed: %v", st)
+	}
+	if stdOut.OpenFlags&fuse.FOPEN_KEEP_CACHE == 0 {
+		t.Errorf("Expected standard mode to always set FOPEN_KEEP_CACHE")
+	}
+
+	// Initial open: stream position > 0, cache empty
+	var openOut1 fuse.OpenOut
+	if st := rawFS.Open(nil, &fuse.OpenIn{
+		InHeader: fuse.InHeader{NodeId: ino},
+	}, &openOut1); st != fuse.OK {
+		t.Fatalf("First Open failed: %v", st)
+	}
+
+	// Stream position moved from 0 to initial pos:
+	// Should invalidate page cache (off=0, len=-1) and attr cache (off=-1, len=0), and NOT keep cache
+	if openOut1.OpenFlags&fuse.FOPEN_KEEP_CACHE != 0 {
+		t.Errorf("Expected FOPEN_KEEP_CACHE to NOT be set when stream position moved")
+	}
+
+	notifyMu.Lock()
+	eventsCount := len(notifyEvents)
+	notifyMu.Unlock()
+	if eventsCount < 2 {
+		t.Fatalf("Expected at least 2 notify events on first open, got %d", eventsCount)
+	}
+
+	// Second open without any changes: stream position has NOT moved
+	notifyMu.Lock()
+	notifyEvents = nil
+	notifyMu.Unlock()
+
+	var openOut2 fuse.OpenOut
+	if st := rawFS.Open(nil, &fuse.OpenIn{
+		InHeader: fuse.InHeader{NodeId: ino},
+	}, &openOut2); st != fuse.OK {
+		t.Fatalf("Second Open failed: %v", st)
+	}
+
+	// Stream position did not move:
+	// Should set FOPEN_KEEP_CACHE and NOT emit invalidation events
+	if openOut2.OpenFlags&fuse.FOPEN_KEEP_CACHE == 0 {
+		t.Errorf("Expected FOPEN_KEEP_CACHE to be set when stream position did not move")
+	}
+	notifyMu.Lock()
+	eventsCount2 := len(notifyEvents)
+	notifyMu.Unlock()
+	if eventsCount2 != 0 {
+		t.Errorf("Expected 0 notify events when stream position did not move, got %d", eventsCount2)
+	}
+}
+
+func TestCloseToOpen_TwoNodeReaderCacheInvalidation(t *testing.T) {
+	ctx := t.Context()
+	backend := controller.NewMemoryBackend()
+	ctrlServer := controller.NewServer(backend)
+	defer func() { _ = ctrlServer.Close() }()
+
+	volumeID := "test-c2o-unit-vol"
+	vol, err := ctrlServer.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
+	vol.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
+
+	lis := bufconn.Listen(4 * 1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, ctrlServer)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	dial := func() pb.ObjectFSControllerClient {
+		conn, err := grpc.NewClient("passthrough://bufnet-c2o-unit",
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+				return lis.Dial()
+			}),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		return pb.NewObjectFSControllerClient(conn)
+	}
+
+	clientA := dial()
+	clientB := dial()
+
+	cacheA := NewNodeCache(64 * 1024 * 1024)
+	cacheB := NewNodeCache(64 * 1024 * 1024)
+
+	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_LAZY_WRITE, cacheA)
+	fsB := NewObjectFS(clientB, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheB)
+	fsB.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
+	fsA.SetSyncOnClose(true)
+
+	// 1. Create file
+	createResp, err := ctrlServer.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "file4k.bin",
+		Mode:        0644,
+	})
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino4k := createResp.GetAttr().GetInode().GetIno()
+
+	// 2. Reader fsB opens & reads size=0, populating stale cache
+	var openOutB1 fuse.OpenOut
+	if st := fsB.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: ino4k}}, &openOutB1); st != fuse.OK {
+		t.Fatalf("fsB Open initial failed: %v", st)
+	}
+	buf0 := make([]byte, 4096)
+	readRes, st := fsB.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: ino4k}, Fh: openOutB1.Fh, Offset: 0, Size: 4096}, buf0)
+	if st != fuse.OK {
+		t.Fatalf("fsB Read initial failed: %v", st)
+	}
+	if readRes.Size() != 0 {
+		t.Fatalf("fsB Read initial size = %d, want 0", readRes.Size())
+	}
+	fsB.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: ino4k}, Fh: openOutB1.Fh})
+
+	// 3. Writer fsA opens, writes 4 KiB, and closes WITHOUT fsync
+	var openOutA1 fuse.OpenOut
+	if st := fsA.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: ino4k}, Flags: syscall.O_RDWR}, &openOutA1); st != fuse.OK {
+		t.Fatalf("fsA Open failed: %v", st)
+	}
+	data4k := bytes.Repeat([]byte("X"), 4096)
+	if _, st := fsA.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: ino4k}, Fh: openOutA1.Fh, Offset: 0}, data4k); st != fuse.OK {
+		t.Fatalf("fsA Write failed: %v", st)
+	}
+	if st := fsA.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: ino4k}, Fh: openOutA1.Fh}); st != fuse.OK {
+		t.Fatalf("fsA Flush failed: %v", st)
+	}
+	fsA.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: ino4k}, Fh: openOutA1.Fh})
+
+	// 4. Reader fsB immediately opens without sleep, measuring barrier latency
+	t0_4k := time.Now()
+	var openOutB2 fuse.OpenOut
+	if st := fsB.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: ino4k}}, &openOutB2); st != fuse.OK {
+		t.Fatalf("fsB Open after close failed: %v", st)
+	}
+	lat4k := time.Since(t0_4k)
+	t.Logf("Measured barrier latency for 4 KiB inline file: %v", lat4k)
+
+	// Read and verify data
+	readBuf := make([]byte, 4096)
+	readRes2, st := fsB.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: ino4k}, Fh: openOutB2.Fh, Offset: 0, Size: 4096}, readBuf)
+	if st != fuse.OK {
+		t.Fatalf("fsB Read after close failed: %v", st)
+	}
+	resData, _ := readRes2.Bytes(readBuf)
+	if !bytes.Equal(resData, data4k) {
+		t.Fatalf("fsB read data mismatch: got length %d, want 4096", len(resData))
+	}
+	fsB.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: ino4k}, Fh: openOutB2.Fh})
+
+	// Case 2: 16 MiB multi-chunk file
+	createResp16, err := ctrlServer.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "file16m.bin",
+		Mode:        0644,
+	})
+	if err != nil || createResp16.GetError() != 0 {
+		t.Fatalf("CreateFile 16m failed: %v", err)
+	}
+	ino16m := createResp16.GetAttr().GetInode().GetIno()
+
+	// fsB opens & reads size=0, populating stale cache
+	var openOutB16_1 fuse.OpenOut
+	if st := fsB.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: ino16m}}, &openOutB16_1); st != fuse.OK {
+		t.Fatalf("fsB Open initial 16m failed: %v", st)
+	}
+	buf16_0 := make([]byte, 4096)
+	readRes16_1, st := fsB.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: ino16m}, Fh: openOutB16_1.Fh, Offset: 0, Size: 4096}, buf16_0)
+	if st != fuse.OK {
+		t.Fatalf("fsB Read initial 16m failed: %v", st)
+	}
+	if readRes16_1.Size() != 0 {
+		t.Fatalf("fsB Read initial 16m size = %d, want 0", readRes16_1.Size())
+	}
+	fsB.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: ino16m}, Fh: openOutB16_1.Fh})
+
+	// fsA writes 16 MiB and closes WITHOUT fsync
+	var openOutA16_1 fuse.OpenOut
+	if st := fsA.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: ino16m}, Flags: syscall.O_RDWR}, &openOutA16_1); st != fuse.OK {
+		t.Fatalf("fsA Open 16m failed: %v", st)
+	}
+	data16m := make([]byte, 16*1024*1024)
+	for i := range data16m {
+		data16m[i] = byte(i % 251)
+	}
+	// Write in 1 MiB chunks
+	for off := 0; off < len(data16m); off += 1024 * 1024 {
+		if _, st := fsA.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: ino16m}, Fh: openOutA16_1.Fh, Offset: uint64(off)}, data16m[off:off+1024*1024]); st != fuse.OK {
+			t.Fatalf("fsA Write 16m at offset %d failed: %v", off, st)
+		}
+	}
+	if st := fsA.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: ino16m}, Fh: openOutA16_1.Fh}); st != fuse.OK {
+		t.Fatalf("fsA Flush 16m failed: %v", st)
+	}
+	fsA.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: ino16m}, Fh: openOutA16_1.Fh})
+
+	// fsB opens without sleep, measuring barrier latency
+	t0_16m := time.Now()
+	var openOutB16_2 fuse.OpenOut
+	if st := fsB.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: ino16m}}, &openOutB16_2); st != fuse.OK {
+		t.Fatalf("fsB Open after close 16m failed: %v", st)
+	}
+	lat16m := time.Since(t0_16m)
+	t.Logf("Measured barrier latency for 16 MiB multi-chunk file: %v", lat16m)
+
+	// Verify reader reads exact 16 MiB
+	for off := 0; off < len(data16m); off += 1024 * 1024 {
+		buf := make([]byte, 1024*1024)
+		r, st := fsB.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: ino16m}, Fh: openOutB16_2.Fh, Offset: uint64(off), Size: 1024 * 1024}, buf)
+		if st != fuse.OK {
+			t.Fatalf("fsB Read 16m at offset %d failed: %v", off, st)
+		}
+		chunk, _ := r.Bytes(buf)
+		if !bytes.Equal(chunk, data16m[off:off+1024*1024]) {
+			t.Fatalf("fsB 16m data mismatch at offset %d", off)
+		}
+	}
+	fsB.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: ino16m}, Fh: openOutB16_2.Fh})
 }

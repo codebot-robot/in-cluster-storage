@@ -407,17 +407,45 @@ To achieve both high write throughput and optimal packing in cloud object storag
    - Only after `PutBlobs` returns successfully does the controller commit all `FileChunk` records and updated inode sizes/mtimes in a single atomic transaction and wait for WAL durability.
    - This ensures **no logged row ever references a blob that is not durable** in cloud storage, preventing dangling references and read I/O errors after crashes.
 
-3. **Consistency Contract ("Nothing is visible or durable before fsync"):**
-   - **On the writer's own node:** Visibility is immediate through its local cache (`NodeCache`).
-   - **Across remote nodes:** Writes become visible only after a sync occurs. Staged writes are not served by `ReadFile` on the controller until synced.
-   - **Close behavior across nodes:** Close starts a per-inode sync for the closed file; data becomes visible on other nodes once its pack is uploaded and the metadata is durable; other staged data on the volume follows on the coalesce window. Close itself does not wait (see #332 for a real close-to-open option).
+3. **Consistency Contract & Modes:**
+
+   ObjectFS provides two consistency modes configured per StorageClass via `parameters: consistency`:
+
+   - **Standard Mode (default, `consistency: standard`):**
+     - **On the writer's own node:** Visibility is immediate through its local cache (`NodeCache`).
+     - **Across remote nodes (what is served during concurrent writes):** Remote nodes do **not** serve a snapshot frozen at `open(2)` time. Instead, reads serve whatever state has already been synced and committed to the controller (its metadata index and object storage) as of the moment the read or cache fetch occurs. While a writer on Node 1 is actively writing, un-synced data remains buffered in Node 1's local cache or staged in controller memory; a reader on Node 2 reading the file observes the previously committed/synced version of those blocks (or pre-existing/zero data) until a sync occurs. If a sync completes on Node 1 while Node 2 has the file open, the controller commits the new chunks and broadcasts an invalidation event via `WatchVolume`, allowing subsequent reads on Node 2 to fetch the newly committed data.
+     - **Close behavior across nodes:** When an application calls `close(2)`, the kernel first delivers FUSE `Flush`. The daemon pushes dirty chunks of that file from `NodeCache` to controller staging memory (`pushDirtyChunksToStaging`, one or more `WriteFile` RPCs) and waits for the controller to acknowledge them. Close blocks for a controller round trip proportional to the file's dirty bytes that periodic sync or dirty-budget overflow has not already moved; if that push fails, `close(2)` returns an error. Then `Release` records the inode as closed and pokes the daemon's background sync goroutine, which later sends a non-blocking `Fsync` with the CLOSE trigger. `close(2)` does not wait for packfile upload or metadata commit. On remote nodes, `open(2)` does not wait. If Node 2 opens the file before the background close sync finishes uploading packs and committing metadata, it may observe the pre-close state (and may continue serving cached pages from its kernel cache).
+
+   - **Close-to-Open Mode (`consistency: close-to-open`):**
+     - **Guaranteed visibility ordering:** If process $P_1$ on Node 1 writes to file $F$ and successfully completes `close(2)`, and process $P_2$ on Node 2 subsequently executes `open(2)` on $F$, $P_2$ is guaranteed to observe all modifications made by $P_1$ up to its close.
+     - **How it works mechanically:**
+       - **No pre-write registration or locks:** Nodes do not cooperatively record file locks, leases, or write intents with the controller before writing. Writes remain in the local daemon's `NodeCache` until `Flush` on close, the periodic sync (`--background-sync-interval`, default 30 s), or dirty-budget overflow (`WouldDirtyOverflow`, running a blocking volume sync including upload).
+       - **Synchronous chunk push on `close(2)`:** When an application calls `close(2)`, the kernel first delivers FUSE `Flush`. The daemon pushes every dirty chunk of that file from `NodeCache` to controller staging memory (`pushDirtyChunksToStaging`, one or more `WriteFile` RPCs) and waits for the controller to acknowledge them. Close blocks for the controller round trip proportional to the file's dirty bytes that periodic sync or dirty-budget overflow has not already moved; if that push fails, `close(2)` returns an error. Then `Release` records the inode as closed and pokes the daemon's background sync goroutine, which later sends a non-blocking `Fsync` with the CLOSE trigger. `close(2)` does not wait for packfile upload or metadata commit.
+       - **The close invariant:** Because a successful `close(2)` requires `Flush` to succeed, **by the time `close(2)` returns to the calling application, the controller holds all of the file's data not already committed by an earlier sync in its in-memory staging table** (`v.stagedChunks[inodeID]`).
+       - **Controller Open-Side Barrier:** The open barrier checks `stagedChunks[ino]` and whether a sync is in flight. It can only work because a successful close implies the file's chunks are already in controller memory:
+         - When process $P_2$ on Node 2 calls `open(2)` on file $F$, the FUSE driver issues an `Open` RPC to the controller.
+         - If file $F$ is clean (no staged chunks in controller memory and no sync currently packaging $F$), `Open` completes without barrier wait.
+         - If file $F$ has staged chunks in controller memory or an in-flight background sync is currently packaging $F$, the controller intercepts `Open`. The controller itself initiates an immediate per-inode sync (`syncInodesLocked`) for that inode, uploads the packfile to object storage, commits the metadata transaction, and waits for completion before replying to `Open`.
+         - This wait is bounded by `--open-barrier-timeout` (default 5 s). If the timeout expires or the volume's WAL stream is degraded, `Open` returns `EIO`.
+       - **Reader Cache Invalidation:** The `OpenResponse` RPC returns fresh `EntryAttr` and the committed `stream_position`. When the stream position moved, Node 2's daemon purges its local page cache (`InodeNotify(ino, 0, -1)`) and attribute cache (`InodeNotify(ino, -1, 0)`), invalidates clean cached chunks, and replies to FUSE without `FOPEN_KEEP_CACHE`, ensuring subsequent reads fetch the newly durable data.
+     - **Trade-offs Relative to Standard Mode:**
+       - The write and close paths are identical in both modes: writes buffer in `NodeCache`, and `close(2)` blocks on FUSE `Flush` pushing remaining dirty chunks to controller staging memory without waiting for cloud storage pack upload.
+       - Close-to-open adds a bounded wait on `open(2)` for files with staged or in-flight data, can fail those opens with `EIO` after `--open-barrier-timeout` or when the volume is degraded, and requires keeping the per-open controller RPC.
+       - Clean opens pay the controller `Open` RPC in both modes.
+       - When the barrier waits on `open(2)`, the latency depends on pack upload and WAL commit. Measured barrier latency (Linux amd64, Go 1.27.3, in-memory backend over bufconn):
+         - 4 KiB inline file: ~443 µs (inlined into transaction, 0 pack blobs)
+         - 16 MiB multi-chunk file: ~106.6 ms
+         Against a real cloud object store, the barrier wait additionally includes the packfile `PutBlobs` upload latency, scaling with the size of dirty data closed since the last sync.
+     - **Visibility, NOT Crash Durability:** Close-to-open orders **visibility across nodes, NOT crash durability**. Until the sync that close triggers (or a reader's barrier forces) has uploaded packfiles and committed metadata, data exists only in controller staging memory and the writer daemon's cache. If the controller restarts during that window, staged data is dropped; if the writer daemon is also lost, the data is lost even though `close(2)` returned success. Durability still arrives only with a committed sync, and `fsync(2)` is the only way for applications to wait for it.
+     - **Interaction with Exclusive-Local Mode:** Exclusive-local volumes (`mode: exclusive-local`) satisfy close-to-open by construction via unmount checkpoints. The `consistency` parameter is ignored on exclusive-local volumes.
+     - **Interaction with #174:** Issue #174 explores avoiding the per-FUSE-open `Open` RPC. Close-to-open consistency strictly requires the `Open` RPC so the controller can execute the open barrier and the node daemon can invalidate stale reader caches. Implementations must retain the `Open` RPC for close-to-open volumes, and any changes under #174 must preserve this path.
 
 4. **Sync Triggers:**
 
 | Trigger | Who | Blocks Caller? | Default |
 | :--- | :--- | :--- | :--- |
 | `fsync` / `fdatasync` | Application via `Fsync` RPC (`blocking=true`) | Yes, until pack uploaded + rows logged at WAL level | Always |
-| Close of written file (`Release`) | Node daemon triggers per-inode sync (`blocking=false, trigger=CLOSE`) | No (close returns immediately, like a local fs) | On (`--sync-on-close=true`) |
+| Close of written file (`Release`) | Node daemon triggers per-inode sync (`blocking=false, trigger=CLOSE`) | No (Flush stages chunks in controller RAM; close does not wait for cloud PUT) | On (`--sync-on-close=true`) |
 | Background timer | Node daemon, per volume (`blocking=false, trigger=PERIODIC`) | No | On (`--background-sync-interval=30s`) |
 | Client cache budget | Node daemon, when dirty bytes exceed cache | The write that overflows waits | Always (`--cache-size-mb=128`) |
 

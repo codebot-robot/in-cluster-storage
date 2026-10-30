@@ -435,3 +435,16 @@ parameters:
   mode: exclusive-local
   checkpointInterval: "0s" # optional: duration string (e.g. "10s", "1m", default "0s" off)
 
+---
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: objectfs-close-to-open
+provisioner: objectfs.labs.gke.io
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+parameters:
+  consistency: close-to-open
+
+

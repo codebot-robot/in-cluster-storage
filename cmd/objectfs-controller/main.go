@@ -67,6 +67,7 @@ var (
 	syncCoalesceWindow        = flag.Duration("sync-coalesce-window", 1*time.Second, "Coalescing window for non-blocking sync requests")
 	maxStagingBytes           = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
 	controllerSyncTimeout     = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
+	openBarrierTimeout        = flag.Duration("open-barrier-timeout", 5*time.Second, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
 )
 
@@ -180,6 +181,9 @@ func main() {
 	}
 	if *controllerSyncTimeout > 0 {
 		serverOpts = append(serverOpts, controller.WithServerSyncTimeout(*controllerSyncTimeout))
+	}
+	if *openBarrierTimeout > 0 {
+		serverOpts = append(serverOpts, controller.WithServerOpenBarrierTimeout(*openBarrierTimeout))
 	}
 	if *acceptUnversionedSegments {
 		serverOpts = append(serverOpts, controller.WithServerAcceptUnversioned(true))

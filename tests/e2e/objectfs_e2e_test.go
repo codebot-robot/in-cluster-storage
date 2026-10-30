@@ -1979,6 +1979,156 @@ spec:
 	}
 }
 
+func TestObjectFSCloseToOpenE2E(t *testing.T) {
+	requireE2EGroup(t, "multinode")
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
+	volumeID := "c2o-barrier-e2e-vol"
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+			t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		}
+	})
+
+	pod1Name := "c2o-writer-node1"
+	pod1Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+          consistency: close-to-open
+`, pod1Name, node1, volumeID)
+
+	pod2Name := "c2o-reader-node2"
+	pod2Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+          consistency: close-to-open
+`, pod2Name, node2, volumeID)
+
+	t.Logf("Starting close-to-open writer on %s and reader on %s", node1, node2)
+	h.KubectlApplyContent(pod1Name, pod1Yaml)
+	h.KubectlApplyContent(pod2Name, pod2Yaml)
+
+	if err := h.WaitForPodReady(pod1Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Writer Pod failed to become ready: %v", err)
+	}
+	if err := h.WaitForPodReady(pod2Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Reader Pod failed to become ready: %v", err)
+	}
+
+	defer func() {
+		h.DeletePod(pod1Name, "default")
+		h.DeletePod(pod2Name, "default")
+	}()
+
+	// Case 1: 4 KiB inline file
+	t.Logf("--- Testing Case 1: 4 KiB inline file ---")
+	// 1. Writer creates empty file and syncs so reader can see dentry
+	if _, err := h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "touch /data/inline_4k.bin && sync /data/inline_4k.bin"); err != nil {
+		t.Fatalf("Failed to initialize empty inline_4k.bin: %v", err)
+	}
+	// 2. Reader reads/stats the file first to populate its local cache with a stale size (size=0)
+	outStat0, err := h.RunInPod(pod2Name, "default", "/bin/sh", "-c", "stat -c %s /data/inline_4k.bin && cat /data/inline_4k.bin")
+	if err != nil || strings.TrimSpace(outStat0) != "0" {
+		t.Fatalf("Reader failed to seed size=0 in cache: %v, out: %q", err, outStat0)
+	}
+	// 3. Writer writes 4 KiB and closes WITHOUT fsync
+	write4kCmd := "dd if=/dev/urandom of=/data/inline_4k.bin bs=4096 count=1 conv=notrunc 2>/dev/null && sha256sum /data/inline_4k.bin | cut -d' ' -f1"
+	expectedSha4k, err := h.RunInPod(pod1Name, "default", "/bin/sh", "-c", write4kCmd)
+	if err != nil {
+		t.Fatalf("Writer failed to write 4 KiB file: %v", err)
+	}
+	expectedSha4k = strings.TrimSpace(expectedSha4k)
+
+	// 4. Reader immediately executes open(2) without sleep, measuring barrier latency
+	read4kCmd := `T0=$(date +%s%N); exec 3< /data/inline_4k.bin; T1=$(date +%s%N); SHA=$(cat <&3 | sha256sum | cut -d' ' -f1); exec 3<&-; echo "LAT_NS:$((T1 - T0)) SHA:$SHA"`
+	outReader4k, err := h.RunInPod(pod2Name, "default", "/bin/sh", "-c", read4kCmd)
+	if err != nil {
+		t.Fatalf("Reader failed to read 4 KiB file: %v", err)
+	}
+	t.Logf("Reader 4 KiB output: %s", outReader4k)
+	if !strings.Contains(outReader4k, expectedSha4k) {
+		t.Fatalf("Reader 4 KiB content mismatch: expected SHA %s, got output: %s", expectedSha4k, outReader4k)
+	}
+	stat4k, err := h.RunInPod(pod2Name, "default", "stat", "-c", "%s", "/data/inline_4k.bin")
+	if err != nil || strings.TrimSpace(stat4k) != "4096" {
+		t.Fatalf("Reader 4 KiB stat size mismatch: expected 4096, got %q (err: %v)", stat4k, err)
+	}
+
+	// Case 2: 16 MiB multi-chunk file
+	t.Logf("--- Testing Case 2: 16 MiB multi-chunk file ---")
+	// 1. Writer creates empty file and syncs so reader can see dentry
+	if _, err := h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "touch /data/multi_16m.bin && sync /data/multi_16m.bin"); err != nil {
+		t.Fatalf("Failed to initialize empty multi_16m.bin: %v", err)
+	}
+	// 2. Reader reads/stats the file first to populate its local cache with a stale size (size=0)
+	outStat16m0, err := h.RunInPod(pod2Name, "default", "/bin/sh", "-c", "stat -c %s /data/multi_16m.bin && cat /data/multi_16m.bin")
+	if err != nil || strings.TrimSpace(outStat16m0) != "0" {
+		t.Fatalf("Reader failed to seed size=0 in cache for 16m: %v, out: %q", err, outStat16m0)
+	}
+	// 3. Writer writes 16 MiB and closes WITHOUT fsync
+	write16mCmd := "dd if=/dev/urandom of=/data/multi_16m.bin bs=1048576 count=16 conv=notrunc 2>/dev/null && sha256sum /data/multi_16m.bin | cut -d' ' -f1"
+	expectedSha16m, err := h.RunInPod(pod1Name, "default", "/bin/sh", "-c", write16mCmd)
+	if err != nil {
+		t.Fatalf("Writer failed to write 16 MiB file: %v", err)
+	}
+	expectedSha16m = strings.TrimSpace(expectedSha16m)
+
+	// 4. Reader immediately executes open(2) without sleep, measuring barrier latency
+	read16mCmd := `T0=$(date +%s%N); exec 3< /data/multi_16m.bin; T1=$(date +%s%N); SHA=$(cat <&3 | sha256sum | cut -d' ' -f1); exec 3<&-; echo "LAT_NS:$((T1 - T0)) SHA:$SHA"`
+	outReader16m, err := h.RunInPod(pod2Name, "default", "/bin/sh", "-c", read16mCmd)
+	if err != nil {
+		t.Fatalf("Reader failed to read 16 MiB file: %v", err)
+	}
+	t.Logf("Reader 16 MiB output: %s", outReader16m)
+	if !strings.Contains(outReader16m, expectedSha16m) {
+		t.Fatalf("Reader 16 MiB content mismatch: expected SHA %s, got output: %s", expectedSha16m, outReader16m)
+	}
+	stat16m, err := h.RunInPod(pod2Name, "default", "stat", "-c", "%s", "/data/multi_16m.bin")
+	if err != nil || strings.TrimSpace(stat16m) != "16777216" {
+		t.Fatalf("Reader 16 MiB stat size mismatch: expected 16777216, got %q (err: %v)", stat16m, err)
+	}
+	t.Logf("Successfully verified two-node close-to-open consistency for 4 KiB inline and 16 MiB multi-chunk files!")
+}
+
 func TestObjectFSControllerCrashMidWriteE2E(t *testing.T) {
 	requireE2EGroup(t, "chaos")
 
