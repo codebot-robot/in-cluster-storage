@@ -19,8 +19,10 @@ package buffer
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -833,5 +835,452 @@ func TestTailOnEmptyStreamReceivesSubsequentAppends(t *testing.T) {
 	}
 	if resp.GetRecord() == nil || resp.GetRecord().GetStreamSeq() != 1 {
 		t.Fatalf("unexpected record: %+v", resp.GetRecord())
+	}
+}
+
+type countingSegmentBackend struct {
+	objectstore.Backend
+	readSegmentCalls int
+}
+
+func (c *countingSegmentBackend) GetObject(ctx context.Context, bucket, key string, offset, count int64, w io.Writer) error {
+	if strings.HasPrefix(key, SegmentsPrefix) {
+		c.readSegmentCalls++
+	}
+	return c.Backend.GetObject(ctx, bucket, key, offset, count, w)
+}
+
+type retentionBackend struct {
+	objectstore.Backend
+}
+
+func (r *retentionBackend) DeleteObject(ctx context.Context, bucket, key string) error {
+	if strings.HasPrefix(key, SegmentsPrefix) {
+		return nil // retain aggregated segments in object storage
+	}
+	return r.Backend.DeleteObject(ctx, bucket, key)
+}
+
+// TestBufferRestart_ReadsOnlyUncoveredSegments tests that a buffer restart with N aggregated segments,
+// most covered by sealed per-stream files, reads ONLY the uncovered tail during startup recovery,
+// while preserving unsealed streams, and that a fresh data dir reads every segment.
+func TestBufferRestart_ReadsOnlyUncoveredSegments(t *testing.T) {
+	ctx := t.Context()
+	baseBackend := inmemorystorage.New()
+	retBackend := &retentionBackend{Backend: baseBackend}
+	dataDir1 := t.TempDir()
+
+	streamIDA := uuid.New()
+	streamIDB := uuid.New()
+
+	// 1. Start server 1
+	srv1, err := NewServer(ctx, ServerConfig{
+		Backend:       retBackend,
+		DataDir:       dataDir1,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server 1: %v", err)
+	}
+
+	// Append 8 batches of 10 records for Stream A (records 1..80, positions 1..80)
+	var currentSeqA uint64
+	for batch := 0; batch < 8; batch++ {
+		for i := 0; i < 10; i++ {
+			currentSeqA++
+			ackChan := make(chan ackResult, 1)
+			srv1.incomingChan <- incomingItem{
+				streamID:  streamIDA,
+				streamSeq: currentSeqA,
+				payload:   []byte(fmt.Sprintf("rec-a-%d", currentSeqA)),
+				ackChan:   ackChan,
+			}
+			<-ackChan
+		}
+		if _, err := srv1.Flush(ctx, &pb.FlushRequest{}); err != nil {
+			t.Fatalf("Flush batch %d failed: %v", batch, err)
+		}
+	}
+
+	// Seal stream A: creates sealed file covering records 1..80 (positions 1..80)
+	if err := srv1.SealStream(ctx, streamIDA); err != nil {
+		t.Fatalf("SealStream failed: %v", err)
+	}
+
+	// Append 2 more batches in the tail:
+	// Stream A appends records 81..100.
+	// Stream B (young unsealed stream) appends records 1..20 and NEVER seals.
+	var currentSeqB uint64
+	for batch := 8; batch < 10; batch++ {
+		for i := 0; i < 10; i++ {
+			currentSeqA++
+			ackChanA := make(chan ackResult, 1)
+			srv1.incomingChan <- incomingItem{
+				streamID:  streamIDA,
+				streamSeq: currentSeqA,
+				payload:   []byte(fmt.Sprintf("rec-a-%d", currentSeqA)),
+				ackChan:   ackChanA,
+			}
+			<-ackChanA
+
+			currentSeqB++
+			ackChanB := make(chan ackResult, 1)
+			srv1.incomingChan <- incomingItem{
+				streamID:  streamIDB,
+				streamSeq: currentSeqB,
+				payload:   []byte(fmt.Sprintf("rec-b-%d", currentSeqB)),
+				ackChan:   ackChanB,
+			}
+			<-ackChanB
+		}
+		if _, err := srv1.Flush(ctx, &pb.FlushRequest{}); err != nil {
+			t.Fatalf("Flush tail batch %d failed: %v", batch, err)
+		}
+	}
+
+	if err := srv1.Close(); err != nil {
+		t.Fatalf("server 1 close failed: %v", err)
+	}
+
+	// 2. Restart on the SAME dataDir: coverage.json exists, skips 8 covered segments, reads only 2 uncovered
+	counting1 := &countingSegmentBackend{Backend: retBackend}
+	srv2, err := NewServer(ctx, ServerConfig{
+		Backend:       counting1,
+		DataDir:       dataDir1,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server 2: %v", err)
+	}
+	defer srv2.Close()
+
+	if counting1.readSegmentCalls != 2 {
+		t.Fatalf("expected exactly 2 ReadSegmentFromBackend calls for uncovered tail on same dataDir, got %d", counting1.readSegmentCalls)
+	}
+	if srv2.lastFlushedPosition != 120 {
+		t.Errorf("expected lastFlushedPosition 120, got %d", srv2.lastFlushedPosition)
+	}
+	if srv2.streams[streamIDA.String()].witnessSeq != 100 {
+		t.Errorf("expected stream A witnessSeq 100, got %d", srv2.streams[streamIDA.String()].witnessSeq)
+	}
+	if srv2.streams[streamIDB.String()].witnessSeq != 20 {
+		t.Errorf("expected stream B witnessSeq 20, got %d", srv2.streams[streamIDB.String()].witnessSeq)
+	}
+
+	// Verify tailPerStream receives all 100 records for Stream A on restarted server
+	tailCtxA, tailCancelA := context.WithCancel(ctx)
+	defer tailCancelA()
+	var receivedSeqsA []uint64
+	mockStreamA := &mockCollectingTailServer{
+		ctx: tailCtxA,
+		onSend: func(resp *pb.TailResponse) {
+			if rec := resp.GetRecord(); rec != nil {
+				receivedSeqsA = append(receivedSeqsA, rec.StreamSeq)
+				if len(receivedSeqsA) == 100 {
+					tailCancelA()
+				}
+			}
+		},
+	}
+	_ = srv2.tailPerStream(tailCtxA, streamIDA, &pb.TailRequest{FromStreamSeq: 0}, mockStreamA)
+	if len(receivedSeqsA) != 100 {
+		t.Fatalf("expected 100 records received via tail for Stream A, got %d", len(receivedSeqsA))
+	}
+	for i := 0; i < 100; i++ {
+		if receivedSeqsA[i] != uint64(i+1) {
+			t.Fatalf("stream A seq mismatch at index %d: got %d, want %d", i, receivedSeqsA[i], i+1)
+		}
+	}
+
+	// Verify tailPerStream receives all 20 records for young unsealed Stream B on restarted server
+	tailCtxB, tailCancelB := context.WithCancel(ctx)
+	defer tailCancelB()
+	var receivedSeqsB []uint64
+	mockStreamB := &mockCollectingTailServer{
+		ctx: tailCtxB,
+		onSend: func(resp *pb.TailResponse) {
+			if rec := resp.GetRecord(); rec != nil {
+				receivedSeqsB = append(receivedSeqsB, rec.StreamSeq)
+				if len(receivedSeqsB) == 20 {
+					tailCancelB()
+				}
+			}
+		},
+	}
+	_ = srv2.tailPerStream(tailCtxB, streamIDB, &pb.TailRequest{FromStreamSeq: 0}, mockStreamB)
+	if len(receivedSeqsB) != 20 {
+		t.Fatalf("expected 20 records received via tail for Stream B, got %d", len(receivedSeqsB))
+	}
+	for i := 0; i < 20; i++ {
+		if receivedSeqsB[i] != uint64(i+1) {
+			t.Fatalf("stream B seq mismatch at index %d: got %d, want %d", i, receivedSeqsB[i], i+1)
+		}
+	}
+
+	// 3. Restart on a FRESH dataDir (no coverage.json exists): must read EVERY segment (all 10)
+	counting2 := &countingSegmentBackend{Backend: retBackend}
+	srv3, err := NewServer(ctx, ServerConfig{
+		Backend:       counting2,
+		DataDir:       t.TempDir(),
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server 3: %v", err)
+	}
+	defer srv3.Close()
+
+	if counting2.readSegmentCalls != 10 {
+		t.Fatalf("expected exactly 10 ReadSegmentFromBackend calls on fresh dataDir, got %d", counting2.readSegmentCalls)
+	}
+	if srv3.lastFlushedPosition != 120 {
+		t.Errorf("expected lastFlushedPosition 120 on fresh dataDir, got %d", srv3.lastFlushedPosition)
+	}
+	if srv3.streams[streamIDA.String()].witnessSeq != 100 {
+		t.Errorf("expected stream A witnessSeq 100 on fresh dataDir, got %d", srv3.streams[streamIDA.String()].witnessSeq)
+	}
+	if srv3.streams[streamIDB.String()].witnessSeq != 20 {
+		t.Errorf("expected stream B witnessSeq 20 on fresh dataDir, got %d", srv3.streams[streamIDB.String()].witnessSeq)
+	}
+}
+
+// TestBufferRestart_InterleavedUnsealedStreamNotSkipped verifies that when an unsealed stream
+// writes records interleaved across segments with another stream that seals, the segments are NOT
+// skipped on restart, preserving the unsealed stream's records and witness watermark.
+func TestBufferRestart_InterleavedUnsealedStreamNotSkipped(t *testing.T) {
+	ctx := t.Context()
+	baseBackend := inmemorystorage.New()
+	retBackend := &retentionBackend{Backend: baseBackend}
+	dataDir := t.TempDir()
+
+	streamIDA := uuid.New()
+	streamIDB := uuid.New()
+
+	srv1, err := NewServer(ctx, ServerConfig{
+		Backend:       retBackend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server 1: %v", err)
+	}
+
+	// Both streams write interleaved records in segments 1..5
+	var seqA, seqB uint64
+	for batch := 0; batch < 5; batch++ {
+		for i := 0; i < 5; i++ {
+			seqA++
+			ackChanA := make(chan ackResult, 1)
+			srv1.incomingChan <- incomingItem{
+				streamID:  streamIDA,
+				streamSeq: seqA,
+				payload:   []byte(fmt.Sprintf("rec-a-%d", seqA)),
+				ackChan:   ackChanA,
+			}
+			<-ackChanA
+
+			seqB++
+			ackChanB := make(chan ackResult, 1)
+			srv1.incomingChan <- incomingItem{
+				streamID:  streamIDB,
+				streamSeq: seqB,
+				payload:   []byte(fmt.Sprintf("rec-b-%d", seqB)),
+				ackChan:   ackChanB,
+			}
+			<-ackChanB
+		}
+		if _, err := srv1.Flush(ctx, &pb.FlushRequest{}); err != nil {
+			t.Fatalf("Flush batch %d failed: %v", batch, err)
+		}
+	}
+
+	// Seal stream A only; stream B remains unsealed.
+	if err := srv1.SealStream(ctx, streamIDA); err != nil {
+		t.Fatalf("SealStream A failed: %v", err)
+	}
+
+	if err := srv1.Close(); err != nil {
+		t.Fatalf("server 1 close failed: %v", err)
+	}
+
+	// Restart on the same dataDir: because Stream B has unsealed records from pos 2,
+	// covered position must be 0 and all 5 segments must be read.
+	counting := &countingSegmentBackend{Backend: retBackend}
+	srv2, err := NewServer(ctx, ServerConfig{
+		Backend:       counting,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server 2: %v", err)
+	}
+	defer srv2.Close()
+
+	if counting.readSegmentCalls != 5 {
+		t.Fatalf("expected all 5 segments read when unsealed stream has interleaved records, got %d", counting.readSegmentCalls)
+	}
+	if srv2.streams[streamIDB.String()] == nil {
+		t.Fatalf("stream B must be known on server 2")
+	}
+	if srv2.streams[streamIDB.String()].witnessSeq != 25 {
+		t.Errorf("expected stream B witnessSeq 25, got %d", srv2.streams[streamIDB.String()].witnessSeq)
+	}
+}
+
+type mockCollectingTailServer struct {
+	grpc.ServerStream
+	ctx    context.Context
+	onSend func(*pb.TailResponse)
+}
+
+func (m *mockCollectingTailServer) Send(resp *pb.TailResponse) error {
+	if m.onSend != nil {
+		m.onSend(resp)
+	}
+	return nil
+}
+
+func (m *mockCollectingTailServer) Context() context.Context {
+	return m.ctx
+}
+
+// TestStartup_10kSegments verifies startup with 10k aggregated segments
+// where sealed per-stream files cover all but the tail.
+func TestStartup_10kSegments(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+
+	streamID := uuid.New()
+	totalSegments := 10000
+	coveredSegments := 9990
+
+	// 1. Seed 10k aggregated segments in backend
+	for i := 1; i <= totalSegments; i++ {
+		pos := uint64(i)
+		rec := &wal.LogRecord{
+			Position:  pos,
+			StreamID:  streamID,
+			StreamSeq: pos,
+			Payload:   []byte("meas-rec"),
+		}
+		var buf bytes.Buffer
+		buf.Write(wal.DefaultSegmentHeader().Encode())
+		buf.Write(rec.Encode())
+
+		segKey := fmt.Sprintf("%s%012d-%012d.wal", SegmentsPrefix, pos, pos)
+		if _, err := backend.PutObject(ctx, "", segKey, blob.NewByteStreamFromBytes(buf.Bytes())); err != nil {
+			t.Fatalf("failed to put segment %d: %v", i, err)
+		}
+	}
+
+	// 2. Seed sealed per-stream file covering 1..9990 and persist coverage.json
+	dataDir := t.TempDir()
+	cov := StreamCoverage{
+		Streams:    map[string]uint64{streamID.String(): uint64(coveredSegments)},
+		Positions:  map[string]uint64{streamID.String(): uint64(coveredSegments)},
+		CoveredPos: uint64(coveredSegments),
+	}
+	covData, err := json.Marshal(cov)
+	if err != nil {
+		t.Fatalf("failed to marshal coverage: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "coverage.json"), covData, 0644); err != nil {
+		t.Fatalf("failed to write coverage.json: %v", err)
+	}
+
+	// 3. Narrowed startup: reading only 10 uncovered segments
+	startNarrowed := time.Now()
+	srvNarrowed, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("failed to create narrowed server: %v", err)
+	}
+	durationNarrowed := time.Since(startNarrowed)
+	defer srvNarrowed.Close()
+
+	if srvNarrowed.lastFlushedPosition != uint64(totalSegments) {
+		t.Errorf("expected lastFlushedPosition %d, got %d", totalSegments, srvNarrowed.lastFlushedPosition)
+	}
+	if srvNarrowed.streams[streamID.String()].witnessSeq != uint64(totalSegments) {
+		t.Errorf("expected witnessSeq %d, got %d", totalSegments, srvNarrowed.streams[streamID.String()].witnessSeq)
+	}
+
+	// 4. Measure full scan startup time when OBJECTFS_BENCH is set
+	if os.Getenv("OBJECTFS_BENCH") != "" {
+		startFull := time.Now()
+		srvFull, err := NewServer(ctx, ServerConfig{
+			Backend:       backend,
+			DataDir:       t.TempDir(), // fresh dir = no coverage.json
+			FlushInterval: 10 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("failed to create full server: %v", err)
+		}
+		durationFull := time.Since(startFull)
+		defer srvFull.Close()
+
+		t.Logf("Measured 10,000 aggregated segments startup: full_scan=%v vs narrowed_uncovered=%v (speedup: %.1fx)",
+			durationFull, durationNarrowed, float64(durationFull)/float64(durationNarrowed))
+	}
+}
+
+func BenchmarkStartup_10kSegments(b *testing.B) {
+	ctx := b.Context()
+	backend := inmemorystorage.New()
+
+	streamID := uuid.New()
+	totalSegments := 10000
+	coveredSegments := 9990
+
+	for i := 1; i <= totalSegments; i++ {
+		pos := uint64(i)
+		rec := &wal.LogRecord{
+			Position:  pos,
+			StreamID:  streamID,
+			StreamSeq: pos,
+			Payload:   []byte("meas-rec"),
+		}
+		var buf bytes.Buffer
+		buf.Write(wal.DefaultSegmentHeader().Encode())
+		buf.Write(rec.Encode())
+
+		segKey := fmt.Sprintf("%s%012d-%012d.wal", SegmentsPrefix, pos, pos)
+		if _, err := backend.PutObject(ctx, "", segKey, blob.NewByteStreamFromBytes(buf.Bytes())); err != nil {
+			b.Fatalf("failed to put segment %d: %v", i, err)
+		}
+	}
+
+	dataDir := b.TempDir()
+	cov := StreamCoverage{
+		Streams:    map[string]uint64{streamID.String(): uint64(coveredSegments)},
+		Positions:  map[string]uint64{streamID.String(): uint64(coveredSegments)},
+		CoveredPos: uint64(coveredSegments),
+	}
+	covData, err := json.Marshal(cov)
+	if err != nil {
+		b.Fatalf("failed to marshal coverage: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "coverage.json"), covData, 0644); err != nil {
+		b.Fatalf("failed to write coverage.json: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		srv, err := NewServer(ctx, ServerConfig{
+			Backend:       backend,
+			DataDir:       dataDir,
+			FlushInterval: 10 * time.Second,
+		})
+		if err != nil {
+			b.Fatalf("failed to create server: %v", err)
+		}
+		_ = srv.Close()
 	}
 }
