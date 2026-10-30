@@ -51,6 +51,10 @@ type WalBufferClient interface {
 	// after a restart. Tail clamps from_position to last_flushed_position + 1 when it exceeds that, returning
 	// the effective start in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq)
 	// and must tolerate re-delivery from the last flushed position after reconnecting.
+	//
+	// Unfiltered Tail (without stream_id) is retained as a tooling and cross-stream debugging mechanism,
+	// preserving the global position-ordered stream across aggregated segments. Production consumers
+	// should supply stream_id to stream directly from per-stream files.
 	Tail(ctx context.Context, in *TailRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TailResponse], error)
 }
 
@@ -117,6 +121,10 @@ type WalBufferServer interface {
 	// after a restart. Tail clamps from_position to last_flushed_position + 1 when it exceeds that, returning
 	// the effective start in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq)
 	// and must tolerate re-delivery from the last flushed position after reconnecting.
+	//
+	// Unfiltered Tail (without stream_id) is retained as a tooling and cross-stream debugging mechanism,
+	// preserving the global position-ordered stream across aggregated segments. Production consumers
+	// should supply stream_id to stream directly from per-stream files.
 	Tail(*TailRequest, grpc.ServerStreamingServer[TailResponse]) error
 	mustEmbedUnimplementedWalBufferServer()
 }
