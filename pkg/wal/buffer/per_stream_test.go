@@ -1180,8 +1180,6 @@ func TestStartup_10kSegments(t *testing.T) {
 	// 2. Seed sealed per-stream file covering 1..9990 and persist coverage.json
 	dataDir := t.TempDir()
 	cov := StreamCoverage{
-		Streams:    map[string]uint64{streamID.String(): uint64(coveredSegments)},
-		Positions:  map[string]uint64{streamID.String(): uint64(coveredSegments)},
 		CoveredPos: uint64(coveredSegments),
 	}
 	covData, err := json.Marshal(cov)
@@ -1259,8 +1257,6 @@ func BenchmarkStartup_10kSegments(b *testing.B) {
 
 	dataDir := b.TempDir()
 	cov := StreamCoverage{
-		Streams:    map[string]uint64{streamID.String(): uint64(coveredSegments)},
-		Positions:  map[string]uint64{streamID.String(): uint64(coveredSegments)},
 		CoveredPos: uint64(coveredSegments),
 	}
 	covData, err := json.Marshal(cov)

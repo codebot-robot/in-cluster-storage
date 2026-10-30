@@ -577,11 +577,9 @@ func (s *StreamStore) SealAll(ctx context.Context) ([]*StreamMeta, error) {
 	return sealed, errors.Join(errs...)
 }
 
-// StreamCoverage describes the highest sealed-and-uploaded sequences and covered position.
+// StreamCoverage describes the covered position below which all known stream records are in sealed files.
 type StreamCoverage struct {
-	Streams    map[string]uint64 `json:"streams"`
-	Positions  map[string]uint64 `json:"positions,omitempty"`
-	CoveredPos uint64            `json:"covered_position"`
+	CoveredPos uint64 `json:"covered_position"`
 }
 
 func (s *StreamStore) writeCoverageFile(cov StreamCoverage) error {
@@ -599,21 +597,13 @@ func (s *StreamStore) writeCoverageFile(cov StreamCoverage) error {
 func (s *StreamStore) saveCoverage() {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	cov := StreamCoverage{
-		Streams:   make(map[string]uint64),
-		Positions: make(map[string]uint64),
-	}
 	var minPos uint64
-	first := true
-	for sid, w := range s.streams {
+	hasRecords := false
+	for _, w := range s.streams {
 		w.mu.Lock()
-		upTo := w.uploadedTo
 		upPos := w.uploadedPos
 		fPos := w.firstPos
 		w.mu.Unlock()
-
-		cov.Streams[sid] = upTo
-		cov.Positions[sid] = upPos
 
 		if fPos == 0 && upPos == 0 {
 			continue // idle stream with no records
@@ -624,13 +614,15 @@ func (s *StreamStore) saveCoverage() {
 			covPos = fPos - 1
 		}
 
-		if first || covPos < minPos {
+		if !hasRecords || covPos < minPos {
 			minPos = covPos
-			first = false
+			hasRecords = true
 		}
 	}
-	if len(cov.Streams) > 0 {
-		cov.CoveredPos = minPos
+	if hasRecords {
+		cov := StreamCoverage{
+			CoveredPos: minPos,
+		}
 		if err := s.writeCoverageFile(cov); err != nil {
 			klog.Warningf("Failed to persist stream coverage: %v", err)
 		}
@@ -638,39 +630,23 @@ func (s *StreamStore) saveCoverage() {
 }
 
 // LoadCoverage loads the persisted coverage index from dataDir.
-// If coverage.json does not exist, it returns nil, 0, nil.
-func (s *StreamStore) LoadCoverage() (map[string]uint64, uint64, error) {
+// If coverage.json does not exist, it returns 0, nil.
+func (s *StreamStore) LoadCoverage() (uint64, error) {
 	covPath := filepath.Join(s.dataDir, "coverage.json")
 	data, err := os.ReadFile(covPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, 0, nil
+			return 0, nil
 		}
-		return nil, 0, fmt.Errorf("failed to read coverage index %s: %w", covPath, err)
+		return 0, fmt.Errorf("failed to read coverage index %s: %w", covPath, err)
 	}
 
 	var cov StreamCoverage
 	if err := json.Unmarshal(data, &cov); err != nil {
-		return nil, 0, fmt.Errorf("failed to unmarshal coverage index %s: %w", covPath, err)
+		return 0, fmt.Errorf("failed to unmarshal coverage index %s: %w", covPath, err)
 	}
 
-	for sid, upTo := range cov.Streams {
-		id, err := uuid.Parse(sid)
-		if err != nil {
-			return nil, 0, fmt.Errorf("invalid stream UUID %q in coverage index: %w", sid, err)
-		}
-		w := s.getOrCreateStream(id)
-		w.mu.Lock()
-		if upTo > w.uploadedTo {
-			w.uploadedTo = upTo
-		}
-		if pos, ok := cov.Positions[sid]; ok && pos > w.uploadedPos {
-			w.uploadedPos = pos
-		}
-		w.mu.Unlock()
-	}
-
-	return cov.Streams, cov.CoveredPos, nil
+	return cov.CoveredPos, nil
 }
 
 // TrackSegmentCoverage records the highest stream sequences contained in an aggregated segment.

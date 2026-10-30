@@ -165,16 +165,13 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to list segments from backend: %w", err)
 	}
 
-	coveredTo, minCoveredPos, err := streamStore.LoadCoverage()
+	minCoveredPos, err := streamStore.LoadCoverage()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load stream coverage: %w", err)
 	}
 
 	var allDiscoveredRecords []*wal.LogRecord
 	backendWatermarks := make(map[string]uint64)
-	for sid, seq := range coveredTo {
-		backendWatermarks[sid] = seq
-	}
 
 	for _, segPath := range discoveredSegments {
 		_, segLast, err := wal.ParseSegmentPath(segPath)
