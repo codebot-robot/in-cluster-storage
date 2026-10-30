@@ -441,6 +441,8 @@ type StreamStore struct {
 
 	stopChan chan struct{}
 	wg       sync.WaitGroup
+
+	evictHook func()
 }
 
 // SetAcceptUnversioned configures whether unversioned segments/streams are accepted during recovery.
@@ -448,6 +450,13 @@ func (s *StreamStore) SetAcceptUnversioned(accept bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.acceptUnversioned = accept
+}
+
+// SetEvictHook registers a callback invoked on each idle eviction pass before writers are evicted.
+func (s *StreamStore) SetEvictHook(hook func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evictHook = hook
 }
 
 // NewStreamStore creates and initializes a StreamStore.
@@ -552,10 +561,33 @@ func (s *StreamStore) checkSealsAndGC(ctx context.Context) {
 	}
 
 	s.mu.Lock()
+	evictHook := s.evictHook
+	s.mu.Unlock()
+
+	if evictHook != nil {
+		evictHook()
+	}
+
+	s.mu.Lock()
 	s.evictIdleWritersLocked()
 	s.mu.Unlock()
 
 	s.saveCoverage()
+}
+
+func (s *StreamStore) canEvictStream(streamID uuid.UUID, witnessSeq, s3Seq uint64) bool {
+	s.mu.RLock()
+	w := s.streams[streamID.String()]
+	s.mu.RUnlock()
+	if w == nil {
+		return true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) > 0 || w.recCount > 0 || w.sealedSinceLastPass || w.hasPendingSealedUploadsLocked() {
+		return false
+	}
+	return witnessSeq <= w.uploadedTo && s3Seq <= w.uploadedTo
 }
 
 func (s *StreamStore) evictIdleWritersLocked() {

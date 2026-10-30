@@ -73,10 +73,12 @@ type ackResult struct {
 }
 
 type streamState struct {
-	mu         sync.Mutex
-	cond       *sync.Cond
-	witnessSeq uint64
-	s3Seq      uint64
+	mu          sync.Mutex
+	cond        *sync.Cond
+	witnessSeq  uint64
+	s3Seq       uint64
+	attachments int
+	waiters     int
 }
 
 func newStreamState(witnessSeq, s3Seq uint64) *streamState {
@@ -278,6 +280,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	for sid, watermark := range streamWatermarks {
 		s.streams[sid] = newStreamState(watermark, backendWatermarks[sid])
 	}
+	s.streamStore.SetEvictHook(s.evictIdleStreams)
 
 	// Flush the local-only tail before serving
 	if len(unflushed) > 0 {
@@ -353,18 +356,60 @@ func (s *Server) LastFlushedPosition() uint64 {
 	return s.lastFlushedPosition
 }
 
+// StreamCount returns the current number of streams tracked in s.streams.
+func (s *Server) StreamCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.streams)
+}
+
+func (s *Server) evictIdleStreams() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for sid, st := range s.streams {
+		st.mu.Lock()
+		attached := st.attachments > 0 || st.waiters > 0
+		witnessSeq := st.witnessSeq
+		s3Seq := st.s3Seq
+		st.mu.Unlock()
+
+		if attached {
+			continue
+		}
+
+		streamID, err := uuid.Parse(sid)
+		if err != nil {
+			klog.Warningf("Failed to parse stream ID %s during idle stream eviction: %v", sid, err)
+			continue
+		}
+
+		if s.streamStore != nil && !s.streamStore.canEvictStream(streamID, witnessSeq, s3Seq) {
+			continue
+		}
+
+		delete(s.streams, sid)
+	}
+}
+
 func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *streamState {
 	s.mu.Lock()
 	sid := streamID.String()
 	st, exists := s.streams[sid]
-	if !exists {
-		st = newStreamState(0, 0)
-		s.streams[sid] = st
+	if exists {
+		s.mu.Unlock()
+		return st
 	}
 	s.mu.Unlock()
 
+	var uploadedTo uint64
 	if s.streamStore != nil {
-		uploadedTo := s.streamStore.EnsureDiscovered(ctx, streamID)
+		uploadedTo = s.streamStore.EnsureDiscovered(ctx, streamID)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, exists = s.streams[sid]; exists {
 		st.mu.Lock()
 		if uploadedTo > st.witnessSeq {
 			st.witnessSeq = uploadedTo
@@ -373,8 +418,11 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 			st.s3Seq = uploadedTo
 		}
 		st.mu.Unlock()
+		return st
 	}
 
+	st = newStreamState(uploadedTo, uploadedTo)
+	s.streams[sid] = st
 	return st
 }
 
@@ -401,9 +449,16 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	st := s.getOrCreateStream(ctx, streamID)
 
 	st.mu.Lock()
+	st.attachments++
 	witnessSeq := st.witnessSeq
 	s3Seq := st.s3Seq
 	st.mu.Unlock()
+	defer func() {
+		st.mu.Lock()
+		st.attachments--
+		st.cond.Broadcast()
+		st.mu.Unlock()
+	}()
 
 	klog.Infof("WAL buffer: Hello received for stream %s: witness watermark=%d, s3 watermark=%d", streamID, witnessSeq, s3Seq)
 
@@ -456,11 +511,6 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		st.mu.Unlock()
 	})
 	defer stopCtxWatcher()
-	defer func() {
-		st.mu.Lock()
-		st.cond.Broadcast()
-		st.mu.Unlock()
-	}()
 
 	// Forward S3 acks notifications to outCh
 	go func() {
@@ -477,7 +527,9 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 					return
 				default:
 				}
+				st.waiters++
 				st.cond.Wait()
+				st.waiters--
 			}
 			curWitness := st.witnessSeq
 			curS3 := st.s3Seq
