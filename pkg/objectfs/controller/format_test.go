@@ -96,6 +96,7 @@ func TestVolumeMetadataPinnedTypeIDs(t *testing.T) {
 		{name: "objectfs.v1alpha1.FileChunk", id: 18},
 		{name: "objectfs.v1alpha1.Content", id: 19},
 		{name: "objectfs.v1alpha1.VolumeStats", id: 20},
+		{name: "objectfs.v1alpha1.XAttr", id: 21},
 	}
 
 	for _, tc := range expectedPinned {
@@ -117,9 +118,9 @@ func TestVolumeMetadataPinnedTypeIDs(t *testing.T) {
 	}
 
 	// Verify all registered types: pinned types must have their exact IDs,
-	// and any future additions must be appended after VolumeStats (ID >= 21).
+	// and any future additions must be appended after XAttr (ID >= 22).
 	for _, def := range reg.Export().GetTypes() {
-		if def.GetId() <= 20 {
+		if def.GetId() <= 21 {
 			var found bool
 			for _, tc := range expectedPinned {
 				if tc.id == def.GetId() && tc.name == def.GetName() {
@@ -128,10 +129,10 @@ func TestVolumeMetadataPinnedTypeIDs(t *testing.T) {
 				}
 			}
 			if !found {
-				t.Errorf("unexpected type ID %d (%q) in pinned range [16..20]", def.GetId(), def.GetName())
+				t.Errorf("unexpected type ID %d (%q) in pinned range [16..21]", def.GetId(), def.GetName())
 			}
-		} else if def.GetId() < 21 {
-			t.Errorf("new table %q must be appended with ID >= 21, got %d", def.GetName(), def.GetId())
+		} else if def.GetId() < 22 {
+			t.Errorf("new table %q must be appended with ID >= 22, got %d", def.GetName(), def.GetId())
 		}
 	}
 
@@ -166,5 +167,54 @@ func TestVolumeMetadataPinnedTypeIDs(t *testing.T) {
 	err := conflictingReg.Import(reg.Export())
 	if !errors.Is(err, record.ErrTypeConflict) {
 		t.Fatalf("expected ErrTypeConflict when importing into index with reordered types, got: %v", err)
+	}
+}
+
+func TestVolumeMetadataImportOldToNewRegistry(t *testing.T) {
+	oldReg := record.NewRegistry()
+	types := []string{
+		"objectfs.v1alpha1.Inode",
+		"objectfs.v1alpha1.DirEntry",
+		"objectfs.v1alpha1.FileChunk",
+		"objectfs.v1alpha1.Content",
+		"objectfs.v1alpha1.VolumeStats",
+	}
+	vol := MustNewVolume(t, "test-import-probe", nil, NewEventBroadcaster())
+	defer func() {
+		if err := vol.Close(); err != nil {
+			t.Errorf("vol.Close failed: %v", err)
+		}
+	}()
+
+	newReg := vol.metadataStream.Registry()
+	for _, name := range types {
+		def, _, ok := newReg.LookupByName(name)
+		if !ok {
+			t.Fatalf("missing %s", name)
+		}
+		if err := oldReg.Register(def); err != nil {
+			t.Fatalf("failed to register %s in oldReg: %v", name, err)
+		}
+	}
+
+	// Import newReg.Export() into oldReg
+	if err := oldReg.Import(newReg.Export()); err != nil {
+		t.Fatalf("Import failed: %v", err)
+	}
+
+	// Verify XAttr was appended with ID 21 and all existing types retained their IDs
+	xattrDef, _, ok := oldReg.LookupByName("objectfs.v1alpha1.XAttr")
+	if !ok || xattrDef.GetId() != 21 {
+		t.Fatalf("expected XAttr at ID 21, got ok=%v, def=%v", ok, xattrDef)
+	}
+	for id := uint32(16); id <= 20; id++ {
+		def, _, ok := oldReg.LookupByID(id)
+		if !ok {
+			t.Fatalf("expected ID %d to be retained", id)
+		}
+		expectedName := types[id-16]
+		if def.GetName() != expectedName {
+			t.Fatalf("expected ID %d to be %s, got %s", id, expectedName, def.GetName())
+		}
 	}
 }

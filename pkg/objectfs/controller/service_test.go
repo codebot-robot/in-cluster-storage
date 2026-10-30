@@ -206,6 +206,39 @@ func testSetAttr(ctx context.Context, server *Server, volumeID string, p string,
 	return server.SetAttr(ctx, req)
 }
 
+func testGetXAttr(ctx context.Context, server *Server, volumeID string, ino uint64, name string) (*pb.GetXAttrResponse, error) {
+	return server.GetXAttr(ctx, &pb.GetXAttrRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Name:     name,
+	})
+}
+
+func testSetXAttr(ctx context.Context, server *Server, volumeID string, ino uint64, name string, value []byte, flags pb.SetXAttrRequest_Flags) (*pb.SetXAttrResponse, error) {
+	return server.SetXAttr(ctx, &pb.SetXAttrRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Name:     name,
+		Value:    value,
+		Flags:    flags,
+	})
+}
+
+func testListXAttr(ctx context.Context, server *Server, volumeID string, ino uint64) (*pb.ListXAttrResponse, error) {
+	return server.ListXAttr(ctx, &pb.ListXAttrRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+	})
+}
+
+func testRemoveXAttr(ctx context.Context, server *Server, volumeID string, ino uint64, name string) (*pb.RemoveXAttrResponse, error) {
+	return server.RemoveXAttr(ctx, &pb.RemoveXAttrRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Name:     name,
+	})
+}
+
 func volGetAttr(ctx context.Context, vol *Volume, p string) (*pb.EntryAttr, error) {
 	ino, err := vol.ResolvePath(ctx, p)
 	if err != nil {
@@ -6823,5 +6856,381 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 	})
 	if err != nil || fsyncResp3.GetError() != 0 {
 		t.Fatalf("Fsync on server3 failed: %v, resp: %v", err, fsyncResp3)
+	}
+}
+
+func TestControllerXAttrOperations(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	defer server.Close()
+
+	volumeID := "test-xattr-vol"
+
+	// 1. Basic Set, Get, List, Remove, xattr_count, and ctime update
+	createResp, err := testCreateFile(ctx, server, volumeID, "/file.txt", 0644, []byte("xattr test file"), 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v, err=%d", err, createResp.GetError())
+	}
+	fileIno := createResp.GetAttr().GetInode().GetIno()
+	initialCtime := createResp.GetAttr().GetInode().GetCtime().AsTime()
+
+	// Newly created file must have xattr_count == 0
+	if createResp.GetAttr().GetInode().GetXattrCount() != 0 {
+		t.Fatalf("expected initial xattr_count 0, got %d", createResp.GetAttr().GetInode().GetXattrCount())
+	}
+
+	// Wait a tiny bit so ctime timestamp changes
+	time.Sleep(10 * time.Millisecond)
+
+	setResp, err := testSetXAttr(ctx, server, volumeID, fileIno, "user.author", []byte("alice"), pb.SetXAttrRequest_FLAGS_NONE)
+	if err != nil || setResp.GetError() != 0 {
+		t.Fatalf("SetXAttr user.author failed: %v, err=%d", err, setResp.GetError())
+	}
+
+	// Verify ctime was updated and xattr_count incremented to 1
+	getAttrResp, err := testGetAttr(ctx, server, volumeID, "/file.txt")
+	if err != nil || getAttrResp.GetError() != 0 {
+		t.Fatalf("GetAttr failed: %v, err=%d", err, getAttrResp.GetError())
+	}
+	newCtime := getAttrResp.GetAttr().GetInode().GetCtime().AsTime()
+	if !newCtime.After(initialCtime) {
+		t.Errorf("expected ctime to advance after SetXAttr, initial=%v, new=%v", initialCtime, newCtime)
+	}
+	if getAttrResp.GetAttr().GetInode().GetXattrCount() != 1 {
+		t.Fatalf("expected xattr_count 1 after first set, got %d", getAttrResp.GetAttr().GetInode().GetXattrCount())
+	}
+
+	setResp2, err := testSetXAttr(ctx, server, volumeID, fileIno, "user.version", []byte("1.0"), pb.SetXAttrRequest_FLAGS_NONE)
+	if err != nil || setResp2.GetError() != 0 {
+		t.Fatalf("SetXAttr user.version failed: %v, err=%d", err, setResp2.GetError())
+	}
+
+	getAttrResp2, err := testGetAttr(ctx, server, volumeID, "/file.txt")
+	if err != nil || getAttrResp2.GetError() != 0 {
+		t.Fatalf("GetAttr failed: %v, err=%d", err, getAttrResp2.GetError())
+	}
+	if getAttrResp2.GetAttr().GetInode().GetXattrCount() != 2 {
+		t.Fatalf("expected xattr_count 2 after second set, got %d", getAttrResp2.GetAttr().GetInode().GetXattrCount())
+	}
+
+	// GetXAttr
+	getResp, err := testGetXAttr(ctx, server, volumeID, fileIno, "user.author")
+	if err != nil || getResp.GetError() != 0 {
+		t.Fatalf("GetXAttr user.author failed: %v, err=%d", err, getResp.GetError())
+	}
+	if string(getResp.GetValue()) != "alice" {
+		t.Fatalf("expected 'alice', got %q", string(getResp.GetValue()))
+	}
+
+	// ListXAttr returns name and value pairs
+	listResp, err := testListXAttr(ctx, server, volumeID, fileIno)
+	if err != nil || listResp.GetError() != 0 {
+		t.Fatalf("ListXAttr failed: %v, err=%d", err, listResp.GetError())
+	}
+	if len(listResp.GetXattrs()) != 2 {
+		t.Fatalf("expected 2 xattrs, got %v", listResp.GetXattrs())
+	}
+	foundAuthor := false
+	foundVersion := false
+	for _, x := range listResp.GetXattrs() {
+		if x.GetName() == "user.author" && string(x.GetValue()) == "alice" {
+			foundAuthor = true
+		}
+		if x.GetName() == "user.version" && string(x.GetValue()) == "1.0" {
+			foundVersion = true
+		}
+	}
+	if !foundAuthor || !foundVersion {
+		t.Fatalf("expected author and version pairs in list, got %v", listResp.GetXattrs())
+	}
+
+	// RemoveXAttr
+	remResp, err := testRemoveXAttr(ctx, server, volumeID, fileIno, "user.author")
+	if err != nil || remResp.GetError() != 0 {
+		t.Fatalf("RemoveXAttr failed: %v, err=%d", err, remResp.GetError())
+	}
+
+	// Verify xattr_count decremented to 1
+	getAttrResp3, err := testGetAttr(ctx, server, volumeID, "/file.txt")
+	if err != nil || getAttrResp3.GetError() != 0 {
+		t.Fatalf("GetAttr failed: %v, err=%d", err, getAttrResp3.GetError())
+	}
+	if getAttrResp3.GetAttr().GetInode().GetXattrCount() != 1 {
+		t.Fatalf("expected xattr_count 1 after remove, got %d", getAttrResp3.GetAttr().GetInode().GetXattrCount())
+	}
+
+	// Get after remove returns ENODATA
+	getRespAfterRem, err := testGetXAttr(ctx, server, volumeID, fileIno, "user.author")
+	if err != nil || getRespAfterRem.GetError() != int32(syscall.ENODATA) {
+		t.Fatalf("expected ENODATA after remove, got err=%v, code=%d", err, getRespAfterRem.GetError())
+	}
+
+	listResp2, err := testListXAttr(ctx, server, volumeID, fileIno)
+	if err != nil || listResp2.GetError() != 0 {
+		t.Fatalf("ListXAttr failed: %v, err=%d", err, listResp2.GetError())
+	}
+	if len(listResp2.GetXattrs()) != 1 || listResp2.GetXattrs()[0].GetName() != "user.version" || string(listResp2.GetXattrs()[0].GetValue()) != "1.0" {
+		t.Fatalf("expected [user.version=1.0], got %v", listResp2.GetXattrs())
+	}
+
+	// 2. CREATE and REPLACE flags
+	// CREATE on existing attribute returns EEXIST
+	setCreateExist, err := testSetXAttr(ctx, server, volumeID, fileIno, "user.version", []byte("2.0"), pb.SetXAttrRequest_FLAGS_CREATE)
+	if err != nil || setCreateExist.GetError() != int32(syscall.EEXIST) {
+		t.Fatalf("expected EEXIST for CREATE on existing, got err=%v, code=%d", err, setCreateExist.GetError())
+	}
+
+	// CREATE on new attribute succeeds and increments count to 2
+	setCreateNew, err := testSetXAttr(ctx, server, volumeID, fileIno, "user.license", []byte("Apache-2.0"), pb.SetXAttrRequest_FLAGS_CREATE)
+	if err != nil || setCreateNew.GetError() != 0 {
+		t.Fatalf("expected success for CREATE on new, got err=%v, code=%d", err, setCreateNew.GetError())
+	}
+	getAttrResp4, err := testGetAttr(ctx, server, volumeID, "/file.txt")
+	if err != nil || getAttrResp4.GetError() != 0 {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if getAttrResp4.GetAttr().GetInode().GetXattrCount() != 2 {
+		t.Fatalf("expected xattr_count 2 after CREATE on new, got %d", getAttrResp4.GetAttr().GetInode().GetXattrCount())
+	}
+
+	// REPLACE on missing attribute returns ENODATA
+	setReplMissing, err := testSetXAttr(ctx, server, volumeID, fileIno, "user.nonexistent", []byte("val"), pb.SetXAttrRequest_FLAGS_REPLACE)
+	if err != nil || setReplMissing.GetError() != int32(syscall.ENODATA) {
+		t.Fatalf("expected ENODATA for REPLACE on missing, got err=%v, code=%d", err, setReplMissing.GetError())
+	}
+
+	// REPLACE on existing attribute succeeds and keeps count at 2
+	setReplExist, err := testSetXAttr(ctx, server, volumeID, fileIno, "user.license", []byte("MIT"), pb.SetXAttrRequest_FLAGS_REPLACE)
+	if err != nil || setReplExist.GetError() != 0 {
+		t.Fatalf("expected success for REPLACE on existing, got err=%v, code=%d", err, setReplExist.GetError())
+	}
+	getAttrResp5, err := testGetAttr(ctx, server, volumeID, "/file.txt")
+	if err != nil || getAttrResp5.GetError() != 0 {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if getAttrResp5.GetAttr().GetInode().GetXattrCount() != 2 {
+		t.Fatalf("expected xattr_count to remain 2 after REPLACE on existing, got %d", getAttrResp5.GetAttr().GetInode().GetXattrCount())
+	}
+
+	// 3. Error cases
+	// ENODATA for missing name on get and remove
+	getMissing, err := testGetXAttr(ctx, server, volumeID, fileIno, "user.notfound")
+	if err != nil || getMissing.GetError() != int32(syscall.ENODATA) {
+		t.Fatalf("expected ENODATA for missing get, got err=%v, code=%d", err, getMissing.GetError())
+	}
+	remMissing, err := testRemoveXAttr(ctx, server, volumeID, fileIno, "user.notfound")
+	if err != nil || remMissing.GetError() != int32(syscall.ENODATA) {
+		t.Fatalf("expected ENODATA for missing remove, got err=%v, code=%d", err, remMissing.GetError())
+	}
+
+	// ENAMETOOLONG above 255 bytes
+	longName := "user." + strings.Repeat("a", 255)
+	setLongName, err := testSetXAttr(ctx, server, volumeID, fileIno, longName, []byte("v"), pb.SetXAttrRequest_FLAGS_NONE)
+	if err != nil || setLongName.GetError() != int32(syscall.ENAMETOOLONG) {
+		t.Fatalf("expected ENAMETOOLONG, got err=%v, code=%d", err, setLongName.GetError())
+	}
+	getLongName, err := testGetXAttr(ctx, server, volumeID, fileIno, longName)
+	if err != nil || getLongName.GetError() != int32(syscall.ENAMETOOLONG) {
+		t.Fatalf("expected ENAMETOOLONG on get, got err=%v, code=%d", err, getLongName.GetError())
+	}
+
+	// E2BIG above 64 KiB
+	bigVal := make([]byte, 64*1024+1)
+	setBigVal, err := testSetXAttr(ctx, server, volumeID, fileIno, "user.big", bigVal, pb.SetXAttrRequest_FLAGS_NONE)
+	if err != nil || setBigVal.GetError() != int32(syscall.E2BIG) {
+		t.Fatalf("expected E2BIG, got err=%v, code=%d", err, setBigVal.GetError())
+	}
+
+	// ENOTSUP for system.* namespace
+	for _, sysName := range []string{"system.posix_acl_access", "system.posix_acl_default", "system.custom"} {
+		setSys, err := testSetXAttr(ctx, server, volumeID, fileIno, sysName, []byte("v"), pb.SetXAttrRequest_FLAGS_NONE)
+		if err != nil || setSys.GetError() != int32(syscall.ENOTSUP) {
+			t.Fatalf("expected ENOTSUP for %s on set, got err=%v, code=%d", sysName, err, setSys.GetError())
+		}
+		getSys, err := testGetXAttr(ctx, server, volumeID, fileIno, sysName)
+		if err != nil || getSys.GetError() != int32(syscall.ENOTSUP) {
+			t.Fatalf("expected ENOTSUP for %s on get, got err=%v, code=%d", sysName, err, getSys.GetError())
+		}
+		remSys, err := testRemoveXAttr(ctx, server, volumeID, fileIno, sysName)
+		if err != nil || remSys.GetError() != int32(syscall.ENOTSUP) {
+			t.Fatalf("expected ENOTSUP for %s on remove, got err=%v, code=%d", sysName, err, remSys.GetError())
+		}
+	}
+
+	// 4. Cascade on unlink (immediate unlink at nlink 0)
+	cImm, err := testCreateFile(ctx, server, volumeID, "/unlink_imm.txt", 0644, []byte("data"), 0, 0)
+	if err != nil || cImm.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	immIno := cImm.GetAttr().GetInode().GetIno()
+	if _, err := testSetXAttr(ctx, server, volumeID, immIno, "user.tag", []byte("imm"), pb.SetXAttrRequest_FLAGS_NONE); err != nil {
+		t.Fatalf("SetXAttr failed: %v", err)
+	}
+
+	// Release the file handle from CreateFile so no handles remain open
+	relImm, err := server.Release(ctx, &pb.ReleaseRequest{
+		VolumeId: volumeID,
+		Inode:    immIno,
+		Fh:       cImm.GetFh(),
+	})
+	if err != nil || relImm.GetError() != 0 {
+		t.Fatalf("Release failed: %v", err)
+	}
+
+	unlResp, err := testUnlink(ctx, server, volumeID, "/unlink_imm.txt")
+	if err != nil || unlResp.GetError() != 0 {
+		t.Fatalf("Unlink failed: %v", err)
+	}
+
+	// Inode row is deleted, so GetXAttr should return ENOENT
+	getImmAfterUnlink, err := testGetXAttr(ctx, server, volumeID, immIno, "user.tag")
+	if err != nil || getImmAfterUnlink.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("expected ENOENT after immediate unlink, got err=%v, code=%d", err, getImmAfterUnlink.GetError())
+	}
+
+	// 5. Cascade on unlink deferred via an open handle
+	cDef, err := testCreateFile(ctx, server, volumeID, "/unlink_def.txt", 0644, []byte("data"), 0, 0)
+	if err != nil || cDef.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	defIno := cDef.GetAttr().GetInode().GetIno()
+	if _, err := testSetXAttr(ctx, server, volumeID, defIno, "user.tag", []byte("def"), pb.SetXAttrRequest_FLAGS_NONE); err != nil {
+		t.Fatalf("SetXAttr failed: %v", err)
+	}
+
+	// CreateFile already opened cDef.GetFh(), so the handle is active.
+	// Unlink while open: nlink reaches 0, but handle holds inode alive
+	if _, err := testUnlink(ctx, server, volumeID, "/unlink_def.txt"); err != nil {
+		t.Fatalf("Unlink failed: %v", err)
+	}
+
+	// XAttr is still readable while handle is open
+	getDefWhileOpen, err := testGetXAttr(ctx, server, volumeID, defIno, "user.tag")
+	if err != nil || getDefWhileOpen.GetError() != 0 {
+		t.Fatalf("expected xattr readable while handle open, got err=%v, code=%d", err, getDefWhileOpen.GetError())
+	}
+	if string(getDefWhileOpen.GetValue()) != "def" {
+		t.Fatalf("expected 'def', got %q", string(getDefWhileOpen.GetValue()))
+	}
+
+	// Close/Release handle -> triggers deferred deletion
+	relResp, err := server.Release(ctx, &pb.ReleaseRequest{
+		VolumeId: volumeID,
+		Inode:    defIno,
+		Fh:       cDef.GetFh(),
+	})
+	if err != nil || relResp.GetError() != 0 {
+		t.Fatalf("Release failed: %v", err)
+	}
+
+	// Now xattr query returns ENOENT
+	getDefAfterRelease, err := testGetXAttr(ctx, server, volumeID, defIno, "user.tag")
+	if err != nil || getDefAfterRelease.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("expected ENOENT after release, got err=%v, code=%d", err, getDefAfterRelease.GetError())
+	}
+
+	// 6. Cascade on rmdir
+	mkdirResp, err := testMkdir(ctx, server, volumeID, "/test_dir", 0755, 0, 0)
+	if err != nil || mkdirResp.GetError() != 0 {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+	dirIno := mkdirResp.GetAttr().GetInode().GetIno()
+	if _, err := testSetXAttr(ctx, server, volumeID, dirIno, "user.dirmeta", []byte("dirval"), pb.SetXAttrRequest_FLAGS_NONE); err != nil {
+		t.Fatalf("SetXAttr on dir failed: %v", err)
+	}
+
+	rmdirResp, err := testRmdir(ctx, server, volumeID, "/test_dir")
+	if err != nil || rmdirResp.GetError() != 0 {
+		t.Fatalf("Rmdir failed: %v", err)
+	}
+
+	getDirAfterRmdir, err := testGetXAttr(ctx, server, volumeID, dirIno, "user.dirmeta")
+	if err != nil || getDirAfterRmdir.GetError() != int32(syscall.ENOENT) {
+		t.Fatalf("expected ENOENT after rmdir, got err=%v, code=%d", err, getDirAfterRmdir.GetError())
+	}
+}
+
+func TestControllerXAttrPersistenceAcrossRestart(t *testing.T) {
+	ctx := t.Context()
+	dataDir := t.TempDir()
+	walDir := filepath.Join(dataDir, "wal")
+	metadataDir := filepath.Join(dataDir, "metadata")
+	backend := NewMemoryBackend()
+	volumeID := "test-xattr-restart-vol"
+
+	// 1. First server instance writes xattrs
+	server1 := NewServer(backend,
+		WithServerWAL(walDir, "", walclient.Local),
+		WithServerMetadataDir(metadataDir),
+	)
+
+	createResp, err := testCreateFile(ctx, server1, volumeID, "/durable.txt", 0644, []byte("durable content"), 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed on server1: %v, code=%d", err, createResp.GetError())
+	}
+	fileIno := createResp.GetAttr().GetInode().GetIno()
+
+	setResp, err := testSetXAttr(ctx, server1, volumeID, fileIno, "user.persistent", []byte("survives-restart"), pb.SetXAttrRequest_FLAGS_NONE)
+	if err != nil || setResp.GetError() != 0 {
+		t.Fatalf("SetXAttr failed on server1: %v, code=%d", err, setResp.GetError())
+	}
+
+	// Close server1
+	if err := server1.Close(); err != nil {
+		t.Fatalf("server1.Close failed: %v", err)
+	}
+
+	// 2. Second server instance opens with same metadata and WAL
+	server2 := NewServer(backend,
+		WithServerWAL(walDir, "", walclient.Local),
+		WithServerMetadataDir(metadataDir),
+	)
+	defer server2.Close()
+
+	getResp, err := testGetXAttr(ctx, server2, volumeID, fileIno, "user.persistent")
+	if err != nil || getResp.GetError() != 0 {
+		t.Fatalf("GetXAttr failed on server2: %v, code=%d", err, getResp.GetError())
+	}
+	if string(getResp.GetValue()) != "survives-restart" {
+		t.Fatalf("expected 'survives-restart', got %q", string(getResp.GetValue()))
+	}
+
+	listResp, err := testListXAttr(ctx, server2, volumeID, fileIno)
+	if err != nil || listResp.GetError() != 0 {
+		t.Fatalf("ListXAttr failed on server2: %v, code=%d", err, listResp.GetError())
+	}
+	if len(listResp.GetXattrs()) != 1 || listResp.GetXattrs()[0].GetName() != "user.persistent" || string(listResp.GetXattrs()[0].GetValue()) != "survives-restart" {
+		t.Fatalf("expected [user.persistent=survives-restart], got %v", listResp.GetXattrs())
+	}
+}
+
+func TestMetadataStreamRegisteredTypeIDs(t *testing.T) {
+	backend := NewMemoryBackend()
+	vol, err := NewVolume("test-type-ids-vol", backend, nil)
+	if err != nil {
+		t.Fatalf("NewVolume failed: %v", err)
+	}
+	defer vol.Close()
+
+	expected := map[string]uint32{
+		"objectfs.v1alpha1.Inode":       16,
+		"objectfs.v1alpha1.DirEntry":    17,
+		"objectfs.v1alpha1.FileChunk":   18,
+		"objectfs.v1alpha1.Content":     19,
+		"objectfs.v1alpha1.VolumeStats": 20,
+		"objectfs.v1alpha1.XAttr":       21,
+	}
+
+	reg := vol.metadataStream.Registry()
+	for typeName, wantID := range expected {
+		def, _, ok := reg.LookupByName(typeName)
+		if !ok {
+			t.Errorf("type %s is not registered in metadata stream registry", typeName)
+			continue
+		}
+		if def.GetId() != wantID {
+			t.Errorf("type %s has ID %d, want pinned ID %d (new types must be appended, never inserted)", typeName, def.GetId(), wantID)
+		}
 	}
 }

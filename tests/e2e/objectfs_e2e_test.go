@@ -988,6 +988,79 @@ spec:
 	t.Logf("Successfully verified ObjectFS persistent deployment with S3 backend, WAL buffer, and restart recovery!")
 }
 
+func TestObjectFSXAttrE2E(t *testing.T) {
+	requireE2EGroup(t, "core")
+
+	h, ns := setupSharedObjectFSCluster(t)
+	volumeID := fmt.Sprintf("objectfs-xattr-vol-%s", ns)
+
+	podName := "objectfs-xattr-pod"
+	podYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: objectfs-node-daemon:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, podName, ns, volumeID)
+
+	h.KubectlApplyContent(podName, podYaml)
+	if err := h.WaitForPodReady(podName, ns, 2*time.Minute); err != nil {
+		t.Fatalf("Pod %s failed to become ready: %v", podName, err)
+	}
+	defer h.DeletePod(podName, ns)
+
+	// Step 1: Create a file
+	_, err := h.RunInPod(podName, ns, "/bin/sh", "-c", "echo 'xattr content' > /data/file.txt")
+	if err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Step 2: Set a user.* extended attribute
+	_, err = h.RunInPod(podName, ns, "setfattr", "-n", "user.testcomment", "-v", "test-val-123", "/data/file.txt")
+	if err != nil {
+		t.Fatalf("failed to setfattr: %v", err)
+	}
+
+	// Step 3: Read it back
+	out, err := h.RunInPod(podName, ns, "getfattr", "--absolute-names", "-n", "user.testcomment", "--only-values", "/data/file.txt")
+	if err != nil {
+		t.Fatalf("failed to getfattr: %v", err)
+	}
+	if strings.TrimSpace(out) != "test-val-123" {
+		t.Fatalf("expected 'test-val-123', got: %q", out)
+	}
+
+	// Step 4: cp -a the file and confirm copy carries the xattr
+	_, err = h.RunInPod(podName, ns, "cp", "-a", "/data/file.txt", "/data/file_copy.txt")
+	if err != nil {
+		t.Fatalf("failed to cp -a: %v", err)
+	}
+
+	copyOut, err := h.RunInPod(podName, ns, "getfattr", "--absolute-names", "-n", "user.testcomment", "--only-values", "/data/file_copy.txt")
+	if err != nil {
+		t.Fatalf("failed to getfattr on copy: %v", err)
+	}
+	if strings.TrimSpace(copyOut) != "test-val-123" {
+		t.Fatalf("expected 'test-val-123' on copied file, got: %q", copyOut)
+	}
+}
+
 var (
 	sharedMultiNodeClusterOnce sync.Once
 	sharedMultiNodeErr         error
@@ -1781,6 +1854,129 @@ spec:
 	h.DeletePod(pod1Name, "default")
 	h.DeletePod(pod2Name, "default")
 	t.Logf("Successfully verified immediate cross-node visibility in steady state!")
+}
+
+func TestObjectFSXAttrCrossNodeE2E(t *testing.T) {
+	requireE2EGroup(t, "multinode")
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
+	volumeID := "cross-node-xattr-vol"
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+			t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		}
+	})
+
+	pod1Name := "xattr-node1-pod"
+	pod1Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: objectfs-node-daemon:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod1Name, node1, volumeID)
+
+	pod2Name := "xattr-node2-pod"
+	pod2Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: objectfs-node-daemon:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod2Name, node2, volumeID)
+
+	h.KubectlApplyContent(pod1Name, pod1Yaml)
+	h.KubectlApplyContent(pod2Name, pod2Yaml)
+	defer h.DeletePod(pod1Name, "default")
+	defer h.DeletePod(pod2Name, "default")
+
+	if err := h.WaitForPodReady(pod1Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Pod 1 failed to become ready: %v", err)
+	}
+	if err := h.WaitForPodReady(pod2Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Pod 2 failed to become ready: %v", err)
+	}
+
+	// Step 1: Create file on Node 1 and fsync so it becomes visible to Node 2
+	_, err := h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "echo 'multinode xattr test' > /data/multi.txt && sync /data/multi.txt")
+	if err != nil {
+		t.Fatalf("failed to create and sync file on Node 1: %v", err)
+	}
+
+	// Step 2: Node 2 stats the file before Node 1 sets the xattr (caches xattr_count == 0)
+	statOut, err := h.RunInPod(pod2Name, "default", "stat", "/data/multi.txt")
+	if err != nil {
+		t.Fatalf("failed to stat file on Node 2: %v (out: %s)", err, statOut)
+	}
+
+	// Step 3: Node 1 sets user.* xattr and fsyncs, triggering EVENT_MODIFIED broadcast to Node 2
+	_, err = h.RunInPod(pod1Name, "default", "/bin/sh", "-c", "setfattr -n user.sharedmeta -v 'shared-value-99' /data/multi.txt && sync /data/multi.txt")
+	if err != nil {
+		t.Fatalf("failed to setfattr and sync on Node 1: %v", err)
+	}
+
+	// Verify readable on Node 1
+	node1Out, err := h.RunInPod(pod1Name, "default", "getfattr", "--absolute-names", "-n", "user.sharedmeta", "--only-values", "/data/multi.txt")
+	if err != nil {
+		t.Fatalf("failed to getfattr from Node 1: %v", err)
+	}
+	if strings.TrimSpace(node1Out) != "shared-value-99" {
+		t.Fatalf("expected 'shared-value-99' on Node 1, got: %q", node1Out)
+	}
+
+	// Step 4: Read xattr on Node 2 (verifies watch event invalidated cached count 0).
+	// A short retry loop allows asynchronous watch event delivery to arrive on slow runners.
+	var out string
+	var lastErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		out, lastErr = h.RunInPod(pod2Name, "default", "getfattr", "--absolute-names", "-n", "user.sharedmeta", "--only-values", "/data/multi.txt")
+		if lastErr == nil && strings.TrimSpace(out) == "shared-value-99" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Fatalf("failed to getfattr from Node 2: %v", lastErr)
+	}
+	if strings.TrimSpace(out) != "shared-value-99" {
+		t.Fatalf("expected 'shared-value-99' on Node 2, got: %q", out)
+	}
 }
 
 func TestObjectFSControllerCrashMidWriteE2E(t *testing.T) {
