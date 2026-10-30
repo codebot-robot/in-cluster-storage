@@ -1098,61 +1098,6 @@ func (s *Server) tailPerStream(ctx context.Context, streamID uuid.UUID, req *pb.
 		return nil
 	}
 
-	w := s.streamStore.getOrCreateStream(streamID)
-	if err := w.flushPending(); err != nil {
-		return fmt.Errorf("failed to flush pending stream records for tail: %w", err)
-	}
-
-	// 1. Stream records from sealed files
-	sealedList := w.getSealedMetas(ctx, s.backend)
-	for _, sm := range sealedList {
-		if sm.ToSeq <= fromSeq {
-			continue
-		}
-		var records []*wal.LogRecord
-		if sm.Path != "" {
-			if recs, _, err := ReadRecordsFromOffset(sm.Path, 0, wal.WithAcceptUnversioned(s.cfg.AcceptUnversioned)); err == nil && len(recs) > 0 {
-				records = recs
-			} else if err != nil {
-				klog.Warningf("failed to read local sealed file %s: %v, falling back to backend", sm.Path, err)
-			}
-		}
-		if records == nil && sm.Key != "" && s.backend != nil {
-			recs, err := ReadSegmentFromBackend(ctx, s.backend, sm.Key, wal.WithAcceptUnversioned(s.cfg.AcceptUnversioned))
-			if err != nil {
-				return fmt.Errorf("failed to read sealed segment %s from backend: %w", sm.Key, err)
-			}
-			records = recs
-		}
-		for _, rec := range records {
-			if err := sendRecord(rec); err != nil {
-				return err
-			}
-		}
-	}
-
-	// 2. Track open file state and offset
-	w.mu.Lock()
-	curOpenFrom := w.openFrom
-	openDir := w.dir
-	w.mu.Unlock()
-
-	var openOffset int64
-	if curOpenFrom > 0 {
-		openPath := filepath.Join(openDir, wal.FormatStreamFileName(curOpenFrom, 0, false))
-		recs, nextOffset, err := ReadRecordsFromOffset(openPath, 0, wal.WithAcceptUnversioned(s.cfg.AcceptUnversioned))
-		if err != nil {
-			return fmt.Errorf("failed to read open stream file %s: %w", openPath, err)
-		}
-		openOffset = nextOffset
-		for _, rec := range recs {
-			if err := sendRecord(rec); err != nil {
-				return err
-			}
-		}
-	}
-
-	// 3. Live streaming loop: reads only newly appended bytes starting at openOffset
 	waitChan := make(chan struct{}, 10)
 	s.tailMu.Lock()
 	s.tailWaiters[waitChan] = struct{}{}
@@ -1163,40 +1108,58 @@ func (s *Server) tailPerStream(ctx context.Context, streamID uuid.UUID, req *pb.
 		s.tailMu.Unlock()
 	}()
 
+	var curOpenFrom uint64
+	var openOffset int64
+	var openDir string
+
 	for {
+		w := s.streamStore.getOrCreateStream(streamID)
 		if err := w.flushPending(); err != nil {
 			return fmt.Errorf("failed to flush pending stream records for tail: %w", err)
 		}
 
+		// 1. Stream records from sealed files
+		sealedList := w.getSealedMetas(ctx, s.backend)
+		for _, sm := range sealedList {
+			if sm.ToSeq <= fromSeq {
+				continue
+			}
+			var records []*wal.LogRecord
+			if sm.Path != "" {
+				if recs, _, err := ReadRecordsFromOffset(sm.Path, 0, wal.WithAcceptUnversioned(s.cfg.AcceptUnversioned)); err == nil && len(recs) > 0 {
+					records = recs
+				} else if err != nil {
+					klog.Warningf("failed to read local sealed file %s: %v, falling back to backend", sm.Path, err)
+				}
+			}
+			if records == nil && sm.Key != "" && s.backend != nil {
+				recs, err := ReadSegmentFromBackend(ctx, s.backend, sm.Key, wal.WithAcceptUnversioned(s.cfg.AcceptUnversioned))
+				if err != nil {
+					return fmt.Errorf("failed to read sealed segment %s from backend: %w", sm.Key, err)
+				}
+				records = recs
+			}
+			for _, rec := range records {
+				if err := sendRecord(rec); err != nil {
+					return err
+				}
+			}
+		}
+
+		// 2. Track open file state and read newly appended bytes
 		w.mu.Lock()
 		latestOpenFrom := w.openFrom
+		openDir = w.dir
 		w.mu.Unlock()
 
 		if latestOpenFrom != curOpenFrom {
-			if curOpenFrom > 0 {
-				sealedList = w.getSealedMetas(ctx, s.backend)
-				for _, sm := range sealedList {
-					if sm.FromSeq == curOpenFrom && sm.Path != "" {
-						recs, _, err := ReadRecordsFromOffset(sm.Path, openOffset)
-						if err != nil {
-							return fmt.Errorf("failed to read sealed stream file %s: %w", sm.Path, err)
-						}
-						for _, rec := range recs {
-							if err := sendRecord(rec); err != nil {
-								return err
-							}
-						}
-						break
-					}
-				}
-			}
 			curOpenFrom = latestOpenFrom
 			openOffset = 0
 		}
 
 		if curOpenFrom > 0 {
 			openPath := filepath.Join(openDir, wal.FormatStreamFileName(curOpenFrom, 0, false))
-			recs, nextOffset, err := ReadRecordsFromOffset(openPath, openOffset)
+			recs, nextOffset, err := ReadRecordsFromOffset(openPath, openOffset, wal.WithAcceptUnversioned(s.cfg.AcceptUnversioned))
 			if err != nil {
 				return fmt.Errorf("failed to read open stream file %s: %w", openPath, err)
 			}

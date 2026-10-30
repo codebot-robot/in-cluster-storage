@@ -68,12 +68,17 @@ type streamWriter struct {
 	uploadedPos         uint64
 	discovered          bool
 	sealedSinceLastPass bool
+	evicted             bool
 }
 
-func (w *streamWriter) appendRecords(records []*wal.LogRecord) {
+func (w *streamWriter) appendRecords(records []*wal.LogRecord) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.evicted {
+		return false
+	}
 	w.pending = append(w.pending, records...)
+	return true
 }
 
 func (w *streamWriter) flushPending() error {
@@ -558,6 +563,7 @@ func (s *StreamStore) evictIdleWritersLocked() {
 		w.mu.Lock()
 		canEvict := len(w.pending) == 0 && w.recCount == 0 && !w.sealedSinceLastPass && !w.hasPendingSealedUploadsLocked()
 		if canEvict {
+			w.evicted = true
 			delete(s.streams, sid)
 		} else {
 			w.sealedSinceLastPass = false
@@ -611,8 +617,12 @@ func (s *StreamStore) AppendRecords(records []*wal.LogRecord) {
 	}
 
 	for streamID, recs := range byStream {
-		w := s.getOrCreateStream(streamID)
-		w.appendRecords(recs)
+		for {
+			w := s.getOrCreateStream(streamID)
+			if w.appendRecords(recs) {
+				break
+			}
+		}
 	}
 
 	select {

@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1491,4 +1492,212 @@ func TestSegmentGC_UnknownStreamNotDeletedUntilDiscovery(t *testing.T) {
 	if err := backend.GetObject(ctx, "", segPath, 0, 0, io.Discard); err == nil {
 		t.Fatalf("expected aggregated segment to be deleted from backend")
 	}
+}
+
+// TestTail_SurvivesWriterEvictionAndReseal verifies that an already-open Tail does not stall
+// when its writer is evicted and subsequently resealed on new appends.
+func TestTail_SurvivesWriterEvictionAndReseal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Close()
+
+	streamID := uuid.New()
+
+	appendRecords := func(from, to uint64) {
+		for seq := from; seq <= to; seq++ {
+			ackChan := make(chan ackResult, 1)
+			srv.incomingChan <- incomingItem{
+				streamID:  streamID,
+				streamSeq: seq,
+				payload:   []byte(fmt.Sprintf("rec-%d", seq)),
+				ackChan:   ackChan,
+			}
+			res := <-ackChan
+			if res.err != nil {
+				t.Fatalf("append %d failed: %v", seq, res.err)
+			}
+		}
+		if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+			t.Fatalf("flush failed: %v", err)
+		}
+	}
+
+	// 1. Initial records 1..5, sealed
+	appendRecords(1, 5)
+	if err := srv.SealStream(ctx, streamID); err != nil {
+		t.Fatalf("SealStream failed: %v", err)
+	}
+
+	// 2. Open tail on the sealed idle stream
+	var mu sync.Mutex
+	var received []uint64
+	receivedChan := make(chan uint64, 20)
+	tailCtx, cancelTail := context.WithCancel(ctx)
+	defer cancelTail()
+
+	mockStream := &mockCollectingTailServer{
+		ctx: tailCtx,
+		onSend: func(resp *pb.TailResponse) {
+			if rec := resp.GetRecord(); rec != nil {
+				mu.Lock()
+				received = append(received, rec.StreamSeq)
+				mu.Unlock()
+				receivedChan <- rec.StreamSeq
+			}
+		},
+	}
+
+	tailErrCh := make(chan error, 1)
+	go func() {
+		tailErrCh <- srv.tailPerStream(tailCtx, streamID, &pb.TailRequest{FromStreamSeq: 0}, mockStream)
+	}()
+
+	waitForSeqs := func(target uint64) {
+		for {
+			mu.Lock()
+			count := len(received)
+			var last uint64
+			if count > 0 {
+				last = received[count-1]
+			}
+			mu.Unlock()
+			if last >= target {
+				return
+			}
+			select {
+			case <-receivedChan:
+			case err := <-tailErrCh:
+				t.Fatalf("tailPerStream exited unexpectedly: %v", err)
+			case <-ctx.Done():
+				mu.Lock()
+				t.Fatalf("timed out waiting for seq %d, received so far: %v", target, received)
+				mu.Unlock()
+			}
+		}
+	}
+
+	// Tail should deliver 1..5
+	waitForSeqs(5)
+
+	// 3. Run two seal passes: writer becomes idle and is evicted
+	srv.streamStore.checkSealsAndGC(ctx)
+	srv.streamStore.checkSealsAndGC(ctx)
+
+	if w := srv.streamStore.getStream(streamID); w != nil {
+		t.Fatalf("expected stream writer to be evicted after two idle passes")
+	}
+
+	// 4. Append 6..8 and flush: new writer created
+	appendRecords(6, 8)
+	waitForSeqs(8)
+
+	// 5. Seal stream again
+	if err := srv.SealStream(ctx, streamID); err != nil {
+		t.Fatalf("SealStream 2 failed: %v", err)
+	}
+
+	// 6. Append 9..11 and flush: another new writer created
+	appendRecords(9, 11)
+	waitForSeqs(11)
+
+	// 7. Verify all 1..11 delivered in order
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 11 {
+		t.Fatalf("expected 11 records, got %d: %v", len(received), received)
+	}
+	for i := 0; i < 11; i++ {
+		expected := uint64(i + 1)
+		if received[i] != expected {
+			t.Errorf("record at index %d = %d, want %d", i, received[i], expected)
+		}
+	}
+}
+
+func TestMeasurement_SealPass1kStreams(t *testing.T) {
+	if os.Getenv("OBJECTFS_BENCH") == "" {
+		t.Skip("skipping 1k streams seal-pass measurement (set OBJECTFS_BENCH=1)")
+	}
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	const totalStreams = 1000
+	streamIDs := make([]uuid.UUID, totalStreams)
+	for i := 0; i < totalStreams; i++ {
+		streamIDs[i] = uuid.New()
+	}
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Close()
+
+	// Append and seal all 1000 streams
+	for _, sid := range streamIDs {
+		ackChan := make(chan ackResult, 1)
+		srv.incomingChan <- incomingItem{
+			streamID:  sid,
+			streamSeq: 1,
+			payload:   []byte("payload"),
+			ackChan:   ackChan,
+		}
+		if res := <-ackChan; res.err != nil {
+			t.Fatalf("append failed: %v", res.err)
+		}
+	}
+	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+	for _, sid := range streamIDs {
+		if err := srv.SealStream(ctx, sid); err != nil {
+			t.Fatalf("seal failed: %v", err)
+		}
+	}
+
+	// 1 active stream keeps appending
+	activeID := streamIDs[0]
+	ackChan := make(chan ackResult, 1)
+	srv.incomingChan <- incomingItem{
+		streamID:  activeID,
+		streamSeq: 2,
+		payload:   []byte("payload-2"),
+		ackChan:   ackChan,
+	}
+	if res := <-ackChan; res.err != nil {
+		t.Fatalf("append active failed: %v", res.err)
+	}
+
+	// Measure pass 1 (before eviction: all 1,000 writers in memory)
+	start1 := time.Now()
+	srv.streamStore.checkSealsAndGC(ctx)
+	durBefore := time.Since(start1)
+
+	// Measure pass 2 (after eviction: only 1 active writer in memory)
+	start2 := time.Now()
+	srv.streamStore.checkSealsAndGC(ctx)
+	durAfter := time.Since(start2)
+
+	activeWriters := len(srv.streamStore.allWriters())
+	t.Logf("Measured 1,000 streams seal-pass: before_eviction (%d writers)=%v vs after_eviction (%d writers)=%v (speedup: %.1fx)",
+		totalStreams, durBefore, activeWriters, durAfter, float64(durBefore)/float64(durAfter))
 }
