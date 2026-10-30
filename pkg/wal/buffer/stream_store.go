@@ -26,7 +26,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -58,6 +57,7 @@ type streamWriter struct {
 	dir         string
 	openFrom    uint64
 	lastSeq     uint64
+	firstPos    uint64
 	lastPos     uint64
 	recCount    int
 	fileSize    int64
@@ -113,6 +113,9 @@ func (w *streamWriter) flushPendingLocked() error {
 		buf.Write(rec.Encode())
 		if rec.StreamSeq > w.lastSeq {
 			w.lastSeq = rec.StreamSeq
+		}
+		if w.firstPos == 0 || rec.Position < w.firstPos {
+			w.firstPos = rec.Position
 		}
 		if rec.Position > w.lastPos {
 			w.lastPos = rec.Position
@@ -295,11 +298,16 @@ func (w *streamWriter) recoverStream(ctx context.Context, backend objectstore.Ba
 				w.openFrom = from
 				w.recCount = meta.RecordCount
 				w.fileSize = meta.Size
-				if len(recs) > 0 && recs[len(recs)-1].StreamSeq > w.lastSeq {
-					w.lastSeq = recs[len(recs)-1].StreamSeq
-				}
-				if len(recs) > 0 && recs[len(recs)-1].Position > w.lastPos {
-					w.lastPos = recs[len(recs)-1].Position
+				if len(recs) > 0 {
+					if w.firstPos == 0 || recs[0].Position < w.firstPos {
+						w.firstPos = recs[0].Position
+					}
+					if recs[len(recs)-1].StreamSeq > w.lastSeq {
+						w.lastSeq = recs[len(recs)-1].StreamSeq
+					}
+					if recs[len(recs)-1].Position > w.lastPos {
+						w.lastPos = recs[len(recs)-1].Position
+					}
 				}
 			}
 		}
@@ -488,7 +496,7 @@ func (s *StreamStore) checkSealsAndGC(ctx context.Context) {
 	if _, err := s.CheckSegmentGC(ctx); err != nil {
 		klog.Warningf("Failed to run aggregated segment GC: %v", err)
 	}
-	s.saveCoverageLocked()
+	s.saveCoverage()
 }
 
 func (s *StreamStore) getOrCreateStream(streamID uuid.UUID) *streamWriter {
@@ -543,7 +551,7 @@ func (s *StreamStore) SealStream(ctx context.Context, streamID uuid.UUID) (*Stre
 	}
 	meta, err := w.sealLocked(ctx, s.backend)
 	w.mu.Unlock()
-	s.saveCoverageLocked()
+	s.saveCoverage()
 	return meta, err
 }
 
@@ -565,17 +573,18 @@ func (s *StreamStore) SealAll(ctx context.Context) ([]*StreamMeta, error) {
 			sealed = append(sealed, meta)
 		}
 	}
-	s.saveCoverageLocked()
+	s.saveCoverage()
 	return sealed, errors.Join(errs...)
 }
 
 // StreamCoverage describes the highest sealed-and-uploaded sequences and covered position.
 type StreamCoverage struct {
 	Streams    map[string]uint64 `json:"streams"`
+	Positions  map[string]uint64 `json:"positions,omitempty"`
 	CoveredPos uint64            `json:"covered_position"`
 }
 
-func (s *StreamStore) saveCoverage(cov StreamCoverage) error {
+func (s *StreamStore) writeCoverageFile(cov StreamCoverage) error {
 	data, err := json.Marshal(cov)
 	if err != nil {
 		return fmt.Errorf("failed to marshal coverage index: %w", err)
@@ -587,11 +596,12 @@ func (s *StreamStore) saveCoverage(cov StreamCoverage) error {
 	return nil
 }
 
-func (s *StreamStore) saveCoverageLocked() {
+func (s *StreamStore) saveCoverage() {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	cov := StreamCoverage{
-		Streams: make(map[string]uint64),
+		Streams:   make(map[string]uint64),
+		Positions: make(map[string]uint64),
 	}
 	var minPos uint64
 	first := true
@@ -599,140 +609,68 @@ func (s *StreamStore) saveCoverageLocked() {
 		w.mu.Lock()
 		upTo := w.uploadedTo
 		upPos := w.uploadedPos
+		fPos := w.firstPos
 		w.mu.Unlock()
-		if upTo > 0 {
-			cov.Streams[sid] = upTo
-			if first || upPos < minPos {
-				minPos = upPos
-				first = false
-			}
+
+		cov.Streams[sid] = upTo
+		cov.Positions[sid] = upPos
+
+		if fPos == 0 && upPos == 0 {
+			continue // idle stream with no records
+		}
+
+		covPos := upPos
+		if covPos == 0 && fPos > 0 {
+			covPos = fPos - 1
+		}
+
+		if first || covPos < minPos {
+			minPos = covPos
+			first = false
 		}
 	}
 	if len(cov.Streams) > 0 {
 		cov.CoveredPos = minPos
-		if err := s.saveCoverage(cov); err != nil {
+		if err := s.writeCoverageFile(cov); err != nil {
 			klog.Warningf("Failed to persist stream coverage: %v", err)
 		}
 	}
 }
 
-// LoadOrDeriveCoverage loads the persisted coverage index from dataDir or derives it from object storage and local streams.
-// It returns a map of streamID -> highest sealed to seq and the highest position covered by sealed per-stream files.
-func (s *StreamStore) LoadOrDeriveCoverage(ctx context.Context) (map[string]uint64, uint64, error) {
+// LoadCoverage loads the persisted coverage index from dataDir.
+// If coverage.json does not exist, it returns nil, 0, nil.
+func (s *StreamStore) LoadCoverage() (map[string]uint64, uint64, error) {
 	covPath := filepath.Join(s.dataDir, "coverage.json")
-	if data, err := os.ReadFile(covPath); err == nil {
-		var cov StreamCoverage
-		if err := json.Unmarshal(data, &cov); err == nil && len(cov.Streams) > 0 {
-			for sid := range cov.Streams {
-				if id, err := uuid.Parse(sid); err == nil {
-					s.getOrCreateStream(id)
-				}
-			}
-			return cov.Streams, cov.CoveredPos, nil
-		}
-	}
-
-	if s.backend == nil {
-		return nil, 0, nil
-	}
-
-	keys, err := s.backend.ListObjects(ctx, "", "streams/")
+	data, err := os.ReadFile(covPath)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to list streams in backend: %w", err)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, 0, nil
+		}
+		return nil, 0, fmt.Errorf("failed to read coverage index %s: %w", covPath, err)
 	}
 
-	type streamInfo struct {
-		toSeq uint64
-		key   string
-	}
-	sealedStreams := make(map[string]streamInfo)
-	for _, k := range keys {
-		if strings.HasPrefix(k, "streams/wal/") {
-			continue
-		}
-		_, to, sealed, err := wal.ParseStreamPath(k)
-		if err != nil || !sealed {
-			continue
-		}
-		clean := strings.TrimPrefix(k, "streams/")
-		parts := strings.Split(clean, "/")
-		if len(parts) < 2 {
-			continue
-		}
-		sid := parts[0]
-		if _, err := uuid.Parse(sid); err != nil {
-			continue
-		}
-		if to > sealedStreams[sid].toSeq {
-			sealedStreams[sid] = streamInfo{toSeq: to, key: k}
-		}
+	var cov StreamCoverage
+	if err := json.Unmarshal(data, &cov); err != nil {
+		return nil, 0, fmt.Errorf("failed to unmarshal coverage index %s: %w", covPath, err)
 	}
 
-	if len(sealedStreams) == 0 {
-		return nil, 0, nil
-	}
-
-	coveredTo := make(map[string]uint64)
-	var minPos uint64
-	first := true
-
-	for sid, info := range sealedStreams {
-		coveredTo[sid] = info.toSeq
+	for sid, upTo := range cov.Streams {
 		id, err := uuid.Parse(sid)
-		if err == nil {
-			w := s.getOrCreateStream(id)
-			w.mu.Lock()
-			if info.toSeq > w.uploadedTo {
-				w.uploadedTo = info.toSeq
-			}
-			w.mu.Unlock()
+		if err != nil {
+			return nil, 0, fmt.Errorf("invalid stream UUID %q in coverage index: %w", sid, err)
 		}
-
-		localPath := filepath.Join(s.dataDir, "streams", sid, filepath.Base(info.key))
-		var lastPos uint64
-		if recs, _, err := ReadRecordsFromOffset(localPath, 0, wal.WithAcceptUnversioned(s.acceptUnversioned)); err == nil && len(recs) > 0 {
-			lastPos = recs[len(recs)-1].Position
-		} else {
-			var buf bytes.Buffer
-			if err := s.backend.GetObject(ctx, "", info.key, 0, 0, &buf); err != nil {
-				return nil, 0, fmt.Errorf("failed to fetch sealed stream %s: %w", info.key, err)
-			}
-			r := bytes.NewReader(buf.Bytes())
-			_, _, err := wal.ReadSegmentHeader(r, s.acceptUnversioned)
-			if err != nil && !errors.Is(err, io.EOF) {
-				return nil, 0, fmt.Errorf("failed to read segment header from %s: %w", info.key, err)
-			}
-			for {
-				rec, err := wal.DecodeLogRecord(r)
-				if err != nil {
-					break
-				}
-				lastPos = rec.Position
-			}
+		w := s.getOrCreateStream(id)
+		w.mu.Lock()
+		if upTo > w.uploadedTo {
+			w.uploadedTo = upTo
 		}
-
-		if err == nil {
-			w := s.getOrCreateStream(id)
-			w.mu.Lock()
-			w.uploadedPos = lastPos
-			w.mu.Unlock()
+		if pos, ok := cov.Positions[sid]; ok && pos > w.uploadedPos {
+			w.uploadedPos = pos
 		}
-
-		if first || lastPos < minPos {
-			minPos = lastPos
-			first = false
-		}
+		w.mu.Unlock()
 	}
 
-	cov := StreamCoverage{
-		Streams:    coveredTo,
-		CoveredPos: minPos,
-	}
-	if err := s.saveCoverage(cov); err != nil {
-		klog.Warningf("Failed to persist stream coverage: %v", err)
-	}
-
-	return coveredTo, minPos, nil
+	return cov.Streams, cov.CoveredPos, nil
 }
 
 // TrackSegmentCoverage records the highest stream sequences contained in an aggregated segment.
@@ -818,9 +756,12 @@ func (s *StreamStore) Recover(ctx context.Context, aggRecords []*wal.LogRecord) 
 	}
 	s.mu.RLock()
 	for sid := range s.streams {
-		if id, err := uuid.Parse(sid); err == nil {
-			streamIDs[id] = struct{}{}
+		id, err := uuid.Parse(sid)
+		if err != nil {
+			s.mu.RUnlock()
+			return fmt.Errorf("invalid stream UUID %q in stream store: %w", sid, err)
 		}
+		streamIDs[id] = struct{}{}
 	}
 	s.mu.RUnlock()
 

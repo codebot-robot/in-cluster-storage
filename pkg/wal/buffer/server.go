@@ -165,9 +165,9 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to list segments from backend: %w", err)
 	}
 
-	coveredTo, minCoveredPos, err := streamStore.LoadOrDeriveCoverage(ctx)
+	coveredTo, minCoveredPos, err := streamStore.LoadCoverage()
 	if err != nil {
-		klog.Warningf("Failed to recover stream coverage: %v", err)
+		return nil, fmt.Errorf("failed to load stream coverage: %w", err)
 	}
 
 	var allDiscoveredRecords []*wal.LogRecord
@@ -178,7 +178,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 	for _, segPath := range discoveredSegments {
 		_, segLast, err := wal.ParseSegmentPath(segPath)
-		if err == nil && segLast <= minCoveredPos {
+		if err == nil && minCoveredPos > 0 && segLast <= minCoveredPos {
 			// Segment is fully covered by sealed per-stream files; skip reading from backend
 			continue
 		}
