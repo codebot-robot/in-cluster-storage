@@ -63,10 +63,11 @@ type streamWriter struct {
 	fileSize    int64
 	openTime    time.Time
 	pending     []*wal.LogRecord
-	sealed      []*StreamMeta
-	uploadedTo  uint64
-	uploadedPos uint64
-	discovered  bool
+	sealed              []*StreamMeta
+	uploadedTo          uint64
+	uploadedPos         uint64
+	discovered          bool
+	sealedSinceLastPass bool
 }
 
 func (w *streamWriter) appendRecords(records []*wal.LogRecord) {
@@ -199,6 +200,7 @@ func (w *streamWriter) sealLocked(ctx context.Context, backend objectstore.Backe
 	w.recCount = 0
 	w.fileSize = 0
 	w.openTime = time.Time{}
+	w.sealedSinceLastPass = true
 
 	// Upload is an idempotent follow-up; if it fails, meta remains in w.sealed to retry.
 	if err := w.uploadSealedMetaLocked(ctx, backend, meta); err != nil {
@@ -207,6 +209,15 @@ func (w *streamWriter) sealLocked(ctx context.Context, backend objectstore.Backe
 	}
 
 	return meta, nil
+}
+
+func (w *streamWriter) hasPendingSealedUploadsLocked() bool {
+	for _, m := range w.sealed {
+		if m.Key == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *streamWriter) uploadPendingSealedLocked(ctx context.Context, backend objectstore.Backend) error {
@@ -221,7 +232,10 @@ func (w *streamWriter) uploadPendingSealedLocked(ctx context.Context, backend ob
 
 func (w *streamWriter) discoverRemoteSealedLocked(ctx context.Context, backend objectstore.Backend) {
 	w.discovered = true
-	if entries, err := os.ReadDir(w.dir); err == nil {
+	entries, err := os.ReadDir(w.dir)
+	if err != nil && !os.IsNotExist(err) {
+		klog.Warningf("Failed to read stream directory %s for local sealed discovery: %v", w.dir, err)
+	} else if err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
@@ -531,7 +545,25 @@ func (s *StreamStore) checkSealsAndGC(ctx context.Context) {
 	if _, err := s.CheckSegmentGC(ctx); err != nil {
 		klog.Warningf("Failed to run aggregated segment GC: %v", err)
 	}
+
+	s.mu.Lock()
+	s.evictIdleWritersLocked()
+	s.mu.Unlock()
+
 	s.saveCoverage()
+}
+
+func (s *StreamStore) evictIdleWritersLocked() {
+	for sid, w := range s.streams {
+		w.mu.Lock()
+		canEvict := len(w.pending) == 0 && w.recCount == 0 && !w.sealedSinceLastPass && !w.hasPendingSealedUploadsLocked()
+		if canEvict {
+			delete(s.streams, sid)
+		} else {
+			w.sealedSinceLastPass = false
+		}
+		w.mu.Unlock()
+	}
 }
 
 // EnsureDiscovered discovers sealed objects from backend if the stream writer
