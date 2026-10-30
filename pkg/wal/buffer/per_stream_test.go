@@ -1701,3 +1701,240 @@ func TestMeasurement_SealPass1kStreams(t *testing.T) {
 	t.Logf("Measured 1,000 streams seal-pass: before_eviction (%d writers)=%v vs after_eviction (%d writers)=%v (speedup: %.1fx)",
 		totalStreams, durBefore, activeWriters, durAfter, float64(durBefore)/float64(durAfter))
 }
+
+// TestServerStreams_EvictsIdleEntries verifies that with N idle streams and one active
+// stream, the Server.streams map size is strictly bounded by active streams (independent of N)
+// after the idle pass.
+func TestServerStreams_EvictsIdleEntries(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	const totalStreams = 20
+	streamIDs := make([]uuid.UUID, totalStreams)
+	for i := 0; i < totalStreams; i++ {
+		streamIDs[i] = uuid.New()
+	}
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Close()
+
+	// Append and seal all 20 streams
+	for _, sid := range streamIDs {
+		ackChan := make(chan ackResult, 1)
+		srv.incomingChan <- incomingItem{
+			streamID:  sid,
+			streamSeq: 1,
+			payload:   []byte("test-payload"),
+			ackChan:   ackChan,
+		}
+		res := <-ackChan
+		if res.err != nil {
+			t.Fatalf("append failed: %v", res.err)
+		}
+	}
+
+	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	for _, sid := range streamIDs {
+		if err := srv.SealStream(ctx, sid); err != nil {
+			t.Fatalf("SealStream failed: %v", err)
+		}
+	}
+
+	// 1 active stream keeps an unsealed record
+	activeID := streamIDs[0]
+	ackChan := make(chan ackResult, 1)
+	srv.incomingChan <- incomingItem{
+		streamID:  activeID,
+		streamSeq: 2,
+		payload:   []byte("active-unsealed-record"),
+		ackChan:   ackChan,
+	}
+	res := <-ackChan
+	if res.err != nil {
+		t.Fatalf("append active failed: %v", res.err)
+	}
+
+	beforeCount := srv.StreamCount()
+	if beforeCount != totalStreams {
+		t.Fatalf("expected %d streams in server map before eviction, got %d", totalStreams, beforeCount)
+	}
+
+	// First pass marks idle streams (clears sealedSinceLastPass), second pass evicts them
+	srv.streamStore.checkSealsAndGC(ctx)
+	srv.streamStore.checkSealsAndGC(ctx)
+
+	afterCount := srv.StreamCount()
+	if afterCount != 1 {
+		t.Errorf("expected server streams map size bounded to 1 active stream after eviction, got %d", afterCount)
+	}
+
+	srv.mu.RLock()
+	_, activeExists := srv.streams[activeID.String()]
+	srv.mu.RUnlock()
+	if !activeExists {
+		t.Errorf("expected active stream %s to remain in server streams map", activeID)
+	}
+
+	t.Logf("Measured Server.streams map size with %d streams (19 idle, 1 active): before_eviction=%d, after_eviction=%d",
+		totalStreams, beforeCount, afterCount)
+}
+
+// TestServerStreams_BlockedWaiterPinsEntry verifies that a client goroutine blocked
+// in Wait on streamState.cond pins its streamState entry against idle eviction.
+func TestServerStreams_BlockedWaiterPinsEntry(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Close()
+
+	streamID := uuid.New()
+	ackChan := make(chan ackResult, 1)
+	srv.incomingChan <- incomingItem{
+		streamID:  streamID,
+		streamSeq: 1,
+		payload:   []byte("data"),
+		ackChan:   ackChan,
+	}
+	if res := <-ackChan; res.err != nil {
+		t.Fatalf("append failed: %v", res.err)
+	}
+	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+	if err := srv.SealStream(ctx, streamID); err != nil {
+		t.Fatalf("seal failed: %v", err)
+	}
+
+	st := srv.getOrCreateStream(ctx, streamID)
+
+	// Block a goroutine in st.cond.Wait() with st.waiters incremented
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		st.mu.Lock()
+		st.waiters++
+		close(ready)
+		st.cond.Wait()
+		st.waiters--
+		st.mu.Unlock()
+	}()
+
+	<-ready
+
+	// Run idle passes: stream has no pending records and is uploaded, but is pinned by the waiter
+	srv.streamStore.checkSealsAndGC(ctx)
+	srv.streamStore.checkSealsAndGC(ctx)
+
+	if count := srv.StreamCount(); count != 1 {
+		t.Fatalf("expected stream to remain pinned while waiter is blocked, got stream count %d", count)
+	}
+
+	// Wake the waiter and wait for goroutine to exit
+	st.mu.Lock()
+	st.cond.Broadcast()
+	st.mu.Unlock()
+	<-done
+
+	// Now that waiter has exited (waiters == 0), the next idle pass must evict it
+	srv.streamStore.checkSealsAndGC(ctx)
+	if count := srv.StreamCount(); count != 0 {
+		t.Fatalf("expected stream to be evicted once waiter unblocked, got stream count %d", count)
+	}
+}
+
+// TestServerStreams_ReconnectAfterEvictionReportsWatermarks verifies that contacting
+// an evicted stream seeds watermarks from discovered sealed state equal to pre-eviction watermarks.
+func TestServerStreams_ReconnectAfterEvictionReportsWatermarks(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Close()
+
+	streamID := uuid.New()
+	for seq := uint64(1); seq <= 5; seq++ {
+		ackChan := make(chan ackResult, 1)
+		srv.incomingChan <- incomingItem{
+			streamID:  streamID,
+			streamSeq: seq,
+			payload:   []byte(fmt.Sprintf("record-%d", seq)),
+			ackChan:   ackChan,
+		}
+		if res := <-ackChan; res.err != nil {
+			t.Fatalf("append seq %d failed: %v", seq, res.err)
+		}
+	}
+
+	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+	if err := srv.SealStream(ctx, streamID); err != nil {
+		t.Fatalf("seal failed: %v", err)
+	}
+
+	stBefore := srv.getOrCreateStream(ctx, streamID)
+	stBefore.mu.Lock()
+	witnessBefore := stBefore.witnessSeq
+	s3Before := stBefore.s3Seq
+	stBefore.mu.Unlock()
+
+	if witnessBefore != 5 || s3Before != 5 {
+		t.Fatalf("expected pre-eviction watermarks (5, 5), got (%d, %d)", witnessBefore, s3Before)
+	}
+
+	// Run idle passes to evict stream
+	srv.streamStore.checkSealsAndGC(ctx)
+	srv.streamStore.checkSealsAndGC(ctx)
+
+	if count := srv.StreamCount(); count != 0 {
+		t.Fatalf("expected stream to be evicted from server map, got count %d", count)
+	}
+
+	// Reconnect: getOrCreateStream discovers sealed state and rebuilds streamState
+	stAfter := srv.getOrCreateStream(ctx, streamID)
+	if count := srv.StreamCount(); count != 1 {
+		t.Fatalf("expected server streams map to hold 1 entry after reconnect, got %d", count)
+	}
+
+	stAfter.mu.Lock()
+	witnessAfter := stAfter.witnessSeq
+	s3After := stAfter.s3Seq
+	stAfter.mu.Unlock()
+
+	if witnessAfter != witnessBefore || s3After != s3Before {
+		t.Fatalf("expected reconnected watermarks (%d, %d) equal to pre-eviction (%d, %d)",
+			witnessAfter, s3After, witnessBefore, s3Before)
+	}
+}

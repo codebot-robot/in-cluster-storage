@@ -395,14 +395,20 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 	s.mu.Lock()
 	sid := streamID.String()
 	st, exists := s.streams[sid]
-	if !exists {
-		st = newStreamState(0, 0)
-		s.streams[sid] = st
+	if exists {
+		s.mu.Unlock()
+		return st
 	}
 	s.mu.Unlock()
 
+	var uploadedTo uint64
 	if s.streamStore != nil {
-		uploadedTo := s.streamStore.EnsureDiscovered(ctx, streamID)
+		uploadedTo = s.streamStore.EnsureDiscovered(ctx, streamID)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, exists = s.streams[sid]; exists {
 		st.mu.Lock()
 		if uploadedTo > st.witnessSeq {
 			st.witnessSeq = uploadedTo
@@ -411,8 +417,11 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 			st.s3Seq = uploadedTo
 		}
 		st.mu.Unlock()
+		return st
 	}
 
+	st = newStreamState(uploadedTo, uploadedTo)
+	s.streams[sid] = st
 	return st
 }
 
