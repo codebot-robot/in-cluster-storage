@@ -676,21 +676,21 @@ func (p *PackFile) DecodeBlob(r io.Reader, entry BlobEntry) (ByteStream, error) 
 	return stream, nil
 }
 
-// WritePackfile writes a v2 packfile directly to w using the default slot count (1024).
-func WritePackfile(w io.Writer, inputs []*EncodedBlob) (*PackFile, error) {
+// WritePackfile writes a v2 packfile directly to ws using the default slot count (1024).
+func WritePackfile(ws io.WriteSeeker, inputs []*EncodedBlob) (*PackFile, error) {
 	slots := DefaultPackSlots
 	if uint32(len(inputs)) > slots {
 		slots = uint32(len(inputs))
 		klog.V(2).Infof("batch size %d exceeds default pack slots %d; reserving S = %d for pack", len(inputs), DefaultPackSlots, slots)
 	}
-	return WritePackfileWithSlots(w, inputs, slots)
+	return WritePackfileWithSlots(ws, inputs, slots)
 }
 
-// WritePackfileWithSlots writes a v2 packfile with explicit slot reservation to w:
+// WritePackfileWithSlots writes a v2 packfile with explicit slot reservation to ws:
 // [Header 32B: 8B base (version 2) + 4B slots S + 4B used N + 4B flags (bit 0=sealed) + 12B reserved]
 // [Table: S * 48B slots: first N sorted by SHA256, remaining S - N zeroed]
 // [Data: for each blob in inputs order: 16B BlobItemHeader + payload data]
-func WritePackfileWithSlots(w io.Writer, inputs []*EncodedBlob, slots uint32) (*PackFile, error) {
+func WritePackfileWithSlots(ws io.WriteSeeker, inputs []*EncodedBlob, slots uint32) (*PackFile, error) {
 	n := len(inputs)
 	if n == 0 {
 		return nil, errors.New("cannot create empty packfile with 0 blobs")
@@ -699,90 +699,26 @@ func WritePackfileWithSlots(w io.Writer, inputs []*EncodedBlob, slots uint32) (*
 		return nil, fmt.Errorf("slots %d cannot be less than blob count %d", slots, n)
 	}
 
-	if uint32(n) == slots {
-		packSlotsFullMu.Lock()
-		packSlotsFullCount++
-		count := packSlotsFullCount
-		packSlotsFullMu.Unlock()
-		klog.V(2).Infof("packfile sealed with all %d slots full (total full packs: %d)", slots, count)
+	pack, err := NewIncrementalPackWriter(ws, slots)
+	if err != nil {
+		return nil, err
 	}
 
-	frontSectionSize := uint32(PackV2HeaderSize) + slots*PackV2SlotSize
-	currentOffset := frontSectionSize
-
-	entries := make([]BlobEntry, n)
-	for i, prep := range inputs {
-		itemHdrOffset := currentOffset
-		payloadStart := itemHdrOffset + uint32(BlobItemHeaderSize)
-		storedLen := uint32(prep.StoredLength)
-		entries[i] = BlobEntry{
-			SHA256:       prep.SHA256,
-			DataOffset:   payloadStart,
-			StoredLength: storedLen,
-			FinalLength:  uint32(prep.FinalLength),
-			Encoding:     prep.Encoding,
-		}
-		currentOffset = payloadStart + storedLen
-	}
-
-	// First N slots must be sorted by SHA256
-	sortedEntries := make([]BlobEntry, n)
-	copy(sortedEntries, entries)
-	sort.Slice(sortedEntries, func(i, j int) bool {
-		return bytes.Compare(sortedEntries[i].SHA256[:], sortedEntries[j].SHA256[:]) < 0
-	})
-
-	// Construct header (32 bytes)
-	hdrBuf := make([]byte, PackV2HeaderSize)
-	copy(hdrBuf[0:8], WriteFileHeaderWithVersion(FileTypePack, VersionV2))
-	binary.BigEndian.PutUint32(hdrBuf[8:12], slots)
-	binary.BigEndian.PutUint32(hdrBuf[12:16], uint32(n))
-	binary.BigEndian.PutUint32(hdrBuf[16:20], PackFlagSealed)
-	// hdrBuf[20:32] is reserved (zeroed)
-
-	if _, err := w.Write(hdrBuf); err != nil {
-		return nil, fmt.Errorf("failed writing pack v2 header: %w", err)
-	}
-
-	// Construct table (S * 48 bytes)
-	tableBuf := make([]byte, slots*PackV2SlotSize)
-	for i, entry := range sortedEntries {
-		off := uint32(i) * PackV2SlotSize
-		copy(tableBuf[off:off+32], entry.SHA256[:])
-		binary.BigEndian.PutUint32(tableBuf[off+32:off+36], entry.DataOffset)
-		binary.BigEndian.PutUint32(tableBuf[off+36:off+40], entry.StoredLength)
-		binary.BigEndian.PutUint32(tableBuf[off+40:off+44], entry.FinalLength)
-		binary.BigEndian.PutUint32(tableBuf[off+44:off+48], entry.Encoding)
-	}
-	// remaining (slots - n) * 48 bytes are already zeroed
-
-	if _, err := w.Write(tableBuf); err != nil {
-		return nil, fmt.Errorf("failed writing pack v2 tables: %w", err)
-	}
-
-	// Write data items in input order
 	for _, prep := range inputs {
-		if err := prep.Stream.Rewind(); err != nil {
-			return nil, fmt.Errorf("failed rewinding blob stream: %w", err)
+		if _, err := pack.AppendBlob(prep); err != nil {
+			return nil, err
 		}
-		itemHdr := make([]byte, BlobItemHeaderSize)
-		binary.BigEndian.PutUint32(itemHdr[0:4], prep.Encoding)
-		binary.BigEndian.PutUint32(itemHdr[4:8], uint32(prep.FinalLength))
-		binary.BigEndian.PutUint64(itemHdr[8:16], 0) // padding/reserved
+	}
 
-		if _, err := w.Write(itemHdr); err != nil {
-			return nil, fmt.Errorf("failed writing blob item header: %w", err)
-		}
-		if _, err := io.Copy(w, prep.Stream); err != nil {
-			return nil, fmt.Errorf("failed writing blob payload: %w", err)
-		}
+	if err := pack.Seal(); err != nil {
+		return nil, err
 	}
 
 	return &PackFile{
 		Version: VersionV2,
 		Slots:   slots,
 		Flags:   PackFlagSealed,
-		Entries: sortedEntries,
+		Entries: pack.Entries(),
 	}, nil
 }
 

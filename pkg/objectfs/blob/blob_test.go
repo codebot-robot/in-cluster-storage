@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -36,6 +37,14 @@ import (
 type testMemoryBackend struct {
 	mu      sync.RWMutex
 	objects map[string][]byte
+}
+
+func createTestPackFile(t *testing.T) *os.File {
+	tf, err := os.CreateTemp(t.TempDir(), "pack-test-*")
+	if err != nil {
+		t.Fatalf("failed creating test packfile: %v", err)
+	}
+	return tf
 }
 
 func newTestMemoryBackend() *testMemoryBackend {
@@ -219,12 +228,15 @@ func TestPackfileEncodeDecode(t *testing.T) {
 		preps = append(preps, p)
 	}
 
-	var packBuf bytes.Buffer
-	packFile, err := WritePackfile(&packBuf, preps)
+	tf := createTestPackFile(t)
+	packFile, err := WritePackfile(tf, preps)
 	if err != nil {
 		t.Fatalf("WritePackfile failed: %v", err)
 	}
-	packData := packBuf.Bytes()
+	packData, err := os.ReadFile(tf.Name())
+	if err != nil {
+		t.Fatalf("failed reading packData: %v", err)
+	}
 
 	// Verify pack tables
 	parsedPack, err := DecodePackTable(bytes.NewReader(packData))
@@ -689,8 +701,8 @@ func TestPackfileV2RoundTripUnsorted(t *testing.T) {
 		origContents[0], origContents[1] = origContents[1], origContents[0]
 	}
 
-	var packBuf bytes.Buffer
-	packFile, err := WritePackfile(&packBuf, preps)
+	tf := createTestPackFile(t)
+	packFile, err := WritePackfile(tf, preps)
 	if err != nil {
 		t.Fatalf("WritePackfile failed: %v", err)
 	}
@@ -704,7 +716,10 @@ func TestPackfileV2RoundTripUnsorted(t *testing.T) {
 		t.Fatalf("expected PackFlagSealed flags, got %d", packFile.Flags)
 	}
 
-	packData := packBuf.Bytes()
+	packData, err := os.ReadFile(tf.Name())
+	if err != nil {
+		t.Fatalf("failed reading packData: %v", err)
+	}
 
 	// Verify raw header bytes: Magic (0..4), Version (4), FileType (5), Slots (8..12), Used (12..16), Flags (16..20)
 	if binary.BigEndian.Uint32(packData[0:4]) != Magic {
@@ -795,8 +810,8 @@ func TestPackfileV2BinarySearchLessSlots(t *testing.T) {
 		preps = append(preps, p)
 	}
 
-	var buf bytes.Buffer
-	pack, err := WritePackfileWithSlots(&buf, preps, 16)
+	tf := createTestPackFile(t)
+	pack, err := WritePackfileWithSlots(tf, preps, 16)
 	if err != nil {
 		t.Fatalf("WritePackfileWithSlots failed: %v", err)
 	}
@@ -804,7 +819,11 @@ func TestPackfileV2BinarySearchLessSlots(t *testing.T) {
 		t.Fatalf("expected 16 slots, 4 entries; got slots=%d, entries=%d", pack.Slots, len(pack.Entries))
 	}
 
-	parsed, err := DecodePackTable(bytes.NewReader(buf.Bytes()))
+	packBytes, err := os.ReadFile(tf.Name())
+	if err != nil {
+		t.Fatalf("failed reading packBytes: %v", err)
+	}
+	parsed, err := DecodePackTable(bytes.NewReader(packBytes))
 	if err != nil {
 		t.Fatalf("DecodePackTable failed: %v", err)
 	}
@@ -873,8 +892,8 @@ func TestPackfileV2FullSlots(t *testing.T) {
 		preps = append(preps, p)
 	}
 
-	var buf bytes.Buffer
-	pack, err := WritePackfileWithSlots(&buf, preps, slotCount)
+	tf := createTestPackFile(t)
+	pack, err := WritePackfileWithSlots(tf, preps, slotCount)
 	if err != nil {
 		t.Fatalf("WritePackfileWithSlots failed: %v", err)
 	}
@@ -886,7 +905,11 @@ func TestPackfileV2FullSlots(t *testing.T) {
 		t.Fatalf("expected sealed bit set in flags")
 	}
 
-	parsed, err := DecodePackTable(bytes.NewReader(buf.Bytes()))
+	packBytes, err := os.ReadFile(tf.Name())
+	if err != nil {
+		t.Fatalf("failed reading packBytes: %v", err)
+	}
+	parsed, err := DecodePackTable(bytes.NewReader(packBytes))
 	if err != nil {
 		t.Fatalf("DecodePackTable failed: %v", err)
 	}
@@ -900,7 +923,7 @@ func TestPackfileV2FullSlots(t *testing.T) {
 		if !found {
 			t.Fatalf("item %d (%x) not found in full pack", i, targetSHA)
 		}
-		r := bytes.NewReader(buf.Bytes()[entry.DataOffset : entry.DataOffset+entry.StoredLength])
+		r := bytes.NewReader(packBytes[entry.DataOffset : entry.DataOffset+entry.StoredLength])
 		stream, err := parsed.DecodeBlob(r, entry)
 		if err != nil {
 			t.Fatalf("DecodeBlob failed: %v", err)
@@ -1043,11 +1066,15 @@ func TestMixedStoreV1V2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
-	var v2Buf bytes.Buffer
-	if _, err := WritePackfile(&v2Buf, []*EncodedBlob{prepV2_1, prepV2_2}); err != nil {
+	tfV2 := createTestPackFile(t)
+	if _, err := WritePackfile(tfV2, []*EncodedBlob{prepV2_1, prepV2_2}); err != nil {
 		t.Fatalf("WritePackfile v2 failed: %v", err)
 	}
-	if _, err := backend.PutObject(ctx, "", "blobs/pack-v2-test-2.pack", NewByteStreamFromBytes(v2Buf.Bytes())); err != nil {
+	v2Bytes, err := os.ReadFile(tfV2.Name())
+	if err != nil {
+		t.Fatalf("failed reading v2Bytes: %v", err)
+	}
+	if _, err := backend.PutObject(ctx, "", "blobs/pack-v2-test-2.pack", NewByteStreamFromBytes(v2Bytes)); err != nil {
 		t.Fatalf("PutObject v2 pack failed: %v", err)
 	}
 
@@ -1114,12 +1141,15 @@ func TestPackfileV2CorruptEntry_Raw(t *testing.T) {
 		t.Fatalf("expected raw encoding for random data, got %d", prep.Encoding)
 	}
 
-	var packBuf bytes.Buffer
-	if _, err := WritePackfileWithSlots(&packBuf, []*EncodedBlob{prep}, 4); err != nil {
+	tf := createTestPackFile(t)
+	if _, err := WritePackfileWithSlots(tf, []*EncodedBlob{prep}, 4); err != nil {
 		t.Fatalf("WritePackfile failed: %v", err)
 	}
 
-	packBytes := packBuf.Bytes()
+	packBytes, err := os.ReadFile(tf.Name())
+	if err != nil {
+		t.Fatalf("failed reading packBytes: %v", err)
+	}
 	// Slot 0 starts at offset 32 (PackV2HeaderSize).
 	// Slot layout: SHA256 (0..32), Start (32..36), StoredLength (36..40)
 	// Mutate Start to point past EOF
@@ -1191,12 +1221,15 @@ func TestPackfileV2CorruptEntry_Compressed(t *testing.T) {
 		t.Fatalf("expected compressed encoding, got %d", prep.Encoding)
 	}
 
-	var packBuf bytes.Buffer
-	if _, err := WritePackfileWithSlots(&packBuf, []*EncodedBlob{prep}, 4); err != nil {
+	tf := createTestPackFile(t)
+	if _, err := WritePackfileWithSlots(tf, []*EncodedBlob{prep}, 4); err != nil {
 		t.Fatalf("WritePackfile failed: %v", err)
 	}
 
-	packBytes := packBuf.Bytes()
+	packBytes, err := os.ReadFile(tf.Name())
+	if err != nil {
+		t.Fatalf("failed reading packBytes: %v", err)
+	}
 	slotStartOff := PackV2HeaderSize + 32
 	badOffset := uint32(len(packBytes) + 5000)
 	binary.BigEndian.PutUint32(packBytes[slotStartOff:slotStartOff+4], badOffset)
@@ -1242,12 +1275,15 @@ func TestPackfileV2CorruptEntry_ShortRangeRead(t *testing.T) {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
 
-	var packBuf bytes.Buffer
-	if _, err := WritePackfile(&packBuf, []*EncodedBlob{prep}); err != nil {
+	tf := createTestPackFile(t)
+	if _, err := WritePackfile(tf, []*EncodedBlob{prep}); err != nil {
 		t.Fatalf("WritePackfile failed: %v", err)
 	}
 
-	packBytes := packBuf.Bytes()
+	packBytes, err := os.ReadFile(tf.Name())
+	if err != nil {
+		t.Fatalf("failed reading packBytes: %v", err)
+	}
 	truncatedPack := packBytes[:len(packBytes)-5]
 
 	packKey := "blobs/truncated-pack-1.pack"
@@ -1284,13 +1320,16 @@ func TestPackfileV2CorruptEntry_ChecksumMismatch(t *testing.T) {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
 
-	var packBuf bytes.Buffer
-	pack, err := WritePackfile(&packBuf, []*EncodedBlob{prep})
+	tf := createTestPackFile(t)
+	pack, err := WritePackfile(tf, []*EncodedBlob{prep})
 	if err != nil {
 		t.Fatalf("WritePackfile failed: %v", err)
 	}
 
-	packBytes := packBuf.Bytes()
+	packBytes, err := os.ReadFile(tf.Name())
+	if err != nil {
+		t.Fatalf("failed reading packBytes: %v", err)
+	}
 	// Corrupt 1 byte in payload
 	entry := pack.Entries[0]
 	packBytes[entry.DataOffset] ^= 0xFF
@@ -1316,5 +1355,31 @@ func TestPackfileV2CorruptEntry_ChecksumMismatch(t *testing.T) {
 	errStr := err.Error()
 	if !strings.Contains(errStr, "checksum mismatch") {
 		t.Errorf("expected checksum mismatch in error %q", errStr)
+	}
+}
+
+func TestIncrementalPack_SlotsFull(t *testing.T) {
+	packPath := filepath.Join(t.TempDir(), "test-slots-full.pack")
+	pack, err := NewIncrementalPack(packPath, 2)
+	if err != nil {
+		t.Fatalf("NewIncrementalPack failed: %v", err)
+	}
+	defer func() { _ = pack.Close() }()
+
+	if _, err := pack.Append([]byte("chunk 1")); err != nil {
+		t.Fatalf("Append 1 failed: %v", err)
+	}
+	if _, err := pack.Append([]byte("chunk 2")); err != nil {
+		t.Fatalf("Append 2 failed: %v", err)
+	}
+
+	// Third unique chunk must fail with ErrPackSlotsFull
+	_, err = pack.Append([]byte("chunk 3"))
+	if !errors.Is(err, ErrPackSlotsFull) {
+		t.Fatalf("expected ErrPackSlotsFull, got: %v", err)
+	}
+
+	if err := pack.Seal(); err != nil {
+		t.Fatalf("Seal failed: %v", err)
 	}
 }
