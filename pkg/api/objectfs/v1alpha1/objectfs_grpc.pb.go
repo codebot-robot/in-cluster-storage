@@ -71,6 +71,7 @@ const (
 	ObjectFSController_ReleaseExclusive_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/ReleaseExclusive"
 	ObjectFSController_GetExclusiveHold_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/GetExclusiveHold"
 	ObjectFSController_RepairVolume_FullMethodName     = "/objectfs.v1alpha1.ObjectFSController/RepairVolume"
+	ObjectFSController_DeleteVolume_FullMethodName     = "/objectfs.v1alpha1.ObjectFSController/DeleteVolume"
 )
 
 // ObjectFSControllerClient is the client API for ObjectFSController service.
@@ -125,6 +126,9 @@ type ObjectFSControllerClient interface {
 	// RepairVolume repairs a degraded volume by moving its local segment directory aside
 	// and reopening its stream to resume from the buffer witness watermark.
 	RepairVolume(ctx context.Context, in *RepairVolumeRequest, opts ...grpc.CallOption) (*RepairVolumeResponse, error)
+	// DeleteVolume deletes a volume, removing its snapshots, per-volume metadata objects,
+	// and local controller state.
+	DeleteVolume(ctx context.Context, in *DeleteVolumeRequest, opts ...grpc.CallOption) (*DeleteVolumeResponse, error)
 }
 
 type objectFSControllerClient struct {
@@ -533,6 +537,16 @@ func (c *objectFSControllerClient) RepairVolume(ctx context.Context, in *RepairV
 	return out, nil
 }
 
+func (c *objectFSControllerClient) DeleteVolume(ctx context.Context, in *DeleteVolumeRequest, opts ...grpc.CallOption) (*DeleteVolumeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteVolumeResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_DeleteVolume_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ObjectFSControllerServer is the server API for ObjectFSController service.
 // All implementations must embed UnimplementedObjectFSControllerServer
 // for forward compatibility.
@@ -585,6 +599,9 @@ type ObjectFSControllerServer interface {
 	// RepairVolume repairs a degraded volume by moving its local segment directory aside
 	// and reopening its stream to resume from the buffer witness watermark.
 	RepairVolume(context.Context, *RepairVolumeRequest) (*RepairVolumeResponse, error)
+	// DeleteVolume deletes a volume, removing its snapshots, per-volume metadata objects,
+	// and local controller state.
+	DeleteVolume(context.Context, *DeleteVolumeRequest) (*DeleteVolumeResponse, error)
 	mustEmbedUnimplementedObjectFSControllerServer()
 }
 
@@ -708,6 +725,9 @@ func (UnimplementedObjectFSControllerServer) GetExclusiveHold(context.Context, *
 }
 func (UnimplementedObjectFSControllerServer) RepairVolume(context.Context, *RepairVolumeRequest) (*RepairVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RepairVolume not implemented")
+}
+func (UnimplementedObjectFSControllerServer) DeleteVolume(context.Context, *DeleteVolumeRequest) (*DeleteVolumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteVolume not implemented")
 }
 func (UnimplementedObjectFSControllerServer) mustEmbedUnimplementedObjectFSControllerServer() {}
 func (UnimplementedObjectFSControllerServer) testEmbeddedByValue()                            {}
@@ -1400,6 +1420,24 @@ func _ObjectFSController_RepairVolume_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ObjectFSController_DeleteVolume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteVolumeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).DeleteVolume(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_DeleteVolume_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).DeleteVolume(ctx, req.(*DeleteVolumeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ObjectFSController_ServiceDesc is the grpc.ServiceDesc for ObjectFSController service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1550,6 +1588,10 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RepairVolume",
 			Handler:    _ObjectFSController_RepairVolume_Handler,
+		},
+		{
+			MethodName: "DeleteVolume",
+			Handler:    _ObjectFSController_DeleteVolume_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
