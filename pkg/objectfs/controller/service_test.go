@@ -7375,3 +7375,391 @@ func TestMetadataStreamRegisteredTypeIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteVolume_Basic(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(backend)
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-del-vol-basic"
+
+	// 1. Create file and flush/snapshot
+	_, err := testCreateFile(ctx, server, volumeID, "/file1.txt", 0644, []byte("content1"), 0, 0)
+	if err != nil {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+
+	snapResp, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+	if snapResp.GetSnapshot().GetName() == "" {
+		t.Fatalf("Expected snapshot name, got empty")
+	}
+
+	if err := server.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+
+	// Verify volume objects exist in backend
+	volObjsBefore, err := backend.ListObjects(ctx, "", fmt.Sprintf("volumes/%s/", volumeID))
+	if err != nil {
+		t.Fatalf("ListObjects volumes failed: %v", err)
+	}
+	if len(volObjsBefore) == 0 {
+		t.Fatalf("Expected objects under volumes/%s/ before deletion", volumeID)
+	}
+
+	streamID := StreamIDForVolume(volumeID)
+	snapObjsBefore, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/snapshots/", streamID.String()))
+	if err != nil {
+		t.Fatalf("ListObjects snapshots failed: %v", err)
+	}
+	if len(snapObjsBefore) == 0 {
+		t.Fatalf("Expected snapshot objects before deletion")
+	}
+
+	// 2. DeleteVolume
+	delResp, err := server.DeleteVolume(ctx, &pb.DeleteVolumeRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("DeleteVolume failed: %v", err)
+	}
+	if delResp == nil {
+		t.Fatalf("Expected non-nil DeleteVolumeResponse")
+	}
+
+	// 3. Confirm backend objects are gone
+	volObjsAfter, err := backend.ListObjects(ctx, "", fmt.Sprintf("volumes/%s/", volumeID))
+	if err != nil {
+		t.Fatalf("ListObjects volumes after deletion failed: %v", err)
+	}
+	if len(volObjsAfter) != 0 {
+		t.Fatalf("Expected 0 objects under volumes/%s/ after deletion, got %v", volumeID, volObjsAfter)
+	}
+
+	snapObjsAfter, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/snapshots/", streamID.String()))
+	if err != nil {
+		t.Fatalf("ListObjects snapshots after deletion failed: %v", err)
+	}
+	if len(snapObjsAfter) != 0 {
+		t.Fatalf("Expected 0 snapshot objects after deletion, got %v", snapObjsAfter)
+	}
+
+	// 4. Confirm ListVolumes does not return the volume
+	listResp, err := server.ListVolumes(ctx, &pb.ListVolumesRequest{})
+	if err != nil {
+		t.Fatalf("ListVolumes failed: %v", err)
+	}
+	for _, v := range listResp.GetVolumes() {
+		if v.GetVolumeId() == volumeID {
+			t.Fatalf("ListVolumes still returned deleted volume %s", volumeID)
+		}
+	}
+
+	// 5. Re-create volume and confirm it starts empty
+	readDirResp, err := server.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1})
+	if err != nil {
+		t.Fatalf("ReadDir on re-created volume failed: %v", err)
+	}
+	if len(readDirResp.GetEntries()) != 0 {
+		t.Fatalf("Expected empty entries for re-created volume, got %d", len(readDirResp.GetEntries()))
+	}
+}
+
+func TestDeleteVolume_RefusesWhenPublished_ExclusiveHold(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(backend)
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-del-hold-vol"
+
+	// Acquire exclusive hold
+	acqResp, err := server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "mount-1",
+	})
+	if err != nil || acqResp.GetHold() == nil {
+		t.Fatalf("AcquireExclusive failed: %v", err)
+	}
+
+	// DeleteVolume must refuse while hold is active
+	_, err = server.DeleteVolume(ctx, &pb.DeleteVolumeRequest{VolumeId: volumeID})
+	if err == nil {
+		t.Fatalf("Expected DeleteVolume to fail when volume has active exclusive hold")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Expected FailedPrecondition, got %v", err)
+	}
+
+	// Release hold
+	relResp, err := server.ReleaseExclusive(ctx, &pb.ReleaseExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "mount-1",
+	})
+	if err != nil || relResp == nil {
+		t.Fatalf("ReleaseExclusive failed: %v", err)
+	}
+
+	// Now DeleteVolume must succeed
+	if _, err := server.DeleteVolume(ctx, &pb.DeleteVolumeRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("DeleteVolume failed after releasing hold: %v", err)
+	}
+}
+
+func TestDeleteVolume_RefusesWhenPublished_Watcher(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(backend)
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-del-watcher-vol"
+
+	// Subscribe watcher via broadcaster
+	ch := server.broadcaster.Subscribe(volumeID)
+
+	// DeleteVolume must refuse while watcher is subscribed
+	_, err := server.DeleteVolume(ctx, &pb.DeleteVolumeRequest{VolumeId: volumeID})
+	if err == nil {
+		t.Fatalf("Expected DeleteVolume to fail when volume has active subscriber")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Expected FailedPrecondition, got %v", err)
+	}
+
+	// Unsubscribe watcher
+	server.broadcaster.Unsubscribe(volumeID, ch)
+
+	// Now DeleteVolume must succeed
+	if _, err := server.DeleteVolume(ctx, &pb.DeleteVolumeRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("DeleteVolume failed after watcher unsubscribe: %v", err)
+	}
+}
+
+func TestDeleteVolume_CSIDelegate(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(backend)
+	csiController := NewCSIController(server)
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-csi-del-vol"
+
+	// Acquire exclusive hold so volume is published
+	_, err := server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "mount-1",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive failed: %v", err)
+	}
+
+	// CSI DeleteVolume must refuse with FailedPrecondition while published
+	_, err = csiController.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volumeID})
+	if err == nil {
+		t.Fatalf("Expected CSI DeleteVolume to fail when published")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Expected FailedPrecondition from CSI DeleteVolume, got %v", err)
+	}
+
+	// Release hold
+	_, err = server.ReleaseExclusive(ctx, &pb.ReleaseExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "mount-1",
+	})
+	if err != nil {
+		t.Fatalf("ReleaseExclusive failed: %v", err)
+	}
+
+	// CSI DeleteVolume must now succeed
+	if _, err := csiController.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("CSI DeleteVolume failed after unpublish: %v", err)
+	}
+}
+
+func TestDeleteVolume_SnapshotRetention(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(backend)
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-del-retention-vol"
+
+	// Create 4 snapshots
+	for i := 1; i <= 4; i++ {
+		_, err := testCreateFile(ctx, server, volumeID, fmt.Sprintf("/file%d.txt", i), 0644, []byte(fmt.Sprintf("data-%d", i)), 0, 0)
+		if err != nil {
+			t.Fatalf("testCreateFile %d failed: %v", i, err)
+		}
+		if _, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID}); err != nil {
+			t.Fatalf("CreateSnapshot %d failed: %v", i, err)
+		}
+	}
+
+	streamID := StreamIDForVolume(volumeID)
+	snapsBefore, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/snapshots/", streamID.String()))
+	if err != nil {
+		t.Fatalf("ListObjects failed: %v", err)
+	}
+	if len(snapsBefore) != 4 {
+		t.Fatalf("Expected 4 snapshots before deletion, got %d", len(snapsBefore))
+	}
+
+	// Delete volume retaining last 2 snapshots
+	retention := int32(2)
+	_, err = server.DeleteVolume(ctx, &pb.DeleteVolumeRequest{
+		VolumeId:  volumeID,
+		Retention: &retention,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVolume failed: %v", err)
+	}
+
+	// Volume metadata objects (volumes/<id>/...) must be deleted
+	volObjs, err := backend.ListObjects(ctx, "", fmt.Sprintf("volumes/%s/", volumeID))
+	if err != nil {
+		t.Fatalf("ListObjects volumes failed: %v", err)
+	}
+	if len(volObjs) != 0 {
+		t.Fatalf("Expected 0 volume objects, got %v", volObjs)
+	}
+
+	// Exactly 2 newest snapshots must remain in backend
+	snapsAfter, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/snapshots/", streamID.String()))
+	if err != nil {
+		t.Fatalf("ListObjects snapshots failed: %v", err)
+	}
+	if len(snapsAfter) != 2 {
+		t.Fatalf("Expected 2 retained snapshots, got %d (%v)", len(snapsAfter), snapsAfter)
+	}
+
+	// The 2 retained snapshots must match the latest 2 from before
+	slices.Sort(snapsBefore)
+	slices.Sort(snapsAfter)
+	if !slices.Equal(snapsAfter, snapsBefore[2:]) {
+		t.Fatalf("Expected retained snapshots %v, got %v", snapsBefore[2:], snapsAfter)
+	}
+}
+
+func TestVolume_SnapshotRetention_CreateSnapshot(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(backend, WithServerSnapshotRetention(2))
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-create-snap-retention-vol"
+
+	for i := 1; i <= 4; i++ {
+		_, err := testCreateFile(ctx, server, volumeID, fmt.Sprintf("/f%d.txt", i), 0644, []byte(fmt.Sprintf("v%d", i)), 0, 0)
+		if err != nil {
+			t.Fatalf("testCreateFile %d failed: %v", i, err)
+		}
+		if _, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID}); err != nil {
+			t.Fatalf("CreateSnapshot %d failed: %v", i, err)
+		}
+	}
+
+	// Only 2 newest snapshots should remain in backend
+	streamID := StreamIDForVolume(volumeID)
+	snaps, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/snapshots/", streamID.String()))
+	if err != nil {
+		t.Fatalf("ListObjects failed: %v", err)
+	}
+	if len(snaps) != 2 {
+		t.Fatalf("Expected exactly 2 snapshots retained, got %d (%v)", len(snaps), snaps)
+	}
+
+	// ListSnapshots RPC should also report 2 snapshots
+	listSnapResp, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("ListSnapshots failed: %v", err)
+	}
+	if len(listSnapResp.GetSnapshots()) != 2 {
+		t.Fatalf("Expected 2 snapshots in ListSnapshots, got %d", len(listSnapResp.GetSnapshots()))
+	}
+}
+
+func TestDeleteVolume_HalfDeleted_Idempotent(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(backend)
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-half-del-vol"
+
+	// Create files and snapshot
+	_, err := testCreateFile(ctx, server, volumeID, "/test.txt", 0644, []byte("data"), 0, 0)
+	if err != nil {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+	if _, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+
+	// Manually delete stream.id to simulate partial deletion
+	streamObjKey := fmt.Sprintf("volumes/%s/stream.id", volumeID)
+	if err := backend.DeleteObject(ctx, "", streamObjKey); err != nil {
+		t.Fatalf("DeleteObject stream.id failed: %v", err)
+	}
+
+	// DeleteVolume must still succeed on partially deleted volume
+	if _, err := server.DeleteVolume(ctx, &pb.DeleteVolumeRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("DeleteVolume failed on partially deleted volume: %v", err)
+	}
+
+	// Calling DeleteVolume again on fully deleted volume must succeed (idempotent)
+	if _, err := server.DeleteVolume(ctx, &pb.DeleteVolumeRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("DeleteVolume second call failed: %v", err)
+	}
+}
+
+func TestLoadFromBackend_FailsOnMissingSnapshot(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(backend)
+
+	volumeID := "test-corrupt-snap-vol"
+
+	// Create file and snapshot
+	_, err := testCreateFile(ctx, server, volumeID, "/data.txt", 0644, []byte("important"), 0, 0)
+	if err != nil {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+	if _, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+	_ = server.Close()
+
+	// Find the snapshot object and delete its underlying file in backend
+	streamID := StreamIDForVolume(volumeID)
+	snaps, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/snapshots/", streamID.String()))
+	if err != nil || len(snaps) == 0 {
+		t.Fatalf("Expected snapshot in backend, got %v (err: %v)", snaps, err)
+	}
+	for _, snapKey := range snaps {
+		if err := backend.DeleteObject(ctx, "", snapKey); err != nil {
+			t.Fatalf("Failed to delete snapshot object: %v", err)
+		}
+	}
+
+	// Open a fresh server instance
+	server2 := NewTestServer(backend)
+	defer func() { _ = server2.Close() }()
+
+	// Volume deletion on this half-deleted volume must succeed cleanly
+	if _, err := server2.DeleteVolume(ctx, &pb.DeleteVolumeRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("DeleteVolume failed on volume with missing snapshot: %v", err)
+	}
+
+	// Confirm objects are gone
+	volObjs, _ := backend.ListObjects(ctx, "", fmt.Sprintf("volumes/%s/", volumeID))
+	if len(volObjs) != 0 {
+		t.Fatalf("Expected 0 volume objects, got %v", volObjs)
+	}
+}

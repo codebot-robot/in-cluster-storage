@@ -87,3 +87,18 @@ func (eb *EventBroadcaster) Broadcast(volumeID string, event *pb.WatchVolumeResp
 		}()
 	}
 }
+
+// HasSubscribers reports whether there are active subscribers watching volumeID.
+func (eb *EventBroadcaster) HasSubscribers(volumeID string) bool {
+	eb.mu.RLock()
+	defer eb.mu.RUnlock()
+	subs, ok := eb.subscribers[volumeID]
+	return ok && len(subs) > 0
+}
+
+// SubscriberCount returns the number of active subscribers watching volumeID.
+func (eb *EventBroadcaster) SubscriberCount(volumeID string) int {
+	eb.mu.RLock()
+	defer eb.mu.RUnlock()
+	return len(eb.subscribers[volumeID])
+}

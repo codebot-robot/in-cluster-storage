@@ -34,7 +34,7 @@ func NewTestServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		return NewServer(backend, opts...)
 	}
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	bt, cleanup := buffertest.Start(ctx, nil, buffertest.WithBackend(backend))
 	walDir, err := os.MkdirTemp("", "controllertest-wal-*")
 	if err != nil {

@@ -148,10 +148,18 @@ type Volume struct {
 	openInodes map[uint64]int
 
 	acceptUnversioned bool
+	snapshotRetention int
 }
 
 // VolumeOption configures a Volume instance.
 type VolumeOption func(*Volume)
+
+// WithVolumeSnapshotRetention sets the number of latest snapshots to retain on the volume.
+func WithVolumeSnapshotRetention(retention int) VolumeOption {
+	return func(v *Volume) {
+		v.snapshotRetention = retention
+	}
+}
 
 // WithAcceptUnversioned configures whether unversioned segments, streams, and snapshots are accepted.
 func WithAcceptUnversioned(accept bool) VolumeOption {
@@ -1395,6 +1403,13 @@ func (v *Volume) commitTxLocked(ctx context.Context, tx *sds.Tx) (uint64, error)
 
 // Close closes the volume, local storage, and any underlying WAL streams.
 func (v *Volume) Close() error {
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return nil
+	}
+	v.mu.Unlock()
+
 	v.stagingMu.Lock()
 	if v.coalesceTimer != nil {
 		v.coalesceTimer.Stop()
@@ -1443,6 +1458,102 @@ func (v *Volume) Close() error {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// RecordDeletion appends a VolumeInfo record with deleted=true to the metadata stream
+// and flushes it to the WAL.
+func (v *Volume) RecordDeletion(ctx context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.closed || v.metadataStream == nil {
+		return nil
+	}
+
+	volInfo := &pb.VolumeInfo{
+		VolumeId: v.volumeID,
+		Deleted:  true,
+	}
+
+	tx := v.beginTxLocked("RecordDeletion")
+	if tx != nil {
+		volInfoKey, err := pkVolumeInfo.Extract(volInfo)
+		if err != nil {
+			return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
+		}
+		v.recordReadLocked(tx, VolumeInfoTypeName, volInfoKey, nil)
+		if _, err := tx.Insert(ctx, volInfo); err != nil {
+			return fmt.Errorf("failed to insert RecordDeletion: %w", err)
+		}
+		if _, err := v.commitTxLocked(ctx, tx); err != nil {
+			return fmt.Errorf("failed to commit RecordDeletion: %w", err)
+		}
+	}
+
+	if v.stream != nil {
+		if err := v.stream.Flush(ctx); err != nil {
+			return fmt.Errorf("failed to flush stream after RecordDeletion: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *Volume) resetToCleanRootLocked(ctx context.Context) error {
+	if v.metadataView != nil {
+		errutil.CloseAndLog(v.metadataView, "metadata view")
+		v.metadataView = nil
+	}
+	if v.localStorageDir != "" {
+		if err := os.RemoveAll(v.localStorageDir); err != nil && !os.IsNotExist(err) {
+			klog.Warningf("Failed to remove local storage dir %s: %v", v.localStorageDir, err)
+		}
+		if err := os.MkdirAll(v.localStorageDir, 0755); err != nil {
+			return fmt.Errorf("failed to recreate local storage dir %s: %w", v.localStorageDir, err)
+		}
+	}
+	if v.indexFactory != nil {
+		newIdx, err := v.indexFactory.NewEmpty(ctx, v.streamID.String(), v.localStorageDir)
+		if err != nil {
+			return err
+		}
+		if err := v.initMetadataViewLocked(ctx, newIdx); err != nil {
+			return err
+		}
+	}
+	rootInodeMsg := &pb.Inode{
+		Ino:       proto.Uint64(1),
+		Mode:      0755 | syscall.S_IFDIR,
+		Mtime:     timestamppb.Now(),
+		IsDir:     true,
+		Nlink:     2,
+		ParentIno: proto.Uint64(1),
+	}
+	keyBytes, valBytes, err := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+	if err != nil {
+		return err
+	}
+	initChanges := []sds.Change{
+		{
+			Seq:      0,
+			TypeName: "objectfs.v1alpha1.Inode",
+			TypeID:   1,
+			Op:       sds.OpCreate,
+			Key:      sds.NewKeyFromBytes(keyBytes),
+			RawKey:   keyBytes,
+			RawVal:   valBytes,
+			Row:      rootInodeMsg,
+		},
+	}
+	if v.metadataView != nil {
+		if err := v.metadataView.ApplyChangesSync(ctx, initChanges); err != nil {
+			return err
+		}
+	}
+	v.rootInodeID = 1
+	v.nextInode = erofs.DefaultInodeStride
+	v.dirParents = make(map[uint64]uint64)
+	v.dirParents[1] = 1
+	return nil
 }
 
 // logMutationLocked appends a mutation record to the WAL stream under v.mu.
@@ -4776,6 +4887,13 @@ func (v *Volume) hasOpenHandlesLocked(inodeID uint64) bool {
 	return v.openInodes != nil && v.openInodes[inodeID] > 0
 }
 
+// HasOpenHandles reports whether any file handles are currently open on this volume.
+func (v *Volume) HasOpenHandles() bool {
+	v.handlesMu.Lock()
+	defer v.handlesMu.Unlock()
+	return len(v.handles) > 0
+}
+
 func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 	if deg := v.Degraded(); deg != nil {
 		return syscall.EIO
@@ -5587,7 +5705,10 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			v.metadataView = nil
 		}
 		restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), remoteSnapKey, v.localStorageDir)
-		if err == nil && restoredIdx != nil {
+		if err != nil {
+			return fmt.Errorf("failed to restore snapshot %s: %w", remoteSnapKey, err)
+		}
+		if restoredIdx != nil {
 			if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
 				return fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
 			}
@@ -5684,8 +5805,17 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				}
 			}
 			if ch.TypeName == VolumeInfoTypeName {
-				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-					v.consistencyMode = vi.GetConsistencyMode()
+				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil {
+					if vi.GetDeleted() {
+						if resetErr := v.resetToCleanRootLocked(ctx); resetErr != nil {
+							return resetErr
+						}
+						highestReplayedIno = 1
+						continue
+					}
+					if vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+						v.consistencyMode = vi.GetConsistencyMode()
+					}
 				}
 			}
 		}
@@ -5697,6 +5827,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	if witnessHead == 0 && (v.stream.ReplicationLevel() == walclient.Local || len(v.stream.RecoveredRecords()) == 0) {
 		targetHead = localHead
 	}
+
 	dec := record.NewDecoder(record.WithDecoderRegistry(v.metadataStream.Registry()))
 
 	// 1. Authoritative tail from stream up to targetHead
@@ -5872,7 +6003,66 @@ func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error
 	}
 	v.snapshotPointers = append(v.snapshotPointers, ptr)
 
+	if v.snapshotRetention > 0 {
+		if _, err := v.pruneSnapshotsLocked(ctx, v.snapshotRetention); err != nil {
+			klog.Warningf("Volume %s: failed to prune snapshots to retention limit %d: %v", v.volumeID, v.snapshotRetention, err)
+		}
+	}
+
 	return snapName, nil
+}
+
+// PruneSnapshots removes older snapshots exceeding keepCount from backend object storage
+// and internal snapshot tracking.
+func (v *Volume) PruneSnapshots(ctx context.Context, keepCount int) (int, error) {
+	v.snapshotMu.Lock()
+	defer v.snapshotMu.Unlock()
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	return v.pruneSnapshotsLocked(ctx, keepCount)
+}
+
+func (v *Volume) pruneSnapshotsLocked(ctx context.Context, keepCount int) (int, error) {
+	if keepCount <= 0 {
+		return 0, nil
+	}
+
+	pointers, err := v.listSnapshotsLocked(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list snapshots for pruning: %w", err)
+	}
+
+	if len(pointers) <= keepCount {
+		return 0, nil
+	}
+
+	numToDelete := len(pointers) - keepCount
+	toDelete := pointers[:numToDelete]
+	deletedLocations := make(map[string]bool)
+
+	for _, p := range toDelete {
+		loc := p.GetLocation()
+		if loc != "" && v.backend != nil {
+			if err := v.backend.DeleteObject(ctx, "", loc); err != nil {
+				klog.Warningf("Volume %s: failed to delete snapshot object %s: %v", v.volumeID, loc, err)
+			}
+		}
+		if loc != "" {
+			deletedLocations[loc] = true
+		}
+	}
+
+	filtered := make([]*sdsv1.SnapshotPointer, 0, len(v.snapshotPointers))
+	for _, ptr := range v.snapshotPointers {
+		if !deletedLocations[ptr.GetLocation()] {
+			filtered = append(filtered, ptr)
+		}
+	}
+	v.snapshotPointers = filtered
+
+	return numToDelete, nil
 }
 
 // ListSnapshots returns all snapshot pointers for this volume sorted chronologically / by position.

@@ -69,6 +69,7 @@ var (
 	controllerSyncTimeout     = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
 	openBarrierTimeout        = flag.Duration("open-barrier-timeout", 5*time.Second, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
+	snapshotRetention         = flag.Int("snapshot-retention", 0, "Number of snapshots to retain per volume (0 to retain all, or delete all on volume deletion)")
 )
 
 func evaluateLeafExpiry(cert *x509.Certificate, now time.Time) {
@@ -187,6 +188,9 @@ func main() {
 	}
 	if *acceptUnversionedSegments {
 		serverOpts = append(serverOpts, controller.WithServerAcceptUnversioned(true))
+	}
+	if *snapshotRetention > 0 {
+		serverOpts = append(serverOpts, controller.WithServerSnapshotRetention(*snapshotRetention))
 	}
 	if *walDir == "" {
 		klog.Fatalf("invalid configuration: --wal-dir is required")

@@ -122,9 +122,11 @@ func (c *CSIController) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeR
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
 
-	c.server.mu.Lock()
-	delete(c.server.volumes, req.GetVolumeId())
-	c.server.mu.Unlock()
+	if _, err := c.server.DeleteVolume(ctx, &pb.DeleteVolumeRequest{
+		VolumeId: req.GetVolumeId(),
+	}); err != nil {
+		return nil, err
+	}
 
 	return &csi.DeleteVolumeResponse{}, nil
 }

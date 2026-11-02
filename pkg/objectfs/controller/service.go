@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -35,6 +36,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
@@ -170,6 +172,9 @@ type Server struct {
 	exclusiveHoldsMu  sync.RWMutex
 	exclusiveHolds    map[string]*ExclusiveHold
 	exclusiveLeaseTTL time.Duration
+
+	snapshotRetention int
+	deletingVolumes   map[string]struct{}
 }
 
 // ExclusiveHold tracks an active exclusive-local hold on a volume.
@@ -330,6 +335,13 @@ func WithServerSyncCoalesceWindow(d time.Duration) ServerOption {
 	}
 }
 
+// WithServerSnapshotRetention sets the default number of snapshots to retain per volume.
+func WithServerSnapshotRetention(retention int) ServerOption {
+	return func(s *Server) {
+		s.snapshotRetention = retention
+	}
+}
+
 // WithServerMaxStagingBytes sets the maximum byte bound for in-memory staged writes across all volumes.
 func WithServerMaxStagingBytes(b int64) ServerOption {
 	return func(s *Server) {
@@ -406,6 +418,7 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		exclusiveLeaseTTL: 30 * time.Second,
 		syncTimeout:       10 * time.Minute,
 		defaultDurability: walclient.Local,
+		deletingVolumes:   make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -469,9 +482,16 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, deleting := s.deletingVolumes[volumeID]; deleting {
+		return nil, status.Errorf(codes.Aborted, "volume %s is currently being deleted", volumeID)
+	}
+
 	vol, ok := s.volumes[volumeID]
 	if !ok {
 		var volOpts []VolumeOption
+		if s.snapshotRetention > 0 {
+			volOpts = append(volOpts, WithVolumeSnapshotRetention(s.snapshotRetention))
+		}
 		stream, err := s.openStreamForVolume(volumeID, s.walDir)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open stream for volume %s: %w", volumeID, err)
@@ -1707,4 +1727,231 @@ func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) 
 		OldPath:      oldPath,
 		NewWatermark: witnessWatermark,
 	}, nil
+}
+
+// IsVolumePublished reports whether volumeID is currently published (has an active exclusive-local hold
+// or active watchers/subscribers).
+func (s *Server) IsVolumePublished(volumeID string) bool {
+	s.exclusiveHoldsMu.RLock()
+	hold, hasHold := s.exclusiveHolds[volumeID]
+	if hasHold && time.Now().Before(hold.LeaseExpiry) {
+		s.exclusiveHoldsMu.RUnlock()
+		return true
+	}
+	s.exclusiveHoldsMu.RUnlock()
+
+	if s.broadcaster != nil && s.broadcaster.HasSubscribers(volumeID) {
+		return true
+	}
+
+	return false
+}
+
+// DeleteVolume deletes a volume, removing its snapshots, per-volume metadata objects,
+// and local controller state. It refuses deletion if the volume is published anywhere.
+func (s *Server) DeleteVolume(ctx context.Context, req *pb.DeleteVolumeRequest) (*pb.DeleteVolumeResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+
+	volumeID := req.GetVolumeId()
+	if !isValidVolumeID(volumeID) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", volumeID)
+	}
+
+	// 1. Refuse if published anywhere
+	if s.IsVolumePublished(volumeID) {
+		return nil, status.Errorf(codes.FailedPrecondition, "volume %s cannot be deleted: volume is currently published/in-use", volumeID)
+	}
+
+	s.mu.Lock()
+	if _, deleting := s.deletingVolumes[volumeID]; deleting {
+		s.mu.Unlock()
+		return nil, status.Errorf(codes.Aborted, "volume %s is currently being deleted", volumeID)
+	}
+	s.deletingVolumes[volumeID] = struct{}{}
+	vol, loaded := s.volumes[volumeID]
+	if loaded {
+		delete(s.volumes, volumeID)
+	}
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.deletingVolumes, volumeID)
+		s.mu.Unlock()
+	}()
+
+	var firstErr error
+
+	// 2. Record deletion in stream and close in-memory volume if loaded
+	var localDir string
+	if loaded && vol != nil {
+		localDir = vol.localStorageDir
+		if err := vol.RecordDeletion(ctx); err != nil {
+			klog.Warningf("Volume %s: failed to record deletion: %v", volumeID, err)
+		}
+		if err := vol.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	} else if s.walClient != nil || s.streamFactory != nil {
+		if stm, err := s.openStreamForVolume(volumeID, s.walDir); err == nil && stm != nil {
+			appender := sds.NewWALAppender(stm, walclient.Local)
+			w := sds.NewWriter(appender)
+			if _, rErr := w.RegisterType(&pb.VolumeInfo{}, 1); rErr != nil {
+				klog.Warningf("Volume %s: failed to register VolumeInfo: %v", volumeID, rErr)
+			} else {
+				tx := w.Begin()
+				volInfoKey, kErr := pkVolumeInfo.Extract(&pb.VolumeInfo{VolumeId: volumeID, Deleted: true})
+				if kErr != nil {
+					klog.Warningf("Volume %s: failed to extract key: %v", volumeID, kErr)
+				} else {
+					tx.RecordRead(VolumeInfoTypeName, volInfoKey, nil)
+					if _, iErr := tx.Insert(ctx, &pb.VolumeInfo{VolumeId: volumeID, Deleted: true}); iErr != nil {
+						klog.Warningf("Volume %s: failed to insert: %v", volumeID, iErr)
+					} else {
+						if _, cErr := tx.Commit(ctx); cErr != nil {
+							klog.Warningf("Volume %s: failed to commit: %v", volumeID, cErr)
+						}
+					}
+					if fErr := stm.Flush(ctx); fErr != nil {
+						klog.Warningf("Volume %s: failed to flush: %v", volumeID, fErr)
+					}
+				}
+			}
+			errutil.CloseAndLog(stm, "wal stream")
+		}
+	}
+
+	// 3. Clean up local directories
+	if localDir != "" {
+		if err := os.RemoveAll(localDir); err != nil && !os.IsNotExist(err) {
+			klog.Warningf("Failed to remove local dir %s for volume %s: %v", localDir, volumeID, err)
+		}
+	}
+	if s.metadataDir != "" {
+		volMetaDir := filepath.Join(s.metadataDir, volumeID)
+		if err := os.RemoveAll(volMetaDir); err != nil && !os.IsNotExist(err) {
+			klog.Warningf("Failed to remove metadata dir %s for volume %s: %v", volMetaDir, volumeID, err)
+		}
+	}
+
+	// 4. Clean up local WAL segment files for this stream
+	streamID := StreamIDForVolume(volumeID)
+	if s.walDir != "" {
+		cleanLocalStreamFiles(s.walDir, streamID)
+	}
+
+	// 5. Discover and delete snapshots according to retention policy
+	retention := s.snapshotRetention
+	if req.Retention != nil {
+		retention = int(req.GetRetention())
+	}
+	if retention < 0 {
+		retention = 0
+	}
+
+	if s.backend != nil {
+		snapPrefix := fmt.Sprintf("streams/%s/snapshots/", streamID.String())
+		snapKeys, err := s.backend.ListObjects(ctx, "", snapPrefix)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to list snapshots from backend: %v", err)
+		}
+
+		volSnapPrefix := fmt.Sprintf("volumes/%s/snapshots/", volumeID)
+		volSnapKeys, err := s.backend.ListObjects(ctx, "", volSnapPrefix)
+		if err != nil {
+			klog.Warningf("Failed to list volume snapshots for volume %s: %v", volumeID, err)
+		}
+
+		allSnapKeysMap := make(map[string]bool)
+		for _, k := range snapKeys {
+			allSnapKeysMap[k] = true
+		}
+		for _, k := range volSnapKeys {
+			allSnapKeysMap[k] = true
+		}
+
+		var allSnaps []string
+		for k := range allSnapKeysMap {
+			allSnaps = append(allSnaps, k)
+		}
+
+		// Sort chronologically by position
+		sort.Slice(allSnaps, func(i, j int) bool {
+			posI := parseSnapshotPosition(allSnaps[i])
+			posJ := parseSnapshotPosition(allSnaps[j])
+			if posI != posJ {
+				return posI < posJ
+			}
+			return allSnaps[i] < allSnaps[j]
+		})
+
+		var snapsToDelete []string
+		if retention > 0 && len(allSnaps) > retention {
+			snapsToDelete = allSnaps[:len(allSnaps)-retention]
+		} else if retention <= 0 {
+			snapsToDelete = allSnaps
+		}
+
+		for _, snapKey := range snapsToDelete {
+			if err := s.backend.DeleteObject(ctx, "", snapKey); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to delete snapshot %q from backend: %v", snapKey, err)
+			}
+		}
+
+		// 6. Delete volume metadata objects (volumes/<id>/...)
+		volPrefix := fmt.Sprintf("volumes/%s/", volumeID)
+		volObjects, err := s.backend.ListObjects(ctx, "", volPrefix)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to list volume objects from backend: %v", err)
+		}
+		for _, objKey := range volObjects {
+			if err := s.backend.DeleteObject(ctx, "", objKey); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to delete volume object %q from backend: %v", objKey, err)
+			}
+		}
+
+		// Also delete volumes/<id> exact key if any
+		if err := s.backend.DeleteObject(ctx, "", fmt.Sprintf("volumes/%s", volumeID)); err != nil {
+			klog.V(4).Infof("DeleteObject root volume object for %s: %v", volumeID, err)
+		}
+	}
+
+	if firstErr != nil {
+		return nil, status.Errorf(codes.Internal, "volume closed with error: %v", firstErr)
+	}
+
+	return &pb.DeleteVolumeResponse{}, nil
+}
+
+func parseSnapshotPosition(key string) uint64 {
+	base := filepath.Base(key)
+	ext := filepath.Ext(base)
+	posStr := strings.TrimSuffix(base, ext)
+	pos, err := strconv.ParseUint(posStr, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return pos
+}
+
+func cleanLocalStreamFiles(walDir string, streamID uuid.UUID) {
+	if walDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		return
+	}
+	prefixDash := fmt.Sprintf("stream-%s-", streamID.String())
+	prefixDot := fmt.Sprintf("stream-%s.", streamID.String())
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, prefixDash) || strings.HasPrefix(name, prefixDot) {
+			if err := os.RemoveAll(filepath.Join(walDir, name)); err != nil && !os.IsNotExist(err) {
+				klog.Warningf("Failed to remove WAL file %s: %v", name, err)
+			}
+		}
+	}
 }
