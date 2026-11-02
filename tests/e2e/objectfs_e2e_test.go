@@ -2355,6 +2355,127 @@ spec:
 	t.Logf("Successfully verified ObjectFS controller crash mid-write data integrity across restarts and node failovers!")
 }
 
+func TestObjectFSControllerKillWithStagedDataE2E(t *testing.T) {
+	requireE2EGroup(t, "chaos")
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t)
+	volumeID := "kill-staged-data-vol"
+
+	writerPodName := "kill-staged-writer-pod"
+	writerPodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, writerPodName, node1, volumeID)
+
+	t.Logf("Creating writer pod on %s", node1)
+	h.KubectlApplyContent(writerPodName, writerPodYaml)
+	if err := h.WaitForPodReady(writerPodName, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Writer pod failed to start: %v", err)
+	}
+
+	t.Cleanup(func() {
+		h.DeletePod(writerPodName, "default")
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+		}
+	})
+
+	// Step 1: Write data in the writer pod that gets pushed to controller staging.
+	// We write a known payload and close it, so dirty chunks are pushed to controller staging
+	// (within the coalesce window before the background sync commits to object storage).
+	t.Logf("Writing staged data in writer pod")
+	expectedContent := "durable staged data surviving controller kill and epoch bump"
+	cmd := fmt.Sprintf("echo -n %q > /data/staged.txt", expectedContent)
+	if _, err := h.RunInPod(writerPodName, "default", "/bin/sh", "-c", cmd); err != nil {
+		t.Fatalf("Failed to write staged.txt: %v", err)
+	}
+
+	// Step 2: Force-kill the controller pod while data is staged.
+	// On restart, the controller deletes all open scratch packs and bumps the staging epoch.
+	// The writer node daemon detects the epoch bump on reconnect/sync and re-pushes dirty chunks.
+	t.Logf("Force-killing objectfs-controller-0")
+	h.RunCommand("kubectl", "delete", "pod", "objectfs-controller-0", "-n", "default", "--force", "--grace-period=0")
+
+	// Wait for controller to recover
+	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
+		t.Fatalf("Controller failed to recover: %v", err)
+	}
+
+	// Create a reader pod on node2 to verify visibility after daemon re-push and sync
+	readerPodName := "kill-staged-reader-pod"
+	readerPodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, readerPodName, node2, volumeID)
+
+	t.Logf("Creating reader pod on %s to verify data visibility after recovery", node2)
+	h.KubectlApplyContent(readerPodName, readerPodYaml)
+	if err := h.WaitForPodReady(readerPodName, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Reader pod failed to start: %v", err)
+	}
+	t.Cleanup(func() {
+		h.DeletePod(readerPodName, "default")
+	})
+
+	// Poll until the data is visible and matches golden content
+	t.Logf("Waiting for staged data to be visible in reader pod")
+	deadline := time.Now().Add(60 * time.Second)
+	var lastContent string
+	var lastErr error
+	recovered := false
+	for time.Now().Before(deadline) {
+		out, err := h.RunInPod(readerPodName, "default", "cat", "/data/staged.txt")
+		if err == nil && strings.TrimSpace(out) == expectedContent {
+			recovered = true
+			break
+		}
+		lastContent = strings.TrimSpace(out)
+		lastErr = err
+		time.Sleep(1 * time.Second)
+	}
+
+	if !recovered {
+		t.Fatalf("Staged data not visible: err=%v, content=%q, expected=%q", lastErr, lastContent, expectedContent)
+	}
+	t.Logf("Successfully verified staged data visibility after controller kill and daemon re-push sync!")
+}
+
 func TestObjectFSControllerOutageE2E(t *testing.T) {
 	requireE2EGroup(t, "chaos")
 
