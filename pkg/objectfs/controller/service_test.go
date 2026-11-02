@@ -304,6 +304,10 @@ func MustNewVolume(t testing.TB, volumeID string, backend ObjectStorageBackend, 
 			localDir = testVol.localStorageDir
 		}
 	}
+	if localDir == "" {
+		localDir = t.TempDir()
+		opts = append([]VolumeOption{WithLocalStorageDir(localDir)}, opts...)
+	}
 	if !hasStream {
 		var walDir string
 		var bt *buffertest.BufferTest

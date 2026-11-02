@@ -101,6 +101,7 @@ func TestRegression_RootInodeInitFailure(t *testing.T) {
 	vol, err := NewVolume("test-vol-root-fail", nil, NewEventBroadcaster(),
 		WithStream(openTestStream(t, "test-vol-root-fail")),
 		WithIndexFactory(factory),
+		WithLocalStorageDir(t.TempDir()),
 	)
 	if err == nil {
 		if vol != nil {
@@ -114,6 +115,7 @@ func TestRegression_RootInodeInitFailure(t *testing.T) {
 	volSuccess, err := NewVolume("test-vol-root-reload", nil, NewEventBroadcaster(),
 		WithStream(openTestStream(t, "test-vol-root-reload")),
 		WithIndexFactory(factory),
+		WithLocalStorageDir(t.TempDir()),
 	)
 	if err != nil {
 		t.Fatalf("expected NewVolume to succeed when failApply is false, got: %v", err)

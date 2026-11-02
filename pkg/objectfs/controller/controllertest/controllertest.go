@@ -30,7 +30,15 @@ import (
 // skipping per-record WAL fsync.
 func NewTestServer(backend controller.ObjectStorageBackend, opts ...controller.ServerOption) *controller.Server {
 	if target := controller.InspectServerTarget(opts...); target != "" {
-		opts = append([]controller.ServerOption{controller.WithServerWithoutFsync()}, opts...)
+		metaDir, err := os.MkdirTemp("", "controllertest-meta-*")
+		if err != nil {
+			panic(err)
+		}
+		opts = append([]controller.ServerOption{
+			controller.WithServerWithoutFsync(),
+			controller.WithServerMetadataDir(metaDir),
+			controller.WithServerTempWALDir(metaDir),
+		}, opts...)
 		return controller.NewServer(backend, opts...)
 	}
 
@@ -40,10 +48,17 @@ func NewTestServer(backend controller.ObjectStorageBackend, opts ...controller.S
 	if err != nil {
 		panic(err)
 	}
+	metaDir, err := os.MkdirTemp("", "controllertest-meta-*")
+	if err != nil {
+		panic(err)
+	}
 	combinedCleanup := func() {
 		cleanup()
 		if err := os.RemoveAll(walDir); err != nil {
 			klog.V(4).Infof("controllertest: remove walDir %s: %v", walDir, err)
+		}
+		if err := os.RemoveAll(metaDir); err != nil {
+			klog.V(4).Infof("controllertest: remove metaDir %s: %v", metaDir, err)
 		}
 	}
 
@@ -52,6 +67,7 @@ func NewTestServer(backend controller.ObjectStorageBackend, opts ...controller.S
 		controller.WithServerWALClient(bt.Client),
 		controller.WithServerWALDialOptions(bt.DialOpts...),
 		controller.WithServerWithoutFsync(),
+		controller.WithServerMetadataDir(metaDir),
 		controller.WithServerTestCleanup(combinedCleanup),
 	}
 	testOpts = append(testOpts, opts...)

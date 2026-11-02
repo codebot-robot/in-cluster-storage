@@ -66,6 +66,7 @@ var (
 	debugStatsCheck           = flag.Bool("debug-stats-check", false, "Enable debug volume stats checking (for test/CI gates)")
 	syncCoalesceWindow        = flag.Duration("sync-coalesce-window", 1*time.Second, "Coalescing window for non-blocking sync requests")
 	maxStagingBytes           = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
+	stagingMaxBytes           = flag.Int64("staging-max-bytes", 4*1024*1024*1024, "Maximum controller-wide staged bytes on local disk before triggering sync (default 4 GiB)")
 	controllerSyncTimeout     = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
 	openBarrierTimeout        = flag.Duration("open-barrier-timeout", 5*time.Second, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
@@ -139,6 +140,9 @@ func main() {
 	if *backendFlag == "" {
 		klog.Fatalf("missing required flag: --backend (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
 	}
+	if *metadataDir == "" {
+		klog.Fatalf("missing required flag: --metadata-dir (local directory required for persistent metadata and write staging)")
+	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
@@ -178,6 +182,9 @@ func main() {
 	}
 	if *maxStagingBytes > 0 {
 		serverOpts = append(serverOpts, controller.WithServerMaxStagingBytes(*maxStagingBytes))
+	}
+	if *stagingMaxBytes > 0 {
+		serverOpts = append(serverOpts, controller.WithServerStagingMaxBytes(*stagingMaxBytes))
 	}
 	if *controllerSyncTimeout > 0 {
 		serverOpts = append(serverOpts, controller.WithServerSyncTimeout(*controllerSyncTimeout))

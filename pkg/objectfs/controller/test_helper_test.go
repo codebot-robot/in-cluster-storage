@@ -30,7 +30,15 @@ import (
 // The production controller binary uses NewServer, which always retains per-record fsync.
 func NewTestServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if target := InspectServerTarget(opts...); target != "" {
-		opts = append([]ServerOption{WithServerWithoutFsync()}, opts...)
+		metaDir, err := os.MkdirTemp("", "controllertest-meta-*")
+		if err != nil {
+			panic(err)
+		}
+		opts = append([]ServerOption{
+			WithServerWithoutFsync(),
+			WithServerMetadataDir(metaDir),
+			WithServerTempWALDir(metaDir),
+		}, opts...)
 		return NewServer(backend, opts...)
 	}
 
@@ -40,10 +48,17 @@ func NewTestServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if err != nil {
 		panic(err)
 	}
+	metaDir, err := os.MkdirTemp("", "controllertest-meta-*")
+	if err != nil {
+		panic(err)
+	}
 	combinedCleanup := func() {
 		cleanup()
 		if err := os.RemoveAll(walDir); err != nil {
 			klog.V(4).Infof("failed to remove test walDir %s: %v", walDir, err)
+		}
+		if err := os.RemoveAll(metaDir); err != nil {
+			klog.V(4).Infof("failed to remove test metaDir %s: %v", metaDir, err)
 		}
 	}
 
@@ -52,6 +67,7 @@ func NewTestServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		WithServerWALClient(bt.Client),
 		WithServerWALDialOptions(bt.DialOpts...),
 		WithServerWithoutFsync(),
+		WithServerMetadataDir(metaDir),
 		WithServerTestCleanup(combinedCleanup),
 	}
 	testOpts = append(testOpts, opts...)

@@ -156,6 +156,8 @@ type Server struct {
 	streamFactory            func(volumeID string) (walclient.Stream, error)
 	syncCoalesceWindow       time.Duration
 	maxStagingBytes          int64
+	stagingMaxBytes          int64
+	stagingBudget            *StagingBudget
 	syncTimeout              time.Duration
 	openBarrierTimeout       time.Duration
 	acceptUnversioned        bool
@@ -170,6 +172,21 @@ type Server struct {
 	exclusiveHoldsMu  sync.RWMutex
 	exclusiveHolds    map[string]*ExclusiveHold
 	exclusiveLeaseTTL time.Duration
+}
+
+// StagingBudget tracks controller-wide staged bytes on local disk across all volumes.
+type StagingBudget struct {
+	mu           sync.Mutex
+	cond         *sync.Cond
+	maxBytes     int64
+	currentBytes int64
+	syncTrigger  func(ctx context.Context, neededBytes int64) error
+}
+
+func NewStagingBudget(maxBytes int64) *StagingBudget {
+	sb := &StagingBudget{maxBytes: maxBytes}
+	sb.cond = sync.NewCond(&sb.mu)
+	return sb
 }
 
 // ExclusiveHold tracks an active exclusive-local hold on a volume.
@@ -337,6 +354,18 @@ func WithServerMaxStagingBytes(b int64) ServerOption {
 	}
 }
 
+// WithServerStagingMaxBytes sets the controller-wide staging byte cap before triggering sync.
+func WithServerStagingMaxBytes(maxBytes int64) ServerOption {
+	return func(s *Server) {
+		s.stagingMaxBytes = maxBytes
+		if s.stagingBudget != nil {
+			s.stagingBudget.mu.Lock()
+			s.stagingBudget.maxBytes = maxBytes
+			s.stagingBudget.mu.Unlock()
+		}
+	}
+}
+
 // WithServerSyncTimeout sets the timeout duration for coalesced background sync operations.
 func WithServerSyncTimeout(d time.Duration) ServerOption {
 	return func(s *Server) {
@@ -406,9 +435,34 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		exclusiveLeaseTTL: 30 * time.Second,
 		syncTimeout:       10 * time.Minute,
 		defaultDurability: walclient.Local,
+		maxStagingBytes:   64 * 1024 * 1024,
+		stagingMaxBytes:   4 * 1024 * 1024 * 1024,
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	s.stagingBudget = NewStagingBudget(s.stagingMaxBytes)
+	s.stagingBudget.syncTrigger = func(ctx context.Context, neededBytes int64) error {
+		s.mu.RLock()
+		var topVol *Volume
+		var maxStaged int64
+		for _, v := range s.volumes {
+			staged := v.StagedBytesOnDisk()
+			if staged > maxStaged {
+				maxStaged = staged
+				topVol = v
+			}
+		}
+		s.mu.RUnlock()
+
+		if topVol != nil && maxStaged > 0 {
+			syncCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+			defer cancel()
+			if err := topVol.Fsync(syncCtx, 0); err != nil {
+				return fmt.Errorf("staging budget sync failed on volume %s: %w", topVol.volumeID, err)
+			}
+		}
+		return nil
 	}
 	if s.walClient != nil {
 		// Existing WAL client provided by test constructor
@@ -525,6 +579,12 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		}
 		if s.acceptUnversioned {
 			volOpts = append(volOpts, WithAcceptUnversioned(true))
+		}
+		if s.stagingBudget != nil {
+			volOpts = append(volOpts, WithSharedStagingBudget(s.stagingBudget))
+		}
+		if s.localStorageDir != "" {
+			volOpts = append(volOpts, WithVolumeStagingDir(filepath.Join(s.localStorageDir, "staging", volumeID)))
 		}
 
 		vol, err = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
