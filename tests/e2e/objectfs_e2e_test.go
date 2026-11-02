@@ -993,44 +993,7 @@ func TestObjectFSVolumeDeleteE2E(t *testing.T) {
 
 	h, ns := setupSharedObjectFSCluster(t)
 	volumeID := fmt.Sprintf("delete-e2e-vol-%s", ns)
-
-	// Step 0: Create admin client pod with admin certificates mounted for mTLS
-	adminClientPod := "objectfs-admin-delete-pod"
-	adminClientYaml := fmt.Sprintf(`
-apiVersion: v1
-kind: Pod
-metadata:
-  name: %s
-  namespace: default
-  labels:
-    app: objectfs-admin
-spec:
-  containers:
-    - name: client
-      image: objectfs-controller:e2e
-      imagePullPolicy: Never
-      command: ["/bin/sh", "-c", "sleep 3600"]
-      volumeMounts:
-        - name: admin-certs
-          mountPath: /etc/objectfs/client
-  volumes:
-    - name: admin-certs
-      secret:
-        secretName: objectfs-admin-client
-        items:
-          - key: tls.key
-            path: tls.key
-          - key: tls.crt
-            path: tls.crt
-          - key: ca.crt
-            path: trust/ca.crt
-`, adminClientPod)
-
-	h.KubectlApplyContent(adminClientPod, adminClientYaml)
-	if err := h.WaitForPodReady(adminClientPod, "default", 1*time.Minute); err != nil {
-		t.Fatalf("admin client pod failed to start: %v", err)
-	}
-	defer h.DeletePod(adminClientPod, "default")
+	adminClientPod := "objectfs-admin-pod"
 
 	// Step 1: Create Pod 1 and write data
 	pod1Name := "delete-e2e-pod-1"
