@@ -994,6 +994,44 @@ func TestObjectFSVolumeDeleteE2E(t *testing.T) {
 	h, ns := setupSharedObjectFSCluster(t)
 	volumeID := fmt.Sprintf("delete-e2e-vol-%s", ns)
 
+	// Step 0: Create admin client pod with admin certificates mounted for mTLS
+	adminClientPod := "objectfs-admin-delete-pod"
+	adminClientYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: default
+  labels:
+    app: objectfs-admin
+spec:
+  containers:
+    - name: client
+      image: objectfs-controller:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: admin-certs
+          mountPath: /etc/objectfs/client
+  volumes:
+    - name: admin-certs
+      secret:
+        secretName: objectfs-admin-client
+        items:
+          - key: tls.key
+            path: tls.key
+          - key: tls.crt
+            path: tls.crt
+          - key: ca.crt
+            path: trust/ca.crt
+`, adminClientPod)
+
+	h.KubectlApplyContent(adminClientPod, adminClientYaml)
+	if err := h.WaitForPodReady(adminClientPod, "default", 1*time.Minute); err != nil {
+		t.Fatalf("admin client pod failed to start: %v", err)
+	}
+	defer h.DeletePod(adminClientPod, "default")
+
 	// Step 1: Create Pod 1 and write data
 	pod1Name := "delete-e2e-pod-1"
 	pod1Yaml := fmt.Sprintf(`
@@ -1025,18 +1063,18 @@ spec:
 		t.Fatalf("Pod 1 failed to start: %v", err)
 	}
 
-	// Step 2: Create snapshot via objectfsctl
-	snapCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "snapshots", "create", volumeID)
-	if out, err := snapCmd.CombinedOutput(); err != nil {
-		t.Fatalf("snapshots create failed: %v, out: %s", err, string(out))
+	// Step 2: Create snapshot via objectfsctl from admin client pod
+	snapOut, snapErr := h.RunInPod(adminClientPod, "default", "objectfsctl", "--server", "objectfs-controller:50051", "snapshots", "create", volumeID)
+	if snapErr != nil {
+		t.Fatalf("snapshots create failed: %v, out: %s", snapErr, snapOut)
 	}
 
 	// Step 3: Attempt DeleteVolume while Pod 1 is running; must be refused because published
-	delFailCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "volumes", "delete", volumeID)
-	if out, err := delFailCmd.CombinedOutput(); err == nil {
-		t.Fatalf("Expected volumes delete to fail while volume is published, but it succeeded: %s", string(out))
-	} else if !strings.Contains(string(out), "published") && !strings.Contains(string(out), "FailedPrecondition") {
-		t.Fatalf("Expected error indicating volume is published, got: %s", string(out))
+	delFailOut, delFailErr := h.RunInPod(adminClientPod, "default", "objectfsctl", "--server", "objectfs-controller:50051", "volumes", "delete", volumeID)
+	if delFailErr == nil {
+		t.Fatalf("Expected volumes delete to fail while volume is published, but it succeeded: %s", delFailOut)
+	} else if !strings.Contains(delFailOut, "published") && !strings.Contains(fmt.Sprintf("%v", delFailErr), "FailedPrecondition") {
+		t.Fatalf("Expected error indicating volume is published, got: %v (out: %s)", delFailErr, delFailOut)
 	}
 
 	// Step 4: Delete Pod 1 and wait for unmount
@@ -1045,20 +1083,19 @@ spec:
 	time.Sleep(3 * time.Second)
 
 	// Step 5: DeleteVolume must now succeed
-	t.Logf("Deleting volume %s via objectfsctl", volumeID)
-	delCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "volumes", "delete", volumeID)
-	if out, err := delCmd.CombinedOutput(); err != nil {
-		t.Fatalf("volumes delete failed after unpublish: %v, out: %s", err, string(out))
+	t.Logf("Deleting volume %s via objectfsctl from admin client pod", volumeID)
+	delOut, delErr := h.RunInPod(adminClientPod, "default", "objectfsctl", "--server", "objectfs-controller:50051", "volumes", "delete", volumeID)
+	if delErr != nil {
+		t.Fatalf("volumes delete failed after unpublish: %v, out: %s", delErr, delOut)
 	}
 
 	// Step 6: Confirm volume is gone from volumes list
-	listCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "volumes", "list")
-	outList, err := listCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("volumes list failed: %v", err)
+	listOut, listErr := h.RunInPod(adminClientPod, "default", "objectfsctl", "--server", "objectfs-controller:50051", "volumes", "list")
+	if listErr != nil {
+		t.Fatalf("volumes list failed: %v, out: %s", listErr, listOut)
 	}
-	if strings.Contains(string(outList), volumeID) {
-		t.Fatalf("volumes list still contains deleted volume %s: %s", volumeID, string(outList))
+	if strings.Contains(listOut, volumeID) {
+		t.Fatalf("volumes list still contains deleted volume %s: %s", volumeID, listOut)
 	}
 
 	// Step 7: Re-create volume in Pod 2 with same volumeID; confirm volume is empty
