@@ -257,8 +257,56 @@ func newVolumesCommand(opts *options) *cobra.Command {
 	volumesCmd.AddCommand(newVolumesListCommand(opts))
 	volumesCmd.AddCommand(newVolumesDescribeCommand(opts))
 	volumesCmd.AddCommand(newVolumesRepairCommand(opts))
+	volumesCmd.AddCommand(newVolumesDeleteCommand(opts))
 
 	return volumesCmd
+}
+
+type volumesDeleteOptions struct {
+	*options
+	retention int32
+}
+
+func newVolumesDeleteCommand(opts *options) *cobra.Command {
+	deleteOpts := &volumesDeleteOptions{options: opts, retention: -1}
+	cmd := &cobra.Command{
+		Use:     "delete <volume>",
+		Aliases: []string{"del", "rm"},
+		Short:   "Delete a volume and its snapshots/metadata from the store",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if deleteOpts.serverAddr == "" {
+				return fmt.Errorf("--server is required")
+			}
+
+			volumeID := args[0]
+			client, conn, err := dialServer(deleteOpts.options)
+			if err != nil {
+				return err
+			}
+			defer errutil.CloseAndLog(conn, "server connection")
+
+			req := &pb.DeleteVolumeRequest{
+				VolumeId: volumeID,
+			}
+			if cmd.Flags().Changed("retention") {
+				req.Retention = &deleteOpts.retention
+			}
+
+			_, err = client.DeleteVolume(cmd.Context(), req)
+			if err != nil {
+				return fmt.Errorf("failed to delete volume %s: %w", volumeID, err)
+			}
+
+			out := cmd.OutOrStdout()
+			if _, err := fmt.Fprintf(out, "Deleted volume %s\n", volumeID); err != nil {
+				return fmt.Errorf("failed writing to output: %w", err)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().Int32Var(&deleteOpts.retention, "retention", -1, "Number of snapshots to retain (default: uses controller setting, 0 to delete all)")
+	return cmd
 }
 
 func newVolumesDescribeCommand(opts *options) *cobra.Command {

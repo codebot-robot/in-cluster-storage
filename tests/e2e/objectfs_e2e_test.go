@@ -988,6 +988,122 @@ spec:
 	t.Logf("Successfully verified ObjectFS persistent deployment with S3 backend, WAL buffer, and restart recovery!")
 }
 
+func TestObjectFSVolumeDeleteE2E(t *testing.T) {
+	requireE2EGroup(t, "core")
+
+	h, ns := setupSharedObjectFSCluster(t)
+	volumeID := fmt.Sprintf("delete-e2e-vol-%s", ns)
+
+	// Step 1: Create Pod 1 and write data
+	pod1Name := "delete-e2e-pod-1"
+	pod1Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "echo 'hello-delete-e2e' > /data/file1.txt && sync && sleep 300"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod1Name, ns, volumeID)
+
+	t.Logf("Creating Pod 1 to populate volume %s in namespace %s", volumeID, ns)
+	h.KubectlApplyContent(pod1Name, pod1Yaml)
+	if err := h.WaitForPodReady(pod1Name, ns, 1*time.Minute); err != nil {
+		t.Fatalf("Pod 1 failed to start: %v", err)
+	}
+
+	// Step 2: Create snapshot via objectfsctl
+	snapCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "snapshots", "create", volumeID)
+	if out, err := snapCmd.CombinedOutput(); err != nil {
+		t.Fatalf("snapshots create failed: %v, out: %s", err, string(out))
+	}
+
+	// Step 3: Attempt DeleteVolume while Pod 1 is running; must be refused because published
+	delFailCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "volumes", "delete", volumeID)
+	if out, err := delFailCmd.CombinedOutput(); err == nil {
+		t.Fatalf("Expected volumes delete to fail while volume is published, but it succeeded: %s", string(out))
+	} else if !strings.Contains(string(out), "published") && !strings.Contains(string(out), "FailedPrecondition") {
+		t.Fatalf("Expected error indicating volume is published, got: %s", string(out))
+	}
+
+	// Step 4: Delete Pod 1 and wait for unmount
+	t.Logf("Deleting Pod 1 to unpublish volume %s", volumeID)
+	h.DeletePod(pod1Name, ns)
+	time.Sleep(3 * time.Second)
+
+	// Step 5: DeleteVolume must now succeed
+	t.Logf("Deleting volume %s via objectfsctl", volumeID)
+	delCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "volumes", "delete", volumeID)
+	if out, err := delCmd.CombinedOutput(); err != nil {
+		t.Fatalf("volumes delete failed after unpublish: %v, out: %s", err, string(out))
+	}
+
+	// Step 6: Confirm volume is gone from volumes list
+	listCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "volumes", "list")
+	outList, err := listCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("volumes list failed: %v", err)
+	}
+	if strings.Contains(string(outList), volumeID) {
+		t.Fatalf("volumes list still contains deleted volume %s: %s", volumeID, string(outList))
+	}
+
+	// Step 7: Re-create volume in Pod 2 with same volumeID; confirm volume is empty
+	pod2Name := "delete-e2e-pod-2"
+	pod2Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "ls -A /data > /tmp/ls.txt && sleep 300"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: objectfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod2Name, ns, volumeID)
+
+	t.Logf("Creating Pod 2 to verify re-created volume is empty")
+	h.KubectlApplyContent(pod2Name, pod2Yaml)
+	if err := h.WaitForPodReady(pod2Name, ns, 1*time.Minute); err != nil {
+		t.Fatalf("Pod 2 failed to start: %v", err)
+	}
+
+	lsOut, err := h.RunInPod(pod2Name, ns, "cat", "/tmp/ls.txt")
+	if err != nil {
+		t.Fatalf("Failed to read /tmp/ls.txt in Pod 2: %v", err)
+	}
+	if strings.TrimSpace(lsOut) != "" {
+		t.Fatalf("Expected empty directory on re-created volume, got entries: %q", lsOut)
+	}
+
+	h.DeletePod(pod2Name, ns)
+	t.Logf("Successfully verified ObjectFS volume deletion, object cleanup, and empty re-creation!")
+}
+
 func TestObjectFSXAttrE2E(t *testing.T) {
 	requireE2EGroup(t, "core")
 

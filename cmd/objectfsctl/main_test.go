@@ -909,3 +909,104 @@ func TestVolumesRepairAndDegradedDisplay(t *testing.T) {
 		t.Errorf("expected no degraded volumes after repair, got: %s", afterList)
 	}
 }
+
+func TestVolumesDeleteCommand(t *testing.T) {
+	ctx := t.Context()
+	server, serverAddr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// 1. Missing --server flag
+	_, err := executeCommand("volumes", "delete", "test-vol")
+	if err == nil || !strings.Contains(err.Error(), "--server is required") {
+		t.Fatalf("expected --server is required error, got: %v", err)
+	}
+
+	// 2. Missing volume arg
+	_, err = executeCommand("--server", serverAddr, "volumes", "delete")
+	if err == nil {
+		t.Fatalf("expected error when volume argument is missing")
+	}
+
+	// 3. Create volume with file and snapshot
+	volID := "cli-del-vol"
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volID,
+		ParentInode:    1,
+		Name:           "file.txt",
+		InitialContent: []byte("content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	if _, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volID}); err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+
+	// 4. Refuse while exclusive hold is active
+	_, err = server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volID,
+		NodeId:   "node-1",
+		MountId:  "mount-1",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive failed: %v", err)
+	}
+
+	_, err = executeCommand("--server", serverAddr, "volumes", "delete", volID)
+	if err == nil || !strings.Contains(err.Error(), "currently published") {
+		t.Fatalf("expected error regarding published volume, got: %v", err)
+	}
+
+	// 5. Release hold
+	_, err = server.ReleaseExclusive(ctx, &pb.ReleaseExclusiveRequest{
+		VolumeId: volID,
+		NodeId:   "node-1",
+		MountId:  "mount-1",
+	})
+	if err != nil {
+		t.Fatalf("ReleaseExclusive failed: %v", err)
+	}
+
+	// 6. Delete volume successfully
+	delOut, err := executeCommand("--server", serverAddr, "volumes", "delete", volID)
+	if err != nil {
+		t.Fatalf("volumes delete failed: %v", err)
+	}
+	if !strings.Contains(delOut, "Deleted volume cli-del-vol") {
+		t.Fatalf("expected 'Deleted volume cli-del-vol' in output, got: %s", delOut)
+	}
+
+	// 7. Verify volumes list no longer shows volID
+	listOut, err := executeCommand("--server", serverAddr, "volumes", "list")
+	if err != nil {
+		t.Fatalf("volumes list failed: %v", err)
+	}
+	if strings.Contains(listOut, volID) {
+		t.Fatalf("expected %s to be removed from volumes list, got: %s", volID, listOut)
+	}
+
+	// 8. Delete volume with --retention flag
+	volID2 := "cli-del-retention-vol"
+	for i := 1; i <= 3; i++ {
+		_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:       volID2,
+			ParentInode:    1,
+			Name:           fmt.Sprintf("f%d.txt", i),
+			InitialContent: []byte("val"),
+		})
+		if err != nil {
+			t.Fatalf("CreateFile %d failed: %v", i, err)
+		}
+		if _, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volID2}); err != nil {
+			t.Fatalf("CreateSnapshot %d failed: %v", i, err)
+		}
+	}
+
+	delRetOut, err := executeCommand("--server", serverAddr, "volumes", "delete", volID2, "--retention", "1")
+	if err != nil {
+		t.Fatalf("volumes delete --retention 1 failed: %v", delRetOut)
+	}
+	if !strings.Contains(delRetOut, "Deleted volume cli-del-retention-vol") {
+		t.Fatalf("expected 'Deleted volume cli-del-retention-vol' in output, got: %s", delRetOut)
+	}
+}
