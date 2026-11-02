@@ -452,16 +452,19 @@ To achieve both high write throughput and optimal packing in cloud object storag
 | Background timer | Node daemon, per volume (`blocking=false, trigger=PERIODIC`) | No | On (`--background-sync-interval=30s`) |
 | Client cache budget | Node daemon, when dirty bytes exceed cache | The write that overflows waits | Always (`--cache-size-mb=128`) |
 
-5. **Controller Coalescing Mechanism:**
-   - Non-blocking syncs are coalesced within a configurable window (`--sync-coalesce-window=1s`, default 1s). The controller gathers staged writes and non-blocking sync requests across the volume, then commits them in a single pack and transaction.
-   - When triggered by close (`trigger=CLOSE`), the controller coalesces close triggers for a short fixed floor window (75ms) so bursts of closes share a pack, and commits only the requested closed file's staged chunks; other staged data on the volume follows on the coalesce window. Waiters registered for other inodes are not completed by a close sync.
+5. **Controller Coalescing Mechanism & Local Staging Tier:**
+   - **Local Scratch Staging Tier:** Staged chunk payloads live on the controller's local disk under `<metadata-dir>/staging/<volume-id>/` in an open version-2 packfile scratch area rather than accumulating in controller memory. In-memory maps retain only lightweight `StagedChunkRef` references indexing chunk entries within the open pack.
+   - **Incremental Append & Slot Rotation:** Incoming chunks are appended directly to the open packfile on local disk in arrival order without fsync. When an open pack's preallocated slot table fills (1024 entries), it is sealed and rotated to a new open pack, tracked by `StagingSlotSeals` in `VolumeStats`.
+   - **Bounded Staging Budget & Sync-and-Wait:** Staged disk usage is bounded controller-wide via `--staging-max-bytes` (default 4 GiB) across all volumes and `--max-staging-bytes=64MB` per volume. When a push would exceed the budget, it triggers a sync and waits for space to free, never failing with `ENOSPC` unless the sync fails.
+   - **Upload at Sync & Early Slot Seal:** Packs are sealed either early when reaching the 1024 slot cap (triggering rotation to a new open scratch pack, tracked by `StagingSlotSeals`) or at sync time (when committing staged bytes, tracked by `StagingByteSeals`). At sync time, all sealed packs are uploaded directly to cloud object storage without repacking or memory copies. Once uploaded, local scratch packfiles are removed.
+   - **Coalescing Windows:** Non-blocking syncs are coalesced within a configurable window (`--sync-coalesce-window=1s`, default 1s). When triggered by close (`trigger=CLOSE`), the controller coalesces close triggers for a short fixed floor window (75ms) so bursts of closes share a pack, and commits the requested closed file's staged chunks. Waiters registered for other inodes are not completed by a close sync.
    - A blocking `fsync` arriving during an active coalesce window preempts the window and flushes immediately, including all writes in the window.
    - Non-blocking sync failures are retained by the controller and surfaced on the next blocking `fsync` for any affected inode.
-   - Controller staging memory is bounded via `--max-staging-bytes=64MB` per volume; writes that exceed this limit are rejected until an `Fsync` commits staged data.
+   - Cross-node visibility and object storage durability remain unchanged.
 
 6. **Crash Recovery & Client Re-Push:**
-   - If the controller restarts before an `Fsync` completes, un-synced staged writes are dropped cleanly.
-   - When the client next contacts the restarted controller for `Fsync`, it detects a staging epoch change (`ESTALE`) and automatically re-pushes its still-dirty chunks, ensuring no data loss.
+   - The open packfile is scratch: if the controller restarts before an `Fsync` completes, open packs are deleted on startup and the staging epoch is bumped as today.
+   - When the client next contacts the restarted controller for `Fsync`, it detects a staging epoch change (`ESTALE`) and automatically re-pushes its still-dirty chunks from local client cache, ensuring no data loss.
 
 7. **Durability Matrix (controller WAL permanent / witness / local):**
 
