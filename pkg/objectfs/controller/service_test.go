@@ -7763,3 +7763,86 @@ func TestLoadFromBackend_FailsOnMissingSnapshot(t *testing.T) {
 		t.Fatalf("Expected 0 volume objects, got %v", volObjs)
 	}
 }
+
+func TestDeleteVolume_CrossServer_Unloaded(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+
+	// Shared WAL buffer across all three controller instances
+	bt, cleanup := buffertest.Start(ctx, nil, buffertest.WithBackend(backend))
+	defer cleanup()
+
+	volumeID := "test-cross-server-del-vol"
+
+	// 1. Controller 1: create three files, snapshot, flush, then close controller 1
+	walDir1 := t.TempDir()
+	server1 := NewServer(backend,
+		WithServerWAL(walDir1, bt.Target, walclient.Witness),
+		WithServerWALClient(bt.Client),
+		WithServerWALDialOptions(bt.DialOpts...),
+		WithServerWithoutFsync(),
+	)
+	for i := 1; i <= 3; i++ {
+		_, err := testCreateFile(ctx, server1, volumeID, fmt.Sprintf("/file%d.txt", i), 0644, []byte(fmt.Sprintf("content%d", i)), 0, 0)
+		if err != nil {
+			t.Fatalf("testCreateFile %d on server 1 failed: %v", i, err)
+		}
+	}
+	if _, err := server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("CreateSnapshot on server 1 failed: %v", err)
+	}
+	if err := server1.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll on server 1 failed: %v", err)
+	}
+	if err := server1.Close(); err != nil {
+		t.Fatalf("Close server 1 failed: %v", err)
+	}
+
+	// 2. Controller 2: volume is NOT loaded here; delete volume on controller 2
+	walDir2 := t.TempDir()
+	server2 := NewServer(backend,
+		WithServerWAL(walDir2, bt.Target, walclient.Witness),
+		WithServerWALClient(bt.Client),
+		WithServerWALDialOptions(bt.DialOpts...),
+		WithServerWithoutFsync(),
+	)
+	if _, err := server2.DeleteVolume(ctx, &pb.DeleteVolumeRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("DeleteVolume on server 2 (unloaded) failed: %v", err)
+	}
+	if err := server2.Close(); err != nil {
+		t.Fatalf("Close server 2 failed: %v", err)
+	}
+
+	// 3. Controller 3: re-create volume on fresh controller 3, must be empty without conflicting type error
+	walDir3 := t.TempDir()
+	server3 := NewServer(backend,
+		WithServerWAL(walDir3, bt.Target, walclient.Witness),
+		WithServerWALClient(bt.Client),
+		WithServerWALDialOptions(bt.DialOpts...),
+		WithServerWithoutFsync(),
+	)
+	defer func() { _ = server3.Close() }()
+
+	readDirResp, err := server3.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1})
+	if err != nil {
+		t.Fatalf("ReadDir on server 3 failed: %v", err)
+	}
+	if len(readDirResp.GetEntries()) != 0 {
+		t.Fatalf("Expected 0 entries on re-created volume, got %d", len(readDirResp.GetEntries()))
+	}
+
+	// Writing a new file on server 3 must succeed without conflicting type registration
+	_, err = testCreateFile(ctx, server3, volumeID, "/newfile.txt", 0644, []byte("new"), 0, 0)
+	if err != nil {
+		t.Fatalf("testCreateFile on server 3 failed: %v", err)
+	}
+
+	// ListSnapshots on re-created volume must be empty (reset cleared snapshot pointers)
+	listSnapResp, err := server3.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("ListSnapshots on server 3 failed: %v", err)
+	}
+	if len(listSnapResp.GetSnapshots()) != 0 {
+		t.Fatalf("Expected 0 snapshots on re-created volume, got %d", len(listSnapResp.GetSnapshots()))
+	}
+}

@@ -1095,17 +1095,8 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
 }
 
-func (v *Volume) initMetadataStreamLocked() error {
-	var writerOpts []record.WriterOption
-	appender := sds.NewWALAppender(v.stream, walclient.Local)
-	// If the stream already contains local records, mark the header as emitted to avoid
-	// appending a duplicate stream header mid-stream upon controller restart.
-	// Accepted edge: if all local segments were pruned after S3 ack and the buffer
-	// reports witness 0, a header will be re-emitted at seq N; readers tolerate this.
-	if local, _, _ := v.stream.Watermarks(); local > 0 {
-		writerOpts = append(writerOpts, record.WithStreamHeaderEmitted(true))
-	}
-	w := sds.NewWriter(appender, writerOpts...)
+// RegisterMetadataStreamTypes registers all canonical SDS record types in their strict, pinned order.
+func RegisterMetadataStreamTypes(w *sds.Writer) error {
 	if _, err := w.RegisterType(&pb.Inode{}, 1); err != nil {
 		return fmt.Errorf("failed to register Inode type: %w", err)
 	}
@@ -1126,6 +1117,23 @@ func (v *Volume) initMetadataStreamLocked() error {
 	}
 	if _, err := w.RegisterType(&pb.VolumeInfo{}, 1); err != nil {
 		return fmt.Errorf("failed to register VolumeInfo type: %w", err)
+	}
+	return nil
+}
+
+func (v *Volume) initMetadataStreamLocked() error {
+	var writerOpts []record.WriterOption
+	appender := sds.NewWALAppender(v.stream, walclient.Local)
+	// If the stream already contains local records, mark the header as emitted to avoid
+	// appending a duplicate stream header mid-stream upon controller restart.
+	// Accepted edge: if all local segments were pruned after S3 ack and the buffer
+	// reports witness 0, a header will be re-emitted at seq N; readers tolerate this.
+	if local, _, _ := v.stream.Watermarks(); local > 0 {
+		writerOpts = append(writerOpts, record.WithStreamHeaderEmitted(true))
+	}
+	w := sds.NewWriter(appender, writerOpts...)
+	if err := RegisterMetadataStreamTypes(w); err != nil {
+		return err
 	}
 	v.metadataStream = w
 	return nil
@@ -1553,6 +1561,8 @@ func (v *Volume) resetToCleanRootLocked(ctx context.Context) error {
 	v.nextInode = erofs.DefaultInodeStride
 	v.dirParents = make(map[uint64]uint64)
 	v.dirParents[1] = 1
+	v.snapshotPointers = nil
+	v.consistencyMode = pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED
 	return nil
 }
 
@@ -4887,13 +4897,6 @@ func (v *Volume) hasOpenHandlesLocked(inodeID uint64) bool {
 	return v.openInodes != nil && v.openInodes[inodeID] > 0
 }
 
-// HasOpenHandles reports whether any file handles are currently open on this volume.
-func (v *Volume) HasOpenHandles() bool {
-	v.handlesMu.Lock()
-	defer v.handlesMu.Unlock()
-	return len(v.handles) > 0
-}
-
 func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 	if deg := v.Degraded(); deg != nil {
 		return syscall.EIO
@@ -6005,7 +6008,7 @@ func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error
 
 	if v.snapshotRetention > 0 {
 		if _, err := v.pruneSnapshotsLocked(ctx, v.snapshotRetention); err != nil {
-			klog.Warningf("Volume %s: failed to prune snapshots to retention limit %d: %v", v.volumeID, v.snapshotRetention, err)
+			return "", fmt.Errorf("failed to prune snapshots to retention limit %d: %w", v.snapshotRetention, err)
 		}
 	}
 
@@ -6046,7 +6049,7 @@ func (v *Volume) pruneSnapshotsLocked(ctx context.Context, keepCount int) (int, 
 		loc := p.GetLocation()
 		if loc != "" && v.backend != nil {
 			if err := v.backend.DeleteObject(ctx, "", loc); err != nil {
-				klog.Warningf("Volume %s: failed to delete snapshot object %s: %v", v.volumeID, loc, err)
+				return 0, fmt.Errorf("failed to delete snapshot object %s: %w", loc, err)
 			}
 		}
 		if loc != "" {

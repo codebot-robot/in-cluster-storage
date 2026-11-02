@@ -173,8 +173,9 @@ type Server struct {
 	exclusiveHolds    map[string]*ExclusiveHold
 	exclusiveLeaseTTL time.Duration
 
-	snapshotRetention int
-	deletingVolumes   map[string]struct{}
+	snapshotRetention       int
+	deleteSnapshotRetention int
+	deletingVolumes         map[string]struct{}
 }
 
 // ExclusiveHold tracks an active exclusive-local hold on a volume.
@@ -335,10 +336,17 @@ func WithServerSyncCoalesceWindow(d time.Duration) ServerOption {
 	}
 }
 
-// WithServerSnapshotRetention sets the default number of snapshots to retain per volume.
+// WithServerSnapshotRetention sets the default number of snapshots to retain per volume during creation.
 func WithServerSnapshotRetention(retention int) ServerOption {
 	return func(s *Server) {
 		s.snapshotRetention = retention
+	}
+}
+
+// WithServerDeleteSnapshotRetention sets the default number of snapshots to retain per volume when deleted.
+func WithServerDeleteSnapshotRetention(retention int) ServerOption {
+	return func(s *Server) {
+		s.deleteSnapshotRetention = retention
 	}
 }
 
@@ -475,6 +483,10 @@ func (s *Server) openStreamForVolume(volumeID string, dir string) (walclient.Str
 }
 
 func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
+	return s.getOrCreateVolumeInternal(volumeID, false)
+}
+
+func (s *Server) getOrCreateVolumeInternal(volumeID string, bypassDeletingGuard bool) (*Volume, error) {
 	if !isValidVolumeID(volumeID) {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", volumeID)
 	}
@@ -482,8 +494,10 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, deleting := s.deletingVolumes[volumeID]; deleting {
-		return nil, status.Errorf(codes.Aborted, "volume %s is currently being deleted", volumeID)
+	if !bypassDeletingGuard {
+		if _, deleting := s.deletingVolumes[volumeID]; deleting {
+			return nil, status.Errorf(codes.Aborted, "volume %s is currently being deleted", volumeID)
+		}
 	}
 
 	vol, ok := s.volumes[volumeID]
@@ -1086,6 +1100,13 @@ func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSContr
 		}
 	}
 
+	s.mu.RLock()
+	if _, deleting := s.deletingVolumes[req.GetVolumeId()]; deleting {
+		s.mu.RUnlock()
+		return status.Errorf(codes.FailedPrecondition, "volume %s is currently being deleted", req.GetVolumeId())
+	}
+	s.mu.RUnlock()
+
 	ch := s.broadcaster.Subscribe(req.GetVolumeId())
 	defer s.broadcaster.Unsubscribe(req.GetVolumeId(), ch)
 
@@ -1523,6 +1544,13 @@ func (s *Server) AcquireExclusive(ctx context.Context, req *pb.AcquireExclusiveR
 	}
 
 	volumeID := req.GetVolumeId()
+	s.mu.RLock()
+	if _, deleting := s.deletingVolumes[volumeID]; deleting {
+		s.mu.RUnlock()
+		return nil, status.Errorf(codes.FailedPrecondition, "volume %s is currently being deleted", volumeID)
+	}
+	s.mu.RUnlock()
+
 	s.exclusiveHoldsMu.Lock()
 	defer s.exclusiveHoldsMu.Unlock()
 
@@ -1759,21 +1787,12 @@ func (s *Server) DeleteVolume(ctx context.Context, req *pb.DeleteVolumeRequest) 
 		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", volumeID)
 	}
 
-	// 1. Refuse if published anywhere
-	if s.IsVolumePublished(volumeID) {
-		return nil, status.Errorf(codes.FailedPrecondition, "volume %s cannot be deleted: volume is currently published/in-use", volumeID)
-	}
-
 	s.mu.Lock()
 	if _, deleting := s.deletingVolumes[volumeID]; deleting {
 		s.mu.Unlock()
 		return nil, status.Errorf(codes.Aborted, "volume %s is currently being deleted", volumeID)
 	}
 	s.deletingVolumes[volumeID] = struct{}{}
-	vol, loaded := s.volumes[volumeID]
-	if loaded {
-		delete(s.volumes, volumeID)
-	}
 	s.mu.Unlock()
 
 	defer func() {
@@ -1782,44 +1801,71 @@ func (s *Server) DeleteVolume(ctx context.Context, req *pb.DeleteVolumeRequest) 
 		s.mu.Unlock()
 	}()
 
+	// 1. Refuse if published anywhere (checked after marking deleting to prevent race with incoming mounts)
+	if s.IsVolumePublished(volumeID) {
+		return nil, status.Errorf(codes.FailedPrecondition, "volume %s cannot be deleted: volume is currently published/in-use", volumeID)
+	}
+
 	var firstErr error
 
-	// 2. Record deletion in stream and close in-memory volume if loaded
+	// 2. Load volume if not loaded, record deletion in stream, and close volume
 	var localDir string
-	if loaded && vol != nil {
-		localDir = vol.localStorageDir
-		if err := vol.RecordDeletion(ctx); err != nil {
-			klog.Warningf("Volume %s: failed to record deletion: %v", volumeID, err)
-		}
-		if err := vol.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	} else if s.walClient != nil || s.streamFactory != nil {
-		if stm, err := s.openStreamForVolume(volumeID, s.walDir); err == nil && stm != nil {
-			appender := sds.NewWALAppender(stm, walclient.Local)
-			w := sds.NewWriter(appender)
-			if _, rErr := w.RegisterType(&pb.VolumeInfo{}, 1); rErr != nil {
-				klog.Warningf("Volume %s: failed to register VolumeInfo: %v", volumeID, rErr)
-			} else {
+	s.mu.Lock()
+	vol, loaded := s.volumes[volumeID]
+	s.mu.Unlock()
+
+	if !loaded {
+		var err error
+		vol, err = s.getOrCreateVolumeInternal(volumeID, true)
+		if err != nil {
+			klog.Warningf("DeleteVolume %s: getOrCreateVolumeInternal failed (%v), opening stream directly for deletion marker", volumeID, err)
+			if s.walClient != nil || s.streamFactory != nil {
+				stm, sErr := s.openStreamForVolume(volumeID, s.walDir)
+				if sErr != nil {
+					return nil, status.Errorf(codes.Internal, "failed to open stream for deletion marker: %v", sErr)
+				}
+				appender := sds.NewWALAppender(stm, walclient.Local)
+				w := sds.NewWriter(appender)
+				if rErr := RegisterMetadataStreamTypes(w); rErr != nil {
+					errutil.CloseAndLog(stm, "wal stream")
+					return nil, status.Errorf(codes.Internal, "failed to register metadata stream types: %v", rErr)
+				}
 				tx := w.Begin()
 				volInfoKey, kErr := pkVolumeInfo.Extract(&pb.VolumeInfo{VolumeId: volumeID, Deleted: true})
 				if kErr != nil {
-					klog.Warningf("Volume %s: failed to extract key: %v", volumeID, kErr)
-				} else {
-					tx.RecordRead(VolumeInfoTypeName, volInfoKey, nil)
-					if _, iErr := tx.Insert(ctx, &pb.VolumeInfo{VolumeId: volumeID, Deleted: true}); iErr != nil {
-						klog.Warningf("Volume %s: failed to insert: %v", volumeID, iErr)
-					} else {
-						if _, cErr := tx.Commit(ctx); cErr != nil {
-							klog.Warningf("Volume %s: failed to commit: %v", volumeID, cErr)
-						}
-					}
-					if fErr := stm.Flush(ctx); fErr != nil {
-						klog.Warningf("Volume %s: failed to flush: %v", volumeID, fErr)
-					}
+					errutil.CloseAndLog(stm, "wal stream")
+					return nil, status.Errorf(codes.Internal, "failed to extract VolumeInfo key: %v", kErr)
 				}
+				tx.RecordRead(VolumeInfoTypeName, volInfoKey, nil)
+				if _, iErr := tx.Insert(ctx, &pb.VolumeInfo{VolumeId: volumeID, Deleted: true}); iErr != nil {
+					errutil.CloseAndLog(stm, "wal stream")
+					return nil, status.Errorf(codes.Internal, "failed to insert deletion marker: %v", iErr)
+				}
+				if _, cErr := tx.Commit(ctx); cErr != nil {
+					errutil.CloseAndLog(stm, "wal stream")
+					return nil, status.Errorf(codes.Internal, "failed to commit deletion marker: %v", cErr)
+				}
+				if fErr := stm.Flush(ctx); fErr != nil {
+					errutil.CloseAndLog(stm, "wal stream")
+					return nil, status.Errorf(codes.Internal, "failed to flush deletion marker: %v", fErr)
+				}
+				errutil.CloseAndLog(stm, "wal stream")
 			}
-			errutil.CloseAndLog(stm, "wal stream")
+		} else {
+			loaded = true
+		}
+	}
+
+	if loaded && vol != nil {
+		localDir = vol.localStorageDir
+		if err := vol.RecordDeletion(ctx); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to record volume deletion: %v", err)
+		}
+		s.mu.Lock()
+		delete(s.volumes, volumeID)
+		s.mu.Unlock()
+		if err := vol.Close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 
@@ -1843,7 +1889,7 @@ func (s *Server) DeleteVolume(ctx context.Context, req *pb.DeleteVolumeRequest) 
 	}
 
 	// 5. Discover and delete snapshots according to retention policy
-	retention := s.snapshotRetention
+	retention := s.deleteSnapshotRetention
 	if req.Retention != nil {
 		retention = int(req.GetRetention())
 	}
