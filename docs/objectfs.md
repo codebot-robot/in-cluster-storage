@@ -453,15 +453,16 @@ To achieve both high write throughput and optimal packing in cloud object storag
 | Client cache budget | Node daemon, when dirty bytes exceed cache | The write that overflows waits | Always (`--cache-size-mb=128`) |
 
 5. **Controller Coalescing Mechanism:**
+   - **Local Scratch Staging Tier:** Staged chunk payloads live on the controller's local disk under `<metadata-dir>/<volume-id>/staging/` in an open version-2 packfile scratch area rather than accumulating in controller memory. In-memory maps retain only the pack entry and the byte length.
    - Non-blocking syncs are coalesced within a configurable window (`--sync-coalesce-window=1s`, default 1s). The controller gathers staged writes and non-blocking sync requests across the volume, then commits them in a single pack and transaction.
    - When triggered by close (`trigger=CLOSE`), the controller coalesces close triggers for a short fixed floor window (75ms) so bursts of closes share a pack, and commits only the requested closed file's staged chunks; other staged data on the volume follows on the coalesce window. Waiters registered for other inodes are not completed by a close sync.
    - A blocking `fsync` arriving during an active coalesce window preempts the window and flushes immediately, including all writes in the window.
    - Non-blocking sync failures are retained by the controller and surfaced on the next blocking `fsync` for any affected inode.
-   - Controller staging memory is bounded via `--max-staging-bytes=64MB` per volume; writes that exceed this limit are rejected until an `Fsync` commits staged data.
+   - Controller staged bytes are bounded via `--max-staging-bytes=64MB` per volume; writes that exceed this limit are rejected until an `Fsync` commits staged data.
 
 6. **Crash Recovery & Client Re-Push:**
-   - If the controller restarts before an `Fsync` completes, un-synced staged writes are dropped cleanly.
-   - When the client next contacts the restarted controller for `Fsync`, it detects a staging epoch change (`ESTALE`) and automatically re-pushes its still-dirty chunks, ensuring no data loss.
+   - The open packfile is scratch: if the controller restarts before an `Fsync` completes, open packs are deleted on startup and the staging epoch is bumped as today.
+   - When the client next contacts the restarted controller for `Fsync`, it detects a staging epoch change (`ESTALE`) and automatically re-pushes its still-dirty chunks from local client cache, ensuring no data loss.
 
 7. **Durability Matrix (controller WAL permanent / witness / local):**
 

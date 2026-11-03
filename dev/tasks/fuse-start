@@ -156,7 +156,8 @@ BUFFER_PORT="${OBJECTFS_BUFFER_PORT:-50052}"
 BUFFER_DIR="${DEV_DIR}/walbuffer"
 BUFFER_LOG="${DEV_DIR}/walbuffer.log"
 WAL_CLIENT_DIR="${DEV_DIR}/walclient"
-mkdir -p "${STORE_DIR}" "${MOUNT_DIR}" "${BUFFER_DIR}" "${WAL_CLIENT_DIR}"
+METADATA_DIR="${DEV_DIR}/metadata"
+mkdir -p "${STORE_DIR}" "${MOUNT_DIR}" "${BUFFER_DIR}" "${WAL_CLIENT_DIR}" "${METADATA_DIR}"
 
 SERVER_ADDR="127.0.0.1:${OBJECTFS_PORT}"
 CONTROLLER_PID=""
@@ -247,6 +248,7 @@ echo "Starting objectfs-controller on ${SERVER_ADDR} (backend file://${STORE_DIR
   exec "${BIN_DIR}/objectfs-controller" \
     --port "${OBJECTFS_PORT}" \
     --backend "file://${STORE_DIR}" \
+    --metadata-dir "${METADATA_DIR}" \
     --metadata-index "${OBJECTFS_METADATA_INDEX:-sqlite}" \
     --flush-interval 1m \
     --wal-dir "${WAL_CLIENT_DIR}" \

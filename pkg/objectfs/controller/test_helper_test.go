@@ -32,7 +32,11 @@ import (
 // The production controller binary uses NewServer, which always retains per-record fsync.
 func NewTestServer(t testing.TB, backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if target := InspectServerTarget(opts...); target != "" {
-		opts = append([]ServerOption{WithServerWithoutFsync()}, opts...)
+		metadataDir := t.TempDir()
+		opts = append([]ServerOption{
+			WithServerWithoutFsync(),
+			WithServerMetadataDir(metadataDir),
+		}, opts...)
 		return NewServer(backend, opts...)
 	}
 
@@ -54,11 +58,14 @@ func NewTestServer(t testing.TB, backend ObjectStorageBackend, opts ...ServerOpt
 		}
 	}
 
+	metadataDir := t.TempDir()
+
 	testOpts := []ServerOption{
 		WithServerWAL(walDir, bt.Target, walclient.Witness),
 		WithServerWALClient(bt.Client),
 		WithServerWALDialOptions(bt.DialOpts...),
 		WithServerWithoutFsync(),
+		WithServerMetadataDir(metadataDir),
 		WithServerTestCleanup(combinedCleanup),
 	}
 	testOpts = append(testOpts, opts...)
