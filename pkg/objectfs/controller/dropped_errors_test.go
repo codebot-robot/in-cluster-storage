@@ -228,7 +228,7 @@ func (b *faultyListBackend) ListObjects(ctx context.Context, bucket, prefix stri
 func TestRegression_ListVolumesBackendFailure(t *testing.T) {
 	ctx := t.Context()
 	backend := &faultyListBackend{Backend: inmemorystorage.New()}
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 
 	// ListVolumes succeeds when backend does not fail
 	resp, err := server.ListVolumes(ctx, &pb.ListVolumesRequest{})
@@ -346,7 +346,7 @@ type faultyPutBackend struct {
 }
 
 func (b *faultyPutBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
-	if b.failPut.Load() {
+	if b.failPut.Load() && !strings.HasPrefix(key, "streams/") {
 		return "", errors.New("injected backend put failure")
 	}
 	return b.Backend.PutObject(ctx, volumeID, key, stream)
@@ -379,6 +379,7 @@ func TestRegression_TruncateFilePutBlobsFailure(t *testing.T) {
 
 	// Now fail backend PutObject during TruncateFile (which uploads the truncated chunk boundary)
 	backend.failPut.Store(true)
+	defer backend.failPut.Store(false)
 
 	_, err = vol.TruncateFile(ctx, ino, 5500)
 	if err == nil {
@@ -429,7 +430,7 @@ func TestRegression_CorruptLocalIndexRecovery(t *testing.T) {
 func TestRegression_ShutdownFlushFailureSurfacedInClose(t *testing.T) {
 	ctx := t.Context()
 	backend := &faultyPutBackend{Backend: inmemorystorage.New()}
-	server := NewTestServer(backend, WithServerSyncTimeout(1*time.Second))
+	server := NewTestServer(t, backend, WithServerSyncTimeout(1*time.Second))
 
 	volumeID := "test-vol-shutdown-flush"
 	vol, err := server.GetVolume(volumeID)

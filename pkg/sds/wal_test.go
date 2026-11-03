@@ -28,6 +28,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"k8s.io/klog/v2"
 )
 
 type testServerHandle struct {
@@ -36,7 +37,9 @@ type testServerHandle struct {
 }
 
 func (h *testServerHandle) StopGraceful() {
-	h.bt.Close()
+	if err := h.bt.Close(); err != nil {
+		klog.Warningf("StopGraceful: buffertest close failed: %v", err)
+	}
 }
 
 func (h *testServerHandle) StreamReader(streamID uuid.UUID, opts ...StreamReaderOption) *StreamReader {
