@@ -1,6 +1,6 @@
 # Developer & Agent Guidelines
 
-This document describes how to set up your environment and run the full end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), how to write commit messages and PR descriptions (section 5), the Go API rules we hold code to (section 6), and PR scope (section 7).
+This document describes how to set up your environment and run the full end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), how to write commit messages and PR descriptions (section 5), the Go API rules we hold code to (section 6), PR scope (section 7), and naming (section 8).
 
 ---
 
@@ -192,4 +192,18 @@ If a change touches many call sites, that is information, not a problem: it says
 - **One idea, one issue, one PR.** If a PR can be split into two ideas, split it; problems found during review that are outside the PR's idea become new issues.
 - **A good PR changes at most 200 lines, including tests.** The time to review and understand a PR grows roughly with the square of the lines in the diff, so two 100-line PRs cost a quarter of one 200-line PR. If the one idea needs more than 200 lines, say so on the issue before pushing and propose where to cut or how to order the parts.
 - **Issues carry a line budget** for the same reason; an issue without one should be given one before it is assigned.
+
+---
+
+## 8. Naming
+
+**Do not abbreviate identifiers.** Write the word: `header` not `hdr`, `entry` not `ent`, `buffer` not `buf`, `registry` not `reg`, `definition` not `def`, `decoder` not `dec`. An abbreviation saves the writer a few keystrokes and costs every reader a lookup, and review time is the bottleneck.
+
+Exceptions, all of them conventional Go and nothing else:
+- `i`, `j`, `k` as integer loop indices;
+- a one- or two-letter method receiver (`p *IncrementalPack`);
+- `ctx`, `err`, `ok`, `wg`, `mu` and `tx`, which are idioms across the Go ecosystem and this codebase (`context` and `error` are also package and type names);
+- a protocol or on-disk field name that is itself the abbreviation (`ino`, `fd`, `sha256`, `uid`).
+
+Names must also match signatures: a function returning `[]byte` is `build...`, not `write...`; `write...` takes an `io.Writer` or a destination slice. Use one name per concept: do not introduce `prepared` beside `encoded` for the same thing.
 
