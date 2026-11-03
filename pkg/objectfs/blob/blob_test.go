@@ -1318,3 +1318,98 @@ func TestPackfileV2CorruptEntry_ChecksumMismatch(t *testing.T) {
 		t.Errorf("expected checksum mismatch in error %q", errStr)
 	}
 }
+
+func TestWritePackfile_ByteIdenticalToBatch(t *testing.T) {
+	fixtureData, err := os.ReadFile(filepath.Join("testdata", "v2_fixture.pack"))
+	if err != nil {
+		t.Fatalf("failed reading checked-in v2 fixture: %v", err)
+	}
+
+	rawBlobs := [][]byte{
+		[]byte("fixture-v2-blob-1-plain-text"),
+		[]byte("fixture-v2-blob-2-repetitive-data-repetitive-data-repetitive-data-repetitive-data"),
+		[]byte("fixture-v2-blob-3-binary-\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09"),
+	}
+	blobs := make([]*EncodedBlob, len(rawBlobs))
+	for i, raw := range rawBlobs {
+		encoded, err := EncodeBlob(NewByteStreamFromBytes(raw), true)
+		if err != nil {
+			t.Fatalf("EncodeBlob %d: %v", i, err)
+		}
+		t.Cleanup(func() {
+			if err := encoded.Close(); err != nil {
+				t.Errorf("Close encoded blob: %v", err)
+			}
+		})
+		blobs[i] = encoded
+	}
+
+	var buffer bytes.Buffer
+	if _, err := WritePackfileWithSlots(&buffer, blobs, 8); err != nil {
+		t.Fatalf("WritePackfileWithSlots: %v", err)
+	}
+
+	if !bytes.Equal(buffer.Bytes(), fixtureData) {
+		t.Fatalf("WritePackfile output does not match golden fixture v2_fixture.pack")
+	}
+}
+
+func TestIncrementalPack_LookupAndReadBlob(t *testing.T) {
+	packPath := filepath.Join(t.TempDir(), "lookup-read.pack")
+	pack, err := NewIncrementalPack(packPath, 4)
+	if err != nil {
+		t.Fatalf("NewIncrementalPack: %v", err)
+	}
+	defer func() {
+		if err := pack.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+	}()
+
+	chunk1, chunk2 := []byte("payload-one"), []byte("payload-two")
+	entry1, err := pack.Append(chunk1)
+	if err != nil {
+		t.Fatalf("Append 1: %v", err)
+	}
+	entry2, err := pack.Append(chunk2)
+	if err != nil {
+		t.Fatalf("Append 2: %v", err)
+	}
+
+	for _, testCase := range []struct {
+		entry BlobEntry
+		want  []byte
+	}{{entry1, chunk1}, {entry2, chunk2}} {
+		if got, ok := pack.Lookup(testCase.entry.SHA256); !ok || got != testCase.entry {
+			t.Fatalf("Lookup open: got %v, want %v", got, testCase.entry)
+		}
+		stream, err := pack.ReadBlob(testCase.entry)
+		if err != nil {
+			t.Fatalf("ReadBlob open: %v", err)
+		}
+		data, err := io.ReadAll(stream)
+		closeErr := stream.Close()
+		if err != nil || closeErr != nil || !bytes.Equal(data, testCase.want) {
+			t.Fatalf("ReadBlob open: got %q, want %q, readErr=%v, closeErr=%v", data, testCase.want, err, closeErr)
+		}
+	}
+	if _, ok := pack.Lookup([32]byte{0xff}); ok {
+		t.Fatalf("expected missing lookup false")
+	}
+
+	if err := pack.Seal(); err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+	if got, ok := pack.Lookup(entry2.SHA256); !ok || got != entry2 {
+		t.Fatalf("Lookup sealed: got %v, want %v", got, entry2)
+	}
+	stream, err := pack.ReadBlob(entry2)
+	if err != nil {
+		t.Fatalf("ReadBlob sealed: %v", err)
+	}
+	data, err := io.ReadAll(stream)
+	closeErr := stream.Close()
+	if err != nil || closeErr != nil || !bytes.Equal(data, chunk2) {
+		t.Fatalf("ReadBlob sealed: got %q, want %q, readErr=%v, closeErr=%v", data, chunk2, err, closeErr)
+	}
+}

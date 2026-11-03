@@ -20,11 +20,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"k8s.io/klog/v2"
 )
 
 var ErrPackSlotsFull = errors.New("incremental pack slots are full")
@@ -58,6 +61,13 @@ func NewIncrementalPack(path string, slots uint32) (*IncrementalPack, error) {
 	return &IncrementalPack{file: f, slots: slots, offset: int64(len(hdr))}, nil
 }
 
+func (p *IncrementalPack) verifyOpenLocked() error {
+	if p.file == nil {
+		return errors.New("incremental pack is closed")
+	}
+	return nil
+}
+
 func (p *IncrementalPack) Append(data []byte) (BlobEntry, error) {
 	blob, err := EncodeBlob(NewByteStreamFromBytes(data), true)
 	if err != nil {
@@ -70,13 +80,14 @@ func (p *IncrementalPack) Append(data []byte) (BlobEntry, error) {
 func (p *IncrementalPack) appendBlob(blob *EncodedBlob) (BlobEntry, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.verifyOpenLocked(); err != nil {
+		return BlobEntry{}, err
+	}
 	if p.sealed {
 		return BlobEntry{}, errors.New("incremental pack is sealed")
 	}
-	for _, e := range p.entries {
-		if e.SHA256 == blob.SHA256 {
-			return e, nil
-		}
+	if existing, ok := p.lookupLocked(blob.SHA256); ok {
+		return existing, nil
 	}
 	if uint32(len(p.entries)) >= p.slots {
 		return BlobEntry{}, ErrPackSlotsFull
@@ -99,6 +110,48 @@ func (p *IncrementalPack) appendBlob(blob *EncodedBlob) (BlobEntry, error) {
 	}
 	p.entries = append(p.entries, ent)
 	return ent, nil
+}
+
+func (p *IncrementalPack) lookupLocked(target [32]byte) (BlobEntry, bool) {
+	for _, entry := range p.entries {
+		if entry.SHA256 == target {
+			return entry, true
+		}
+	}
+	return BlobEntry{}, false
+}
+
+// Lookup finds a blob by SHA256 in the packfile.
+func (p *IncrementalPack) Lookup(target [32]byte) (BlobEntry, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lookupLocked(target)
+}
+
+// ReadBlob reads and decodes the blob payload corresponding to entry.
+func (p *IncrementalPack) ReadBlob(entry BlobEntry) (ByteStream, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.verifyOpenLocked(); err != nil {
+		return nil, err
+	}
+	sectionReader := io.NewSectionReader(p.file, int64(entry.DataOffset), int64(entry.StoredLength))
+	return decodePayloadToByteStream(sectionReader, entry.Encoding, int64(entry.FinalLength))
+}
+
+func (p *IncrementalPack) writeTo(w io.Writer) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.verifyOpenLocked(); err != nil {
+		return err
+	}
+	if _, err := p.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed seeking packfile: %w", err)
+	}
+	if _, err := io.Copy(w, p.file); err != nil {
+		return fmt.Errorf("failed writing packfile to destination: %w", err)
+	}
+	return nil
 }
 
 func buildItemHeader(encoding uint32, finalLength uint32) []byte {
@@ -124,6 +177,16 @@ func (p *IncrementalPack) Seal() error {
 	defer p.mu.Unlock()
 	if p.sealed {
 		return nil
+	}
+	if err := p.verifyOpenLocked(); err != nil {
+		return err
+	}
+	if uint32(len(p.entries)) == p.slots {
+		packSlotsFullMu.Lock()
+		packSlotsFullCount++
+		count := packSlotsFullCount
+		packSlotsFullMu.Unlock()
+		klog.V(2).Infof("packfile sealed with all %d slots full (total full packs: %d)", p.slots, count)
 	}
 	p.sealed = true
 	sort.Slice(p.entries, func(i, j int) bool {
