@@ -21,11 +21,11 @@ import (
 	"errors"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
-	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
@@ -37,31 +37,44 @@ import (
 
 // BufferTest wraps an in-process WAL buffer server running over bufconn.
 type BufferTest struct {
-	Server   *buffer.Server
-	Target   string
-	DialOpts []grpc.DialOption
-	Client   pb.WalBufferClient
-	Backend  objectstore.Backend
-	DataDir  string
-	conn     *grpc.ClientConn
-	grpcSrv  *grpc.Server
-	listener *bufconn.Listener
+	Server    *buffer.Server
+	Target    string
+	DialOpts  []grpc.DialOption
+	Client    pb.WalBufferClient
+	Backend   objectstore.Backend
+	DataDir   string
+	conn      *grpc.ClientConn
+	grpcSrv   *grpc.Server
+	listener  *bufconn.Listener
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Close stops the buffer server and closes connections and listeners.
-func (bt *BufferTest) Close() {
-	if bt.conn != nil {
-		errutil.CloseAndLog(bt.conn, "buffertest client connection")
-	}
-	if bt.grpcSrv != nil {
-		bt.grpcSrv.Stop()
-	}
-	if bt.Server != nil {
-		errutil.CloseAndLog(bt.Server, "buffertest server")
-	}
-	if bt.listener != nil {
-		errutil.CloseAndLog(bt.listener, "buffertest listener")
-	}
+func (bt *BufferTest) Close() error {
+	bt.closeOnce.Do(func() {
+		var errs []error
+		if bt.conn != nil {
+			if err := bt.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+		if bt.grpcSrv != nil {
+			bt.grpcSrv.Stop()
+		}
+		if bt.Server != nil {
+			if err := bt.Server.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if bt.listener != nil {
+			if err := bt.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+		bt.closeErr = errors.Join(errs...)
+	})
+	return bt.closeErr
 }
 
 // Option configures BufferTest options.
@@ -220,7 +233,13 @@ func Start(ctx context.Context, t testing.TB, opts ...Option) (*BufferTest, func
 	}
 
 	cleanup := func() {
-		bt.Close()
+		if err := bt.Close(); err != nil {
+			if t != nil {
+				t.Fatalf("buffertest: close failed: %v", err)
+			} else {
+				klog.Warningf("buffertest: close failed: %v", err)
+			}
+		}
 	}
 
 	if t != nil {

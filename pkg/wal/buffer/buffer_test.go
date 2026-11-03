@@ -1280,3 +1280,30 @@ func TestPerStreamTailInvalidStreamID(t *testing.T) {
 	}
 	_ = srv
 }
+
+func TestServerClose_WaitsForLoopGoroutines(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       t.TempDir(),
+		FlushInterval: 10 * time.Millisecond,
+		BatchMaxDelay: 1 * time.Millisecond,
+		NoFsync:       true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if loops := srv.ActiveLoops(); loops != 2 {
+		t.Fatalf("expected 2 active loops running, got %d", loops)
+	}
+
+	if err := srv.Close(); err != nil {
+		t.Fatalf("server Close failed: %v", err)
+	}
+
+	if loops := srv.ActiveLoops(); loops != 0 {
+		t.Fatalf("expected 0 active loops after Close, got %d", loops)
+	}
+}

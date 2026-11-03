@@ -76,7 +76,7 @@ func TestStageAndSync_SinglePackMultiInode(t *testing.T) {
 	ctx := t.Context()
 	rawBackend := NewMemoryBackend()
 	backend := newRecordingBackend(rawBackend)
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-single-pack-vol"
 	defer func() { _ = server.Close() }()
 
@@ -172,7 +172,7 @@ func TestStageAndSync_SinglePackMultiInode(t *testing.T) {
 // until Fsync, and immediately sees the new content after Fsync.
 func TestStageAndSync_CrossNodeVisibility(t *testing.T) {
 	ctx := t.Context()
-	server := NewTestServer(NewMemoryBackend())
+	server := NewTestServer(t, NewMemoryBackend())
 	volumeID := "test-cross-node-vol"
 	defer func() { _ = server.Close() }()
 
@@ -249,7 +249,7 @@ func TestStageAndSync_ControllerCrashBeforeSyncRePush(t *testing.T) {
 
 	// Initial session
 	clientDir1 := t.TempDir()
-	server1 := NewTestServer(backend, WithServerWAL(clientDir1, target, walclient.Witness))
+	server1 := NewTestServer(t, backend, WithServerWAL(clientDir1, target, walclient.Witness))
 	initialData := []byte("persisted-initial-data")
 	cResp, err := testCreateFile(ctx, server1, volumeID, "/file.txt", 0644, initialData, 0, 0)
 	if err != nil || cResp.GetError() != 0 {
@@ -276,7 +276,7 @@ func TestStageAndSync_ControllerCrashBeforeSyncRePush(t *testing.T) {
 
 	// Server 2 starts up (new controller instance with same backend & wal-buffer)
 	clientDir2 := t.TempDir()
-	server2 := NewTestServer(backend, WithServerWAL(clientDir2, target, walclient.Witness))
+	server2 := NewTestServer(t, backend, WithServerWAL(clientDir2, target, walclient.Witness))
 	defer func() { _ = server2.Close() }()
 
 	// Client calls Fsync using oldEpoch: must fail with ESTALE
@@ -336,7 +336,7 @@ func TestStageAndSync_ControllerCrashBeforeSyncRePush(t *testing.T) {
 // truncate-then-write composition with staging.
 func TestStageAndSync_TruncateComposition(t *testing.T) {
 	ctx := t.Context()
-	server := NewTestServer(NewMemoryBackend())
+	server := NewTestServer(t, NewMemoryBackend())
 	volumeID := "test-trunc-comp-vol"
 	defer func() { _ = server.Close() }()
 
@@ -461,7 +461,7 @@ func TestStageAndSync_CoalesceWindowBurst(t *testing.T) {
 	ctx := t.Context()
 	rawBackend := NewMemoryBackend()
 	backend := newRecordingBackend(rawBackend)
-	server := NewTestServer(backend, WithServerSyncCoalesceWindow(200*time.Millisecond))
+	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(200*time.Millisecond))
 	volumeID := "test-coalesce-burst-vol"
 	defer func() { _ = server.Close() }()
 
@@ -517,7 +517,7 @@ func TestStageAndSync_BlockingFsyncPreemptsCoalesceWindow(t *testing.T) {
 	rawBackend := NewMemoryBackend()
 	backend := newRecordingBackend(rawBackend)
 	// Long coalesce window (5 seconds)
-	server := NewTestServer(backend, WithServerSyncCoalesceWindow(5*time.Second))
+	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(5*time.Second))
 	volumeID := "test-preempt-window-vol"
 	defer func() { _ = server.Close() }()
 
@@ -575,7 +575,7 @@ func TestStageAndSync_CloseTriggerStartsCoalescedSyncImmediately(t *testing.T) {
 	rawBackend := NewMemoryBackend()
 	backend := newRecordingBackend(rawBackend)
 	// 10s coalesce window so any difference is unambiguous
-	server := NewTestServer(backend, WithServerSyncCoalesceWindow(10*time.Second))
+	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(10*time.Second))
 	defer func() { _ = server.Close() }()
 
 	// 1. Periodic non-blocking Fsync: must wait for the coalesce window
@@ -649,7 +649,7 @@ func TestStageAndSync_CloseTriggerPreemptsActiveWindow(t *testing.T) {
 	rawBackend := NewMemoryBackend()
 	backend := newRecordingBackend(rawBackend)
 	// 10s coalesce window so any difference is unambiguous
-	server := NewTestServer(backend, WithServerSyncCoalesceWindow(10*time.Second))
+	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(10*time.Second))
 	volumeID := "test-close-preempt-window-vol"
 	defer func() { _ = server.Close() }()
 
@@ -724,7 +724,7 @@ func TestStageAndSync_TenConcurrentCloseRequestsCoalesceIntoOnePack(t *testing.T
 	ctx := t.Context()
 	rawBackend := NewMemoryBackend()
 	backend := newRecordingBackend(rawBackend)
-	server := NewTestServer(backend, WithServerSyncCoalesceWindow(10*time.Second))
+	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(10*time.Second))
 	volumeID := "test-ten-concurrent-close-vol"
 	defer func() { _ = server.Close() }()
 
@@ -790,7 +790,7 @@ func TestStageAndSync_CloseTriggerSyncsOnlyClosedInodeLeavesStagedWindow(t *test
 	rawBackend := NewMemoryBackend()
 	backend := newRecordingBackend(rawBackend)
 	// 500ms coalesce window so the periodic window sync fires without a long delay
-	server := NewTestServer(backend, WithServerSyncCoalesceWindow(500*time.Millisecond))
+	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(500*time.Millisecond))
 	volumeID := "test-close-per-inode-vol"
 	defer func() { _ = server.Close() }()
 
@@ -901,7 +901,7 @@ func TestStageAndSync_NonBlockingSyncFailureSurfacesOnBlockingFsync(t *testing.T
 	ctx := t.Context()
 	rawBackend := NewMemoryBackend()
 	backend := newRecordingBackend(rawBackend)
-	server := NewTestServer(backend, WithServerSyncCoalesceWindow(50*time.Millisecond))
+	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(50*time.Millisecond))
 	volumeID := "test-error-surface-vol"
 	defer func() { _ = server.Close() }()
 
@@ -942,7 +942,7 @@ func TestStageAndSync_NonBlockingSyncFailureSurfacesOnBlockingFsync(t *testing.T
 // in-memory staging cap rejects writes when exceeded.
 func TestStageAndSync_MaxStagingBytesEnforced(t *testing.T) {
 	ctx := t.Context()
-	server := NewTestServer(NewMemoryBackend(), WithServerMaxStagingBytes(128*1024))
+	server := NewTestServer(t, NewMemoryBackend(), WithServerMaxStagingBytes(128*1024))
 	volumeID := "test-staging-cap-vol"
 	defer func() { _ = server.Close() }()
 
@@ -999,7 +999,7 @@ func TestStageAndSync_EmptyCoalesceTimerFireDoesNotDeadlock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	s := NewTestServer(NewMemoryBackend(), WithServerSyncCoalesceWindow(50*time.Millisecond))
+	s := NewTestServer(t, NewMemoryBackend(), WithServerSyncCoalesceWindow(50*time.Millisecond))
 	vol := "test-empty-coalesce-vol"
 	defer func() { _ = s.Close() }()
 
@@ -1066,7 +1066,7 @@ func TestStageAndSync_NonBlockingSyncWaiterNotAcknowledgedByEarlierSync(t *testi
 		ObjectStorageBackend: rawBackend,
 		gate:                 make(chan struct{}),
 	}
-	s := NewTestServer(gateBackend, WithServerSyncCoalesceWindow(50*time.Millisecond))
+	s := NewTestServer(t, gateBackend, WithServerSyncCoalesceWindow(50*time.Millisecond))
 	vol := "test-waiter-seq-vol"
 	defer func() { _ = s.Close() }()
 
@@ -1133,7 +1133,7 @@ func TestFsyncDurability_WithWAL_DurableAcrossRestart(t *testing.T) {
 
 	clientDir1 := t.TempDir()
 	volumeID := "test-durability-with-wal"
-	server1 := NewTestServer(backend, WithServerWAL(clientDir1, target, walclient.Witness))
+	server1 := NewTestServer(t, backend, WithServerWAL(clientDir1, target, walclient.Witness))
 
 	// 1. Create /f and snapshot initial state
 	createResp, err := testCreateFile(ctx, server1, volumeID, "/f", 0644, nil, 0, 0)
@@ -1172,7 +1172,7 @@ func TestFsyncDurability_WithWAL_DurableAcrossRestart(t *testing.T) {
 
 	// 4. Recover on server2 from backend + WAL
 	clientDir2 := t.TempDir()
-	server2 := NewTestServer(backend, WithServerWAL(clientDir2, target, walclient.Witness))
+	server2 := NewTestServer(t, backend, WithServerWAL(clientDir2, target, walclient.Witness))
 	defer func() { _ = server2.Close() }()
 
 	readResp2, err := testReadFile(ctx, server2, volumeID, "/f", 0, 1024)
@@ -1206,7 +1206,7 @@ func (b *blockingPutBackend) PutObject(ctx context.Context, volumeID, key string
 func TestOpenBarrier_StagedInodeBlocksAndReturnsFreshAttrs(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-barrier-staged-vol"
@@ -1277,7 +1277,7 @@ func TestOpenBarrier_StagedInodeBlocksAndReturnsFreshAttrs(t *testing.T) {
 func TestOpenBarrier_CleanInodeDoesNotBlock(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-barrier-clean-vol"
@@ -1341,7 +1341,7 @@ func TestOpenBarrier_TimeoutReturnsEIO(t *testing.T) {
 		ObjectStorageBackend: NewMemoryBackend(),
 		blockCh:              make(chan struct{}),
 	}
-	server := NewTestServer(blockingBackend, WithServerOpenBarrierTimeout(50*time.Millisecond))
+	server := NewTestServer(t, blockingBackend, WithServerOpenBarrierTimeout(50*time.Millisecond))
 	defer func() {
 		close(blockingBackend.blockCh)
 		_ = server.Close()
@@ -1395,7 +1395,7 @@ func (f *fakeCloseStream) Close() error { return nil }
 func TestOpenBarrier_DegradedReturnsEIOImmediately(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-barrier-degraded-vol"
@@ -1454,7 +1454,7 @@ func (m *mockWatchStream) Send(*pb.WatchVolumeResponse) error {
 func TestWatchVolume_ConflictingConsistencyModeRejected(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-watch-conflict-vol"
@@ -1518,7 +1518,7 @@ func TestOpenBarrier_SurvivesControllerRestartOverSameMetadataDir(t *testing.T) 
 	walDir := t.TempDir()
 
 	// 1. Controller 1 starts with metadataDir and creates close-to-open volume
-	server1 := NewTestServer(backend,
+	server1 := NewTestServer(t, backend,
 		WithServerMetadataDir(metaDir),
 		WithServerMetadataIndex("sqlite"),
 		WithServerWAL(walDir, bt.Target, walclient.Witness),
@@ -1578,7 +1578,7 @@ func TestOpenBarrier_SurvivesControllerRestartOverSameMetadataDir(t *testing.T) 
 	}
 
 	// 2. Controller 2 starts with same metadataDir over the same backend
-	server2 := NewTestServer(backend,
+	server2 := NewTestServer(t, backend,
 		WithServerMetadataDir(metaDir),
 		WithServerMetadataIndex("sqlite"),
 		WithServerWAL(walDir, bt.Target, walclient.Witness),

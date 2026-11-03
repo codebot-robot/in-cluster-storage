@@ -17,8 +17,10 @@ limitations under the License.
 package controller
 
 import (
-	"context"
 	"os"
+	"runtime"
+	"strings"
+	"testing"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -28,19 +30,23 @@ import (
 // NewTestServer constructs a Server configured for testing with an in-process WAL buffer over bufconn,
 // skipping per-record WAL fsync.
 // The production controller binary uses NewServer, which always retains per-record fsync.
-func NewTestServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
+func NewTestServer(t testing.TB, backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if target := InspectServerTarget(opts...); target != "" {
 		opts = append([]ServerOption{WithServerWithoutFsync()}, opts...)
 		return NewServer(backend, opts...)
 	}
 
-	// The buffer's lifetime is bounded by the returned cleanup, not by a test context.
-	ctx := context.Background()
-	bt, cleanup := buffertest.Start(ctx, nil, buffertest.WithBackend(backend))
+	ctx := t.Context()
+	bt, cleanup := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
 	walDir, err := os.MkdirTemp("", "controllertest-wal-*")
 	if err != nil {
 		panic(err)
 	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(walDir); err != nil {
+			klog.V(4).Infof("failed to remove test walDir %s: %v", walDir, err)
+		}
+	})
 	combinedCleanup := func() {
 		cleanup()
 		if err := os.RemoveAll(walDir); err != nil {
@@ -57,4 +63,23 @@ func NewTestServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	}
 	testOpts = append(testOpts, opts...)
 	return NewServer(backend, testOpts...)
+}
+
+func TestNewTestServer_CleanupWaitsForBufferLoops(t *testing.T) {
+	t.Run("subtest_without_explicit_close", func(t *testing.T) {
+		backend := NewMemoryBackend()
+		_ = NewTestServer(t, backend)
+	})
+
+	// After subtest completion, its t.Cleanup must have stopped the WAL buffer.
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	stacks := string(buf[:n])
+
+	if strings.Contains(stacks, "periodicFlushLoop") {
+		t.Fatalf("periodicFlushLoop still running after test return:\n%s", stacks)
+	}
+	if strings.Contains(stacks, "groupCommitLoop") {
+		t.Fatalf("groupCommitLoop still running after test return:\n%s", stacks)
+	}
 }

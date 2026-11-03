@@ -24,6 +24,7 @@ import (
 	"io"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
@@ -124,7 +125,11 @@ type Server struct {
 
 	stopChan chan struct{}
 	stopOnce sync.Once
-	wg       sync.WaitGroup
+
+	groupCommitWg     sync.WaitGroup
+	periodicFlushWg   sync.WaitGroup
+	backgroundFlushWg sync.WaitGroup
+	activeLoops       atomic.Int32
 }
 
 // NewServer creates and initializes a new WAL buffer Server.
@@ -301,16 +306,36 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	s.checkAggregatedSegmentGC(ctx)
 
 	// Start background group commit worker
-	s.wg.Add(1)
+	s.groupCommitWg.Add(1)
+	s.activeLoops.Add(1)
 	go s.groupCommitLoop()
 
 	// Start background flush worker
 	if cfg.FlushInterval > 0 {
-		s.wg.Add(1)
+		s.periodicFlushWg.Add(1)
+		s.activeLoops.Add(1)
 		go s.periodicFlushLoop(cfg.FlushInterval)
 	}
 
 	return s, nil
+}
+
+const loopShutdownTimeout = 5 * time.Second
+
+func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration, name string) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("buffer loop %s timed out waiting to exit", name)
+	}
 }
 
 // Close gracefully stops workers, flushes to permanent storage, and closes local stores.
@@ -332,9 +357,17 @@ func (s *Server) Close() error {
 		st.mu.Unlock()
 	}
 	s.mu.RUnlock()
-	s.wg.Wait()
 
 	var errs []error
+	if err := waitWithTimeout(&s.groupCommitWg, loopShutdownTimeout, "groupCommitLoop"); err != nil {
+		errs = append(errs, err)
+	}
+	if err := waitWithTimeout(&s.periodicFlushWg, loopShutdownTimeout, "periodicFlushLoop"); err != nil {
+		errs = append(errs, err)
+	}
+	if err := waitWithTimeout(&s.backgroundFlushWg, loopShutdownTimeout, "backgroundFlush"); err != nil {
+		errs = append(errs, err)
+	}
 
 	// Perform a final flush on shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -656,7 +689,8 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 }
 
 func (s *Server) groupCommitLoop() {
-	defer s.wg.Done()
+	defer s.groupCommitWg.Done()
+	defer s.activeLoops.Add(-1)
 
 	ticker := time.NewTicker(s.cfg.BatchMaxDelay)
 	defer ticker.Stop()
@@ -792,7 +826,14 @@ func (s *Server) commitItems(items []incomingItem) {
 	}
 
 	if triggerFlush {
+		s.backgroundFlushWg.Add(1)
 		go func() {
+			defer s.backgroundFlushWg.Done()
+			select {
+			case <-s.stopChan:
+				return
+			default:
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if _, err := s.flushInternal(ctx); err != nil {
@@ -807,8 +848,14 @@ func (s *Server) Flush(ctx context.Context, req *pb.FlushRequest) (*pb.FlushResp
 	return s.flushInternal(ctx)
 }
 
+// ActiveLoops returns the number of active background loop goroutines.
+func (s *Server) ActiveLoops() int {
+	return int(s.activeLoops.Load())
+}
+
 func (s *Server) periodicFlushLoop(interval time.Duration) {
-	defer s.wg.Done()
+	defer s.periodicFlushWg.Done()
+	defer s.activeLoops.Add(-1)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

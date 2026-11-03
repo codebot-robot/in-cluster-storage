@@ -356,7 +356,7 @@ func MustNewVolume(t testing.TB, volumeID string, backend ObjectStorageBackend, 
 func TestControllerServiceOperations(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-vol-1"
 
 	// 1. Root attribute
@@ -565,7 +565,7 @@ func TestControllerServiceOperations(t *testing.T) {
 func TestServerRmdirAndUnlinkErrorCodes(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-error-codes-vol"
 
 	// Create /parent/child.txt
@@ -634,7 +634,7 @@ func TestServerRmdirAndUnlinkErrorCodes(t *testing.T) {
 func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-flush-vol"
 
 	// Create files
@@ -692,7 +692,7 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 
 	// Test Recovery / LoadFromBackend
 	// Create a new server pointing to the same backend
-	newServer := NewTestServer(backend)
+	newServer := NewTestServer(t, backend)
 	readResp, err := testReadFile(ctx, newServer, volumeID, "/file2.txt", 0, 100)
 	if err != nil {
 		t.Fatalf("Failed to read file2 from recovered server: %v", err)
@@ -711,7 +711,7 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 func TestPeriodicFlusherLifecycle(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-periodic-vol"
 
 	server.StartPeriodicFlush(ctx, 10*time.Millisecond)
@@ -727,7 +727,7 @@ func TestPeriodicFlusherLifecycle(t *testing.T) {
 	server.StopPeriodicFlush()
 
 	// Verify recovered server reads the auto-flushed file
-	newServer := NewTestServer(backend)
+	newServer := NewTestServer(t, backend)
 	readResp, err := testReadFile(ctx, newServer, volumeID, "/auto-flushed.txt", 0, 100)
 	if err != nil {
 		t.Fatalf("Failed to read auto-flushed file from recovered server: %v", err)
@@ -740,7 +740,7 @@ func TestPeriodicFlusherLifecycle(t *testing.T) {
 func TestConcurrentFlusherAndMutationsRace(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-flusher-race-vol"
 
 	server.StartPeriodicFlush(ctx, 5*time.Millisecond)
@@ -757,7 +757,7 @@ func TestConcurrentFlusherAndMutationsRace(t *testing.T) {
 
 func TestControllerPushNotifications(t *testing.T) {
 	ctx := t.Context()
-	server := NewTestServer(nil)
+	server := NewTestServer(t, nil)
 	volumeID := "test-watch-vol"
 
 	ch := server.broadcaster.Subscribe(volumeID)
@@ -838,7 +838,7 @@ func TestEventBroadcasterSlowSubscriber(t *testing.T) {
 
 func TestConcurrentAttributeMutationAndReadRace(t *testing.T) {
 	ctx := t.Context()
-	server := NewTestServer(nil, WithServerMetadataApplierBatchSize(5))
+	server := NewTestServer(t, nil, WithServerMetadataApplierBatchSize(5))
 	volumeID := "test-race-vol"
 
 	// Create test files
@@ -1168,7 +1168,7 @@ func TestMutationCheckCatchesInPlaceInodeModification(t *testing.T) {
 func TestSnapshotCreationAndRecovery(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-snap-vol"
 
 	// Create a nested directory hierarchy and files
@@ -1230,7 +1230,7 @@ func TestSnapshotCreationAndRecovery(t *testing.T) {
 	}
 
 	// 4. Test Recovery on a new Server instance using only the backend
-	newServer := NewTestServer(backend)
+	newServer := NewTestServer(t, backend)
 
 	// Verify directory structure on recovered server
 	dirResp, err := testReadDir(ctx, newServer, volumeID, "/data")
@@ -1270,7 +1270,7 @@ func TestSnapshotCreationAndRecovery(t *testing.T) {
 func TestSnapshotRollback(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-rollback-vol"
 
 	// State 1: create v1
@@ -1359,7 +1359,7 @@ func TestSnapshotRollback(t *testing.T) {
 func TestSnapshotRestoreDurableAcrossRestart(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server1 := NewTestServer(backend)
+	server1 := NewTestServer(t, backend)
 	volumeID := "test-restore-durable-restart"
 
 	// create /doc.txt "version 1 data"; CreateSnapshot s1
@@ -1397,8 +1397,8 @@ func TestSnapshotRestoreDurableAcrossRestart(t *testing.T) {
 		t.Fatalf("in-process read got %q, want %q", string(readResp1.Data), "version 1 data")
 	}
 
-	// NewTestServer(backend) read: "version 1 data" (not "version 2 data overwritten")
-	server2 := NewTestServer(backend)
+	// NewTestServer(t, backend) read: "version 1 data" (not "version 2 data overwritten")
+	server2 := NewTestServer(t, backend)
 	readResp2, err := testReadFile(ctx, server2, volumeID, "/doc.txt", 0, 1024)
 	if err != nil {
 		t.Fatalf("recovered server ReadFile failed: %v", err)
@@ -1414,7 +1414,7 @@ func TestSnapshotRestoreWriteThenRestart(t *testing.T) {
 	backend := NewMemoryBackend()
 	volumeID := "test-restore-write-restart"
 
-	server1 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server1 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 
 	// Create v1
 	_, err := testCreateFile(ctx, server1, volumeID, "/doc.txt", 0644, []byte("version 1 data"), 0, 0)
@@ -1462,7 +1462,7 @@ func TestSnapshotRestoreWriteThenRestart(t *testing.T) {
 	_ = server1.Close()
 
 	// Restart controller from backend + WAL
-	server2 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 	defer func() { _ = server2.Close() }()
 
 	// Read /doc.txt -> should be post-restore write ("version 3 data post-restore")
@@ -1499,7 +1499,7 @@ func TestSnapshotRestoreRebuildFromLog(t *testing.T) {
 	backend := NewMemoryBackend()
 	volumeID := "test-restore-rebuild-log"
 
-	server1 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server1 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 
 	// 1. Create file & snapshot s1
 	_, err := testCreateFile(ctx, server1, volumeID, "/file1.txt", 0644, []byte("file 1 initial"), 0, 0)
@@ -1587,7 +1587,7 @@ func TestSnapshotRestoreRebuildFromLog(t *testing.T) {
 	_ = server1.Close()
 
 	// Compare with fresh recovered server
-	server2 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 	defer func() { _ = server2.Close() }()
 
 	read1, err := testReadFile(ctx, server2, volumeID, "/file1.txt", 0, 1024)
@@ -1613,7 +1613,7 @@ func TestVolume_RebuildIndexTargetlessWALStream(t *testing.T) {
 	volumeID := "test-targetless-rebuild"
 
 	// Create server with default targetless WAL stream (walDir unset, only localStorageDir set)
-	server := NewTestServer(backend,
+	server := NewTestServer(t, backend,
 		WithServerLocalStorageDir(localDir),
 		WithServerMetadataIndex("sqlite"),
 	)
@@ -1685,7 +1685,7 @@ func TestSnapshotRestoreInodeMonotonicity(t *testing.T) {
 	backend := NewMemoryBackend()
 	volumeID := "test-restore-inode-monotonic"
 
-	server1 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server1 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 
 	// 1. Create file 1 and take snapshot s1
 	f1Attr, err := testCreateFile(ctx, server1, volumeID, "/file1.txt", 0644, []byte("f1"), 0, 0)
@@ -1737,7 +1737,7 @@ func TestSnapshotRestoreInodeMonotonicity(t *testing.T) {
 	_ = server1.Close()
 
 	// 5. Restart controller and create another file after recovery
-	server2 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 	defer func() { _ = server2.Close() }()
 
 	fRestartAttr, err := testCreateFile(ctx, server2, volumeID, "/file_restart.txt", 0644, []byte("frestart"), 0, 0)
@@ -1754,7 +1754,7 @@ func TestSnapshotRestoreInodeMonotonicity(t *testing.T) {
 func TestCSIControllerOperations(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	csiController := NewCSIController(server)
 
 	// 1. GetPluginInfo
@@ -1867,7 +1867,7 @@ func (t *testGetBlobServer) Send(resp *pb.GetBlobResponse) error {
 func TestControllerListBlobsAndGetBlob(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-blob-vol"
 
 	content1 := bytes.Repeat([]byte("blob data content number 1 "), 300)
@@ -1972,7 +1972,7 @@ func TestControllerListBlobsAndGetBlob(t *testing.T) {
 func TestListVolumes(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 
 	// 1. Empty server returns empty list
 	resp, err := server.ListVolumes(ctx, &pb.ListVolumesRequest{})
@@ -2029,7 +2029,7 @@ func TestListVolumes(t *testing.T) {
 	if err := server.FlushAll(ctx); err != nil {
 		t.Fatalf("FlushAll failed: %v", err)
 	}
-	recoveredServer := NewTestServer(backend)
+	recoveredServer := NewTestServer(t, backend)
 	recResp, err := recoveredServer.ListVolumes(ctx, &pb.ListVolumesRequest{})
 	if err != nil {
 		t.Fatalf("recovered server ListVolumes failed: %v", err)
@@ -2042,7 +2042,7 @@ func TestListVolumes(t *testing.T) {
 func TestSnapshotsServicePagination(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 
 	// 1. Validation errors
 	if _, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{}); err == nil {
@@ -2199,7 +2199,7 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	ctx := t.Context()
 	walDir := t.TempDir()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 	defer func() { _ = server.Close() }()
 
 	volumeID := "wal-vol-test"
@@ -2290,7 +2290,7 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	volumeID := "recovery-vol"
 
 	// Step 1: Initialize server 1 and perform initial changes
-	server1 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server1 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 	_, err := testMkdir(ctx, server1, volumeID, "/base", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("server1 Mkdir failed: %v", err)
@@ -2325,7 +2325,7 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	_ = server1.Close()
 
 	// Step 4: Start new server instance with same backend and walDir
-	server2 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 	defer func() { _ = server2.Close() }()
 
 	vol2 := mustGetVolume(t, server2, volumeID)
@@ -2377,7 +2377,7 @@ func TestStreamsDurabilityModes(t *testing.T) {
 	volumeID := "durability-vol"
 
 	// Create server with Witness durability
-	server := NewTestServer(backend, WithServerWAL(clientDir, target, walclient.Witness))
+	server := NewTestServer(t, backend, WithServerWAL(clientDir, target, walclient.Witness))
 	defer func() { _ = server.Close() }()
 
 	ctx := t.Context()
@@ -2631,7 +2631,7 @@ func TestTargetlessWALDurabilityLocalOnly(t *testing.T) {
 	walDir := t.TempDir()
 	backend := NewMemoryBackend()
 	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
-	server := NewTestServer(backend,
+	server := NewTestServer(t, backend,
 		WithServerWAL(walDir, bt.Target, walclient.Local),
 		WithServerWALDialOptions(bt.DialOpts...),
 	)
@@ -2760,7 +2760,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 	}
 
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend,
+	server := NewTestServer(t, backend,
 		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
 			return fakeStream, nil
 		}),
@@ -2854,7 +2854,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 		waitCalled:   make(chan struct{}, 10),
 		waitGate:     make(chan struct{}),
 	}
-	server2 := NewTestServer(backend,
+	server2 := NewTestServer(t, backend,
 		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
 			return fakeStream2, nil
 		}),
@@ -2909,7 +2909,7 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 	}
 
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend,
+	server := NewTestServer(t, backend,
 		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
 			return fakeStream, nil
 		}),
@@ -3178,7 +3178,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 func TestStableInodeNumbersAcrossSnapshots(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "stable-ino-vol"
 
 	// 1. Create a directory /dir1 and file /file1.txt and /dir1/file2.txt
@@ -3295,7 +3295,7 @@ func TestSDSStepReplayScratch(t *testing.T) {
 	volumeID := "sds-replay-vol"
 
 	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
-	server := NewTestServer(backend,
+	server := NewTestServer(t, backend,
 		WithServerWAL(walDir, bt.Target, walclient.Witness),
 		WithServerWALDialOptions(bt.DialOpts...),
 	)
@@ -3446,7 +3446,7 @@ func TestSDSCatOnObjectFSStream(t *testing.T) {
 	backend := NewMemoryBackend()
 	volumeID := "sds-cat-vol"
 
-	server := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 
 	// Perform changes that register Inode, DirEntry, Content
 	_, err := testMkdir(ctx, server, volumeID, "/cats", 0755, 0, 0)
@@ -3522,7 +3522,7 @@ func TestSDSCatOnObjectFSStream(t *testing.T) {
 func TestTruncateUpwardAndSparseRead(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-vol-truncate"
 
 	// Create a file with small initial content
@@ -3566,7 +3566,7 @@ func TestTruncateUpwardAndSparseRead(t *testing.T) {
 func TestLargeFileBlobFirstAndSparseWrite(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "large-vol"
 	defer server.Close()
 
@@ -3651,7 +3651,7 @@ func TestLargeFileBlobFirstAndSparseWrite(t *testing.T) {
 func TestWriteThenTruncateAndUnlinkOrdering(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "order-vol"
 	defer server.Close()
 
@@ -3718,7 +3718,7 @@ func TestWriteThenTruncateAndUnlinkOrdering(t *testing.T) {
 func TestTinyFileInlineLogging(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "tiny-vol"
 	defer server.Close()
 
@@ -3748,7 +3748,7 @@ func TestTinyFileInlineLogging(t *testing.T) {
 func TestHugeSparseTruncateAndUnlink(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "huge-vol"
 	defer server.Close()
 
@@ -3809,7 +3809,7 @@ func TestHugeSparseTruncateAndUnlink(t *testing.T) {
 func TestSetAttrAndMetadataTimestamps(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-setattr-ts-vol"
 
 	// Create a test file
@@ -3888,7 +3888,7 @@ func TestSetAttrAndMetadataTimestamps(t *testing.T) {
 func TestSetgidInheritance(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-setgid-vol"
 
 	// Create parent directory with setgid bit (02770) and GID 3000
@@ -3936,7 +3936,7 @@ func TestSetgidInheritance(t *testing.T) {
 func TestTarExtractionPreservation(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-tar-extract-vol"
 
 	// Create an in-memory tar archive with various modes, owners, timestamps
@@ -4091,7 +4091,7 @@ func TestSnapshotRestartRecoveryFromSnapshotPlusStream(t *testing.T) {
 	volumeID := "test-sds-restart-recovery"
 
 	// 1. Initial server instance
-	server1 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server1 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 
 	_, err := testMkdir(ctx, server1, volumeID, "/base", 0755, 0, 0)
 	if err != nil {
@@ -4133,7 +4133,7 @@ func TestSnapshotRestartRecoveryFromSnapshotPlusStream(t *testing.T) {
 	_ = server1.Close()
 
 	// 4. Start second server instance simulating crash restart recovery
-	server2 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 
 	// Verify volume recovered from snapshot + stream suffix
 	vol2 := mustGetVolume(t, server2, volumeID)
@@ -4197,7 +4197,7 @@ func TestSnapshotSafePositionAndS3Watermark(t *testing.T) {
 	backend := NewMemoryBackend()
 	volumeID := "test-sds-safe-watermark"
 
-	server := NewTestServer(backend, WithServerWAL(clientDir, target, walclient.Permanent))
+	server := NewTestServer(t, backend, WithServerWAL(clientDir, target, walclient.Permanent))
 	defer func() { _ = server.Close() }()
 
 	// 1. Create file with Permanent durability
@@ -4240,7 +4240,7 @@ func TestSnapshotSafePositionAndS3Watermark(t *testing.T) {
 func TestNameLengthLimit(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "vol-name-limit"
 
 	validNames := map[string]string{
@@ -4460,7 +4460,7 @@ func TestNameLengthLimit(t *testing.T) {
 func TestControllerMknodSpecialFiles(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-mknod-vol"
 
 	// Create a FIFO
@@ -4593,7 +4593,7 @@ func TestServerMetadataDirPersistenceAcrossRestart(t *testing.T) {
 	volumeID := "test-server-persistence-vol"
 
 	// 1. First server instance writes files
-	server1 := NewTestServer(backend,
+	server1 := NewTestServer(t, backend,
 		WithServerWAL(walDir, "", walclient.Local),
 		WithServerMetadataDir(metadataDir),
 	)
@@ -4621,7 +4621,7 @@ func TestServerMetadataDirPersistenceAcrossRestart(t *testing.T) {
 	}
 
 	// 2. Second server instance starts with same WAL and metadata dirs
-	server2 := NewTestServer(backend,
+	server2 := NewTestServer(t, backend,
 		WithServerWAL(walDir, "", walclient.Local),
 		WithServerMetadataDir(metadataDir),
 	)
@@ -4688,7 +4688,7 @@ func TestVolumeIDValidation(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	server := NewTestServer(NewMemoryBackend())
+	server := NewTestServer(t, NewMemoryBackend())
 	for _, id := range invalidIDs {
 		_, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: id, Inode: 1})
 		if err == nil {
@@ -4713,7 +4713,7 @@ func TestAuthoritativeRecoveryOnNewNodeWithoutSnapshot(t *testing.T) {
 	// 1. Controller 1 starts on Node 1 (walDir1, metaDir1) with Witness durability
 	walDir1 := t.TempDir()
 	metaDir1 := t.TempDir()
-	server1 := NewTestServer(backend,
+	server1 := NewTestServer(t, backend,
 		WithServerWAL(walDir1, target, walclient.Witness),
 		WithServerMetadataDir(metaDir1),
 		WithServerMetadataIndex("sqlite"),
@@ -4743,7 +4743,7 @@ func TestAuthoritativeRecoveryOnNewNodeWithoutSnapshot(t *testing.T) {
 	// 2. Controller 2 starts on Node 2 with EMPTY walDir2 and EMPTY metaDir2 against the same wal-buffer & backend
 	walDir2 := t.TempDir()
 	metaDir2 := t.TempDir()
-	server2 := NewTestServer(backend,
+	server2 := NewTestServer(t, backend,
 		WithServerWAL(walDir2, target, walclient.Witness),
 		WithServerMetadataDir(metaDir2),
 		WithServerMetadataIndex("sqlite"),
@@ -4780,7 +4780,7 @@ func TestAuthoritativeRecoveryOnNewNodeWithoutSnapshot(t *testing.T) {
 	// 4. Controller 3 starts on Node 3 (empty dirs again) and verifies all writes survive
 	walDir3 := t.TempDir()
 	metaDir3 := t.TempDir()
-	server3 := NewTestServer(backend,
+	server3 := NewTestServer(t, backend,
 		WithServerWAL(walDir3, target, walclient.Witness),
 		WithServerMetadataDir(metaDir3),
 		WithServerMetadataIndex("sqlite"),
@@ -4842,7 +4842,7 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 	// 2. Authoritative controller on Node 2 writes authoritative files to wal-buffer
 	node2WalDir := t.TempDir()
 	node2MetaDir := t.TempDir()
-	server2 := NewTestServer(backend,
+	server2 := NewTestServer(t, backend,
 		WithServerWAL(node2WalDir, target, walclient.Witness),
 		WithServerMetadataDir(node2MetaDir),
 		WithServerMetadataIndex("sqlite"),
@@ -4854,7 +4854,7 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 	_ = server2.Close()
 
 	// 3. Controller moves back to Node 1 with stale local WAL directory and stale SQLite DB
-	server1Restarted := NewTestServer(backend,
+	server1Restarted := NewTestServer(t, backend,
 		WithServerWAL(node1WalDir, target, walclient.Witness),
 		WithServerMetadataDir(node1MetaDir),
 		WithServerMetadataIndex("sqlite"),
@@ -5147,7 +5147,7 @@ func TestServerEIOOnError(t *testing.T) {
 	ctx := t.Context()
 	rawBackend := NewMemoryBackend()
 	backend := newChunkFaultBackend(rawBackend)
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-server-eio-vol"
 
 	// Create chunked file via server across 2 flushes
@@ -5239,7 +5239,7 @@ func TestServerEIOOnError(t *testing.T) {
 func TestTruncateZeroThenGrowReadsZeros(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-trunc-zero-grow"
 
 	createResp, err := testCreateFile(ctx, server, volumeID, "/f", 0644, nil, 0, 0)
@@ -5284,7 +5284,7 @@ func TestInlineToChunkedTransitionUploadsChunk0OnRestart(t *testing.T) {
 	backend := NewMemoryBackend()
 	volumeID := "test-inline-chunk-restart"
 
-	server1 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server1 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 	inlineData := []byte("hello-inline-world")
 	createResp, err := testCreateFile(ctx, server1, volumeID, "/file.txt", 0644, inlineData, 0, 0)
 	if err != nil || createResp.GetError() != 0 {
@@ -5320,7 +5320,7 @@ func TestInlineToChunkedTransitionUploadsChunk0OnRestart(t *testing.T) {
 	_ = server1.Close()
 
 	// Restart server from the same backend & WAL
-	server2 := NewTestServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
 	defer func() { _ = server2.Close() }()
 
 	readResp, err := server2.ReadFile(ctx, &pb.ReadFileRequest{
@@ -5342,7 +5342,7 @@ func TestInlineToChunkedTransitionUploadsChunk0OnRestart(t *testing.T) {
 
 func TestGetManifest(t *testing.T) {
 	ctx := t.Context()
-	server := NewTestServer(nil)
+	server := NewTestServer(t, nil)
 	volumeID := "test-manifest-vol"
 
 	// 1. Create small inline file
@@ -5416,7 +5416,7 @@ func TestGetManifest(t *testing.T) {
 func TestPunchHoleWholeChunks(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend, WithServerMutationCheck())
+	server := NewTestServer(t, backend, WithServerMutationCheck())
 	volumeID := "test-punch-whole-ctrl"
 
 	chunkSize := 64 * 1024
@@ -5498,7 +5498,7 @@ func TestPunchHoleWholeChunks(t *testing.T) {
 func TestPunchHolePartialEdgesAndGrowSize(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend, WithServerMutationCheck())
+	server := NewTestServer(t, backend, WithServerMutationCheck())
 	volumeID := "test-punch-edges-ctrl"
 
 	content := make([]byte, 150*1024)
@@ -5577,7 +5577,7 @@ func TestPunchHolePartialEdgesAndGrowSize(t *testing.T) {
 func TestPunchHoleStagedChunks(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend, WithServerMutationCheck())
+	server := NewTestServer(t, backend, WithServerMutationCheck())
 	volumeID := "test-punch-staged"
 
 	chunkSize := 64 * 1024
@@ -5633,7 +5633,7 @@ func TestPunchHoleStagedChunks(t *testing.T) {
 func TestPunchHoleChunkBoundaryCases(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend, WithServerMutationCheck())
+	server := NewTestServer(t, backend, WithServerMutationCheck())
 	volumeID := "test-punch-boundary-ctrl"
 
 	// Case 1: file size 128 KiB, punch [0, 10 KiB) (keep_size)
@@ -5755,7 +5755,7 @@ func TestPunchHoleChunkBoundaryCases(t *testing.T) {
 func TestPunchHoleStagedWriteKeepsSize(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend, WithServerMutationCheck())
+	server := NewTestServer(t, backend, WithServerMutationCheck())
 	volumeID := "test-punch-staged-size"
 
 	chunkSize := 64 * 1024
@@ -5813,7 +5813,7 @@ func TestPunchHoleStagedWriteKeepsSize(t *testing.T) {
 func TestControllerCheckpointRPC(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	volumeID := "test-checkpoint-rpc-vol"
 
 	// 1. Empty volume_id returns error
@@ -5962,7 +5962,7 @@ func TestControllerWALStreamDegraded(t *testing.T) {
 		streamID: streamID1,
 	}
 
-	server := NewTestServer(storage,
+	server := NewTestServer(t, storage,
 		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
 			if volumeID == vol1ID {
 				return faultStream1, nil
@@ -6343,7 +6343,7 @@ func TestSharedWALBufferConnectionAcrossVolumes(t *testing.T) {
 
 	clientDir := t.TempDir()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend,
+	server := NewTestServer(t, backend,
 		WithServerWAL(clientDir, target, walclient.Witness),
 		WithServerWALDialOptions(grpc.WithContextDialer(testDialer)),
 	)
@@ -6390,7 +6390,7 @@ func TestSharedWALBufferConnectionAcrossVolumes(t *testing.T) {
 func TestExclusiveHold_AcquireRenewRelease(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend, WithExclusiveLeaseTTL(10*time.Second))
+	server := NewTestServer(t, backend, WithExclusiveLeaseTTL(10*time.Second))
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-hold-vol"
@@ -6476,7 +6476,7 @@ func TestExclusiveHold_AcquireRenewRelease(t *testing.T) {
 func TestExclusiveHold_ConflictRejection(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend, WithExclusiveLeaseTTL(10*time.Second))
+	server := NewTestServer(t, backend, WithExclusiveLeaseTTL(10*time.Second))
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-conflict-vol"
@@ -6550,7 +6550,7 @@ func TestExclusiveHold_LeaseExpiry(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	// Configure short lease TTL (50ms) to test expiry
-	server := NewTestServer(backend, WithExclusiveLeaseTTL(50*time.Millisecond))
+	server := NewTestServer(t, backend, WithExclusiveLeaseTTL(50*time.Millisecond))
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-expiry-vol"
@@ -6596,7 +6596,7 @@ func TestExclusiveHold_ControllerRestart_RenewReestablishes(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	// Server 1
-	server1 := NewTestServer(backend, WithExclusiveLeaseTTL(10*time.Second))
+	server1 := NewTestServer(t, backend, WithExclusiveLeaseTTL(10*time.Second))
 	defer func() { _ = server1.Close() }()
 
 	volumeID := "test-restart-vol"
@@ -6611,7 +6611,7 @@ func TestExclusiveHold_ControllerRestart_RenewReestablishes(t *testing.T) {
 	}
 
 	// Simulate controller restart: new server instance with same backend, but empty memory lease table
-	server2 := NewTestServer(backend, WithExclusiveLeaseTTL(10*time.Second))
+	server2 := NewTestServer(t, backend, WithExclusiveLeaseTTL(10*time.Second))
 	defer func() { _ = server2.Close() }()
 
 	// Periodic renew from node-1 arrives at restarted controller: must re-establish hold
@@ -6652,7 +6652,7 @@ func TestControllerRepairVolume(t *testing.T) {
 	streamID1 := StreamIDForVolume(vol1ID)
 	streamID2 := StreamIDForVolume(vol2ID)
 
-	server := NewTestServer(storage,
+	server := NewTestServer(t, storage,
 		WithServerWAL(walDir, walTarget, walclient.Witness),
 	)
 	defer server.Close()
@@ -6856,7 +6856,7 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 	// 1. Another server node writes authoritative records to wal-buffer for streamID
 	storageB := NewMemoryBackend()
 	nodeBDir := t.TempDir()
-	serverB := NewTestServer(storageB, WithServerWAL(nodeBDir, walTarget, walclient.Permanent))
+	serverB := NewTestServer(t, storageB, WithServerWAL(nodeBDir, walTarget, walclient.Permanent))
 	initB, err := serverB.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:       volumeID,
 		ParentInode:    1,
@@ -6879,7 +6879,7 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 	}
 
 	// 2. Server 1 writes local records in local mode (not replicated to buffer), producing divergent records ahead of buffer
-	server1 := NewTestServer(storage, WithServerWAL(walDir, "", walclient.Local))
+	server1 := NewTestServer(t, storage, WithServerWAL(walDir, "", walclient.Local))
 	for i := 1; i <= 3; i++ {
 		initResp, err := server1.CreateFile(ctx, &pb.CreateFileRequest{
 			VolumeId:       volumeID,
@@ -6913,7 +6913,7 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 	}
 
 	// Server 2 starts up cleanly - not crashlooping!
-	server2 := NewTestServer(storage, WithServerStreamFactory(faultStream), WithServerDurability(walclient.Permanent))
+	server2 := NewTestServer(t, storage, WithServerStreamFactory(faultStream), WithServerDurability(walclient.Permanent))
 
 	// Volume comes back degraded, but server is alive and volume is readable
 	statsResp2, err := server2.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: volumeID})
@@ -6971,7 +6971,7 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 
 	// 4. Controller restart with fault CLEARED:
 	// Real store truncate succeeds, controller recovers the volume by itself
-	server3 := NewTestServer(storage, WithServerWAL(walDir, walTarget, walclient.Permanent))
+	server3 := NewTestServer(t, storage, WithServerWAL(walDir, walTarget, walclient.Permanent))
 	defer server3.Close()
 
 	statsResp3, err := server3.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: volumeID})
@@ -7005,7 +7005,7 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 func TestControllerXAttrOperations(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
-	server := NewTestServer(backend)
+	server := NewTestServer(t, backend)
 	defer server.Close()
 
 	volumeID := "test-xattr-vol"
@@ -7303,7 +7303,7 @@ func TestControllerXAttrPersistenceAcrossRestart(t *testing.T) {
 	volumeID := "test-xattr-restart-vol"
 
 	// 1. First server instance writes xattrs
-	server1 := NewTestServer(backend,
+	server1 := NewTestServer(t, backend,
 		WithServerWAL(walDir, "", walclient.Local),
 		WithServerMetadataDir(metadataDir),
 	)
@@ -7325,7 +7325,7 @@ func TestControllerXAttrPersistenceAcrossRestart(t *testing.T) {
 	}
 
 	// 2. Second server instance opens with same metadata and WAL
-	server2 := NewTestServer(backend,
+	server2 := NewTestServer(t, backend,
 		WithServerWAL(walDir, "", walclient.Local),
 		WithServerMetadataDir(metadataDir),
 	)

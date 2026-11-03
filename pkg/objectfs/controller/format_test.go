@@ -64,7 +64,7 @@ func TestController_UnversionedUpgrade(t *testing.T) {
 	}
 
 	// 2. With flag: Server.walclient.Open succeeds and volume loads
-	srv := NewTestServer(NewMemoryBackend(),
+	srv := NewTestServer(t, NewMemoryBackend(),
 		WithServerWAL(walDir, bt.Target, walclient.Witness),
 		WithServerWALDialOptions(bt.DialOpts...),
 		WithServerAcceptUnversioned(true),
