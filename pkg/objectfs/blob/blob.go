@@ -275,13 +275,8 @@ func ParseFileHeader(data []byte) (FileHeader, error) {
 	}, nil
 }
 
-// WriteFileHeader writes the 8-byte base file header into a buffer with the default Version.
-func WriteFileHeader(fileType uint8) []byte {
-	return WriteFileHeaderWithVersion(fileType, Version)
-}
-
-// WriteFileHeaderWithVersion writes the 8-byte base file header with a specific version into a buffer.
-func WriteFileHeaderWithVersion(fileType uint8, version uint8) []byte {
+// BuildFileHeaderWithVersion returns the 8-byte base file header with a specific version.
+func BuildFileHeaderWithVersion(fileType uint8, version uint8) []byte {
 	buf := make([]byte, FileHeaderSize)
 	binary.BigEndian.PutUint32(buf[0:4], Magic)
 	buf[4] = version
@@ -453,7 +448,7 @@ func EncodeLooseBlob(blob *EncodedBlob) (ByteStream, error) {
 	}
 
 	hdr := make([]byte, SingleBlobHeaderSize)
-	copy(hdr[0:8], WriteFileHeaderWithVersion(FileTypeBlob, VersionV1))
+	copy(hdr[0:8], BuildFileHeaderWithVersion(FileTypeBlob, VersionV1))
 	binary.BigEndian.PutUint32(hdr[8:12], blob.Encoding)
 	binary.BigEndian.PutUint64(hdr[12:20], blob.FinalLength)
 	copy(hdr[20:52], blob.SHA256[:])
@@ -734,7 +729,7 @@ func WritePackfileWithSlots(w io.Writer, inputs []*EncodedBlob, slots uint32) (*
 
 	// Construct header (32 bytes)
 	hdrBuf := make([]byte, PackV2HeaderSize)
-	copy(hdrBuf[0:8], WriteFileHeaderWithVersion(FileTypePack, VersionV2))
+	copy(hdrBuf[0:8], BuildFileHeaderWithVersion(FileTypePack, VersionV2))
 	binary.BigEndian.PutUint32(hdrBuf[8:12], slots)
 	binary.BigEndian.PutUint32(hdrBuf[12:16], uint32(n))
 	binary.BigEndian.PutUint32(hdrBuf[16:20], PackFlagSealed)
@@ -826,7 +821,7 @@ func WritePackfileV1(w io.Writer, inputs []*EncodedBlob) (*PackFile, error) {
 
 	// Construct front table buffer
 	tableBuf := make([]byte, frontTableSize)
-	copy(tableBuf[0:8], WriteFileHeaderWithVersion(FileTypePack, VersionV1))
+	copy(tableBuf[0:8], BuildFileHeaderWithVersion(FileTypePack, VersionV1))
 	binary.BigEndian.PutUint32(tableBuf[8:12], uint32(n))
 	binary.BigEndian.PutUint32(tableBuf[12:16], 0)
 
