@@ -1,6 +1,6 @@
 # Developer & Agent Guidelines
 
-This document describes how to set up your environment and run the full end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), how to write commit messages and PR descriptions (section 5), and the Go API rules we hold code to (section 6).
+This document describes how to set up your environment and run the full end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), how to write commit messages and PR descriptions (section 5), the Go API rules we hold code to (section 6), and PR scope (section 7).
 
 ---
 
@@ -184,4 +184,12 @@ The reason is the point of using a strongly typed language: when a function's in
 Variadics are fine where the list is genuinely a list: `fmt`-style arguments, `errors.Join(errs...)`, and the functional-options idiom (`opts ...Option`) for *configuration* that has a sensible default by design. They are not fine for a single value that changes what the function does, such as a mode, a trigger, a flag, or a device number.
 
 If a change touches many call sites, that is information, not a problem: it says the function has many callers who now have to decide something. Make the decision visible at each one.
+
+---
+
+## 7. Scope
+
+- **One idea, one issue, one PR.** If a PR can be split into two ideas, split it; problems found during review that are outside the PR's idea become new issues.
+- **A good PR changes at most 200 lines, including tests.** The time to review and understand a PR grows roughly with the square of the lines in the diff, so two 100-line PRs cost a quarter of one 200-line PR. If the one idea needs more than 200 lines, say so on the issue before pushing and propose where to cut or how to order the parts.
+- **Issues carry a line budget** for the same reason; an issue without one should be given one before it is assigned.
 
