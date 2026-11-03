@@ -355,6 +355,41 @@ spec:
 		t.Fatalf("ObjectFS Node Daemon failed to start: %v", err)
 	}
 
+	adminPodYaml := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: objectfs-admin-pod
+  namespace: default
+  labels:
+    app: objectfs-admin
+spec:
+  containers:
+    - name: client
+      image: objectfs-controller:e2e
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 36000"]
+      volumeMounts:
+        - name: certs-client
+          mountPath: /etc/objectfs/certs/client
+          readOnly: true
+  volumes:
+    - name: certs-client
+      secret:
+        secretName: objectfs-admin-client
+        items:
+          - key: tls.key
+            path: tls.key
+          - key: tls.crt
+            path: tls.crt
+          - key: ca.crt
+            path: trust/ca.crt
+`
+	h.KubectlApplyContent("objectfs-admin-pod", adminPodYaml)
+	if err := h.WaitForPodReady("objectfs-admin-pod", "default", 2*time.Minute); err != nil {
+		t.Fatalf("objectfs-admin-pod failed to start: %v", err)
+	}
+
 	return h, node1, node2
 }
 
@@ -880,13 +915,12 @@ disruptionLoop:
 			if !snapshotDone && now.After(snapshotTriggerTime) {
 				snapshotDone = true
 				t.Logf("[%s] DISRUPTION: Creating mid-run snapshot via objectfsctl", now.Format("15:04:05"))
-				snapCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "snapshots", "create", volumeID)
-				snapOut, snapErr := snapCmd.CombinedOutput()
+				snapOut, snapErr := h.RunInPod("objectfs-admin-pod", "default", "objectfsctl", "--server", "objectfs-controller:50051", "snapshots", "create", volumeID)
 				if snapErr != nil {
-					t.Logf("[%s] Warning: Mid-run snapshot create error: %v (out: %s)", time.Now().Format("15:04:05"), snapErr, string(snapOut))
-				} else {
-					t.Logf("[%s] Mid-run snapshot created: %s", time.Now().Format("15:04:05"), strings.TrimSpace(string(snapOut)))
+					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
+					t.Fatalf("Failed to create mid-run snapshot: %v (out: %s)", snapErr, snapOut)
 				}
+				t.Logf("[%s] Mid-run snapshot created: %s", time.Now().Format("15:04:05"), strings.TrimSpace(snapOut))
 			}
 		}
 	}
@@ -970,13 +1004,12 @@ disruptionLoop:
 	// Take final snapshot and create fresh mount verifier pod
 	// -------------------------------------------------------------------------
 	t.Logf("Creating final snapshot at end of torture run...")
-	finalSnapCmd := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "snapshots", "create", volumeID)
-	finalSnapOut, err := finalSnapCmd.CombinedOutput()
+	finalSnapOut, err := h.RunInPod("objectfs-admin-pod", "default", "objectfsctl", "--server", "objectfs-controller:50051", "snapshots", "create", volumeID)
 	if err != nil {
 		dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
-		t.Fatalf("Failed to create final snapshot: %v (out: %s)", err, string(finalSnapOut))
+		t.Fatalf("Failed to create final snapshot: %v (out: %s)", err, finalSnapOut)
 	}
-	t.Logf("Final snapshot: %s", strings.TrimSpace(string(finalSnapOut)))
+	t.Logf("Final snapshot: %s", strings.TrimSpace(finalSnapOut))
 
 	verifierPodName := "torture-fresh-mount-verifier"
 	verifierPodYaml := fmt.Sprintf(`
