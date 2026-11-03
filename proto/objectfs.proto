@@ -70,6 +70,9 @@ service ObjectFSController {
   // RepairVolume repairs a degraded volume by moving its local segment directory aside
   // and reopening its stream to resume from the buffer witness watermark.
   rpc RepairVolume(RepairVolumeRequest) returns (RepairVolumeResponse);
+  // DeleteVolume deletes a volume, removing its snapshots, per-volume metadata objects,
+  // and local controller state.
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
 }
 
 enum WriteMode {
@@ -489,11 +492,20 @@ message VolumeInfo {
   string volume_id = 1;
   Degraded degraded = 3;
   ConsistencyMode consistency_mode = 4;
+  bool deleted = 5;
 }
 
 message ListVolumesResponse {
   repeated VolumeInfo volumes = 1;
   bool end_of_data = 2;
+}
+
+message DeleteVolumeRequest {
+  string volume_id = 1;
+  optional int32 retention = 2;
+}
+
+message DeleteVolumeResponse {
 }
 
 message SnapshotInfo {
