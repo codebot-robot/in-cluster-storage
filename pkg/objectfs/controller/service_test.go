@@ -7375,3 +7375,60 @@ func TestMetadataStreamRegisteredTypeIDs(t *testing.T) {
 		}
 	}
 }
+
+type dummyMetadataAppender struct{}
+
+func (d *dummyMetadataAppender) Append(ctx context.Context, payload []byte) (uint64, error) {
+	return 1, nil
+}
+
+func TestMetadataStreamRegistry_IdenticalAcrossEntryPoints(t *testing.T) {
+	backend := NewMemoryBackend()
+
+	// Entry point 1: direct standalone writer via registerMetadataStreamTypes.
+	directWriter := sds.NewWriter(&dummyMetadataAppender{})
+	if err := registerMetadataStreamTypes(directWriter); err != nil {
+		t.Fatalf("registerMetadataStreamTypes failed: %v", err)
+	}
+	directReg := directWriter.Registry()
+
+	// Entry point 2: volume initialization via MustNewVolume (invokes initMetadataStreamLocked).
+	vol := MustNewVolume(t, "test-entrypoint-vol", backend, nil)
+	defer vol.Close()
+	volReg := vol.metadataStream.Registry()
+
+	// Entry point 3: live volume stream reset via ResetStream (re-invokes initMetadataStreamLocked).
+	server := NewTestServer(backend)
+	defer server.Close()
+
+	newStream, err := server.openStreamForVolume("test-reset-stream-vol", server.walDir)
+	if err != nil {
+		t.Fatalf("openStreamForVolume failed: %v", err)
+	}
+	defer newStream.Close()
+	if err := vol.ResetStream(newStream); err != nil {
+		t.Fatalf("ResetStream failed: %v", err)
+	}
+	resetReg := vol.metadataStream.Registry()
+
+	// Entry point 4: server loading volume via getOrCreateVolume.
+	serverVol, err := server.getOrCreateVolume("test-entrypoint-srv-vol")
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	serverReg := serverVol.metadataStream.Registry()
+
+	registries := map[string]*record.Registry{
+		"MustNewVolume":     volReg,
+		"ResetStream":       resetReg,
+		"getOrCreateVolume": serverReg,
+	}
+
+	directExport := directReg.Export()
+	for name, reg := range registries {
+		export := reg.Export()
+		if !proto.Equal(directExport, export) {
+			t.Errorf("registry for entry point %s differs from registerMetadataStreamTypes canonical registry", name)
+		}
+	}
+}

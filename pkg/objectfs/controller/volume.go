@@ -1087,17 +1087,8 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
 }
 
-func (v *Volume) initMetadataStreamLocked() error {
-	var writerOpts []record.WriterOption
-	appender := sds.NewWALAppender(v.stream, walclient.Local)
-	// If the stream already contains local records, mark the header as emitted to avoid
-	// appending a duplicate stream header mid-stream upon controller restart.
-	// Accepted edge: if all local segments were pruned after S3 ack and the buffer
-	// reports witness 0, a header will be re-emitted at seq N; readers tolerate this.
-	if local, _, _ := v.stream.Watermarks(); local > 0 {
-		writerOpts = append(writerOpts, record.WithStreamHeaderEmitted(true))
-	}
-	w := sds.NewWriter(appender, writerOpts...)
+// registerMetadataStreamTypes registers all canonical SDS record types in their strict, pinned order.
+func registerMetadataStreamTypes(w *sds.Writer) error {
 	if _, err := w.RegisterType(&pb.Inode{}, 1); err != nil {
 		return fmt.Errorf("failed to register Inode type: %w", err)
 	}
@@ -1118,6 +1109,23 @@ func (v *Volume) initMetadataStreamLocked() error {
 	}
 	if _, err := w.RegisterType(&pb.VolumeInfo{}, 1); err != nil {
 		return fmt.Errorf("failed to register VolumeInfo type: %w", err)
+	}
+	return nil
+}
+
+func (v *Volume) initMetadataStreamLocked() error {
+	var writerOpts []record.WriterOption
+	appender := sds.NewWALAppender(v.stream, walclient.Local)
+	// If the stream already contains local records, mark the header as emitted to avoid
+	// appending a duplicate stream header mid-stream upon controller restart.
+	// Accepted edge: if all local segments were pruned after S3 ack and the buffer
+	// reports witness 0, a header will be re-emitted at seq N; readers tolerate this.
+	if local, _, _ := v.stream.Watermarks(); local > 0 {
+		writerOpts = append(writerOpts, record.WithStreamHeaderEmitted(true))
+	}
+	w := sds.NewWriter(appender, writerOpts...)
+	if err := registerMetadataStreamTypes(w); err != nil {
+		return err
 	}
 	v.metadataStream = w
 	return nil
