@@ -3990,6 +3990,7 @@ type VolumeInfo struct {
 	Degraded        *Degraded              `protobuf:"bytes,3,opt,name=degraded,proto3" json:"degraded,omitempty"`
 	ConsistencyMode ConsistencyMode        `protobuf:"varint,4,opt,name=consistency_mode,json=consistencyMode,proto3,enum=objectfs.v1alpha1.ConsistencyMode" json:"consistency_mode,omitempty"`
 	Deleted         bool                   `protobuf:"varint,5,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	Retention       *int32                 `protobuf:"varint,6,opt,name=retention,proto3,oneof" json:"retention,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -4050,6 +4051,13 @@ func (x *VolumeInfo) GetDeleted() bool {
 		return x.Deleted
 	}
 	return false
+}
+
+func (x *VolumeInfo) GetRetention() int32 {
+	if x != nil && x.Retention != nil {
+		return *x.Retention
+	}
+	return 0
 }
 
 type ListVolumesResponse struct {
@@ -6244,13 +6252,16 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05since\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x05since\">\n" +
 	"\x04Code\x12\x1d\n" +
 	"\x19DEGRADED_CODE_UNSPECIFIED\x10\x00\x12\x17\n" +
-	"\x13WAL_STREAM_DEGRADED\x10\x01\"\xe2\x01\n" +
+	"\x13WAL_STREAM_DEGRADED\x10\x01\"\x93\x02\n" +
 	"\n" +
 	"VolumeInfo\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x127\n" +
 	"\bdegraded\x18\x03 \x01(\v2\x1b.objectfs.v1alpha1.DegradedR\bdegraded\x12M\n" +
 	"\x10consistency_mode\x18\x04 \x01(\x0e2\".objectfs.v1alpha1.ConsistencyModeR\x0fconsistencyMode\x12\x18\n" +
-	"\adeleted\x18\x05 \x01(\bR\adeletedJ\x04\b\x02\x10\x03R\x0fdegraded_reason\"n\n" +
+	"\adeleted\x18\x05 \x01(\bR\adeleted\x12!\n" +
+	"\tretention\x18\x06 \x01(\x05H\x00R\tretention\x88\x01\x01B\f\n" +
+	"\n" +
+	"_retentionJ\x04\b\x02\x10\x03R\x0fdegraded_reason\"n\n" +
 	"\x13ListVolumesResponse\x127\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1d.objectfs.v1alpha1.VolumeInfoR\avolumes\x12\x1e\n" +
 	"\vend_of_data\x18\x02 \x01(\bR\tendOfData\"c\n" +
@@ -6719,6 +6730,7 @@ func file_proto_objectfs_proto_init() {
 		return
 	}
 	file_proto_objectfs_proto_msgTypes[3].OneofWrappers = []any{}
+	file_proto_objectfs_proto_msgTypes[57].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[59].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[82].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[83].OneofWrappers = []any{}

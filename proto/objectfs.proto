@@ -493,6 +493,7 @@ message VolumeInfo {
   Degraded degraded = 3;
   ConsistencyMode consistency_mode = 4;
   bool deleted = 5;
+  optional int32 retention = 6;
 }
 
 message ListVolumesResponse {
