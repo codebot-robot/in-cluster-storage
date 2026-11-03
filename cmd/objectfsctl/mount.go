@@ -28,6 +28,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/consistency"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/spf13/cobra"
@@ -35,14 +36,15 @@ import (
 
 type mountOptions struct {
 	*options
-	volumeID     string
-	writeMode    string
-	cacheSizeMB  int64
-	nodeID       string
-	allowOther   bool
-	debug        bool
-	entryTimeout time.Duration
-	attrTimeout  time.Duration
+	volumeID        string
+	writeMode       string
+	consistencyMode pb.ConsistencyMode
+	cacheSizeMB     int64
+	nodeID          string
+	allowOther      bool
+	debug           bool
+	entryTimeout    time.Duration
+	attrTimeout     time.Duration
 }
 
 func parseWriteMode(val string) (pb.WriteMode, error) {
@@ -72,6 +74,7 @@ func newMountCommand(opts *options) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&mountOpts.volumeID, "volume", "", "Volume ID to mount (required)")
 	cmd.Flags().StringVar(&mountOpts.writeMode, "write-mode", "fsync", "Write mode: fsync, lazy or eager")
+	cmd.Flags().Var(consistency.NewValue(&mountOpts.consistencyMode), "consistency", "Consistency mode: standard or close-to-open")
 	cmd.Flags().Int64Var(&mountOpts.cacheSizeMB, "cache-size-mb", 128, "Local cache size in MB")
 	cmd.Flags().StringVar(&mountOpts.nodeID, "node-id", "", "Node ID reported to the controller (defaults to the hostname)")
 	cmd.Flags().BoolVar(&mountOpts.allowOther, "allow-other", false, "Allow other users to access the mount (requires user_allow_other in /etc/fuse.conf when not root)")
@@ -121,6 +124,7 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 	rawFS := objectfuse.NewObjectFS(client, opts.volumeID, writeMode, nodeCache)
 	rawFS.SetEntryTimeout(opts.entryTimeout)
 	rawFS.SetAttrTimeout(opts.attrTimeout)
+	rawFS.SetConsistencyMode(opts.consistencyMode)
 
 	fuseOpts := &gofuse.MountOptions{
 		FsName:     "objectfs",
@@ -144,7 +148,7 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 
 	watchCtx, cancelWatch := context.WithCancel(ctx)
 	defer cancelWatch()
-	objectfuse.StartWatcher(watchCtx, client, opts.volumeID, nodeID, pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, nodeCache, rawFS)
+	objectfuse.StartWatcher(watchCtx, client, opts.volumeID, nodeID, opts.consistencyMode, nodeCache, rawFS)
 
 	fmt.Fprintf(os.Stderr, "Mounted volume %s at %s (writeMode=%v); press Ctrl-C to unmount\n", opts.volumeID, mountpoint, writeMode)
 

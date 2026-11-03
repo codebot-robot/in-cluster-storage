@@ -1849,6 +1849,51 @@ func TestCSIControllerOperations(t *testing.T) {
 	}
 }
 
+func TestCreateVolume_ConsistencyMode(t *testing.T) {
+	ctx := t.Context()
+	server := NewTestServer(t, NewMemoryBackend())
+	csiServer := NewCSIController(server)
+	caps := []*csi.VolumeCapability{{
+		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+		AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER},
+	}}
+
+	tests := []struct {
+		name     string
+		mode     string
+		wantMode pb.ConsistencyMode
+		wantCode codes.Code
+	}{
+		{"typo", "close_to_open", 0, codes.InvalidArgument},
+		{"c2o", "close-to-open", pb.ConsistencyMode_CLOSE_TO_OPEN, codes.OK},
+		{"std", "standard", pb.ConsistencyMode_STANDARD, codes.OK},
+		{"empty", "", pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, codes.OK},
+	}
+	for _, tt := range tests {
+		params := map[string]string{}
+		if tt.mode != "" {
+			params["consistency"] = tt.mode
+		}
+		_, err := csiServer.CreateVolume(ctx, &csi.CreateVolumeRequest{
+			Name:               tt.name,
+			Parameters:         params,
+			VolumeCapabilities: caps,
+		})
+		if status.Code(err) != tt.wantCode {
+			t.Errorf("%s: CreateVolume code = %v, want %v", tt.name, status.Code(err), tt.wantCode)
+		}
+		if tt.wantCode == codes.OK {
+			vol, err := server.getOrCreateVolume(tt.name)
+			if err != nil {
+				t.Fatalf("%s: getOrCreateVolume failed: %v", tt.name, err)
+			}
+			if vol.ConsistencyMode() != tt.wantMode {
+				t.Errorf("%s: volume mode = %v, want %v", tt.name, vol.ConsistencyMode(), tt.wantMode)
+			}
+		}
+	}
+}
+
 type testGetBlobServer struct {
 	pb.ObjectFSController_GetBlobServer
 	ctx    context.Context
