@@ -20,13 +20,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"k8s.io/klog/v2"
 )
 
@@ -41,24 +41,40 @@ type IncrementalPack struct {
 	entries []BlobEntry
 }
 
-func NewIncrementalPack(path string, slots uint32) (*IncrementalPack, error) {
+// NewIncrementalPackFromFile creates an IncrementalPack directly over an existing open destination file.
+// The destination file must be newly created and empty; the pack writes at absolute offsets from 0.
+// Calling Close on the returned IncrementalPack closes file.
+func NewIncrementalPackFromFile(file *os.File, slots uint32) (*IncrementalPack, error) {
 	if slots == 0 {
 		slots = DefaultPackSlots
 	}
+	header := make([]byte, PackV2HeaderSize+int(slots)*PackV2SlotSize)
+	copy(header, BuildFileHeaderWithVersion(FileTypePack, VersionV2))
+	binary.BigEndian.PutUint32(header[8:], slots)
+	if _, err := file.WriteAt(header, 0); err != nil {
+		return nil, err
+	}
+	return &IncrementalPack{file: file, slots: slots, offset: int64(len(header))}, nil
+}
+
+// NewIncrementalPack creates a new packfile on disk at the specified path.
+func NewIncrementalPack(path string, slots uint32) (*IncrementalPack, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
-	f, err := os.Create(path)
+	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
-	hdr := make([]byte, PackV2HeaderSize+int(slots)*PackV2SlotSize)
-	copy(hdr, BuildFileHeaderWithVersion(FileTypePack, VersionV2))
-	binary.BigEndian.PutUint32(hdr[8:], slots)
-	if _, err := f.Write(hdr); err != nil {
-		return nil, errors.Join(err, f.Close())
+	pack, err := NewIncrementalPackFromFile(file, slots)
+	if err != nil {
+		errutil.CloseAndLog(file, "incremental pack")
+		if removeErr := os.Remove(path); removeErr != nil {
+			klog.Warningf("failed to remove packfile %s: %v", path, removeErr)
+		}
+		return nil, err
 	}
-	return &IncrementalPack{file: f, slots: slots, offset: int64(len(hdr))}, nil
+	return pack, nil
 }
 
 func (p *IncrementalPack) verifyOpenLocked() error {
@@ -73,8 +89,8 @@ func (p *IncrementalPack) Append(data []byte) (BlobEntry, error) {
 	if err != nil {
 		return BlobEntry{}, err
 	}
-	ent, err := p.appendBlob(blob)
-	return ent, errors.Join(err, blob.Close())
+	entry, err := p.appendBlob(blob)
+	return entry, errors.Join(err, blob.Close())
 }
 
 func (p *IncrementalPack) appendBlob(blob *EncodedBlob) (BlobEntry, error) {
@@ -139,21 +155,6 @@ func (p *IncrementalPack) ReadBlob(entry BlobEntry) (ByteStream, error) {
 	return decodePayloadToByteStream(sectionReader, entry.Encoding, int64(entry.FinalLength))
 }
 
-func (p *IncrementalPack) writeTo(w io.Writer) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := p.verifyOpenLocked(); err != nil {
-		return err
-	}
-	if _, err := p.file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("failed seeking packfile: %w", err)
-	}
-	if _, err := io.Copy(w, p.file); err != nil {
-		return fmt.Errorf("failed writing packfile to destination: %w", err)
-	}
-	return nil
-}
-
 func buildItemHeader(encoding uint32, finalLength uint32) []byte {
 	hdr := make([]byte, BlobItemHeaderSize)
 	binary.BigEndian.PutUint32(hdr[0:4], encoding)
@@ -215,11 +216,18 @@ func (p *IncrementalPack) Entries() []BlobEntry {
 func (p *IncrementalPack) Count() int      { p.mu.Lock(); defer p.mu.Unlock(); return len(p.entries) }
 func (p *IncrementalPack) ByteSize() int64 { p.mu.Lock(); defer p.mu.Unlock(); return p.offset }
 
-func (p *IncrementalPack) Close() (err error) {
+func (p *IncrementalPack) Close() error {
+	if p == nil {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.file != nil {
-		p.file, err = nil, p.file.Close()
+	if p.file == nil {
+		return nil
 	}
-	return
+	if err := p.file.Close(); err != nil {
+		return err
+	}
+	p.file = nil
+	return nil
 }

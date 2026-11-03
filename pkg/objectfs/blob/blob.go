@@ -671,21 +671,23 @@ func (p *PackFile) DecodeBlob(r io.Reader, entry BlobEntry) (ByteStream, error) 
 	return stream, nil
 }
 
-// WritePackfile writes a v2 packfile directly to w using the default slot count (1024).
-func WritePackfile(w io.Writer, inputs []*EncodedBlob) (*PackFile, error) {
+// WritePackfile writes a v2 packfile directly to destination using the default slot count (1024).
+// WritePackfile does not close destination; ownership remains with the caller.
+func WritePackfile(destination *os.File, inputs []*EncodedBlob) (*PackFile, error) {
 	slots := DefaultPackSlots
 	if uint32(len(inputs)) > slots {
 		slots = uint32(len(inputs))
 		klog.V(2).Infof("batch size %d exceeds default pack slots %d; reserving S = %d for pack", len(inputs), DefaultPackSlots, slots)
 	}
-	return WritePackfileWithSlots(w, inputs, slots)
+	return WritePackfileWithSlots(destination, inputs, slots)
 }
 
-// WritePackfileWithSlots writes a v2 packfile with explicit slot reservation to w:
+// WritePackfileWithSlots writes a v2 packfile with explicit slot reservation to destination:
 // [Header 32B: 8B base (version 2) + 4B slots S + 4B used N + 4B flags (bit 0=sealed) + 12B reserved]
 // [Table: S * 48B slots: first N sorted by SHA256, remaining S - N zeroed]
 // [Data: for each blob in inputs order: 16B BlobItemHeader + payload data]
-func WritePackfileWithSlots(w io.Writer, inputs []*EncodedBlob, slots uint32) (packFile *PackFile, returnErr error) {
+// WritePackfileWithSlots does not close destination; ownership remains with the caller.
+func WritePackfileWithSlots(destination *os.File, inputs []*EncodedBlob, slots uint32) (*PackFile, error) {
 	n := len(inputs)
 	if n == 0 {
 		return nil, errors.New("cannot create empty packfile with 0 blobs")
@@ -694,27 +696,10 @@ func WritePackfileWithSlots(w io.Writer, inputs []*EncodedBlob, slots uint32) (p
 		return nil, fmt.Errorf("slots %d cannot be less than blob count %d", slots, n)
 	}
 
-	tempFile, err := os.CreateTemp("", "packfile-*")
-	if err != nil {
-		return nil, fmt.Errorf("failed creating temp file for packfile: %w", err)
-	}
-	tempPath := tempFile.Name()
-	defer func() {
-		if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) {
-			returnErr = errors.Join(returnErr, err)
-		}
-	}()
-	if err := tempFile.Close(); err != nil {
-		return nil, fmt.Errorf("failed closing temp file: %w", err)
-	}
-
-	pack, err := NewIncrementalPack(tempPath, slots)
+	pack, err := NewIncrementalPackFromFile(destination, slots)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		returnErr = errors.Join(returnErr, pack.Close())
-	}()
 
 	for _, blob := range inputs {
 		if _, err := pack.appendBlob(blob); err != nil {
@@ -723,10 +708,6 @@ func WritePackfileWithSlots(w io.Writer, inputs []*EncodedBlob, slots uint32) (p
 	}
 
 	if err := pack.Seal(); err != nil {
-		return nil, err
-	}
-
-	if err := pack.writeTo(w); err != nil {
 		return nil, err
 	}
 

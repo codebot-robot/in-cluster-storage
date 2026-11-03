@@ -40,8 +40,8 @@ func TestIncrementalPack(t *testing.T) {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	if ent, err := pack.Append(c1); err != nil || ent.SHA256 != sha256.Sum256(c1) {
-		t.Fatalf("duplicate: got %v err %v", ent, err)
+	if entry, err := pack.Append(c1); err != nil || entry.SHA256 != sha256.Sum256(c1) {
+		t.Fatalf("duplicate: got %v err %v", entry, err)
 	}
 	if _, err := pack.Append([]byte("overflow")); !errors.Is(err, ErrPackSlotsFull) {
 		t.Fatalf("expected ErrPackSlotsFull, got: %v", err)

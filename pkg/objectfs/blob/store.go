@@ -136,8 +136,8 @@ func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error
 	packFile, err := WritePackfile(tf, smallInputs)
 	if err != nil {
 		errutil.CloseAndLog(tf, "temp packfile")
-		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, remErr)
+		if removeErr := os.Remove(tempPath); removeErr != nil {
+			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, removeErr)
 		}
 		return fmt.Errorf("failed to write packfile: %w", err)
 	}
@@ -145,15 +145,15 @@ func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error
 	st, err := tf.Stat()
 	if err != nil {
 		errutil.CloseAndLog(tf, "temp packfile")
-		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, remErr)
+		if removeErr := os.Remove(tempPath); removeErr != nil {
+			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, removeErr)
 		}
 		return fmt.Errorf("failed to stat temp packfile: %w", err)
 	}
 	if _, err := tf.Seek(0, io.SeekStart); err != nil {
 		errutil.CloseAndLog(tf, "temp packfile")
-		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, remErr)
+		if removeErr := os.Remove(tempPath); removeErr != nil {
+			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, removeErr)
 		}
 		return fmt.Errorf("failed to seek temp packfile: %w", err)
 	}
