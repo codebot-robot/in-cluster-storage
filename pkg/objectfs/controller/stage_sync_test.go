@@ -17,8 +17,11 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,15 +44,25 @@ import (
 
 type recordingBackend struct {
 	ObjectStorageBackend
-	mu       sync.Mutex
-	packKeys []string
-	failPut  bool
+	mu           sync.Mutex
+	packKeys     []string
+	packGetCalls int
+	failPut      bool
 }
 
 func newRecordingBackend(base ObjectStorageBackend) *recordingBackend {
 	return &recordingBackend{
 		ObjectStorageBackend: base,
 	}
+}
+
+func (b *recordingBackend) GetObject(ctx context.Context, volumeID, key string, offset, length int64, writer io.Writer) error {
+	b.mu.Lock()
+	if strings.HasSuffix(key, ".pack") {
+		b.packGetCalls++
+	}
+	b.mu.Unlock()
+	return b.ObjectStorageBackend.GetObject(ctx, volumeID, key, offset, length, writer)
 }
 
 func (b *recordingBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
@@ -91,6 +104,12 @@ func (b *recordingBackend) getChunkCount() int {
 		}
 	}
 	return totalChunks
+}
+
+func (b *recordingBackend) getPackGetCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.packGetCalls
 }
 
 func (b *recordingBackend) getPackKeys() []string {
@@ -1797,8 +1816,10 @@ func TestStageAndSync_ScratchOpenPack_PushAndReadBack(t *testing.T) {
 	if backendPackCount := helper.backend.getPackCount(); backendPackCount == 0 {
 		t.Fatalf("expected backend packs uploaded after sync, got 0")
 	}
-	if _, err := os.Stat(scratchPackPath); !os.IsNotExist(err) {
-		t.Fatalf("expected scratch pack %s to be deleted after sync, stat err: %v", scratchPackPath, err)
+	// In the local pack retention design (Issue #455), the uploaded pack remains on disk
+	// for reading without round-tripping through object storage until staging cap eviction.
+	if _, err := os.Stat(scratchPackPath); err != nil {
+		t.Fatalf("expected uploaded pack %s to remain on disk for reads after sync, stat err: %v", scratchPackPath, err)
 	}
 
 	secondPayload := []byte("second-write-payload")
@@ -1971,10 +1992,11 @@ func TestStagedPackRetainedUntilAllReferencingInodesCommit(t *testing.T) {
 		t.Fatalf("read data mismatch on Inode B: got %q, want %q", string(readResponse.GetData()), string(expectedB))
 	}
 
-	// Now that both Inode A and Inode B have committed, all live refs for the pack are dropped,
-	// and the scratch pack file on disk must be removed.
-	if _, err := os.Stat(packPath); !os.IsNotExist(err) {
-		t.Fatalf("expected pack file %s to be removed after all referencing inodes committed, but it still exists (err=%v)", packPath, err)
+	// In the local pack retention design (Issue #455), the packfile remains on disk
+	// and in volume.packs after all referencing inodes commit so immediate post-sync reads
+	// are served locally without round-tripping through object storage.
+	if _, err := os.Stat(packPath); err != nil {
+		t.Fatalf("expected pack file %s to remain on disk for reads after commit: %v", packPath, err)
 	}
 }
 
@@ -2053,5 +2075,59 @@ func TestPackObjectKeysDistinctAcrossRestart(t *testing.T) {
 
 	if firstKey == secondKey {
 		t.Fatalf("expected distinct pack keys for different pack contents across restart, got identical key: %s", firstKey)
+	}
+}
+
+// TestLocalPackRead_NoBackendRoundTripOnCommittedRead verifies that reads of chunks
+// committed from a pack created by the controller are served from the local pack on disk
+// without fetching from object storage, and that eviction upon exceeding staging cap
+// cleanly falls back to object storage on miss.
+func TestLocalPackRead_NoBackendRoundTripOnCommittedRead(t *testing.T) {
+	ctx := t.Context()
+	backend := newRecordingBackend(NewMemoryBackend())
+	server := NewTestServer(t, backend, WithServerMaxStagingBytes(64*1024*1024))
+	volumeID := "test-local-pack-read-vol"
+
+	createResp, err := testCreateFile(ctx, server, volumeID, "/chunk.bin", 0644, nil, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := createResp.GetAttr().GetInode().GetIno()
+
+	payload := bytes.Repeat([]byte("X"), 64*1024)
+	if resp, err := server.WriteFile(ctx, &pb.WriteFileRequest{VolumeId: volumeID, Inode: ino, Data: payload}); err != nil || resp.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if resp, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino, Blocking: true}); err != nil || !resp.GetSuccess() {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	// 1. Controller ReadFile RPC (used by daemon and FUSE fallback)
+	readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino, Size: int64(len(payload))})
+	if err != nil || readResp.GetError() != 0 || !bytes.Equal(readResp.GetData(), payload) {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+
+	// 2. Controller GetBlob RPC (used by FUSE disk cache fill)
+	hasher := sha256.New()
+	hasher.Write(payload)
+	stream := &testGetBlobServer{ctx: ctx}
+	if err := server.GetBlob(&pb.GetBlobRequest{Sha256: hex.EncodeToString(hasher.Sum(nil))}, stream); err != nil || !bytes.Equal(bytes.Join(stream.chunks, nil), payload) {
+		t.Fatalf("GetBlob failed: %v", err)
+	}
+	if count := backend.getPackGetCount(); count != 0 {
+		t.Fatalf("expected 0 backend pack GetObject calls for local pack, got %d", count)
+	}
+
+	// 3. Evict pack by reducing staging capacity and verify fallback to backend GetObject
+	vol, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	vol.evictAllUploadedPacksForTest()
+
+	postResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino, Size: int64(len(payload))})
+	if err != nil || postResp.GetError() != 0 || !bytes.Equal(postResp.GetData(), payload) || backend.getPackGetCount() == 0 {
+		t.Fatalf("post-eviction ReadFile failed or did not fetch from backend: %v", err)
 	}
 }
