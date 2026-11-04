@@ -922,3 +922,19 @@ func TestMountConsistencyFlag(t *testing.T) {
 		t.Fatal("expected error for typo")
 	}
 }
+
+func TestMountWriteModeFlag(t *testing.T) {
+	cmd := newMountCommand(&options{})
+	if err := cmd.ParseFlags([]string{"--write-mode=lazy"}); err != nil {
+		t.Fatalf("ParseFlags lazy: %v", err)
+	}
+	if err := newMountCommand(&options{}).ParseFlags([]string{"--write-mode=eager"}); err != nil {
+		t.Fatalf("ParseFlags eager: %v", err)
+	}
+	if err := newMountCommand(&options{}).ParseFlags([]string{"--write-mode=fsync"}); err != nil {
+		t.Fatalf("ParseFlags fsync: %v", err)
+	}
+	if err := newMountCommand(&options{}).ParseFlags([]string{"--write-mode=writethrough"}); err == nil {
+		t.Fatal("expected error for typo writethrough")
+	}
+}

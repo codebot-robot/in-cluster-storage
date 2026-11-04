@@ -22,7 +22,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -30,6 +29,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/consistency"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/writemode"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/spf13/cobra"
 )
@@ -37,7 +37,7 @@ import (
 type mountOptions struct {
 	*options
 	volumeID        string
-	writeMode       string
+	writeMode       pb.WriteMode
 	consistencyMode pb.ConsistencyMode
 	cacheSizeMB     int64
 	nodeID          string
@@ -47,23 +47,10 @@ type mountOptions struct {
 	attrTimeout     time.Duration
 }
 
-func parseWriteMode(val string) (pb.WriteMode, error) {
-	switch strings.ToLower(val) {
-	case "", "fsync", "writethrough", "write_through_fsync":
-		return pb.WriteMode_WRITE_THROUGH_FSYNC, nil
-	case "lazy", "lazywrite", "lazy_write":
-		return pb.WriteMode_LAZY_WRITE, nil
-	case "eager", "eagerreplication", "eager_replication":
-		return pb.WriteMode_EAGER_REPLICATION, nil
-	default:
-		return pb.WriteMode_WRITE_THROUGH_FSYNC, fmt.Errorf("unknown write mode %q (expected fsync, lazy or eager)", val)
-	}
-}
-
 // newMountCommand mounts a volume via FUSE directly, without going through the
 // CSI node daemon. It is intended for local development and debugging.
 func newMountCommand(opts *options) *cobra.Command {
-	mountOpts := &mountOptions{options: opts}
+	mountOpts := &mountOptions{options: opts, writeMode: pb.WriteMode_WRITE_THROUGH_FSYNC}
 	cmd := &cobra.Command{
 		Use:   "mount <mountpoint>",
 		Short: "Mount a volume via FUSE (blocks until interrupted)",
@@ -73,7 +60,7 @@ func newMountCommand(opts *options) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&mountOpts.volumeID, "volume", "", "Volume ID to mount (required)")
-	cmd.Flags().StringVar(&mountOpts.writeMode, "write-mode", "fsync", "Write mode: fsync, lazy or eager")
+	cmd.Flags().Var(writemode.NewValue(&mountOpts.writeMode), "write-mode", "Write mode: fsync, lazy or eager")
 	cmd.Flags().Var(consistency.NewValue(&mountOpts.consistencyMode), "consistency", "Consistency mode: standard or close-to-open")
 	cmd.Flags().Int64Var(&mountOpts.cacheSizeMB, "cache-size-mb", 128, "Local cache size in MB")
 	cmd.Flags().StringVar(&mountOpts.nodeID, "node-id", "", "Node ID reported to the controller (defaults to the hostname)")
@@ -91,12 +78,10 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 	if opts.volumeID == "" {
 		return fmt.Errorf("--volume is required")
 	}
-	writeMode, err := parseWriteMode(opts.writeMode)
-	if err != nil {
-		return err
-	}
+	writeMode := opts.writeMode
 	nodeID := opts.nodeID
 	if nodeID == "" {
+		var err error
 		nodeID, err = os.Hostname()
 		if err != nil {
 			return fmt.Errorf("failed to determine hostname (set --node-id): %w", err)
