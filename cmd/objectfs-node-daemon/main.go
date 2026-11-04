@@ -33,6 +33,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/consistency"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/volumemode"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/writemode"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
@@ -302,8 +303,11 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	mode := strings.ToLower(req.GetVolumeContext()["mode"])
-	if mode == "exclusive-local" {
+	mode, err := volumemode.ParseVolumeMode(req.GetVolumeContext()["mode"])
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if mode == volumemode.ModeExclusiveLocal {
 		cap := req.GetVolumeCapability()
 		if cap == nil || cap.GetAccessMode() == nil || cap.GetAccessMode().GetMode() != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
 			return nil, status.Errorf(codes.InvalidArgument, "exclusive-local mode requires SINGLE_NODE_SINGLE_WRITER access mode (ReadWriteOncePod)")
