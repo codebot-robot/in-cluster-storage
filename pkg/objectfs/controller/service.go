@@ -127,6 +127,7 @@ func volInitError(err error) error {
 type Server struct {
 	pb.UnimplementedObjectFSControllerServer
 	mu          sync.RWMutex
+	closeOnce   sync.Once
 	volumes     map[string]*Volume
 	backend     ObjectStorageBackend
 	blobStore   *blob.Store
@@ -542,32 +543,40 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 // Close stops periodic flushing and closes all active volumes and streams.
 func (s *Server) Close() error {
 	var firstErr error
-	if err := s.StopPeriodicFlush(); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, v := range s.volumes {
-		if err := v.Close(); err != nil && firstErr == nil {
+	var ran bool
+	s.closeOnce.Do(func() {
+		ran = true
+		if err := s.StopPeriodicFlush(); err != nil && firstErr == nil {
 			firstErr = err
 		}
-	}
-	if s.walConn != nil {
-		if err := s.walConn.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, v := range s.volumes {
+			if err := v.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-		s.walConn = nil
-		s.walClient = nil
-	}
-	if s.tempWalDir != "" {
-		if err := os.RemoveAll(s.tempWalDir); err != nil && firstErr == nil {
-			firstErr = err
+		clear(s.volumes)
+		if s.walConn != nil {
+			if err := s.walConn.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			s.walConn = nil
+			s.walClient = nil
 		}
-		s.tempWalDir = ""
-	}
-	if s.testBufferCleanup != nil {
-		s.testBufferCleanup()
-		s.testBufferCleanup = nil
+		if s.tempWalDir != "" {
+			if err := os.RemoveAll(s.tempWalDir); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			s.tempWalDir = ""
+		}
+		if s.testBufferCleanup != nil {
+			s.testBufferCleanup()
+			s.testBufferCleanup = nil
+		}
+	})
+	if !ran {
+		return nil
 	}
 	return firstErr
 }

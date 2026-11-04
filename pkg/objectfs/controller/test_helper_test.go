@@ -22,6 +22,7 @@ import (
 	"strings"
 	"testing"
 
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"k8s.io/klog/v2"
@@ -31,45 +32,54 @@ import (
 // skipping per-record WAL fsync.
 // The production controller binary uses NewServer, which always retains per-record fsync.
 func NewTestServer(t testing.TB, backend ObjectStorageBackend, opts ...ServerOption) *Server {
+	var server *Server
 	if target := InspectServerTarget(opts...); target != "" {
 		metadataDir := t.TempDir()
 		opts = append([]ServerOption{
 			WithServerWithoutFsync(),
 			WithServerMetadataDir(metadataDir),
 		}, opts...)
-		return NewServer(backend, opts...)
+		server = NewServer(backend, opts...)
+	} else {
+		ctx := t.Context()
+		bt, cleanup := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
+		walDir, err := os.MkdirTemp("", "controllertest-wal-*")
+		if err != nil {
+			panic(err)
+		}
+		t.Cleanup(func() {
+			if err := os.RemoveAll(walDir); err != nil {
+				klog.V(4).Infof("failed to remove test walDir %s: %v", walDir, err)
+			}
+		})
+
+		combinedCleanup := func() {
+			cleanup()
+			if err := os.RemoveAll(walDir); err != nil {
+				klog.V(4).Infof("failed to remove test walDir %s: %v", walDir, err)
+			}
+		}
+
+		metadataDir := t.TempDir()
+
+		testOpts := []ServerOption{
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALClient(bt.Client),
+			WithServerWALDialOptions(bt.DialOpts...),
+			WithServerWithoutFsync(),
+			WithServerMetadataDir(metadataDir),
+			WithServerTestCleanup(combinedCleanup),
+		}
+		testOpts = append(testOpts, opts...)
+		server = NewServer(backend, testOpts...)
 	}
 
-	ctx := t.Context()
-	bt, cleanup := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
-	walDir, err := os.MkdirTemp("", "controllertest-wal-*")
-	if err != nil {
-		panic(err)
-	}
 	t.Cleanup(func() {
-		if err := os.RemoveAll(walDir); err != nil {
-			klog.V(4).Infof("failed to remove test walDir %s: %v", walDir, err)
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close failed on test cleanup: %v", err)
 		}
 	})
-	combinedCleanup := func() {
-		cleanup()
-		if err := os.RemoveAll(walDir); err != nil {
-			klog.V(4).Infof("failed to remove test walDir %s: %v", walDir, err)
-		}
-	}
-
-	metadataDir := t.TempDir()
-
-	testOpts := []ServerOption{
-		WithServerWAL(walDir, bt.Target, walclient.Witness),
-		WithServerWALClient(bt.Client),
-		WithServerWALDialOptions(bt.DialOpts...),
-		WithServerWithoutFsync(),
-		WithServerMetadataDir(metadataDir),
-		WithServerTestCleanup(combinedCleanup),
-	}
-	testOpts = append(testOpts, opts...)
-	return NewServer(backend, testOpts...)
+	return server
 }
 
 func TestNewTestServer_CleanupWaitsForBufferLoops(t *testing.T) {
@@ -88,5 +98,37 @@ func TestNewTestServer_CleanupWaitsForBufferLoops(t *testing.T) {
 	}
 	if strings.Contains(stacks, "groupCommitLoop") {
 		t.Fatalf("groupCommitLoop still running after test return:\n%s", stacks)
+	}
+}
+
+func TestNewTestServer_CleanupClosesWALClientStreams(t *testing.T) {
+	stackBuffer := make([]byte, 1<<20)
+	stackLength := runtime.Stack(stackBuffer, true)
+	before := strings.Count(string(stackBuffer[:stackLength]), "backgroundReplicationLoop")
+
+	t.Run("subtest_without_explicit_close", func(t *testing.T) {
+		ctx := t.Context()
+		backend := NewMemoryBackend()
+		server := NewTestServer(t, backend)
+		response, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    "test-leak-vol",
+			ParentInode: 1,
+			Name:        "leak.txt",
+			Mode:        0644,
+		})
+		if err != nil || response.GetError() != 0 {
+			t.Fatalf("CreateFile failed: %v (code %d)", err, response.GetError())
+		}
+	})
+
+	stackLength = runtime.Stack(stackBuffer, true)
+	stacks := string(stackBuffer[:stackLength])
+
+	if before == 0 {
+		if strings.Contains(stacks, "backgroundReplicationLoop") {
+			t.Fatalf("backgroundReplicationLoop still running after test return:\n%s", stacks)
+		}
+	} else if strings.Count(stacks, "backgroundReplicationLoop") > before {
+		t.Fatalf("backgroundReplicationLoop still running after test return:\n%s", stacks)
 	}
 }
