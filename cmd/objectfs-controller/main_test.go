@@ -137,13 +137,13 @@ func TestOptionsParseAndValidate(t *testing.T) {
 		{"invalid csi endpoint", func(o *Options) { o.CSIEndpoint = "http://invalid" }, "invalid endpoint"},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
 			validOptions := *options
-			tt.mutate(&validOptions)
+			testCase.mutate(&validOptions)
 			err := validOptions.Validate()
-			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("Validate() = %v, want error containing %q", err, tt.wantErr)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantErr) {
+				t.Errorf("Validate() = %v, want error containing %q", err, testCase.wantErr)
 			}
 		})
 	}
