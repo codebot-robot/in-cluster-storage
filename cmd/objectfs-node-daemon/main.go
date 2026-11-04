@@ -33,6 +33,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/consistency"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/writemode"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -286,19 +287,6 @@ func (d *objectFSDriver) NodeGetCapabilities(ctx context.Context, req *csi.NodeG
 	}, nil
 }
 
-func parseWriteMode(val string) pb.WriteMode {
-	switch strings.ToLower(val) {
-	case "lazy", "lazywrite", "lazy_write":
-		return pb.WriteMode_LAZY_WRITE
-	case "eager", "eagerreplication", "eager_replication":
-		return pb.WriteMode_EAGER_REPLICATION
-	case "fsync", "writethrough", "write_through_fsync":
-		return pb.WriteMode_WRITE_THROUGH_FSYNC
-	default:
-		return pb.WriteMode_WRITE_THROUGH_FSYNC
-	}
-}
-
 func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	targetPath := req.GetTargetPath()
 	volumeID := req.GetVolumeContext()["volumeID"]
@@ -323,8 +311,10 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return d.publishExclusiveLocal(ctx, req, volumeID)
 	}
 
-	writeModeStr := req.GetVolumeContext()["writeMode"]
-	writeMode := parseWriteMode(writeModeStr)
+	writeMode, err := writemode.ParseWriteMode(req.GetVolumeContext()["writeMode"])
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 
 	klog.Infof("Publishing ObjectFS volume %s (writeMode=%v, consistency=%v) to %s", volumeID, writeMode, consistencyMode, targetPath)
 

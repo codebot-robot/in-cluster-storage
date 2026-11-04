@@ -57,25 +57,24 @@ func TestParseEndpoint(t *testing.T) {
 	}
 }
 
-func TestParseWriteMode(t *testing.T) {
-	tests := []struct {
-		input string
-		want  pb.WriteMode
-	}{
-		{"lazy", pb.WriteMode_LAZY_WRITE},
-		{"lazy_write", pb.WriteMode_LAZY_WRITE},
-		{"eager", pb.WriteMode_EAGER_REPLICATION},
-		{"eager_replication", pb.WriteMode_EAGER_REPLICATION},
-		{"fsync", pb.WriteMode_WRITE_THROUGH_FSYNC},
-		{"writethrough", pb.WriteMode_WRITE_THROUGH_FSYNC},
-		{"unknown", pb.WriteMode_WRITE_THROUGH_FSYNC},
+func TestNodePublishVolume_InvalidWriteModeFails(t *testing.T) {
+	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true)
+	if err != nil {
+		t.Fatalf("newDriver: %v", err)
 	}
-
-	for _, tt := range tests {
-		got := parseWriteMode(tt.input)
-		if got != tt.want {
-			t.Errorf("parseWriteMode(%q) = %v, want %v", tt.input, got, tt.want)
+	t.Cleanup(func() {
+		if err := driver.Close(); err != nil {
+			t.Errorf("driver.Close failed: %v", err)
 		}
+	})
+
+	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+		VolumeId:      "test-vol",
+		TargetPath:    t.TempDir(),
+		VolumeContext: map[string]string{"writeMode": "writethrough"},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("got status %v, want InvalidArgument", status.Code(err))
 	}
 }
 
