@@ -454,6 +454,9 @@ func TestLocalIndexSnapshotPublishRestoreAndReplay(t *testing.T) {
 
 			liveIdx, cleanupLive := factory.create(t, ctx, streamID)
 			defer cleanupLive()
+			if liveIdx.Registry() == nil {
+				t.Fatalf("expected non-nil registry after open")
+			}
 			_ = liveIdx.SyncRegistry(ctx, writer.Registry())
 
 			reader := sds.NewChangeReader()
@@ -498,9 +501,17 @@ func TestLocalIndexSnapshotPublishRestoreAndReplay(t *testing.T) {
 			if restoredPos != snapPos {
 				t.Fatalf("restoredPos %d != snapPos %d", restoredPos, snapPos)
 			}
+			if restoredIdx.Registry() == nil {
+				t.Fatalf("expected non-nil registry from restored index")
+			}
+			if _, _, ok := restoredIdx.Registry().LookupByName("testpkg.User"); !ok {
+				t.Fatalf("expected testpkg.User in restored snapshot registry")
+			}
 
 			replayReader := sds.NewChangeReader()
-			_ = replayReader.Registry().Import(writer.Registry().Export())
+			if err := replayReader.Registry().Import(restoredIdx.Registry().Export()); err != nil {
+				t.Fatalf("failed to import restored snapshot registry: %v", err)
+			}
 			for i := int(snapPos); i < len(transport.payloads); i++ {
 				changes, _ := replayReader.Feed(uint64(i+1), transport.payloads[i])
 				if len(changes) > 0 {

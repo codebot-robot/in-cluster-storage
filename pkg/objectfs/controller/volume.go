@@ -1151,11 +1151,7 @@ func (v *Volume) importIndexRegistryLocked(index sds.LocalIndex) error {
 	if v.metadataStream == nil {
 		return nil
 	}
-	provider, ok := index.(interface{ Registry() *record.Registry })
-	if !ok || provider == nil || provider.Registry() == nil {
-		return fmt.Errorf("restored index of type %T does not provide a type registry", index)
-	}
-	if err := v.metadataStream.Registry().Import(provider.Registry().Export()); err != nil {
+	if err := v.metadataStream.Registry().Import(index.Registry().Export()); err != nil {
 		return fmt.Errorf("failed to import restored snapshot registry: %w", err)
 	}
 	return nil
