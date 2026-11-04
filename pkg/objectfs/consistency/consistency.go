@@ -15,6 +15,9 @@ limitations under the License.
 */
 
 // Package consistency provides parsing and flag binding for ObjectFS consistency modes.
+//
+// In ObjectFS, StorageClass and volume-context parameters follow the
+// lowercase-hyphenated convention (e.g. "standard", "close-to-open").
 package consistency
 
 import (
@@ -25,30 +28,30 @@ import (
 )
 
 // ParseConsistencyMode parses a consistency mode string into a ConsistencyMode enum.
-// Canonical values use Kubernetes CamelCase format: "Standard" and "CloseToOpen".
-// Hyphenated and lowercase variants ("standard", "close-to-open", "closeToOpen") are also accepted.
+// In accordance with ObjectFS StorageClass parameter conventions, accepted canonical
+// values are lowercase-hyphenated: "standard" and "close-to-open".
 // An empty string parses as CONSISTENCY_MODE_UNSPECIFIED.
 // Any other value returns an error naming the accepted values.
 func ParseConsistencyMode(value string) (pb.ConsistencyMode, error) {
 	switch value {
 	case "":
 		return pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, nil
-	case "Standard", "standard":
+	case "standard":
 		return pb.ConsistencyMode_STANDARD, nil
-	case "CloseToOpen", "closeToOpen", "close-to-open":
+	case "close-to-open":
 		return pb.ConsistencyMode_CLOSE_TO_OPEN, nil
 	default:
-		return pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, fmt.Errorf("unknown consistency mode %q (accepted values: Standard, CloseToOpen)", value)
+		return pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, fmt.Errorf("unknown consistency mode %q (accepted values: standard, close-to-open)", value)
 	}
 }
 
-// ConsistencyModeString returns the canonical user-facing string for mode in Kubernetes CamelCase format.
+// ConsistencyModeString returns the canonical user-facing string for mode ("standard" or "close-to-open").
 func ConsistencyModeString(mode pb.ConsistencyMode) string {
 	switch mode {
 	case pb.ConsistencyMode_STANDARD:
-		return "Standard"
+		return "standard"
 	case pb.ConsistencyMode_CLOSE_TO_OPEN:
-		return "CloseToOpen"
+		return "close-to-open"
 	default:
 		return ""
 	}
