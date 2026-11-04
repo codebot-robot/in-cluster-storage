@@ -177,7 +177,11 @@ func TestNodePublishVolume_ConsistencyModeValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newDriver: %v", err)
 	}
-	defer func() { _ = driver.Close() }()
+	t.Cleanup(func() {
+		if err := driver.Close(); err != nil {
+			t.Errorf("driver.Close failed: %v", err)
+		}
+	})
 
 	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:      "test-vol",
@@ -188,4 +192,3 @@ func TestNodePublishVolume_ConsistencyModeValidation(t *testing.T) {
 		t.Fatalf("got status %v, want InvalidArgument", status.Code(err))
 	}
 }
-

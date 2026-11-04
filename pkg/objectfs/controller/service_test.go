@@ -1869,26 +1869,26 @@ func TestCreateVolume_ConsistencyMode(t *testing.T) {
 		{"std", "standard", pb.ConsistencyMode_STANDARD, codes.OK},
 		{"empty", "", pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, codes.OK},
 	}
-	for _, tt := range tests {
+	for _, testCase := range tests {
 		params := map[string]string{}
-		if tt.mode != "" {
-			params["consistency"] = tt.mode
+		if testCase.mode != "" {
+			params["consistency"] = testCase.mode
 		}
 		_, err := csiServer.CreateVolume(ctx, &csi.CreateVolumeRequest{
-			Name:               tt.name,
+			Name:               testCase.name,
 			Parameters:         params,
 			VolumeCapabilities: caps,
 		})
-		if status.Code(err) != tt.wantCode {
-			t.Errorf("%s: CreateVolume code = %v, want %v", tt.name, status.Code(err), tt.wantCode)
+		if status.Code(err) != testCase.wantCode {
+			t.Errorf("%s: CreateVolume code = %v, want %v", testCase.name, status.Code(err), testCase.wantCode)
 		}
-		if tt.wantCode == codes.OK {
-			vol, err := server.getOrCreateVolume(tt.name)
+		if testCase.wantCode == codes.OK {
+			vol, err := server.getOrCreateVolume(testCase.name)
 			if err != nil {
-				t.Fatalf("%s: getOrCreateVolume failed: %v", tt.name, err)
+				t.Fatalf("%s: getOrCreateVolume failed: %v", testCase.name, err)
 			}
-			if vol.ConsistencyMode() != tt.wantMode {
-				t.Errorf("%s: volume mode = %v, want %v", tt.name, vol.ConsistencyMode(), tt.wantMode)
+			if vol.ConsistencyMode() != testCase.wantMode {
+				t.Errorf("%s: volume mode = %v, want %v", testCase.name, vol.ConsistencyMode(), testCase.wantMode)
 			}
 		}
 	}
