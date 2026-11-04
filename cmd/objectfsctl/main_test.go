@@ -42,12 +42,14 @@ import (
 
 type fakeObjectFSControllerServer struct {
 	*controller.Server
-	mu                 sync.Mutex
-	lastDeleteRequest  *pb.DeleteVolumeRequest
-	deleteError        error
-	lastRestoreRequest *pb.RestoreSnapshotRequest
-	restoreResponse    *pb.RestoreSnapshotResponse
-	restoreError       error
+	mu                        sync.Mutex
+	lastDeleteRequest         *pb.DeleteVolumeRequest
+	deleteError               error
+	lastRestoreRequest        *pb.RestoreSnapshotRequest
+	restoreResponse           *pb.RestoreSnapshotResponse
+	restoreError              error
+	lastDeleteSnapshotRequest *pb.DeleteSnapshotRequest
+	deleteSnapshotError       error
 }
 
 func (s *fakeObjectFSControllerServer) DeleteVolume(ctx context.Context, request *pb.DeleteVolumeRequest) (*pb.DeleteVolumeResponse, error) {
@@ -101,6 +103,28 @@ func (s *fakeObjectFSControllerServer) getLastDeleteRequest() *pb.DeleteVolumeRe
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastDeleteRequest
+}
+
+func (s *fakeObjectFSControllerServer) DeleteSnapshot(ctx context.Context, request *pb.DeleteSnapshotRequest) (*pb.DeleteSnapshotResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastDeleteSnapshotRequest = request
+	if s.deleteSnapshotError != nil {
+		return nil, s.deleteSnapshotError
+	}
+	return &pb.DeleteSnapshotResponse{}, nil
+}
+
+func (s *fakeObjectFSControllerServer) setDeleteSnapshotError(deleteSnapshotError error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteSnapshotError = deleteSnapshotError
+}
+
+func (s *fakeObjectFSControllerServer) getLastDeleteSnapshotRequest() *pb.DeleteSnapshotRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastDeleteSnapshotRequest
 }
 
 func startTestServer(t *testing.T) (*fakeObjectFSControllerServer, string, func()) {
@@ -1087,5 +1111,45 @@ func TestSnapshotsRestoreCommand(t *testing.T) {
 		t.Fatalf("expected error from RestoreSnapshot RPC")
 	} else if !strings.Contains(err.Error(), "restore is already running on volume cli-restore-vol") {
 		t.Fatalf("expected error containing status error, got: %v", err)
+	}
+}
+
+func TestSnapshotsDeleteCommand(t *testing.T) {
+	server, serverAddr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// 1. Missing --server flag
+	if _, err := executeCommand("snapshots", "delete", "test-vol", "snap-1"); err == nil || !strings.Contains(err.Error(), "--server is required") {
+		t.Fatalf("expected --server is required error, got: %v", err)
+	}
+
+	// 2. Missing arguments
+	if _, err := executeCommand("--server", serverAddr, "snapshots", "delete"); err == nil {
+		t.Fatalf("expected error when all arguments are missing")
+	}
+	if _, err := executeCommand("--server", serverAddr, "snapshots", "delete", "test-vol"); err == nil {
+		t.Fatalf("expected error when snapshot argument is missing")
+	}
+
+	// 3. Delete snapshot successfully
+	volumeID := "cli-snap-vol"
+	snapshotName := "cli-snap-1"
+	deleteOutput, err := executeCommand("--server", serverAddr, "snapshots", "delete", volumeID, snapshotName)
+	if err != nil || !strings.Contains(deleteOutput, "Deleted snapshot cli-snap-1 for volume cli-snap-vol") {
+		t.Fatalf("expected 'Deleted snapshot cli-snap-1 for volume cli-snap-vol' in output, got: %q (err: %v)", deleteOutput, err)
+	}
+	request := server.getLastDeleteSnapshotRequest()
+	if request == nil || request.GetVolumeId() != volumeID || request.GetSnapshotName() != snapshotName {
+		t.Fatalf("expected DeleteSnapshot request for volume %q and snapshot %q, got: %+v", volumeID, snapshotName, request)
+	}
+
+	// 4. Error returned by controller includes error message, volume ID, and snapshot name
+	server.setDeleteSnapshotError(status.Error(codes.FailedPrecondition, "cannot delete newest snapshot"))
+	_, err = executeCommand("--server", serverAddr, "snapshots", "delete", volumeID, snapshotName)
+	if err == nil {
+		t.Fatalf("expected error from DeleteSnapshot RPC")
+	}
+	if !strings.Contains(err.Error(), "cannot delete newest snapshot") || !strings.Contains(err.Error(), volumeID) || !strings.Contains(err.Error(), snapshotName) {
+		t.Fatalf("expected error containing status error, volume ID, and snapshot name, got: %v", err)
 	}
 }

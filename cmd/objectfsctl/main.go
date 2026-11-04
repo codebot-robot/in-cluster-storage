@@ -533,6 +533,7 @@ func newSnapshotsCommand(opts *options) *cobra.Command {
 	snapshotsCmd.AddCommand(newSnapshotsListCommand(opts))
 	snapshotsCmd.AddCommand(newSnapshotCreateCommand(opts))
 	snapshotsCmd.AddCommand(newSnapshotRestoreCommand(opts))
+	snapshotsCmd.AddCommand(newSnapshotsDeleteCommand(opts))
 
 	return snapshotsCmd
 }
@@ -761,6 +762,42 @@ func newSnapshotRestoreCommand(opts *options) *cobra.Command {
 
 			out := cmd.OutOrStdout()
 			if _, err := fmt.Fprintln(out, response.GetSnapshot().GetName()); err != nil {
+				return fmt.Errorf("failed writing to output: %w", err)
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
+func newSnapshotsDeleteCommand(opts *options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "delete <volume> <snapshot>",
+		Aliases: []string{"del", "rm"},
+		Short:   "Delete a snapshot",
+		Args:    cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.serverAddr == "" {
+				return fmt.Errorf("--server is required")
+			}
+
+			volumeID := args[0]
+			snapshotName := args[1]
+			client, connection, err := dialServer(opts)
+			if err != nil {
+				return err
+			}
+			defer errutil.CloseAndLog(connection, "server connection")
+
+			request := &pb.DeleteSnapshotRequest{
+				VolumeId:     volumeID,
+				SnapshotName: snapshotName,
+			}
+			if _, err := client.DeleteSnapshot(cmd.Context(), request); err != nil {
+				return fmt.Errorf("failed to delete snapshot %s for volume %s: %w", snapshotName, volumeID, err)
+			}
+
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Deleted snapshot %s for volume %s\n", snapshotName, volumeID); err != nil {
 				return fmt.Errorf("failed writing to output: %w", err)
 			}
 			return nil
