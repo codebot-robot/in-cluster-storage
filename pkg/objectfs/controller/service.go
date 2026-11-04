@@ -542,31 +542,31 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 
 // Close stops periodic flushing and closes all active volumes and streams.
 func (s *Server) Close() error {
-	var firstErr error
+	var errs []error
 	var ran bool
 	s.closeOnce.Do(func() {
 		ran = true
-		if err := s.StopPeriodicFlush(); err != nil && firstErr == nil {
-			firstErr = err
+		if err := s.StopPeriodicFlush(); err != nil {
+			errs = append(errs, err)
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		for _, v := range s.volumes {
-			if err := v.Close(); err != nil && firstErr == nil {
-				firstErr = err
+		for _, volume := range s.volumes {
+			if err := volume.Close(); err != nil {
+				errs = append(errs, err)
 			}
 		}
 		clear(s.volumes)
 		if s.walConn != nil {
-			if err := s.walConn.Close(); err != nil && firstErr == nil {
-				firstErr = err
+			if err := s.walConn.Close(); err != nil {
+				errs = append(errs, err)
 			}
 			s.walConn = nil
 			s.walClient = nil
 		}
 		if s.tempWalDir != "" {
-			if err := os.RemoveAll(s.tempWalDir); err != nil && firstErr == nil {
-				firstErr = err
+			if err := os.RemoveAll(s.tempWalDir); err != nil {
+				errs = append(errs, err)
 			}
 			s.tempWalDir = ""
 		}
@@ -578,7 +578,7 @@ func (s *Server) Close() error {
 	if !ran {
 		return nil
 	}
-	return firstErr
+	return errors.Join(errs...)
 }
 
 func (s *Server) FlushAll(ctx context.Context) error {
