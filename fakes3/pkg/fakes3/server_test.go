@@ -617,4 +617,70 @@ func TestConcurrentWriters(t *testing.T) {
 	}
 }
 
+func TestListObjectsMetadata(t *testing.T) {
+	ctx := t.Context()
+	client, testServer := newTestClient(t, WithBuckets("metadata-bucket"))
+	if testServer == nil {
+		t.Fatal("expected non-nil test server")
+	}
+
+	firstKey := "first.txt"
+	secondKey := "second.txt"
+	firstContent := "first object content"
+	secondContent := "second object longer content"
+
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("metadata-bucket"),
+		Key:    aws.String(firstKey),
+		Body:   strings.NewReader(firstContent),
+	}); err != nil {
+		t.Fatalf("PutObject %s: %v", firstKey, err)
+	}
+
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("metadata-bucket"),
+		Key:    aws.String(secondKey),
+		Body:   strings.NewReader(secondContent),
+	}); err != nil {
+		t.Fatalf("PutObject %s: %v", secondKey, err)
+	}
+
+	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String("metadata-bucket"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectsV2: %v", err)
+	}
+	if len(output.Contents) != 2 {
+		t.Fatalf("expected 2 contents, got %d", len(output.Contents))
+	}
+
+	firstEntry := output.Contents[0]
+	secondEntry := output.Contents[1]
+
+	if aws.ToString(firstEntry.Key) != firstKey {
+		t.Errorf("expected first key %s, got %s", firstKey, aws.ToString(firstEntry.Key))
+	}
+	if aws.ToInt64(firstEntry.Size) != int64(len(firstContent)) {
+		t.Errorf("expected first size %d, got %d", len(firstContent), aws.ToInt64(firstEntry.Size))
+	}
+	if firstEntry.LastModified == nil || firstEntry.LastModified.IsZero() {
+		t.Errorf("expected non-zero LastModified for first entry")
+	}
+
+	if aws.ToString(secondEntry.Key) != secondKey {
+		t.Errorf("expected second key %s, got %s", secondKey, aws.ToString(secondEntry.Key))
+	}
+	if aws.ToInt64(secondEntry.Size) != int64(len(secondContent)) {
+		t.Errorf("expected second size %d, got %d", len(secondContent), aws.ToInt64(secondEntry.Size))
+	}
+	if secondEntry.LastModified == nil || secondEntry.LastModified.IsZero() {
+		t.Errorf("expected non-zero LastModified for second entry")
+	}
+
+	if firstEntry.LastModified.After(*secondEntry.LastModified) {
+		t.Errorf("expected LastModified ordered: first (%v) after second (%v)", firstEntry.LastModified, secondEntry.LastModified)
+	}
+}
+
 var _ = context.Background

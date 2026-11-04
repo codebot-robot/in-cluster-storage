@@ -586,7 +586,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucketName, k
 	obj := &object{
 		data:        body,
 		etag:        hexMD5(body),
-		modTime:     time.Now().UTC().Truncate(time.Second),
+		modTime:     time.Now().UTC().Truncate(time.Millisecond),
 		contentType: r.Header.Get("Content-Type"),
 		metadata:    userMetadata(r.Header),
 		checksums:   checksums,
@@ -656,7 +656,7 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucketName, 
 	dst := &object{
 		data:        append([]byte(nil), src.data...),
 		etag:        src.etag,
-		modTime:     time.Now().UTC().Truncate(time.Second),
+		modTime:     time.Now().UTC().Truncate(time.Millisecond),
 		contentType: src.contentType,
 		metadata:    src.metadata,
 		checksums:   src.checksums,
