@@ -2127,6 +2127,13 @@ spec:
 		t.Fatalf("Reader 16 MiB stat size mismatch: expected 16777216, got %q (err: %v)", stat16m, err)
 	}
 	t.Logf("Successfully verified two-node close-to-open consistency for 4 KiB inline and 16 MiB multi-chunk files!")
+
+	controllerLogs := h.GetPodLogsByName("objectfs-controller-0", "default")
+	for _, logLine := range strings.Split(controllerLogs, "\n") {
+		if strings.Contains(logLine, "sync completed in") {
+			t.Logf("Controller: %s", logLine)
+		}
+	}
 }
 
 func TestObjectFSControllerCrashMidWriteE2E(t *testing.T) {

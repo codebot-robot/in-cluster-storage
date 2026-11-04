@@ -22,11 +22,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -34,6 +36,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"golang.org/x/sync/errgroup"
@@ -2244,5 +2247,140 @@ func TestLocalPackRead_NoBackendRoundTripOnCommittedRead(t *testing.T) {
 	postResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: volumeID, Inode: ino, Size: int64(len(payload))})
 	if err != nil || postResp.GetError() != 0 || !bytes.Equal(postResp.GetData(), payload) || backend.getPackGetCount() == 0 {
 		t.Fatalf("post-eviction ReadFile failed or did not fetch from backend: %v", err)
+	}
+}
+
+type durabilityCountingStream struct {
+	appendCount atomic.Int64
+	waitCount   atomic.Int64
+	localSeq    atomic.Uint64
+}
+
+func (s *durabilityCountingStream) Append(_ context.Context, _ []byte) (uint64, error) {
+	s.appendCount.Add(1)
+	return s.localSeq.Add(1), nil
+}
+
+func (s *durabilityCountingStream) Wait(_ context.Context, _ uint64, _ walclient.Level, _ bool) error {
+	s.waitCount.Add(1)
+	return nil
+}
+
+func (s *durabilityCountingStream) Flush(_ context.Context) error {
+	return nil
+}
+
+func (s *durabilityCountingStream) Watermarks() (local, witness, permanent uint64) {
+	currentSeq := s.localSeq.Load()
+	return currentSeq, currentSeq, currentSeq
+}
+
+func (s *durabilityCountingStream) RecoveredRecords() []*wal.ClientRecord {
+	return nil
+}
+
+func (s *durabilityCountingStream) ReplicationLevel() walclient.Level {
+	return walclient.Permanent
+}
+
+func (s *durabilityCountingStream) Tail(_ context.Context, _ uint64) (iter.Seq2[uint64, []byte], error) {
+	return func(yield func(uint64, []byte) bool) {}, nil
+}
+
+func (s *durabilityCountingStream) Degraded() *walclient.DegradedError {
+	return nil
+}
+
+func (s *durabilityCountingStream) Close() error {
+	return nil
+}
+
+// TestSync_SingleDurabilityWaitPerCommit asserts that during a multi-chunk sync,
+// all metadata records are committed with exactly one durability wait at commit time,
+// never waiting once per record.
+func TestSync_SingleDurabilityWaitPerCommit(t *testing.T) {
+	tests := []struct {
+		name       string
+		durability walclient.Level
+	}{
+		{name: "Local", durability: walclient.Local},
+		{name: "Witness", durability: walclient.Witness},
+		{name: "Permanent", durability: walclient.Permanent},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := t.Context()
+			countingStream := &durabilityCountingStream{}
+
+			backend := NewMemoryBackend()
+			server := NewTestServer(t, backend,
+				WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
+					return countingStream, nil
+				}),
+				WithServerDurability(testCase.durability),
+			)
+			defer func() {
+				if err := server.Close(); err != nil {
+					t.Errorf("server.Close failed: %v", err)
+				}
+			}()
+
+			volumeID := "test-single-wait-" + strings.ToLower(testCase.name)
+			createResponse, err := testCreateFile(ctx, server, volumeID, "/multi_chunk.bin", 0644, nil, 0, 0)
+			if err != nil || createResponse.GetError() != 0 {
+				t.Fatalf("testCreateFile failed: %v (code %d)", err, createResponse.GetError())
+			}
+			inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+			// Reset wait and append counters after initial file creation
+			countingStream.waitCount.Store(0)
+			countingStream.appendCount.Store(0)
+
+			// Write 16 chunks with LAZY_WRITE so chunks are staged in memory
+			chunkSize := 64 * 1024
+			numChunks := 16
+			payload := bytes.Repeat([]byte("X"), numChunks*chunkSize)
+
+			for chunkIndex := 0; chunkIndex < numChunks; chunkIndex++ {
+				offset := int64(chunkIndex * chunkSize)
+				chunkData := payload[offset : offset+int64(chunkSize)]
+				writeResponse, err := testWriteFile(ctx, server, volumeID, "/multi_chunk.bin", offset, chunkData, pb.WriteMode_LAZY_WRITE)
+				if err != nil || writeResponse.GetError() != 0 {
+					t.Fatalf("testWriteFile chunk %d failed: %v (code %d)", chunkIndex, err, writeResponse.GetError())
+				}
+			}
+
+			// During lazy staging, no WAL appends or durability waits have occurred
+			if appends := countingStream.appendCount.Load(); appends != 0 {
+				t.Fatalf("expected 0 appends during lazy staging, got %d", appends)
+			}
+			if waits := countingStream.waitCount.Load(); waits != 0 {
+				t.Fatalf("expected 0 durability waits during lazy staging, got %d", waits)
+			}
+
+			// Fsync triggers executeSyncLocked, committing all 16 FileChunk rows + Inode update + TxCommit
+			fsyncResponse, err := server.Fsync(ctx, &pb.FsyncRequest{
+				VolumeId: volumeID,
+				Inode:    inodeID,
+				Blocking: true,
+			})
+			if err != nil || !fsyncResponse.GetSuccess() {
+				t.Fatalf("server.Fsync failed: %v", err)
+			}
+
+			appends := countingStream.appendCount.Load()
+			waits := countingStream.waitCount.Load()
+
+			// Expect at least numChunks (16) records appended: 16 FileChunk records + 1 Inode update + 1 TxCommit = 18 records
+			if appends < int64(numChunks) {
+				t.Errorf("expected at least %d appends, got %d", numChunks, appends)
+			}
+
+			// Critical invariant: exactly ONE durability wait per sync, not one per record!
+			if waits != 1 {
+				t.Errorf("expected exactly 1 durability wait per sync, got %d (for %d appended records)", waits, appends)
+			}
+		})
 	}
 }

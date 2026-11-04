@@ -269,7 +269,8 @@ func (s *ClientSegmentStore) segmentFilename(firstSeq uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("%s-%019d.wal", s.filePrefix, firstSeq))
 }
 
-// Append writes and fsyncs a single ClientRecord.
+// Append writes a single ClientRecord to the active segment file without fsync.
+// Fsync is deferred to Sync() when a durability wait is executed at commit time.
 func (s *ClientSegmentStore) Append(rec *ClientRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -287,12 +288,6 @@ func (s *ClientSegmentStore) Append(rec *ClientRecord) error {
 		return fmt.Errorf("failed writing to segment file %s: %w", s.activeMeta.Path, err)
 	}
 
-	if !s.noFsync {
-		if err := s.activeFile.Sync(); err != nil {
-			return fmt.Errorf("failed syncing segment file %s: %w", s.activeMeta.Path, err)
-		}
-	}
-
 	if s.activeMeta.RecordCount == 0 {
 		s.activeMeta.FirstSeq = rec.StreamSeq
 	}
@@ -300,6 +295,19 @@ func (s *ClientSegmentStore) Append(rec *ClientRecord) error {
 	s.activeMeta.Size += recordLen
 	s.activeMeta.RecordCount++
 
+	return nil
+}
+
+// Sync flushes buffered writes in the active segment file to disk.
+func (s *ClientSegmentStore) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.activeFile != nil && !s.noFsync {
+		if err := s.activeFile.Sync(); err != nil {
+			return fmt.Errorf("failed syncing segment file %s: %w", s.activeMeta.Path, err)
+		}
+	}
 	return nil
 }
 

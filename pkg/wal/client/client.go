@@ -95,7 +95,7 @@ func (e *DegradedError) Unwrap() error {
 
 // Stream is the interface used by node daemons to append to the WAL.
 type Stream interface {
-	// Append writes and fsyncs locally, then returns the stream_seq.
+	// Append writes locally, then returns the stream_seq.
 	Append(ctx context.Context, payload []byte) (uint64, error)
 	// Wait blocks until seq has reached level. If requestFlush is true and level is Permanent,
 	// a Flush RPC is issued (coalesced server-side) before waiting instead of relying on the periodic flush.
@@ -117,6 +117,7 @@ type Stream interface {
 // SegmentStore defines the interface for local segment file operations.
 type SegmentStore interface {
 	Append(rec *wal.ClientRecord) error
+	Sync() error
 	Close() error
 	TruncateAfter(seq uint64) error
 	DeleteSegmentsBeforeS3Ack(seq uint64) error
@@ -357,7 +358,7 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 	return s, nil
 }
 
-// Append writes and fsyncs locally, applying backpressure if retained bytes exceed maxRetainedBytes.
+// Append writes locally without per-record fsync, applying backpressure if retained bytes exceed maxRetainedBytes.
 func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error) {
 	if s.closed.Load() {
 		return 0, errors.New("stream closed")
@@ -428,7 +429,7 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		Payload:   payload,
 	}
 
-	// 1. Write and fsync locally first
+	// 1. Write locally first (fsync is deferred to Wait/Flush at commit time)
 	if err := s.store.Append(rec); err != nil {
 		s.mu.Lock()
 		s.retainedBytes -= recordSize
@@ -546,6 +547,12 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 		return fmt.Errorf("invalid durability level: %v", level)
 	}
 
+	if s.store != nil {
+		if err := s.store.Sync(); err != nil {
+			return fmt.Errorf("local fsync failed: %w", err)
+		}
+	}
+
 	if level == Local {
 		return nil
 	}
@@ -592,6 +599,12 @@ func (s *streamImpl) Flush(ctx context.Context) error {
 
 	if targetSeq == 0 || s3 >= targetSeq {
 		return nil
+	}
+
+	if s.store != nil {
+		if err := s.store.Sync(); err != nil {
+			return fmt.Errorf("local fsync failed: %w", err)
+		}
 	}
 
 	if Permanent > s.replicationLevel {
