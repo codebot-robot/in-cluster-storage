@@ -74,7 +74,7 @@ func newMountCommand(opts *options) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&mountOpts.volumeID, "volume", "", "Volume ID to mount (required)")
 	cmd.Flags().StringVar(&mountOpts.writeMode, "write-mode", "fsync", "Write mode: fsync, lazy or eager")
-	cmd.Flags().Var(consistency.NewValue(&mountOpts.consistencyMode), "consistency", "Consistency mode: standard or close-to-open")
+	cmd.Flags().Var(consistency.NewValue(&mountOpts.consistencyMode), "consistency", "Consistency mode: Standard or CloseToOpen")
 	cmd.Flags().Int64Var(&mountOpts.cacheSizeMB, "cache-size-mb", 128, "Local cache size in MB")
 	cmd.Flags().StringVar(&mountOpts.nodeID, "node-id", "", "Node ID reported to the controller (defaults to the hostname)")
 	cmd.Flags().BoolVar(&mountOpts.allowOther, "allow-other", false, "Allow other users to access the mount (requires user_allow_other in /etc/fuse.conf when not root)")

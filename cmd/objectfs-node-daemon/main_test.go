@@ -192,3 +192,27 @@ func TestNodePublishVolume_ConsistencyModeValidation(t *testing.T) {
 		t.Fatalf("got status %v, want InvalidArgument", status.Code(err))
 	}
 }
+
+func TestNodePublishVolume_ExclusiveLocalRejectsConsistency(t *testing.T) {
+	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true)
+	if err != nil {
+		t.Fatalf("newDriver: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := driver.Close(); err != nil {
+			t.Errorf("driver.Close failed: %v", err)
+		}
+	})
+
+	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+		VolumeId:   "test-vol",
+		TargetPath: t.TempDir(),
+		VolumeContext: map[string]string{
+			"mode":        "exclusive-local",
+			"consistency": "CloseToOpen",
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("got status %v, want InvalidArgument", status.Code(err))
+	}
+}

@@ -912,8 +912,11 @@ func TestVolumesRepairAndDegradedDisplay(t *testing.T) {
 
 func TestMountConsistencyFlag(t *testing.T) {
 	cmd := newMountCommand(&options{})
-	if err := cmd.ParseFlags([]string{"--consistency=close-to-open"}); err != nil {
-		t.Fatalf("ParseFlags: %v", err)
+	if err := cmd.ParseFlags([]string{"--consistency=CloseToOpen"}); err != nil {
+		t.Fatalf("ParseFlags CloseToOpen: %v", err)
+	}
+	if err := newMountCommand(&options{}).ParseFlags([]string{"--consistency=close-to-open"}); err != nil {
+		t.Fatalf("ParseFlags close-to-open: %v", err)
 	}
 	if err := newMountCommand(&options{}).ParseFlags([]string{"--consistency=close_to_open"}); err == nil {
 		t.Fatal("expected error for typo")
