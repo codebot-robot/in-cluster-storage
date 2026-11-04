@@ -309,21 +309,18 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return nil, fmt.Errorf("volumeID is required")
 	}
 
+	consistencyMode, err := consistency.ParseConsistencyMode(req.GetVolumeContext()["consistency"])
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	mode := strings.ToLower(req.GetVolumeContext()["mode"])
 	if mode == "exclusive-local" {
-		if req.GetVolumeContext()["consistency"] != "" {
-			return nil, status.Errorf(codes.InvalidArgument, "exclusive-local volume %s does not support consistency parameter %q", volumeID, req.GetVolumeContext()["consistency"])
-		}
 		cap := req.GetVolumeCapability()
 		if cap == nil || cap.GetAccessMode() == nil || cap.GetAccessMode().GetMode() != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
 			return nil, status.Errorf(codes.InvalidArgument, "exclusive-local mode requires SINGLE_NODE_SINGLE_WRITER access mode (ReadWriteOncePod)")
 		}
 		return d.publishExclusiveLocal(ctx, req, volumeID)
-	}
-
-	consistencyMode, err := consistency.ParseConsistencyMode(req.GetVolumeContext()["consistency"])
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	writeModeStr := req.GetVolumeContext()["writeMode"]

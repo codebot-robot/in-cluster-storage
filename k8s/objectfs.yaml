@@ -445,6 +445,6 @@ provisioner: objectfs.labs.gke.io
 volumeBindingMode: Immediate
 reclaimPolicy: Delete
 parameters:
-  consistency: CloseToOpen
+  consistency: close-to-open
 
 

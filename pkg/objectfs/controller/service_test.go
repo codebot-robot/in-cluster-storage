@@ -1865,10 +1865,9 @@ func TestCreateVolume_ConsistencyMode(t *testing.T) {
 		wantCode codes.Code
 	}{
 		{"typo", "close_to_open", 0, codes.InvalidArgument},
-		{"c2o_camel", "CloseToOpen", pb.ConsistencyMode_CLOSE_TO_OPEN, codes.OK},
-		{"c2o_hyphen", "close-to-open", pb.ConsistencyMode_CLOSE_TO_OPEN, codes.OK},
-		{"std_camel", "Standard", pb.ConsistencyMode_STANDARD, codes.OK},
-		{"std_lower", "standard", pb.ConsistencyMode_STANDARD, codes.OK},
+		{"non_canonical_camel", "CloseToOpen", 0, codes.InvalidArgument},
+		{"c2o", "close-to-open", pb.ConsistencyMode_CLOSE_TO_OPEN, codes.OK},
+		{"std", "standard", pb.ConsistencyMode_STANDARD, codes.OK},
 		{"empty", "", pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, codes.OK},
 	}
 	for _, testCase := range tests {

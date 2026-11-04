@@ -193,7 +193,7 @@ func TestNodePublishVolume_ConsistencyModeValidation(t *testing.T) {
 	}
 }
 
-func TestNodePublishVolume_ExclusiveLocalRejectsConsistency(t *testing.T) {
+func TestNodePublishVolume_ExclusiveLocalMisspellingFails(t *testing.T) {
 	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true)
 	if err != nil {
 		t.Fatalf("newDriver: %v", err)
@@ -209,7 +209,7 @@ func TestNodePublishVolume_ExclusiveLocalRejectsConsistency(t *testing.T) {
 		TargetPath: t.TempDir(),
 		VolumeContext: map[string]string{
 			"mode":        "exclusive-local",
-			"consistency": "CloseToOpen",
+			"consistency": "close_to_open",
 		},
 	})
 	if status.Code(err) != codes.InvalidArgument {

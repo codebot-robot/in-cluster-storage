@@ -412,7 +412,7 @@ To achieve both high write throughput and optimal packing in cloud object storag
 
 3. **Consistency Contract & Modes:**
 
-   ObjectFS provides two consistency modes configured per StorageClass via `parameters: consistency`:
+   ObjectFS provides two consistency modes configured per StorageClass via `parameters: consistency` (StorageClass and volume-context parameters in ObjectFS follow the lowercase-hyphenated convention):
 
    - **Standard Mode (default, `consistency: standard`):**
      - **On the writer's own node:** Visibility is immediate through its local cache (`NodeCache`).
@@ -440,7 +440,7 @@ To achieve both high write throughput and optimal packing in cloud object storag
          - 16 MiB multi-chunk file: ~106.6 ms
          Against a real cloud object store, the barrier wait additionally includes the packfile `PutBlobs` upload latency, scaling with the size of dirty data closed since the last sync.
      - **Visibility, NOT Crash Durability:** Close-to-open orders **visibility across nodes, NOT crash durability**. Until the sync that close triggers (or a reader's barrier forces) has uploaded packfiles and committed metadata, data exists only in controller staging memory and the writer daemon's cache. If the controller restarts during that window, staged data is dropped; if the writer daemon is also lost, the data is lost even though `close(2)` returned success. Durability still arrives only with a committed sync, and `fsync(2)` is the only way for applications to wait for it.
-     - **Interaction with Exclusive-Local Mode:** Exclusive-local volumes (`mode: exclusive-local`) satisfy close-to-open by construction via unmount checkpoints. Setting the `consistency` parameter on an exclusive-local volume returns an error.
+     - **Interaction with Exclusive-Local Mode:** Exclusive-local volumes (`mode: exclusive-local`) satisfy close-to-open by construction via unmount checkpoints. The `consistency` parameter is ignored on exclusive-local volumes, and misspelled or unknown values return an error.
      - **Interaction with #174:** Issue #174 explores avoiding the per-FUSE-open `Open` RPC. Close-to-open consistency strictly requires the `Open` RPC so the controller can execute the open barrier and the node daemon can invalidate stale reader caches. Implementations must retain the `Open` RPC for close-to-open volumes, and any changes under #174 must preserve this path.
 
 4. **Sync Triggers:**
