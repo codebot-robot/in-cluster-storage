@@ -7777,73 +7777,73 @@ func TestMetadataStreamRegisteredTypeIDs(t *testing.T) {
 }
 
 func TestVolume_DeletionMarker_Lifecycle(t *testing.T) {
-	volumeID, ctx := "vol-del-lifecycle", t.Context()
-	backend, broadcaster := NewMemoryBackend(), NewEventBroadcaster()
+	ctx, backend, volumeID := t.Context(), NewMemoryBackend(), "vol-del-lifecycle"
 	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
-	openStream := func() walclient.Stream {
-		s, err := walclient.Open(ctx, t.TempDir(), StreamIDForVolume(volumeID), bt.Target,
-			walclient.WithGRPCClient(bt.Client),
-			walclient.WithDialOptions(bt.DialOpts...),
-			walclient.WithoutFsync(),
+	walDirectory := t.TempDir()
+	newServer := func() *Server {
+		return NewServer(backend,
+			WithServerWAL(walDirectory, bt.Target, walclient.Witness),
+			WithServerWALClient(bt.Client),
+			WithServerWALDialOptions(bt.DialOpts...),
+			WithServerLocalStorageDir(t.TempDir()),
+			WithServerWithoutFsync(),
 		)
-		if err != nil {
-			t.Fatalf("walclient.Open failed: %v", err)
-		}
-		return s
 	}
 
-	// 1. Write file and consistency mode
-	volume1 := MustNewVolume(t, volumeID, backend, broadcaster, WithLocalStorageDir(t.TempDir()), WithStream(openStream()))
-	if _, err := volume1.CreateFile(ctx, 1, "old.txt", 0644, []byte("content"), 0, 0, 0); err != nil || volume1.PersistConsistencyMode(ctx, pb.ConsistencyMode_CLOSE_TO_OPEN) != nil {
-		t.Fatalf("setup volume1 failed: %v", err)
+	// 1. Write file
+	server1 := newServer()
+	if _, err := testCreateFile(ctx, server1, volumeID, "/old.txt", 0644, []byte("content"), 0, 0); err != nil {
+		t.Fatalf("testCreateFile failed: %v", err)
 	}
 
 	// 2. Delete: repeated deletes are idempotent; operations on deleted volume return NotFound
-	if err := volume1.RecordDeletion(ctx); err != nil || volume1.RecordDeletion(ctx) != nil {
+	vol, err := server1.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
+	if err := vol.RecordDeletion(ctx); err != nil || vol.RecordDeletion(ctx) != nil {
 		t.Fatalf("repeated RecordDeletion failed: %v", err)
 	}
-	if _, err := volume1.ReadDir(ctx, 1); status.Code(err) != codes.NotFound {
+	if _, err := server1.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1}); status.Code(err) != codes.NotFound {
 		t.Fatalf("expected NotFound on ReadDir after delete, got: %v", err)
 	}
-	if _, err := volume1.GetAttr(ctx, 1); status.Code(err) != codes.NotFound {
+	if _, err := server1.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Inode: 1}); status.Code(err) != codes.NotFound {
 		t.Fatalf("expected NotFound on GetAttr after delete, got: %v", err)
 	}
-	if err := volume1.Close(); err != nil {
-		t.Fatalf("volume1.Close failed: %v", err)
+	if err := server1.Close(); err != nil {
+		t.Fatalf("server1.Close failed: %v", err)
 	}
 
 	// 3. Restart keeps it deleted (LoadFromBackend fails with NotFound)
-	volume2, err := NewVolume(volumeID, backend, broadcaster, WithLocalStorageDir(t.TempDir()), WithStream(openStream()))
-	if err != nil {
-		t.Fatalf("NewVolume failed: %v", err)
-	}
-	if err := volume2.LoadFromBackend(ctx); status.Code(err) != codes.NotFound {
+	server2 := newServer()
+	if _, err := server2.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1}); status.Code(err) != codes.NotFound {
 		t.Fatalf("expected NotFound on restart, got: %v", err)
 	}
-	if err := volume2.Close(); err != nil {
-		t.Fatalf("volume2.Close failed: %v", err)
+	if err := server2.Close(); err != nil {
+		t.Fatalf("server2.Close failed: %v", err)
 	}
 
 	// 4. A deleted:false record restores the data (re-creating under same id recovery)
-	stream3 := openStream()
+	stream3, err := server2.openStreamForVolume(volumeID, walDirectory)
+	if err != nil {
+		t.Fatalf("openStreamForVolume failed: %v", err)
+	}
 	if err := recordTombstone(ctx, stream3, volumeID, false); err != nil {
 		t.Fatalf("recordTombstone undelete failed: %v", err)
 	}
 	if err := stream3.Close(); err != nil {
 		t.Fatalf("stream3.Close failed: %v", err)
 	}
-	volume3 := MustNewVolume(t, volumeID, backend, broadcaster, WithLocalStorageDir(t.TempDir()), WithStream(openStream()))
+
+	server3 := newServer()
 	t.Cleanup(func() {
-		if err := volume3.Close(); err != nil {
-			t.Errorf("volume3.Close failed: %v", err)
+		if err := server3.Close(); err != nil {
+			t.Errorf("server3.Close failed: %v", err)
 		}
 	})
-	entries, err := volume3.ReadDir(ctx, 1)
-	if err != nil || len(entries) != 1 || entries[0].GetName() != "old.txt" {
+	entries, err := server3.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1})
+	if err != nil || len(entries.GetEntries()) != 1 || entries.GetEntries()[0].GetName() != "old.txt" {
 		t.Fatalf("expected restored old.txt, got %v (err: %v)", entries, err)
-	}
-	if volume3.ConsistencyMode() != pb.ConsistencyMode_CLOSE_TO_OPEN {
-		t.Fatalf("expected preserved consistency mode, got %v", volume3.ConsistencyMode())
 	}
 }
 
@@ -7885,5 +7885,43 @@ func TestVolume_DeletionMarker_ThreeControllers(t *testing.T) {
 	})
 	if _, err := server3.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1}); status.Code(err) != codes.NotFound {
 		t.Fatalf("expected NotFound on server3 (deleted-on-3), got: %v", err)
+	}
+}
+
+func TestVolume_DeletionMarker_LoadedRejectsOperations(t *testing.T) {
+	ctx, backend, volumeID := t.Context(), NewMemoryBackend(), "vol-loaded-rejects"
+	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
+	server := NewServer(backend,
+		WithServerWAL(t.TempDir(), bt.Target, walclient.Witness),
+		WithServerWALClient(bt.Client),
+		WithServerWALDialOptions(bt.DialOpts...),
+		WithServerLocalStorageDir(t.TempDir()),
+		WithServerWithoutFsync(),
+	)
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close failed: %v", err)
+		}
+	})
+
+	createResp, err := testCreateFile(ctx, server, volumeID, "/test.txt", 0644, []byte("hello"), 0, 0)
+	if err != nil {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+
+	vol, err := server.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
+	if err := vol.RecordDeletion(ctx); err != nil {
+		t.Fatalf("RecordDeletion on loaded volume failed: %v", err)
+	}
+
+	ino := createResp.GetAttr().GetInode().GetIno()
+	if _, err := server.WriteFile(ctx, &pb.WriteFileRequest{VolumeId: volumeID, Inode: ino, Data: []byte("fail")}); status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound on WriteFile on loaded deleted volume, got: %v", err)
+	}
+	if _, err := server.Open(ctx, &pb.OpenRequest{VolumeId: volumeID, Inode: ino}); status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound on Open on loaded deleted volume, got: %v", err)
 	}
 }

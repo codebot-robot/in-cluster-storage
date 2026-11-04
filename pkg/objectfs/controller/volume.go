@@ -47,8 +47,6 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
@@ -81,6 +79,9 @@ const (
 	// while bounding cross-node visibility latency for quiet files.
 	closeCoalesceWindow = 75 * time.Millisecond
 )
+
+// ErrVolumeDeleted is returned when an operation is attempted on a volume that has been deleted.
+var ErrVolumeDeleted = errors.New("volume not found")
 
 type syncResult struct {
 	pos uint64
@@ -2326,9 +2327,6 @@ func (v *Volume) toEntryAttrLocked(ctx context.Context, tx *sds.Tx, inodeID uint
 func (v *Volume) GetAttr(ctx context.Context, inodeID uint64) (*pb.EntryAttr, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	if v.deleted {
-		return nil, status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
-	}
 
 	inodeID = v.normalizeInodeID(inodeID)
 	return v.toEntryAttrLocked(ctx, nil, inodeID, "")
@@ -2685,9 +2683,6 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	if v.deleted {
-		return nil, status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
-	}
 
 	parentInodeID = v.normalizeInodeID(parentInodeID)
 
@@ -2728,9 +2723,6 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAttr, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	if v.deleted {
-		return nil, status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
-	}
 
 	dirInodeID = v.normalizeInodeID(dirInodeID)
 
@@ -6341,7 +6333,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	}
 	v.assertStatsMatchLocked("after loadFromBackendMetadataLocked")
 	if v.deleted {
-		return status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
+		return ErrVolumeDeleted
 	}
 	return nil
 }
@@ -6415,9 +6407,6 @@ func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error
 func (v *Volume) ListSnapshots(ctx context.Context) ([]*sdsv1.SnapshotPointer, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	if v.deleted {
-		return nil, status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
-	}
 	return v.listSnapshotsLocked(ctx)
 }
 
