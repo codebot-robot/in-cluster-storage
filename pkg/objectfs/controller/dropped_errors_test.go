@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -461,5 +462,48 @@ func TestRegression_ShutdownFlushFailureSurfacedInClose(t *testing.T) {
 	// Close must return error so controller exits non-zero on failed final flush
 	if err := server.Close(); err == nil {
 		t.Fatal("expected server.Close() to fail when final flush fails, got nil")
+	}
+}
+
+type failingCloseStream struct {
+	walclient.Stream
+	closeErr error
+}
+
+func (s *failingCloseStream) Close() error {
+	return s.closeErr
+}
+
+func TestServer_Close_ReturnsAllErrorsJoined(t *testing.T) {
+	volumeA := &Volume{
+		stream: &failingCloseStream{closeErr: errors.New("volume a close failed")},
+	}
+	volumeA.syncCond = sync.NewCond(&volumeA.stagingMu)
+
+	volumeB := &Volume{
+		stream: &failingCloseStream{closeErr: errors.New("volume b close failed")},
+	}
+	volumeB.syncCond = sync.NewCond(&volumeB.stagingMu)
+
+	server := &Server{
+		volumes: map[string]*Volume{
+			"vol-a": volumeA,
+			"vol-b": volumeB,
+		},
+	}
+
+	err := server.Close()
+	if err == nil {
+		t.Fatal("expected server.Close() to fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "volume a close failed") {
+		t.Errorf("expected error to contain %q, got: %v", "volume a close failed", err)
+	}
+	if !strings.Contains(err.Error(), "volume b close failed") {
+		t.Errorf("expected error to contain %q, got: %v", "volume b close failed", err)
+	}
+
+	if err := server.Close(); err != nil {
+		t.Errorf("expected subsequent server.Close() to return nil, got: %v", err)
 	}
 }

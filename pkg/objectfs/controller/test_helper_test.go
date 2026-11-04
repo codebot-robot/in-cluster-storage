@@ -25,7 +25,6 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
-	"k8s.io/klog/v2"
 )
 
 // NewTestServer constructs a Server configured for testing with an in-process WAL buffer over bufconn,
@@ -49,16 +48,9 @@ func NewTestServer(t testing.TB, backend ObjectStorageBackend, opts ...ServerOpt
 		}
 		t.Cleanup(func() {
 			if err := os.RemoveAll(walDir); err != nil {
-				klog.V(4).Infof("failed to remove test walDir %s: %v", walDir, err)
+				t.Errorf("failed to remove test walDir %s: %v", walDir, err)
 			}
 		})
-
-		combinedCleanup := func() {
-			cleanup()
-			if err := os.RemoveAll(walDir); err != nil {
-				klog.V(4).Infof("failed to remove test walDir %s: %v", walDir, err)
-			}
-		}
 
 		metadataDir := t.TempDir()
 
@@ -68,7 +60,7 @@ func NewTestServer(t testing.TB, backend ObjectStorageBackend, opts ...ServerOpt
 			WithServerWALDialOptions(bt.DialOpts...),
 			WithServerWithoutFsync(),
 			WithServerMetadataDir(metadataDir),
-			WithServerTestCleanup(combinedCleanup),
+			WithServerTestCleanup(cleanup),
 		}
 		testOpts = append(testOpts, opts...)
 		server = NewServer(backend, testOpts...)
