@@ -1064,7 +1064,9 @@ func TestSnapshotsRestoreCommand(t *testing.T) {
 	targetSnapshot := "snapshot-20261104-001.sqlite"
 	expectedPublishedSnapshot := "snapshot-20261104-002.sqlite"
 	server.setRestoreResponse(&pb.RestoreSnapshotResponse{
-		SnapshotName: expectedPublishedSnapshot,
+		Snapshot: &pb.SnapshotInfo{
+			Name: expectedPublishedSnapshot,
+		},
 	})
 
 	restoreOutput, err := executeCommand("--server", serverAddr, "snapshots", "restore", volumeID, targetSnapshot)

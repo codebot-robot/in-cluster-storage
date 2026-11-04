@@ -760,7 +760,7 @@ func newSnapshotRestoreCommand(opts *options) *cobra.Command {
 			}
 
 			out := cmd.OutOrStdout()
-			if _, err := fmt.Fprintln(out, response.GetSnapshotName()); err != nil {
+			if _, err := fmt.Fprintln(out, response.GetSnapshot().GetName()); err != nil {
 				return fmt.Errorf("failed writing to output: %w", err)
 			}
 			return nil
