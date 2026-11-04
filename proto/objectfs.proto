@@ -52,6 +52,8 @@ service ObjectFSController {
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  // RestoreSnapshot restores the volume filesystem state to a specific snapshot in-place.
+  rpc RestoreSnapshot(RestoreSnapshotRequest) returns (RestoreSnapshotResponse);
   rpc GetVolumeStats(GetVolumeStatsRequest) returns (GetVolumeStatsResponse);
   // Checkpoint requests an immediate checkpoint commit on an exclusive-local volume and waits
   // for the mounting node daemon to acknowledge it. Only exclusive-local mounts act on the event;
@@ -502,9 +504,6 @@ message ListVolumesResponse {
 }
 
 message DeleteVolumeRequest {
-  reserved 2;
-  reserved "retention";
-
   string volume_id = 1;
 }
 
@@ -539,6 +538,15 @@ message CreateSnapshotRequest {
 message CreateSnapshotResponse {
   string snapshot_name = 1;
   SnapshotInfo snapshot = 2;
+}
+
+message RestoreSnapshotRequest {
+  string volume_id = 1;
+  string snapshot_name = 2;
+}
+
+message RestoreSnapshotResponse {
+  string snapshot_name = 1;
 }
 
 message GetVolumeStatsRequest {
