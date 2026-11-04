@@ -2343,6 +2343,18 @@ func TestSnapshotsServicePagination(t *testing.T) {
 	}
 }
 
+func createTestSnapshot(t testing.TB, ctx context.Context, server *Server, volumeID, filePath, content string) string {
+	t.Helper()
+	if _, err := testCreateFile(ctx, server, volumeID, filePath, 0644, []byte(content), 0, 0); err != nil {
+		t.Fatalf("testCreateFile %s failed: %v", filePath, err)
+	}
+	response, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot on %s failed: %v", volumeID, err)
+	}
+	return response.GetSnapshotName()
+}
+
 func TestDeleteSnapshotRules(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
@@ -2358,17 +2370,7 @@ func TestDeleteSnapshotRules(t *testing.T) {
 	}
 
 	volumeID := "test-delete-snapshot-vol"
-
-	// Create initial file and snapshot 1
-	_, err = testCreateFile(ctx, server, volumeID, "/file1.txt", 0644, []byte("snapshot 1 data"), 0, 0)
-	if err != nil {
-		t.Fatalf("CreateFile 1 failed: %v", err)
-	}
-	snapshotResponse1, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
-	if err != nil {
-		t.Fatalf("CreateSnapshot 1 failed: %v", err)
-	}
-	snapshotName1 := snapshotResponse1.GetSnapshotName()
+	snapshotName1 := createTestSnapshot(t, ctx, server, volumeID, "/file1.txt", "snapshot 1 data")
 
 	// 2. Non-existent snapshot on known volume succeeds idempotently
 	_, err = server.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
@@ -2379,7 +2381,14 @@ func TestDeleteSnapshotRules(t *testing.T) {
 		t.Fatalf("expected idempotent success for non-existent snapshot, got: %v", err)
 	}
 
-	// 3. Attempt to delete newest snapshot fails with FailedPrecondition
+	// 3. Attempt to delete newest snapshot fails with FailedPrecondition and ErrNewestSnapshot
+	volume, err := server.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
+	if err := volume.DeleteSnapshot(ctx, snapshotName1); !errors.Is(err, ErrNewestSnapshot) {
+		t.Fatalf("expected ErrNewestSnapshot from volume.DeleteSnapshot, got: %v", err)
+	}
 	_, err = server.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
 		VolumeId:     volumeID,
 		SnapshotName: snapshotName1,
@@ -2390,26 +2399,9 @@ func TestDeleteSnapshotRules(t *testing.T) {
 
 	// Create snapshot 2 and snapshot 3
 	time.Sleep(10 * time.Millisecond)
-	_, err = testCreateFile(ctx, server, volumeID, "/file2.txt", 0644, []byte("snapshot 2 data"), 0, 0)
-	if err != nil {
-		t.Fatalf("CreateFile 2 failed: %v", err)
-	}
-	snapshotResponse2, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
-	if err != nil {
-		t.Fatalf("CreateSnapshot 2 failed: %v", err)
-	}
-	snapshotName2 := snapshotResponse2.GetSnapshotName()
-
+	snapshotName2 := createTestSnapshot(t, ctx, server, volumeID, "/file2.txt", "snapshot 2 data")
 	time.Sleep(10 * time.Millisecond)
-	_, err = testCreateFile(ctx, server, volumeID, "/file3.txt", 0644, []byte("snapshot 3 data"), 0, 0)
-	if err != nil {
-		t.Fatalf("CreateFile 3 failed: %v", err)
-	}
-	snapshotResponse3, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
-	if err != nil {
-		t.Fatalf("CreateSnapshot 3 failed: %v", err)
-	}
-	snapshotName3 := snapshotResponse3.GetSnapshotName()
+	snapshotName3 := createTestSnapshot(t, ctx, server, volumeID, "/file3.txt", "snapshot 3 data")
 
 	// Verify all 3 snapshots present
 	listResponse, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VolumeId: volumeID})
@@ -2453,6 +2445,9 @@ func TestDeleteSnapshotRules(t *testing.T) {
 	}
 
 	// Snapshot 3 is still the newest snapshot, cannot be deleted
+	if err := volume.DeleteSnapshot(ctx, snapshotName3); !errors.Is(err, ErrNewestSnapshot) {
+		t.Fatalf("expected ErrNewestSnapshot from volume.DeleteSnapshot for snapshot 3, got: %v", err)
+	}
 	_, err = server.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
 		VolumeId:     volumeID,
 		SnapshotName: snapshotName3,
@@ -2475,28 +2470,11 @@ func TestDeleteSnapshotReplayDependencyRule(t *testing.T) {
 	volumeID := "test-delete-replay-dependency-vol"
 
 	server1 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
-	_, err := testCreateFile(ctx, server1, volumeID, "/base.txt", 0644, []byte("initial content"), 0, 0)
-	if err != nil {
-		t.Fatalf("CreateFile failed: %v", err)
-	}
-	snapshotResponse1, err := server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
-	if err != nil {
-		t.Fatalf("CreateSnapshot 1 failed: %v", err)
-	}
-	snapshotName1 := snapshotResponse1.GetSnapshotName()
-
+	snapshotName1 := createTestSnapshot(t, ctx, server1, volumeID, "/base.txt", "initial content")
 	time.Sleep(10 * time.Millisecond)
-	_, err = testCreateFile(ctx, server1, volumeID, "/file2.txt", 0644, []byte("second content"), 0, 0)
-	if err != nil {
-		t.Fatalf("CreateFile 2 failed: %v", err)
-	}
-	snapshotResponse2, err := server1.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
-	if err != nil {
-		t.Fatalf("CreateSnapshot 2 failed: %v", err)
-	}
-	snapshotName2 := snapshotResponse2.GetSnapshotName()
+	snapshotName2 := createTestSnapshot(t, ctx, server1, volumeID, "/file2.txt", "second content")
 
-	err = server1.Close()
+	err := server1.Close()
 	if err != nil {
 		t.Fatalf("server1 Close failed: %v", err)
 	}
@@ -2520,20 +2498,15 @@ func TestDeleteSnapshotReplayDependencyRule(t *testing.T) {
 	}
 
 	// Mutate and take snapshot 3 so snapshot 2 is no longer the newest snapshot
-	_, err = testCreateFile(ctx, server2, volumeID, "/file3.txt", 0644, []byte("third content"), 0, 0)
-	if err != nil {
-		t.Fatalf("CreateFile 3 failed: %v", err)
-	}
-	snapshotResponse3, err := server2.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
-	if err != nil {
-		t.Fatalf("CreateSnapshot 3 failed: %v", err)
-	}
-	snapshotName3 := snapshotResponse3.GetSnapshotName()
+	snapshotName3 := createTestSnapshot(t, ctx, server2, volumeID, "/file3.txt", "third content")
 	if snapshotName3 == snapshotName2 {
 		t.Fatalf("expected different snapshot name for snapshot 3")
 	}
 
-	// Attempting to delete snapshot 2 must be rejected because the live stream replay started from it
+	// Attempting to delete snapshot 2 must be rejected with ErrSnapshotInUse / FailedPrecondition
+	if err := recoveredVolume.DeleteSnapshot(ctx, snapshotName2); !errors.Is(err, ErrSnapshotInUse) {
+		t.Fatalf("expected ErrSnapshotInUse from volume.DeleteSnapshot, got: %v", err)
+	}
 	_, err = server2.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
 		VolumeId:     volumeID,
 		SnapshotName: snapshotName2,

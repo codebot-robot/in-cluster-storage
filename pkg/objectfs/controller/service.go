@@ -1447,6 +1447,12 @@ func (s *Server) DeleteSnapshot(ctx context.Context, request *pb.DeleteSnapshotR
 		return nil, err
 	}
 	if err := volume.DeleteSnapshot(ctx, request.GetSnapshotName()); err != nil {
+		if errors.Is(err, ErrNewestSnapshot) {
+			return nil, status.Errorf(codes.FailedPrecondition, "cannot delete newest snapshot %s", request.GetSnapshotName())
+		}
+		if errors.Is(err, ErrSnapshotInUse) {
+			return nil, status.Errorf(codes.FailedPrecondition, "cannot delete snapshot %s: live stream depends on it", request.GetSnapshotName())
+		}
 		return nil, err
 	}
 	return &pb.DeleteSnapshotResponse{}, nil

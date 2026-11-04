@@ -47,11 +47,16 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
+)
+
+var (
+	// ErrNewestSnapshot indicates that a snapshot cannot be deleted because recovery requires the newest snapshot.
+	ErrNewestSnapshot = errors.New("cannot delete newest snapshot")
+	// ErrSnapshotInUse indicates that a snapshot cannot be deleted because the live stream still depends on it.
+	ErrSnapshotInUse = errors.New("cannot delete snapshot: live stream depends on it")
 )
 
 const (
@@ -6301,14 +6306,21 @@ func snapshotInfoFromPointer(pointer *sdsv1.SnapshotPointer) *pb.SnapshotInfo {
 	}
 }
 
+func snapshotMatches(pointer *sdsv1.SnapshotPointer, name string) bool {
+	if pointer == nil {
+		return false
+	}
+	return pointer.GetName() == name || pointer.GetLocation() == name || path.Base(pointer.GetLocation()) == name
+}
+
 func (v *Volume) getSnapshotInfoLocked(ctx context.Context, snapshotName string) (*pb.SnapshotInfo, error) {
 	pointers, err := v.listSnapshotsLocked(ctx)
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range pointers {
-		if p.GetName() == snapshotName || p.GetLocation() == snapshotName || path.Base(p.GetLocation()) == snapshotName {
-			return snapshotInfoFromPointer(p), nil
+	for _, pointer := range pointers {
+		if snapshotMatches(pointer, snapshotName) {
+			return snapshotInfoFromPointer(pointer), nil
 		}
 	}
 	return nil, fmt.Errorf("snapshot %q not found", snapshotName)
@@ -6317,12 +6329,12 @@ func (v *Volume) getSnapshotInfoLocked(ctx context.Context, snapshotName string)
 // ErrSnapshotNotFound indicates that the requested snapshot was not found.
 var ErrSnapshotNotFound = errors.New("snapshot not found")
 
-// DeleteSnapshot removes the named snapshot pointer and the snapshot objects under
-// snapshots/<volume>/ for that name.
+// DeleteSnapshot removes the named snapshot pointer and its backend snapshot object.
 // Rules enforced:
 // - Never delete the newest snapshot (recovery needs it).
 // - Never delete a snapshot the live stream still depends on (the one the current replay starts from).
-// - Deletion is idempotent (NotFound only when the volume is unknown).
+// - Deletion is idempotent (returns success if the snapshot is not found).
+// A failed delete leaves the snapshot listed and the call is safe to repeat.
 // Blobs are not touched: they are content-addressed and global, and global GC reclaims them later.
 func (v *Volume) DeleteSnapshot(ctx context.Context, name string) error {
 	v.snapshotMu.Lock()
@@ -6341,7 +6353,7 @@ func (v *Volume) DeleteSnapshot(ctx context.Context, name string) error {
 
 	var targetPointer *sdsv1.SnapshotPointer
 	for _, pointer := range pointers {
-		if pointer.GetName() == name || pointer.GetLocation() == name || path.Base(pointer.GetLocation()) == name {
+		if snapshotMatches(pointer, name) {
 			targetPointer = pointer
 			break
 		}
@@ -6351,50 +6363,29 @@ func (v *Volume) DeleteSnapshot(ctx context.Context, name string) error {
 	}
 
 	newestPointer := pointers[len(pointers)-1]
-	if targetPointer.GetPosition() == newestPointer.GetPosition() &&
-		(targetPointer.GetName() == newestPointer.GetName() || targetPointer.GetLocation() == newestPointer.GetLocation()) {
-		return status.Errorf(codes.FailedPrecondition, "cannot delete newest snapshot %s", name)
+	if targetPointer.GetLocation() == newestPointer.GetLocation() {
+		return ErrNewestSnapshot
 	}
 
-	if v.replayStartPos > 0 && targetPointer.GetPosition() == v.replayStartPos {
-		return status.Errorf(codes.FailedPrecondition, "cannot delete snapshot %s: live stream depends on it", name)
+	if (v.replayStartPos > 0 && targetPointer.GetPosition() == v.replayStartPos) ||
+		(v.replaySnapshotLocation != "" && targetPointer.GetLocation() == v.replaySnapshotLocation) {
+		return ErrSnapshotInUse
 	}
-	if v.replaySnapshotLocation != "" &&
-		(targetPointer.GetLocation() == v.replaySnapshotLocation ||
-			path.Base(targetPointer.GetLocation()) == v.replaySnapshotLocation ||
-			targetPointer.GetName() == v.replaySnapshotLocation) {
-		return status.Errorf(codes.FailedPrecondition, "cannot delete snapshot %s: live stream depends on it", name)
+
+	if v.backend != nil && targetPointer.GetLocation() != "" {
+		if err := v.backend.DeleteObject(ctx, "", targetPointer.GetLocation()); err != nil {
+			return fmt.Errorf("failed to delete snapshot object %s: %w", targetPointer.GetLocation(), err)
+		}
 	}
 
 	var remainingPointers []*sdsv1.SnapshotPointer
 	for _, pointer := range v.snapshotPointers {
-		if pointer.GetName() == targetPointer.GetName() || pointer.GetLocation() == targetPointer.GetLocation() {
+		if pointer.GetLocation() == targetPointer.GetLocation() {
 			continue
 		}
 		remainingPointers = append(remainingPointers, pointer)
 	}
 	v.snapshotPointers = remainingPointers
-
-	if v.backend != nil {
-		if targetPointer.GetLocation() != "" {
-			if err := v.backend.DeleteObject(ctx, "", targetPointer.GetLocation()); err != nil {
-				return fmt.Errorf("failed to delete snapshot object %s: %w", targetPointer.GetLocation(), err)
-			}
-		}
-		snapshotKey := fmt.Sprintf("snapshots/%s/%s", v.volumeID, name)
-		if err := v.backend.DeleteObject(ctx, "", snapshotKey); err != nil {
-			return fmt.Errorf("failed to delete snapshot object %s: %w", snapshotKey, err)
-		}
-		objects, err := v.backend.ListObjects(ctx, "", snapshotKey)
-		if err != nil {
-			return fmt.Errorf("failed to list snapshot objects for %s: %w", snapshotKey, err)
-		}
-		for _, objectEntry := range objects {
-			if err := v.backend.DeleteObject(ctx, "", objectEntry.Key); err != nil {
-				return fmt.Errorf("failed to delete snapshot object %s: %w", objectEntry.Key, err)
-			}
-		}
-	}
 
 	return nil
 }
@@ -6438,7 +6429,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 
 	var targetPtr *sdsv1.SnapshotPointer
 	for _, p := range pointers {
-		if p.GetName() == snapshotName || p.GetLocation() == snapshotName || path.Base(p.GetLocation()) == snapshotName {
+		if snapshotMatches(p, snapshotName) {
 			targetPtr = p
 			break
 		}
