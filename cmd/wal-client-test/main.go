@@ -61,7 +61,8 @@ func runAppend(args []string) (err error) {
 	streamIDStr := fs.String("stream-id", "", "Stream UUID")
 	target := fs.String("target", "wal-buffer-client:50051", "WAL buffer service target")
 	count := fs.Int("count", 10, "Number of records to append")
-	waitLevelStr := fs.String("wait-level", "witness", "Durability level to wait for (local, witness, permanent)")
+	waitLevel := client.Witness
+	fs.Var(client.NewLevelValue(&waitLevel), "wait-level", "Durability level to wait for (local, witness, permanent)")
 	doFlush := fs.Bool("flush", false, "Whether to call Flush to permanent storage at the end")
 	holdOpen := fs.Duration("hold-open", 0, "Duration to hold stream open before exiting")
 	if err := fs.Parse(args); err != nil {
@@ -79,19 +80,7 @@ func runAppend(args []string) (err error) {
 		streamID = uuid.New()
 	}
 
-	var waitLevel client.Level
-	var requestFlush bool
-	switch *waitLevelStr {
-	case "local":
-		waitLevel = client.Local
-	case "witness":
-		waitLevel = client.Witness
-	case "permanent", "s3":
-		waitLevel = client.Permanent
-		requestFlush = true
-	default:
-		return fmt.Errorf("invalid wait-level %q", *waitLevelStr)
-	}
+	requestFlush := (waitLevel == client.Permanent)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

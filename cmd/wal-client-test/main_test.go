@@ -44,7 +44,7 @@ func TestRunAppend_InvalidArguments(t *testing.T) {
 
 	// Invalid wait-level
 	err = runAppend([]string{"--wait-level", "invalid-level"})
-	if err == nil || !strings.Contains(err.Error(), "invalid wait-level") {
+	if err == nil || !strings.Contains(err.Error(), "wait-level") {
 		t.Fatalf("expected invalid wait-level error, got: %v", err)
 	}
 }
