@@ -1560,6 +1560,100 @@ func (v *Volume) Close() error {
 	return firstErr
 }
 
+// RecordDeletionMarker records a VolumeInfo deletion marker (deleted=true) directly to a stream.
+// It is used as a fallback when a volume cannot be loaded into memory or is not currently loaded.
+func RecordDeletionMarker(ctx context.Context, stream walclient.Stream, volumeID string) error {
+	if stream == nil {
+		return nil
+	}
+	localHead, witnessHead, _ := stream.Watermarks()
+	var writerOptions []record.WriterOption
+	if localHead > 0 {
+		writerOptions = []record.WriterOption{record.WithStreamHeaderEmitted(true)}
+	}
+	writer := sds.NewWriter(sds.NewWALAppender(stream, walclient.Local), writerOptions...)
+	if targetHead := max(localHead, witnessHead); targetHead > 0 {
+		decoder := record.NewDecoder(record.WithDecoderRegistry(writer.Registry()))
+		tailIterator, err := stream.Tail(ctx, 0)
+		if err != nil {
+			return fmt.Errorf("failed to tail stream for deletion marker: %w", err)
+		}
+		for seq, payload := range tailIterator {
+			if _, decodeError := decoder.Decode(payload); decodeError != nil {
+				return fmt.Errorf("failed to decode stream record at seq %d: %w", seq, decodeError)
+			}
+			if seq >= targetHead {
+				break
+			}
+		}
+	}
+	if err := registerMetadataTypes(writer); err != nil {
+		return fmt.Errorf("failed to register metadata types for deletion marker: %w", err)
+	}
+	tx := writer.Begin()
+	volumeInfo := &pb.VolumeInfo{VolumeId: volumeID, Deleted: true}
+	key, err := pkVolumeInfo.Extract(volumeInfo)
+	if err != nil {
+		return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
+	}
+	tx.RecordRead(VolumeInfoTypeName, key, nil)
+	if _, err := tx.Insert(ctx, volumeInfo); err != nil {
+		return fmt.Errorf("failed to insert deletion marker: %w", err)
+	}
+	if _, err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit deletion marker: %w", err)
+	}
+	return stream.Flush(ctx)
+}
+
+// RecordDeletion appends a VolumeInfo record with deleted=true to the metadata stream
+// and flushes it to the WAL.
+func (v *Volume) RecordDeletion(ctx context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed || v.stream == nil {
+		return nil
+	}
+	return RecordDeletionMarker(ctx, v.stream, v.volumeID)
+}
+
+func (v *Volume) resetToCleanRootLocked(ctx context.Context) error {
+	if v.metadataView != nil {
+		errutil.CloseAndLog(v.metadataView, "metadata view")
+		v.metadataView = nil
+	}
+	if v.localStorageDir != "" {
+		if err := os.RemoveAll(v.localStorageDir); err != nil && !os.IsNotExist(err) {
+			klog.Warningf("Failed to remove local storage dir %s: %v", v.localStorageDir, err)
+		}
+		if err := os.MkdirAll(v.localStorageDir, 0755); err != nil {
+			return fmt.Errorf("failed to recreate local storage dir %s: %w", v.localStorageDir, err)
+		}
+	}
+	if v.indexFactory != nil {
+		newIndex, err := v.indexFactory.NewEmpty(ctx, v.streamID.String(), v.localStorageDir)
+		if err != nil {
+			return err
+		}
+		if err := v.initMetadataViewLocked(ctx, newIndex); err != nil {
+			return err
+		}
+	}
+	rootInode := &pb.Inode{Ino: proto.Uint64(1), Mode: 0755 | syscall.S_IFDIR, Mtime: timestamppb.Now(), IsDir: true, Nlink: 2, ParentIno: proto.Uint64(1), XattrCount: proto.Uint32(0)}
+	keyBytes, valueBytes, err := sds.SplitKeyAndNonKey(rootInode, []int32{1})
+	if err != nil {
+		return err
+	}
+	if v.metadataView != nil {
+		if err := v.metadataView.ApplyChangesSync(ctx, []sds.Change{{Seq: 0, TypeName: InodeTypeName, Op: sds.OpCreate, Key: sds.NewKeyFromBytes(keyBytes), RawKey: keyBytes, RawVal: valueBytes, Row: rootInode}}); err != nil {
+			return err
+		}
+	}
+	v.rootInodeID, v.nextInode = 1, erofs.DefaultInodeStride
+	v.dirParents, v.snapshotPointers, v.consistencyMode = map[uint64]uint64{1: 1}, nil, pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED
+	return nil
+}
+
 // logMutationLocked appends a mutation record to the WAL stream under v.mu.
 // It returns a wait function that blocks until the requested durability level is reached.
 // The wait function MUST be invoked outside v.mu so that WAL durability waits do not
@@ -5976,8 +6070,17 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				}
 			}
 			if ch.TypeName == VolumeInfoTypeName {
-				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-					v.consistencyMode = vi.GetConsistencyMode()
+				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil {
+					if vi.GetDeleted() {
+						if resetError := v.resetToCleanRootLocked(ctx); resetError != nil {
+							return resetError
+						}
+						highestReplayedIno = 1
+						continue
+					}
+					if vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+						v.consistencyMode = vi.GetConsistencyMode()
+					}
 				}
 			}
 		}

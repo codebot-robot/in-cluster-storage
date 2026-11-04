@@ -7775,3 +7775,93 @@ func TestMetadataStreamRegisteredTypeIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestVolume_DeletionMarker_Lifecycle(t *testing.T) {
+	volumeID, ctx, localDirectory := "vol-del-lifecycle", t.Context(), t.TempDir()
+	backend, broadcaster := NewMemoryBackend(), NewEventBroadcaster()
+	openVolume := func() *Volume {
+		return MustNewVolume(t, volumeID, backend, broadcaster, WithLocalStorageDir(localDirectory))
+	}
+
+	// 1. Write file, consistency mode, snapshot pointer; repeated deletes are idempotent; re-create empty
+	volume1 := openVolume()
+	if _, err := volume1.CreateFile(ctx, 1, "old.txt", 0644, []byte("content"), 0, 0, 0); err != nil || volume1.PersistConsistencyMode(ctx, pb.ConsistencyMode_CLOSE_TO_OPEN) != nil {
+		t.Fatalf("setup volume1 failed: %v", err)
+	}
+	if _, err := volume1.metadataStream.AppendSnapshotPointer(ctx, &sdsv1.SnapshotPointer{Location: "dummy", Name: "snap1"}); err != nil || volume1.stream.Flush(ctx) != nil || volume1.RecordDeletion(ctx) != nil || volume1.RecordDeletion(ctx) != nil || volume1.Close() != nil {
+		t.Fatalf("snapshot/flush/delete/close volume1 failed")
+	}
+
+	volume2 := openVolume()
+	entries, err := volume2.ReadDir(ctx, 1)
+	snapshots, snapshotErr := volume2.ListSnapshots(ctx)
+	if err != nil || len(entries) != 0 || snapshotErr != nil || len(snapshots) != 0 || volume2.ConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+		t.Fatalf("re-created volume not empty/reset")
+	}
+
+	// 2. Write after re-create and restart: new file survives, old file stays gone
+	if _, err := volume2.CreateFile(ctx, 1, "new.txt", 0644, []byte("new content"), 0, 0, 0); err != nil || volume2.stream.Flush(ctx) != nil || volume2.Close() != nil {
+		t.Fatalf("create/flush/close volume2 failed: %v", err)
+	}
+
+	volume3 := openVolume()
+	t.Cleanup(func() {
+		if err := volume3.Close(); err != nil {
+			t.Errorf("volume3.Close failed: %v", err)
+		}
+	})
+	if entries, err := volume3.ReadDir(ctx, 1); err != nil || len(entries) != 1 || entries[0].GetName() != "new.txt" {
+		t.Fatalf("unexpected entries on restart: %v, err: %v", entries, err)
+	}
+}
+
+func TestVolume_DeletionMarker_ThreeControllers(t *testing.T) {
+	ctx, backend, volumeID := t.Context(), NewMemoryBackend(), "vol-three-controllers"
+	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
+	newServer := func(walDirectory string) *Server {
+		return NewServer(backend, WithServerWAL(walDirectory, bt.Target, walclient.Witness), WithServerWALClient(bt.Client), WithServerWALDialOptions(bt.DialOpts...), WithServerLocalStorageDir(t.TempDir()), WithServerWithoutFsync())
+	}
+	assertEmptyDirectory := func(server *Server) {
+		if response, err := server.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1}); err != nil || len(response.GetEntries()) != 0 {
+			t.Fatalf("expected 0 entries, err: %v", err)
+		}
+	}
+
+	// 1. Controller 1: write files on 1, flush, then close
+	server1 := newServer(t.TempDir())
+	for i := 1; i <= 3; i++ {
+		if _, err := testCreateFile(ctx, server1, volumeID, fmt.Sprintf("/file%d.txt", i), 0644, []byte("content"), 0, 0); err != nil {
+			t.Fatalf("testCreateFile %d failed: %v", i, err)
+		}
+	}
+	if err := server1.FlushAll(ctx); err != nil || server1.Close() != nil {
+		t.Fatalf("flush/close server1 failed: %v", err)
+	}
+
+	// 2. Controller 2: volume is unloaded; record marker directly on stream, then read on 2
+	walDirectory2 := t.TempDir()
+	server2 := newServer(walDirectory2)
+	stream2, err := server2.openStreamForVolume(volumeID, walDirectory2)
+	if err != nil || RecordDeletionMarker(ctx, stream2, volumeID) != nil || stream2.Close() != nil {
+		t.Fatalf("record deletion marker on server2 failed: %v", err)
+	}
+	assertEmptyDirectory(server2)
+	if server2.Close() != nil {
+		t.Fatalf("server2.Close failed")
+	}
+
+	// 3. Controller 3: fresh controller reads volume, must be empty without conflicting type error
+	server3 := newServer(t.TempDir())
+	t.Cleanup(func() {
+		if err := server3.Close(); err != nil {
+			t.Errorf("server3.Close failed: %v", err)
+		}
+	})
+	assertEmptyDirectory(server3)
+	if _, err := testCreateFile(ctx, server3, volumeID, "/newfile.txt", 0644, []byte("new"), 0, 0); err != nil {
+		t.Fatalf("testCreateFile on server3 failed: %v", err)
+	}
+	if response, err := server3.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1}); err != nil || len(response.GetEntries()) != 1 || response.GetEntries()[0].GetName() != "newfile.txt" {
+		t.Fatalf("unexpected entries on server3 after create: %v, err: %v", response.GetEntries(), err)
+	}
+}
