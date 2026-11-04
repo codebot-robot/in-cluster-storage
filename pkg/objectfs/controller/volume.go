@@ -496,7 +496,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		packKeys:           make(map[uint64]string),
 		coalesceWindow:     1 * time.Second,
 		syncTimeout:        10 * time.Minute,
-		openBarrierTimeout: 5 * time.Second,
+		openBarrierTimeout: 30 * time.Second,
 		syncingInodes:      make(map[uint64]struct{}),
 	}
 	v.syncCond = sync.NewCond(&v.stagingMu)
@@ -842,6 +842,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, inodeFilter map[uint64]struct{}) (uint64, error) {
 	// Must be called with v.stagingMu held.
 	// Invariant: ALWAYS returns with v.stagingMu UNLOCKED.
+	syncStartTime := time.Now()
 	if v.activePack != nil {
 		if err := v.activePack.Seal(); err != nil {
 			snapSeq := v.stagingSeq
@@ -902,6 +903,11 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 		}
 	}
 
+	totalChunks := 0
+	for _, chunks := range snapshotChunks {
+		totalChunks += len(chunks)
+	}
+
 	v.syncInProgress = true
 	if v.syncingInodes == nil {
 		v.syncingInodes = make(map[uint64]struct{})
@@ -948,10 +954,13 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 			packKey := v.blobStore.PackKey(packIDString, pack.Count())
 			packStream := blob.NewByteStreamFromFile(file, pack.ByteSize(), false)
 
+			uploadStartTime := time.Now()
 			if err := v.blobStore.PutPackFile(ctx, packKey, packStream, pack.Entries(), pack); err != nil {
 				errutil.CloseAndLog(packStream, "failed pack stream")
 				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to upload sealed pack %s: %w", packKey, err), snapshotChunks, 0, inodeFilter)
 			}
+			uploadDuration := time.Since(uploadStartTime)
+			klog.Infof("ObjectFS volume %s uploaded sealed pack %s (%d bytes, %d entries) in %v", v.volumeID, packKey, pack.ByteSize(), pack.Count(), uploadDuration)
 			if err := packStream.Close(); err != nil {
 				klog.Warningf("failed to close pack stream %s: %v", packKey, err)
 			}
@@ -1139,6 +1148,9 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 			StreamPosition: commitSeq,
 		})
 	}
+
+	syncDuration := time.Since(syncStartTime)
+	klog.Infof("ObjectFS volume %s sync completed in %v (%d chunks, %d inodes, commitSeq=%d)", v.volumeID, syncDuration, totalChunks, len(snapshotChunks), commitSeq)
 
 	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
 }
@@ -5025,7 +5037,7 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 
 	timeout := v.openBarrierTimeout
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		timeout = 30 * time.Second
 	}
 	barrierCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -5040,11 +5052,19 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 	})
 	defer stopTimer()
 
+	barrierStartTime := time.Now()
+	var waitReason string
+
 	for {
 		if deg := v.Degraded(); deg != nil {
 			return syscall.EIO
 		}
 		if barrierCtx.Err() != nil {
+			reason := waitReason
+			if reason == "" {
+				reason = "context_timeout"
+			}
+			klog.Warningf("ObjectFS volume %s inode %d open barrier timed out after %v waiting on %s", v.volumeID, inodeID, time.Since(barrierStartTime), reason)
 			return syscall.EIO
 		}
 
@@ -5055,10 +5075,18 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 		}
 
 		if !hasStaged && !inFlight {
+			if waitReason != "" {
+				klog.Infof("ObjectFS volume %s inode %d open barrier satisfied in %v (waited on %s)", v.volumeID, inodeID, time.Since(barrierStartTime), waitReason)
+			}
 			return nil
 		}
 
 		if inFlight || v.syncInProgress {
+			if inFlight {
+				waitReason = "in_flight_inode_sync"
+			} else {
+				waitReason = "in_flight_volume_sync"
+			}
 			v.syncCond.Wait()
 			continue
 		}
@@ -5071,17 +5099,21 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 			}
 		}
 
+		waitReason = "staged_inode_sync"
 		_, err := v.syncInodesLocked(barrierCtx, map[uint64]struct{}{inodeID: {}})
 		v.stagingMu.Lock()
 		if err != nil {
+			klog.Warningf("ObjectFS volume %s inode %d open barrier sync failed after %v: %v", v.volumeID, inodeID, time.Since(barrierStartTime), err)
 			return syscall.EIO
 		}
 		if deg := v.Degraded(); deg != nil {
 			return syscall.EIO
 		}
 		if barrierCtx.Err() != nil {
+			klog.Warningf("ObjectFS volume %s inode %d open barrier timed out after %v waiting on %s", v.volumeID, inodeID, time.Since(barrierStartTime), waitReason)
 			return syscall.EIO
 		}
+		klog.Infof("ObjectFS volume %s inode %d open barrier satisfied in %v (executed %s)", v.volumeID, inodeID, time.Since(barrierStartTime), waitReason)
 		return nil
 	}
 }

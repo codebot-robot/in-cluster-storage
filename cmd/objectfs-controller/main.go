@@ -87,7 +87,7 @@ func NewOptions() *Options {
 		SyncCoalesceWindow:       1 * time.Second,
 		MaxStagingBytes:          64 * 1024 * 1024,
 		ControllerSyncTimeout:    10 * time.Minute,
-		OpenBarrierTimeout:       5 * time.Second,
+		OpenBarrierTimeout:       30 * time.Second,
 	}
 }
 
