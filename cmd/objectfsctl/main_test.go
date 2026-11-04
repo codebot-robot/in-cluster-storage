@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"net"
@@ -35,9 +36,40 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-func startTestServer(t *testing.T) (*controller.Server, string, func()) {
+type fakeObjectFSControllerServer struct {
+	*controller.Server
+	mu                sync.Mutex
+	lastDeleteRequest *pb.DeleteVolumeRequest
+	deleteError       error
+}
+
+func (s *fakeObjectFSControllerServer) DeleteVolume(ctx context.Context, request *pb.DeleteVolumeRequest) (*pb.DeleteVolumeResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastDeleteRequest = request
+	if s.deleteError != nil {
+		return nil, s.deleteError
+	}
+	return &pb.DeleteVolumeResponse{}, nil
+}
+
+func (s *fakeObjectFSControllerServer) setDeleteError(deleteError error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteError = deleteError
+}
+
+func (s *fakeObjectFSControllerServer) getLastDeleteRequest() *pb.DeleteVolumeRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastDeleteRequest
+}
+
+func startTestServer(t *testing.T) (*fakeObjectFSControllerServer, string, func()) {
 	t.Helper()
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -48,7 +80,8 @@ func startTestServer(t *testing.T) (*controller.Server, string, func()) {
 	grpcServer := grpc.NewServer()
 	backend := controller.NewMemoryBackend()
 	server := controllertest.NewTestServer(backend)
-	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	fakeServer := &fakeObjectFSControllerServer{Server: server}
+	pb.RegisterObjectFSControllerServer(grpcServer, fakeServer)
 
 	go func() {
 		_ = grpcServer.Serve(lis)
@@ -59,7 +92,7 @@ func startTestServer(t *testing.T) (*controller.Server, string, func()) {
 		_ = lis.Close()
 	}
 
-	return server, lis.Addr().String(), cleanup
+	return fakeServer, lis.Addr().String(), cleanup
 }
 
 func startTestUnixServer(t *testing.T) (*controller.Server, string, func()) {
@@ -936,5 +969,41 @@ func TestMountWriteModeFlag(t *testing.T) {
 	}
 	if err := newMountCommand(&options{}).ParseFlags([]string{"--write-mode=writethrough"}); err == nil {
 		t.Fatal("expected error for typo writethrough")
+	}
+}
+
+func TestVolumesDeleteCommand(t *testing.T) {
+	server, serverAddr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// 1. Missing --server flag
+	if _, err := executeCommand("volumes", "delete", "test-vol"); err == nil || !strings.Contains(err.Error(), "--server is required") {
+		t.Fatalf("expected --server is required error, got: %v", err)
+	}
+
+	// 2. Missing volume arg
+	if _, err := executeCommand("--server", serverAddr, "volumes", "delete"); err == nil {
+		t.Fatalf("expected error when volume argument is missing")
+	}
+
+	// 3. Delete volume successfully
+	volumeID := "cli-del-vol"
+	deleteOutput, err := executeCommand("--server", serverAddr, "volumes", "delete", volumeID)
+	if err != nil || !strings.Contains(deleteOutput, "Deleted volume cli-del-vol") {
+		t.Fatalf("expected 'Deleted volume cli-del-vol' in output, got: %q (err: %v)", deleteOutput, err)
+	}
+	request := server.getLastDeleteRequest()
+	if request == nil || request.GetVolumeId() != volumeID {
+		t.Fatalf("expected DeleteVolume request for volume %q, got: %+v", volumeID, request)
+	}
+
+	// 4. Error returned by controller includes error message and volume ID
+	server.setDeleteError(status.Error(codes.FailedPrecondition, "volume is published"))
+	_, err = executeCommand("--server", serverAddr, "volumes", "delete", volumeID)
+	if err == nil {
+		t.Fatalf("expected error from DeleteVolume RPC")
+	}
+	if !strings.Contains(err.Error(), "volume is published") || !strings.Contains(err.Error(), volumeID) {
+		t.Fatalf("expected error containing status error and volume ID, got: %v", err)
 	}
 }
