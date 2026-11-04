@@ -86,6 +86,7 @@ type syncWaiter struct {
 
 // stagedChunkReference references a chunk payload stored in an incremental v2 packfile.
 type stagedChunkReference struct {
+	PackID uint64
 	Entry  blob.BlobEntry
 	Length uint32
 }
@@ -101,8 +102,13 @@ type Volume struct {
 	maxInlineLen int64
 	chunkSize    uint32
 
-	stagingDir string
-	activePack *blob.IncrementalPack
+	stagingDir         string
+	activePack         *blob.IncrementalPack
+	activePackID       uint64
+	nextPackID         uint64
+	packs              map[uint64]*blob.IncrementalPack
+	packLiveReferences map[uint64]int
+	packUploaded       map[uint64]bool
 
 	stagingMu       sync.Mutex
 	stagingEpoch    int64
@@ -474,6 +480,9 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		stagedMtimes:       make(map[uint64]time.Time),
 		lastSyncError:      make(map[uint64]error),
 		maxStagingBytes:    64 * 1024 * 1024,
+		packs:              make(map[uint64]*blob.IncrementalPack),
+		packLiveReferences: make(map[uint64]int),
+		packUploaded:       make(map[uint64]bool),
 		coalesceWindow:     1 * time.Second,
 		syncTimeout:        10 * time.Minute,
 		openBarrierTimeout: 5 * time.Second,
@@ -509,6 +518,29 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	return v, nil
 }
 
+func (v *Volume) cleanupPackIfUnreferencedLocked(packID uint64) {
+	if v.packUploaded[packID] && v.packLiveReferences[packID] <= 0 {
+		if pack, ok := v.packs[packID]; ok {
+			errutil.CloseAndLog(pack, "uploaded pack")
+			packPath := v.scratchPackPath(packID)
+			if removeErr := os.Remove(packPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				klog.Warningf("failed removing uploaded pack %s: %v", packPath, removeErr)
+			}
+			delete(v.packs, packID)
+			delete(v.packUploaded, packID)
+			delete(v.packLiveReferences, packID)
+		}
+	}
+}
+
+func (v *Volume) dropPackReferenceLocked(packID uint64) {
+	v.packLiveReferences[packID]--
+	if v.packLiveReferences[packID] <= 0 {
+		delete(v.packLiveReferences, packID)
+		v.cleanupPackIfUnreferencedLocked(packID)
+	}
+}
+
 func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int]stagedChunkReference, pos uint64, inodeFilter map[uint64]struct{}) error {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
@@ -523,6 +555,10 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 			v.lastSyncError[sIno] = err
 		}
 	} else {
+		for packID := range v.packs {
+			v.cleanupPackIfUnreferencedLocked(packID)
+		}
+
 		for ino, chunks := range snapshotChunks {
 			for index, reference := range chunks {
 				if currentReference, ok := v.stagedChunks[ino][index]; ok && currentReference == reference {
@@ -530,9 +566,6 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 				}
 			}
 			delete(v.lastSyncError, ino)
-		}
-		if len(v.stagedChunks) == 0 {
-			v.discardScratchPackLocked()
 		}
 	}
 
@@ -774,6 +807,15 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, inodeFilter map[uint64]struct{}) (uint64, error) {
 	// Must be called with v.stagingMu held.
 	// Invariant: ALWAYS returns with v.stagingMu UNLOCKED.
+	if v.activePack != nil {
+		if err := v.activePack.Seal(); err != nil {
+			snapSeq := v.stagingSeq
+			v.stagingMu.Unlock()
+			return 0, v.finishSync(snapSeq, fmt.Errorf("failed to seal active pack: %w", err), nil, 0, inodeFilter)
+		}
+		v.activePack = nil
+	}
+
 	if len(v.stagedChunks) == 0 {
 		snapSeq := v.stagingSeq
 		pos := v.Position()
@@ -832,17 +874,65 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 	for ino := range snapshotChunks {
 		v.syncingInodes[ino] = struct{}{}
 	}
+
+	var packIDsToUpload []uint64
+	for packID := range v.packs {
+		if !v.packUploaded[packID] {
+			packIDsToUpload = append(packIDsToUpload, packID)
+		}
+	}
+	sort.Slice(packIDsToUpload, func(i, j int) bool {
+		return packIDsToUpload[i] < packIDsToUpload[j]
+	})
 	v.stagingMu.Unlock()
 
-	chunkShas := make(map[uint64]map[int]string, len(snapshotChunks))
-	blobsMap := make(map[string]blob.ByteStream)
-	var streamsToClose []blob.ByteStream
-	defer func() {
-		for _, stream := range streamsToClose {
-			errutil.CloseAndLog(stream, "staged chunk stream")
-		}
-	}()
+	if v.blobStore != nil {
+		for _, packID := range packIDsToUpload {
+			v.stagingMu.Lock()
+			pack := v.packs[packID]
+			v.stagingMu.Unlock()
+			if pack == nil {
+				continue
+			}
+			packPath := v.scratchPackPath(packID)
 
+			file, openErr := os.Open(packPath)
+			if openErr != nil {
+				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to open sealed pack %s: %w", packPath, openErr), snapshotChunks, 0, inodeFilter)
+			}
+			hasher := sha256.New()
+			if _, copyErr := io.Copy(hasher, file); copyErr != nil {
+				errutil.CloseAndLog(file, "pack file")
+				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed hashing sealed pack %s: %w", packPath, copyErr), snapshotChunks, 0, inodeFilter)
+			}
+			if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+				errutil.CloseAndLog(file, "pack file")
+				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed seeking sealed pack %s: %w", packPath, seekErr), snapshotChunks, 0, inodeFilter)
+			}
+			packIDString := hex.EncodeToString(hasher.Sum(nil))
+			packKey := v.blobStore.PackKey(packIDString, pack.Count())
+			packStream := blob.NewByteStreamFromFile(file, pack.ByteSize(), false)
+
+			if err := v.blobStore.PutPackFile(ctx, packKey, packStream, pack.Entries()); err != nil {
+				errutil.CloseAndLog(packStream, "failed pack stream")
+				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to upload sealed pack %s: %w", packKey, err), snapshotChunks, 0, inodeFilter)
+			}
+			if err := packStream.Close(); err != nil {
+				klog.Warningf("failed to close pack stream %s: %v", packKey, err)
+			}
+			v.stagingMu.Lock()
+			v.packUploaded[packID] = true
+			v.stagingMu.Unlock()
+		}
+	} else {
+		v.stagingMu.Lock()
+		for _, packID := range packIDsToUpload {
+			v.packUploaded[packID] = true
+		}
+		v.stagingMu.Unlock()
+	}
+
+	chunkShas := make(map[uint64]map[int]string, len(snapshotChunks))
 	for ino, chunks := range snapshotChunks {
 		chunkShas[ino] = make(map[int]string, len(chunks))
 		sSize := snapshotSizes[ino]
@@ -850,39 +940,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 			continue
 		}
 		for index, reference := range chunks {
-			stream, err := v.readStagedChunkStream(reference)
-			if err != nil {
-				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed reading staged chunk %d on inode %d: %w", index, ino, err), snapshotChunks, 0, inodeFilter)
-			}
-			streamsToClose = append(streamsToClose, stream)
-			shaHex := fmt.Sprintf("%x", reference.Entry.SHA256)
-			chunkShas[ino][index] = shaHex
-			blobsMap[shaHex] = stream
-		}
-	}
-
-	if v.blobStore != nil && len(blobsMap) > 0 {
-		const maxPackCapBytes = 64 * 1024 * 1024
-		currentBatch := make(map[string]blob.ByteStream)
-		var currentBatchBytes int64
-
-		for sha, stream := range blobsMap {
-			if currentBatchBytes+stream.Length() > maxPackCapBytes && len(currentBatch) > 0 {
-				if err := v.blobStore.PutBlobs(ctx, currentBatch); err != nil {
-					klog.Errorf("ObjectFS volume %s sync PutBlobs failed: %v", v.volumeID, err)
-					return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
-				}
-				currentBatch = make(map[string]blob.ByteStream)
-				currentBatchBytes = 0
-			}
-			currentBatch[sha] = stream
-			currentBatchBytes += stream.Length()
-		}
-		if len(currentBatch) > 0 {
-			if err := v.blobStore.PutBlobs(ctx, currentBatch); err != nil {
-				klog.Errorf("ObjectFS volume %s sync PutBlobs failed: %v", v.volumeID, err)
-				return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
-			}
+			chunkShas[ino][index] = reference.Entry.SHA256Hex()
 		}
 	}
 
@@ -3560,21 +3618,16 @@ func (v *Volume) GetManifest(ctx context.Context, inodeID uint64) (*pb.GetManife
 	}, nil
 }
 
-func (v *Volume) scratchPackPath() string {
-	return filepath.Join(v.stagingDir, "scratch.pack")
+func (v *Volume) scratchPackPath(packID uint64) string {
+	return filepath.Join(v.stagingDir, fmt.Sprintf("pack-%016x.pack", packID))
 }
 
 func (v *Volume) readStagedChunkStreamLocked(reference stagedChunkReference) (blob.ByteStream, error) {
-	if v.activePack == nil {
-		return nil, errors.New("staged scratch pack is not open")
+	pack, ok := v.packs[reference.PackID]
+	if !ok {
+		return nil, fmt.Errorf("staged pack %d not found", reference.PackID)
 	}
-	return v.activePack.ReadBlob(reference.Entry)
-}
-
-func (v *Volume) readStagedChunkStream(reference stagedChunkReference) (blob.ByteStream, error) {
-	v.stagingMu.Lock()
-	defer v.stagingMu.Unlock()
-	return v.readStagedChunkStreamLocked(reference)
+	return pack.ReadBlob(reference.Entry)
 }
 
 // readStagedChunkBytesLocked reads a single staged chunk's payload into memory for modification.
@@ -3594,19 +3647,17 @@ func (v *Volume) readStagedChunkBytes(reference stagedChunkReference) ([]byte, e
 	return v.readStagedChunkBytesLocked(reference)
 }
 
-func (v *Volume) discardScratchPackLocked() {
+func (v *Volume) removeStagingDirLocked() error {
 	if v.activePack != nil {
 		errutil.CloseAndLog(v.activePack, "active scratch pack")
 		v.activePack = nil
 	}
-	packPath := v.scratchPackPath()
-	if removeErr := os.Remove(packPath); removeErr != nil && !os.IsNotExist(removeErr) {
-		klog.Warningf("failed removing scratch pack %s: %v", packPath, removeErr)
+	for _, pack := range v.packs {
+		errutil.CloseAndLog(pack, "staged pack")
 	}
-}
-
-func (v *Volume) removeStagingDirLocked() error {
-	v.discardScratchPackLocked()
+	v.packs = make(map[uint64]*blob.IncrementalPack)
+	v.packLiveReferences = make(map[uint64]int)
+	v.packUploaded = make(map[uint64]bool)
 	if removeErr := os.RemoveAll(v.stagingDir); removeErr != nil && !os.IsNotExist(removeErr) {
 		return fmt.Errorf("failed removing staging directory %s: %w", v.stagingDir, removeErr)
 	}
@@ -3625,12 +3676,16 @@ func (v *Volume) resetStagingDirLocked() error {
 
 func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
 	if v.activePack == nil {
-		packPath := v.scratchPackPath()
+		v.nextPackID++
+		packID := v.nextPackID
+		packPath := v.scratchPackPath(packID)
 		pack, err := blob.NewIncrementalPack(packPath, blob.DefaultPackSlots)
 		if err != nil {
 			return stagedChunkReference{}, fmt.Errorf("failed creating incremental pack %s: %w", packPath, err)
 		}
 		v.activePack = pack
+		v.activePackID = packID
+		v.packs[packID] = pack
 	}
 
 	entry, err := v.activePack.Append(data)
@@ -3642,6 +3697,7 @@ func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
 	}
 
 	return stagedChunkReference{
+		PackID: v.activePackID,
 		Entry:  entry,
 		Length: uint32(len(data)),
 	}, nil
@@ -3654,9 +3710,11 @@ func (v *Volume) setStagedChunkLocked(inodeID uint64, index int, reference stage
 		v.stagedChunks[inodeID] = chunks
 	} else if existing, ok := chunks[index]; ok {
 		v.stagedBytes -= int64(existing.Length)
+		v.dropPackReferenceLocked(existing.PackID)
 	}
 	chunks[index] = reference
 	v.stagedBytes += int64(reference.Length)
+	v.packLiveReferences[reference.PackID]++
 }
 
 func (v *Volume) dropStagedChunkLocked(inodeID uint64, index int) {
@@ -3667,6 +3725,7 @@ func (v *Volume) dropStagedChunkLocked(inodeID uint64, index int) {
 	if existing, ok := chunks[index]; ok {
 		v.stagedBytes -= int64(existing.Length)
 		delete(chunks, index)
+		v.dropPackReferenceLocked(existing.PackID)
 		if len(chunks) == 0 {
 			delete(v.stagedChunks, inodeID)
 			delete(v.stagedSizes, inodeID)
@@ -3682,6 +3741,7 @@ func (v *Volume) dropStagedChunksLocked(inodeID uint64) {
 	}
 	for _, reference := range chunks {
 		v.stagedBytes -= int64(reference.Length)
+		v.dropPackReferenceLocked(reference.PackID)
 	}
 	delete(v.stagedChunks, inodeID)
 	delete(v.stagedSizes, inodeID)
