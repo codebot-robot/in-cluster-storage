@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -25,7 +26,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -33,9 +33,11 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/consistency"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuseholder"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/volumemode"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/writemode"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -57,6 +59,7 @@ var (
 	controllerSyncTimeout  = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for sync RPCs (fsync, flush, write) to ObjectFS controller")
 	syncOnClose            = flag.Bool("sync-on-close", true, "Schedule non-blocking sync on file release")
 	backgroundSyncInterval = flag.Duration("background-sync-interval", 30*time.Second, "Background sync interval for dirty volumes")
+	fuseHolderSocket       = flag.String("fuse-holder-socket", "", "Path to FUSE holder Unix domain socket")
 	debug                  = flag.Bool("debug", false, "Log every FUSE request (for test/CI gates)")
 )
 
@@ -66,6 +69,9 @@ func main() {
 
 	if *nodeID == "" {
 		klog.Fatal("nodeid must be provided")
+	}
+	if *fuseHolderSocket == "" {
+		klog.Fatal("--fuse-holder-socket must be provided")
 	}
 
 	proto, addr, err := parseEndpoint(*endpoint)
@@ -87,7 +93,7 @@ func main() {
 
 	server := grpc.NewServer()
 
-	driver, err := newDriver(*nodeID, *controllerAddress, *cacheDir, *cacheSizeMB*1024*1024, *diskCacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval, *clientCertDir, *insecureFlag)
+	driver, err := newDriver(*nodeID, *controllerAddress, *cacheDir, *cacheSizeMB*1024*1024, *diskCacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval, *clientCertDir, *insecureFlag, *fuseHolderSocket)
 	if err != nil {
 		klog.Fatalf("failed to initialize driver: %v", err)
 	}
@@ -131,6 +137,14 @@ type activeMount struct {
 	mountID     string
 }
 
+type fuseHolderClient interface {
+	Mount(request fuseholder.MountRequest) (int, error)
+	Get(target string) (int, fuseholder.Entry, error)
+	List() ([]fuseholder.Entry, error)
+	Unmount(target string, detach bool) error
+	Close() error
+}
+
 type objectFSDriver struct {
 	csi.UnimplementedIdentityServer
 	csi.UnimplementedNodeServer
@@ -147,16 +161,29 @@ type objectFSDriver struct {
 	backgroundSyncInterval time.Duration
 	clientCertDir          string
 	insecure               bool
+	fuseHolderSocket       string
 	debug                  bool
 
 	clientConn *grpc.ClientConn
 	client     pb.ObjectFSControllerClient
+	dialHolder func(socketPath string) (fuseHolderClient, error)
 
 	mu     sync.Mutex
 	mounts map[string]*activeMount
 }
 
-func newDriver(nodeID, controllerAddress, cacheDir string, cacheBytes, diskCacheBytes int64, rpcTimeout, syncTimeout time.Duration, syncOnClose bool, backgroundSyncInterval time.Duration, clientCertDir string, insecure bool) (*objectFSDriver, error) {
+func dialFuseHolder(socketPath string) (fuseHolderClient, error) {
+	if socketPath == "" {
+		return nil, errors.New("--fuse-holder-socket is required for FUSE mode")
+	}
+	client, err := fuseholder.Dial(socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to fuse holder at %s: %w", socketPath, err)
+	}
+	return client, nil
+}
+
+func newDriver(nodeID, controllerAddress, cacheDir string, cacheBytes, diskCacheBytes int64, rpcTimeout, syncTimeout time.Duration, syncOnClose bool, backgroundSyncInterval time.Duration, clientCertDir string, insecure bool, fuseHolderSocket string) (*objectFSDriver, error) {
 	if rpcTimeout <= 0 {
 		rpcTimeout = 30 * time.Second
 	}
@@ -186,6 +213,8 @@ func newDriver(nodeID, controllerAddress, cacheDir string, cacheBytes, diskCache
 		backgroundSyncInterval: backgroundSyncInterval,
 		clientCertDir:          clientCertDir,
 		insecure:               insecure,
+		fuseHolderSocket:       fuseHolderSocket,
+		dialHolder:             dialFuseHolder,
 		mounts:                 make(map[string]*activeMount),
 	}, nil
 }
@@ -195,6 +224,23 @@ func (d *objectFSDriver) Close() error {
 	defer d.mu.Unlock()
 	if d.diskCache != nil {
 		return d.diskCache.Close()
+	}
+	return nil
+}
+
+func (d *objectFSDriver) unmountFUSEViaHolder(targetPath string) error {
+	holder, err := d.dialHolder(d.fuseHolderSocket)
+	if err != nil {
+		return fmt.Errorf("failed to get fuse holder client: %w", err)
+	}
+	defer func() {
+		if closeErr := holder.Close(); closeErr != nil {
+			klog.Warningf("failed to close fuse holder client: %v", closeErr)
+		}
+	}()
+
+	if err := holder.Unmount(targetPath, false); err != nil && !errors.Is(err, fuseholder.ErrNotFound) {
+		return fmt.Errorf("failed to unmount %s via holder: %w", targetPath, err)
 	}
 	return nil
 }
@@ -341,22 +387,55 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		rawFS.SetDiskBlobCache(d.diskCache)
 	}
 
-	mountOpts := &gofuse.MountOptions{
-		AllowOther:  true,
-		FsName:      "objectfs",
-		Name:        "objectfs",
-		Options:     []string{"default_permissions", "allow_other"},
-		Debug:       d.debug,
-		DirectMount: os.Geteuid() == 0,
+	maxWrite := 128 * 1024
+	holder, err := d.dialHolder(d.fuseHolderSocket)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := holder.Close(); closeErr != nil {
+			klog.Warningf("failed to close fuse holder client: %v", closeErr)
+		}
+	}()
+
+	fd, err := holder.Mount(fuseholder.MountRequest{
+		Entry: fuseholder.Entry{
+			Target:   targetPath,
+			VolumeID: volumeID,
+			Mode:     volumemode.VolumeModeString(volumemode.ModeFuse),
+			FsName:   "objectfs",
+			Name:     "objectfs",
+			MaxRead:  maxWrite,
+			Options:  []string{"default_permissions", "allow_other"},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to mount FUSE filesystem at %s via holder: %w", targetPath, err)
 	}
 
-	server, err := gofuse.NewServer(rawFS, targetPath, mountOpts)
+	mountOpts := &gofuse.MountOptions{
+		AllowOther: true,
+		FsName:     "objectfs",
+		Name:       "objectfs",
+		Options:    []string{"default_permissions", "allow_other"},
+		MaxWrite:   maxWrite,
+		Debug:      d.debug,
+	}
+
+	mountPoint := fmt.Sprintf("/dev/fd/%d", fd)
+	server, err := gofuse.NewServer(rawFS, mountPoint, mountOpts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to mount FUSE filesystem at %s: %w", targetPath, err)
+		if closeErr := unix.Close(fd); closeErr != nil {
+			klog.Warningf("failed to close descriptor %d after NewServer error: %v", fd, closeErr)
+		}
+		if unmountErr := holder.Unmount(targetPath, false); unmountErr != nil {
+			klog.Warningf("failed to unmount %s via holder after NewServer failure: %v", targetPath, unmountErr)
+		}
+		return nil, fmt.Errorf("failed to create FUSE server for %s at %s: %w", targetPath, mountPoint, err)
 	}
 	go server.Serve()
 	if err := server.WaitMount(); err != nil {
-		if unmountErr := server.Unmount(); unmountErr != nil {
+		if unmountErr := holder.Unmount(targetPath, false); unmountErr != nil {
 			klog.Warningf("failed to unmount %s after WaitMount failure: %v", targetPath, unmountErr)
 		}
 		return nil, fmt.Errorf("failed waiting for FUSE mount at %s: %w", targetPath, err)
@@ -382,7 +461,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		server:     server,
 		cancelFunc: cancel,
 		volumeID:   volumeID,
-		mode:       "fuse",
+		mode:       volumemode.VolumeModeString(volumemode.ModeFuse),
 	}
 	d.mu.Unlock()
 
@@ -396,9 +475,6 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 
 	d.mu.Lock()
 	mountInfo, ok := d.mounts[targetPath]
-	if ok {
-		delete(d.mounts, targetPath)
-	}
 	d.mu.Unlock()
 
 	volumeID := req.GetVolumeId()
@@ -406,7 +482,10 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 		volumeID = mountInfo.volumeID
 	}
 	volumeDir := filepath.Join(d.cacheDir, volumeID)
-	if (ok && mountInfo != nil && mountInfo.mode == "exclusive-local") || isExclusiveLocalDir(volumeDir) {
+	if (ok && mountInfo != nil && mountInfo.mode == volumemode.VolumeModeString(volumemode.ModeExclusiveLocal)) || isExclusiveLocalDir(volumeDir) {
+		d.mu.Lock()
+		delete(d.mounts, targetPath)
+		d.mu.Unlock()
 		return d.unpublishExclusiveLocal(ctx, req, volumeID, volumeDir, mountInfo)
 	}
 
@@ -435,24 +514,15 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 		if mountInfo.cancelFunc != nil {
 			mountInfo.cancelFunc()
 		}
-		if mountInfo.server != nil {
-			if err := mountInfo.server.Unmount(); err != nil {
-				klog.Warningf("FUSE server unmount returned error: %v, attempting system unmount", err)
-				if err := syscall.Unmount(targetPath, 0); err != nil && err != syscall.EINVAL {
-					return nil, fmt.Errorf("failed to unmount %s: %w", targetPath, err)
-				}
-			}
-		} else {
-			if err := syscall.Unmount(targetPath, 0); err != nil && err != syscall.EINVAL {
-				return nil, fmt.Errorf("failed to unmount %s: %w", targetPath, err)
-			}
-		}
-	} else {
-		// Fallback unmount if not tracked
-		if err := syscall.Unmount(targetPath, 0); err != nil && err != syscall.EINVAL {
-			return nil, fmt.Errorf("failed to unmount %s: %w", targetPath, err)
-		}
 	}
+
+	if err := d.unmountFUSEViaHolder(targetPath); err != nil {
+		return nil, err
+	}
+
+	d.mu.Lock()
+	delete(d.mounts, targetPath)
+	d.mu.Unlock()
 
 	klog.Infof("Successfully unpublished ObjectFS volume from %s", targetPath)
 	return &csi.NodeUnpublishVolumeResponse{}, nil

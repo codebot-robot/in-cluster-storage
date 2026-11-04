@@ -166,6 +166,46 @@ spec:
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
+  name: objectfs-fuse-holder
+  namespace: kube-objectfs-system
+spec:
+  selector:
+    matchLabels:
+      app: objectfs-fuse-holder
+  template:
+    metadata:
+      labels:
+        app: objectfs-fuse-holder
+    spec:
+      serviceAccountName: objectfs-node-daemon
+      containers:
+        - name: objectfs-fuse-holder
+          securityContext:
+            privileged: true
+          image: objectfs-fuse-holder:latest
+          args:
+            - "--socket-path=/run/objectfs/fuse-holder.sock"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /run/objectfs
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: "Bidirectional"
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/run/objectfs
+            type: DirectoryOrCreate
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+
+---
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
   name: objectfs-node-daemon
   namespace: kube-objectfs-system
 spec:
@@ -207,6 +247,7 @@ spec:
             - "--endpoint=unix:///csi/csi.sock"
             - "--nodeid=$(NODE_ID)"
             - "--controller-address=objectfs-controller:50051"
+            - "--fuse-holder-socket=/run/objectfs/fuse-holder.sock"
             - "--cache-dir=/var/cache/objectfs"
             - "--client-cert-dir=/etc/objectfs/certs/client"
           env:
@@ -217,6 +258,8 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
+            - name: holder-socket-dir
+              mountPath: /run/objectfs
             - name: kubelet-dir
               mountPath: /var/lib/kubelet
               mountPropagation: "Bidirectional"
@@ -229,6 +272,10 @@ spec:
         - name: socket-dir
           hostPath:
             path: /var/lib/kubelet/plugins/objectfs.labs.gke.io/
+            type: DirectoryOrCreate
+        - name: holder-socket-dir
+          hostPath:
+            path: /var/run/objectfs
             type: DirectoryOrCreate
         - name: registration-dir
           hostPath:

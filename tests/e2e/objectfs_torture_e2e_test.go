@@ -229,12 +229,14 @@ func setupObjectFSTortureCluster(t *testing.T, clusterName string) (*Harness, st
 	// Build and load docker images
 	h.DockerBuild("objectfs-controller:e2e", filepath.Join(experimentRoot, "images/objectfs-controller/Dockerfile"), experimentRoot)
 	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/objectfs-node-daemon/Dockerfile"), experimentRoot)
+	h.DockerBuild("objectfs-fuse-holder:e2e", filepath.Join(experimentRoot, "images/objectfs-fuse-holder/Dockerfile"), experimentRoot)
 	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
 	h.DockerBuild("fakes3:e2e", filepath.Join(experimentRoot, "fakes3/images/fakes3/Dockerfile"), experimentRoot)
 	h.DockerBuild("certsigner:e2e", filepath.Join(experimentRoot, "certsigner/images/certsigner/Dockerfile"), experimentRoot)
 
 	h.KindLoad("objectfs-controller:e2e")
 	h.KindLoad("objectfs-node-daemon:e2e")
+	h.KindLoad("objectfs-fuse-holder:e2e")
 	h.KindLoad("wal-buffer:e2e")
 	h.KindLoad("fakes3:e2e")
 	h.KindLoad("certsigner:e2e")
@@ -294,6 +296,7 @@ spec:
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
+	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-fuse-holder:latest", "image: objectfs-fuse-holder:e2e\n          imagePullPolicy: Never")
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: certsigner:latest", "image: certsigner:e2e\n          imagePullPolicy: Never")
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
 
@@ -350,6 +353,9 @@ spec:
 	}
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS Controller failed to start on %s: %v", node1, err)
+	}
+	if err := h.WaitForDaemonSet("objectfs-fuse-holder", "default", 2*time.Minute); err != nil {
+		t.Fatalf("ObjectFS FUSE Holder failed to start: %v", err)
 	}
 	if err := h.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS Node Daemon failed to start: %v", err)
