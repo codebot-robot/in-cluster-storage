@@ -23,7 +23,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"sort"
 	"strings"
@@ -31,6 +30,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/tempfile"
 	"k8s.io/klog/v2"
 )
 
@@ -158,41 +158,28 @@ func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error
 	}
 
 	packID := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("pack-%d-%d", len(smallInputs), time.Now().UnixNano()))))
-	tf, err := os.CreateTemp("", "objectfs-pack-write-*")
+	tempPackFile, err := tempfile.Create("", "objectfs-pack-write-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file for packfile: %w", err)
 	}
-	tempPath := tf.Name()
+	defer tempPackFile.CloseAndLog(ctx)
 
-	packFile, err := WritePackfile(tf, smallInputs)
+	packFile, err := WritePackfile(tempPackFile.File, smallInputs)
 	if err != nil {
-		errutil.CloseAndLog(tf, "temp packfile")
-		if removeErr := os.Remove(tempPath); removeErr != nil {
-			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, removeErr)
-		}
 		return fmt.Errorf("failed to write packfile: %w", err)
 	}
 
-	st, err := tf.Stat()
+	fileInfo, err := tempPackFile.Stat()
 	if err != nil {
-		errutil.CloseAndLog(tf, "temp packfile")
-		if removeErr := os.Remove(tempPath); removeErr != nil {
-			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, removeErr)
-		}
 		return fmt.Errorf("failed to stat temp packfile: %w", err)
 	}
-	if _, err := tf.Seek(0, io.SeekStart); err != nil {
-		errutil.CloseAndLog(tf, "temp packfile")
-		if removeErr := os.Remove(tempPath); removeErr != nil {
-			klog.Warningf("failed to remove temp packfile %s: %v", tempPath, removeErr)
-		}
+	if _, err := tempPackFile.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek temp packfile: %w", err)
 	}
 
-	packStream := NewByteStreamFromFile(tf, st.Size(), true)
+	packStream := NewByteStreamFromReadSeekCloser(tempPackFile, fileInfo.Size())
 	packFileKey := s.packKey(packID, len(smallInputs))
 	if _, err := s.backend.PutObject(ctx, "", packFileKey, packStream); err != nil {
-		errutil.CloseAndLog(packStream, "temp packfile stream")
 		return fmt.Errorf("failed to write packfile %s to backend: %w", packFileKey, err)
 	}
 	if err := packStream.Close(); err != nil {
