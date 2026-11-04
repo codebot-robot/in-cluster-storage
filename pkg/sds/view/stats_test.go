@@ -429,7 +429,12 @@ func TestView_FailedStatsReadFailsLoad(t *testing.T) {
 		getFailCount:   10,
 	}
 
-	v := view.New(faulty, view.WithStats(initialStats, updateTestStats))
+	reg := record.NewRegistry()
+	if _, err := reg.RegisterDescriptor(statsMD, 1); err != nil {
+		t.Fatalf("RegisterDescriptor failed: %v", err)
+	}
+
+	v := view.New(faulty, view.WithRegistry(reg), view.WithStats(initialStats, updateTestStats))
 	defer v.Close()
 
 	if err := v.LoadStats(ctx); err == nil {
@@ -437,6 +442,55 @@ func TestView_FailedStatsReadFailsLoad(t *testing.T) {
 	}
 	if err := v.SetIndex(faulty); err == nil {
 		t.Errorf("expected SetIndex to fail when reading stats errors, got nil")
+	}
+}
+
+func TestView_StatsUnavailableUntilTypeRegistered(t *testing.T) {
+	ctx := t.Context()
+	store := memtable.New(memtable.WithStreamID("test-stats-unreg"))
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close failed: %v", err)
+		}
+	}()
+
+	statsMD := statsDescriptor(t)
+	initialStats := dynamicpb.NewMessage(statsMD)
+	initialStats.Set(statsMD.Fields().ByName("name"), protoreflect.ValueOfString("stats"))
+
+	reg := record.NewRegistry()
+	v := view.New(store,
+		view.WithRegistry(reg),
+		view.WithStats(initialStats, updateTestStats),
+	)
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Errorf("v.Close failed: %v", err)
+		}
+	}()
+
+	// 1. Registry does not contain stats type; Stats() must be unavailable and registry unmutated
+	if v.Stats() != nil {
+		t.Fatalf("expected Stats() to be nil before type registered, got %v", v.Stats())
+	}
+	if len(reg.Export().GetTypes()) != 0 {
+		t.Fatalf("expected empty registry, got %d types", len(reg.Export().GetTypes()))
+	}
+
+	// 2. Register stats type into registry and sync to view
+	if _, err := reg.RegisterDescriptor(statsMD, 1); err != nil {
+		t.Fatalf("RegisterDescriptor failed: %v", err)
+	}
+	if err := v.SyncRegistry(ctx, reg); err != nil {
+		t.Fatalf("SyncRegistry failed: %v", err)
+	}
+	if err := v.LoadStats(ctx); err != nil {
+		t.Fatalf("LoadStats failed: %v", err)
+	}
+
+	// 3. Stats must now be available
+	if v.Stats() == nil {
+		t.Fatal("expected Stats() to be non-nil after type registered and loaded")
 	}
 }
 
