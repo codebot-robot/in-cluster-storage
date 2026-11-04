@@ -37,10 +37,33 @@ func TestConsistencyModeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseConsistencyMode_AcceptedValues(t *testing.T) {
+	tests := []struct {
+		input    string
+		wantMode pb.ConsistencyMode
+	}{
+		{"", pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED},
+		{"Standard", pb.ConsistencyMode_STANDARD},
+		{"standard", pb.ConsistencyMode_STANDARD},
+		{"CloseToOpen", pb.ConsistencyMode_CLOSE_TO_OPEN},
+		{"closeToOpen", pb.ConsistencyMode_CLOSE_TO_OPEN},
+		{"close-to-open", pb.ConsistencyMode_CLOSE_TO_OPEN},
+	}
+	for _, testCase := range tests {
+		got, err := ParseConsistencyMode(testCase.input)
+		if err != nil {
+			t.Errorf("ParseConsistencyMode(%q) unexpected error: %v", testCase.input, err)
+		}
+		if got != testCase.wantMode {
+			t.Errorf("ParseConsistencyMode(%q) = %v, want %v", testCase.input, got, testCase.wantMode)
+		}
+	}
+}
+
 func TestParseConsistencyMode_Errors(t *testing.T) {
-	for _, input := range []string{"close_to_open", "unknown", "c2o", "Close-To-Open", "STANDARD"} {
-		if _, err := ParseConsistencyMode(input); err == nil || !strings.Contains(err.Error(), "standard") || !strings.Contains(err.Error(), "close-to-open") {
-			t.Errorf("ParseConsistencyMode(%q) = %v; want error naming standard and close-to-open", input, err)
+	for _, input := range []string{"close_to_open", "unknown", "c2o", "STANDARD", "CLOSE_TO_OPEN"} {
+		if _, err := ParseConsistencyMode(input); err == nil || !strings.Contains(err.Error(), "Standard") || !strings.Contains(err.Error(), "CloseToOpen") {
+			t.Errorf("ParseConsistencyMode(%q) = %v; want error naming Standard and CloseToOpen", input, err)
 		}
 	}
 }
@@ -51,11 +74,14 @@ func TestFlagValue(t *testing.T) {
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
 	flagSet.Var(flagValue, "consistency", "Consistency mode")
 
+	if err := flagSet.Parse([]string{"--consistency=CloseToOpen"}); err != nil || mode != pb.ConsistencyMode_CLOSE_TO_OPEN {
+		t.Fatalf("parse CloseToOpen: err=%v, mode=%v", err, mode)
+	}
+	if flagValue.String() != "CloseToOpen" || flagValue.Type() != "mode" {
+		t.Errorf("flagValue String/Type mismatch: %q, %q", flagValue.String(), flagValue.Type())
+	}
 	if err := flagSet.Parse([]string{"--consistency=close-to-open"}); err != nil || mode != pb.ConsistencyMode_CLOSE_TO_OPEN {
 		t.Fatalf("parse close-to-open: err=%v, mode=%v", err, mode)
-	}
-	if flagValue.String() != "close-to-open" || flagValue.Type() != "mode" {
-		t.Errorf("flagValue String/Type mismatch: %q, %q", flagValue.String(), flagValue.Type())
 	}
 	if err := flagSet.Parse([]string{"--consistency=close_to_open"}); err == nil {
 		t.Errorf("parse typo succeeded, want error")

@@ -25,29 +25,30 @@ import (
 )
 
 // ParseConsistencyMode parses a consistency mode string into a ConsistencyMode enum.
-// The accepted canonical values are "standard" and "close-to-open".
+// Canonical values use Kubernetes CamelCase format: "Standard" and "CloseToOpen".
+// Hyphenated and lowercase variants ("standard", "close-to-open", "closeToOpen") are also accepted.
 // An empty string parses as CONSISTENCY_MODE_UNSPECIFIED.
 // Any other value returns an error naming the accepted values.
 func ParseConsistencyMode(value string) (pb.ConsistencyMode, error) {
 	switch value {
 	case "":
 		return pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, nil
-	case "standard":
+	case "Standard", "standard":
 		return pb.ConsistencyMode_STANDARD, nil
-	case "close-to-open":
+	case "CloseToOpen", "closeToOpen", "close-to-open":
 		return pb.ConsistencyMode_CLOSE_TO_OPEN, nil
 	default:
-		return pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, fmt.Errorf("unknown consistency mode %q (accepted values: standard, close-to-open)", value)
+		return pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, fmt.Errorf("unknown consistency mode %q (accepted values: Standard, CloseToOpen)", value)
 	}
 }
 
-// ConsistencyModeString returns the canonical user-facing string for mode.
+// ConsistencyModeString returns the canonical user-facing string for mode in Kubernetes CamelCase format.
 func ConsistencyModeString(mode pb.ConsistencyMode) string {
 	switch mode {
 	case pb.ConsistencyMode_STANDARD:
-		return "standard"
+		return "Standard"
 	case pb.ConsistencyMode_CLOSE_TO_OPEN:
-		return "close-to-open"
+		return "CloseToOpen"
 	default:
 		return ""
 	}
