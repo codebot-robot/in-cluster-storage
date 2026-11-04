@@ -55,7 +55,7 @@ var (
 	flushInterval             = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
 	walDir                    = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
 	walTarget                 = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
-	walDurability             = flag.String("wal-durability", "local", "Default WAL durability level (local, witness, permanent)")
+	walDurability             = walclient.Local
 	metadataIndex             = flag.String("metadata-index", "sqlite", "Metadata local index type (sqlite, memory, table)")
 	metadataIndexCacheMB      = flag.Int("metadata-index-cache-mb", 64, "Pebble shared block cache size in megabytes for table metadata index")
 	metadataCacheEntries      = flag.Int("metadata-cache-entries", 0, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
@@ -70,6 +70,10 @@ var (
 	openBarrierTimeout        = flag.Duration("open-barrier-timeout", 5*time.Second, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
 )
+
+func init() {
+	flag.Var(walclient.NewLevelValue(&walDurability), "wal-durability", "Default WAL durability level (local, witness, permanent)")
+}
 
 func evaluateLeafExpiry(cert *x509.Certificate, now time.Time) {
 	if cert == nil {
@@ -197,18 +201,7 @@ func main() {
 	if *walTarget == "" {
 		klog.Fatalf("invalid configuration: --wal-target is required")
 	}
-	durability := walclient.Permanent
-	switch strings.ToLower(*walDurability) {
-	case "witness":
-		durability = walclient.Witness
-	case "permanent":
-		durability = walclient.Permanent
-	case "local":
-		durability = walclient.Local
-	default:
-		klog.Fatalf("invalid wal-durability: %s (must be local, witness, or permanent)", *walDurability)
-	}
-	serverOpts = append(serverOpts, controller.WithServerWAL(*walDir, *walTarget, durability))
+	serverOpts = append(serverOpts, controller.WithServerWAL(*walDir, *walTarget, walDurability))
 
 	var grpcServer *grpc.Server
 	if *insecure {

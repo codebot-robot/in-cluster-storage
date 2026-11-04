@@ -64,6 +64,30 @@ func TestMetadataIndexCacheMBFlag(t *testing.T) {
 	}
 }
 
+func TestWalDurabilityFlag(t *testing.T) {
+	f := flag.Lookup("wal-durability")
+	if f == nil {
+		t.Fatal("flag --wal-durability not registered")
+	}
+	if f.DefValue != "local" {
+		t.Errorf("default value = %q, want local", f.DefValue)
+	}
+	t.Cleanup(func() {
+		if err := f.Value.Set("local"); err != nil {
+			t.Errorf("restore wal-durability flag failed: %v", err)
+		}
+	})
+	if err := f.Value.Set("witness"); err != nil {
+		t.Fatalf("Set witness failed: %v", err)
+	}
+	if err := f.Value.Set("permanent"); err != nil {
+		t.Fatalf("Set permanent failed: %v", err)
+	}
+	if err := f.Value.Set("invalid"); err == nil {
+		t.Fatal("expected error for invalid durability")
+	}
+}
+
 func TestControllerTableRegistration(t *testing.T) {
 	ctx := t.Context()
 	cache := pebble.NewCache(64 * 1024 * 1024)
