@@ -28,6 +28,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	"github.com/gke-labs/in-cluster-storage/pkg/tempfile"
 )
 
 var (
@@ -190,29 +191,24 @@ func PublishSnapshot(ctx context.Context, db *DB, backend objectstore.Backend, t
 		return "", 0, ErrPendingTransaction
 	}
 
-	tmpFile, err := os.CreateTemp(tempDir, "sds-sqlite-snap-*.sqlite")
+	tempFile, err := tempfile.Create(tempDir, "sds-sqlite-snap-*.sqlite")
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to create temp file for snapshot: %w", err)
 	}
-	tmpPath := tmpFile.Name()
-	if err := tmpFile.Close(); err != nil {
-		removeAndLog(tmpPath, "temp snapshot file")
-		return "", 0, fmt.Errorf("failed to close temp file %q: %w", tmpPath, err)
-	}
-	defer removeAndLog(tmpPath, "temp snapshot file")
+	defer tempFile.CloseAndLog(ctx)
 
 	// Use SQLite VACUUM INTO to create a defragmented, clean snapshot file
-	vacuumSQL := fmt.Sprintf("VACUUM INTO %q;", tmpPath)
+	vacuumSQL := fmt.Sprintf("VACUUM INTO %q;", tempFile.Name())
 	if _, err := db.SQLDB().ExecContext(ctx, vacuumSQL); err != nil {
-		return "", 0, fmt.Errorf("failed to vacuum snapshot into %q: %w", tmpPath, err)
+		return "", 0, fmt.Errorf("failed to vacuum snapshot into %q: %w", tempFile.Name(), err)
 	}
 
-	stat, err := os.Stat(tmpPath)
+	stat, err := os.Stat(tempFile.Name())
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to stat snapshot file: %w", err)
 	}
 
-	f, err := os.Open(tmpPath)
+	f, err := os.Open(tempFile.Name())
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to open snapshot file for reading: %w", err)
 	}
@@ -235,18 +231,13 @@ func BuildSnapshot(ctx context.Context, streamID string, payloads [][]byte, back
 		return "", 0, errors.New("nil backend")
 	}
 
-	tmpFile, err := os.CreateTemp(tempDir, "sds-sqlite-build-*.sqlite")
+	tempFile, err := tempfile.Create(tempDir, "sds-sqlite-build-*.sqlite")
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to create temp file: %w", err)
 	}
-	tmpPath := tmpFile.Name()
-	if err := tmpFile.Close(); err != nil {
-		removeAndLog(tmpPath, "temp build file")
-		return "", 0, fmt.Errorf("failed to close temp file %q: %w", tmpPath, err)
-	}
-	defer removeAndLog(tmpPath, "temp snapshot file")
+	defer tempFile.CloseAndLog(ctx)
 
-	db, err := Open(ctx, tmpPath,
+	db, err := Open(ctx, tempFile.Name(),
 		WithStreamID(streamID),
 		WithJournalMode("OFF"),
 		WithSynchronous("OFF"),
@@ -274,7 +265,7 @@ func BuildSnapshot(ctx context.Context, streamID string, payloads [][]byte, back
 	}
 
 	// Reopen file to upload
-	f, err := os.Open(tmpPath)
+	f, err := os.Open(tempFile.Name())
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to open build db file: %w", err)
 	}
