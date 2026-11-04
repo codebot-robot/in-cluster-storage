@@ -1334,8 +1334,11 @@ func TestSnapshotRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RestoreSnapshot to %s failed: %v", snap1, err)
 	}
-	if restoreResp1.GetSnapshotName() == "" {
+	if restoreResp1.GetSnapshot().GetName() == "" {
 		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
+	}
+	if restoreResp1.GetSnapshot().GetCreatedAt() == nil {
+		t.Fatalf("expected RestoreSnapshot to populate created_at timestamp in snapshot info")
 	}
 
 	// Read /doc.txt -> should be version 1 data
@@ -1364,7 +1367,7 @@ func TestSnapshotRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RestoreSnapshot to %s failed: %v", snap2, err)
 	}
-	if restoreResp2.GetSnapshotName() == "" {
+	if restoreResp2.GetSnapshot().GetName() == "" {
 		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
@@ -1425,6 +1428,45 @@ func TestRestoreSnapshotErrors(t *testing.T) {
 	server.restoringMu.Unlock()
 }
 
+func TestVolumeRestoreSnapshotReturnsSnapshotInfo(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(t, backend)
+	volumeID := "test-volume-restore-info"
+
+	vol, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("failed to create volume: %v", err)
+	}
+
+	_, err = testCreateFile(ctx, server, volumeID, "/file1.txt", 0644, []byte("data1"), 0, 0)
+	if err != nil {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+
+	snapName, err := vol.CreateSnapshot(ctx, "snap-initial")
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+
+	snapshotInfo, err := vol.RestoreSnapshot(ctx, snapName)
+	if err != nil {
+		t.Fatalf("vol.RestoreSnapshot failed: %v", err)
+	}
+	if snapshotInfo == nil {
+		t.Fatalf("expected non-nil SnapshotInfo from vol.RestoreSnapshot")
+	}
+	if snapshotInfo.GetName() == "" {
+		t.Fatalf("expected non-empty name in SnapshotInfo")
+	}
+	if snapshotInfo.GetCreatedAt() == nil {
+		t.Fatalf("expected non-nil CreatedAt in SnapshotInfo")
+	}
+	if snapshotInfo.GetPosition() == 0 {
+		t.Fatalf("expected non-zero position in SnapshotInfo")
+	}
+}
+
 func TestSnapshotRestoreDurableAcrossRestart(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
@@ -1460,7 +1502,7 @@ func TestSnapshotRestoreDurableAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
 	}
-	if restoreRespDurable.GetSnapshotName() == "" {
+	if restoreRespDurable.GetSnapshot().GetName() == "" {
 		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
@@ -1525,7 +1567,7 @@ func TestSnapshotRestoreWriteThenRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
 	}
-	if restoreRespWrite.GetSnapshotName() == "" {
+	if restoreRespWrite.GetSnapshot().GetName() == "" {
 		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
@@ -1617,7 +1659,7 @@ func TestSnapshotRestoreRebuildFromLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
 	}
-	if restoreRespRebuild.GetSnapshotName() == "" {
+	if restoreRespRebuild.GetSnapshot().GetName() == "" {
 		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
@@ -1815,7 +1857,7 @@ func TestSnapshotRestoreInodeMonotonicity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
 	}
-	if restoreRespIno.GetSnapshotName() == "" {
+	if restoreRespIno.GetSnapshot().GetName() == "" {
 		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 

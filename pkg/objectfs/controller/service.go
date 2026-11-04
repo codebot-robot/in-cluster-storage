@@ -697,7 +697,7 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return nil, volInitError(err)
 	}
 
-	publishedSnapshotName, err := vol.RestoreSnapshot(ctx, req.GetSnapshotName())
+	snapshotInfo, err := vol.RestoreSnapshot(ctx, req.GetSnapshotName())
 	if err != nil {
 		if errors.Is(err, ErrSnapshotNotFound) {
 			return nil, status.Errorf(codes.NotFound, "snapshot %q not found", req.GetSnapshotName())
@@ -706,7 +706,7 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	}
 
 	return &pb.RestoreSnapshotResponse{
-		SnapshotName: publishedSnapshotName,
+		Snapshot: snapshotInfo,
 	}, nil
 }
 
