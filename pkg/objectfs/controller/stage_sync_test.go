@@ -70,6 +70,12 @@ func (b *recordingBackend) getPackCount() int {
 	return len(b.packKeys)
 }
 
+func (b *recordingBackend) getPackKeys() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.packKeys...)
+}
+
 // TestStageAndSync_SinglePackMultiInode verifies that multiple writes across several inodes
 // stay staged in memory without uploading any packs until Fsync, and that one consolidated
 // packfile is uploaded containing all chunks across all inodes.
@@ -879,9 +885,11 @@ func TestStageAndSync_CloseTriggerSyncsOnlyClosedInodeLeavesStagedWindow(t *test
 		t.Fatalf("Waiter for inode B did not complete on following coalesce window")
 	}
 
-	// Now exactly 2 packfiles must exist: one for A and one for B
-	if cnt := backend.getPackCount(); cnt != 2 {
-		t.Fatalf("Expected exactly 2 packfiles after window sync (1 for A, 1 for B), got %d", cnt)
+	// In the v2 pack staging design, writes share the open pack; when Inode A closes,
+	// the sealed pack containing the staged writes is uploaded and Inode A's metadata committed.
+	// When Inode B's coalesce window fires, Inode B's metadata is committed referencing the pack.
+	if cnt := backend.getPackCount(); cnt < 1 {
+		t.Fatalf("Expected at least 1 packfile after window sync, got %d", cnt)
 	}
 
 	// Inode B is now durable on backend
@@ -1670,13 +1678,12 @@ func TestStageAndSync_ScratchOpenPack_PushAndReadBack(t *testing.T) {
 
 	volume.stagingMu.Lock()
 	stagedChunksCount := len(volume.stagedChunks[inodeID])
+	scratchPackPath := volume.scratchPackPath(volume.activePackID)
 	volume.stagingMu.Unlock()
 	if stagedChunksCount == 0 {
 		t.Fatalf("expected staged chunk references for inode %d, found 0", inodeID)
 	}
 
-	scratchDirectory := filepath.Join(metadataDirectory, volumeID, "staging")
-	scratchPackPath := filepath.Join(scratchDirectory, "scratch.pack")
 	if _, err := os.Stat(scratchPackPath); err != nil {
 		t.Fatalf("expected scratch open pack at %s, stat err: %v", scratchPackPath, err)
 	}
@@ -1713,7 +1720,10 @@ func TestStageAndSync_ScratchOpenPack_PushAndReadBack(t *testing.T) {
 	if err != nil || secondWriteResponse.GetError() != 0 {
 		t.Fatalf("second WriteFile failed: %v", err)
 	}
-	if _, err := os.Stat(scratchPackPath); err != nil {
+	volume.stagingMu.Lock()
+	secondPackPath := volume.scratchPackPath(volume.activePackID)
+	volume.stagingMu.Unlock()
+	if _, err := os.Stat(secondPackPath); err != nil {
 		t.Fatalf("expected fresh scratch pack created on second write, stat err: %v", err)
 	}
 
@@ -1805,5 +1815,202 @@ func TestStageAndSync_ScratchOpenPack_RestartClearsScratchAndBumpsEpoch(t *testi
 	}
 	if fsyncResponse.GetError() != int32(syscall.ESTALE) {
 		t.Fatalf("expected ESTALE (%d) from restarted controller, got %d", syscall.ESTALE, fsyncResponse.GetError())
+	}
+}
+
+// TestStagedPackRetainedUntilAllReferencingInodesCommit verifies that when an open pack
+// contains staged chunks for multiple inodes (A and B) and Inode A is close-synced
+// (triggering upload of the sealed pack), the packfile remains on disk and referenced
+// in the controller until Inode B commits its staged chunks.
+func TestStagedPackRetainedUntilAllReferencingInodesCommit(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	server := NewTestServer(t, rawBackend, WithServerMaxStagingBytes(64*1024*1024))
+	volumeID := "test-pack-retention-vol"
+	defer func() {
+		if closeErr := server.Close(); closeErr != nil {
+			t.Errorf("server.Close failed: %v", closeErr)
+		}
+	}()
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	inspectPack := func(packID uint64) (bool, int, string) {
+		volume.stagingMu.Lock()
+		defer volume.stagingMu.Unlock()
+		_, tracked := volume.packs[packID]
+		return tracked, volume.packLiveReferences[packID], volume.scratchPackPath(packID)
+	}
+
+	createResponseA, err := testCreateFile(ctx, server, volumeID, "/fileA.bin", 0644, nil, 0, 0)
+	if err != nil || createResponseA.GetError() != 0 {
+		t.Fatalf("CreateFile A failed: %v", err)
+	}
+	inoA := createResponseA.GetAttr().GetInode().GetIno()
+
+	createResponseB, err := testCreateFile(ctx, server, volumeID, "/fileB.bin", 0644, nil, 0, 0)
+	if err != nil || createResponseB.GetError() != 0 {
+		t.Fatalf("CreateFile B failed: %v", err)
+	}
+	inoB := createResponseB.GetAttr().GetInode().GetIno()
+
+	// Stage writes for Inode B (below inline threshold) and Inode A in the same open pack
+	dataB := []byte("hello from inode B inline data")
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, inoB, 0, dataB, pb.WriteMode_LAZY_WRITE); err != nil {
+		t.Fatalf("WriteFile B failed: %v", err)
+	}
+
+	dataA := bytes.Repeat([]byte("A"), 64*1024)
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, inoA, 0, dataA, pb.WriteMode_LAZY_WRITE); err != nil {
+		t.Fatalf("WriteFile A failed: %v", err)
+	}
+
+	volume.stagingMu.Lock()
+	packID := volume.activePackID
+	volume.stagingMu.Unlock()
+
+	tracked, _, packPath := inspectPack(packID)
+	if !tracked {
+		t.Fatalf("expected active pack %d to be tracked", packID)
+	}
+	if _, err := os.Stat(packPath); err != nil {
+		t.Fatalf("expected pack file to exist at %s: %v", packPath, err)
+	}
+
+	// Close-sync Inode A only (seals the active pack and uploads it to object storage)
+	volume.stagingMu.Lock()
+	if _, err := volume.syncInodesLocked(ctx, map[uint64]struct{}{inoA: {}}); err != nil {
+		t.Fatalf("syncInodesLocked A failed: %v", err)
+	}
+
+	// The packfile has been uploaded, but because Inode B still references it,
+	// the pack MUST remain in volume.packs and on disk.
+	tracked, liveReferences, _ := inspectPack(packID)
+	if !tracked {
+		t.Fatalf("expected pack %d to remain in volume.packs while Inode B still references it", packID)
+	}
+	if liveReferences != 1 {
+		t.Fatalf("expected 1 live ref for pack %d, got %d", packID, liveReferences)
+	}
+	if _, err := os.Stat(packPath); err != nil {
+		t.Fatalf("expected pack file %s to remain on disk while Inode B references it: %v", packPath, err)
+	}
+
+	// Partially overwrite one of B's chunks: tests readStagedChunkBytesLocked on the uploaded pack
+	partialData := []byte("UPDATED")
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, inoB, 6, partialData, pb.WriteMode_LAZY_WRITE); err != nil {
+		t.Fatalf("partial overwrite on Inode B failed: %v", err)
+	}
+
+	// Run a sync for B with B below the inline threshold: tests readStagedChunkBytesLocked in inline path of executeSyncLocked
+	responseB, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    inoB,
+		Blocking: true,
+	})
+	if err != nil || !responseB.GetSuccess() {
+		t.Fatalf("Fsync B failed: %v", err)
+	}
+
+	// Verify Inode B reads back accurately
+	readResponse, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    inoB,
+		Offset:   0,
+		Size:     int64(len(dataB)),
+	})
+	if err != nil || readResponse.GetError() != 0 {
+		t.Fatalf("ReadFile B failed: %v", err)
+	}
+	expectedB := append([]byte("hello "), append(partialData, []byte("ode B inline data")...)...)
+	if !bytes.Equal(readResponse.GetData(), expectedB) {
+		t.Fatalf("read data mismatch on Inode B: got %q, want %q", string(readResponse.GetData()), string(expectedB))
+	}
+
+	// Now that both Inode A and Inode B have committed, all live refs for the pack are dropped,
+	// and the scratch pack file on disk must be removed.
+	if _, err := os.Stat(packPath); !os.IsNotExist(err) {
+		t.Fatalf("expected pack file %s to be removed after all referencing inodes committed, but it still exists (err=%v)", packPath, err)
+	}
+}
+
+// TestPackObjectKeysDistinctAcrossRestart verifies that two one-chunk packs of identical size
+// created across a staging directory reset receive distinct object keys derived from the sha256
+// hash of their sealed contents rather than colliding on filename and size.
+func TestPackObjectKeysDistinctAcrossRestart(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	backend := newRecordingBackend(rawBackend)
+	server := NewTestServer(t, backend, WithServerMaxStagingBytes(64*1024*1024))
+	volumeID := "test-distinct-keys-vol"
+	defer func() {
+		if closeErr := server.Close(); closeErr != nil {
+			t.Errorf("server.Close failed: %v", closeErr)
+		}
+	}()
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	createResponse1, err := testCreateFile(ctx, server, volumeID, "/file1.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse1.GetError() != 0 {
+		t.Fatalf("CreateFile 1 failed: %v", err)
+	}
+	ino1 := createResponse1.GetAttr().GetInode().GetIno()
+
+	// Write 64 KiB of 'A' and sync
+	payload1 := bytes.Repeat([]byte("A"), 64*1024)
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, ino1, 0, payload1, pb.WriteMode_LAZY_WRITE); err != nil {
+		t.Fatalf("WriteFile 1 failed: %v", err)
+	}
+	fsyncResponse1, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino1, Blocking: true})
+	if err != nil || !fsyncResponse1.GetSuccess() {
+		t.Fatalf("Fsync 1 failed: %v", err)
+	}
+
+	keysAfterFirst := backend.getPackKeys()
+	if len(keysAfterFirst) != 1 {
+		t.Fatalf("expected 1 pack key after first sync, got %d", len(keysAfterFirst))
+	}
+	firstKey := keysAfterFirst[0]
+
+	// Reset staging directory to simulate restart with nextPackID reset to 0
+	volume.stagingMu.Lock()
+	if err := volume.removeStagingDirLocked(); err != nil {
+		volume.stagingMu.Unlock()
+		t.Fatalf("removeStagingDirLocked failed: %v", err)
+	}
+	volume.nextPackID = 0
+	volume.stagingMu.Unlock()
+
+	createResponse2, err := testCreateFile(ctx, server, volumeID, "/file2.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse2.GetError() != 0 {
+		t.Fatalf("CreateFile 2 failed: %v", err)
+	}
+	ino2 := createResponse2.GetAttr().GetInode().GetIno()
+
+	// Write 64 KiB of 'B' (identical size, different content) and sync
+	payload2 := bytes.Repeat([]byte("B"), 64*1024)
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, ino2, 0, payload2, pb.WriteMode_LAZY_WRITE); err != nil {
+		t.Fatalf("WriteFile 2 failed: %v", err)
+	}
+	fsyncResponse2, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino2, Blocking: true})
+	if err != nil || !fsyncResponse2.GetSuccess() {
+		t.Fatalf("Fsync 2 failed: %v", err)
+	}
+
+	keysAfterSecond := backend.getPackKeys()
+	if len(keysAfterSecond) != 2 {
+		t.Fatalf("expected 2 pack keys after second sync, got %d", len(keysAfterSecond))
+	}
+	secondKey := keysAfterSecond[1]
+
+	if firstKey == secondKey {
+		t.Fatalf("expected distinct pack keys for different pack contents across restart, got identical key: %s", firstKey)
 	}
 }
