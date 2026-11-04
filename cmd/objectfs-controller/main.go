@@ -139,6 +139,9 @@ func main() {
 	if *backendFlag == "" {
 		klog.Fatalf("missing required flag: --backend (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
 	}
+	if *metadataDir == "" {
+		klog.Fatalf("missing required flag: --metadata-dir (local directory required for persistent metadata and write staging)")
+	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {

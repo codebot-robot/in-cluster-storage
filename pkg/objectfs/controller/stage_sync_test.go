@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1621,5 +1622,188 @@ func TestOpenBarrier_SurvivesControllerRestartOverSameMetadataDir(t *testing.T) 
 	}
 	if openResp.GetAttr().GetInode().GetSize() != 16384 {
 		t.Fatalf("Open response on server2 size = %d, want 16384 (barrier did not flush staged write)", openResp.GetAttr().GetInode().GetSize())
+	}
+}
+
+func createScratchRemnant(t *testing.T, scratchDirectory string) string {
+	t.Helper()
+	if err := os.MkdirAll(scratchDirectory, 0755); err != nil {
+		t.Fatalf("failed creating scratch directory: %v", err)
+	}
+	packPath := filepath.Join(scratchDirectory, "scratch.pack")
+	if err := os.WriteFile(packPath, []byte("stale-scratch-pack-bytes"), 0644); err != nil {
+		t.Fatalf("failed writing scratch pack remnant: %v", err)
+	}
+	return packPath
+}
+
+func TestStageAndSync_ScratchOpenPack_PushAndReadBack(t *testing.T) {
+	ctx := t.Context()
+	metadataDirectory := t.TempDir()
+	rawBackend := NewMemoryBackend()
+	backend := newRecordingBackend(rawBackend)
+	server := NewTestServer(t, backend, WithServerMetadataDir(metadataDirectory))
+	volumeID := "test-scratch-pack-vol"
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	createResponse, err := testCreateFile(ctx, server, volumeID, "/testfile.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	payload := bytes.Repeat([]byte("scratch-open-pack-data-"), 5000)
+	writeResponse, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     inodeID,
+		Offset:    0,
+		Data:      payload,
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || writeResponse.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v, err=%d", err, writeResponse.GetError())
+	}
+
+	volume.stagingMu.Lock()
+	stagedChunksCount := len(volume.stagedChunks[inodeID])
+	volume.stagingMu.Unlock()
+	if stagedChunksCount == 0 {
+		t.Fatalf("expected staged chunk references for inode %d, found 0", inodeID)
+	}
+
+	scratchDirectory := filepath.Join(metadataDirectory, volumeID, "staging")
+	scratchPackPath := filepath.Join(scratchDirectory, "scratch.pack")
+	if _, err := os.Stat(scratchPackPath); err != nil {
+		t.Fatalf("expected scratch open pack at %s, stat err: %v", scratchPackPath, err)
+	}
+
+	if backendPackCount := backend.getPackCount(); backendPackCount != 0 {
+		t.Fatalf("expected 0 backend packs before sync, got %d", backendPackCount)
+	}
+
+	fsyncResponse, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    inodeID,
+		Blocking: true,
+	})
+	if err != nil || !fsyncResponse.GetSuccess() {
+		t.Fatalf("Fsync failed: %v, err=%d", err, fsyncResponse.GetError())
+	}
+
+	if backendPackCount := backend.getPackCount(); backendPackCount == 0 {
+		t.Fatalf("expected backend packs uploaded after sync, got 0")
+	}
+
+	if _, err := os.Stat(scratchPackPath); !os.IsNotExist(err) {
+		t.Fatalf("expected scratch pack %s to be deleted after sync, stat err: %v", scratchPackPath, err)
+	}
+
+	secondPayload := []byte("second-write-payload")
+	secondWriteResponse, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     inodeID,
+		Offset:    int64(len(payload)),
+		Data:      secondPayload,
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || secondWriteResponse.GetError() != 0 {
+		t.Fatalf("second WriteFile failed: %v", err)
+	}
+	if _, err := os.Stat(scratchPackPath); err != nil {
+		t.Fatalf("expected fresh scratch pack created on second write, stat err: %v", err)
+	}
+
+	secondFsyncResponse, err := server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Inode:    inodeID,
+		Blocking: true,
+	})
+	if err != nil || !secondFsyncResponse.GetSuccess() {
+		t.Fatalf("second Fsync failed: %v", err)
+	}
+
+	expectedPayload := append(payload, secondPayload...)
+	readAfterSync, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    inodeID,
+		Offset:   0,
+		Size:     int64(len(expectedPayload)),
+	})
+	if err != nil || readAfterSync.GetError() != 0 {
+		t.Fatalf("ReadFile after sync failed: %v, err=%d", err, readAfterSync.GetError())
+	}
+	if !bytes.Equal(readAfterSync.GetData(), expectedPayload) {
+		t.Fatalf("ReadFile content mismatch after sync from scratch pack")
+	}
+}
+
+func TestStageAndSync_ScratchOpenPack_RestartClearsScratchAndBumpsEpoch(t *testing.T) {
+	ctx := t.Context()
+	metadataDirectory := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-scratch-restart-vol"
+
+	server1 := NewTestServer(t, backend, WithServerMetadataDir(metadataDirectory))
+	createResponse, err := testCreateFile(ctx, server1, volumeID, "/staged.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed on server1: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	writePayload := bytes.Repeat([]byte("staged-not-synced-"), 1000)
+	writeResponse, err := server1.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     inodeID,
+		Offset:    0,
+		Data:      writePayload,
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || writeResponse.GetError() != 0 {
+		t.Fatalf("WriteFile failed on server1: %v", err)
+	}
+	oldEpoch := writeResponse.GetStagingEpoch()
+
+	scratchDirectory := filepath.Join(metadataDirectory, volumeID, "staging")
+	if err := server1.Close(); err != nil {
+		t.Errorf("server1.Close failed: %v", err)
+	}
+	createScratchRemnant(t, scratchDirectory)
+
+	server2 := NewTestServer(t, backend, WithServerMetadataDir(metadataDirectory))
+	volume2, err := server2.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed on server2: %v", err)
+	}
+
+	remainingPackFiles, err := filepath.Glob(filepath.Join(scratchDirectory, "*.pack"))
+	if err != nil {
+		t.Fatalf("failed globbing scratch pack files after restart: %v", err)
+	}
+	if len(remainingPackFiles) != 0 {
+		t.Fatalf("expected scratch directory to be cleared on volume open, found %v", remainingPackFiles)
+	}
+
+	volume2.stagingMu.Lock()
+	newEpoch := volume2.stagingEpoch
+	volume2.stagingMu.Unlock()
+	if newEpoch == oldEpoch {
+		t.Fatalf("expected staging epoch to be bumped on restart, got %d for both", oldEpoch)
+	}
+
+	fsyncResponse, err := server2.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId:     volumeID,
+		Inode:        inodeID,
+		Blocking:     true,
+		StagingEpoch: oldEpoch,
+	})
+	if err != nil {
+		t.Fatalf("Fsync RPC failed: %v", err)
+	}
+	if fsyncResponse.GetError() != int32(syscall.ESTALE) {
+		t.Fatalf("expected ESTALE (%d) from restarted controller, got %d", syscall.ESTALE, fsyncResponse.GetError())
 	}
 }
