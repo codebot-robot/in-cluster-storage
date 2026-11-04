@@ -30,15 +30,15 @@ func TestConsistencyModeRoundTrip(t *testing.T) {
 		pb.ConsistencyMode_STANDARD,
 		pb.ConsistencyMode_CLOSE_TO_OPEN,
 	} {
-		str := ConsistencyModeString(mode)
-		if parsed, err := ParseConsistencyMode(str); err != nil || parsed != mode {
-			t.Errorf("round trip failed for %v: string %q, parsed %v, err %v", mode, str, parsed, err)
+		modeString := ConsistencyModeString(mode)
+		if parsed, err := ParseConsistencyMode(modeString); err != nil || parsed != mode {
+			t.Errorf("round trip failed for %v: string %q, parsed %v, err %v", mode, modeString, parsed, err)
 		}
 	}
 }
 
 func TestParseConsistencyMode_Errors(t *testing.T) {
-	for _, input := range []string{"close_to_open", "unknown", "c2o"} {
+	for _, input := range []string{"close_to_open", "unknown", "c2o", "Close-To-Open", "STANDARD"} {
 		if _, err := ParseConsistencyMode(input); err == nil || !strings.Contains(err.Error(), "standard") || !strings.Contains(err.Error(), "close-to-open") {
 			t.Errorf("ParseConsistencyMode(%q) = %v; want error naming standard and close-to-open", input, err)
 		}
@@ -47,15 +47,15 @@ func TestParseConsistencyMode_Errors(t *testing.T) {
 
 func TestFlagValue(t *testing.T) {
 	var mode pb.ConsistencyMode
-	val := NewValue(&mode)
+	flagValue := NewValue(&mode)
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
-	flagSet.Var(val, "consistency", "Consistency mode")
+	flagSet.Var(flagValue, "consistency", "Consistency mode")
 
 	if err := flagSet.Parse([]string{"--consistency=close-to-open"}); err != nil || mode != pb.ConsistencyMode_CLOSE_TO_OPEN {
 		t.Fatalf("parse close-to-open: err=%v, mode=%v", err, mode)
 	}
-	if val.String() != "close-to-open" || val.Type() != "string" {
-		t.Errorf("val String/Type mismatch: %q, %q", val.String(), val.Type())
+	if flagValue.String() != "close-to-open" || flagValue.Type() != "mode" {
+		t.Errorf("flagValue String/Type mismatch: %q, %q", flagValue.String(), flagValue.Type())
 	}
 	if err := flagSet.Parse([]string{"--consistency=close_to_open"}); err == nil {
 		t.Errorf("parse typo succeeded, want error")

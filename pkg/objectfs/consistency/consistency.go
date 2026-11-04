@@ -20,7 +20,6 @@ package consistency
 import (
 	"flag"
 	"fmt"
-	"strings"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 )
@@ -28,8 +27,9 @@ import (
 // ParseConsistencyMode parses a consistency mode string into a ConsistencyMode enum.
 // The accepted canonical values are "standard" and "close-to-open".
 // An empty string parses as CONSISTENCY_MODE_UNSPECIFIED.
+// Any other value returns an error naming the accepted values.
 func ParseConsistencyMode(value string) (pb.ConsistencyMode, error) {
-	switch strings.ToLower(value) {
+	switch value {
 	case "":
 		return pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, nil
 	case "standard":
@@ -84,4 +84,4 @@ func (v *Value) Set(value string) error {
 	return nil
 }
 
-func (v *Value) Type() string { return "string" }
+func (v *Value) Type() string { return "mode" }
