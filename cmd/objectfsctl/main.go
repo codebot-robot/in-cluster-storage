@@ -257,8 +257,41 @@ func newVolumesCommand(opts *options) *cobra.Command {
 	volumesCmd.AddCommand(newVolumesListCommand(opts))
 	volumesCmd.AddCommand(newVolumesDescribeCommand(opts))
 	volumesCmd.AddCommand(newVolumesRepairCommand(opts))
+	volumesCmd.AddCommand(newVolumesDeleteCommand(opts))
 
 	return volumesCmd
+}
+
+func newVolumesDeleteCommand(opts *options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "delete <volume>",
+		Aliases: []string{"del", "rm"},
+		Short:   "Delete a volume",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.serverAddr == "" {
+				return fmt.Errorf("--server is required")
+			}
+
+			volumeID := args[0]
+			client, connection, err := dialServer(opts)
+			if err != nil {
+				return err
+			}
+			defer errutil.CloseAndLog(connection, "server connection")
+
+			request := &pb.DeleteVolumeRequest{VolumeId: volumeID}
+			if _, err := client.DeleteVolume(cmd.Context(), request); err != nil {
+				return fmt.Errorf("failed to delete volume %s: %w", volumeID, err)
+			}
+
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Deleted volume %s\n", volumeID); err != nil {
+				return fmt.Errorf("failed writing to output: %w", err)
+			}
+			return nil
+		},
+	}
+	return cmd
 }
 
 func newVolumesDescribeCommand(opts *options) *cobra.Command {

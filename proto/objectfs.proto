@@ -502,8 +502,10 @@ message ListVolumesResponse {
 }
 
 message DeleteVolumeRequest {
+  reserved 2;
+  reserved "retention";
+
   string volume_id = 1;
-  optional int32 retention = 2;
 }
 
 message DeleteVolumeResponse {

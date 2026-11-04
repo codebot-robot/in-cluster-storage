@@ -4115,7 +4115,6 @@ func (x *ListVolumesResponse) GetEndOfData() bool {
 type DeleteVolumeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	Retention     *int32                 `protobuf:"varint,2,opt,name=retention,proto3,oneof" json:"retention,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4155,13 +4154,6 @@ func (x *DeleteVolumeRequest) GetVolumeId() string {
 		return x.VolumeId
 	}
 	return ""
-}
-
-func (x *DeleteVolumeRequest) GetRetention() int32 {
-	if x != nil && x.Retention != nil {
-		return *x.Retention
-	}
-	return 0
 }
 
 type DeleteVolumeResponse struct {
@@ -6264,12 +6256,9 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"_retentionJ\x04\b\x02\x10\x03R\x0fdegraded_reason\"n\n" +
 	"\x13ListVolumesResponse\x127\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1d.objectfs.v1alpha1.VolumeInfoR\avolumes\x12\x1e\n" +
-	"\vend_of_data\x18\x02 \x01(\bR\tendOfData\"c\n" +
+	"\vend_of_data\x18\x02 \x01(\bR\tendOfData\"C\n" +
 	"\x13DeleteVolumeRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
-	"\tretention\x18\x02 \x01(\x05H\x00R\tretention\x88\x01\x01B\f\n" +
-	"\n" +
-	"_retention\"\x16\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeIdJ\x04\b\x02\x10\x03R\tretention\"\x16\n" +
 	"\x14DeleteVolumeResponse\"\x8d\x01\n" +
 	"\fSnapshotInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x129\n" +
@@ -6731,7 +6720,6 @@ func file_proto_objectfs_proto_init() {
 	}
 	file_proto_objectfs_proto_msgTypes[3].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[57].OneofWrappers = []any{}
-	file_proto_objectfs_proto_msgTypes[59].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[82].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[83].OneofWrappers = []any{}
 	file_proto_objectfs_proto_msgTypes[84].OneofWrappers = []any{}
