@@ -501,4 +501,3 @@ func TestServer_Close_ReturnsAllErrorsJoined(t *testing.T) {
 		t.Errorf("expected subsequent server.Close() to return nil, got: %v", err)
 	}
 }
-
