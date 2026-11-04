@@ -28,7 +28,7 @@ import (
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/in-cluster-storage/pkg/tempfile"
 )
 
 var (
@@ -77,42 +77,33 @@ func (b *Backend) PutObject(ctx context.Context, volumeID, key string, stream bl
 		return "", fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	tf, err := os.CreateTemp(dir, ".tmp-upload-*")
+	tempFile, err := tempfile.Create(dir, ".tmp-upload-*")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp file in %s: %w", dir, err)
 	}
-	tempPath := tf.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			errutil.CloseAndLog(tf, "temp upload file")
-			if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
-				klog.Warningf("failed to remove temp upload file %s: %v", tempPath, remErr)
-			}
-		}
-	}()
+	defer tempFile.CloseAndLog(ctx)
 
 	if err := stream.Rewind(); err != nil {
 		return "", fmt.Errorf("failed to rewind stream: %w", err)
 	}
 
 	hasher := sha256.New()
-	mw := io.MultiWriter(tf, hasher)
-	if _, err := io.Copy(mw, stream); err != nil {
+	multiWriter := io.MultiWriter(tempFile, hasher)
+	if _, err := io.Copy(multiWriter, stream); err != nil {
 		return "", fmt.Errorf("failed to write object data: %w", err)
 	}
 
-	if err := tf.Sync(); err != nil {
+	if err := tempFile.Sync(); err != nil {
 		return "", fmt.Errorf("failed to fsync temp file: %w", err)
 	}
-	if err := tf.Close(); err != nil {
-		return "", fmt.Errorf("failed to close temp file: %w", err)
-	}
 
-	if err := os.Rename(tempPath, targetPath); err != nil {
+	if err := tempFile.RenameTo(targetPath); err != nil {
 		return "", fmt.Errorf("failed to rename temp file to %s: %w", targetPath, err)
 	}
-	cleanup = false
+
+	if err := tempFile.Close(); err != nil {
+		return "", fmt.Errorf("failed to close temp file: %w", err)
+	}
 
 	etag := fmt.Sprintf("%x", hasher.Sum(nil))
 	return etag, nil
