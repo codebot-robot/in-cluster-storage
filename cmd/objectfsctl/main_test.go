@@ -909,3 +909,16 @@ func TestVolumesRepairAndDegradedDisplay(t *testing.T) {
 		t.Errorf("expected no degraded volumes after repair, got: %s", afterList)
 	}
 }
+
+func TestMountConsistencyFlag(t *testing.T) {
+	cmd := newMountCommand(&options{})
+	if err := cmd.ParseFlags([]string{"--consistency=close-to-open"}); err != nil {
+		t.Fatalf("ParseFlags close-to-open: %v", err)
+	}
+	if err := newMountCommand(&options{}).ParseFlags([]string{"--consistency=standard"}); err != nil {
+		t.Fatalf("ParseFlags standard: %v", err)
+	}
+	if err := newMountCommand(&options{}).ParseFlags([]string{"--consistency=close_to_open"}); err == nil {
+		t.Fatal("expected error for typo")
+	}
+}

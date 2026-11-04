@@ -27,7 +27,9 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -167,5 +169,50 @@ func TestNodeDaemonSecurityFlags(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), nonExistentDir) {
 		t.Errorf("expected error to name nonexistent cert dir %s, got: %v", nonExistentDir, err)
+	}
+}
+
+func TestNodePublishVolume_ConsistencyModeValidation(t *testing.T) {
+	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true)
+	if err != nil {
+		t.Fatalf("newDriver: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := driver.Close(); err != nil {
+			t.Errorf("driver.Close failed: %v", err)
+		}
+	})
+
+	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+		VolumeId:      "test-vol",
+		TargetPath:    t.TempDir(),
+		VolumeContext: map[string]string{"consistency": "close_to_open"},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("got status %v, want InvalidArgument", status.Code(err))
+	}
+}
+
+func TestNodePublishVolume_ExclusiveLocalMisspellingFails(t *testing.T) {
+	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true)
+	if err != nil {
+		t.Fatalf("newDriver: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := driver.Close(); err != nil {
+			t.Errorf("driver.Close failed: %v", err)
+		}
+	})
+
+	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+		VolumeId:   "test-vol",
+		TargetPath: t.TempDir(),
+		VolumeContext: map[string]string{
+			"mode":        "exclusive-local",
+			"consistency": "close_to_open",
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("got status %v, want InvalidArgument", status.Code(err))
 	}
 }

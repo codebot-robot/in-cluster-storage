@@ -31,6 +31,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/consistency"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
@@ -308,22 +309,18 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return nil, fmt.Errorf("volumeID is required")
 	}
 
+	consistencyMode, err := consistency.ParseConsistencyMode(req.GetVolumeContext()["consistency"])
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	mode := strings.ToLower(req.GetVolumeContext()["mode"])
-	consistencyStr := strings.ToLower(req.GetVolumeContext()["consistency"])
 	if mode == "exclusive-local" {
-		if consistencyStr != "" {
-			klog.Infof("exclusive-local volume %s ignores consistency parameter %q (close-to-open satisfied by construction)", volumeID, consistencyStr)
-		}
 		cap := req.GetVolumeCapability()
 		if cap == nil || cap.GetAccessMode() == nil || cap.GetAccessMode().GetMode() != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
 			return nil, status.Errorf(codes.InvalidArgument, "exclusive-local mode requires SINGLE_NODE_SINGLE_WRITER access mode (ReadWriteOncePod)")
 		}
 		return d.publishExclusiveLocal(ctx, req, volumeID)
-	}
-
-	consistencyMode := pb.ConsistencyMode_STANDARD
-	if consistencyStr == "close-to-open" {
-		consistencyMode = pb.ConsistencyMode_CLOSE_TO_OPEN
 	}
 
 	writeModeStr := req.GetVolumeContext()["writeMode"]
