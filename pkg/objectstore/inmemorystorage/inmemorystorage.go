@@ -21,22 +21,29 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 )
 
+type memoryObject struct {
+	data    []byte
+	modTime time.Time
+}
+
 // Backend is an in-memory implementation of ObjectStorageBackend.
 type Backend struct {
 	mu      sync.RWMutex
-	objects map[string][]byte // key: volumeID + "/" + key
+	objects map[string]memoryObject // key: volumeID + "/" + key
 }
 
 // New creates a new in-memory object storage backend.
 func New() *Backend {
 	return &Backend{
-		objects: make(map[string][]byte),
+		objects: make(map[string]memoryObject),
 	}
 }
 
@@ -45,18 +52,18 @@ func NewMemoryBackend() *Backend {
 	return New()
 }
 
-func (m *Backend) storageKey(volumeID, key string) string {
+func (backend *Backend) storageKey(volumeID, key string) string {
 	if volumeID == "" || strings.HasPrefix(key, "volumes/") || strings.HasPrefix(key, "blobs/") {
 		return key
 	}
 	return fmt.Sprintf("%s/%s", volumeID, key)
 }
 
-func (m *Backend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (backend *Backend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
 
-	k := m.storageKey(volumeID, key)
+	storageKey := backend.storageKey(volumeID, key)
 	if err := stream.Rewind(); err != nil {
 		return "", err
 	}
@@ -64,23 +71,26 @@ func (m *Backend) PutObject(ctx context.Context, volumeID, key string, stream bl
 	if err != nil {
 		return "", err
 	}
-	m.objects[k] = buf
+	backend.objects[storageKey] = memoryObject{
+		data:    buf,
+		modTime: time.Now().UTC(),
+	}
 
 	h := sha256.Sum256(buf)
 	return fmt.Sprintf("%x", h), nil
 }
 
-func (m *Backend) GetObject(ctx context.Context, volumeID, key string, offset, length int64, w io.Writer) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (backend *Backend) GetObject(ctx context.Context, volumeID, key string, offset, length int64, w io.Writer) error {
+	backend.mu.RLock()
+	defer backend.mu.RUnlock()
 
-	k := m.storageKey(volumeID, key)
-	data, ok := m.objects[k]
+	storageKey := backend.storageKey(volumeID, key)
+	obj, ok := backend.objects[storageKey]
 	if !ok {
 		return fmt.Errorf("object %s not found in volume %s", key, volumeID)
 	}
 
-	total := int64(len(data))
+	total := int64(len(obj.data))
 	if offset >= total {
 		return nil
 	}
@@ -89,34 +99,41 @@ func (m *Backend) GetObject(ctx context.Context, volumeID, key string, offset, l
 		end = total
 	}
 
-	_, err := w.Write(data[offset:end])
+	_, err := w.Write(obj.data[offset:end])
 	return err
 }
 
-func (m *Backend) DeleteObject(ctx context.Context, volumeID, key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (backend *Backend) DeleteObject(ctx context.Context, volumeID, key string) error {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
 
-	k := m.storageKey(volumeID, key)
-	delete(m.objects, k)
+	storageKey := backend.storageKey(volumeID, key)
+	delete(backend.objects, storageKey)
 	return nil
 }
 
-func (m *Backend) GetRedirectURL(ctx context.Context, volumeID, key string) (string, error) {
+func (backend *Backend) GetRedirectURL(ctx context.Context, volumeID, key string) (string, error) {
 	// For memory backend or when direct redirect is not used, returns empty string.
 	return "", nil
 }
 
-func (m *Backend) ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (backend *Backend) ListObjects(ctx context.Context, volumeID, prefix string) ([]blob.ObjectEntry, error) {
+	backend.mu.RLock()
+	defer backend.mu.RUnlock()
 
-	fullPrefix := m.storageKey(volumeID, prefix)
-	var matches []string
-	for k := range m.objects {
-		if strings.HasPrefix(k, fullPrefix) {
-			matches = append(matches, k)
+	fullPrefix := backend.storageKey(volumeID, prefix)
+	var matches []blob.ObjectEntry
+	for storageKey, obj := range backend.objects {
+		if strings.HasPrefix(storageKey, fullPrefix) {
+			matches = append(matches, blob.ObjectEntry{
+				Key:          storageKey,
+				Size:         int64(len(obj.data)),
+				LastModified: obj.modTime,
+			})
 		}
 	}
+	sort.Slice(matches, func(firstIndex, secondIndex int) bool {
+		return matches[firstIndex].Key < matches[secondIndex].Key
+	})
 	return matches, nil
 }

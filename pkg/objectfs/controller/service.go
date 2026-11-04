@@ -1214,7 +1214,7 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 			return nil, status.Errorf(codes.Internal, "failed to list volumes from backend: %v", err)
 		}
 		for _, obj := range objects {
-			trimmed := strings.TrimPrefix(obj, "volumes/")
+			trimmed := strings.TrimPrefix(obj.Key, "volumes/")
 			parts := strings.Split(trimmed, "/")
 			if len(parts) > 0 && parts[0] != "" {
 				volMap[parts[0]] = struct{}{}

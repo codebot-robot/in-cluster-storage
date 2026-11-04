@@ -163,13 +163,13 @@ func RunBackendTests(t *testing.T, b objectstore.Backend) {
 
 	t.Run("ListObjectsWithPrefix", func(t *testing.T) {
 		prefix := "conformance/list/"
-		k1 := prefix + "a/1.txt"
-		k2 := prefix + "a/2.txt"
-		k3 := prefix + "b/3.txt"
+		firstKey := prefix + "a/1.txt"
+		secondKey := prefix + "a/2.txt"
+		thirdKey := prefix + "b/3.txt"
 
-		for _, k := range []string{k1, k2, k3} {
-			if _, err := b.PutObject(ctx, "", k, blob.NewByteStreamFromBytes([]byte(k))); err != nil {
-				t.Fatalf("PutObject %s failed: %v", k, err)
+		for _, itemKey := range []string{firstKey, secondKey, thirdKey} {
+			if _, err := b.PutObject(ctx, "", itemKey, blob.NewByteStreamFromBytes([]byte(itemKey))); err != nil {
+				t.Fatalf("PutObject %s failed: %v", itemKey, err)
 			}
 		}
 
@@ -178,9 +178,13 @@ func RunBackendTests(t *testing.T, b objectstore.Backend) {
 		if err != nil {
 			t.Fatalf("ListObjects %s failed: %v", prefix, err)
 		}
-		sort.Strings(listAll)
-		if len(listAll) < 3 {
-			t.Fatalf("ListObjects expected at least 3 items, got %v", listAll)
+		var allKeys []string
+		for _, entry := range listAll {
+			allKeys = append(allKeys, entry.Key)
+		}
+		sort.Strings(allKeys)
+		if len(allKeys) < 3 {
+			t.Fatalf("ListObjects expected at least 3 items, got %v", allKeys)
 		}
 
 		// List sub-prefix
@@ -188,9 +192,68 @@ func RunBackendTests(t *testing.T, b objectstore.Backend) {
 		if err != nil {
 			t.Fatalf("ListObjects subprefix failed: %v", err)
 		}
-		sort.Strings(listA)
-		if len(listA) != 2 || listA[0] != k1 || listA[1] != k2 {
-			t.Fatalf("ListObjects subprefix mismatch: got %v, want [%s, %s]", listA, k1, k2)
+		var subKeys []string
+		for _, entry := range listA {
+			subKeys = append(subKeys, entry.Key)
+		}
+		sort.Strings(subKeys)
+		if len(subKeys) != 2 || subKeys[0] != firstKey || subKeys[1] != secondKey {
+			t.Fatalf("ListObjects subprefix mismatch: got %v, want [%s, %s]", subKeys, firstKey, secondKey)
+		}
+	})
+
+	t.Run("ListObjectsMetadata", func(t *testing.T) {
+		prefix := "conformance/metadata/"
+		firstKey := prefix + "first.txt"
+		secondKey := prefix + "second.txt"
+		firstContent := []byte("first object content")
+		secondContent := []byte("second object longer content")
+
+		if _, err := b.PutObject(ctx, "", firstKey, blob.NewByteStreamFromBytes(firstContent)); err != nil {
+			t.Fatalf("PutObject %s failed: %v", firstKey, err)
+		}
+
+		if _, err := b.PutObject(ctx, "", secondKey, blob.NewByteStreamFromBytes(secondContent)); err != nil {
+			t.Fatalf("PutObject %s failed: %v", secondKey, err)
+		}
+
+		entries, err := b.ListObjects(ctx, "", prefix)
+		if err != nil {
+			t.Fatalf("ListObjects failed: %v", err)
+		}
+		if len(entries) != 2 {
+			t.Fatalf("expected 2 entries, got %d", len(entries))
+		}
+
+		sort.Slice(entries, func(firstIndex, secondIndex int) bool {
+			return entries[firstIndex].Key < entries[secondIndex].Key
+		})
+
+		firstEntry := entries[0]
+		secondEntry := entries[1]
+
+		if firstEntry.Key != firstKey {
+			t.Errorf("expected first key %s, got %s", firstKey, firstEntry.Key)
+		}
+		if firstEntry.Size != int64(len(firstContent)) {
+			t.Errorf("expected first size %d, got %d", len(firstContent), firstEntry.Size)
+		}
+		if firstEntry.LastModified.IsZero() {
+			t.Errorf("expected non-zero LastModified for first entry")
+		}
+
+		if secondEntry.Key != secondKey {
+			t.Errorf("expected second key %s, got %s", secondKey, secondEntry.Key)
+		}
+		if secondEntry.Size != int64(len(secondContent)) {
+			t.Errorf("expected second size %d, got %d", len(secondContent), secondEntry.Size)
+		}
+		if secondEntry.LastModified.IsZero() {
+			t.Errorf("expected non-zero LastModified for second entry")
+		}
+
+		if firstEntry.LastModified.After(secondEntry.LastModified) {
+			t.Errorf("expected LastModified ordered: first (%v) after second (%v)", firstEntry.LastModified, secondEntry.LastModified)
 		}
 	})
 

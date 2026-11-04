@@ -165,30 +165,34 @@ func (b *Backend) GetRedirectURL(ctx context.Context, volumeID, key string) (str
 	return "", ErrNotSupported
 }
 
-func (b *Backend) ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error) {
-	fullPrefix := b.storageKey(volumeID, prefix)
-	var matches []string
+func (backend *Backend) ListObjects(ctx context.Context, volumeID, prefix string) ([]blob.ObjectEntry, error) {
+	fullPrefix := backend.storageKey(volumeID, prefix)
+	var matches []blob.ObjectEntry
 
-	err := filepath.Walk(b.rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) {
+	err := filepath.Walk(backend.rootDir, func(path string, fileInfo os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
 				return nil
 			}
-			return err
+			return walkErr
 		}
-		if info.IsDir() {
+		if fileInfo.IsDir() {
 			return nil
 		}
-		if strings.HasPrefix(info.Name(), ".tmp-upload-") {
+		if strings.HasPrefix(fileInfo.Name(), ".tmp-upload-") {
 			return nil
 		}
-		rel, err := filepath.Rel(b.rootDir, path)
+		relativeFilePath, err := filepath.Rel(backend.rootDir, path)
 		if err != nil {
 			return err
 		}
-		relSlash := filepath.ToSlash(rel)
-		if strings.HasPrefix(relSlash, fullPrefix) {
-			matches = append(matches, relSlash)
+		relativeSlashPath := filepath.ToSlash(relativeFilePath)
+		if strings.HasPrefix(relativeSlashPath, fullPrefix) {
+			matches = append(matches, blob.ObjectEntry{
+				Key:          relativeSlashPath,
+				Size:         fileInfo.Size(),
+				LastModified: fileInfo.ModTime(),
+			})
 		}
 		return nil
 	})

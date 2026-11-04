@@ -6146,11 +6146,12 @@ func (v *Volume) listSnapshotsLocked(ctx context.Context) ([]*sdsv1.SnapshotPoin
 	if v.backend != nil && v.indexFactory != nil {
 		format := v.indexFactory.Format()
 		prefix := fmt.Sprintf("streams/%s/snapshots/%s/", v.streamID.String(), format)
-		keys, err := v.backend.ListObjects(ctx, "", prefix)
+		entries, err := v.backend.ListObjects(ctx, "", prefix)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list snapshot objects from backend: %w", err)
 		}
-		for _, key := range keys {
+		for _, entry := range entries {
+			key := entry.Key
 			if _, ok := pointersByLoc[key]; !ok {
 				var pos uint64
 				var parseErr error

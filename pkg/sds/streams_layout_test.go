@@ -51,12 +51,16 @@ func TestStreamsWalLayoutTolerance(t *testing.T) {
 	}
 
 	// 1. List objects under streams/
-	keys, err := backend.ListObjects(ctx, "", "streams/")
+	entries, err := backend.ListObjects(ctx, "", "streams/")
 	if err != nil {
 		t.Fatalf("ListObjects streams/ failed: %v", err)
 	}
-	if len(keys) != 6 {
-		t.Fatalf("expected 6 objects under streams/, got %d: %v", len(keys), keys)
+	if len(entries) != 6 {
+		t.Fatalf("expected 6 objects under streams/, got %d: %v", len(entries), entries)
+	}
+	var keys []string
+	for _, entry := range entries {
+		keys = append(keys, entry.Key)
 	}
 
 	// 2. ParseStreamPath must skip streams/wal/ entries and succeed for valid stream files

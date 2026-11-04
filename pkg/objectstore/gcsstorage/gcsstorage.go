@@ -163,22 +163,26 @@ func (b *Backend) GetRedirectURL(ctx context.Context, volumeID, key string) (str
 	return url, nil
 }
 
-func (b *Backend) ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error) {
-	fullPrefix := b.fullKey(volumeID, prefix)
+func (backend *Backend) ListObjects(ctx context.Context, volumeID, prefix string) ([]blob.ObjectEntry, error) {
+	fullPrefix := backend.fullKey(volumeID, prefix)
 	query := &storage.Query{
 		Prefix: fullPrefix,
 	}
-	it := b.client.Bucket(b.bucket).Objects(ctx, query)
-	var matches []string
+	objectIterator := backend.client.Bucket(backend.bucket).Objects(ctx, query)
+	var matches []blob.ObjectEntry
 	for {
-		attrs, err := it.Next()
+		attrs, err := objectIterator.Next()
 		if errors.Is(err, iterator.Done) {
 			break
 		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to list gcs objects with prefix %s: %w", fullPrefix, err)
 		}
-		matches = append(matches, b.relativeKey(attrs.Name))
+		matches = append(matches, blob.ObjectEntry{
+			Key:          backend.relativeKey(attrs.Name),
+			Size:         attrs.Size,
+			LastModified: attrs.Updated,
+		})
 	}
 	return matches, nil
 }

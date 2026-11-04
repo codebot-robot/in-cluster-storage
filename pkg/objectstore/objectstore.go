@@ -40,6 +40,9 @@ var (
 	ErrNotFound = errors.New("object not found")
 )
 
+// ObjectEntry represents an object entry returned by ListObjects.
+type ObjectEntry = blob.ObjectEntry
+
 // Backend defines the common interface for object storage persistence.
 type Backend interface {
 	// PutObject atomically uploads the provided byte stream to the object store at the given key
@@ -61,8 +64,8 @@ type Backend interface {
 	// or no signing credentials are configured, it returns ErrNotSupported (or empty string for memory backend).
 	GetRedirectURL(ctx context.Context, volumeID, key string) (string, error)
 
-	// ListObjects returns relative object keys matching the given prefix within the volumeID scope.
-	ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error)
+	// ListObjects returns relative object entries matching the given prefix within the volumeID scope.
+	ListObjects(ctx context.Context, volumeID, prefix string) ([]ObjectEntry, error)
 }
 
 // StorageKey resolves the full relative key within the storage root for a given volumeID and key.

@@ -83,29 +83,29 @@ func TestPeriodicPerStreamSealing(t *testing.T) {
 	}
 
 	// Check object storage: Stream A must have sealed file
-	keysA, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/", streamIDA.String()))
+	entriesA, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/", streamIDA.String()))
 	if err != nil {
 		t.Fatalf("ListObjects failed: %v", err)
 	}
-	if len(keysA) != 1 {
-		t.Fatalf("expected 1 sealed object for stream A, got %d (%v)", len(keysA), keysA)
+	if len(entriesA) != 1 {
+		t.Fatalf("expected 1 sealed object for stream A, got %d (%v)", len(entriesA), entriesA)
 	}
 
 	expectedKeyA := wal.FormatStreamObjectKey(streamIDA, 1, 10)
-	if keysA[0] != expectedKeyA {
-		t.Fatalf("unexpected object key: got %s, want %s", keysA[0], expectedKeyA)
+	if entriesA[0].Key != expectedKeyA {
+		t.Fatalf("unexpected object key: got %s, want %s", entriesA[0].Key, expectedKeyA)
 	}
 
 	// Check idle Stream B: sealing must be a no-op (no files produced)
 	if err := srv.SealStream(ctx, streamIDB); err != nil {
 		t.Fatalf("SealStream on idle stream B failed: %v", err)
 	}
-	keysB, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/", streamIDB.String()))
+	entriesB, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/", streamIDB.String()))
 	if err != nil {
 		t.Fatalf("ListObjects for stream B failed: %v", err)
 	}
-	if len(keysB) != 0 {
-		t.Fatalf("expected 0 sealed objects for idle stream B, got %d (%v)", len(keysB), keysB)
+	if len(entriesB) != 0 {
+		t.Fatalf("expected 0 sealed objects for idle stream B, got %d (%v)", len(entriesB), entriesB)
 	}
 
 	// Append next batch to Stream A (records 11..15)
@@ -125,12 +125,16 @@ func TestPeriodicPerStreamSealing(t *testing.T) {
 		t.Fatalf("SealStream 2 failed: %v", err)
 	}
 
-	keysA2, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/", streamIDA.String()))
+	entriesA2, err := backend.ListObjects(ctx, "", fmt.Sprintf("streams/%s/", streamIDA.String()))
 	if err != nil {
 		t.Fatalf("ListObjects 2 failed: %v", err)
 	}
-	if len(keysA2) != 2 {
-		t.Fatalf("expected 2 sealed objects for stream A, got %d (%v)", len(keysA2), keysA2)
+	if len(entriesA2) != 2 {
+		t.Fatalf("expected 2 sealed objects for stream A, got %d (%v)", len(entriesA2), entriesA2)
+	}
+	var keysA2 []string
+	for _, entry := range entriesA2 {
+		keysA2 = append(keysA2, entry.Key)
 	}
 	sort.Strings(keysA2)
 	expectedKeyA2 := wal.FormatStreamObjectKey(streamIDA, 11, 15)
