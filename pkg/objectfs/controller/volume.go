@@ -110,6 +110,7 @@ type Volume struct {
 	packLiveReferences map[uint64]int
 	packUploaded       map[uint64]bool
 	packKeys           map[uint64]string
+	slotSeals          int64
 
 	stagingMu       sync.Mutex
 	stagingEpoch    int64
@@ -1653,6 +1654,8 @@ type VolumeStats struct {
 	IsDegraded     bool
 	Cache          view.LRUCacheStats
 
+	StagingSlotSeals int64
+
 	Stats *pb.VolumeStats
 }
 
@@ -1674,13 +1677,19 @@ func (v *Volume) Stats() VolumeStats {
 	if st == nil {
 		st = &pb.VolumeStats{Name: VolumeStatsRowName}
 	}
+
+	v.stagingMu.Lock()
+	slotSeals := v.slotSeals
+	v.stagingMu.Unlock()
+
 	return VolumeStats{
-		Lag:            v.metadataView.Lag(v.lastCommitSeq),
-		UnappliedBytes: v.metadataView.UnappliedBytes(),
-		Failures:       v.metadataView.ApplierFailures(),
-		IsDegraded:     v.metadataView.IsDegraded(),
-		Cache:          v.metadataView.CacheStats(),
-		Stats:          st,
+		Lag:              v.metadataView.Lag(v.lastCommitSeq),
+		UnappliedBytes:   v.metadataView.UnappliedBytes(),
+		Failures:         v.metadataView.ApplierFailures(),
+		IsDegraded:       v.metadataView.IsDegraded(),
+		Cache:            v.metadataView.CacheStats(),
+		StagingSlotSeals: slotSeals,
+		Stats:            st,
 	}
 }
 
@@ -3741,16 +3750,31 @@ func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
 	entry, err := v.activePack.Append(data)
 	if err != nil {
 		if errors.Is(err, blob.ErrPackSlotsFull) {
-			return stagedChunkReference{}, fmt.Errorf("staged scratch pack slots full (limit %d appends between syncs): %w", blob.DefaultPackSlots, err)
+			return stagedChunkReference{}, fmt.Errorf("active pack %d is full despite eager sealing: %w", v.activePackID, err)
 		}
 		return stagedChunkReference{}, err
 	}
 
-	return stagedChunkReference{
+	ref := stagedChunkReference{
 		PackID: v.activePackID,
 		Entry:  entry,
 		Length: uint32(len(data)),
-	}, nil
+	}
+
+	// Seal eagerly on the write that fills the pack so the active pack is never full
+	// and the next write opens a fresh pack without retry recursion.
+	if v.activePack.Count() >= int(blob.DefaultPackSlots) {
+		sealedPackID := v.activePackID
+		entryCount := v.activePack.Count()
+		if sealErr := v.activePack.Seal(); sealErr != nil {
+			return stagedChunkReference{}, fmt.Errorf("failed sealing full pack: %w", sealErr)
+		}
+		v.slotSeals++
+		v.activePack = nil
+		klog.Infof("ObjectFS volume %s: sealed pack %d (%d entries) on slot cap", v.volumeID, sealedPackID, entryCount)
+	}
+
+	return ref, nil
 }
 
 func (v *Volume) setStagedChunkLocked(inodeID uint64, index int, reference stagedChunkReference) {
