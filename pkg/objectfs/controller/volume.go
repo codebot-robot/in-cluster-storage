@@ -47,6 +47,8 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
@@ -160,6 +162,7 @@ type Volume struct {
 
 	closed   bool
 	closedCh chan struct{}
+	deleted  bool
 
 	snapshotMu       sync.Mutex
 	batchCheckMu     sync.Mutex
@@ -1560,9 +1563,8 @@ func (v *Volume) Close() error {
 	return firstErr
 }
 
-// recordDeletionMarker records a VolumeInfo deletion marker (deleted=true) directly to a stream.
-// It is used as a fallback when a volume cannot be loaded into memory or is not currently loaded.
-func recordDeletionMarker(ctx context.Context, stream walclient.Stream, volumeID string) error {
+// recordTombstone writes a VolumeInfo marker with the given deleted state to a stream.
+func recordTombstone(ctx context.Context, stream walclient.Stream, volumeID string, deleted bool) error {
 	if stream == nil {
 		return errors.New("wal stream is required for deletion marker")
 	}
@@ -1601,7 +1603,7 @@ func recordDeletionMarker(ctx context.Context, stream walclient.Stream, volumeID
 		return fmt.Errorf("failed to register metadata types for deletion marker: %w", err)
 	}
 	tx := writer.Begin()
-	volumeInfo := &pb.VolumeInfo{VolumeId: volumeID, Deleted: true}
+	volumeInfo := &pb.VolumeInfo{VolumeId: volumeID, Deleted: deleted}
 	key, err := pkVolumeInfo.Extract(volumeInfo)
 	if err != nil {
 		return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
@@ -1624,6 +1626,12 @@ func recordDeletionMarker(ctx context.Context, stream walclient.Stream, volumeID
 		return fmt.Errorf("failed to commit deletion marker: %w", err)
 	}
 	return stream.Flush(ctx)
+}
+
+// recordDeletionMarker records a VolumeInfo deletion marker (deleted=true) directly to a stream.
+// It is used as a fallback when a volume cannot be loaded into memory or is not currently loaded.
+func recordDeletionMarker(ctx context.Context, stream walclient.Stream, volumeID string) error {
+	return recordTombstone(ctx, stream, volumeID, true)
 }
 
 // RecordDeletion appends a VolumeInfo record with deleted=true to the metadata stream
@@ -1682,6 +1690,7 @@ func (v *Volume) RecordDeletion(ctx context.Context) error {
 		v.mu.Unlock()
 		return fmt.Errorf("failed to commit deletion marker: %w", err)
 	}
+	v.deleted = true
 	waitFn := v.makeWaitFn(commitSeq, nil)
 	v.mu.Unlock()
 
@@ -1696,41 +1705,11 @@ func (v *Volume) RecordDeletion(ctx context.Context) error {
 	return nil
 }
 
-func (v *Volume) resetToCleanRootLocked(ctx context.Context) error {
-	if v.metadataView != nil {
-		errutil.CloseAndLog(v.metadataView, "metadata view")
-		v.metadataView = nil
-	}
-	if v.localStorageDir != "" {
-		if err := os.RemoveAll(v.localStorageDir); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed to remove local storage dir %s: %w", v.localStorageDir, err)
-		}
-		if err := os.MkdirAll(v.localStorageDir, 0755); err != nil {
-			return fmt.Errorf("failed to recreate local storage dir %s: %w", v.localStorageDir, err)
-		}
-	}
-	if v.indexFactory != nil {
-		newIndex, err := v.indexFactory.NewEmpty(ctx, v.streamID.String(), v.localStorageDir)
-		if err != nil {
-			return err
-		}
-		if err := v.initMetadataViewLocked(ctx, newIndex); err != nil {
-			return err
-		}
-	}
-	rootInode := &pb.Inode{Ino: proto.Uint64(1), Mode: 0755 | syscall.S_IFDIR, Mtime: timestamppb.Now(), IsDir: true, Nlink: 2, ParentIno: proto.Uint64(1), XattrCount: proto.Uint32(0)}
-	keyBytes, valueBytes, err := sds.SplitKeyAndNonKey(rootInode, []int32{1})
-	if err != nil {
-		return err
-	}
-	if v.metadataView != nil {
-		if err := v.metadataView.ApplyChangesSync(ctx, []sds.Change{{Seq: 0, TypeName: InodeTypeName, Op: sds.OpCreate, Key: sds.NewKeyFromBytes(keyBytes), RawKey: keyBytes, RawVal: valueBytes, Row: rootInode}}); err != nil {
-			return err
-		}
-	}
-	v.rootInodeID, v.nextInode = 1, erofs.DefaultInodeStride
-	v.dirParents, v.snapshotPointers, v.consistencyMode = map[uint64]uint64{1: 1}, nil, pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED
-	return nil
+// IsDeleted reports whether the volume has been marked deleted.
+func (v *Volume) IsDeleted() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.deleted
 }
 
 // logMutationLocked appends a mutation record to the WAL stream under v.mu.
@@ -2347,6 +2326,9 @@ func (v *Volume) toEntryAttrLocked(ctx context.Context, tx *sds.Tx, inodeID uint
 func (v *Volume) GetAttr(ctx context.Context, inodeID uint64) (*pb.EntryAttr, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	if v.deleted {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
+	}
 
 	inodeID = v.normalizeInodeID(inodeID)
 	return v.toEntryAttrLocked(ctx, nil, inodeID, "")
@@ -2703,6 +2685,9 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	if v.deleted {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
+	}
 
 	parentInodeID = v.normalizeInodeID(parentInodeID)
 
@@ -2743,6 +2728,9 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAttr, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	if v.deleted {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
+	}
 
 	dirInodeID = v.normalizeInodeID(dirInodeID)
 
@@ -6150,13 +6138,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			}
 			if ch.TypeName == VolumeInfoTypeName {
 				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil {
-					if vi.GetDeleted() {
-						if resetError := v.resetToCleanRootLocked(ctx); resetError != nil {
-							return resetError
-						}
-						highestReplayedIno = 1
-						continue
-					}
+					v.deleted = vi.GetDeleted()
 					if vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
 						v.consistencyMode = vi.GetConsistencyMode()
 					}
@@ -6345,8 +6327,11 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			return fmt.Errorf("failed to get VolumeInfo: %w", err)
 		}
 		if ok && msg != nil {
-			if vi, ok := msg.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-				v.consistencyMode = vi.GetConsistencyMode()
+			if vi, ok := msg.(*pb.VolumeInfo); ok && vi != nil {
+				v.deleted = vi.GetDeleted()
+				if vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+					v.consistencyMode = vi.GetConsistencyMode()
+				}
 			}
 		}
 	}
@@ -6355,6 +6340,9 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
 	}
 	v.assertStatsMatchLocked("after loadFromBackendMetadataLocked")
+	if v.deleted {
+		return status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
+	}
 	return nil
 }
 
@@ -6427,6 +6415,9 @@ func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error
 func (v *Volume) ListSnapshots(ctx context.Context) ([]*sdsv1.SnapshotPointer, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	if v.deleted {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found (deleted)", v.volumeID)
+	}
 	return v.listSnapshotsLocked(ctx)
 }
 
