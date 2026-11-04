@@ -2218,15 +2218,15 @@ func (fs *ObjectFS) syncVolumeBlocking(ctx context.Context) error {
 	}
 
 	for _, item := range allUncleaned {
+		if fs.cache != nil && resp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(item.inode, resp.GetStreamPosition())
+		}
 		for _, run := range item.runs {
 			for _, idx := range run {
 				fs.cache.MarkChunkClean(item.inode, idx, item.gens[idx])
 			}
 		}
 		fs.invalidateManifest(item.inode)
-		if fs.cache != nil && resp.GetStreamPosition() > 0 {
-			fs.cache.RecordPosition(item.inode, resp.GetStreamPosition())
-		}
 	}
 	if fs.diskCache != nil {
 		fs.cache.InvalidateAllClean()
@@ -2285,15 +2285,15 @@ func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context, trigger pb.FsyncR
 	}
 
 	for _, item := range allUncleaned {
+		if fs.cache != nil && resp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(item.inode, resp.GetStreamPosition())
+		}
 		for _, run := range item.runs {
 			for _, idx := range run {
 				fs.cache.MarkChunkClean(item.inode, idx, item.gens[idx])
 			}
 		}
 		fs.invalidateManifest(item.inode)
-		if fs.cache != nil && resp.GetStreamPosition() > 0 {
-			fs.cache.RecordPosition(item.inode, resp.GetStreamPosition())
-		}
 	}
 	if fs.diskCache != nil {
 		fs.cache.InvalidateAllClean()
@@ -2383,15 +2383,15 @@ func (fs *ObjectFS) syncClosedInodes(ctx context.Context) error {
 				if retryResp.GetError() != 0 {
 					return syscall.Errno(retryResp.GetError())
 				}
+				if fs.cache != nil && retryResp.GetStreamPosition() > 0 {
+					fs.cache.RecordPosition(item.inode, retryResp.GetStreamPosition())
+				}
 				for _, run := range newRuns {
 					for _, idx := range run {
 						fs.cache.MarkChunkClean(item.inode, idx, newGens[idx])
 					}
 				}
 				fs.invalidateManifest(item.inode)
-				if fs.cache != nil && retryResp.GetStreamPosition() > 0 {
-					fs.cache.RecordPosition(item.inode, retryResp.GetStreamPosition())
-				}
 				if fs.diskCache != nil {
 					fs.cache.InvalidateAllClean()
 				}
@@ -2401,15 +2401,15 @@ func (fs *ObjectFS) syncClosedInodes(ctx context.Context) error {
 				return syscall.Errno(resp.GetError())
 			}
 
+			if fs.cache != nil && resp.GetStreamPosition() > 0 {
+				fs.cache.RecordPosition(item.inode, resp.GetStreamPosition())
+			}
 			for _, run := range item.runs {
 				for _, idx := range run {
 					fs.cache.MarkChunkClean(item.inode, idx, item.gens[idx])
 				}
 			}
 			fs.invalidateManifest(item.inode)
-			if fs.cache != nil && resp.GetStreamPosition() > 0 {
-				fs.cache.RecordPosition(item.inode, resp.GetStreamPosition())
-			}
 			if fs.diskCache != nil {
 				fs.cache.InvalidateAllClean()
 			}
@@ -2465,15 +2465,15 @@ func (fs *ObjectFS) syncAndFsyncLocked(ctx context.Context, inode uint64, blocki
 		if retryResp.GetError() != 0 {
 			return syscall.Errno(retryResp.GetError())
 		}
+		if fs.cache != nil && retryResp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(inode, retryResp.GetStreamPosition())
+		}
 		for _, run := range newRuns {
 			for _, idx := range run {
 				fs.cache.MarkChunkClean(inode, idx, newGens[idx])
 			}
 		}
 		fs.invalidateManifest(inode)
-		if fs.cache != nil && retryResp.GetStreamPosition() > 0 {
-			fs.cache.RecordPosition(inode, retryResp.GetStreamPosition())
-		}
 		if fs.diskCache != nil {
 			fs.cache.InvalidateAllClean()
 		}
@@ -2483,15 +2483,15 @@ func (fs *ObjectFS) syncAndFsyncLocked(ctx context.Context, inode uint64, blocki
 		return syscall.Errno(resp.GetError())
 	}
 
+	if fs.cache != nil && resp.GetStreamPosition() > 0 {
+		fs.cache.RecordPosition(inode, resp.GetStreamPosition())
+	}
 	for _, run := range runs {
 		for _, idx := range run {
 			fs.cache.MarkChunkClean(inode, idx, chunkGens[idx])
 		}
 	}
 	fs.invalidateManifest(inode)
-	if fs.cache != nil && resp.GetStreamPosition() > 0 {
-		fs.cache.RecordPosition(inode, resp.GetStreamPosition())
-	}
 	if fs.diskCache != nil {
 		fs.cache.InvalidateAllClean()
 	}

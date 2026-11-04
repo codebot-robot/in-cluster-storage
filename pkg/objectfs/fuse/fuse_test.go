@@ -6164,6 +6164,9 @@ func TestTwoClientNoSelfInvalidation(t *testing.T) {
 		t.Fatalf("Client B did not receive InodeNotify for modified file")
 	}
 
+	// Give watcher A a brief settle window to process the broadcast event
+	time.Sleep(20 * time.Millisecond)
+
 	// Verify fsA saw NO InodeNotify for fileInode (self-invalidation was skipped!)
 	notifyMuA.Lock()
 	sawSelfInodeInval := false
