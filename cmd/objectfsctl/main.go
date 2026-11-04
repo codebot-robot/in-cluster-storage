@@ -532,6 +532,7 @@ func newSnapshotsCommand(opts *options) *cobra.Command {
 
 	snapshotsCmd.AddCommand(newSnapshotsListCommand(opts))
 	snapshotsCmd.AddCommand(newSnapshotCreateCommand(opts))
+	snapshotsCmd.AddCommand(newSnapshotRestoreCommand(opts))
 
 	return snapshotsCmd
 }
@@ -727,6 +728,44 @@ func newSnapshotCreateCommand(opts *options) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&createOpts.volumeID, "volume", "", "Volume ID")
 	cmd.Flags().StringVar(&createOpts.name, "name", "", "Snapshot name (optional)")
+	return cmd
+}
+
+func newSnapshotRestoreCommand(opts *options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "restore <volume> <snapshot>",
+		Aliases: []string{"rollback"},
+		Short:   "Restore a volume to a snapshot (in-place)",
+		Args:    cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.serverAddr == "" {
+				return fmt.Errorf("--server is required")
+			}
+
+			volumeID := args[0]
+			snapshotName := args[1]
+			client, connection, err := dialServer(opts)
+			if err != nil {
+				return err
+			}
+			defer errutil.CloseAndLog(connection, "server connection")
+
+			request := &pb.RestoreSnapshotRequest{
+				VolumeId:     volumeID,
+				SnapshotName: snapshotName,
+			}
+			response, err := client.RestoreSnapshot(cmd.Context(), request)
+			if err != nil {
+				return fmt.Errorf("failed to restore snapshot %s on volume %s: %w", snapshotName, volumeID, err)
+			}
+
+			out := cmd.OutOrStdout()
+			if _, err := fmt.Fprintln(out, response.GetSnapshotName()); err != nil {
+				return fmt.Errorf("failed writing to output: %w", err)
+			}
+			return nil
+		},
+	}
 	return cmd
 }
 
