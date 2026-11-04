@@ -546,7 +546,7 @@ message RestoreSnapshotRequest {
 }
 
 message RestoreSnapshotResponse {
-  string snapshot_name = 1;
+  SnapshotInfo snapshot = 1;
 }
 
 message GetVolumeStatsRequest {
