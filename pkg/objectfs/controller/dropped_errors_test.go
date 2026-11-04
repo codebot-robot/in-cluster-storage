@@ -97,16 +97,19 @@ func TestRegression_RootInodeInitFailure(t *testing.T) {
 	faultyIdx.failApply.Store(true)
 	factory := &faultyRootApplyFactory{IndexFactory: baseFactory, idx: faultyIdx}
 
-	// 1. NewVolume should fail when root inode initialization fails.
+	// 1. Root inode initialization fails during load.
 	vol, err := NewVolume("test-vol-root-fail", nil, NewEventBroadcaster(),
 		WithStream(openTestStream(t, "test-vol-root-fail")),
 		WithIndexFactory(factory),
 	)
 	if err == nil {
+		err = vol.LoadFromBackend(t.Context())
 		if vol != nil {
 			_ = vol.Close()
 		}
-		t.Fatal("expected NewVolume to fail when root inode creation fails, got nil")
+	}
+	if err == nil {
+		t.Fatal("expected root inode creation to fail, got nil")
 	}
 
 	// 2. loadFromBackendMetadataLocked should also fail when root inode initialization fails.
@@ -410,6 +413,9 @@ func TestRegression_CorruptLocalIndexRecovery(t *testing.T) {
 		t.Fatalf("expected volume to start successfully despite corrupt local index, got: %v", err)
 	}
 	defer vol.Close()
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
 
 	// Verify volume came up and is functional
 	entries, err := vol.ReadDir(ctx, 1)

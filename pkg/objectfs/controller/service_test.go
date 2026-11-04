@@ -350,6 +350,9 @@ func MustNewVolume(t testing.TB, volumeID string, backend ObjectStorageBackend, 
 	if err != nil {
 		t.Fatalf("failed to create volume %s: %v", volumeID, err)
 	}
+	if err := v.LoadFromBackend(t.Context()); err != nil {
+		t.Fatalf("failed to load volume %s from backend: %v", volumeID, err)
+	}
 	return v
 }
 

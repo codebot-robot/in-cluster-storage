@@ -489,74 +489,6 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		return nil, fmt.Errorf("failed to init metadata view: %w", err)
 	}
 
-	rootKey, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
-	if err != nil {
-		return nil, fmt.Errorf("failed to extract root inode key: %w", err)
-	}
-	msg, ok, err := v.metadataView.Get(context.Background(), "objectfs.v1alpha1.Inode", rootKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get root inode: %w", err)
-	}
-	if !ok || msg == nil {
-		rootInodeMsg := &pb.Inode{
-			Ino:        proto.Uint64(1),
-			Mode:       0755 | syscall.S_IFDIR,
-			Mtime:      timestamppb.Now(),
-			IsDir:      true,
-			Nlink:      2,
-			XattrCount: proto.Uint32(0),
-		}
-		keyBytes, valBytes, err := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
-		if err != nil {
-			return nil, fmt.Errorf("failed to split key for root inode: %w", err)
-		}
-		initChanges := []sds.Change{
-			{
-				Seq:      0,
-				TypeID:   16,
-				TypeName: "objectfs.v1alpha1.Inode",
-				Op:       sds.OpCreate,
-				Key:      sds.NewKeyFromBytes(keyBytes),
-				RawKey:   keyBytes,
-				RawVal:   valBytes,
-				Row:      rootInodeMsg,
-			},
-		}
-		if v.consistencyMode != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-			volInfoMsg := &pb.VolumeInfo{
-				VolumeId:        v.volumeID,
-				ConsistencyMode: v.consistencyMode,
-			}
-			viKeyBytes, viValBytes, viErr := sds.SplitKeyAndNonKey(volInfoMsg, []int32{1})
-			if viErr != nil {
-				return nil, fmt.Errorf("failed to split key for VolumeInfo: %w", viErr)
-			}
-			initChanges = append(initChanges, sds.Change{
-				Seq:      0,
-				TypeName: VolumeInfoTypeName,
-				Op:       sds.OpCreate,
-				Key:      sds.NewKeyFromBytes(viKeyBytes),
-				RawKey:   viKeyBytes,
-				RawVal:   viValBytes,
-				Row:      volInfoMsg,
-			})
-		}
-		if err := v.metadataView.ApplyChangesSync(context.Background(), initChanges); err != nil {
-			return nil, fmt.Errorf("failed to apply root inode change: %w", err)
-		}
-	}
-
-	if err := v.cleanOrphanInodesLocked(context.Background()); err != nil {
-		klog.Warningf("Failed to clean orphan inodes during volume init: %v", err)
-	}
-
-	v.rootInodeID = 1
-	v.nextInode = erofs.DefaultInodeStride
-	v.dirParents[1] = 1
-
-	v.initLiveStatsLocked()
-	v.assertStatsMatchLocked("after NewVolume")
-
 	return v, nil
 }
 
@@ -1087,6 +1019,60 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
 }
 
+type metadataStreamType struct {
+	message   proto.Message
+	keyFields []int32
+}
+
+var metadataStreamTypes = []metadataStreamType{
+	{message: &pb.Inode{}, keyFields: []int32{1}},
+	{message: &pb.DirEntry{}, keyFields: []int32{1, 2}},
+	{message: &pb.FileChunk{}, keyFields: []int32{1, 2}},
+	{message: &pb.Content{}, keyFields: []int32{1}},
+	{message: &pb.VolumeStats{}, keyFields: []int32{1}},
+	{message: &pb.XAttr{}, keyFields: []int32{1, 2}},
+	{message: &pb.VolumeInfo{}, keyFields: []int32{1}},
+}
+
+func registerMetadataTypes(writer *sds.Writer) error {
+	for _, entry := range metadataStreamTypes {
+		if _, err := writer.RegisterType(entry.message, entry.keyFields...); err != nil {
+			return fmt.Errorf("failed to register metadata type %s: %w", entry.message.ProtoReflect().Descriptor().FullName(), err)
+		}
+	}
+	return nil
+}
+
+type registrySyncer interface {
+	SyncRegistry(context.Context, *record.Registry) error
+}
+
+func (v *Volume) registerMetadataTypesLocked(ctx context.Context, syncer registrySyncer) error {
+	if err := registerMetadataTypes(v.metadataStream); err != nil {
+		return err
+	}
+	if syncer != nil && v.metadataStream != nil {
+		if err := syncer.SyncRegistry(ctx, v.metadataStream.Registry()); err != nil {
+			return fmt.Errorf("failed to sync registry: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *Volume) importIndexRegistryLocked(index sds.LocalIndex) error {
+	if v.metadataStream == nil {
+		return nil
+	}
+	provider, ok := index.(interface{ Registry() *record.Registry })
+	if !ok || provider == nil || provider.Registry() == nil {
+		return fmt.Errorf("restored index of type %T does not provide a type registry", index)
+	}
+	if err := v.metadataStream.Registry().Import(provider.Registry().Export()); err != nil {
+		return fmt.Errorf("failed to import restored snapshot registry: %w", err)
+	}
+	return nil
+}
+
 func (v *Volume) initMetadataStreamLocked() error {
 	var writerOpts []record.WriterOption
 	appender := sds.NewWALAppender(v.stream, walclient.Local)
@@ -1097,29 +1083,7 @@ func (v *Volume) initMetadataStreamLocked() error {
 	if local, _, _ := v.stream.Watermarks(); local > 0 {
 		writerOpts = append(writerOpts, record.WithStreamHeaderEmitted(true))
 	}
-	w := sds.NewWriter(appender, writerOpts...)
-	if _, err := w.RegisterType(&pb.Inode{}, 1); err != nil {
-		return fmt.Errorf("failed to register Inode type: %w", err)
-	}
-	if _, err := w.RegisterType(&pb.DirEntry{}, 1, 2); err != nil {
-		return fmt.Errorf("failed to register DirEntry type: %w", err)
-	}
-	if _, err := w.RegisterType(&pb.FileChunk{}, 1, 2); err != nil {
-		return fmt.Errorf("failed to register FileChunk type: %w", err)
-	}
-	if _, err := w.RegisterType(&pb.Content{}, 1); err != nil {
-		return fmt.Errorf("failed to register Content type: %w", err)
-	}
-	if _, err := w.RegisterType(&pb.VolumeStats{}, 1); err != nil {
-		return fmt.Errorf("failed to register VolumeStats type: %w", err)
-	}
-	if _, err := w.RegisterType(&pb.XAttr{}, 1, 2); err != nil {
-		return fmt.Errorf("failed to register XAttr type: %w", err)
-	}
-	if _, err := w.RegisterType(&pb.VolumeInfo{}, 1); err != nil {
-		return fmt.Errorf("failed to register VolumeInfo type: %w", err)
-	}
-	v.metadataStream = w
+	v.metadataStream = sds.NewWriter(appender, writerOpts...)
 	return nil
 }
 
@@ -1315,7 +1279,10 @@ func (v *Volume) ResetStream(stream walclient.Stream) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.stream = stream
-	return v.initMetadataStreamLocked()
+	if err := v.initMetadataStreamLocked(); err != nil {
+		return err
+	}
+	return v.registerMetadataTypesLocked(context.Background(), nil)
 }
 
 // ConsistencyMode returns the configured consistency mode for this volume.
@@ -5018,7 +4985,7 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 		if change.Seq > v.lastCommitSeq {
 			v.lastCommitSeq = change.Seq
 		}
-		if change.TypeName == "objectfs.v1alpha1.Inode" || change.TypeID == 16 {
+		if change.TypeName == InodeTypeName {
 			if inode, ok := change.Row.(*pb.Inode); ok {
 				ino := inode.GetIno()
 				if ino >= v.nextInode {
@@ -5205,13 +5172,17 @@ func (v *Volume) rebuildRestoreSnapshot(ctx context.Context, oldIdx sds.LocalInd
 			}
 		}
 	}
-	if v.metadataStream != nil {
-		if err := restoredIdx.SyncRegistry(ctx, v.metadataStream.Registry()); err != nil {
-			if closeErr := restoredIdx.Close(); closeErr != nil {
-				return nil, fmt.Errorf("failed to sync registry (%v) and close failed: %w", err, closeErr)
-			}
-			return nil, fmt.Errorf("failed to sync registry to rebuilt index: %w", err)
+	if err := v.importIndexRegistryLocked(restoredIdx); err != nil {
+		if closeErr := restoredIdx.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to import snapshot registry (%v) and close failed: %w", err, closeErr)
 		}
+		return nil, err
+	}
+	if err := v.registerMetadataTypesLocked(ctx, restoredIdx); err != nil {
+		if closeErr := restoredIdx.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to register metadata types (%v) and close failed: %w", err, closeErr)
+		}
+		return nil, err
 	}
 	return restoredIdx, nil
 }
@@ -5306,8 +5277,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 		initChanges := []sds.Change{
 			{
 				Seq:      0,
-				TypeID:   16,
-				TypeName: "objectfs.v1alpha1.Inode",
+				TypeName: InodeTypeName,
 				Op:       sds.OpCreate,
 				Key:      sds.NewKeyFromBytes(keyBytes),
 				RawKey:   keyBytes,
@@ -5441,6 +5411,13 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 			errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
 			return nil, 0, err
 		}
+	}
+
+	cr.DiscardPending()
+
+	if err := v.registerMetadataTypesLocked(ctx, rebuiltIdx); err != nil {
+		errutil.CloseAndLog(rebuiltIdx, "rebuilt index")
+		return nil, 0, fmt.Errorf("failed to register metadata types after rebuild replay: %w", err)
 	}
 
 	// 6. Ensure stats row exists or backfill stats in the rebuilt index
@@ -5588,6 +5565,10 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		}
 		restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), remoteSnapKey, v.localStorageDir)
 		if err == nil && restoredIdx != nil {
+			if err := v.importIndexRegistryLocked(restoredIdx); err != nil {
+				errutil.CloseAndLog(restoredIdx, "restored index")
+				return err
+			}
 			if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
 				return fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
 			}
@@ -5616,44 +5597,6 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				return fmt.Errorf("failed to init empty metadata view: %w", err)
 			}
 		}
-		rootKey, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
-		if err != nil {
-			return fmt.Errorf("failed to extract root inode key: %w", err)
-		}
-		msg, ok, err := v.metadataView.Get(ctx, "objectfs.v1alpha1.Inode", rootKey)
-		if err != nil {
-			return fmt.Errorf("failed to get root inode: %w", err)
-		}
-		if !ok || msg == nil {
-			rootInodeMsg := &pb.Inode{
-				Ino:   proto.Uint64(1),
-				Mode:  0755 | syscall.S_IFDIR,
-				Mtime: timestamppb.Now(),
-				IsDir: true,
-			}
-			keyBytes, valBytes, err := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
-			if err != nil {
-				return fmt.Errorf("failed to split key for root inode: %w", err)
-			}
-			initChanges := []sds.Change{
-				{
-					Seq:      0,
-					TypeID:   16,
-					TypeName: "objectfs.v1alpha1.Inode",
-					Op:       sds.OpCreate,
-					Key:      sds.NewKeyFromBytes(keyBytes),
-					RawKey:   keyBytes,
-					RawVal:   valBytes,
-					Row:      rootInodeMsg,
-				},
-			}
-			if err := v.metadataView.ApplyChangesSync(ctx, initChanges); err != nil {
-				return fmt.Errorf("failed to apply root inode change: %w", err)
-			}
-		}
-		v.rootInodeID = 1
-		v.nextInode = erofs.DefaultInodeStride
-		v.dirParents[1] = 1
 	}
 
 	if snapPos > v.lastCommitSeq {
@@ -5717,6 +5660,12 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			rec, decErr := dec.Decode(payload)
 			if decErr != nil {
 				klog.Warningf("volume %s: failed to decode authoritative record at seq %d: %v", v.volumeID, seq, decErr)
+			} else if rec.TypeID == record.TypeIDTypeDefinition {
+				if v.metadataView != nil && v.metadataStream != nil {
+					if err := v.metadataView.SyncRegistry(ctx, v.metadataStream.Registry()); err != nil {
+						return fmt.Errorf("failed to sync registry with metadata view during replay: %w", err)
+					}
+				}
 			} else if rec.TypeID == record.TypeIDSnapshotPointer {
 				if ptr, ok := rec.Message.(*sdsv1.SnapshotPointer); ok && ptr != nil {
 					if ptr.GetRestoredFrom() != "" {
@@ -5762,6 +5711,12 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		r, decErr := dec.Decode(rec.Payload)
 		if decErr != nil {
 			klog.Warningf("volume %s: failed to decode local recovered record at seq %d: %v", v.volumeID, rec.StreamSeq, decErr)
+		} else if r.TypeID == record.TypeIDTypeDefinition {
+			if v.metadataView != nil && v.metadataStream != nil {
+				if err := v.metadataView.SyncRegistry(ctx, v.metadataStream.Registry()); err != nil {
+					return fmt.Errorf("failed to sync registry with metadata view during replay: %w", err)
+				}
+			}
 		} else if r.TypeID == record.TypeIDSnapshotPointer {
 			if ptr, ok := r.Message.(*sdsv1.SnapshotPointer); ok && ptr != nil {
 				if ptr.GetRestoredFrom() != "" {
@@ -5784,6 +5739,61 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	}
 
 	cr.DiscardPending()
+
+	if err := v.registerMetadataTypesLocked(ctx, v.metadataView); err != nil {
+		return fmt.Errorf("failed to register metadata types after replay: %w", err)
+	}
+	if v.metadataView != nil {
+		if err := v.metadataView.LoadStats(ctx); err != nil {
+			return fmt.Errorf("failed to load metadata view stats after replay: %w", err)
+		}
+	}
+
+	if !initialized {
+		rootKey, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1)})
+		if err != nil {
+			return fmt.Errorf("failed to extract root inode key: %w", err)
+		}
+		msg, ok, err := v.metadataView.Get(ctx, InodeTypeName, rootKey)
+		if err != nil {
+			return fmt.Errorf("failed to get root inode: %w", err)
+		}
+		if !ok || msg == nil {
+			rootInodeMsg := &pb.Inode{
+				Ino:        proto.Uint64(1),
+				Mode:       0755 | syscall.S_IFDIR,
+				Mtime:      timestamppb.Now(),
+				IsDir:      true,
+				Nlink:      2,
+				XattrCount: proto.Uint32(0),
+			}
+			keyBytes, valBytes, err := sds.SplitKeyAndNonKey(rootInodeMsg, []int32{1})
+			if err != nil {
+				return fmt.Errorf("failed to split key for root inode: %w", err)
+			}
+			initChanges := []sds.Change{
+				{
+					Seq:      0,
+					TypeName: InodeTypeName,
+					Op:       sds.OpCreate,
+					Key:      sds.NewKeyFromBytes(keyBytes),
+					RawKey:   keyBytes,
+					RawVal:   valBytes,
+					Row:      rootInodeMsg,
+				},
+			}
+			if err := v.metadataView.ApplyChangesSync(ctx, initChanges); err != nil {
+				return fmt.Errorf("failed to apply root inode change: %w", err)
+			}
+		}
+		v.rootInodeID = 1
+		v.nextInode = erofs.DefaultInodeStride
+		v.dirParents[1] = 1
+	}
+
+	if err := v.cleanOrphanInodesLocked(ctx); err != nil {
+		klog.Warningf("Failed to clean orphan inodes during volume load: %v", err)
+	}
 
 	if v.metadataView != nil {
 		v.metadataView.ClearCache()
