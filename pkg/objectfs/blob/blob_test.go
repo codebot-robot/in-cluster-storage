@@ -35,29 +35,34 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 )
 
+type testMemoryObject struct {
+	data    []byte
+	modTime time.Time
+}
+
 type testMemoryBackend struct {
 	mu      sync.RWMutex
-	objects map[string][]byte
+	objects map[string]testMemoryObject
 }
 
 func newTestMemoryBackend() *testMemoryBackend {
 	return &testMemoryBackend{
-		objects: make(map[string][]byte),
+		objects: make(map[string]testMemoryObject),
 	}
 }
 
-func (m *testMemoryBackend) storageKey(volumeID, key string) string {
+func (backend *testMemoryBackend) storageKey(volumeID, key string) string {
 	if volumeID == "" || strings.HasPrefix(key, "volumes/") || strings.HasPrefix(key, "blobs/") {
 		return key
 	}
 	return fmt.Sprintf("%s/%s", volumeID, key)
 }
 
-func (m *testMemoryBackend) PutObject(ctx context.Context, volumeID, key string, stream ByteStream) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (backend *testMemoryBackend) PutObject(ctx context.Context, volumeID, key string, stream ByteStream) (string, error) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
 
-	k := m.storageKey(volumeID, key)
+	storageKey := backend.storageKey(volumeID, key)
 	if err := stream.Rewind(); err != nil {
 		return "", err
 	}
@@ -65,23 +70,26 @@ func (m *testMemoryBackend) PutObject(ctx context.Context, volumeID, key string,
 	if err != nil {
 		return "", err
 	}
-	m.objects[k] = buf
+	backend.objects[storageKey] = testMemoryObject{
+		data:    buf,
+		modTime: time.Now().UTC(),
+	}
 
 	h := sha256.Sum256(buf)
 	return fmt.Sprintf("%x", h), nil
 }
 
-func (m *testMemoryBackend) GetObject(ctx context.Context, volumeID, key string, offset, length int64, w io.Writer) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (backend *testMemoryBackend) GetObject(ctx context.Context, volumeID, key string, offset, length int64, w io.Writer) error {
+	backend.mu.RLock()
+	defer backend.mu.RUnlock()
 
-	k := m.storageKey(volumeID, key)
-	data, ok := m.objects[k]
+	storageKey := backend.storageKey(volumeID, key)
+	obj, ok := backend.objects[storageKey]
 	if !ok {
 		return fmt.Errorf("object %s not found in volume %s", key, volumeID)
 	}
 
-	total := int64(len(data))
+	total := int64(len(obj.data))
 	if offset >= total {
 		return nil
 	}
@@ -90,35 +98,100 @@ func (m *testMemoryBackend) GetObject(ctx context.Context, volumeID, key string,
 		end = total
 	}
 
-	_, err := w.Write(data[offset:end])
+	_, err := w.Write(obj.data[offset:end])
 	return err
 }
 
-func (m *testMemoryBackend) DeleteObject(ctx context.Context, volumeID, key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (backend *testMemoryBackend) DeleteObject(ctx context.Context, volumeID, key string) error {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
 
-	k := m.storageKey(volumeID, key)
-	delete(m.objects, k)
+	storageKey := backend.storageKey(volumeID, key)
+	delete(backend.objects, storageKey)
 	return nil
 }
 
-func (m *testMemoryBackend) GetRedirectURL(ctx context.Context, volumeID, key string) (string, error) {
+func (backend *testMemoryBackend) GetRedirectURL(ctx context.Context, volumeID, key string) (string, error) {
 	return "", nil
 }
 
-func (m *testMemoryBackend) ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (backend *testMemoryBackend) ListObjects(ctx context.Context, volumeID, prefix string) ([]ObjectEntry, error) {
+	backend.mu.RLock()
+	defer backend.mu.RUnlock()
 
-	fullPrefix := m.storageKey(volumeID, prefix)
-	var matches []string
-	for k := range m.objects {
-		if strings.HasPrefix(k, fullPrefix) {
-			matches = append(matches, k)
+	fullPrefix := backend.storageKey(volumeID, prefix)
+	var matches []ObjectEntry
+	for storageKey, obj := range backend.objects {
+		if strings.HasPrefix(storageKey, fullPrefix) {
+			matches = append(matches, ObjectEntry{
+				Key:          storageKey,
+				Size:         int64(len(obj.data)),
+				LastModified: obj.modTime,
+			})
 		}
 	}
+	sort.Slice(matches, func(firstIndex, secondIndex int) bool {
+		return matches[firstIndex].Key < matches[secondIndex].Key
+	})
 	return matches, nil
+}
+
+func TestTestMemoryBackendListObjectsMetadata(t *testing.T) {
+	ctx := t.Context()
+	backend := newTestMemoryBackend()
+
+	prefix := "test-blobs/"
+	firstKey := prefix + "first.dat"
+	secondKey := prefix + "second.dat"
+	firstContent := []byte("first memory object")
+	secondContent := []byte("second memory object longer content")
+
+	if _, err := backend.PutObject(ctx, "", firstKey, NewByteStreamFromBytes(firstContent)); err != nil {
+		t.Fatalf("PutObject %s failed: %v", firstKey, err)
+	}
+
+	if _, err := backend.PutObject(ctx, "", secondKey, NewByteStreamFromBytes(secondContent)); err != nil {
+		t.Fatalf("PutObject %s failed: %v", secondKey, err)
+	}
+
+	entries, err := backend.ListObjects(ctx, "", prefix)
+	if err != nil {
+		t.Fatalf("ListObjects failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+
+	sort.Slice(entries, func(firstIndex, secondIndex int) bool {
+		return entries[firstIndex].Key < entries[secondIndex].Key
+	})
+
+	firstEntry := entries[0]
+	secondEntry := entries[1]
+
+	if firstEntry.Key != firstKey {
+		t.Errorf("expected first key %s, got %s", firstKey, firstEntry.Key)
+	}
+	if firstEntry.Size != int64(len(firstContent)) {
+		t.Errorf("expected first size %d, got %d", len(firstContent), firstEntry.Size)
+	}
+	if firstEntry.LastModified.IsZero() {
+		t.Errorf("expected non-zero LastModified for first entry")
+	}
+
+	if secondEntry.Key != secondKey {
+		t.Errorf("expected second key %s, got %s", secondKey, secondEntry.Key)
+	}
+	if secondEntry.Size != int64(len(secondContent)) {
+		t.Errorf("expected second size %d, got %d", len(secondContent), secondEntry.Size)
+	}
+	if secondEntry.LastModified.IsZero() {
+		t.Errorf("expected non-zero LastModified for second entry")
+	}
+
+	if firstEntry.LastModified.After(secondEntry.LastModified) {
+		t.Errorf("expected LastModified ordered: first (%v) after second (%v)", firstEntry.LastModified, secondEntry.LastModified)
+	}
 }
 
 func TestSingleBlobEncodeDecode(t *testing.T) {

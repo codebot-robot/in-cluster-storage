@@ -81,7 +81,7 @@ func FindLatestSnapshot(ctx context.Context, backend objectstore.Backend, stream
 	}
 
 	prefix := fmt.Sprintf("streams/%s/snapshots/memory/", streamID)
-	keys, err := backend.ListObjects(ctx, "", prefix)
+	entries, err := backend.ListObjects(ctx, "", prefix)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to list memory snapshots for stream %s: %w", streamID, err)
 	}
@@ -92,13 +92,13 @@ func FindLatestSnapshot(ctx context.Context, backend objectstore.Backend, stream
 	}
 	var matches []match
 
-	for _, k := range keys {
-		sID, pos, parseErr := ParseSnapshotKey(k)
+	for _, entry := range entries {
+		sID, pos, parseErr := ParseSnapshotKey(entry.Key)
 		if parseErr != nil || sID != streamID {
 			continue
 		}
 		if maxPosition == 0 || pos <= maxPosition {
-			matches = append(matches, match{key: k, pos: pos})
+			matches = append(matches, match{key: entry.Key, pos: pos})
 		}
 	}
 

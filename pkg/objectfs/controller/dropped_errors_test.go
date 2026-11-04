@@ -223,11 +223,11 @@ type faultyListBackend struct {
 	failList atomic.Bool
 }
 
-func (b *faultyListBackend) ListObjects(ctx context.Context, bucket, prefix string) ([]string, error) {
-	if b.failList.Load() {
+func (backend *faultyListBackend) ListObjects(ctx context.Context, bucket, prefix string) ([]objectstore.ObjectEntry, error) {
+	if backend.failList.Load() {
 		return nil, errors.New("injected backend list failure")
 	}
-	return b.Backend.ListObjects(ctx, bucket, prefix)
+	return backend.Backend.ListObjects(ctx, bucket, prefix)
 }
 
 func TestRegression_ListVolumesBackendFailure(t *testing.T) {

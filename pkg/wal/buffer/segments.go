@@ -38,7 +38,7 @@ const (
 // sorted in ascending order by start position. It returns the list of segment object keys
 // and the highest last_position across all discovered segments (0 if no segments exist).
 func ListSegmentsFromBackend(ctx context.Context, backend objectstore.Backend) ([]string, uint64, error) {
-	keys, err := backend.ListObjects(ctx, "", SegmentsPrefix)
+	entries, err := backend.ListObjects(ctx, "", SegmentsPrefix)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to list segments under %s: %w", SegmentsPrefix, err)
 	}
@@ -52,16 +52,16 @@ func ListSegmentsFromBackend(ctx context.Context, backend objectstore.Backend) (
 	var validEntries []segEntry
 	var maxLastPos uint64
 
-	for _, k := range keys {
-		if !strings.HasPrefix(k, SegmentsPrefix) || !strings.HasSuffix(k, ".wal") {
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Key, SegmentsPrefix) || !strings.HasSuffix(entry.Key, ".wal") {
 			continue
 		}
-		firstPos, lastPos, err := wal.ParseSegmentPath(k)
+		firstPos, lastPos, err := wal.ParseSegmentPath(entry.Key)
 		if err != nil {
 			continue
 		}
 		validEntries = append(validEntries, segEntry{
-			key:      k,
+			key:      entry.Key,
 			firstPos: firstPos,
 			lastPos:  lastPos,
 		})

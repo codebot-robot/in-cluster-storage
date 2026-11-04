@@ -34,13 +34,20 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// ObjectEntry represents an object entry returned by ListObjects.
+type ObjectEntry struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+}
+
 // ObjectStorageBackend is the interface required for blob persistence.
 type ObjectStorageBackend interface {
 	PutObject(ctx context.Context, volumeID, key string, stream ByteStream) (etag string, err error)
 	GetObject(ctx context.Context, volumeID, key string, offset, length int64, w io.Writer) error
 	DeleteObject(ctx context.Context, volumeID, key string) error
 	GetRedirectURL(ctx context.Context, volumeID, key string) (string, error)
-	ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error)
+	ListObjects(ctx context.Context, volumeID, prefix string) ([]ObjectEntry, error)
 }
 
 // BlobLocation describes where a blob can be fetched from.
@@ -215,7 +222,8 @@ func (s *Store) RefreshIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to list blobs: %w", err)
 	}
 
-	for _, obj := range objects {
+	for _, objectEntry := range objects {
+		obj := objectEntry.Key
 		if strings.HasSuffix(obj, ".pack") {
 			s.mu.RLock()
 			_, exists := s.packIndexes[obj]

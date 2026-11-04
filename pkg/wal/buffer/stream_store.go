@@ -269,13 +269,13 @@ func (w *streamWriter) discoverRemoteSealedLocked(ctx context.Context, backend o
 	}
 	if backend != nil {
 		prefix := fmt.Sprintf("streams/%s/", w.streamID.String())
-		keys, err := backend.ListObjects(ctx, "", prefix)
+		entries, err := backend.ListObjects(ctx, "", prefix)
 		if err != nil {
 			klog.Warningf("Failed to list remote sealed objects for stream %s: %v", w.streamID, err)
 			return
 		}
-		for _, k := range keys {
-			from, to, sealed, err := wal.ParseStreamPath(k)
+		for _, entry := range entries {
+			from, to, sealed, err := wal.ParseStreamPath(entry.Key)
 			if err != nil || !sealed {
 				continue
 			}
@@ -289,14 +289,14 @@ func (w *streamWriter) discoverRemoteSealedLocked(ctx context.Context, backend o
 			for _, sm := range w.sealed {
 				if sm.FromSeq == from && sm.ToSeq == to {
 					if sm.Key == "" {
-						sm.Key = k
+						sm.Key = entry.Key
 					}
 					found = true
 					break
 				}
 			}
 			if !found {
-				w.sealed = append(w.sealed, &StreamMeta{FromSeq: from, ToSeq: to, Key: k})
+				w.sealed = append(w.sealed, &StreamMeta{FromSeq: from, ToSeq: to, Key: entry.Key})
 			}
 		}
 	}

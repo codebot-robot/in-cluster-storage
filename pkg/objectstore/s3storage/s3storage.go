@@ -227,22 +227,34 @@ func (b *Backend) GetRedirectURL(ctx context.Context, volumeID, key string) (str
 	return req.URL, nil
 }
 
-func (b *Backend) ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error) {
-	fullPrefix := b.fullKey(volumeID, prefix)
-	paginator := s3.NewListObjectsV2Paginator(b.client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(b.bucket),
+func (backend *Backend) ListObjects(ctx context.Context, volumeID, prefix string) ([]blob.ObjectEntry, error) {
+	fullPrefix := backend.fullKey(volumeID, prefix)
+	paginator := s3.NewListObjectsV2Paginator(backend.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(backend.bucket),
 		Prefix: aws.String(fullPrefix),
 	})
 
-	var matches []string
+	var matches []blob.ObjectEntry
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list s3 objects with prefix %s: %w", fullPrefix, err)
 		}
-		for _, obj := range page.Contents {
-			if obj.Key != nil {
-				matches = append(matches, b.relativeKey(*obj.Key))
+		for _, objectItem := range page.Contents {
+			if objectItem.Key != nil {
+				var objectSize int64
+				if objectItem.Size != nil {
+					objectSize = *objectItem.Size
+				}
+				var lastModified time.Time
+				if objectItem.LastModified != nil {
+					lastModified = *objectItem.LastModified
+				}
+				matches = append(matches, blob.ObjectEntry{
+					Key:          backend.relativeKey(*objectItem.Key),
+					Size:         objectSize,
+					LastModified: lastModified,
+				})
 			}
 		}
 	}
