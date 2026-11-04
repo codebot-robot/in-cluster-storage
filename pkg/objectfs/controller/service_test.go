@@ -7788,8 +7788,23 @@ func TestVolume_DeletionMarker_Lifecycle(t *testing.T) {
 	if _, err := volume1.CreateFile(ctx, 1, "old.txt", 0644, []byte("content"), 0, 0, 0); err != nil || volume1.PersistConsistencyMode(ctx, pb.ConsistencyMode_CLOSE_TO_OPEN) != nil {
 		t.Fatalf("setup volume1 failed: %v", err)
 	}
-	if _, err := volume1.metadataStream.AppendSnapshotPointer(ctx, &sdsv1.SnapshotPointer{Location: "dummy", Name: "snap1"}); err != nil || volume1.stream.Flush(ctx) != nil || volume1.RecordDeletion(ctx) != nil || volume1.RecordDeletion(ctx) != nil || volume1.Close() != nil {
-		t.Fatalf("snapshot/flush/delete/close volume1 failed")
+	if _, err := volume1.metadataStream.AppendSnapshotPointer(ctx, &sdsv1.SnapshotPointer{Location: "dummy", Name: "snap1"}); err != nil {
+		t.Fatalf("AppendSnapshotPointer failed: %v", err)
+	}
+	// VolumeInfo exists before delete: RecordDeletion updates existing row
+	if err := volume1.RecordDeletion(ctx); err != nil {
+		t.Fatalf("RecordDeletion failed: %v", err)
+	}
+	volumeInfoKey, err := pkVolumeInfo.Extract(&pb.VolumeInfo{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("Extract VolumeInfo key failed: %v", err)
+	}
+	msg, ok, err := volume1.metadataView.Get(ctx, VolumeInfoTypeName, volumeInfoKey)
+	if err != nil || !ok || msg == nil || !msg.(*pb.VolumeInfo).GetDeleted() {
+		t.Fatalf("expected updated VolumeInfo with deleted=true: ok=%v, msg=%v, err=%v", ok, msg, err)
+	}
+	if err := volume1.RecordDeletion(ctx); err != nil || volume1.Close() != nil {
+		t.Fatalf("repeated RecordDeletion/close failed")
 	}
 
 	volume2 := openVolume()
@@ -7842,7 +7857,7 @@ func TestVolume_DeletionMarker_ThreeControllers(t *testing.T) {
 	walDirectory2 := t.TempDir()
 	server2 := newServer(walDirectory2)
 	stream2, err := server2.openStreamForVolume(volumeID, walDirectory2)
-	if err != nil || RecordDeletionMarker(ctx, stream2, volumeID) != nil || stream2.Close() != nil {
+	if err != nil || recordDeletionMarker(ctx, stream2, volumeID) != nil || stream2.Close() != nil {
 		t.Fatalf("record deletion marker on server2 failed: %v", err)
 	}
 	assertEmptyDirectory(server2)
