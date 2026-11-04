@@ -42,6 +42,10 @@ type LocalIndex interface {
 	// SetPosition updates the stream sequence position of the local index.
 	SetPosition(pos uint64) error
 
+	// Registry returns the in-band type registry for the local index.
+	// For an open index, this must never be nil.
+	Registry() *record.Registry
+
 	// SyncRegistry registers type definitions in force with the local index.
 	SyncRegistry(ctx context.Context, reg *record.Registry) error
 
