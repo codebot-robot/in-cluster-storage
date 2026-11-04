@@ -171,6 +171,9 @@ type Server struct {
 	exclusiveHoldsMu  sync.RWMutex
 	exclusiveHolds    map[string]*ExclusiveHold
 	exclusiveLeaseTTL time.Duration
+
+	restoringMu sync.Mutex
+	restoring   map[string]bool
 }
 
 // ExclusiveHold tracks an active exclusive-local hold on a volume.
@@ -407,6 +410,7 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		exclusiveLeaseTTL: 30 * time.Second,
 		syncTimeout:       10 * time.Minute,
 		defaultDurability: walclient.Local,
+		restoring:         make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -659,15 +663,48 @@ func (s *Server) GetVolume(volumeID string) (*Volume, error) {
 	return s.getOrCreateVolume(volumeID)
 }
 
-// RestoreSnapshot restores the volume filesystem state to a specific snapshot.
+// RestoreSnapshot restores the volume filesystem state to a specific snapshot in-place.
 // The restore operation is logged to the stream and published as a fresh snapshot,
 // making it durable across controller restarts and rebuilds.
-func (s *Server) RestoreSnapshot(ctx context.Context, volumeID, snapshotName string) error {
+func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.RestoreSnapshotResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	if req.GetSnapshotName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot_name is required")
+	}
+
+	volumeID := req.GetVolumeId()
+	s.restoringMu.Lock()
+	if s.restoring[volumeID] {
+		s.restoringMu.Unlock()
+		return nil, status.Errorf(codes.FailedPrecondition, "restore is already running on volume %s", volumeID)
+	}
+	s.restoring[volumeID] = true
+	s.restoringMu.Unlock()
+
+	defer func() {
+		s.restoringMu.Lock()
+		delete(s.restoring, volumeID)
+		s.restoringMu.Unlock()
+	}()
+
 	vol, err := s.getOrCreateVolume(volumeID)
 	if err != nil {
-		return err
+		return nil, volInitError(err)
 	}
-	return vol.RestoreSnapshot(ctx, snapshotName)
+
+	publishedSnapshotName, err := vol.RestoreSnapshot(ctx, req.GetSnapshotName())
+	if err != nil {
+		if errors.Is(err, ErrSnapshotNotFound) {
+			return nil, status.Errorf(codes.NotFound, "snapshot %q not found", req.GetSnapshotName())
+		}
+		return nil, status.Errorf(codes.Internal, "failed to restore snapshot: %v", err)
+	}
+
+	return &pb.RestoreSnapshotResponse{
+		SnapshotName: publishedSnapshotName,
+	}, nil
 }
 
 func (s *Server) GetAttr(ctx context.Context, req *pb.GetAttrRequest) (*pb.GetAttrResponse, error) {

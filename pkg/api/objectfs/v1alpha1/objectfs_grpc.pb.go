@@ -63,6 +63,7 @@ const (
 	ObjectFSController_ListVolumes_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/ListVolumes"
 	ObjectFSController_ListSnapshots_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/ListSnapshots"
 	ObjectFSController_CreateSnapshot_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/CreateSnapshot"
+	ObjectFSController_RestoreSnapshot_FullMethodName  = "/objectfs.v1alpha1.ObjectFSController/RestoreSnapshot"
 	ObjectFSController_GetVolumeStats_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/GetVolumeStats"
 	ObjectFSController_Checkpoint_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/Checkpoint"
 	ObjectFSController_AckCheckpoint_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/AckCheckpoint"
@@ -108,6 +109,8 @@ type ObjectFSControllerClient interface {
 	ListVolumes(ctx context.Context, in *ListVolumesRequest, opts ...grpc.CallOption) (*ListVolumesResponse, error)
 	ListSnapshots(ctx context.Context, in *ListSnapshotsRequest, opts ...grpc.CallOption) (*ListSnapshotsResponse, error)
 	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
+	// RestoreSnapshot restores the volume filesystem state to a specific snapshot in-place.
+	RestoreSnapshot(ctx context.Context, in *RestoreSnapshotRequest, opts ...grpc.CallOption) (*RestoreSnapshotResponse, error)
 	GetVolumeStats(ctx context.Context, in *GetVolumeStatsRequest, opts ...grpc.CallOption) (*GetVolumeStatsResponse, error)
 	// Checkpoint requests an immediate checkpoint commit on an exclusive-local volume and waits
 	// for the mounting node daemon to acknowledge it. Only exclusive-local mounts act on the event;
@@ -457,6 +460,16 @@ func (c *objectFSControllerClient) CreateSnapshot(ctx context.Context, in *Creat
 	return out, nil
 }
 
+func (c *objectFSControllerClient) RestoreSnapshot(ctx context.Context, in *RestoreSnapshotRequest, opts ...grpc.CallOption) (*RestoreSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RestoreSnapshotResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_RestoreSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *objectFSControllerClient) GetVolumeStats(ctx context.Context, in *GetVolumeStatsRequest, opts ...grpc.CallOption) (*GetVolumeStatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetVolumeStatsResponse)
@@ -581,6 +594,8 @@ type ObjectFSControllerServer interface {
 	ListVolumes(context.Context, *ListVolumesRequest) (*ListVolumesResponse, error)
 	ListSnapshots(context.Context, *ListSnapshotsRequest) (*ListSnapshotsResponse, error)
 	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
+	// RestoreSnapshot restores the volume filesystem state to a specific snapshot in-place.
+	RestoreSnapshot(context.Context, *RestoreSnapshotRequest) (*RestoreSnapshotResponse, error)
 	GetVolumeStats(context.Context, *GetVolumeStatsRequest) (*GetVolumeStatsResponse, error)
 	// Checkpoint requests an immediate checkpoint commit on an exclusive-local volume and waits
 	// for the mounting node daemon to acknowledge it. Only exclusive-local mounts act on the event;
@@ -701,6 +716,9 @@ func (UnimplementedObjectFSControllerServer) ListSnapshots(context.Context, *Lis
 }
 func (UnimplementedObjectFSControllerServer) CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSnapshot not implemented")
+}
+func (UnimplementedObjectFSControllerServer) RestoreSnapshot(context.Context, *RestoreSnapshotRequest) (*RestoreSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestoreSnapshot not implemented")
 }
 func (UnimplementedObjectFSControllerServer) GetVolumeStats(context.Context, *GetVolumeStatsRequest) (*GetVolumeStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetVolumeStats not implemented")
@@ -1276,6 +1294,24 @@ func _ObjectFSController_CreateSnapshot_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ObjectFSController_RestoreSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).RestoreSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_RestoreSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).RestoreSnapshot(ctx, req.(*RestoreSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ObjectFSController_GetVolumeStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetVolumeStatsRequest)
 	if err := dec(in); err != nil {
@@ -1556,6 +1592,10 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreateSnapshot",
 			Handler:    _ObjectFSController_CreateSnapshot_Handler,
+		},
+		{
+			MethodName: "RestoreSnapshot",
+			Handler:    _ObjectFSController_RestoreSnapshot_Handler,
 		},
 		{
 			MethodName: "GetVolumeStats",

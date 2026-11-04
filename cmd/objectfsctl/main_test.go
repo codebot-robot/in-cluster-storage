@@ -42,9 +42,12 @@ import (
 
 type fakeObjectFSControllerServer struct {
 	*controller.Server
-	mu                sync.Mutex
-	lastDeleteRequest *pb.DeleteVolumeRequest
-	deleteError       error
+	mu                 sync.Mutex
+	lastDeleteRequest  *pb.DeleteVolumeRequest
+	deleteError        error
+	lastRestoreRequest *pb.RestoreSnapshotRequest
+	restoreResponse    *pb.RestoreSnapshotResponse
+	restoreError       error
 }
 
 func (s *fakeObjectFSControllerServer) DeleteVolume(ctx context.Context, request *pb.DeleteVolumeRequest) (*pb.DeleteVolumeResponse, error) {
@@ -55,6 +58,37 @@ func (s *fakeObjectFSControllerServer) DeleteVolume(ctx context.Context, request
 		return nil, s.deleteError
 	}
 	return &pb.DeleteVolumeResponse{}, nil
+}
+
+func (s *fakeObjectFSControllerServer) RestoreSnapshot(ctx context.Context, request *pb.RestoreSnapshotRequest) (*pb.RestoreSnapshotResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastRestoreRequest = request
+	if s.restoreError != nil {
+		return nil, s.restoreError
+	}
+	if s.restoreResponse != nil {
+		return s.restoreResponse, nil
+	}
+	return s.Server.RestoreSnapshot(ctx, request)
+}
+
+func (s *fakeObjectFSControllerServer) setRestoreError(restoreError error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.restoreError = restoreError
+}
+
+func (s *fakeObjectFSControllerServer) setRestoreResponse(restoreResponse *pb.RestoreSnapshotResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.restoreResponse = restoreResponse
+}
+
+func (s *fakeObjectFSControllerServer) getLastRestoreRequest() *pb.RestoreSnapshotRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastRestoreRequest
 }
 
 func (s *fakeObjectFSControllerServer) setDeleteError(deleteError error) {
@@ -1005,5 +1039,51 @@ func TestVolumesDeleteCommand(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "volume is published") || !strings.Contains(err.Error(), volumeID) {
 		t.Fatalf("expected error containing status error and volume ID, got: %v", err)
+	}
+}
+
+func TestSnapshotsRestoreCommand(t *testing.T) {
+	server, serverAddr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// 1. Missing --server flag
+	if _, err := executeCommand("snapshots", "restore", "test-vol", "snap-1"); err == nil || !strings.Contains(err.Error(), "--server is required") {
+		t.Fatalf("expected --server is required error, got: %v", err)
+	}
+
+	// 2. Missing args
+	if _, err := executeCommand("--server", serverAddr, "snapshots", "restore"); err == nil {
+		t.Fatalf("expected error when both arguments are missing")
+	}
+	if _, err := executeCommand("--server", serverAddr, "snapshots", "restore", "test-vol"); err == nil {
+		t.Fatalf("expected error when snapshot argument is missing")
+	}
+
+	// 3. Restore snapshot successfully, printing the new snapshot name
+	volumeID := "cli-restore-vol"
+	targetSnapshot := "snapshot-20261104-001.sqlite"
+	expectedPublishedSnapshot := "snapshot-20261104-002.sqlite"
+	server.setRestoreResponse(&pb.RestoreSnapshotResponse{
+		SnapshotName: expectedPublishedSnapshot,
+	})
+
+	restoreOutput, err := executeCommand("--server", serverAddr, "snapshots", "restore", volumeID, targetSnapshot)
+	if err != nil {
+		t.Fatalf("snapshots restore failed: %v", err)
+	}
+	if strings.TrimSpace(restoreOutput) != expectedPublishedSnapshot {
+		t.Fatalf("expected output %q, got: %q", expectedPublishedSnapshot, restoreOutput)
+	}
+	request := server.getLastRestoreRequest()
+	if request == nil || request.GetVolumeId() != volumeID || request.GetSnapshotName() != targetSnapshot {
+		t.Fatalf("expected RestoreSnapshot request for volume %q and snapshot %q, got: %+v", volumeID, targetSnapshot, request)
+	}
+
+	// 4. Error returned by controller includes error message
+	server.setRestoreError(status.Error(codes.FailedPrecondition, "restore is already running on volume cli-restore-vol"))
+	if _, err := executeCommand("--server", serverAddr, "snapshots", "restore", volumeID, targetSnapshot); err == nil {
+		t.Fatalf("expected error from RestoreSnapshot RPC")
+	} else if !strings.Contains(err.Error(), "restore is already running on volume cli-restore-vol") {
+		t.Fatalf("expected error containing status error, got: %v", err)
 	}
 }

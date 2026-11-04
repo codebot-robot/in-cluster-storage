@@ -1327,8 +1327,15 @@ func TestSnapshotRollback(t *testing.T) {
 	}
 
 	// Roll back to snap1
-	if err := server.RestoreSnapshot(ctx, volumeID, snap1); err != nil {
+	restoreResp1, err := server.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: snap1,
+	})
+	if err != nil {
 		t.Fatalf("RestoreSnapshot to %s failed: %v", snap1, err)
+	}
+	if restoreResp1.GetSnapshotName() == "" {
+		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
 	// Read /doc.txt -> should be version 1 data
@@ -1350,8 +1357,15 @@ func TestSnapshotRollback(t *testing.T) {
 	}
 
 	// Now roll forward to snap2
-	if err := server.RestoreSnapshot(ctx, volumeID, snap2); err != nil {
+	restoreResp2, err := server.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: snap2,
+	})
+	if err != nil {
 		t.Fatalf("RestoreSnapshot to %s failed: %v", snap2, err)
+	}
+	if restoreResp2.GetSnapshotName() == "" {
+		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
 	readResp2, err := testReadFile(ctx, server, volumeID, "/doc.txt", 0, 1024)
@@ -1361,6 +1375,54 @@ func TestSnapshotRollback(t *testing.T) {
 	if string(readResp2.Data) != "version 2 data overwritten" {
 		t.Fatalf("Expected 'version 2 data overwritten' after restore to snap2, got %q", string(readResp2.Data))
 	}
+}
+
+func TestRestoreSnapshotErrors(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(t, backend)
+	volumeID := "test-restore-snapshot-errors"
+
+	// Missing volume_id
+	if _, err := server.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		SnapshotName: "some-snapshot",
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for empty volume_id, got: %v", err)
+	}
+
+	// Missing snapshot_name
+	if _, err := server.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		VolumeId: volumeID,
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for empty snapshot_name, got: %v", err)
+	}
+
+	// Unknown snapshot -> NotFound
+	if _, err := server.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: "nonexistent-snapshot",
+	}); status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound for unknown snapshot, got: %v", err)
+	}
+
+	// Restore already running on volume -> FailedPrecondition
+	server.restoringMu.Lock()
+	server.restoring[volumeID] = true
+	server.restoringMu.Unlock()
+
+	if _, err := server.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: "some-snapshot",
+	}); status.Code(err) != codes.FailedPrecondition {
+		server.restoringMu.Lock()
+		delete(server.restoring, volumeID)
+		server.restoringMu.Unlock()
+		t.Fatalf("expected FailedPrecondition when restore already running, got: %v", err)
+	}
+
+	server.restoringMu.Lock()
+	delete(server.restoring, volumeID)
+	server.restoringMu.Unlock()
 }
 
 func TestSnapshotRestoreDurableAcrossRestart(t *testing.T) {
@@ -1391,8 +1453,15 @@ func TestSnapshotRestoreDurableAcrossRestart(t *testing.T) {
 	}
 
 	// RestoreSnapshot s1
-	if err := server1.RestoreSnapshot(ctx, volumeID, s1); err != nil {
+	restoreRespDurable, err := server1.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: s1,
+	})
+	if err != nil {
 		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
+	}
+	if restoreRespDurable.GetSnapshotName() == "" {
+		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
 	// in-process read: "version 1 data"
@@ -1449,8 +1518,15 @@ func TestSnapshotRestoreWriteThenRestart(t *testing.T) {
 	}
 
 	// RestoreSnapshot s1
-	if err := server1.RestoreSnapshot(ctx, volumeID, s1); err != nil {
+	restoreRespWrite, err := server1.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: s1,
+	})
+	if err != nil {
 		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
+	}
+	if restoreRespWrite.GetSnapshotName() == "" {
+		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
 	// Post-restore write: modify doc.txt and create post_restore.txt
@@ -1534,8 +1610,15 @@ func TestSnapshotRestoreRebuildFromLog(t *testing.T) {
 	}
 
 	// 3. Restore to s1
-	if err := server1.RestoreSnapshot(ctx, volumeID, s1); err != nil {
+	restoreRespRebuild, err := server1.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: s1,
+	})
+	if err != nil {
 		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
+	}
+	if restoreRespRebuild.GetSnapshotName() == "" {
+		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
 	// 4. Post-restore writes
@@ -1725,8 +1808,15 @@ func TestSnapshotRestoreInodeMonotonicity(t *testing.T) {
 	}
 
 	// 3. Restore to snapshot s1 (file2 and file3 are rolled back)
-	if err := server1.RestoreSnapshot(ctx, volumeID, s1); err != nil {
+	restoreRespIno, err := server1.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: s1,
+	})
+	if err != nil {
 		t.Fatalf("RestoreSnapshot s1 failed: %v", err)
+	}
+	if restoreRespIno.GetSnapshotName() == "" {
+		t.Fatalf("expected non-empty snapshot name from RestoreSnapshot")
 	}
 
 	// 4. Create a new file post-restore in the same running process

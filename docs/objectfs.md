@@ -249,6 +249,9 @@ Snapshots are written to cloud object storage under the volume metadata prefix:
 - **Content Flushing:** Referenced `Content` rows are flushed to the blob store during snapshot compilation, while unreferenced rows are safely discarded. Following snapshot upload, a `SnapshotPointer` framework record is appended to the SDS log.
 - **Crash Recovery:** Controller memory is reconstructed on startup by mounting the latest EROFS snapshot projection, extracting its position and registry from root xattrs, and replaying subsequent records from that position using `sds.StreamReader`.
 
+#### In-Place Snapshot Restore
+In-place restore rolls a volume's active filesystem state back to that of an earlier snapshot without truncating or diverging metadata history. The restore operation appends a Restore record (`SnapshotPointer` with `restored_from` set to the target snapshot location) at the current stream head ($H+1$), restores the metadata index to the target snapshot state with its stream sequence set to $H+1$, ensures monotonic inode numbering across the restore, and immediately publishes a fresh index snapshot at $H+1$. Because the restore advances the stream head monotonically rather than rewriting or truncating prior stream records, metadata history remains linear, earlier snapshots remain valid and restorable, and recovery deterministically reconstructs the post-restore volume state across controller restarts.
+
 ---
 
 ## Content-Addressable Blob Storage & Packfiles
@@ -511,6 +514,7 @@ The gRPC contract between `objectfs-node-daemon` and `objectfs-controller` is de
 | | `ListVolumes` | Discovers available volumes across the cluster. |
 | | `ListSnapshots` | Lists point-in-time EROFS snapshots for a volume. |
 | | `CreateSnapshot` | Manually triggers an immediate EROFS snapshot compilation. |
+| | `RestoreSnapshot` | Restores a volume to a prior snapshot in-place and publishes a new snapshot reflecting the restore. |
 | | `Checkpoint` | Triggers an explicit checkpoint commit on an exclusive-local volume and waits for acknowledgement. |
 | | `AckCheckpoint` | Acknowledges completion of an explicit checkpoint commit by a node daemon. |
 | | `RepairVolume` | Moves volume's degraded segment files aside and reopens stream from witness watermark. |
