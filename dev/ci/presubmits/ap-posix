@@ -196,6 +196,7 @@ expected_pass_count=0
 expected_fail_count=0
 unexpected_pass_list=()
 unexpected_fail_list=()
+actual_failures=()
 
 for test_file in \$(find "\${PJDFSTEST_TESTS_DIR}" -name "*.t" | sort); do
   t_rel="\${test_file#\${PJDFSTEST_TESTS_DIR}/}"
@@ -235,6 +236,17 @@ for test_file in \$(find "\${PJDFSTEST_TESTS_DIR}" -name "*.t" | sort); do
       expected_pass_count=\$((expected_pass_count + 1))
     fi
   else
+    if [[ \${is_flaky} -eq 0 ]]; then
+      actual_failures+=("\${t_rel}")
+    fi
+    mapfile -t failure_lines < <(printf '%s\n' "\${output}" | { grep "^not ok" || true; } | { grep -v -E "# (TODO|SKIP)" || true; })
+    for line in "\${failure_lines[@]}"; do
+      echo "\${t_rel}: \${line}"
+    done
+    if [[ \${exit_code} -ne 0 && \${#failure_lines[@]} -eq 0 ]]; then
+      echo "\${t_rel}: failed with exit code \${exit_code}: \${output}"
+    fi
+
     if [[ \${is_expected_fail} -eq 1 ]]; then
       expected_fail_count=\$((expected_fail_count + 1))
     else
@@ -280,6 +292,11 @@ if [[ \${#unexpected_fail_list[@]} -gt 0 ]]; then
 fi
 
 if [[ \${#unexpected_pass_list[@]} -gt 0 || \${#unexpected_fail_list[@]} -gt 0 ]]; then
+  echo
+  echo "Expected failures diff (-expected, +actual):"
+  diff -u --label "expected" --label "actual" \
+    <(grep -v -E '^(#|[[:space:]]*$)' "\${EXPECTED_FAILURES}" | sort) \
+    <(if [[ \${#actual_failures[@]} -gt 0 ]]; then printf '%s\n' "\${actual_failures[@]}" | sort; fi) || true
   exit 1
 fi
 
