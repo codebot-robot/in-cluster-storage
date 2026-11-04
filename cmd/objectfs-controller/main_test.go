@@ -19,12 +19,14 @@ package main
 import (
 	"crypto/x509"
 	"flag"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
+	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 )
 
 func TestParseEndpoint(t *testing.T) {
@@ -55,7 +57,10 @@ func TestParseEndpoint(t *testing.T) {
 }
 
 func TestMetadataIndexCacheMBFlag(t *testing.T) {
-	f := flag.Lookup("metadata-index-cache-mb")
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	options.AddFlags(flagSet)
+	f := flagSet.Lookup("metadata-index-cache-mb")
 	if f == nil {
 		t.Fatal("flag --metadata-index-cache-mb not registered")
 	}
@@ -65,26 +70,82 @@ func TestMetadataIndexCacheMBFlag(t *testing.T) {
 }
 
 func TestWalDurabilityFlag(t *testing.T) {
-	f := flag.Lookup("wal-durability")
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	options.AddFlags(flagSet)
+	f := flagSet.Lookup("wal-durability")
 	if f == nil {
 		t.Fatal("flag --wal-durability not registered")
 	}
 	if f.DefValue != "local" {
 		t.Errorf("default value = %q, want local", f.DefValue)
 	}
-	t.Cleanup(func() {
-		if err := f.Value.Set("local"); err != nil {
-			t.Errorf("restore wal-durability flag failed: %v", err)
-		}
-	})
 	if err := f.Value.Set("witness"); err != nil {
 		t.Fatalf("Set witness failed: %v", err)
+	}
+	if options.WALDurability != walclient.Witness {
+		t.Errorf("options.WALDurability = %v, want %v", options.WALDurability, walclient.Witness)
 	}
 	if err := f.Value.Set("permanent"); err != nil {
 		t.Fatalf("Set permanent failed: %v", err)
 	}
+	if options.WALDurability != walclient.Permanent {
+		t.Errorf("options.WALDurability = %v, want %v", options.WALDurability, walclient.Permanent)
+	}
 	if err := f.Value.Set("invalid"); err == nil {
 		t.Fatal("expected error for invalid durability")
+	}
+}
+
+func TestOptionsParseAndValidate(t *testing.T) {
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	options.AddFlags(flagSet)
+
+	arguments := []string{
+		"--backend=memory://",
+		"--metadata-dir=/tmp/metadata",
+		"--wal-dir=/tmp/wal",
+		"--wal-target=127.0.0.1:50051",
+		"--port=8080",
+		"--wal-durability=permanent",
+		"--csi-endpoint=unix:///tmp/csi.sock",
+	}
+	if err := flagSet.Parse(arguments); err != nil {
+		t.Fatalf("flagSet.Parse failed: %v", err)
+	}
+
+	if options.Backend != "memory://" || options.MetadataDir != "/tmp/metadata" ||
+		options.WALDir != "/tmp/wal" || options.WALTarget != "127.0.0.1:50051" ||
+		options.Port != 8080 || options.WALDurability != walclient.Permanent ||
+		options.CSIEndpoint != "unix:///tmp/csi.sock" {
+		t.Fatalf("parsed options mismatch: %+v", options)
+	}
+	if err := options.Validate(); err != nil {
+		t.Fatalf("options.Validate() unexpected error: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(o *Options)
+		wantErr string
+	}{
+		{"missing backend", func(o *Options) { o.Backend = "" }, "--backend"},
+		{"missing metadata dir", func(o *Options) { o.MetadataDir = "" }, "--metadata-dir"},
+		{"missing wal dir", func(o *Options) { o.WALDir = "" }, "--wal-dir"},
+		{"missing wal target", func(o *Options) { o.WALTarget = "" }, "--wal-target"},
+		{"invalid csi endpoint", func(o *Options) { o.CSIEndpoint = "http://invalid" }, "invalid endpoint"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			validOptions := *options
+			tt.mutate(&validOptions)
+			err := validOptions.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 

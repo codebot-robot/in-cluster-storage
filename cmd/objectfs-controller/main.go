@@ -44,35 +44,101 @@ import (
 	"k8s.io/klog/v2"
 )
 
-var (
-	port                      = flag.Int("port", 50051, "The server port")
-	serverCertDir             = flag.String("server-cert-dir", "/etc/objectfs/certs/server", "Directory containing tls.key, tls.crt, and trust/*.crt for mTLS")
-	insecure                  = flag.Bool("insecure", false, "Disable TLS and client certificate authentication (dev only)")
-	namespace                 = flag.String("namespace", "", "Kubernetes namespace for caller authorization (default from POD_NAMESPACE)")
-	csiEndpoint               = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
-	backendFlag               = flag.String("backend", "", "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
-	metadataDir               = flag.String("metadata-dir", "", "Local directory for persistent metadata indices (e.g. SQLite databases)")
-	flushInterval             = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
-	walDir                    = flag.String("wal-dir", "", "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
-	walTarget                 = flag.String("wal-target", "", "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
-	walDurability             = walclient.Local
-	metadataIndex             = flag.String("metadata-index", "sqlite", "Metadata local index type (sqlite, memory, table)")
-	metadataIndexCacheMB      = flag.Int("metadata-index-cache-mb", 64, "Pebble shared block cache size in megabytes for table metadata index")
-	metadataCacheEntries      = flag.Int("metadata-cache-entries", 0, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
-	metadataCacheBytes        = flag.Int64("metadata-cache-bytes", 64*1024*1024, "Maximum byte size of metadata read cache")
-	metadataOverlayMaxBytes   = flag.Int64("metadata-overlay-max-bytes", 64*1024*1024, "Maximum byte size of unapplied metadata overlay before applying backpressure")
-	metadataApplierBatchSize  = flag.Int("metadata-applier-batch-size", 100, "Maximum batch size for SQLite background applier")
-	debugMutationCheck        = flag.Bool("debug-mutation-check", false, "Enable debug mutation checking on metadata view (for test/CI gates)")
-	debugStatsCheck           = flag.Bool("debug-stats-check", false, "Enable debug volume stats checking (for test/CI gates)")
-	syncCoalesceWindow        = flag.Duration("sync-coalesce-window", 1*time.Second, "Coalescing window for non-blocking sync requests")
-	maxStagingBytes           = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
-	controllerSyncTimeout     = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
-	openBarrierTimeout        = flag.Duration("open-barrier-timeout", 5*time.Second, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
-	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
-)
+// Options holds configuration for the ObjectFS controller.
+type Options struct {
+	Port                      int
+	ServerCertDir             string
+	Insecure                  bool
+	Namespace                 string
+	CSIEndpoint               string
+	Backend                   string
+	MetadataDir               string
+	FlushInterval             time.Duration
+	WALDir                    string
+	WALTarget                 string
+	WALDurability             walclient.Level
+	MetadataIndex             string
+	MetadataIndexCacheMB      int
+	MetadataCacheEntries      int
+	MetadataCacheBytes        int64
+	MetadataOverlayMaxBytes   int64
+	MetadataApplierBatchSize  int
+	DebugMutationCheck        bool
+	DebugStatsCheck           bool
+	SyncCoalesceWindow        time.Duration
+	MaxStagingBytes           int64
+	ControllerSyncTimeout     time.Duration
+	OpenBarrierTimeout        time.Duration
+	AcceptUnversionedSegments bool
+}
 
-func init() {
-	flag.Var(walclient.NewLevelValue(&walDurability), "wal-durability", "Default WAL durability level (local, witness, permanent)")
+// NewOptions returns an Options struct populated with defaults.
+func NewOptions() *Options {
+	return &Options{
+		Port:                     50051,
+		ServerCertDir:            "/etc/objectfs/certs/server",
+		FlushInterval:            1 * time.Hour,
+		WALDurability:            walclient.Local,
+		MetadataIndex:            "sqlite",
+		MetadataIndexCacheMB:     64,
+		MetadataCacheBytes:       64 * 1024 * 1024,
+		MetadataOverlayMaxBytes:  64 * 1024 * 1024,
+		MetadataApplierBatchSize: 100,
+		SyncCoalesceWindow:       1 * time.Second,
+		MaxStagingBytes:          64 * 1024 * 1024,
+		ControllerSyncTimeout:    10 * time.Minute,
+		OpenBarrierTimeout:       5 * time.Second,
+	}
+}
+
+// AddFlags registers flags into the provided FlagSet.
+func (o *Options) AddFlags(flagSet *flag.FlagSet) {
+	flagSet.IntVar(&o.Port, "port", o.Port, "The server port")
+	flagSet.StringVar(&o.ServerCertDir, "server-cert-dir", o.ServerCertDir, "Directory containing tls.key, tls.crt, and trust/*.crt for mTLS")
+	flagSet.BoolVar(&o.Insecure, "insecure", o.Insecure, "Disable TLS and client certificate authentication (dev only)")
+	flagSet.StringVar(&o.Namespace, "namespace", o.Namespace, "Kubernetes namespace for caller authorization (default from POD_NAMESPACE)")
+	flagSet.StringVar(&o.CSIEndpoint, "csi-endpoint", o.CSIEndpoint, "CSI endpoint (e.g. unix:///csi/csi.sock)")
+	flagSet.StringVar(&o.Backend, "backend", o.Backend, "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
+	flagSet.StringVar(&o.MetadataDir, "metadata-dir", o.MetadataDir, "Local directory for persistent metadata indices (e.g. SQLite databases)")
+	flagSet.DurationVar(&o.FlushInterval, "flush-interval", o.FlushInterval, "Periodic flush interval to backend object storage")
+	flagSet.StringVar(&o.WALDir, "wal-dir", o.WALDir, "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
+	flagSet.StringVar(&o.WALTarget, "wal-target", o.WALTarget, "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
+	flagSet.Var(walclient.NewLevelValue(&o.WALDurability), "wal-durability", "Default WAL durability level (local, witness, permanent)")
+	flagSet.StringVar(&o.MetadataIndex, "metadata-index", o.MetadataIndex, "Metadata local index type (sqlite, memory, table)")
+	flagSet.IntVar(&o.MetadataIndexCacheMB, "metadata-index-cache-mb", o.MetadataIndexCacheMB, "Pebble shared block cache size in megabytes for table metadata index")
+	flagSet.IntVar(&o.MetadataCacheEntries, "metadata-cache-entries", o.MetadataCacheEntries, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
+	flagSet.Int64Var(&o.MetadataCacheBytes, "metadata-cache-bytes", o.MetadataCacheBytes, "Maximum byte size of metadata read cache")
+	flagSet.Int64Var(&o.MetadataOverlayMaxBytes, "metadata-overlay-max-bytes", o.MetadataOverlayMaxBytes, "Maximum byte size of unapplied metadata overlay before applying backpressure")
+	flagSet.IntVar(&o.MetadataApplierBatchSize, "metadata-applier-batch-size", o.MetadataApplierBatchSize, "Maximum batch size for SQLite background applier")
+	flagSet.BoolVar(&o.DebugMutationCheck, "debug-mutation-check", o.DebugMutationCheck, "Enable debug mutation checking on metadata view (for test/CI gates)")
+	flagSet.BoolVar(&o.DebugStatsCheck, "debug-stats-check", o.DebugStatsCheck, "Enable debug volume stats checking (for test/CI gates)")
+	flagSet.DurationVar(&o.SyncCoalesceWindow, "sync-coalesce-window", o.SyncCoalesceWindow, "Coalescing window for non-blocking sync requests")
+	flagSet.Int64Var(&o.MaxStagingBytes, "max-staging-bytes", o.MaxStagingBytes, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
+	flagSet.DurationVar(&o.ControllerSyncTimeout, "controller-sync-timeout", o.ControllerSyncTimeout, "Timeout for controller coalesced background sync operations")
+	flagSet.DurationVar(&o.OpenBarrierTimeout, "open-barrier-timeout", o.OpenBarrierTimeout, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
+	flagSet.BoolVar(&o.AcceptUnversionedSegments, "accept-unversioned-segments", o.AcceptUnversionedSegments, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
+}
+
+// Validate validates that the configured options are valid.
+func (o *Options) Validate() error {
+	if o.Backend == "" {
+		return fmt.Errorf("missing required flag: --backend (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
+	}
+	if o.MetadataDir == "" {
+		return fmt.Errorf("missing required flag: --metadata-dir (local directory required for persistent metadata and write staging)")
+	}
+	if o.WALDir == "" {
+		return fmt.Errorf("invalid configuration: --wal-dir is required")
+	}
+	if o.WALTarget == "" {
+		return fmt.Errorf("invalid configuration: --wal-target is required")
+	}
+	if o.CSIEndpoint != "" {
+		if _, _, err := parseEndpoint(o.CSIEndpoint); err != nil {
+			return fmt.Errorf("failed to parse csi-endpoint %s: %w", o.CSIEndpoint, err)
+		}
+	}
+	return nil
 }
 
 func evaluateLeafExpiry(cert *x509.Certificate, now time.Time) {
@@ -121,98 +187,97 @@ func parseEndpoint(endpoint string) (string, string, error) {
 
 func main() {
 	klog.InitFlags(nil)
+	options := NewOptions()
+	options.AddFlags(flag.CommandLine)
 	flag.Parse()
 
+	if err := options.Validate(); err != nil {
+		klog.Fatalf("%v", err)
+	}
+
+	if err := run(*options); err != nil {
+		klog.Fatalf("%v", err)
+	}
+}
+
+func run(options Options) error {
 	// Controller registration uses explicit options: WithDisableWAL(true)
 	// (stream is the source of truth, position and rows move in one batch),
 	// and one process-wide pebble.Cache shared by all volumes. Memtable size
 	// keeps Pebble's ramp default (starts at min(256KB, MemTableSize) and doubles up to 4MB).
-	var tableOpts []table.Option
-	tableOpts = append(tableOpts, table.WithDisableWAL(true)) // stream is the source of truth, position and rows move in one batch
-	if *metadataIndexCacheMB > 0 {
-		tableCache := pebble.NewCache(int64(*metadataIndexCacheMB) * 1024 * 1024)
+	var tableOptions []table.Option
+	tableOptions = append(tableOptions, table.WithDisableWAL(true)) // stream is the source of truth, position and rows move in one batch
+	if options.MetadataIndexCacheMB > 0 {
+		tableCache := pebble.NewCache(int64(options.MetadataIndexCacheMB) * 1024 * 1024)
 		defer tableCache.Unref()
-		tableOpts = append(tableOpts, table.WithCache(tableCache))
+		tableOptions = append(tableOptions, table.WithCache(tableCache))
 	}
-	if *acceptUnversionedSegments {
-		tableOpts = append(tableOpts, table.WithAcceptUnversioned(true))
+	if options.AcceptUnversionedSegments {
+		tableOptions = append(tableOptions, table.WithAcceptUnversioned(true))
 		sds.RegisterIndexFactory(sqlite.NewFactory(sqlite.WithAcceptUnversioned(true)))
 	}
-	sds.RegisterIndexFactory(table.NewFactory(tableOpts...))
+	sds.RegisterIndexFactory(table.NewFactory(tableOptions...))
 
-	if *backendFlag == "" {
-		klog.Fatalf("missing required flag: --backend (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
-	}
-	if *metadataDir == "" {
-		klog.Fatalf("missing required flag: --metadata-dir (local directory required for persistent metadata and write staging)")
-	}
-
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", options.Port))
 	if err != nil {
-		klog.Fatalf("failed to listen: %v", err)
+		return fmt.Errorf("failed to listen: %w", err)
 	}
 
 	ctx := context.Background()
-	backend, err := objectstore.Open(ctx, *backendFlag)
+	backend, err := objectstore.Open(ctx, options.Backend)
 	if err != nil {
-		klog.Fatalf("failed to initialize backend %q: %v", *backendFlag, err)
+		return fmt.Errorf("failed to initialize backend %q: %w", options.Backend, err)
 	}
 
-	var serverOpts []controller.ServerOption
-	if *metadataIndex != "" {
-		serverOpts = append(serverOpts, controller.WithServerMetadataIndex(*metadataIndex))
+	var serverOptions []controller.ServerOption
+	if options.MetadataIndex != "" {
+		serverOptions = append(serverOptions, controller.WithServerMetadataIndex(options.MetadataIndex))
 	}
-	if *metadataDir != "" {
-		serverOpts = append(serverOpts, controller.WithServerMetadataDir(*metadataDir))
+	if options.MetadataDir != "" {
+		serverOptions = append(serverOptions, controller.WithServerMetadataDir(options.MetadataDir))
 	}
-	if *metadataCacheEntries > 0 || *metadataCacheBytes > 0 {
-		serverOpts = append(serverOpts, controller.WithServerMetadataCacheLimits(*metadataCacheEntries, *metadataCacheBytes))
+	if options.MetadataCacheEntries > 0 || options.MetadataCacheBytes > 0 {
+		serverOptions = append(serverOptions, controller.WithServerMetadataCacheLimits(options.MetadataCacheEntries, options.MetadataCacheBytes))
 	}
-	if *metadataOverlayMaxBytes > 0 {
-		serverOpts = append(serverOpts, controller.WithServerMetadataOverlayMaxBytes(*metadataOverlayMaxBytes))
+	if options.MetadataOverlayMaxBytes > 0 {
+		serverOptions = append(serverOptions, controller.WithServerMetadataOverlayMaxBytes(options.MetadataOverlayMaxBytes))
 	}
-	if *metadataApplierBatchSize > 0 {
-		serverOpts = append(serverOpts, controller.WithServerMetadataApplierBatchSize(*metadataApplierBatchSize))
+	if options.MetadataApplierBatchSize > 0 {
+		serverOptions = append(serverOptions, controller.WithServerMetadataApplierBatchSize(options.MetadataApplierBatchSize))
 	}
-	if *debugMutationCheck {
-		serverOpts = append(serverOpts, controller.WithServerMutationCheck(), controller.WithServerStatsCheck())
+	if options.DebugMutationCheck {
+		serverOptions = append(serverOptions, controller.WithServerMutationCheck(), controller.WithServerStatsCheck())
 	}
-	if *debugStatsCheck && !*debugMutationCheck {
-		serverOpts = append(serverOpts, controller.WithServerStatsCheck())
+	if options.DebugStatsCheck && !options.DebugMutationCheck {
+		serverOptions = append(serverOptions, controller.WithServerStatsCheck())
 	}
-	if *syncCoalesceWindow > 0 {
-		serverOpts = append(serverOpts, controller.WithServerSyncCoalesceWindow(*syncCoalesceWindow))
+	if options.SyncCoalesceWindow > 0 {
+		serverOptions = append(serverOptions, controller.WithServerSyncCoalesceWindow(options.SyncCoalesceWindow))
 	}
-	if *maxStagingBytes > 0 {
-		serverOpts = append(serverOpts, controller.WithServerMaxStagingBytes(*maxStagingBytes))
+	if options.MaxStagingBytes > 0 {
+		serverOptions = append(serverOptions, controller.WithServerMaxStagingBytes(options.MaxStagingBytes))
 	}
-	if *controllerSyncTimeout > 0 {
-		serverOpts = append(serverOpts, controller.WithServerSyncTimeout(*controllerSyncTimeout))
+	if options.ControllerSyncTimeout > 0 {
+		serverOptions = append(serverOptions, controller.WithServerSyncTimeout(options.ControllerSyncTimeout))
 	}
-	if *openBarrierTimeout > 0 {
-		serverOpts = append(serverOpts, controller.WithServerOpenBarrierTimeout(*openBarrierTimeout))
+	if options.OpenBarrierTimeout > 0 {
+		serverOptions = append(serverOptions, controller.WithServerOpenBarrierTimeout(options.OpenBarrierTimeout))
 	}
-	if *acceptUnversionedSegments {
-		serverOpts = append(serverOpts, controller.WithServerAcceptUnversioned(true))
+	if options.AcceptUnversionedSegments {
+		serverOptions = append(serverOptions, controller.WithServerAcceptUnversioned(true))
 	}
-	if *walDir == "" {
-		klog.Fatalf("invalid configuration: --wal-dir is required")
-	}
-	if *walTarget == "" {
-		klog.Fatalf("invalid configuration: --wal-target is required")
-	}
-	serverOpts = append(serverOpts, controller.WithServerWAL(*walDir, *walTarget, walDurability))
+	serverOptions = append(serverOptions, controller.WithServerWAL(options.WALDir, options.WALTarget, options.WALDurability))
 
 	var grpcServer *grpc.Server
-	if *insecure {
+	if options.Insecure {
 		klog.Warning("Serving plaintext gRPC without TLS or authentication (--insecure is set)")
 		grpcServer = grpc.NewServer()
 	} else {
-		if !grpcutil.DirExists(*serverCertDir) {
-			klog.Fatalf("server certificate directory %s does not exist; pass --insecure for plaintext local dev", *serverCertDir)
+		if !grpcutil.DirExists(options.ServerCertDir) {
+			return fmt.Errorf("server certificate directory %s does not exist; pass --insecure for plaintext local dev", options.ServerCertDir)
 		}
 
-		checkLeafExpiry(filepath.Join(*serverCertDir, "tls.crt"), time.Now())
+		checkLeafExpiry(filepath.Join(options.ServerCertDir, "tls.crt"), time.Now())
 		go func() {
 			ticker := time.NewTicker(24 * time.Hour)
 			defer ticker.Stop()
@@ -221,17 +286,17 @@ func main() {
 				case <-ctx.Done():
 					return
 				case t := <-ticker.C:
-					checkLeafExpiry(filepath.Join(*serverCertDir, "tls.crt"), t)
+					checkLeafExpiry(filepath.Join(options.ServerCertDir, "tls.crt"), t)
 				}
 			}
 		}()
 
-		tlsCreds, err := grpcutil.NewServerTLSFromDir(*serverCertDir)
+		tlsCreds, err := grpcutil.NewServerTLSFromDir(options.ServerCertDir)
 		if err != nil {
-			klog.Fatalf("failed to load server TLS credentials from %s: %v", *serverCertDir, err)
+			return fmt.Errorf("failed to load server TLS credentials from %s: %w", options.ServerCertDir, err)
 		}
 
-		ns := *namespace
+		ns := options.Namespace
 		if ns == "" {
 			ns = os.Getenv("POD_NAMESPACE")
 		}
@@ -250,11 +315,11 @@ func main() {
 			grpc.StreamInterceptor(authInterceptor.StreamServerInterceptor()),
 		)
 	}
-	server := controller.NewServer(backend, serverOpts...)
+	server := controller.NewServer(backend, serverOptions...)
 	csiController := controller.NewCSIController(server)
 
-	if *flushInterval > 0 {
-		server.StartPeriodicFlush(ctx, *flushInterval)
+	if options.FlushInterval > 0 {
+		server.StartPeriodicFlush(ctx, options.FlushInterval)
 	}
 
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
@@ -262,22 +327,22 @@ func main() {
 	csi.RegisterControllerServer(grpcServer, csiController)
 
 	var csiServer *grpc.Server
-	if *csiEndpoint != "" {
-		proto, addr, err := parseEndpoint(*csiEndpoint)
+	if options.CSIEndpoint != "" {
+		proto, addr, err := parseEndpoint(options.CSIEndpoint)
 		if err != nil {
-			klog.Fatalf("failed to parse csi-endpoint %s: %v", *csiEndpoint, err)
+			return fmt.Errorf("failed to parse csi-endpoint %s: %w", options.CSIEndpoint, err)
 		}
 
 		if proto == "unix" {
 			addr = filepath.FromSlash(addr)
 			if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
-				klog.Fatalf("failed to remove %s: %v", addr, err)
+				return fmt.Errorf("failed to remove %s: %w", addr, err)
 			}
 		}
 
 		csiListener, err := net.Listen(proto, addr)
 		if err != nil {
-			klog.Fatalf("failed to listen on CSI endpoint %s: %v", *csiEndpoint, err)
+			return fmt.Errorf("failed to listen on CSI endpoint %s: %w", options.CSIEndpoint, err)
 		}
 
 		csiServer = grpc.NewServer()
@@ -285,7 +350,7 @@ func main() {
 		csi.RegisterControllerServer(csiServer, csiController)
 
 		go func() {
-			klog.Infof("ObjectFS CSI controller listening on %s", *csiEndpoint)
+			klog.Infof("ObjectFS CSI controller listening on %s", options.CSIEndpoint)
 			if err := csiServer.Serve(csiListener); err != nil {
 				klog.Fatalf("failed to serve CSI controller: %v", err)
 			}
@@ -303,7 +368,7 @@ func main() {
 		grpcServer.GracefulStop()
 	}()
 
-	klog.Infof("ObjectFS Controller listening on port %d (flushInterval=%v)", *port, *flushInterval)
+	klog.Infof("ObjectFS Controller listening on port %d (flushInterval=%v)", options.Port, options.FlushInterval)
 	serveErr := grpcServer.Serve(listener)
 	if err := server.Close(); err != nil {
 		klog.Errorf("failed to close server on shutdown: %v", err)
@@ -311,6 +376,7 @@ func main() {
 		os.Exit(1)
 	}
 	if serveErr != nil {
-		klog.Fatalf("failed to serve: %v", serveErr)
+		return fmt.Errorf("failed to serve: %w", serveErr)
 	}
+	return nil
 }
