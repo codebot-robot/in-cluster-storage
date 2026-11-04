@@ -157,6 +157,10 @@ type Server struct {
 	streamFactory            func(volumeID string) (walclient.Stream, error)
 	syncCoalesceWindow       time.Duration
 	maxStagingBytes          int64
+	maxTotalStagingBytes     int64
+	stagingBytes             int64
+	stagingMu                sync.Mutex
+	stagingCond              *sync.Cond
 	syncTimeout              time.Duration
 	openBarrierTimeout       time.Duration
 	acceptUnversioned        bool
@@ -341,6 +345,11 @@ func WithServerMaxStagingBytes(b int64) ServerOption {
 	}
 }
 
+// WithServerMaxTotalStagingBytes sets the controller-wide staging byte cap before triggering sync.
+func WithServerMaxTotalStagingBytes(maxBytes int64) ServerOption {
+	return func(s *Server) { s.maxTotalStagingBytes = maxBytes }
+}
+
 // WithServerSyncTimeout sets the timeout duration for coalesced background sync operations.
 func WithServerSyncTimeout(d time.Duration) ServerOption {
 	return func(s *Server) {
@@ -401,17 +410,20 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		backend = NewMemoryBackend()
 	}
 	s := &Server{
-		volumes:           make(map[string]*Volume),
-		backend:           backend,
-		blobStore:         blob.NewStore(backend, 0),
-		broadcaster:       NewEventBroadcaster(),
-		checkpointWaiters: make(map[string]chan uint64),
-		exclusiveHolds:    make(map[string]*ExclusiveHold),
-		exclusiveLeaseTTL: 30 * time.Second,
-		syncTimeout:       10 * time.Minute,
-		defaultDurability: walclient.Local,
-		restoring:         make(map[string]bool),
+		volumes:              make(map[string]*Volume),
+		backend:              backend,
+		blobStore:            blob.NewStore(backend, 0),
+		broadcaster:          NewEventBroadcaster(),
+		checkpointWaiters:    make(map[string]chan uint64),
+		exclusiveHolds:       make(map[string]*ExclusiveHold),
+		exclusiveLeaseTTL:    30 * time.Second,
+		syncTimeout:          10 * time.Minute,
+		defaultDurability:    walclient.Local,
+		restoring:            make(map[string]bool),
+		maxStagingBytes:      64 * 1024 * 1024,
+		maxTotalStagingBytes: 4 * 1024 * 1024 * 1024,
 	}
+	s.stagingCond = sync.NewCond(&s.stagingMu)
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -522,6 +534,7 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		if s.maxStagingBytes > 0 {
 			volOpts = append(volOpts, WithMaxStagingBytes(s.maxStagingBytes))
 		}
+		volOpts = append(volOpts, WithServer(s))
 		if s.syncTimeout > 0 {
 			volOpts = append(volOpts, WithSyncTimeout(s.syncTimeout))
 		}
@@ -545,6 +558,31 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		s.volumes[volumeID] = vol
 	}
 	return vol, nil
+}
+
+func (s *Server) syncLargestStagedVolume(ctx context.Context) (bool, error) {
+	s.mu.RLock()
+	var topVolume *Volume
+	var maxStaged int64
+	for _, volume := range s.volumes {
+		if staged := volume.stagedBytesOnDisk(); staged > maxStaged {
+			maxStaged, topVolume = staged, volume
+		}
+	}
+	s.mu.RUnlock()
+	if topVolume != nil && maxStaged > 0 {
+		timeout := s.syncTimeout
+		if timeout <= 0 {
+			timeout = 10 * time.Minute
+		}
+		syncCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		if err := topVolume.Fsync(syncCtx, 0); err != nil {
+			return false, fmt.Errorf("staging sync failed on volume %s: %w", topVolume.volumeID, err)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // Close stops periodic flushing and closes all active volumes and streams.

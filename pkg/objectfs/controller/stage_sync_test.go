@@ -999,8 +999,8 @@ func TestStageAndSync_NonBlockingSyncFailureSurfacesOnBlockingFsync(t *testing.T
 	}
 }
 
-// TestStageAndSync_MaxStagingBytesEnforced verifies that the controller's
-// in-memory staging cap rejects writes when exceeded.
+// TestStageAndSync_MaxStagingBytesEnforced verifies that writes exceeding the
+// staging cap automatically trigger a sync and proceed without error.
 func TestStageAndSync_MaxStagingBytesEnforced(t *testing.T) {
 	ctx := t.Context()
 	server := NewTestServer(t, NewMemoryBackend(), WithServerMaxStagingBytes(128*1024))
@@ -1021,18 +1021,15 @@ func TestStageAndSync_MaxStagingBytesEnforced(t *testing.T) {
 		t.Fatalf("First write failed: %v", err)
 	}
 
-	// Next write of 1 byte: must be rejected with ENOSPC
+	// Next write of 1 byte would exceed cap: automatically triggers sync and succeeds
 	w2, err := server.WriteFile(ctx, &pb.WriteFileRequest{
 		VolumeId: volumeID,
 		Inode:    ino,
 		Offset:   128 * 1024,
 		Data:     []byte("X"),
 	})
-	if err != nil {
-		t.Fatalf("Expected gRPC success with response error, got %v", err)
-	}
-	if w2.GetError() != int32(syscall.ENOSPC) {
-		t.Fatalf("Expected ENOSPC (%d), got error %d", syscall.ENOSPC, w2.GetError())
+	if err != nil || w2.GetError() != 0 {
+		t.Fatalf("Expected write exceeding cap to succeed after auto-sync, got err=%v, respErr=%d", err, w2.GetError())
 	}
 
 	// Fsync flushes staging
@@ -1050,6 +1047,271 @@ func TestStageAndSync_MaxStagingBytesEnforced(t *testing.T) {
 	})
 	if err != nil || w3.GetError() != 0 {
 		t.Fatalf("Write after Fsync failed: %v, resp=%v", err, w3)
+	}
+}
+
+// TestStageAndSync_TwoVolumesWaitAndRelease verifies that pushing past the controller-wide
+// staging cap across two volumes causes the second volume to wait for capacity and release once
+// the first volume syncs.
+func TestStageAndSync_TwoVolumesWaitAndRelease(t *testing.T) {
+	ctx := t.Context()
+	gateBackend := &gatedBackend{ObjectStorageBackend: NewMemoryBackend(), gate: make(chan struct{})}
+	server := NewTestServer(t, gateBackend, WithServerMaxTotalStagingBytes(128*1024))
+	volume1ID, volume2ID := "test-staging-two-vols-1", "test-staging-two-vols-2"
+	defer server.Close()
+
+	create1, err1 := testCreateFile(ctx, server, volume1ID, "/file1.bin", 0644, nil, 0, 0)
+	create2, err2 := testCreateFile(ctx, server, volume2ID, "/file2.bin", 0644, nil, 0, 0)
+	if err1 != nil || err2 != nil || create1.GetError() != 0 || create2.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v, %v", err1, err2)
+	}
+
+	if _, err := server.WriteFile(ctx, &pb.WriteFileRequest{VolumeId: volume1ID, Inode: create1.GetAttr().GetInode().GetIno(), Offset: 0, Data: bytes.Repeat([]byte("A"), 96*1024)}); err != nil {
+		t.Fatalf("Volume 1 write failed: %v", err)
+	}
+
+	// Volume 2 writes 64 KiB: 96 KiB + 64 KiB = 160 KiB > 128 KiB staging cap.
+	// This push triggers sync on Volume 1, which blocks on gateBackend.
+	write2Done := make(chan error, 1)
+	go func() {
+		_, writeErr := server.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId: volume2ID,
+			Inode:    create2.GetAttr().GetInode().GetIno(),
+			Offset:   0,
+			Data:     bytes.Repeat([]byte("B"), 64*1024),
+		})
+		write2Done <- writeErr
+	}()
+
+	select {
+	case err := <-write2Done:
+		t.Fatalf("Volume 2 write returned prematurely: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(gateBackend.gate)
+
+	if err := <-write2Done; err != nil {
+		t.Fatalf("Volume 2 write failed after release: %v", err)
+	}
+
+	volume1, err1 := server.getOrCreateVolume(volume1ID)
+	volume2, err2 := server.getOrCreateVolume(volume2ID)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("getOrCreateVolume failed: %v, %v", err1, err2)
+	}
+
+	if staged1, staged2 := volume1.stagedBytesOnDisk(), volume2.stagedBytesOnDisk(); staged1 != 0 || staged2 != 64*1024 {
+		t.Errorf("unexpected staging stats: volume 1 bytes=%d, volume 2 bytes=%d", staged1, staged2)
+	}
+
+	// Arm backend failure on overflow sync
+	gateBackend.mu.Lock()
+	gateBackend.failPut = true
+	gateBackend.mu.Unlock()
+	defer func() { gateBackend.mu.Lock(); gateBackend.failPut = false; gateBackend.mu.Unlock() }()
+
+	// Next write exceeding cap triggers sync which fails without deadlock or double unlock
+	if writeFail, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volume2ID,
+		Inode:    create2.GetAttr().GetInode().GetIno(),
+		Offset:   64 * 1024,
+		Data:     bytes.Repeat([]byte("C"), 65*1024),
+	}); err == nil && writeFail.GetError() == 0 {
+		t.Fatalf("expected write to fail when overflow sync fails")
+	}
+}
+
+// TestStageAndSync_OversizeWriteOnEmptyVolumeAdmittedWhileAnotherVolumeStaged verifies
+// that a write exceeding the per-volume cap on a volume with no staged chunks is admitted
+// even when another volume has staged data, rather than spinning in a busy loop.
+func TestStageAndSync_OversizeWriteOnEmptyVolumeAdmittedWhileAnotherVolumeStaged(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	server := NewTestServer(t, NewMemoryBackend(), WithServerMaxStagingBytes(8*1024))
+	volumeAID, volumeBID := "test-oversize-vol-a", "test-oversize-vol-b"
+	defer server.Close()
+
+	createA, err1 := testCreateFile(ctx, server, volumeAID, "/fileA.bin", 0644, nil, 0, 0)
+	createB, err2 := testCreateFile(ctx, server, volumeBID, "/fileB.bin", 0644, nil, 0, 0)
+	if err1 != nil || err2 != nil || createA.GetError() != 0 || createB.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v, %v", err1, err2)
+	}
+
+	// Volume A writes 4 KiB (staged on volume A)
+	if _, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeAID,
+		Inode:    createA.GetAttr().GetInode().GetIno(),
+		Offset:   0,
+		Data:     bytes.Repeat([]byte("A"), 4*1024),
+	}); err != nil {
+		t.Fatalf("Volume A write failed: %v", err)
+	}
+
+	// Volume B writes 16 KiB (> 8 KiB per-volume cap) with 0 staged bytes on volume B
+	writeB, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeBID,
+		Inode:    createB.GetAttr().GetInode().GetIno(),
+		Offset:   0,
+		Data:     bytes.Repeat([]byte("B"), 16*1024),
+	})
+	if err != nil || writeB.GetError() != 0 {
+		t.Fatalf("Volume B oversize write failed: err=%v, respErr=%d", err, writeB.GetError())
+	}
+}
+
+// TestStageAndSync_SpuriousWakeDuringSyncIgnoresPreviousError verifies that if a previous
+// sync failed, a writer waiting on a subsequent in-flight sync does not return the stale error
+// if woken spuriously while the in-flight sync is still running.
+func TestStageAndSync_SpuriousWakeDuringSyncIgnoresPreviousError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	rawBackend := NewMemoryBackend()
+	gateBackend := &gatedBackend{
+		ObjectStorageBackend: rawBackend,
+	}
+	server := NewTestServer(t, gateBackend, WithServerMaxStagingBytes(128*1024))
+	volumeID := "test-spurious-wake-vol"
+	defer server.Close()
+
+	create1, err1 := testCreateFile(ctx, server, volumeID, "/file1.bin", 0644, nil, 0, 0)
+	create2, err2 := testCreateFile(ctx, server, volumeID, "/file2.bin", 0644, nil, 0, 0)
+	create3, err3 := testCreateFile(ctx, server, volumeID, "/file3.bin", 0644, nil, 0, 0)
+	if err1 != nil || err2 != nil || err3 != nil || create1.GetError() != 0 || create2.GetError() != 0 || create3.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v, %v, %v", err1, err2, err3)
+	}
+	inode1ID := create1.GetAttr().GetInode().GetIno()
+	inode2ID := create2.GetAttr().GetInode().GetIno()
+	inode3ID := create3.GetAttr().GetInode().GetIno()
+
+	// 1. Stage file 1 (32 KiB)
+	if _, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    inode1ID,
+		Offset:   0,
+		Data:     bytes.Repeat([]byte("A"), 32*1024),
+	}); err != nil {
+		t.Fatalf("File 1 write failed: %v", err)
+	}
+
+	// 2. Arm backend failure and trigger sync 1, so lastCompletedSyncError is non-nil
+	gateBackend.mu.Lock()
+	gateBackend.failPut = true
+	gateBackend.mu.Unlock()
+
+	fResp, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: inode1ID, Blocking: true})
+	if err == nil && fResp.GetSuccess() {
+		t.Fatalf("expected first sync to fail")
+	}
+
+	// 3. Clear failure and stage file 2 (32 KiB)
+	gateBackend.mu.Lock()
+	gateBackend.failPut = false
+	gateBackend.mu.Unlock()
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	volume.stagingMu.Lock()
+	if volume.lastCompletedSyncError == nil {
+		volume.stagingMu.Unlock()
+		t.Fatalf("expected lastCompletedSyncError to be non-nil after failed sync")
+	}
+	volume.stagingMu.Unlock()
+
+	// Stage file 2: total staged is 64 KiB <= 128 KiB cap
+	if _, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Inode:    inode2ID,
+		Offset:   0,
+		Data:     bytes.Repeat([]byte("B"), 32*1024),
+	}); err != nil {
+		t.Fatalf("File 2 write failed: %v", err)
+	}
+
+	// Arm gate for sync 2
+	gateGate := make(chan struct{})
+	gateBackend.mu.Lock()
+	gateBackend.gate = gateGate
+	gateBackend.mu.Unlock()
+
+	// 4. Start second sync in background; it will block on gateBackend.gate
+	sync2Done := make(chan error, 1)
+	go func() {
+		resp, sErr := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: inode2ID, Blocking: true})
+		if sErr != nil {
+			sync2Done <- sErr
+		} else if !resp.GetSuccess() {
+			sync2Done <- fmt.Errorf("sync 2 failed")
+		} else {
+			sync2Done <- nil
+		}
+	}()
+
+	// Wait until sync 2 is in progress
+	for {
+		volume.stagingMu.Lock()
+		inProgress := volume.syncInProgress
+		volume.stagingMu.Unlock()
+		if inProgress {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 5. Start a writer on file 3 (96 KiB) that will exceed 128 KiB cap and wait while sync 2 is in flight
+	writeDone := make(chan error, 1)
+	go func() {
+		resp, wErr := server.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId: volumeID,
+			Inode:    inode3ID,
+			Offset:   0,
+			Data:     bytes.Repeat([]byte("C"), 96*1024),
+		})
+		if wErr != nil {
+			writeDone <- wErr
+		} else if resp.GetError() != 0 {
+			writeDone <- fmt.Errorf("write error: %d", resp.GetError())
+		} else {
+			writeDone <- nil
+		}
+	}()
+
+	// Give the writer a moment to enter acquireStagingCapacity and wait on syncCond
+	time.Sleep(50 * time.Millisecond)
+
+	// 6. Spuriously broadcast syncCond while sync 2 is STILL in progress
+	volume.stagingMu.Lock()
+	volume.syncCond.Broadcast()
+	volume.stagingMu.Unlock()
+
+	// Assert the writer does NOT wake up with the stale error from sync 1
+	select {
+	case err := <-writeDone:
+		t.Fatalf("writer returned prematurely with error on spurious wake: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: writer saw syncInProgress is still true, and went back to waiting
+	}
+
+	// 7. Release sync 2 gate so it can complete successfully
+	close(gateGate)
+
+	if err := <-sync2Done; err != nil {
+		t.Fatalf("sync 2 failed after release: %v", err)
+	}
+
+	// 8. Now the writer must complete successfully without error
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("writer failed after sync 2 succeeded: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for writer to complete")
 	}
 }
 
@@ -1103,16 +1365,21 @@ type gatedBackend struct {
 	mu       sync.Mutex
 	gate     chan struct{}
 	putCalls int
+	failPut  bool
 }
 
 func (b *gatedBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
 	b.mu.Lock()
+	if b.failPut {
+		b.mu.Unlock()
+		return "", fmt.Errorf("injected PutObject failure")
+	}
 	b.putCalls++
-	callNum := b.putCalls
+	gate := b.gate
 	b.mu.Unlock()
 
-	if callNum == 1 {
-		<-b.gate
+	if gate != nil {
+		<-gate
 	}
 	return b.ObjectStorageBackend.PutObject(ctx, volumeID, key, stream)
 }

@@ -102,6 +102,8 @@ type Volume struct {
 	maxInlineLen int64
 	chunkSize    uint32
 
+	server *Server
+
 	stagingDir         string
 	activePack         *blob.IncrementalPack
 	activePackID       uint64
@@ -111,15 +113,16 @@ type Volume struct {
 	packUploaded       map[uint64]bool
 	packKeys           map[uint64]string
 
-	stagingMu       sync.Mutex
-	stagingEpoch    int64
-	stagingSeq      uint64
-	stagedChunks    map[uint64]map[int]stagedChunkReference
-	stagedSizes     map[uint64]int64
-	stagedMtimes    map[uint64]time.Time
-	stagedBytes     int64
-	maxStagingBytes int64
-	lastSyncError   map[uint64]error
+	stagingMu              sync.Mutex
+	stagingEpoch           int64
+	stagingSeq             uint64
+	stagedChunks           map[uint64]map[int]stagedChunkReference
+	stagedSizes            map[uint64]int64
+	stagedMtimes           map[uint64]time.Time
+	stagedBytes            int64
+	maxStagingBytes        int64
+	lastSyncError          map[uint64]error
+	lastCompletedSyncError error
 
 	coalesceTimer      *time.Timer
 	coalesceWaiters    []*syncWaiter
@@ -201,6 +204,11 @@ func WithBlobStore(store *blob.Store) VolumeOption {
 			v.blobStore = store
 		}
 	}
+}
+
+// WithServer associates the volume with its owning controller server for shared capacity limits.
+func WithServer(server *Server) VolumeOption {
+	return func(v *Volume) { v.server = server }
 }
 
 // WithSyncTimeout sets the timeout duration for coalesced background syncs on the controller.
@@ -583,6 +591,7 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 	defer v.stagingMu.Unlock()
 
 	v.syncInProgress = false
+	v.lastCompletedSyncError = err
 	for sIno := range snapshotChunks {
 		delete(v.syncingInodes, sIno)
 	}
@@ -1498,6 +1507,7 @@ func (v *Volume) Close() error {
 		close(w.ch)
 	}
 	v.coalesceWaiters = nil
+	v.subStagedBytes(v.stagedBytes)
 	if removeErr := v.removeStagingDirLocked(); removeErr != nil {
 		klog.Warningf("failed removing staging directory: %v", removeErr)
 	}
@@ -1669,6 +1679,13 @@ func (v *Volume) Stats() VolumeStats {
 		Cache:          v.metadataView.CacheStats(),
 		Stats:          st,
 	}
+}
+
+// stagedBytesOnDisk returns the current byte size of staged chunk payloads on disk.
+func (v *Volume) stagedBytesOnDisk() int64 {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+	return v.stagedBytes
 }
 
 // MetadataCacheStats returns cache hit/miss and memory usage statistics.
@@ -3740,17 +3757,48 @@ func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
 	}, nil
 }
 
+func subtractStagedBytesChecked(current *int64, delta int64, what string) {
+	if *current < delta {
+		if testing.Testing() {
+			panic(fmt.Sprintf("staging accounting drift on %s: current %d, subtracting %d", what, *current, delta))
+		}
+		klog.Errorf("staging accounting drift on %s: current %d, subtracting %d", what, *current, delta)
+		*current = 0
+		return
+	}
+	*current -= delta
+}
+
+func (v *Volume) addStagedBytes(delta int64) {
+	v.stagedBytes += delta
+	if server := v.server; server != nil {
+		server.stagingMu.Lock()
+		server.stagingBytes += delta
+		server.stagingMu.Unlock()
+	}
+}
+
+func (v *Volume) subStagedBytes(delta int64) {
+	subtractStagedBytesChecked(&v.stagedBytes, delta, fmt.Sprintf("volume %s", v.volumeID))
+	if server := v.server; server != nil {
+		server.stagingMu.Lock()
+		subtractStagedBytesChecked(&server.stagingBytes, delta, "server")
+		server.stagingCond.Broadcast()
+		server.stagingMu.Unlock()
+	}
+}
+
 func (v *Volume) setStagedChunkLocked(inodeID uint64, index int, reference stagedChunkReference) {
 	chunks, ok := v.stagedChunks[inodeID]
 	if !ok {
 		chunks = make(map[int]stagedChunkReference)
 		v.stagedChunks[inodeID] = chunks
 	} else if existing, ok := chunks[index]; ok {
-		v.stagedBytes -= int64(existing.Length)
+		v.subStagedBytes(int64(existing.Length))
 		v.dropPackReferenceLocked(existing.PackID)
 	}
 	chunks[index] = reference
-	v.stagedBytes += int64(reference.Length)
+	v.addStagedBytes(int64(reference.Length))
 	v.packLiveReferences[reference.PackID]++
 }
 
@@ -3760,7 +3808,7 @@ func (v *Volume) dropStagedChunkLocked(inodeID uint64, index int) {
 		return
 	}
 	if existing, ok := chunks[index]; ok {
-		v.stagedBytes -= int64(existing.Length)
+		v.subStagedBytes(int64(existing.Length))
 		delete(chunks, index)
 		v.dropPackReferenceLocked(existing.PackID)
 		if len(chunks) == 0 {
@@ -3777,7 +3825,7 @@ func (v *Volume) dropStagedChunksLocked(inodeID uint64) {
 		return
 	}
 	for _, reference := range chunks {
-		v.stagedBytes -= int64(reference.Length)
+		v.subStagedBytes(int64(reference.Length))
 		v.dropPackReferenceLocked(reference.PackID)
 	}
 	delete(v.stagedChunks, inodeID)
@@ -3802,6 +3850,74 @@ func (v *Volume) rewriteStagedChunkLocked(inodeID uint64, index int, modify func
 		return err
 	}
 	v.setStagedChunkLocked(inodeID, index, reference)
+	return nil
+}
+
+func (v *Volume) acquireStagingCapacity(ctx context.Context, inodeID uint64, dataLength int64) error {
+	v.stagingMu.Lock()
+	for {
+		if ctx.Err() != nil {
+			v.stagingMu.Unlock()
+			return ctx.Err()
+		}
+
+		volumeOverflow := v.maxStagingBytes > 0 && v.stagedBytes+dataLength > v.maxStagingBytes && v.stagedBytes > 0
+		var sharedOverflow bool
+		var sharedCurrentBytes int64
+		server := v.server
+		if server != nil && server.maxTotalStagingBytes > 0 {
+			server.stagingMu.Lock()
+			sharedCurrentBytes = server.stagingBytes
+			sharedOverflow = sharedCurrentBytes+dataLength > server.maxTotalStagingBytes && sharedCurrentBytes > 0
+			server.stagingMu.Unlock()
+		}
+
+		if !volumeOverflow && !sharedOverflow {
+			break
+		}
+		if v.syncInProgress {
+			v.syncCond.Wait()
+			if v.syncInProgress {
+				continue
+			}
+			if v.lastCompletedSyncError != nil {
+				v.stagingMu.Unlock()
+				return v.lastCompletedSyncError
+			}
+			continue
+		}
+		if len(v.stagedChunks) > 0 {
+			// executeSyncLocked always returns with v.stagingMu UNLOCKED
+			if _, err := v.executeSyncLocked(ctx, false, nil); err != nil {
+				return err
+			}
+			v.stagingMu.Lock()
+			continue
+		}
+		if sharedOverflow && server != nil {
+			v.stagingMu.Unlock()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			didSync, err := server.syncLargestStagedVolume(ctx)
+			if err != nil {
+				return err
+			}
+			if !didSync {
+				server.stagingMu.Lock()
+				if ctx.Err() == nil {
+					stopWait := context.AfterFunc(ctx, func() { server.stagingMu.Lock(); server.stagingCond.Broadcast(); server.stagingMu.Unlock() })
+					server.stagingCond.Wait()
+					stopWait()
+				}
+				server.stagingMu.Unlock()
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+			}
+			v.stagingMu.Lock()
+		}
+	}
 	return nil
 }
 
@@ -3843,11 +3959,6 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	// To avoid holding stagingMu across backend GetBlob, check staged chunks under stagingMu,
 	// fetch missing base chunks outside stagingMu (and outside v.mu), then reacquire stagingMu.
 	v.stagingMu.Lock()
-	if v.stagedBytes+dataLength > v.maxStagingBytes {
-		v.stagingMu.Unlock()
-		return 0, 0, time.Time{}, 0, syscall.ENOSPC
-	}
-
 	currentSize := node.Row.GetSize()
 	if stagedSize, ok := v.stagedSizes[inodeID]; ok && stagedSize > currentSize {
 		currentSize = stagedSize
@@ -3892,12 +4003,10 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		}
 	}
 
-	v.stagingMu.Lock()
-	defer v.stagingMu.Unlock()
-
-	if v.stagedBytes+dataLength > v.maxStagingBytes {
-		return 0, 0, time.Time{}, 0, syscall.ENOSPC
+	if err := v.acquireStagingCapacity(ctx, inodeID, dataLength); err != nil {
+		return 0, 0, time.Time{}, 0, err
 	}
+	defer v.stagingMu.Unlock()
 
 	currentSize = node.Row.GetSize()
 	if stagedSize, ok := v.stagedSizes[inodeID]; ok && stagedSize > currentSize {
@@ -6261,6 +6370,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (stri
 		v.stagingMu.Unlock()
 		return "", err
 	}
+	v.subStagedBytes(v.stagedBytes)
 	v.stagedChunks = make(map[uint64]map[int]stagedChunkReference)
 	v.stagedSizes = make(map[uint64]int64)
 	v.stagedMtimes = make(map[uint64]time.Time)

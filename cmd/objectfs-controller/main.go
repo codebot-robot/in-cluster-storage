@@ -67,6 +67,7 @@ type Options struct {
 	DebugStatsCheck           bool
 	SyncCoalesceWindow        time.Duration
 	MaxStagingBytes           int64
+	MaxTotalStagingBytes      int64
 	ControllerSyncTimeout     time.Duration
 	OpenBarrierTimeout        time.Duration
 	AcceptUnversionedSegments bool
@@ -86,6 +87,7 @@ func NewOptions() *Options {
 		MetadataApplierBatchSize: 100,
 		SyncCoalesceWindow:       1 * time.Second,
 		MaxStagingBytes:          64 * 1024 * 1024,
+		MaxTotalStagingBytes:     4 * 1024 * 1024 * 1024,
 		ControllerSyncTimeout:    10 * time.Minute,
 		OpenBarrierTimeout:       5 * time.Second,
 	}
@@ -113,7 +115,8 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.BoolVar(&o.DebugMutationCheck, "debug-mutation-check", o.DebugMutationCheck, "Enable debug mutation checking on metadata view (for test/CI gates)")
 	flagSet.BoolVar(&o.DebugStatsCheck, "debug-stats-check", o.DebugStatsCheck, "Enable debug volume stats checking (for test/CI gates)")
 	flagSet.DurationVar(&o.SyncCoalesceWindow, "sync-coalesce-window", o.SyncCoalesceWindow, "Coalescing window for non-blocking sync requests")
-	flagSet.Int64Var(&o.MaxStagingBytes, "max-staging-bytes", o.MaxStagingBytes, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
+	flagSet.Int64Var(&o.MaxStagingBytes, "max-staging-bytes", o.MaxStagingBytes, "Maximum byte size of write staging on local disk per volume before triggering sync (default 64 MiB)")
+	flagSet.Int64Var(&o.MaxTotalStagingBytes, "max-total-staging-bytes", o.MaxTotalStagingBytes, "Maximum controller-wide write staging bytes on local disk across all volumes before triggering sync (default 4 GiB)")
 	flagSet.DurationVar(&o.ControllerSyncTimeout, "controller-sync-timeout", o.ControllerSyncTimeout, "Timeout for controller coalesced background sync operations")
 	flagSet.DurationVar(&o.OpenBarrierTimeout, "open-barrier-timeout", o.OpenBarrierTimeout, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
 	flagSet.BoolVar(&o.AcceptUnversionedSegments, "accept-unversioned-segments", o.AcceptUnversionedSegments, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
@@ -256,6 +259,9 @@ func run(options Options) error {
 	}
 	if options.MaxStagingBytes > 0 {
 		serverOptions = append(serverOptions, controller.WithServerMaxStagingBytes(options.MaxStagingBytes))
+	}
+	if options.MaxTotalStagingBytes > 0 {
+		serverOptions = append(serverOptions, controller.WithServerMaxTotalStagingBytes(options.MaxTotalStagingBytes))
 	}
 	if options.ControllerSyncTimeout > 0 {
 		serverOptions = append(serverOptions, controller.WithServerSyncTimeout(options.ControllerSyncTimeout))
