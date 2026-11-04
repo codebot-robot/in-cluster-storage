@@ -380,19 +380,16 @@ func (v *View) loadStatsLocked(ctx context.Context) error {
 	}
 	statsTypeName := string(v.statsRow.ProtoReflect().Descriptor().FullName())
 	if v.reg == nil {
-		v.reg = record.NewRegistry()
+		return nil
 	}
-	if _, err := v.reg.RegisterMessage(v.statsRow, 1); err != nil {
-		return fmt.Errorf("failed to register stats message %s: %w", statsTypeName, err)
+	def, _, ok := v.reg.LookupByName(statsTypeName)
+	if !ok {
+		return nil
 	}
 	if err := v.index.SyncRegistry(ctx, v.reg); err != nil {
 		return fmt.Errorf("failed to sync registry with index: %w", err)
 	}
 
-	def, _, ok := v.reg.LookupByName(statsTypeName)
-	if !ok {
-		return fmt.Errorf("stats type %s not in registry", statsTypeName)
-	}
 	kBytes, _, err := sds.SplitKeyAndNonKey(v.statsRow, def.GetKeyFields())
 	if err != nil {
 		return fmt.Errorf("failed to extract stats key: %w", err)
@@ -455,10 +452,15 @@ func (v *View) loadStatsLocked(ctx context.Context) error {
 }
 
 // Stats returns a clone of the current in-memory stats row.
+// Stats are unavailable until the stats type definition exists in the registry.
 func (v *View) Stats() proto.Message {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	if v.statsRow == nil {
+	if v.statsRow == nil || v.reg == nil {
+		return nil
+	}
+	statsTypeName := string(v.statsRow.ProtoReflect().Descriptor().FullName())
+	if _, _, ok := v.reg.LookupByName(statsTypeName); !ok {
 		return nil
 	}
 	return proto.Clone(v.statsRow)
@@ -569,7 +571,7 @@ func (v *View) computeBatchStats(ctx context.Context, changes []sds.Change, base
 
 	def, _, ok := v.reg.LookupByName(statsTypeName)
 	if !ok {
-		return nil, nil, fmt.Errorf("stats type %s not in registry", statsTypeName)
+		return changes, baseStats, nil
 	}
 	keyBytes, valBytes, err := sds.SplitKeyAndNonKey(newStats, def.GetKeyFields())
 	if err != nil {
