@@ -3748,6 +3748,8 @@ func (v *Volume) dropStagedChunksLocked(inodeID uint64) {
 	delete(v.stagedMtimes, inodeID)
 }
 
+// rewriteStagedChunkLocked modifies an existing staged chunk in-place by reading, transforming, and re-appending it.
+// Kept for Truncate only.
 func (v *Volume) rewriteStagedChunkLocked(inodeID uint64, index int, modify func([]byte) []byte) error {
 	existing, ok := v.stagedChunks[inodeID][index]
 	if !ok {
@@ -3767,8 +3769,8 @@ func (v *Volume) rewriteStagedChunkLocked(inodeID uint64, index int, modify func
 }
 
 func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, data []byte, writeMode pb.WriteMode) (int64, int64, time.Time, error) {
-	nWritten, newSize, modTime, _, err := v.WriteFileWithEpoch(ctx, inodeID, offset, data, writeMode)
-	return nWritten, newSize, modTime, err
+	bytesWritten, newSize, modifiedTime, _, err := v.WriteFileWithEpoch(ctx, inodeID, offset, data, writeMode)
+	return bytesWritten, newSize, modifiedTime, err
 }
 
 func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset int64, data []byte, writeMode pb.WriteMode) (int64, int64, time.Time, int64, error) {
@@ -3787,35 +3789,35 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		return 0, 0, time.Time{}, 0, fmt.Errorf("cannot write to directory: %w", syscall.EISDIR)
 	}
 
-	dataLen := int64(len(data))
+	dataLength := int64(len(data))
 	now := time.Now()
-	cs := int64(v.chunkSize)
-	if cs == 0 {
-		cs = 64 * 1024
+	chunkSize := int64(v.chunkSize)
+	if chunkSize == 0 {
+		chunkSize = 64 * 1024
 	}
 	if node.Row.GetChunkSize() > 0 {
-		cs = int64(node.Row.GetChunkSize())
+		chunkSize = int64(node.Row.GetChunkSize())
 	}
 
-	startChunk := int(offset / cs)
-	endChunk := int((offset + dataLen - 1) / cs)
+	startChunk := int(offset / chunkSize)
+	endChunk := int((offset + dataLength - 1) / chunkSize)
 
 	// Identify which chunks require base chunk reads (partial chunk writes not yet staged).
 	// To avoid holding stagingMu across backend GetBlob, check staged chunks under stagingMu,
 	// fetch missing base chunks outside stagingMu (and outside v.mu), then reacquire stagingMu.
 	v.stagingMu.Lock()
-	if v.stagedBytes+dataLen > v.maxStagingBytes {
+	if v.stagedBytes+dataLength > v.maxStagingBytes {
 		v.stagingMu.Unlock()
 		return 0, 0, time.Time{}, 0, syscall.ENOSPC
 	}
 
-	currSize := node.Row.GetSize()
-	if s, ok := v.stagedSizes[inodeID]; ok && s > currSize {
-		currSize = s
+	currentSize := node.Row.GetSize()
+	if stagedSize, ok := v.stagedSizes[inodeID]; ok && stagedSize > currentSize {
+		currentSize = stagedSize
 	}
-	calculatedSize := offset + dataLen
-	if calculatedSize < currSize {
-		calculatedSize = currSize
+	calculatedSize := offset + dataLength
+	if calculatedSize < currentSize {
+		calculatedSize = currentSize
 	}
 
 	var neededBaseChunks []int
@@ -3823,50 +3825,50 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		if _, ok := v.stagedChunks[inodeID][i]; ok {
 			continue
 		}
-		chunkStart := int64(i) * cs
-		wStart := offset - chunkStart
-		if wStart < 0 {
-			wStart = 0
+		chunkStart := int64(i) * chunkSize
+		writeStart := offset - chunkStart
+		if writeStart < 0 {
+			writeStart = 0
 		}
-		wEnd := offset + dataLen - chunkStart
-		if wEnd > cs {
-			wEnd = cs
+		writeEnd := offset + dataLength - chunkStart
+		if writeEnd > chunkSize {
+			writeEnd = chunkSize
 		}
-		expectedChunkLen := cs
-		if int64(i+1)*cs > calculatedSize {
-			expectedChunkLen = calculatedSize - int64(i)*cs
+		expectedChunkLength := chunkSize
+		if int64(i+1)*chunkSize > calculatedSize {
+			expectedChunkLength = calculatedSize - int64(i)*chunkSize
 		}
-		if wStart > 0 || wEnd < expectedChunkLen {
+		if writeStart > 0 || writeEnd < expectedChunkLength {
 			neededBaseChunks = append(neededBaseChunks, i)
 		}
 	}
 	v.stagingMu.Unlock()
 
 	baseChunks := make(map[int][]byte, len(neededBaseChunks))
-	for _, idx := range neededBaseChunks {
-		bData, bErr := v.readBaseChunk(ctx, node, idx)
-		if bErr != nil {
-			return 0, 0, time.Time{}, 0, bErr
+	for _, index := range neededBaseChunks {
+		baseData, err := v.readBaseChunk(ctx, node, index)
+		if err != nil {
+			return 0, 0, time.Time{}, 0, err
 		}
-		if len(bData) > 0 {
-			baseChunks[idx] = bData
+		if len(baseData) > 0 {
+			baseChunks[index] = baseData
 		}
 	}
 
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
 
-	if v.stagedBytes+dataLen > v.maxStagingBytes {
+	if v.stagedBytes+dataLength > v.maxStagingBytes {
 		return 0, 0, time.Time{}, 0, syscall.ENOSPC
 	}
 
-	currSize = node.Row.GetSize()
-	if s, ok := v.stagedSizes[inodeID]; ok && s > currSize {
-		currSize = s
+	currentSize = node.Row.GetSize()
+	if stagedSize, ok := v.stagedSizes[inodeID]; ok && stagedSize > currentSize {
+		currentSize = stagedSize
 	}
-	calculatedSize = offset + dataLen
-	if calculatedSize < currSize {
-		calculatedSize = currSize
+	calculatedSize = offset + dataLength
+	if calculatedSize < currentSize {
+		calculatedSize = currentSize
 	}
 
 	// If there's inline data committed on the base inode and startChunk > 0 or write is partial,
@@ -3882,61 +3884,53 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	}
 
 	for i := startChunk; i <= endChunk; i++ {
-		chunkStart := int64(i) * cs
-		chunkEnd := chunkStart + cs
-		wStart := offset - chunkStart
-		if wStart < 0 {
-			wStart = 0
+		chunkStart := int64(i) * chunkSize
+		chunkEnd := chunkStart + chunkSize
+		writeStart := offset - chunkStart
+		if writeStart < 0 {
+			writeStart = 0
 		}
-		wEnd := offset + dataLen - chunkStart
-		if wEnd > cs {
-			wEnd = cs
+		writeEnd := offset + dataLength - chunkStart
+		if writeEnd > chunkSize {
+			writeEnd = chunkSize
 		}
 		dataStart := chunkStart - offset
 		if dataStart < 0 {
 			dataStart = 0
 		}
 		dataEnd := chunkEnd - offset
-		if dataEnd > dataLen {
-			dataEnd = dataLen
+		if dataEnd > dataLength {
+			dataEnd = dataLength
 		}
 
-		expectedChunkLen := cs
-		if int64(i+1)*cs > calculatedSize {
-			expectedChunkLen = calculatedSize - int64(i)*cs
+		expectedChunkLength := chunkSize
+		if int64(i+1)*chunkSize > calculatedSize {
+			expectedChunkLength = calculatedSize - int64(i)*chunkSize
 		}
 
-		if _, ok := v.stagedChunks[inodeID][i]; ok {
-			err := v.rewriteStagedChunkLocked(inodeID, i, func(chunkData []byte) []byte {
-				if int64(len(chunkData)) < expectedChunkLen {
-					newBuffer := make([]byte, expectedChunkLen)
-					copy(newBuffer, chunkData)
-					chunkData = newBuffer
-				}
-				copy(chunkData[wStart:wEnd], data[dataStart:dataEnd])
-				return chunkData
-			})
+		var chunkData []byte
+		if existing, ok := v.stagedChunks[inodeID][i]; ok {
+			var err error
+			chunkData, err = v.readStagedChunkBytesLocked(existing)
 			if err != nil {
-				return 0, 0, time.Time{}, 0, err
+				return 0, 0, time.Time{}, 0, fmt.Errorf("failed reading staged chunk %d: %w", i, err)
 			}
-		} else {
-			var chunkData []byte
-			if bData, ok := baseChunks[i]; ok && len(bData) > 0 {
-				chunkData = make([]byte, len(bData))
-				copy(chunkData, bData)
-			}
-			if int64(len(chunkData)) < expectedChunkLen {
-				newBuffer := make([]byte, expectedChunkLen)
-				copy(newBuffer, chunkData)
-				chunkData = newBuffer
-			}
-			copy(chunkData[wStart:wEnd], data[dataStart:dataEnd])
-			reference, err := v.appendChunkLocked(chunkData)
-			if err != nil {
-				return 0, 0, time.Time{}, 0, err
-			}
-			v.setStagedChunkLocked(inodeID, i, reference)
+		} else if baseData, ok := baseChunks[i]; ok && len(baseData) > 0 {
+			chunkData = make([]byte, len(baseData))
+			copy(chunkData, baseData)
 		}
+
+		if int64(len(chunkData)) < expectedChunkLength {
+			newBuffer := make([]byte, expectedChunkLength)
+			copy(newBuffer, chunkData)
+			chunkData = newBuffer
+		}
+		copy(chunkData[writeStart:writeEnd], data[dataStart:dataEnd])
+		reference, err := v.appendChunkLocked(chunkData)
+		if err != nil {
+			return 0, 0, time.Time{}, 0, err
+		}
+		v.setStagedChunkLocked(inodeID, i, reference)
 	}
 
 	v.stagedSizes[inodeID] = calculatedSize
@@ -3947,7 +3941,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
 	}
 
-	return dataLen, calculatedSize, now, v.stagingEpoch, nil
+	return dataLength, calculatedSize, now, v.stagingEpoch, nil
 }
 
 func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (*pb.EntryAttr, error) {
