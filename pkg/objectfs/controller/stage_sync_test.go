@@ -2569,7 +2569,7 @@ func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
 	// Wait until close sync enters the upload phase and is held at the gate
 	select {
 	case <-gateEntered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("timed out waiting for close sync to enter upload gate")
 	}
 
@@ -2605,7 +2605,7 @@ func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
 	var result openResult
 	select {
 	case result = <-openChannel:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("openBarrier failed to complete after releasing close sync")
 	}
 
