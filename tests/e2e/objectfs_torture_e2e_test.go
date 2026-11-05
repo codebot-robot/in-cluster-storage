@@ -231,7 +231,7 @@ func setupObjectFSTortureCluster(t *testing.T, clusterName string) (*Harness, st
 	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/objectfs-node-daemon/Dockerfile"), experimentRoot)
 	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
 	h.DockerBuild("fakes3:e2e", filepath.Join(experimentRoot, "fakes3/images/fakes3/Dockerfile"), experimentRoot)
-	h.DockerBuild("certsigner:e2e", filepath.Join(experimentRoot, "certsigner/images/certsigner/Dockerfile"), filepath.Join(experimentRoot, "certsigner"))
+	h.DockerBuild("certsigner:e2e", filepath.Join(experimentRoot, "certsigner/images/certsigner/Dockerfile"), experimentRoot)
 
 	h.KindLoad("objectfs-controller:e2e")
 	h.KindLoad("objectfs-node-daemon:e2e")
