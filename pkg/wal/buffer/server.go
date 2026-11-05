@@ -65,13 +65,6 @@ type incomingItem struct {
 	streamID  uuid.UUID
 	streamSeq uint64
 	payload   []byte
-	ackChan   chan ackResult
-}
-
-type ackResult struct {
-	witnessSeq uint64
-	s3Seq      uint64
-	err        error
 }
 
 type streamState struct {
@@ -79,6 +72,9 @@ type streamState struct {
 	cond        *sync.Cond
 	witnessSeq  uint64
 	s3Seq       uint64
+	commitErr   error
+	inFlight    int
+	ackNeeded   bool
 	attachments int
 	waiters     int
 }
@@ -477,7 +473,8 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 
 // Append handles the bidirectional client append stream.
 func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
-	ctx := stream.Context()
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
 
 	// 1. First message MUST be Hello
 	firstReq, err := stream.Recv()
@@ -553,7 +550,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		return status.Errorf(codes.Unavailable, "server shutting down")
 	}
 
-	// Wake the S3 ack forwarding goroutine on context cancellation or stream return so it can exit.
+	// Wake the condition variable on context cancellation or stream return so it can exit.
 	stopCtxWatcher := context.AfterFunc(ctx, func() {
 		st.mu.Lock()
 		st.cond.Broadcast()
@@ -561,12 +558,14 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	})
 	defer stopCtxWatcher()
 
-	// Forward S3 acks notifications to outCh
+	// Forward watermark acks (witness and S3) to outCh
+	forwarderErrChan := make(chan error, 1)
 	go func() {
+		lastAckedWitness := witnessSeq
 		lastAckedS3 := s3Seq
 		for {
 			st.mu.Lock()
-			for st.s3Seq <= lastAckedS3 {
+			for st.witnessSeq <= lastAckedWitness && st.s3Seq <= lastAckedS3 && !st.ackNeeded && st.commitErr == nil {
 				select {
 				case <-ctx.Done():
 					st.mu.Unlock()
@@ -580,9 +579,22 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 				st.cond.Wait()
 				st.waiters--
 			}
-			curWitness := st.witnessSeq
-			curS3 := st.s3Seq
-			lastAckedS3 = curS3
+
+			if st.commitErr != nil {
+				commitErr := st.commitErr
+				st.mu.Unlock()
+				select {
+				case forwarderErrChan <- status.Errorf(codes.Internal, "commit failed: %v", commitErr):
+				default:
+				}
+				return
+			}
+
+			currentWitness := st.witnessSeq
+			currentS3 := st.s3Seq
+			lastAckedWitness = currentWitness
+			lastAckedS3 = currentS3
+			st.ackNeeded = false
 			st.mu.Unlock()
 
 			select {
@@ -593,8 +605,8 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 			case outCh <- &pb.AppendResponse{
 				Msg: &pb.AppendResponse_Ack{
 					Ack: &pb.Ack{
-						WitnessAckedStreamSeq: curWitness,
-						S3AckedStreamSeq:      curS3,
+						WitnessAckedStreamSeq: currentWitness,
+						S3AckedStreamSeq:      currentS3,
 					},
 				},
 			}:
@@ -602,87 +614,148 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		}
 	}()
 
+	type receiveResult struct {
+		request *pb.AppendRequest
+		err     error
+	}
+
+	// This receive goroutine exists solely so the handler can return Internal
+	// promptly when a commit fails while the client is idle waiting for
+	// acknowledgements, because gRPC provides no server-side mechanism to
+	// interrupt stream.Recv().
+	receiveChan := make(chan receiveResult)
+	go func() {
+		for {
+			request, err := stream.Recv()
+			select {
+			case receiveChan <- receiveResult{request: request, err: err}:
+				if err != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			case <-s.stopChan:
+				return
+			}
+		}
+	}()
+
+	decInFlight := func() {
+		st.mu.Lock()
+		st.inFlight--
+		st.cond.Broadcast()
+		st.mu.Unlock()
+	}
+
 	// Read loop for AppendRequest records
 	for {
-		req, err := stream.Recv()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
+		var result receiveResult
+		select {
+		case result = <-receiveChan:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.stopChan:
+			return status.Errorf(codes.Unavailable, "server shutting down")
+		case err := <-forwarderErrChan:
+			return err
+		case err := <-sendErrCh:
 			return err
 		}
 
-		pbRec := req.GetRecord()
+		if result.err != nil {
+			if errors.Is(result.err, io.EOF) {
+				st.mu.Lock()
+				for st.inFlight > 0 && st.commitErr == nil {
+					select {
+					case <-ctx.Done():
+						st.mu.Unlock()
+						return ctx.Err()
+					case <-s.stopChan:
+						st.mu.Unlock()
+						return status.Errorf(codes.Unavailable, "server shutting down")
+					case err := <-sendErrCh:
+						st.mu.Unlock()
+						return err
+					default:
+					}
+					st.cond.Wait()
+				}
+				if st.commitErr != nil {
+					commitErr := st.commitErr
+					st.mu.Unlock()
+					return status.Errorf(codes.Internal, "commit failed: %v", commitErr)
+				}
+				st.mu.Unlock()
+				return nil
+			}
+			return result.err
+		}
+
+		pbRec := result.request.GetRecord()
 		if pbRec == nil {
 			continue
 		}
 
 		st.mu.Lock()
-		curWitness := st.witnessSeq
-		curS3 := st.s3Seq
-		st.mu.Unlock()
+		if st.commitErr != nil {
+			commitErr := st.commitErr
+			st.mu.Unlock()
+			return status.Errorf(codes.Internal, "commit failed: %v", commitErr)
+		}
 
-		// Idempotency: duplicate records at or below witness watermark are acked and dropped
-		if pbRec.StreamSeq <= curWitness {
-			select {
-			case outCh <- &pb.AppendResponse{
-				Msg: &pb.AppendResponse_Ack{
-					Ack: &pb.Ack{
-						WitnessAckedStreamSeq: curWitness,
-						S3AckedStreamSeq:      curS3,
-					},
-				},
-			}:
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-s.stopChan:
-				return status.Errorf(codes.Unavailable, "server shutting down")
-			}
+		// Idempotency: duplicate records at or below witness watermark trigger an Ack from the forwarder
+		if pbRec.StreamSeq <= st.witnessSeq {
+			st.ackNeeded = true
+			st.cond.Broadcast()
+			st.mu.Unlock()
 			continue
 		}
 
-		// Submit to group commit
-		ackChan := make(chan ackResult, 1)
+		// Backpressure: wait while inFlight >= 1024
+		for st.inFlight >= 1024 && st.commitErr == nil {
+			select {
+			case <-ctx.Done():
+				st.mu.Unlock()
+				return ctx.Err()
+			case <-s.stopChan:
+				st.mu.Unlock()
+				return status.Errorf(codes.Unavailable, "server shutting down")
+			case err := <-forwarderErrChan:
+				st.mu.Unlock()
+				return err
+			case err := <-sendErrCh:
+				st.mu.Unlock()
+				return err
+			default:
+			}
+			st.cond.Wait()
+		}
+		if st.commitErr != nil {
+			commitErr := st.commitErr
+			st.mu.Unlock()
+			return status.Errorf(codes.Internal, "commit failed: %v", commitErr)
+		}
+
+		st.inFlight++
+		st.mu.Unlock()
+
 		select {
 		case s.incomingChan <- incomingItem{
 			streamID:  streamID,
 			streamSeq: pbRec.StreamSeq,
 			payload:   pbRec.Payload,
-			ackChan:   ackChan,
 		}:
 		case <-ctx.Done():
+			decInFlight()
 			return ctx.Err()
 		case <-s.stopChan:
+			decInFlight()
 			return status.Errorf(codes.Unavailable, "server shutting down")
-		case err := <-sendErrCh:
+		case err := <-forwarderErrChan:
+			decInFlight()
 			return err
-		}
-
-		// Wait for witness commit result
-		select {
-		case res := <-ackChan:
-			if res.err != nil {
-				return status.Errorf(codes.Internal, "commit failed: %v", res.err)
-			}
-			select {
-			case outCh <- &pb.AppendResponse{
-				Msg: &pb.AppendResponse_Ack{
-					Ack: &pb.Ack{
-						WitnessAckedStreamSeq: res.witnessSeq,
-						S3AckedStreamSeq:      res.s3Seq,
-					},
-				},
-			}:
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-s.stopChan:
-				return status.Errorf(codes.Unavailable, "server shutting down")
-			}
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-s.stopChan:
-			return status.Errorf(codes.Unavailable, "server shutting down")
 		case err := <-sendErrCh:
+			decInFlight()
 			return err
 		}
 	}
@@ -751,8 +824,21 @@ func (s *Server) commitItems(items []incomingItem) {
 	// 1. Write batch to local log segment store and fsync
 	if err := s.localStore.AppendBatch(recordsToStore); err != nil {
 		klog.Errorf("Failed writing batch to local log segment store: %v", err)
+		streamCounts := make(map[string]int)
 		for _, item := range items {
-			item.ackChan <- ackResult{err: err}
+			streamCounts[item.streamID.String()]++
+		}
+		for sid, count := range streamCounts {
+			st := s.streams[sid]
+			if st != nil {
+				st.mu.Lock()
+				if st.commitErr == nil {
+					st.commitErr = err
+				}
+				st.inFlight -= count
+				st.cond.Broadcast()
+				st.mu.Unlock()
+			}
 		}
 		return
 	}
@@ -777,30 +863,19 @@ func (s *Server) commitItems(items []incomingItem) {
 	}
 	s.tailMu.Unlock()
 
-	// 3. Update stream witness watermarks and send results
+	// 3. Update stream witness watermarks, decrement inFlight, and broadcast
 	streamCounts := make(map[string]int)
 	streamMinSeq := make(map[string]uint64)
 	streamMaxSeq := make(map[string]uint64)
 
-	for i, item := range items {
+	for i := range items {
 		rec := recordsToStore[i]
 		sid := rec.StreamID.String()
 		st := s.streams[sid]
 		if st == nil {
 			st = newStreamState(rec.StreamSeq, 0)
 			s.streams[sid] = st
-		} else {
-			st.mu.Lock()
-			if rec.StreamSeq > st.witnessSeq {
-				st.witnessSeq = rec.StreamSeq
-			}
-			st.mu.Unlock()
 		}
-
-		st.mu.Lock()
-		wSeq := st.witnessSeq
-		sSeq := st.s3Seq
-		st.mu.Unlock()
 
 		streamCounts[sid]++
 		if _, ok := streamMinSeq[sid]; !ok || rec.StreamSeq < streamMinSeq[sid] {
@@ -809,16 +884,23 @@ func (s *Server) commitItems(items []incomingItem) {
 		if rec.StreamSeq > streamMaxSeq[sid] {
 			streamMaxSeq[sid] = rec.StreamSeq
 		}
-
-		item.ackChan <- ackResult{
-			witnessSeq: wSeq,
-			s3Seq:      sSeq,
-		}
 	}
 
 	for sid, count := range streamCounts {
 		st := s.streams[sid]
 		st.mu.Lock()
+		maxSeq := streamMaxSeq[sid]
+		if maxSeq > st.witnessSeq {
+			st.witnessSeq = maxSeq
+		}
+		st.inFlight -= count
+		if st.inFlight < 0 {
+			// A negative inFlight count indicates counter imbalance. This can only
+			// happen spuriously if a stream was evicted by evictIdleStreams and recreated
+			// in commitItems while items were still queued.
+			klog.Errorf("WAL buffer stream %s: negative inFlight count %d after committing %d items", sid, st.inFlight, count)
+		}
+		st.cond.Broadcast()
 		wSeq := st.witnessSeq
 		st.mu.Unlock()
 		klog.Infof("WAL buffer stream %s: accepted %d records (%d..%d, witness watermark=%d)",

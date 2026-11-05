@@ -67,14 +67,7 @@ func TestPeriodicPerStreamSealing(t *testing.T) {
 
 	// Append 10 records to Stream A
 	for i := uint64(1); i <= 10; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamIDA,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("rec-A-%d", i)),
-			ackChan:   ackChan,
-		}
-		<-ackChan
+		appendDirectRecord(t, srv, streamIDA, i, []byte(fmt.Sprintf("rec-A-%d", i)))
 	}
 
 	// Trigger manual seal on Stream A
@@ -110,14 +103,7 @@ func TestPeriodicPerStreamSealing(t *testing.T) {
 
 	// Append next batch to Stream A (records 11..15)
 	for i := uint64(11); i <= 15; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamIDA,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("rec-A-%d", i)),
-			ackChan:   ackChan,
-		}
-		<-ackChan
+		appendDirectRecord(t, srv, streamIDA, i, []byte(fmt.Sprintf("rec-A-%d", i)))
 	}
 
 	// Seal again
@@ -166,23 +152,9 @@ func TestAggregatedSegmentGCWhenCovered(t *testing.T) {
 
 	// Append records for both streams into the same aggregated batch
 	for i := uint64(1); i <= 5; i++ {
-		ackChanA := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamIDA,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("A-%d", i)),
-			ackChan:   ackChanA,
-		}
-		<-ackChanA
+		appendDirectRecord(t, srv, streamIDA, i, []byte(fmt.Sprintf("A-%d", i)))
 
-		ackChanB := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamIDB,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("B-%d", i)),
-			ackChan:   ackChanB,
-		}
-		<-ackChanB
+		appendDirectRecord(t, srv, streamIDB, i, []byte(fmt.Sprintf("B-%d", i)))
 	}
 
 	// Flush aggregated segment to object storage (positions 1..10)
@@ -377,14 +349,7 @@ func TestCrashRecoveryAndSplitResumption(t *testing.T) {
 	}
 
 	for i := uint64(1); i <= 5; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv1.incomingChan <- incomingItem{
-			streamID:  streamID,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("crash-rec-%d", i)),
-			ackChan:   ackChan,
-		}
-		<-ackChan
+		appendDirectRecord(t, srv1, streamID, i, []byte(fmt.Sprintf("crash-rec-%d", i)))
 	}
 	if _, err := srv1.Flush(ctx, &pb.FlushRequest{}); err != nil {
 		t.Fatalf("Flush failed: %v", err)
@@ -428,14 +393,7 @@ func TestCrashRecoveryAndSplitResumption(t *testing.T) {
 
 	// 4. Append 5 more records (6..10)
 	for i := uint64(6); i <= 10; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv2.incomingChan <- incomingItem{
-			streamID:  streamID,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("crash-rec-%d", i)),
-			ackChan:   ackChan,
-		}
-		<-ackChan
+		appendDirectRecord(t, srv2, streamID, i, []byte(fmt.Sprintf("crash-rec-%d", i)))
 	}
 
 	// 5. Seal stream: must create from00000000000000000001-to00000000000000000010.wal
@@ -500,14 +458,7 @@ func TestSnapshotThenTrimRetention(t *testing.T) {
 
 	appendAndSealBatch := func(start, end uint64) {
 		for i := start; i <= end; i++ {
-			ackChan := make(chan ackResult, 1)
-			srv.incomingChan <- incomingItem{
-				streamID:  streamID,
-				streamSeq: i,
-				payload:   []byte(fmt.Sprintf("rec-%d", i)),
-				ackChan:   ackChan,
-			}
-			<-ackChan
+			appendDirectRecord(t, srv, streamID, i, []byte(fmt.Sprintf("rec-%d", i)))
 		}
 		if err := srv.SealStream(ctx, streamID); err != nil {
 			t.Fatalf("SealStream failed: %v", err)
@@ -607,14 +558,7 @@ func TestSealUploadFailurePreservesFileSequenceAndRetries(t *testing.T) {
 
 	// 1. Append 5 records (1..5)
 	for i := uint64(1); i <= 5; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamID,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("rec-%d", i)),
-			ackChan:   ackChan,
-		}
-		<-ackChan
+		appendDirectRecord(t, srv, streamID, i, []byte(fmt.Sprintf("rec-%d", i)))
 	}
 
 	// 2. First seal fails upload because failStreamPut is true
@@ -643,14 +587,7 @@ func TestSealUploadFailurePreservesFileSequenceAndRetries(t *testing.T) {
 
 	// 3. Append 2 more records (6..7)
 	for i := uint64(6); i <= 7; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamID,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("rec-%d", i)),
-			ackChan:   ackChan,
-		}
-		<-ackChan
+		appendDirectRecord(t, srv, streamID, i, []byte(fmt.Sprintf("rec-%d", i)))
 	}
 
 	// 4. Clear failure and seal again
@@ -734,14 +671,7 @@ func TestAggregatedSegmentGCPreservedDuringUploadFailure(t *testing.T) {
 	streamID := uuid.New()
 
 	for i := uint64(1); i <= 5; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamID,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("rec-%d", i)),
-			ackChan:   ackChan,
-		}
-		<-ackChan
+		appendDirectRecord(t, srv, streamID, i, []byte(fmt.Sprintf("rec-%d", i)))
 	}
 
 	// Flush aggregated segment 1..5 to object storage
@@ -894,14 +824,7 @@ func TestBufferRestart_ReadsOnlyUncoveredSegments(t *testing.T) {
 	for batch := 0; batch < 8; batch++ {
 		for i := 0; i < 10; i++ {
 			currentSeqA++
-			ackChan := make(chan ackResult, 1)
-			srv1.incomingChan <- incomingItem{
-				streamID:  streamIDA,
-				streamSeq: currentSeqA,
-				payload:   []byte(fmt.Sprintf("rec-a-%d", currentSeqA)),
-				ackChan:   ackChan,
-			}
-			<-ackChan
+			appendDirectRecord(t, srv1, streamIDA, currentSeqA, []byte(fmt.Sprintf("rec-a-%d", currentSeqA)))
 		}
 		if _, err := srv1.Flush(ctx, &pb.FlushRequest{}); err != nil {
 			t.Fatalf("Flush batch %d failed: %v", batch, err)
@@ -920,24 +843,10 @@ func TestBufferRestart_ReadsOnlyUncoveredSegments(t *testing.T) {
 	for batch := 8; batch < 10; batch++ {
 		for i := 0; i < 10; i++ {
 			currentSeqA++
-			ackChanA := make(chan ackResult, 1)
-			srv1.incomingChan <- incomingItem{
-				streamID:  streamIDA,
-				streamSeq: currentSeqA,
-				payload:   []byte(fmt.Sprintf("rec-a-%d", currentSeqA)),
-				ackChan:   ackChanA,
-			}
-			<-ackChanA
+			appendDirectRecord(t, srv1, streamIDA, currentSeqA, []byte(fmt.Sprintf("rec-a-%d", currentSeqA)))
 
 			currentSeqB++
-			ackChanB := make(chan ackResult, 1)
-			srv1.incomingChan <- incomingItem{
-				streamID:  streamIDB,
-				streamSeq: currentSeqB,
-				payload:   []byte(fmt.Sprintf("rec-b-%d", currentSeqB)),
-				ackChan:   ackChanB,
-			}
-			<-ackChanB
+			appendDirectRecord(t, srv1, streamIDB, currentSeqB, []byte(fmt.Sprintf("rec-b-%d", currentSeqB)))
 		}
 		if _, err := srv1.Flush(ctx, &pb.FlushRequest{}); err != nil {
 			t.Fatalf("Flush tail batch %d failed: %v", batch, err)
@@ -1078,24 +987,10 @@ func TestBufferRestart_InterleavedUnsealedStreamNotSkipped(t *testing.T) {
 	for batch := 0; batch < 5; batch++ {
 		for i := 0; i < 5; i++ {
 			seqA++
-			ackChanA := make(chan ackResult, 1)
-			srv1.incomingChan <- incomingItem{
-				streamID:  streamIDA,
-				streamSeq: seqA,
-				payload:   []byte(fmt.Sprintf("rec-a-%d", seqA)),
-				ackChan:   ackChanA,
-			}
-			<-ackChanA
+			appendDirectRecord(t, srv1, streamIDA, seqA, []byte(fmt.Sprintf("rec-a-%d", seqA)))
 
 			seqB++
-			ackChanB := make(chan ackResult, 1)
-			srv1.incomingChan <- incomingItem{
-				streamID:  streamIDB,
-				streamSeq: seqB,
-				payload:   []byte(fmt.Sprintf("rec-b-%d", seqB)),
-				ackChan:   ackChanB,
-			}
-			<-ackChanB
+			appendDirectRecord(t, srv1, streamIDB, seqB, []byte(fmt.Sprintf("rec-b-%d", seqB)))
 		}
 		if _, err := srv1.Flush(ctx, &pb.FlushRequest{}); err != nil {
 			t.Fatalf("Flush batch %d failed: %v", batch, err)
@@ -1312,17 +1207,7 @@ func TestCoverage_IndependentOfStreamCount(t *testing.T) {
 
 	// Append records to all N streams and flush them
 	for _, sid := range streamIDs {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  sid,
-			streamSeq: 1,
-			payload:   []byte("test-payload"),
-			ackChan:   ackChan,
-		}
-		res := <-ackChan
-		if res.err != nil {
-			t.Fatalf("append failed: %v", res.err)
-		}
+		appendDirectRecord(t, srv, sid, 1, []byte("test-payload"))
 	}
 
 	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
@@ -1338,17 +1223,7 @@ func TestCoverage_IndependentOfStreamCount(t *testing.T) {
 
 	// Append unsealed record to only the first stream (streamIDs[0])
 	activeID := streamIDs[0]
-	ackChan := make(chan ackResult, 1)
-	srv.incomingChan <- incomingItem{
-		streamID:  activeID,
-		streamSeq: 2,
-		payload:   []byte("active-unsealed-record"),
-		ackChan:   ackChan,
-	}
-	res := <-ackChan
-	if res.err != nil {
-		t.Fatalf("append active record failed: %v", res.err)
-	}
+	appendDirectRecord(t, srv, activeID, 2, []byte("active-unsealed-record"))
 
 	// Run seal passes: first pass marks idle streams, second pass evicts them
 	srv.streamStore.checkSealsAndGC(ctx)
@@ -1522,17 +1397,7 @@ func TestTail_SurvivesWriterEvictionAndReseal(t *testing.T) {
 
 	appendRecords := func(from, to uint64) {
 		for seq := from; seq <= to; seq++ {
-			ackChan := make(chan ackResult, 1)
-			srv.incomingChan <- incomingItem{
-				streamID:  streamID,
-				streamSeq: seq,
-				payload:   []byte(fmt.Sprintf("rec-%d", seq)),
-				ackChan:   ackChan,
-			}
-			res := <-ackChan
-			if res.err != nil {
-				t.Fatalf("append %d failed: %v", seq, res.err)
-			}
+			appendDirectRecord(t, srv, streamID, seq, []byte(fmt.Sprintf("rec-%d", seq)))
 		}
 		if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
 			t.Fatalf("flush failed: %v", err)
@@ -1658,16 +1523,7 @@ func TestMeasurement_SealPass1kStreams(t *testing.T) {
 
 	// Append and seal all 1000 streams
 	for _, sid := range streamIDs {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  sid,
-			streamSeq: 1,
-			payload:   []byte("payload"),
-			ackChan:   ackChan,
-		}
-		if res := <-ackChan; res.err != nil {
-			t.Fatalf("append failed: %v", res.err)
-		}
+		appendDirectRecord(t, srv, sid, 1, []byte("payload"))
 	}
 	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
 		t.Fatalf("flush failed: %v", err)
@@ -1680,16 +1536,7 @@ func TestMeasurement_SealPass1kStreams(t *testing.T) {
 
 	// 1 active stream keeps appending
 	activeID := streamIDs[0]
-	ackChan := make(chan ackResult, 1)
-	srv.incomingChan <- incomingItem{
-		streamID:  activeID,
-		streamSeq: 2,
-		payload:   []byte("payload-2"),
-		ackChan:   ackChan,
-	}
-	if res := <-ackChan; res.err != nil {
-		t.Fatalf("append active failed: %v", res.err)
-	}
+	appendDirectRecord(t, srv, activeID, 2, []byte("payload-2"))
 
 	// Measure pass 1 (before eviction: all 1,000 writers in memory)
 	start1 := time.Now()
@@ -1733,17 +1580,7 @@ func TestServerStreams_EvictsIdleEntries(t *testing.T) {
 
 	// Append and seal all 20 streams
 	for _, sid := range streamIDs {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  sid,
-			streamSeq: 1,
-			payload:   []byte("test-payload"),
-			ackChan:   ackChan,
-		}
-		res := <-ackChan
-		if res.err != nil {
-			t.Fatalf("append failed: %v", res.err)
-		}
+		appendDirectRecord(t, srv, sid, 1, []byte("test-payload"))
 	}
 
 	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
@@ -1758,17 +1595,7 @@ func TestServerStreams_EvictsIdleEntries(t *testing.T) {
 
 	// 1 active stream keeps an unsealed record
 	activeID := streamIDs[0]
-	ackChan := make(chan ackResult, 1)
-	srv.incomingChan <- incomingItem{
-		streamID:  activeID,
-		streamSeq: 2,
-		payload:   []byte("active-unsealed-record"),
-		ackChan:   ackChan,
-	}
-	res := <-ackChan
-	if res.err != nil {
-		t.Fatalf("append active failed: %v", res.err)
-	}
+	appendDirectRecord(t, srv, activeID, 2, []byte("active-unsealed-record"))
 
 	beforeCount := srv.StreamCount()
 	if beforeCount != totalStreams {
@@ -1814,16 +1641,7 @@ func TestServerStreams_BlockedWaiterPinsEntry(t *testing.T) {
 	defer srv.Close()
 
 	streamID := uuid.New()
-	ackChan := make(chan ackResult, 1)
-	srv.incomingChan <- incomingItem{
-		streamID:  streamID,
-		streamSeq: 1,
-		payload:   []byte("data"),
-		ackChan:   ackChan,
-	}
-	if res := <-ackChan; res.err != nil {
-		t.Fatalf("append failed: %v", res.err)
-	}
+	appendDirectRecord(t, srv, streamID, 1, []byte("data"))
 	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
 		t.Fatalf("flush failed: %v", err)
 	}
@@ -1890,16 +1708,7 @@ func TestServerStreams_AttachedHandlerPinsEntry(t *testing.T) {
 	defer srv.Close()
 
 	streamID := uuid.New()
-	ackChan := make(chan ackResult, 1)
-	srv.incomingChan <- incomingItem{
-		streamID:  streamID,
-		streamSeq: 1,
-		payload:   []byte("data"),
-		ackChan:   ackChan,
-	}
-	if res := <-ackChan; res.err != nil {
-		t.Fatalf("append failed: %v", res.err)
-	}
+	appendDirectRecord(t, srv, streamID, 1, []byte("data"))
 	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
 		t.Fatalf("flush failed: %v", err)
 	}
@@ -2094,16 +1903,7 @@ func TestServerStreams_ReconnectAfterEvictionReportsWatermarks(t *testing.T) {
 
 	streamID := uuid.New()
 	for seq := uint64(1); seq <= 5; seq++ {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamID,
-			streamSeq: seq,
-			payload:   []byte(fmt.Sprintf("record-%d", seq)),
-			ackChan:   ackChan,
-		}
-		if res := <-ackChan; res.err != nil {
-			t.Fatalf("append seq %d failed: %v", seq, res.err)
-		}
+		appendDirectRecord(t, srv, streamID, seq, []byte(fmt.Sprintf("record-%d", seq)))
 	}
 
 	if _, err := srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
