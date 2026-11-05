@@ -78,7 +78,7 @@ func buildAndLoadE2EImages(h *Harness, gitRoot string) {
 	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(gitRoot, "images/objectfs-node-daemon/Dockerfile"), gitRoot)
 	h.DockerBuild("wal-buffer:e2e", filepath.Join(gitRoot, "images/wal-buffer/Dockerfile"), gitRoot)
 	h.DockerBuild("fakes3:e2e", filepath.Join(gitRoot, "fakes3/images/fakes3/Dockerfile"), gitRoot)
-	h.DockerBuild("certsigner:e2e", filepath.Join(gitRoot, "certsigner/images/certsigner/Dockerfile"), filepath.Join(gitRoot, "certsigner"))
+	h.DockerBuild("certsigner:e2e", filepath.Join(gitRoot, "certsigner/images/certsigner/Dockerfile"), gitRoot)
 
 	h.KindLoad("objectfs-controller:e2e")
 	h.KindLoad("objectfs-node-daemon:e2e")

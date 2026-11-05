@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build context is the certsigner/ module directory.
 FROM golang:1.27.3 AS builder
 
 WORKDIR /app
 COPY . .
+WORKDIR /app/certsigner
+RUN go mod download
 RUN CGO_ENABLED=0 go build -o certsigner ./cmd/certsigner
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /app/certsigner /usr/local/bin/certsigner
+COPY --from=builder /app/certsigner/certsigner /usr/local/bin/certsigner
 
 ENTRYPOINT ["/usr/local/bin/certsigner"]
