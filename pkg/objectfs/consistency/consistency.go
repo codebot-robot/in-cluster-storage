@@ -21,71 +21,39 @@ limitations under the License.
 package consistency
 
 import (
-	"flag"
-	"fmt"
-
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/protoenum"
 )
 
-// ParseConsistencyMode parses a consistency mode string into a ConsistencyMode enum.
+// Parse parses a consistency mode string into a ConsistencyMode enum.
 // In accordance with ObjectFS StorageClass parameter conventions, accepted canonical
 // values are lowercase-hyphenated: "standard" and "close-to-open".
 // An empty string parses as CONSISTENCY_MODE_UNSPECIFIED.
 // Any other value returns an error naming the accepted values.
+func Parse(value string) (pb.ConsistencyMode, error) {
+	number, err := protoenum.Parse(pb.ConsistencyMode(0).Descriptor(), value)
+	return pb.ConsistencyMode(number), err
+}
+
+// ParseConsistencyMode parses a consistency mode string into a ConsistencyMode enum.
 func ParseConsistencyMode(value string) (pb.ConsistencyMode, error) {
-	switch value {
-	case "":
-		return pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, nil
-	case "standard":
-		return pb.ConsistencyMode_STANDARD, nil
-	case "close-to-open":
-		return pb.ConsistencyMode_CLOSE_TO_OPEN, nil
-	default:
-		return pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, fmt.Errorf("unknown consistency mode %q (accepted values: standard, close-to-open)", value)
-	}
+	return Parse(value)
+}
+
+// String returns the canonical user-facing string for mode ("standard" or "close-to-open").
+func String(mode pb.ConsistencyMode) string {
+	return protoenum.Name(mode)
 }
 
 // ConsistencyModeString returns the canonical user-facing string for mode ("standard" or "close-to-open").
 func ConsistencyModeString(mode pb.ConsistencyMode) string {
-	switch mode {
-	case pb.ConsistencyMode_STANDARD:
-		return "standard"
-	case pb.ConsistencyMode_CLOSE_TO_OPEN:
-		return "close-to-open"
-	default:
-		return ""
-	}
+	return String(mode)
 }
 
 // Value wraps a *pb.ConsistencyMode to implement flag.Value and pflag.Value.
-type Value struct {
-	target *pb.ConsistencyMode
-}
-
-var _ flag.Value = (*Value)(nil)
+type Value = protoenum.Value[pb.ConsistencyMode]
 
 // NewValue returns a Value that sets target when parsed.
 func NewValue(target *pb.ConsistencyMode) *Value {
-	return &Value{target: target}
+	return protoenum.NewValue(target)
 }
-
-func (v *Value) String() string {
-	if v == nil || v.target == nil {
-		return ""
-	}
-	return ConsistencyModeString(*v.target)
-}
-
-func (v *Value) Set(value string) error {
-	if v == nil || v.target == nil {
-		return fmt.Errorf("consistency value target is nil")
-	}
-	mode, err := ParseConsistencyMode(value)
-	if err != nil {
-		return err
-	}
-	*v.target = mode
-	return nil
-}
-
-func (v *Value) Type() string { return "mode" }
