@@ -1,0 +1,82 @@
+/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"errors"
+	"flag"
+	"net"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuseholder"
+	"k8s.io/klog/v2"
+)
+
+var socketPath = flag.String("socket-path", "/run/objectfs/fuse-holder.sock", "Path to Unix domain socket")
+
+func main() {
+	klog.InitFlags(nil)
+	flag.Parse()
+
+	if *socketPath == "" {
+		klog.Fatal("--socket-path is required")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(*socketPath), 0755); err != nil {
+		klog.Fatalf("failed to create socket directory: %v", err)
+	}
+	if err := os.Remove(*socketPath); err != nil && !os.IsNotExist(err) {
+		klog.Fatalf("failed to remove existing socket: %v", err)
+	}
+
+	listener, err := net.Listen("unix", *socketPath)
+	if err != nil {
+		klog.Fatalf("failed to listen on socket %s: %v", *socketPath, err)
+	}
+	defer func() {
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			klog.Warningf("failed to close listener: %v", closeErr)
+		}
+	}()
+
+	holder := fuseholder.New()
+	defer func() {
+		if closeErr := holder.Close(); closeErr != nil {
+			klog.Warningf("failed to close holder: %v", closeErr)
+		}
+	}()
+
+	stopSignal := make(chan os.Signal, 1)
+	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stopSignal
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			klog.Warningf("failed to close listener on signal: %v", err)
+		}
+		if err := holder.Close(); err != nil {
+			klog.Warningf("failed to close holder on signal: %v", err)
+		}
+	}()
+
+	klog.Infof("FUSE holder listening on %s", *socketPath)
+	if err := holder.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
+		klog.Fatalf("holder serve error: %v", err)
+	}
+}
