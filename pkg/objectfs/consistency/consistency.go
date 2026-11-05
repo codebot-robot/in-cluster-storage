@@ -35,19 +35,9 @@ func Parse(value string) (pb.ConsistencyMode, error) {
 	return pb.ConsistencyMode(number), err
 }
 
-// ParseConsistencyMode parses a consistency mode string into a ConsistencyMode enum.
-func ParseConsistencyMode(value string) (pb.ConsistencyMode, error) {
-	return Parse(value)
-}
-
 // String returns the canonical user-facing string for mode ("standard" or "close-to-open").
 func String(mode pb.ConsistencyMode) string {
 	return protoenum.Name(mode)
-}
-
-// ConsistencyModeString returns the canonical user-facing string for mode ("standard" or "close-to-open").
-func ConsistencyModeString(mode pb.ConsistencyMode) string {
-	return String(mode)
 }
 
 // Value wraps a *pb.ConsistencyMode to implement flag.Value and pflag.Value.

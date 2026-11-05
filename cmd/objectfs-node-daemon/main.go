@@ -298,7 +298,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return nil, fmt.Errorf("volumeID is required")
 	}
 
-	consistencyMode, err := consistency.ParseConsistencyMode(req.GetVolumeContext()["consistency"])
+	consistencyMode, err := consistency.Parse(req.GetVolumeContext()["consistency"])
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
