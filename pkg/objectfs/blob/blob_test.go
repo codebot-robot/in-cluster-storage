@@ -1477,6 +1477,77 @@ func TestIncrementalPack_LookupAndReadBlob(t *testing.T) {
 	}
 }
 
+func TestIncrementalPack_SealWriteFailureLeavesPackAppendable(t *testing.T) {
+	dir := t.TempDir()
+	packPath := filepath.Join(dir, "pack.pack")
+	pack, err := NewIncrementalPack(packPath, 10)
+	if err != nil {
+		t.Fatalf("NewIncrementalPack failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := pack.Close(); closeErr != nil {
+			t.Errorf("pack.Close failed: %v", closeErr)
+		}
+	})
+
+	chunk1 := []byte("first chunk data")
+	entry1, err := pack.Append(chunk1)
+	if err != nil {
+		t.Fatalf("Append 1 failed: %v", err)
+	}
+
+	// Swap the underlying file with a read-only descriptor to cause WriteAt in Seal to fail.
+	rwFile := pack.file
+	roFile, err := os.Open(packPath)
+	if err != nil {
+		t.Fatalf("os.Open read-only failed: %v", err)
+	}
+	pack.file = roFile
+
+	if err := pack.Seal(); err == nil {
+		t.Fatalf("expected Seal to fail on read-only file descriptor")
+	}
+
+	// Restore the writable file descriptor.
+	if closeErr := roFile.Close(); closeErr != nil {
+		t.Fatalf("roFile.Close failed: %v", closeErr)
+	}
+	pack.file = rwFile
+
+	// Verify that the pack was NOT marked sealed: Append of a new chunk must succeed.
+	chunk2 := []byte("second chunk data")
+	entry2, err := pack.Append(chunk2)
+	if err != nil {
+		t.Fatalf("Append 2 failed after seal failure: %v", err)
+	}
+
+	// Retry Seal with the writable descriptor; should succeed.
+	if err := pack.Seal(); err != nil {
+		t.Fatalf("Seal retry failed: %v", err)
+	}
+
+	// Once sealed, Append must be refused with "incremental pack is sealed".
+	if _, err := pack.Append([]byte("third chunk")); err == nil || !strings.Contains(err.Error(), "sealed") {
+		t.Fatalf("expected Append on sealed pack to fail with sealed error, got: %v", err)
+	}
+
+	// Verify entries exist and can be read back.
+	for _, testCase := range []struct {
+		entry BlobEntry
+		want  []byte
+	}{{entry1, chunk1}, {entry2, chunk2}} {
+		stream, err := pack.ReadBlob(testCase.entry)
+		if err != nil {
+			t.Fatalf("ReadBlob failed: %v", err)
+		}
+		data, err := io.ReadAll(stream)
+		closeErr := stream.Close()
+		if err != nil || closeErr != nil || !bytes.Equal(data, testCase.want) {
+			t.Fatalf("ReadBlob mismatch: got %q, want %q, readErr=%v, closeErr=%v", data, testCase.want, err, closeErr)
+		}
+	}
+}
+
 func writePackfileWithFnForTest(t *testing.T, writeFn func(*os.File) (*PackFile, error)) ([]byte, *PackFile, error) {
 	t.Helper()
 	file, err := os.Create(filepath.Join(t.TempDir(), "test.pack"))

@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -2382,5 +2383,94 @@ func TestSync_SingleDurabilityWaitPerCommit(t *testing.T) {
 				t.Errorf("expected exactly 1 durability wait per sync, got %d (for %d appended records)", waits, appends)
 			}
 		})
+	}
+}
+
+// TestStagingSlotSeals_RotationAndMetrics verifies that appending more than 1024 unique chunks
+// triggers a slot-cap seal rotation and increments StagingSlotSeals in VolumeStats.
+func TestStagingSlotSeals_RotationAndMetrics(t *testing.T) {
+	ctx := t.Context()
+	server := NewTestServer(t, NewMemoryBackend(), WithServerMaxStagingBytes(256*1024*1024))
+	volumeID := "test-slot-seals-vol"
+
+	vol, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	cResp, err := testCreateFile(ctx, server, volumeID, "/slot_test.bin", 0644, nil, 0, 0)
+	if err != nil || cResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	ino := cResp.GetAttr().GetInode().GetIno()
+
+	var firstChunkData, lastChunkData []byte
+
+	// Append 1025 unique 16-byte chunks (each at a separate 64 KiB chunk boundary)
+	for i := 0; i < 1025; i++ {
+		data := make([]byte, 16)
+		binary.BigEndian.PutUint64(data[0:8], uint64(i))
+		binary.BigEndian.PutUint64(data[8:16], uint64(time.Now().UnixNano()))
+		if i == 0 {
+			firstChunkData = append([]byte(nil), data...)
+		}
+		if i == 1024 {
+			lastChunkData = append([]byte(nil), data...)
+		}
+		_, _, _, _, err := vol.WriteFileWithEpoch(ctx, ino, int64(i*64*1024), data, pb.WriteMode_LAZY_WRITE)
+		if err != nil {
+			t.Fatalf("WriteFile chunk %d failed: %v", i, err)
+		}
+		if i == int(blob.DefaultPackSlots)-1 {
+			// At exactly DefaultPackSlots entries, pack 1 must be sealed eagerly and cleared.
+			vol.stagingMu.Lock()
+			activePackNil := vol.activePack == nil
+			slotSealsAfter1024 := vol.slotSeals
+			vol.stagingMu.Unlock()
+			if !activePackNil {
+				t.Fatalf("expected activePack to be nil immediately after filling slot cap (eager seal)")
+			}
+			if slotSealsAfter1024 != 1 {
+				t.Fatalf("expected slotSeals=1 immediately after filling slot cap, got %d", slotSealsAfter1024)
+			}
+		}
+	}
+
+	stats := vol.Stats()
+	if stats.StagingSlotSeals < 1 {
+		t.Fatalf("expected at least 1 slot-cap seal, got %d", stats.StagingSlotSeals)
+	}
+
+	vol.stagingMu.Lock()
+	packCount := len(vol.packs)
+	activeID := vol.activePackID
+	vol.stagingMu.Unlock()
+	if packCount < 2 {
+		t.Fatalf("expected at least 2 packs in staging, got %d", packCount)
+	}
+	if activeID < 2 {
+		t.Fatalf("expected active pack ID >= 2 after rotation, got %d", activeID)
+	}
+
+	// Sync to ensure all sealed packs upload cleanly
+	if err := vol.Fsync(ctx, ino); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	// Verify both first (from initial pack) and last chunk (from rotated pack) are readable after sync
+	read0, err := testReadFile(ctx, server, volumeID, "/slot_test.bin", 0, 16)
+	if err != nil || read0.GetError() != 0 {
+		t.Fatalf("ReadFile chunk 0 failed: %v, resp=%v", err, read0)
+	}
+	if !bytes.Equal(read0.GetData(), firstChunkData) {
+		t.Fatalf("chunk 0 data mismatch")
+	}
+
+	read1024, err := testReadFile(ctx, server, volumeID, "/slot_test.bin", 1024*64*1024, 16)
+	if err != nil || read1024.GetError() != 0 {
+		t.Fatalf("ReadFile chunk 1024 failed: %v, resp=%v", err, read1024)
+	}
+	if !bytes.Equal(read1024.GetData(), lastChunkData) {
+		t.Fatalf("chunk 1024 data mismatch")
 	}
 }

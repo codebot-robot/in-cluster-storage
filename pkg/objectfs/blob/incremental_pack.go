@@ -190,7 +190,6 @@ func (p *IncrementalPack) Seal() error {
 		packSlotsFullMu.Unlock()
 		klog.V(2).Infof("packfile sealed with all %d slots full (total full packs: %d)", p.slots, count)
 	}
-	p.sealed = true
 	sort.Slice(p.entries, func(i, j int) bool {
 		return bytes.Compare(p.entries[i].SHA256[:], p.entries[j].SHA256[:]) < 0
 	})
@@ -204,8 +203,11 @@ func (p *IncrementalPack) Seal() error {
 	hdr := make([]byte, 8)
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(p.entries)))
 	binary.BigEndian.PutUint32(hdr[4:8], PackFlagSealed)
-	_, err := p.file.WriteAt(hdr, 12)
-	return err
+	if _, err := p.file.WriteAt(hdr, 12); err != nil {
+		return err
+	}
+	p.sealed = true
+	return nil
 }
 
 func (p *IncrementalPack) Entries() []BlobEntry {
