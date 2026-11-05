@@ -1066,3 +1066,53 @@ func TestVolume_SequenceNumberContinuityAcrossRestart(t *testing.T) {
 		}
 	}
 }
+
+func TestVolume_RecoverOrphanInodeStatsConsistency(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	server := NewTestServer(t, backend)
+	volumeID := "test-orphan-stats-vol"
+
+	// 1. Create file1 with an open handle, and file2.
+	if _, err := testCreateFile(ctx, server, volumeID, "/file1.txt", 0644, []byte("file 1 initial data"), 0, 0); err != nil {
+		t.Fatalf("CreateFile file1 failed: %v", err)
+	}
+
+	if _, err := testCreateFile(ctx, server, volumeID, "/file2.txt", 0644, []byte("file 2 updated content!"), 0, 0); err != nil {
+		t.Fatalf("CreateFile file2 failed: %v", err)
+	}
+
+	// 2. Unlink file1. Since CreateFile allocated an open handle (AllocFh),
+	// file1 becomes an orphan (Nlink == 0) retained in live state.
+	if _, err := testUnlink(ctx, server, volumeID, "/file1.txt"); err != nil {
+		t.Fatalf("Unlink file1 failed: %v", err)
+	}
+
+	// 3. Flush to backend snapshot. The snapshot includes orphan file1 (19 bytes)
+	// and file2 (23 bytes), totaling 42 bytes across 2 files.
+	if err := server.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+
+	// 4. Recover on a new server with no open handles. LoadFromBackend cleans orphan file1.
+	newServer := NewTestServer(t, backend,
+		WithServerViewOptions(view.WithFaultHook(func() error {
+			time.Sleep(50 * time.Millisecond)
+			return nil
+		})),
+	)
+	recoveredVolume := mustGetVolume(t, newServer, volumeID)
+	if err := recoveredVolume.FlushOverlay(ctx); err != nil {
+		t.Fatalf("FlushOverlay on recovered volume failed: %v", err)
+	}
+
+	// 5. Verify stats match cleanly and reflect exactly 1 file (file2, 23 bytes).
+	recoveredVolume.mu.Lock()
+	defer recoveredVolume.mu.Unlock()
+	if recoveredVolume.liveStats.GetInodesFile() != 1 {
+		t.Fatalf("expected 1 file in liveStats, got %d", recoveredVolume.liveStats.GetInodesFile())
+	}
+	if recoveredVolume.liveStats.GetLogicalBytes() != 23 {
+		t.Fatalf("expected 23 bytes in liveStats, got %d", recoveredVolume.liveStats.GetLogicalBytes())
+	}
+}

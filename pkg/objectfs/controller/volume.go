@@ -1884,16 +1884,16 @@ func (v *Volume) normalizeInodeID(id uint64) uint64 {
 	return id
 }
 
-func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
+func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) (int, error) {
 	tx := v.beginTxLocked("cleanOrphanInodes")
 
 	prefix, err := sds.EncodeKeyPrefix(&pb.Inode{}, 0)
 	if err != nil {
-		return fmt.Errorf("failed to encode inode key prefix: %w", err)
+		return 0, fmt.Errorf("failed to encode inode key prefix: %w", err)
 	}
 	msgs, err := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.Inode", prefix)
 	if err != nil {
-		return fmt.Errorf("failed to scan orphan inodes: %w", err)
+		return 0, fmt.Errorf("failed to scan orphan inodes: %w", err)
 	}
 	var orphanInos []uint64
 	for _, msg := range msgs {
@@ -1903,7 +1903,7 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 		}
 	}
 	if len(orphanInos) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	// Reads before writes: scan all orphan chunk rows before buffering any deletions into tx.
@@ -1911,37 +1911,37 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 	for _, ino := range orphanInos {
 		chunkPrefix, err := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(ino)}, 1)
 		if err != nil {
-			return fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", ino, err)
+			return 0, fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", ino, err)
 		}
 		chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
 		if err != nil {
-			return fmt.Errorf("failed to scan chunk rows for orphan inode %d: %w", ino, err)
+			return 0, fmt.Errorf("failed to scan chunk rows for orphan inode %d: %w", ino, err)
 		}
 		orphanChunks[ino] = chunkMsgs
 	}
 
 	for _, ino := range orphanInos {
 		if _, err := tx.Delete(ctx, &pb.Inode{Ino: proto.Uint64(ino)}); err != nil {
-			return fmt.Errorf("failed to log orphan inode %d deletion: %w", ino, err)
+			return 0, fmt.Errorf("failed to log orphan inode %d deletion: %w", ino, err)
 		}
 		for _, cMsg := range orphanChunks[ino] {
 			c := cMsg.(*pb.FileChunk)
 			if _, err := tx.Delete(ctx, &pb.FileChunk{Ino: proto.Uint64(ino), Index: proto.Uint32(c.GetIndex())}); err != nil {
-				return fmt.Errorf("failed to log chunk deletion for orphan inode %d: %w", ino, err)
+				return 0, fmt.Errorf("failed to log chunk deletion for orphan inode %d: %w", ino, err)
 			}
 		}
 	}
 	commitSeq, err := v.commitTxLocked(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
+		return 0, fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
 	}
 	waitFn := v.makeWaitFn(commitSeq, nil)
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
-			return fmt.Errorf("failed to wait for orphan deletion sync: %w", err)
+			return 0, fmt.Errorf("failed to wait for orphan deletion sync: %w", err)
 		}
 	}
-	return nil
+	return len(orphanInos), nil
 }
 
 // deleteInodeRowsLocked deletes the Inode row, all FileChunk rows, and all XAttr rows
@@ -6023,8 +6023,16 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		v.dirParents[1] = 1
 	}
 
-	if err := v.cleanOrphanInodesLocked(ctx); err != nil {
+	v.initLiveStatsLocked()
+
+	cleanedCount, err := v.cleanOrphanInodesLocked(ctx)
+	if err != nil {
 		klog.Warningf("Failed to clean orphan inodes during volume load: %v", err)
+	}
+	if cleanedCount > 0 {
+		if err := v.flushOverlayLocked(ctx); err != nil {
+			return fmt.Errorf("failed to flush overlay after clean orphan inodes: %w", err)
+		}
 	}
 
 	if v.metadataView != nil {
@@ -6044,7 +6052,6 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		}
 	}
 
-	v.initLiveStatsLocked()
 	if err := v.initNextInodeFromStatsLocked(ctx, highestReplayedIno); err != nil {
 		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
 	}
