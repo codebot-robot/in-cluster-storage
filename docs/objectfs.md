@@ -115,6 +115,16 @@ ObjectFS supports two distinct mount modes, selected via the `mode` parameter in
    - Read and write operations issue per-operation RPCs to the controller or interact with the local in-memory/disk cache, with remote writes invalidated proactively via `WatchVolume` event streams.
    - **FUSE Mount Descriptor Holder (`objectfs-fuse-holder`):** To keep active FUSE mounts alive across node daemon restarts, crashes, or rolling upgrades, mounts are performed by a dedicated `objectfs-fuse-holder` DaemonSet. The holder opens `/dev/fuse`, executes the privileged mount syscall, and passes the open file descriptor to the node daemon over a Unix domain socket (`SCM_RIGHTS`). The daemon then serves filesystem requests on the descriptor using go-fuse's `/dev/fd/N` mountpoint interface. Because both processes hold open descriptors to the connection, node daemon restarts or upgrades do not tear down kernel FUSE connections, allowing pending filesystem requests to queue safely in the kernel until the daemon resumes serving.
 
+     This holder pattern also generalizes: because the holder does all the
+     privileged work (opening `/dev/fuse`, the mount syscall, and passing the
+     descriptor over a Unix socket), the component that serves the filesystem
+     needs no privileges at all. Nothing in the holder is specific to objectfs,
+     so the same binary could serve any FUSE-based CSI driver, and if the
+     pattern were built into CSI itself, FUSE filesystems could run unprivileged
+     by default. This is an architectural direction, not something objectfs
+     ships today, and objectfs keeps its own holder until the filesystem itself
+     is robust.
+
 2. **Exclusive-Local Mode (`mode: exclusive-local`):**
    - The node daemon eagerly materialises the volume from the controller into a local directory (`<cacheDir>/<volume>/lower`), mounts an **OverlayFS** filesystem into the pod with local `upper` and `work` directories, and serves I/O at local kernel filesystem speed with **no FUSE overhead and no per-operation RPCs**.
    - **Durability Contract:** Writes remain entirely local on the node until a **checkpoint**. Writes are durable **at unmount, at each checkpoint, and on request**:
