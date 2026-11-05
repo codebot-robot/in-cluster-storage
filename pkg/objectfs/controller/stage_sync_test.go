@@ -52,6 +52,8 @@ type recordingBackend struct {
 	packKeys     []string
 	packGetCalls int
 	failPut      bool
+	gateEntered  chan struct{}
+	gateRelease  chan struct{}
 }
 
 func newRecordingBackend(base ObjectStorageBackend) *recordingBackend {
@@ -69,16 +71,34 @@ func (b *recordingBackend) GetObject(ctx context.Context, volumeID, key string, 
 	return b.ObjectStorageBackend.GetObject(ctx, volumeID, key, offset, length, writer)
 }
 
+func (b *recordingBackend) setGate(gateEntered, gateRelease chan struct{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.gateEntered = gateEntered
+	b.gateRelease = gateRelease
+}
+
 func (b *recordingBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
 	b.mu.Lock()
 	if b.failPut {
 		b.mu.Unlock()
 		return "", fmt.Errorf("injected PutObject failure")
 	}
-	if strings.HasSuffix(key, ".pack") || strings.Contains(key, "blobs/") {
+	isPack := strings.HasSuffix(key, ".pack") || strings.Contains(key, "blobs/")
+	if isPack {
 		b.packKeys = append(b.packKeys, key)
 	}
+	gateEntered := b.gateEntered
+	gateRelease := b.gateRelease
 	b.mu.Unlock()
+
+	if isPack && gateEntered != nil && gateRelease != nil {
+		select {
+		case gateEntered <- struct{}{}:
+		default:
+		}
+		<-gateRelease
+	}
 	return b.ObjectStorageBackend.PutObject(ctx, volumeID, key, stream)
 }
 
@@ -2472,5 +2492,137 @@ func TestStagingSlotSeals_RotationAndMetrics(t *testing.T) {
 	}
 	if !bytes.Equal(read1024.GetData(), lastChunkData) {
 		t.Fatalf("chunk 1024 data mismatch")
+	}
+}
+
+func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	backend := newRecordingBackend(rawBackend)
+	server := NewTestServer(t, backend, WithServerMaxStagingBytes(64*1024*1024))
+	volumeID := "test-c2o-repro-vol"
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	volume.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
+
+	createResponse, err := testCreateFile(ctx, server, volumeID, "/multi_16m.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	// Initial open stream position before multi-chunk write
+	initialOpenResponse, err := server.Open(ctx, &pb.OpenRequest{
+		VolumeId: volumeID,
+		Inode:    inodeID,
+		Flags:    0,
+	})
+	if err != nil {
+		t.Fatalf("Initial Open failed: %v", err)
+	}
+	initialPosition := initialOpenResponse.GetStreamPosition()
+
+	// Write 16 MiB (multi-chunk)
+	data := bytes.Repeat([]byte("X"), 16*1024*1024)
+	for chunkIndex := 0; chunkIndex < 16; chunkIndex++ {
+		if _, _, _, _, writeError := volume.WriteFileWithEpoch(ctx, inodeID, int64(chunkIndex*1024*1024), data[chunkIndex*1024*1024:(chunkIndex+1)*1024*1024], pb.WriteMode_WRITE_THROUGH_FSYNC); writeError != nil {
+			t.Fatalf("WriteFile chunk %d failed: %v", chunkIndex, writeError)
+		}
+	}
+
+	// Gate the close sync inside the pack upload to deterministically test interleaving
+	// with a concurrent open-barrier sync.
+	gateEntered := make(chan struct{})
+	gateRelease := make(chan struct{})
+	backend.setGate(gateEntered, gateRelease)
+
+	// Start close sync (blocking Fsync or close trigger)
+	go func() {
+		if _, fsyncError := server.Fsync(ctx, &pb.FsyncRequest{
+			VolumeId: volumeID,
+			Inode:    inodeID,
+			Blocking: true,
+			Trigger:  pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+		}); fsyncError != nil {
+			t.Errorf("Fsync failed: %v", fsyncError)
+		}
+	}()
+
+	// Wait until close sync enters the upload phase and is held at the gate
+	select {
+	case <-gateEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for close sync to enter upload gate")
+	}
+
+	// Run open barrier on reader while close sync is in-flight and held inside upload
+	type openResult struct {
+		response *pb.OpenResponse
+		err      error
+	}
+	openChannel := make(chan openResult, 1)
+	go func() {
+		response, err := server.Open(ctx, &pb.OpenRequest{
+			VolumeId: volumeID,
+			Inode:    inodeID,
+			Flags:    0,
+		})
+		openChannel <- openResult{response: response, err: err}
+	}()
+
+	// Verify that open barrier does not return while close sync is held
+	select {
+	case result := <-openChannel:
+		t.Fatalf("openBarrier did not wait while close sync was in flight: %+v, err=%v", result.response, result.err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: open barrier is blocked waiting for in-flight sync to complete
+	}
+
+	// Release the close sync upload gate
+	close(gateRelease)
+
+	// Open barrier must now unblock and return successfully
+	var result openResult
+	select {
+	case result = <-openChannel:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("openBarrier failed to complete after releasing close sync")
+	}
+
+	if result.err != nil {
+		t.Fatalf("Open failed: %v", result.err)
+	}
+	openResponse := result.response
+	t.Logf("OpenResponse: err=%d, size=%d, pos=%d", openResponse.GetError(), openResponse.GetAttr().GetInode().GetSize(), openResponse.GetStreamPosition())
+	if openResponse.GetError() != 0 {
+		t.Fatalf("Open returned error: %d", openResponse.GetError())
+	}
+	if openResponse.GetAttr().GetInode().GetSize() != 16*1024*1024 {
+		t.Fatalf("Expected size %d, got %d", 16*1024*1024, openResponse.GetAttr().GetInode().GetSize())
+	}
+	if openResponse.GetStreamPosition() <= initialPosition {
+		t.Fatalf("Expected stream position to advance from %d, got %d", initialPosition, openResponse.GetStreamPosition())
+	}
+
+	// Verify chunk rows committed and readable
+	readResponse, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    inodeID,
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil || readResponse.GetError() != 0 {
+		t.Fatalf("ReadFile failed: %v, code=%d", err, readResponse.GetError())
+	}
+	if !bytes.Equal(readResponse.GetData(), data[:1024]) {
+		t.Fatalf("ReadFile content mismatch on committed multi-chunk file")
 	}
 }
