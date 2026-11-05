@@ -97,7 +97,7 @@ func (c *CSIController) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
 	}
 
-	consistencyMode, err := consistency.ParseConsistencyMode(req.GetParameters()["consistency"])
+	consistencyMode, err := consistency.Parse(req.GetParameters()["consistency"])
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
