@@ -97,6 +97,22 @@ func TestWalDurabilityFlag(t *testing.T) {
 	}
 }
 
+func TestOpenBarrierTimeoutFlag(t *testing.T) {
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	options.AddFlags(flagSet)
+	f := flagSet.Lookup("open-barrier-timeout")
+	if f == nil {
+		t.Fatal("flag --open-barrier-timeout not registered")
+	}
+	if f.DefValue != "30s" {
+		t.Errorf("default value = %q, want 30s", f.DefValue)
+	}
+	if options.OpenBarrierTimeout != 30*time.Second {
+		t.Errorf("options.OpenBarrierTimeout = %v, want 30s", options.OpenBarrierTimeout)
+	}
+}
+
 func TestOptionsParseAndValidate(t *testing.T) {
 	options := NewOptions()
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)

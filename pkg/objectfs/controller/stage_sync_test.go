@@ -1447,6 +1447,121 @@ func TestOpenBarrier_TimeoutReturnsEIO(t *testing.T) {
 	}
 }
 
+func TestOpenBarrier_WaitsOnInFlightSync(t *testing.T) {
+	ctx := t.Context()
+	blockingBackend := &blockingPutBackend{
+		ObjectStorageBackend: NewMemoryBackend(),
+		blockCh:              make(chan struct{}),
+	}
+	server := NewTestServer(t, blockingBackend, WithServerOpenBarrierTimeout(5*time.Second))
+	defer func() {
+		select {
+		case <-blockingBackend.blockCh:
+		default:
+			close(blockingBackend.blockCh)
+		}
+		if err := server.Close(); err != nil {
+			t.Logf("server.Close failed: %v", err)
+		}
+	}()
+
+	volumeID := "test-barrier-wait-inflight-vol"
+	vol, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	vol.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
+
+	createResp, err := testCreateFile(ctx, server, volumeID, "/inflight.bin", 0644, nil, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResp.GetAttr().GetInode().GetIno()
+
+	payload := make([]byte, 64*1024)
+	wResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     inodeID,
+		Offset:    0,
+		Data:      payload,
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || wResp.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	type fsyncResult struct {
+		resp *pb.FsyncResponse
+		err  error
+	}
+	fsyncDone := make(chan fsyncResult, 1)
+	go func() {
+		resp, fsyncErr := server.Fsync(ctx, &pb.FsyncRequest{
+			VolumeId: volumeID,
+			Inode:    inodeID,
+			Blocking: false,
+			Trigger:  pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+		})
+		fsyncDone <- fsyncResult{resp: resp, err: fsyncErr}
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		vol.stagingMu.Lock()
+		inProgress := vol.syncInProgress
+		vol.stagingMu.Unlock()
+		if inProgress {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for close sync to enter in-flight state")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	type openResult struct {
+		resp *pb.OpenResponse
+		err  error
+	}
+	openDone := make(chan openResult, 1)
+	go func() {
+		resp, openErr := server.Open(ctx, &pb.OpenRequest{
+			VolumeId: volumeID,
+			Inode:    inodeID,
+		})
+		openDone <- openResult{resp: resp, err: openErr}
+	}()
+
+	select {
+	case res := <-openDone:
+		t.Fatalf("Open returned prematurely while sync was in-flight: resp=%+v, err=%v", res.resp, res.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(blockingBackend.blockCh)
+
+	select {
+	case res := <-fsyncDone:
+		if res.err != nil || res.resp.GetError() != 0 {
+			t.Fatalf("Fsync failed: %v, resp=%+v", res.err, res.resp)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Fsync failed to complete after backend unblocked")
+	}
+
+	select {
+	case res := <-openDone:
+		if res.err != nil || res.resp.GetError() != 0 {
+			t.Fatalf("Open failed: %v, resp=%+v", res.err, res.resp)
+		}
+		if res.resp.GetAttr() == nil || res.resp.GetAttr().GetInode().GetSize() != int64(len(payload)) {
+			t.Fatalf("Open returned unexpected size: %+v", res.resp.GetAttr())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Open failed to unblock after in-flight sync completed")
+	}
+}
+
 type fakeCloseStream struct {
 	walclient.Stream
 }

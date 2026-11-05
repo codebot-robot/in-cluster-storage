@@ -2082,7 +2082,7 @@ spec:
 	read4kCmd := `T0=$(date +%s%N); exec 3< /data/inline_4k.bin; T1=$(date +%s%N); SHA=$(cat <&3 | sha256sum | cut -d' ' -f1); exec 3<&-; echo "LAT_NS:$((T1 - T0)) SHA:$SHA"`
 	outReader4k, err := h.RunInPod(pod2Name, "default", "/bin/sh", "-c", read4kCmd)
 	if err != nil {
-		t.Fatalf("Reader failed to read 4 KiB file: %v", err)
+		t.Fatalf("Reader failed to read 4 KiB file: %v (output: %q)", err, outReader4k)
 	}
 	t.Logf("Reader 4 KiB output: %s", outReader4k)
 	if !strings.Contains(outReader4k, expectedSha4k) {
@@ -2116,7 +2116,7 @@ spec:
 	read16mCmd := `T0=$(date +%s%N); exec 3< /data/multi_16m.bin; T1=$(date +%s%N); SHA=$(cat <&3 | sha256sum | cut -d' ' -f1); exec 3<&-; echo "LAT_NS:$((T1 - T0)) SHA:$SHA"`
 	outReader16m, err := h.RunInPod(pod2Name, "default", "/bin/sh", "-c", read16mCmd)
 	if err != nil {
-		t.Fatalf("Reader failed to read 16 MiB file: %v", err)
+		t.Fatalf("Reader failed to read 16 MiB file: %v (output: %q)", err, outReader16m)
 	}
 	t.Logf("Reader 16 MiB output: %s", outReader16m)
 	if !strings.Contains(outReader16m, expectedSha16m) {
