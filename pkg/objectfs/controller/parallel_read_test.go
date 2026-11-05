@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,6 +45,37 @@ func (b *sleepingBackend) GetObject(ctx context.Context, volumeID, key string, o
 		time.Sleep(b.sleepDuration)
 	}
 	return b.ObjectStorageBackend.GetObject(ctx, volumeID, key, offset, length, w)
+}
+
+type gatedGetBackend struct {
+	ObjectStorageBackend
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newGatedGetBackend(base ObjectStorageBackend, entered, release chan struct{}) *gatedGetBackend {
+	return &gatedGetBackend{
+		ObjectStorageBackend: base,
+		entered:              entered,
+		release:              release,
+	}
+}
+
+func (b *gatedGetBackend) GetObject(ctx context.Context, volumeID, key string, offset, length int64, writer io.Writer) error {
+	if b.entered != nil {
+		b.once.Do(func() {
+			close(b.entered)
+		})
+	}
+	if b.release != nil {
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.ObjectStorageBackend.GetObject(ctx, volumeID, key, offset, length, writer)
 }
 
 func TestParallelReadFile_SleepingBackend(t *testing.T) {
@@ -206,10 +238,15 @@ func TestParallelReadFile_DropVolumeLockDuringBlobIO(t *testing.T) {
 
 func TestWriteFileWithEpoch_DoesNotHoldStagingMuDuringBaseChunkGet(t *testing.T) {
 	ctx := t.Context()
-	sleepDur := 250 * time.Millisecond
-	rawBackend := newSleepingBackend(NewMemoryBackend(), sleepDur)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	rawBackend := newGatedGetBackend(NewMemoryBackend(), entered, release)
 	server := NewTestServer(t, rawBackend)
-	defer func() { _ = server.Close() }()
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
 
 	volumeID := "test-staging-lock-drop-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
@@ -240,36 +277,50 @@ func TestWriteFileWithEpoch_DoesNotHoldStagingMuDuringBaseChunkGet(t *testing.T)
 	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: inoA, Blocking: true}); err != nil {
 		t.Fatalf("Fsync failed: %v", err)
 	}
+	vol.evictAllUploadedPacksForTest()
 
-	writeStarted := make(chan struct{})
-	writeDone := make(chan struct{})
+	writeADone := make(chan error, 1)
 
 	// Partial overwrite of file A chunk 0: requires fetching base chunk from backend
 	go func() {
-		close(writeStarted)
 		patch := []byte("XXXX")
-		_, _, _, _, _ = vol.WriteFileWithEpoch(ctx, inoA, 100, patch, pb.WriteMode_LAZY_WRITE)
-		close(writeDone)
+		_, _, _, _, writeError := vol.WriteFileWithEpoch(ctx, inoA, 100, patch, pb.WriteMode_LAZY_WRITE)
+		writeADone <- writeError
 	}()
 
-	<-writeStarted
-	// Give the goroutine time to enter readBaseChunk's backend GetObject
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-entered:
+	case writeErrorA := <-writeADone:
+		t.Fatalf("WriteFileWithEpoch A finished before entering backend GetObject: %v", writeErrorA)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for file A to enter backend GetObject")
+	}
 
 	// An independent write to file B must NOT block on stagingMu while file A fetches base chunk
-	startOp := time.Now()
-	dataB := []byte("fast write to file B")
-	_, _, _, _, err = vol.WriteFileWithEpoch(ctx, inoB, 0, dataB, pb.WriteMode_LAZY_WRITE)
-	opElapsed := time.Since(startOp)
+	writeBDone := make(chan error, 1)
+	go func() {
+		dataB := []byte("fast write to file B")
+		_, _, _, _, writeError := vol.WriteFileWithEpoch(ctx, inoB, 0, dataB, pb.WriteMode_LAZY_WRITE)
+		writeBDone <- writeError
+	}()
 
-	if err != nil {
-		t.Fatalf("WriteFileWithEpoch B failed: %v", err)
+	select {
+	case writeErrorB := <-writeBDone:
+		if writeErrorB != nil {
+			t.Fatalf("WriteFileWithEpoch B failed: %v", writeErrorB)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("WriteFileWithEpoch B blocked on stagingMu during base chunk GET")
 	}
 
-	// Operation must complete quickly without waiting for the 250ms backend sleep of file A
-	if opElapsed >= 150*time.Millisecond {
-		t.Fatalf("WriteFileWithEpoch blocked on stagingMu during base chunk GET: took %v, want < 150ms", opElapsed)
-	}
+	close(release)
 
-	<-writeDone
+	select {
+	case writeErrorA := <-writeADone:
+		if writeErrorA != nil {
+			t.Fatalf("WriteFileWithEpoch A failed: %v", writeErrorA)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for WriteFileWithEpoch A to complete")
+	}
 }
