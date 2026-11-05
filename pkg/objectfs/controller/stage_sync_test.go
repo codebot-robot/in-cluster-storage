@@ -71,6 +71,10 @@ func (b *recordingBackend) GetObject(ctx context.Context, volumeID, key string, 
 	return b.ObjectStorageBackend.GetObject(ctx, volumeID, key, offset, length, writer)
 }
 
+// setGate configures channels to pause pack uploads at the storage boundary.
+// gateEntered must be a buffered channel of capacity at least one so the
+// arrival signal cannot be lost if the test goroutine has not yet reached its
+// receive.
 func (b *recordingBackend) setGate(gateEntered, gateRelease chan struct{}) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -2501,11 +2505,11 @@ func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
 	backend := newRecordingBackend(rawBackend)
 	server := NewTestServer(t, backend, WithServerMaxStagingBytes(64*1024*1024))
 	volumeID := "test-c2o-repro-vol"
-	defer func() {
+	t.Cleanup(func() {
 		if closeError := server.Close(); closeError != nil {
 			t.Errorf("server.Close failed: %v", closeError)
 		}
-	}()
+	})
 
 	volume, err := server.getOrCreateVolume(volumeID)
 	if err != nil {
@@ -2540,9 +2544,15 @@ func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
 
 	// Gate the close sync inside the pack upload to deterministically test interleaving
 	// with a concurrent open-barrier sync.
-	gateEntered := make(chan struct{})
+	gateEntered := make(chan struct{}, 1)
 	gateRelease := make(chan struct{})
 	backend.setGate(gateEntered, gateRelease)
+	var gateReleaseOnce sync.Once
+	t.Cleanup(func() {
+		gateReleaseOnce.Do(func() {
+			close(gateRelease)
+		})
+	})
 
 	// Start close sync (blocking Fsync or close trigger)
 	go func() {
@@ -2587,7 +2597,9 @@ func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
 	}
 
 	// Release the close sync upload gate
-	close(gateRelease)
+	gateReleaseOnce.Do(func() {
+		close(gateRelease)
+	})
 
 	// Open barrier must now unblock and return successfully
 	var result openResult
