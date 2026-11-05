@@ -1412,6 +1412,52 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	}, nil
 }
 
+func (s *Server) findVolume(ctx context.Context, volumeID string) (*Volume, error) {
+	s.mu.RLock()
+	volume, exists := s.volumes[volumeID]
+	s.mu.RUnlock()
+	if exists {
+		return volume, nil
+	}
+	if s.backend != nil {
+		objects, err := s.backend.ListObjects(ctx, "", fmt.Sprintf("volumes/%s/", volumeID))
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to check volume in backend: %v", err)
+		}
+		if len(objects) > 0 {
+			return s.getOrCreateVolume(volumeID)
+		}
+	}
+	return nil, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
+}
+
+func (s *Server) DeleteSnapshot(ctx context.Context, request *pb.DeleteSnapshotRequest) (*pb.DeleteSnapshotResponse, error) {
+	if request.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	if request.GetSnapshotName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot_name is required")
+	}
+	if !isValidVolumeID(request.GetVolumeId()) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q", request.GetVolumeId())
+	}
+
+	volume, err := s.findVolume(ctx, request.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	if err := volume.DeleteSnapshot(ctx, request.GetSnapshotName()); err != nil {
+		if errors.Is(err, ErrNewestSnapshot) {
+			return nil, status.Errorf(codes.FailedPrecondition, "cannot delete newest snapshot %s", request.GetSnapshotName())
+		}
+		if errors.Is(err, ErrSnapshotInUse) {
+			return nil, status.Errorf(codes.FailedPrecondition, "cannot delete snapshot %s: live stream depends on it", request.GetSnapshotName())
+		}
+		return nil, err
+	}
+	return &pb.DeleteSnapshotResponse{}, nil
+}
+
 const (
 	defaultNominalCapacityBytes = 4 * 1024 * 1024 * 1024 * 1024 // 4 TiB nominal capacity
 	defaultNominalTotalInodes   = 10000000                      // 10,000,000 nominal inodes

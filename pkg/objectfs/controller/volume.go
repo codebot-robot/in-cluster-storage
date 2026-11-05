@@ -52,6 +52,13 @@ import (
 	"k8s.io/klog/v2"
 )
 
+var (
+	// ErrNewestSnapshot indicates that a snapshot cannot be deleted because recovery requires the newest snapshot.
+	ErrNewestSnapshot = errors.New("cannot delete newest snapshot")
+	// ErrSnapshotInUse indicates that a snapshot cannot be deleted because the live stream still depends on it.
+	ErrSnapshotInUse = errors.New("cannot delete snapshot: live stream depends on it")
+)
+
 const (
 	defaultApplierBatchSize = 100
 
@@ -138,11 +145,13 @@ type Volume struct {
 	durability walclient.Level
 	streamID   uuid.UUID
 
-	metadataStream   *sds.Writer
-	lastCommitSeq    uint64
-	snapshotPointers []*sdsv1.SnapshotPointer
-	liveStats        *pb.VolumeStats
-	debugStatsCheck  *bool
+	metadataStream         *sds.Writer
+	lastCommitSeq          uint64
+	snapshotPointers       []*sdsv1.SnapshotPointer
+	replayStartPos         uint64
+	replaySnapshotLocation string
+	liveStats              *pb.VolumeStats
+	debugStatsCheck        *bool
 
 	localStorageDir string
 	indexFactory    sds.IndexFactory
@@ -5537,6 +5546,8 @@ func (v *Volume) applyRestoreRecordLocked(ctx context.Context, ptr *sdsv1.Snapsh
 	if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
 		return fmt.Errorf("failed to init metadata view from replay restored snapshot: %w", err)
 	}
+	v.replayStartPos = ptr.GetPosition()
+	v.replaySnapshotLocation = ptr.GetRestoredFrom()
 	v.lastCommitSeq = seq
 	v.dirParents = make(map[uint64]uint64)
 	v.dirParents[1] = 1
@@ -5553,9 +5564,10 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 	}
 
 	var (
-		rebuiltIdx sds.LocalIndex
-		snapPos    uint64
-		err        error
+		rebuiltIdx  sds.LocalIndex
+		snapPos     uint64
+		snapshotKey string
+		err         error
 	)
 
 	// 1. Try to restore latest snapshot from object storage
@@ -5566,6 +5578,7 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 			if err == nil && restoredIdx != nil {
 				rebuiltIdx = restoredIdx
 				snapPos = rPos
+				snapshotKey = snapKey
 			}
 		}
 	}
@@ -5577,6 +5590,10 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 			return nil, 0, fmt.Errorf("failed to create new empty index: %w", err)
 		}
 		snapPos = 0
+	}
+	v.replayStartPos = snapPos
+	if v.backend != nil && snapPos > 0 {
+		v.replaySnapshotLocation = snapshotKey
 	}
 
 	// 3. Sync registry
@@ -5932,6 +5949,8 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	if snapPos > v.lastCommitSeq {
 		v.lastCommitSeq = snapPos
 	}
+	v.replayStartPos = snapPos
+	v.replaySnapshotLocation = remoteSnapKey
 
 	// Replay stream from snapPos
 	var highestReplayedIno uint64
@@ -6245,6 +6264,15 @@ func (v *Volume) listSnapshotsLocked(ctx context.Context) ([]*sdsv1.SnapshotPoin
 		if err != nil {
 			return nil, fmt.Errorf("failed to list snapshot objects from backend: %w", err)
 		}
+		existingKeys := make(map[string]bool, len(entries))
+		for _, entry := range entries {
+			existingKeys[entry.Key] = true
+		}
+		for location := range pointersByLoc {
+			if strings.HasPrefix(location, prefix) && !existingKeys[location] {
+				delete(pointersByLoc, location)
+			}
+		}
 		for _, entry := range entries {
 			key := entry.Key
 			if _, ok := pointersByLoc[key]; !ok {
@@ -6302,14 +6330,21 @@ func snapshotInfoFromPointer(pointer *sdsv1.SnapshotPointer) *pb.SnapshotInfo {
 	}
 }
 
+func snapshotMatches(pointer *sdsv1.SnapshotPointer, name string) bool {
+	if pointer == nil {
+		return false
+	}
+	return pointer.GetName() == name || pointer.GetLocation() == name || path.Base(pointer.GetLocation()) == name
+}
+
 func (v *Volume) getSnapshotInfoLocked(ctx context.Context, snapshotName string) (*pb.SnapshotInfo, error) {
 	pointers, err := v.listSnapshotsLocked(ctx)
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range pointers {
-		if p.GetName() == snapshotName || p.GetLocation() == snapshotName || path.Base(p.GetLocation()) == snapshotName {
-			return snapshotInfoFromPointer(p), nil
+	for _, pointer := range pointers {
+		if snapshotMatches(pointer, snapshotName) {
+			return snapshotInfoFromPointer(pointer), nil
 		}
 	}
 	return nil, fmt.Errorf("snapshot %q not found", snapshotName)
@@ -6317,6 +6352,67 @@ func (v *Volume) getSnapshotInfoLocked(ctx context.Context, snapshotName string)
 
 // ErrSnapshotNotFound indicates that the requested snapshot was not found.
 var ErrSnapshotNotFound = errors.New("snapshot not found")
+
+// DeleteSnapshot removes the named snapshot pointer and its backend snapshot object.
+// Rules enforced:
+// - Never delete the newest snapshot (recovery needs it).
+// - Never delete a snapshot the live stream still depends on (the one the current replay starts from).
+// - Deletion is idempotent (returns success if the snapshot is not found).
+// A failed delete leaves the snapshot listed and the call is safe to repeat.
+// Blobs are not touched: they are content-addressed and global, and global GC reclaims them later.
+func (v *Volume) DeleteSnapshot(ctx context.Context, name string) error {
+	v.snapshotMu.Lock()
+	defer v.snapshotMu.Unlock()
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	pointers, err := v.listSnapshotsLocked(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list snapshots: %w", err)
+	}
+	if len(pointers) == 0 {
+		return nil
+	}
+
+	var targetPointer *sdsv1.SnapshotPointer
+	for _, pointer := range pointers {
+		if snapshotMatches(pointer, name) {
+			targetPointer = pointer
+			break
+		}
+	}
+	if targetPointer == nil {
+		return nil
+	}
+
+	newestPointer := pointers[len(pointers)-1]
+	if targetPointer.GetLocation() == newestPointer.GetLocation() {
+		return ErrNewestSnapshot
+	}
+
+	if (v.replayStartPos > 0 && targetPointer.GetPosition() == v.replayStartPos) ||
+		(v.replaySnapshotLocation != "" && targetPointer.GetLocation() == v.replaySnapshotLocation) {
+		return ErrSnapshotInUse
+	}
+
+	if v.backend != nil && targetPointer.GetLocation() != "" {
+		if err := v.backend.DeleteObject(ctx, "", targetPointer.GetLocation()); err != nil {
+			return fmt.Errorf("failed to delete snapshot object %s: %w", targetPointer.GetLocation(), err)
+		}
+	}
+
+	var remainingPointers []*sdsv1.SnapshotPointer
+	for _, pointer := range v.snapshotPointers {
+		if pointer.GetLocation() == targetPointer.GetLocation() {
+			continue
+		}
+		remainingPointers = append(remainingPointers, pointer)
+	}
+	v.snapshotPointers = remainingPointers
+
+	return nil
+}
 
 // RestoreSnapshot restores the volume filesystem state to a specific snapshot.
 // A restore is appended to the stream as a Restore record (SnapshotPointer with restored_from set)
@@ -6357,7 +6453,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 
 	var targetPtr *sdsv1.SnapshotPointer
 	for _, p := range pointers {
-		if p.GetName() == snapshotName || p.GetLocation() == snapshotName || path.Base(p.GetLocation()) == snapshotName {
+		if snapshotMatches(p, snapshotName) {
 			targetPtr = p
 			break
 		}
@@ -6457,6 +6553,8 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 		Name:      path.Base(freshKey),
 		CreatedAt: timestamppb.Now(),
 	}
+	v.replayStartPos = freshPos
+	v.replaySnapshotLocation = freshKey
 	v.snapshotPointers = append(v.snapshotPointers, restorePtr, freshPtr)
 
 	return snapshotInfoFromPointer(freshPtr), nil

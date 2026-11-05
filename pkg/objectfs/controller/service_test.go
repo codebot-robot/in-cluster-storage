@@ -2343,6 +2343,188 @@ func TestSnapshotsServicePagination(t *testing.T) {
 	}
 }
 
+func createTestSnapshot(t testing.TB, ctx context.Context, server *Server, volumeID, filePath, content string) string {
+	t.Helper()
+	if _, err := testCreateFile(ctx, server, volumeID, filePath, 0644, []byte(content), 0, 0); err != nil {
+		t.Fatalf("testCreateFile %s failed: %v", filePath, err)
+	}
+	response, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot on %s failed: %v", volumeID, err)
+	}
+	return response.GetSnapshotName()
+}
+
+func TestDeleteSnapshotRules(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(t, backend)
+
+	// 1. Unknown volume returns NotFound
+	_, err := server.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
+		VolumeId:     "non-existent-volume",
+		SnapshotName: "some-snapshot",
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound for unknown volume, got: %v", err)
+	}
+
+	volumeID := "test-delete-snapshot-vol"
+	snapshotName1 := createTestSnapshot(t, ctx, server, volumeID, "/file1.txt", "snapshot 1 data")
+
+	// 2. Non-existent snapshot on known volume succeeds idempotently
+	_, err = server.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: "non-existent-snapshot",
+	})
+	if err != nil {
+		t.Fatalf("expected idempotent success for non-existent snapshot, got: %v", err)
+	}
+
+	// 3. Attempt to delete newest snapshot fails with FailedPrecondition and ErrNewestSnapshot
+	volume, err := server.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
+	if err := volume.DeleteSnapshot(ctx, snapshotName1); !errors.Is(err, ErrNewestSnapshot) {
+		t.Fatalf("expected ErrNewestSnapshot from volume.DeleteSnapshot, got: %v", err)
+	}
+	_, err = server.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: snapshotName1,
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition when deleting newest snapshot, got: %v", err)
+	}
+
+	// Create snapshot 2 and snapshot 3
+	time.Sleep(10 * time.Millisecond)
+	snapshotName2 := createTestSnapshot(t, ctx, server, volumeID, "/file2.txt", "snapshot 2 data")
+	time.Sleep(10 * time.Millisecond)
+	snapshotName3 := createTestSnapshot(t, ctx, server, volumeID, "/file3.txt", "snapshot 3 data")
+
+	// Verify all 3 snapshots present
+	listResponse, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("ListSnapshots failed: %v", err)
+	}
+	if len(listResponse.GetSnapshots()) != 3 {
+		t.Fatalf("expected 3 snapshots before deletion, got %d", len(listResponse.GetSnapshots()))
+	}
+
+	// 4. Delete snapshot 1 (older snapshot)
+	_, err = server.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: snapshotName1,
+	})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot snapshot 1 failed: %v", err)
+	}
+
+	// Snapshot 1 is removed from list
+	listResponseAfterDelete, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("ListSnapshots after delete failed: %v", err)
+	}
+	if len(listResponseAfterDelete.GetSnapshots()) != 2 {
+		t.Fatalf("expected 2 snapshots after deletion, got %d", len(listResponseAfterDelete.GetSnapshots()))
+	}
+	for _, snapshotInfo := range listResponseAfterDelete.GetSnapshots() {
+		if snapshotInfo.GetName() == snapshotName1 {
+			t.Fatalf("deleted snapshot %s still returned in ListSnapshots", snapshotName1)
+		}
+	}
+
+	// Repeat delete of snapshot 1 succeeds idempotently
+	_, err = server.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: snapshotName1,
+	})
+	if err != nil {
+		t.Fatalf("repeated DeleteSnapshot failed: %v", err)
+	}
+
+	// Snapshot 3 is still the newest snapshot, cannot be deleted
+	if err := volume.DeleteSnapshot(ctx, snapshotName3); !errors.Is(err, ErrNewestSnapshot) {
+		t.Fatalf("expected ErrNewestSnapshot from volume.DeleteSnapshot for snapshot 3, got: %v", err)
+	}
+	_, err = server.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: snapshotName3,
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition when deleting newest snapshot 3, got: %v", err)
+	}
+
+	// Verify snapshot 2 and snapshot 3 remain
+	if listResponseAfterDelete.GetSnapshots()[0].GetName() != snapshotName2 ||
+		listResponseAfterDelete.GetSnapshots()[1].GetName() != snapshotName3 {
+		t.Fatalf("expected snapshots 2 and 3 remaining, got: %v", listResponseAfterDelete.GetSnapshots())
+	}
+}
+
+func TestDeleteSnapshotReplayDependencyRule(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	volumeID := "test-delete-replay-dependency-vol"
+
+	server1 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
+	snapshotName1 := createTestSnapshot(t, ctx, server1, volumeID, "/base.txt", "initial content")
+	time.Sleep(10 * time.Millisecond)
+	snapshotName2 := createTestSnapshot(t, ctx, server1, volumeID, "/file2.txt", "second content")
+
+	err := server1.Close()
+	if err != nil {
+		t.Fatalf("server1 Close failed: %v", err)
+	}
+
+	// Restart server and recover volume; it restores from snapshot 2 (the latest snapshot)
+	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
+	defer func() {
+		closeErr := server2.Close()
+		if closeErr != nil {
+			t.Logf("server2 Close error: %v", closeErr)
+		}
+	}()
+
+	recoveredVolume, err := server2.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("server2 GetVolume failed: %v", err)
+	}
+	err = recoveredVolume.LoadFromBackend(ctx)
+	if err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// Mutate and take snapshot 3 so snapshot 2 is no longer the newest snapshot
+	snapshotName3 := createTestSnapshot(t, ctx, server2, volumeID, "/file3.txt", "third content")
+	if snapshotName3 == snapshotName2 {
+		t.Fatalf("expected different snapshot name for snapshot 3")
+	}
+
+	// Attempting to delete snapshot 2 must be rejected with ErrSnapshotInUse / FailedPrecondition
+	if err := recoveredVolume.DeleteSnapshot(ctx, snapshotName2); !errors.Is(err, ErrSnapshotInUse) {
+		t.Fatalf("expected ErrSnapshotInUse from volume.DeleteSnapshot, got: %v", err)
+	}
+	_, err = server2.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: snapshotName2,
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition when deleting snapshot replay started from, got: %v", err)
+	}
+
+	// But snapshot 1 (which replay did not start from and is not the newest) CAN be deleted
+	_, err = server2.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
+		VolumeId:     volumeID,
+		SnapshotName: snapshotName1,
+	})
+	if err != nil {
+		t.Fatalf("expected success deleting snapshot 1, got: %v", err)
+	}
+}
+
 func startTestWalBufferServer(t *testing.T, dir string) (*walbuffer.Server, string, func()) {
 	return startTestWalBufferServerWithBackend(t, dir, NewMemoryBackend())
 }
