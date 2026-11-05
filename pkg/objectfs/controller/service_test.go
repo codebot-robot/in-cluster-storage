@@ -6068,6 +6068,23 @@ func (f *faultInjectingStream) Degraded() *walclient.DegradedError {
 	return f.Stream.Degraded()
 }
 
+type syncBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (s *syncBuffer) Write(data []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buffer.Write(data)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buffer.String()
+}
+
 func TestControllerWALStreamDegraded(t *testing.T) {
 	ctx := t.Context()
 	storage := NewMemoryBackend()
@@ -6089,7 +6106,6 @@ func TestControllerWALStreamDegraded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open stream2 failed: %v", err)
 	}
-	defer stream2.Close()
 
 	// Create real stream for vol1, wrapped with a fault-injecting proxy
 	walDir1 := filepath.Join(dir, "wal1")
@@ -6102,7 +6118,6 @@ func TestControllerWALStreamDegraded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open realStream1 failed: %v", err)
 	}
-	defer realStream1.Close()
 
 	faultStream1 := &faultInjectingStream{
 		Stream:   realStream1,
@@ -6120,7 +6135,19 @@ func TestControllerWALStreamDegraded(t *testing.T) {
 			return nil, fmt.Errorf("unexpected volume %s", volumeID)
 		}),
 	)
-	defer server.Close()
+
+	closeAll := sync.OnceFunc(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close failed: %v", err)
+		}
+		if err := stream2.Close(); err != nil {
+			t.Errorf("stream2.Close failed: %v", err)
+		}
+		if err := realStream1.Close(); err != nil {
+			t.Errorf("realStream1.Close failed: %v", err)
+		}
+	})
+	defer closeAll()
 
 	// Populate initial file and directory objects on vol1 while healthy so mutating RPCs reach the stream
 	initFile, err := server.CreateFile(ctx, &pb.CreateFileRequest{
@@ -6172,9 +6199,9 @@ func TestControllerWALStreamDegraded(t *testing.T) {
 	}
 
 	// Capture klog output to verify exactly one error log line in total across all operations
-	var logBuf bytes.Buffer
+	var logBuffer syncBuffer
 	klog.LogToStderr(false)
-	klog.SetOutput(&logBuf)
+	klog.SetOutput(&logBuffer)
 	defer func() {
 		klog.LogToStderr(true)
 		klog.SetOutput(os.Stderr)
@@ -6391,15 +6418,6 @@ func TestControllerWALStreamDegraded(t *testing.T) {
 		}
 	}
 
-	klog.Flush()
-	expectedLog := fmt.Sprintf("WAL client stream %s degraded", streamID1)
-	if !strings.Contains(logBuf.String(), expectedLog) {
-		t.Fatalf("expected log %q to appear in log output:\n%s", expectedLog, logBuf.String())
-	}
-	if diff := klog.Stats.Error.Lines() - beforeErrorLines; diff != 1 {
-		t.Fatalf("expected exactly 1 error log line in total, got %d", diff)
-	}
-
 	// Verify GetVolumeStats reports structured Degraded status on vol1
 	stats1, err := server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: vol1ID})
 	if err != nil {
@@ -6473,6 +6491,17 @@ func TestControllerWALStreamDegraded(t *testing.T) {
 	}
 	if stats2.GetDegraded() != nil {
 		t.Fatalf("expected nil Degraded on vol2, got: %v", stats2.GetDegraded())
+	}
+
+	closeAll()
+
+	klog.Flush()
+	expectedLog := fmt.Sprintf("WAL client stream %s degraded", streamID1)
+	if !strings.Contains(logBuffer.String(), expectedLog) {
+		t.Fatalf("expected log %q to appear in log output:\n%s", expectedLog, logBuffer.String())
+	}
+	if diff := klog.Stats.Error.Lines() - beforeErrorLines; diff != 1 {
+		t.Fatalf("expected exactly 1 error log line in total, got %d", diff)
 	}
 }
 
