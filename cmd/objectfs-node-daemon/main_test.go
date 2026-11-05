@@ -533,7 +533,7 @@ func TestNodeUnpublishVolume_HolderFailurePreservesMount(t *testing.T) {
 	targetDirectory := t.TempDir()
 	driver.mounts[targetDirectory] = &activeMount{
 		volumeID: "test-vol",
-		mode:     volumemode.VolumeModeString(volumemode.ModeFuse),
+		mode:     volumemode.String(pb.VolumeMode_FUSE),
 	}
 
 	expectedError := errors.New("injected unmount failure")

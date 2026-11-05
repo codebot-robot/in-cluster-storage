@@ -20,37 +20,71 @@ import (
 	"flag"
 	"strings"
 	"testing"
+
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 )
 
-func TestVolumeModeRoundTrip(t *testing.T) {
-	for _, mode := range []Mode{
-		ModeFuse,
-		ModeExclusiveLocal,
-	} {
-		modeString := VolumeModeString(mode)
-		parsed, err := ParseVolumeMode(modeString)
-		if err != nil || parsed != mode {
-			t.Errorf("round trip failed for %v: string %q, parsed %v, err %v", mode, modeString, parsed, err)
+func TestDerivedNamesEqualDocs(t *testing.T) {
+	testCases := []struct {
+		mode pb.VolumeMode
+		want string
+	}{
+		{pb.VolumeMode_VOLUME_MODE_UNSPECIFIED, ""},
+		{pb.VolumeMode_FUSE, "fuse"},
+		{pb.VolumeMode_EXCLUSIVE_LOCAL, "exclusive-local"},
+	}
+	for _, testCase := range testCases {
+		if got := String(testCase.mode); got != testCase.want {
+			t.Errorf("String(%v) = %q, want %q", testCase.mode, got, testCase.want)
 		}
-	}
-	if parsed, err := ParseVolumeMode(""); err != nil || parsed != ModeFuse {
-		t.Errorf("ParseVolumeMode(\"\") = (%v, %v), want (%v, nil)", parsed, err, ModeFuse)
-	}
-	if got := VolumeModeString(Mode(99)); got != "" {
-		t.Errorf("VolumeModeString(invalid) = %q, want empty", got)
 	}
 }
 
-func TestParseVolumeMode_Errors(t *testing.T) {
-	for _, input := range []string{"shared", "exclusive_local", "exclusive", "local", "unknown", "FUSE", "Exclusive-Local"} {
-		if _, err := ParseVolumeMode(input); err == nil || !strings.Contains(err.Error(), "fuse") || !strings.Contains(err.Error(), "exclusive-local") {
-			t.Errorf("ParseVolumeMode(%q) = %v; want error naming accepted values", input, err)
+func TestVolumeModeRoundTrip(t *testing.T) {
+	modes := []pb.VolumeMode{
+		pb.VolumeMode_VOLUME_MODE_UNSPECIFIED,
+		pb.VolumeMode_FUSE,
+		pb.VolumeMode_EXCLUSIVE_LOCAL,
+	}
+	for _, mode := range modes {
+		modeString := String(mode)
+		if parsed, err := Parse(modeString); err != nil || parsed != mode {
+			t.Errorf("round trip failed for %v: string %q, parsed %v, err %v", mode, modeString, parsed, err)
+		}
+	}
+}
+
+func TestParse_AcceptedValues(t *testing.T) {
+	testCases := []struct {
+		input    string
+		wantMode pb.VolumeMode
+	}{
+		{"", pb.VolumeMode_VOLUME_MODE_UNSPECIFIED},
+		{"fuse", pb.VolumeMode_FUSE},
+		{"exclusive-local", pb.VolumeMode_EXCLUSIVE_LOCAL},
+	}
+	for _, testCase := range testCases {
+		got, err := Parse(testCase.input)
+		if err != nil {
+			t.Errorf("Parse(%q) unexpected error: %v", testCase.input, err)
+		}
+		if got != testCase.wantMode {
+			t.Errorf("Parse(%q) = %v, want %v", testCase.input, got, testCase.wantMode)
+		}
+	}
+}
+
+func TestParse_Errors(t *testing.T) {
+	inputs := []string{"shared", "exclusive_local", "exclusive", "local", "unknown", "FUSE", "Exclusive-Local"}
+	for _, input := range inputs {
+		if parsed, err := Parse(input); err == nil || !strings.Contains(err.Error(), "fuse") || !strings.Contains(err.Error(), "exclusive-local") {
+			t.Errorf("Parse(%q) = %v, %v; want error naming accepted values", input, parsed, err)
 		}
 	}
 }
 
 func TestValue_FlagIntegration(t *testing.T) {
-	var target Mode
+	var target pb.VolumeMode
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
 	flagValue := NewValue(&target)
 	flagSet.Var(flagValue, "mode", "Volume mode")
@@ -58,8 +92,8 @@ func TestValue_FlagIntegration(t *testing.T) {
 	if err := flagSet.Parse([]string{"--mode=exclusive-local"}); err != nil {
 		t.Fatalf("Parse failed: %v", err)
 	}
-	if target != ModeExclusiveLocal {
-		t.Errorf("target = %v, want ModeExclusiveLocal", target)
+	if target != pb.VolumeMode_EXCLUSIVE_LOCAL {
+		t.Errorf("target = %v, want EXCLUSIVE_LOCAL", target)
 	}
 	if flagValue.String() != "exclusive-local" || flagValue.Type() != "volume-mode" {
 		t.Errorf("flagValue String/Type mismatch: %q, %q", flagValue.String(), flagValue.Type())
