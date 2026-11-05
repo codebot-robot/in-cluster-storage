@@ -19,6 +19,9 @@ package client
 import (
 	"flag"
 	"fmt"
+
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/protoenum"
 )
 
 // ParseLevel parses a WAL durability level string into a Level.
@@ -26,29 +29,39 @@ import (
 // An empty string parses as the documented default (Local).
 // Any other value returns an error naming the accepted values.
 func ParseLevel(value string) (Level, error) {
-	switch value {
-	case "", "local":
-		return Local, nil
-	case "witness":
-		return Witness, nil
-	case "permanent":
-		return Permanent, nil
-	default:
-		return Local, fmt.Errorf("unknown durability level %q (accepted values: local, witness, permanent)", value)
+	number, err := protoenum.Parse(pb.DurabilityLevel(0).Descriptor(), value)
+	if err != nil {
+		return Local, err
 	}
+	return protoToLevel(pb.DurabilityLevel(number)), nil
 }
 
 // LevelString returns the canonical user-facing string for a durability level.
 func LevelString(level Level) string {
+	return protoenum.Name(levelToProto(level))
+}
+
+func protoToLevel(durability pb.DurabilityLevel) Level {
+	switch durability {
+	case pb.DurabilityLevel_WITNESS:
+		return Witness
+	case pb.DurabilityLevel_PERMANENT:
+		return Permanent
+	default:
+		return Local
+	}
+}
+
+func levelToProto(level Level) pb.DurabilityLevel {
 	switch level {
 	case Local:
-		return "local"
+		return pb.DurabilityLevel_LOCAL
 	case Witness:
-		return "witness"
+		return pb.DurabilityLevel_WITNESS
 	case Permanent:
-		return "permanent"
+		return pb.DurabilityLevel_PERMANENT
 	default:
-		return ""
+		return pb.DurabilityLevel_DURABILITY_LEVEL_UNSPECIFIED
 	}
 }
 

@@ -20,6 +20,9 @@ import (
 	"flag"
 	"strings"
 	"testing"
+
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/protoenum"
 )
 
 func TestLevelRoundTrip(t *testing.T) {
@@ -39,6 +42,36 @@ func TestLevelRoundTrip(t *testing.T) {
 	}
 	if got := LevelString(Level(99)); got != "" {
 		t.Errorf("LevelString(invalid) = %q, want empty", got)
+	}
+}
+
+func TestDerivedNamesEqualDocs(t *testing.T) {
+	testCases := []struct {
+		level Level
+		proto pb.DurabilityLevel
+		want  string
+	}{
+		{Local, pb.DurabilityLevel_LOCAL, "local"},
+		{Witness, pb.DurabilityLevel_WITNESS, "witness"},
+		{Permanent, pb.DurabilityLevel_PERMANENT, "permanent"},
+	}
+	for _, testCase := range testCases {
+		if got := LevelString(testCase.level); got != testCase.want {
+			t.Errorf("LevelString(%v) = %q, want %q", testCase.level, got, testCase.want)
+		}
+		if got := protoenum.Name(testCase.proto); got != testCase.want {
+			t.Errorf("protoenum.Name(%v) = %q, want %q", testCase.proto, got, testCase.want)
+		}
+		parsed, err := ParseLevel(testCase.want)
+		if err != nil {
+			t.Errorf("ParseLevel(%q) unexpected error: %v", testCase.want, err)
+		}
+		if parsed != testCase.level {
+			t.Errorf("ParseLevel(%q) = %v, want %v", testCase.want, parsed, testCase.level)
+		}
+	}
+	if got := protoenum.Name(pb.DurabilityLevel_DURABILITY_LEVEL_UNSPECIFIED); got != "" {
+		t.Errorf("protoenum.Name(UNSPECIFIED) = %q, want empty", got)
 	}
 }
 
