@@ -216,7 +216,7 @@ Every filesystem operation that mutates state—such as `mkdir`, `create`, `writ
 
 ### 2. SQLite Metadata Storage, In-Memory Read Cache & Write-Behind Architecture
 
-To provide bounded memory consumption, fast indexing, and ACID transaction safety when serving millions of files and directories, ObjectFS uses an embedded **SQLite metadata store** with an asynchronous write-behind applier and an in-memory LRU read cache:
+To provide bounded memory consumption, fast indexing, and ACID transaction safety when serving millions of files and directories, ObjectFS uses an embedded metadata store configured via the controller's `--metadata-index` flag (accepts `sqlite` and `table`, defaulting to `sqlite`; `memory` is test-only and rejected by the flag) with an asynchronous write-behind applier and an in-memory LRU read cache:
 
 1. **Relational Schema Architecture (Inodes, DirEntries & FileChunks):**
    - **`objectfs.v1alpha1.Inode`:** Stores inode metadata (`ino`, `mode`, `size`, `mtime`, `atime`, `ctime`, `uid`, `gid`, `is_dir`, `sha256`, `etag`, `content_sha256`, `chunk_size`, `manifest_sha256`).

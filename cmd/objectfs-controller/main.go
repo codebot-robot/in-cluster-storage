@@ -91,6 +91,32 @@ func NewOptions() *Options {
 	}
 }
 
+func validateMetadataIndex(value string) error {
+	if value != "sqlite" && value != "table" {
+		return fmt.Errorf("invalid metadata index %q; accepted values: sqlite, table", value)
+	}
+	return nil
+}
+
+type metadataIndexValue struct {
+	target *string
+}
+
+func (v *metadataIndexValue) String() string {
+	if v == nil || v.target == nil {
+		return ""
+	}
+	return *v.target
+}
+
+func (v *metadataIndexValue) Set(value string) error {
+	if err := validateMetadataIndex(value); err != nil {
+		return err
+	}
+	*v.target = value
+	return nil
+}
+
 // AddFlags registers flags into the provided FlagSet.
 func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.IntVar(&o.Port, "port", o.Port, "The server port")
@@ -104,7 +130,7 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.StringVar(&o.WALDir, "wal-dir", o.WALDir, "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
 	flagSet.StringVar(&o.WALTarget, "wal-target", o.WALTarget, "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
 	flagSet.Var(walclient.NewLevelValue(&o.WALDurability), "wal-durability", "Default WAL durability level (local, witness, permanent)")
-	flagSet.StringVar(&o.MetadataIndex, "metadata-index", o.MetadataIndex, "Metadata local index type (sqlite, memory, table)")
+	flagSet.Var(&metadataIndexValue{target: &o.MetadataIndex}, "metadata-index", "Metadata local index type (sqlite, table)")
 	flagSet.IntVar(&o.MetadataIndexCacheMB, "metadata-index-cache-mb", o.MetadataIndexCacheMB, "Pebble shared block cache size in megabytes for table metadata index")
 	flagSet.IntVar(&o.MetadataCacheEntries, "metadata-cache-entries", o.MetadataCacheEntries, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
 	flagSet.Int64Var(&o.MetadataCacheBytes, "metadata-cache-bytes", o.MetadataCacheBytes, "Maximum byte size of metadata read cache")
@@ -132,6 +158,9 @@ func (o *Options) Validate() error {
 	}
 	if o.WALTarget == "" {
 		return fmt.Errorf("invalid configuration: --wal-target is required")
+	}
+	if err := validateMetadataIndex(o.MetadataIndex); err != nil {
+		return err
 	}
 	if o.CSIEndpoint != "" {
 		if _, _, err := parseEndpoint(o.CSIEndpoint); err != nil {

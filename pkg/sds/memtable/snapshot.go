@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// The memory index snapshot format is test-only. Publishing builds a JSON document
+// containing every row as a marshalled protobuf with the entire index held in memory,
+// consuming roughly three times the index size in RAM during publication. This format
+// is inefficient and must not be used in production deployments.
+
 package memtable
 
 import (
