@@ -89,7 +89,7 @@ func TestUntarPackCounts(t *testing.T) {
 		client := pb.NewObjectFSControllerClient(conn)
 		volID := fmt.Sprintf("vol-untar-bench-%d", time.Now().UnixNano())
 		cache := NewNodeCache(128 * 1024 * 1024)
-		rawFS := NewObjectFS(client, volID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+		rawFS := NewObjectFS(client, volID, pb.WriteMode_FSYNC, cache)
 		rawFS.StartBackgroundSync(ctx)
 
 		var bigWriteDone atomic.Bool

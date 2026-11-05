@@ -189,14 +189,14 @@ Because the controller's local disk is a node `hostPath` cache, durability must 
 
 ObjectFS supports three client write modes:
 
-1. **`WRITE_THROUGH_FSYNC` (Default):**
+1. **`FSYNC` (Default):**
    - File writes are buffered in client node memory (`NodeCache`).
    - Synchronously transmitted to the controller and flushed to the WAL on `fsync(2)`, `fdatasync(2)`, or `close(2)`.
    - Guarantees POSIX compliance for transactional databases and applications relying on fsync.
-2. **`LAZY_WRITE`:**
+2. **`LAZY`:**
    - Writes are buffered asynchronously in node cache and flushed in background batches.
    - Maximizes throughput and minimizes network round-trips for batch processing, compilation caches, and scratch storage.
-3. **`EAGER_REPLICATION`:**
+3. **`EAGER`:**
    - Every `write(2)` syscall is streamed immediately to the central controller memory and change-log.
    - Provides immediate cross-node visibility for collaborative multi-writer workloads.
 

@@ -1092,7 +1092,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				Inode:     ino,
 				Offset:    op.Offset,
 				Data:      op.Data,
-				WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
+				WriteMode: pb.WriteMode_FSYNC,
 			})
 			if err != nil {
 				return 0, fmt.Errorf("write file %s (offset %d): %w", op.Path, op.Offset, err)

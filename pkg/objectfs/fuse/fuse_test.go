@@ -83,7 +83,7 @@ func TestRawFileSystemOperations(t *testing.T) {
 	defer cleanup()
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, "vol-1", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, "vol-1", pb.WriteMode_FSYNC, cache)
 
 	// 1. Getattr on root
 	var attrOut fuse.AttrOut
@@ -230,7 +230,7 @@ func TestFUSERmdirAndUnlinkErrors(t *testing.T) {
 	defer cleanup()
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, "vol-errors", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, "vol-errors", pb.WriteMode_FSYNC, cache)
 
 	// Create directory /dir and child /dir/file
 	var dirOut fuse.EntryOut
@@ -311,7 +311,7 @@ func TestLocalWriteBufferingAndSync(t *testing.T) {
 	defer cleanup()
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, "vol-buffering", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, "vol-buffering", pb.WriteMode_FSYNC, cache)
 
 	// Create file
 	var createOut fuse.CreateOut
@@ -398,7 +398,7 @@ func TestFUSEAttributesOwnerAndNlink(t *testing.T) {
 	const callerGID = 1000
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, "vol-attrs", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, "vol-attrs", pb.WriteMode_FSYNC, cache)
 
 	// 1. Root directory GetAttr (root has default 0/0 UID/GID in EROFS)
 	var rootAttrOut fuse.AttrOut
@@ -563,7 +563,7 @@ func TestFUSEStableInodesAcrossSnapshots(t *testing.T) {
 	volumeID := "fuse-stable-ino-vol"
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// 1. Mkdir /subdir
 	var mkdirOut fuse.EntryOut
@@ -656,7 +656,7 @@ func TestRenameDescendantOpenHandleAndDirtyFlush(t *testing.T) {
 
 	volumeID := "vol-rename-bug"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// 1. Create directory 'a'
 	var mkdirOut fuse.EntryOut
@@ -749,7 +749,7 @@ func TestDotAndDotDotLookup(t *testing.T) {
 
 	volumeID := "vol-dot-dot"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// 1. Root '.' and '..' lookup
 	var rootDotOut, rootDotDotOut fuse.EntryOut
@@ -830,7 +830,7 @@ func TestDeepPathLookupEfficiency(t *testing.T) {
 
 	volumeID := "vol-deep-path"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// Create 50 nested directories
 	parentID := uint64(fuse.FUSE_ROOT_ID)
@@ -876,7 +876,7 @@ func TestFUSENameLengthLimit(t *testing.T) {
 
 	volumeID := "vol-name-limit"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	validNames := map[string]string{
 		"ascii_255":   strings.Repeat("a", 255),
@@ -1026,7 +1026,7 @@ func TestFUSESetAttrAllFields(t *testing.T) {
 	client := pb.NewObjectFSControllerClient(conn)
 	volumeID := "test-setattr-fields-vol"
 	cache := NewNodeCache(16 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// Create file
 	var createOut fuse.CreateOut
@@ -1113,7 +1113,7 @@ func TestFUSESymlinkAndLinkOperations(t *testing.T) {
 	defer cleanup()
 
 	volumeID := "test-fuse-symlinks"
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, NewNodeCache(1024*1024))
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, NewNodeCache(1024*1024))
 
 	// 1. Create a regular file
 	var createOut fuse.CreateOut
@@ -1218,7 +1218,7 @@ func TestFUSEMknodSpecialFiles(t *testing.T) {
 	volumeID := "fuse-mknod-vol"
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// 1. Mknod FIFO
 	var fifoOut fuse.EntryOut
@@ -1298,7 +1298,7 @@ func TestFUSETruncateAndUnalignedWriteWithCacheInvalidation(t *testing.T) {
 	defer cleanup()
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, "vol-trunc-test", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, "vol-trunc-test", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := rawFS.Create(nil, &fuse.CreateIn{
@@ -1393,7 +1393,7 @@ func TestFUSEUnflushedHoleAndDirtyWriteRead(t *testing.T) {
 	defer cleanup()
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, "vol-unflushed-test", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, "vol-unflushed-test", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := rawFS.Create(nil, &fuse.CreateIn{
@@ -1489,7 +1489,7 @@ func TestDirectoryLinkCountsAndDotDotOnRename(t *testing.T) {
 
 	volumeID := "vol-dir-nlink-rename"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// 1. Mkdir src_parent (nlink 2) and dst_parent (nlink 2)
 	var srcPOut, dstPOut fuse.EntryOut
@@ -1562,7 +1562,7 @@ func TestRenameOntoNonEmptyDirectoryAndMultiplyHardlinked(t *testing.T) {
 
 	volumeID := "vol-rename-edge-cases"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// Test 1: Rename onto non-empty directory returns ENOTEMPTY
 	var dirA, dirB, dirBChild fuse.EntryOut
@@ -1608,7 +1608,7 @@ func TestOpenUnlinkedFileSemantics(t *testing.T) {
 
 	volumeID := "vol-open-unlinked"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// 1. Create file and open it
 	var createOut fuse.CreateOut
@@ -1666,7 +1666,7 @@ func TestMultipleOpenHandlesAndRelease(t *testing.T) {
 
 	volumeID := "vol-multi-open-handles"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// 1. Create file (assigns handle 1)
 	var createOut fuse.CreateOut
@@ -1818,7 +1818,7 @@ func TestObjectFS_StatFs(t *testing.T) {
 
 	volumeID := "test-statfs-volume"
 	cache := NewNodeCache(1024 * 1024)
-	fs := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// Initial StatFs: root directory exists (1 inode)
 	var out fuse.StatfsOut
@@ -1935,7 +1935,7 @@ func TestObjectFS_StatFs_RPCFailure(t *testing.T) {
 		ObjectFSControllerClient: client,
 		err:                      status.Error(codes.Unavailable, "controller unavailable"),
 	}
-	errFS := NewObjectFS(errClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	errFS := NewObjectFS(errClient, volumeID, pb.WriteMode_FSYNC, cache)
 	var out2 fuse.StatfsOut
 	if st := errFS.StatFs(nil, &fuse.InHeader{}, &out2); st != fuse.EIO {
 		t.Fatalf("expected EIO on gRPC error, got %v", st)
@@ -1946,7 +1946,7 @@ func TestObjectFS_StatFs_RPCFailure(t *testing.T) {
 		ObjectFSControllerClient: client,
 		respErr:                  int32(syscall.EIO),
 	}
-	respErrFS := NewObjectFS(respErrClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	respErrFS := NewObjectFS(respErrClient, volumeID, pb.WriteMode_FSYNC, cache)
 	var out3 fuse.StatfsOut
 	if st := respErrFS.StatFs(nil, &fuse.InHeader{}, &out3); st != fuse.EIO {
 		t.Fatalf("expected EIO on response error, got %v", st)
@@ -1975,7 +1975,7 @@ func TestObjectFS_StatFs_Cache(t *testing.T) {
 		ObjectFSControllerClient: client,
 	}
 	cache := NewNodeCache(1024 * 1024)
-	fs := NewObjectFS(countClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(countClient, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var out1 fuse.StatfsOut
 	if st := fs.StatFs(nil, &fuse.InHeader{}, &out1); st != fuse.OK {
@@ -2030,7 +2030,7 @@ func TestObjectFSWaitForReadyAndRecovery(t *testing.T) {
 
 	client := pb.NewObjectFSControllerClient(conn)
 	cache := NewNodeCache(1024 * 1024)
-	fs := NewObjectFSWithTimeout(client, "vol-wait-ready", pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 5*time.Second)
+	fs := NewObjectFSWithTimeout(client, "vol-wait-ready", pb.WriteMode_FSYNC, cache, 5*time.Second)
 
 	done := make(chan fuse.Status, 1)
 	var attrOut fuse.AttrOut
@@ -2094,7 +2094,7 @@ func TestObjectFSServerDownReturnsEIOOnTimeout(t *testing.T) {
 	client := pb.NewObjectFSControllerClient(conn)
 	cache := NewNodeCache(1024 * 1024)
 	// Short deadline of 200ms
-	fs := NewObjectFSWithTimeout(client, "vol-timeout", pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 200*time.Millisecond)
+	fs := NewObjectFSWithTimeout(client, "vol-timeout", pb.WriteMode_FSYNC, cache, 200*time.Millisecond)
 
 	var attrOut fuse.AttrOut
 	start := time.Now()
@@ -2219,7 +2219,7 @@ func TestFsyncSlowSyncSucceedsWithinSyncTimeout(t *testing.T) {
 	volumeID := "vol-slow-sync"
 
 	// rpcTimeout is 1s, but syncTimeout is longer (5s)
-	fs := NewObjectFSWithTimeouts(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 1*time.Second, 5*time.Second)
+	fs := NewObjectFSWithTimeouts(client, volumeID, pb.WriteMode_FSYNC, cache, 1*time.Second, 5*time.Second)
 
 	// Create a test file
 	var createOut fuse.CreateOut
@@ -2252,7 +2252,7 @@ func TestFUSETruncateReportsNewSizeOnFstatAndGetAttr(t *testing.T) {
 	defer cleanup()
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, "vol-trunc-stat-test", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, "vol-trunc-stat-test", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := rawFS.Create(nil, &fuse.CreateIn{
@@ -2349,7 +2349,7 @@ func TestFUSESetAttrTruncateFailsWhenFlushFails(t *testing.T) {
 
 	client := pb.NewObjectFSControllerClient(conn)
 	cache := NewNodeCache(1024 * 1024)
-	fs := NewObjectFSWithTimeouts(client, "vol-fail", pb.WriteMode_WRITE_THROUGH_FSYNC, cache, 50*time.Millisecond, 50*time.Millisecond)
+	fs := NewObjectFSWithTimeouts(client, "vol-fail", pb.WriteMode_FSYNC, cache, 50*time.Millisecond, 50*time.Millisecond)
 
 	// Stage a dirty write in cache
 	const fileID = uint64(10)
@@ -2376,7 +2376,7 @@ func TestFUSEConcurrentOperationsRace(t *testing.T) {
 
 	volumeID := "vol-concurrent-race"
 	cache := NewNodeCache(4 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := rawFS.Create(nil, &fuse.CreateIn{
@@ -2615,7 +2615,7 @@ func TestFUSEMountXAttr(t *testing.T) {
 
 	volumeID := "vol-xattr-mount"
 	cache := NewNodeCache(4 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	mountDir := t.TempDir()
 	mountOpts := &fuse.MountOptions{
@@ -2740,7 +2740,7 @@ func TestRawFileSystemXAttrOperations(t *testing.T) {
 	defer cleanup()
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, "vol-raw-xattr", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, "vol-raw-xattr", pb.WriteMode_FSYNC, cache)
 
 	// Create a test file
 	var createOut fuse.CreateOut
@@ -2854,7 +2854,7 @@ func TestFUSEHandlerXAttrCountShortcut(t *testing.T) {
 
 	countingClient := &xattrCountingClient{ObjectFSControllerClient: realClient}
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(countingClient, "vol-xattr-shortcut", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(countingClient, "vol-xattr-shortcut", pb.WriteMode_FSYNC, cache)
 
 	// 1. Create a file. Create populates inode in cache with XattrCount == 0
 	var createOut fuse.CreateOut
@@ -2915,7 +2915,7 @@ func TestFUSEHandlerXAttrCountInvalidationAndPruning(t *testing.T) {
 	defer cleanup()
 
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(realClient, "vol-xattr-invalidate", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(realClient, "vol-xattr-invalidate", pb.WriteMode_FSYNC, cache)
 
 	// Create file, which records XattrCount == 0 in inodeAttrs and sets lookup count to 1
 	var createOut fuse.CreateOut
@@ -3002,7 +3002,7 @@ func TestSyncFileToServiceCoalescesContiguousChunks(t *testing.T) {
 
 	rec := &recordingClient{ObjectFSControllerClient: baseClient}
 	cache := NewNodeCache(8 * 1024 * 1024)
-	fs := NewObjectFS(rec, "vol-coalesce", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(rec, "vol-coalesce", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := fs.Create(nil, &fuse.CreateIn{
@@ -3054,7 +3054,7 @@ func TestSyncFileToServiceNonContiguousRuns(t *testing.T) {
 
 	rec := &recordingClient{ObjectFSControllerClient: baseClient}
 	cache := NewNodeCache(8 * 1024 * 1024)
-	fs := NewObjectFS(rec, "vol-noncontiguous", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(rec, "vol-noncontiguous", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := fs.Create(nil, &fuse.CreateIn{
@@ -3111,7 +3111,7 @@ func TestSyncFileToServiceSplitsAt32ChunksAnd2MiB(t *testing.T) {
 
 	rec := &recordingClient{ObjectFSControllerClient: baseClient}
 	cache := NewNodeCache(16 * 1024 * 1024)
-	fs := NewObjectFS(rec, "vol-split-32", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(rec, "vol-split-32", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := fs.Create(nil, &fuse.CreateIn{
@@ -3162,7 +3162,7 @@ func TestSyncFileToServicePartialChunkBoundary(t *testing.T) {
 
 	rec := &recordingClient{ObjectFSControllerClient: baseClient}
 	cache := NewNodeCache(8 * 1024 * 1024)
-	fs := NewObjectFS(rec, "vol-partial", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(rec, "vol-partial", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := fs.Create(nil, &fuse.CreateIn{
@@ -3209,7 +3209,7 @@ func TestSyncFileToServiceRPCFailureLeavesChunksDirty(t *testing.T) {
 		failWrite:                true,
 	}
 	cache := NewNodeCache(8 * 1024 * 1024)
-	fs := NewObjectFS(rec, "vol-fail", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(rec, "vol-fail", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := fs.Create(nil, &fuse.CreateIn{
@@ -3254,7 +3254,7 @@ func TestSyncFileToServiceConcurrentWritePreservesDirtyGeneration(t *testing.T) 
 			}
 		},
 	}
-	fs := NewObjectFS(rec, "vol-race", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(rec, "vol-race", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := fs.Create(nil, &fuse.CreateIn{
@@ -3311,7 +3311,7 @@ func TestSyncFileToServiceRetriesFailedTruncateAndClearsSizeGen(t *testing.T) {
 		failTruncateCount:        1,
 	}
 	cache := NewNodeCache(8 * 1024 * 1024)
-	fs := NewObjectFS(rec, "vol-retry-trunc", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(rec, "vol-retry-trunc", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := fs.Create(nil, &fuse.CreateIn{
@@ -3386,7 +3386,7 @@ func TestSyncFileToServiceOrderingDirtySizeBeforeChunksAndDropsBeyondEOF(t *test
 		ObjectFSControllerClient: baseClient,
 	}
 	cache := NewNodeCache(8 * 1024 * 1024)
-	fs := NewObjectFS(rec, "vol-ordering", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	fs := NewObjectFS(rec, "vol-ordering", pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if status := fs.Create(nil, &fuse.CreateIn{
@@ -3495,7 +3495,7 @@ func TestFUSETruncateZeroThenGrowReadsZeros(t *testing.T) {
 
 	volumeID := "test-fuse-trunc-zero-grow"
 	cache := NewNodeCache(64 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY, cache)
 
 	var createOut fuse.CreateOut
 	if status := rawFS.Create(nil, &fuse.CreateIn{
@@ -3600,7 +3600,7 @@ func TestWritePartialChunkReadFileFailureReturnsEIO(t *testing.T) {
 			faultClient := &faultReadFileClient{ObjectFSControllerClient: baseClient}
 			cache := NewNodeCache(8 * 1024 * 1024)
 			volumeID := "test-write-fill-" + tc.name
-			rawFS := NewObjectFS(faultClient, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+			rawFS := NewObjectFS(faultClient, volumeID, pb.WriteMode_LAZY, cache)
 
 			var createOut fuse.CreateOut
 			if status := rawFS.Create(nil, &fuse.CreateIn{
@@ -3729,7 +3729,7 @@ func TestLargeSequentialWriteCrossesStagingCapAndSucceeds(t *testing.T) {
 	volumeID := "vol-large-seq-200mb"
 	// Client cache 128 MiB (default), controller staging cap 64 MiB (default)
 	cache := NewNodeCache(128 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY, cache)
 
 	var createOut fuse.CreateOut
 	if status := rawFS.Create(nil, &fuse.CreateIn{
@@ -3783,7 +3783,7 @@ func TestBudgetTriggeredSyncFlushesAcrossMultipleDirtyFiles(t *testing.T) {
 	volumeID := "vol-multi-file-budget"
 	// Client cache 128 MiB
 	cache := NewNodeCache(128 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY, cache)
 
 	const numFiles = 3
 	const fileSize = 50 * 1024 * 1024 // 50 MiB each -> total 150 MiB > 128 MiB cache
@@ -3857,7 +3857,7 @@ func TestFUSEReadConcurrentChunks(t *testing.T) {
 
 	volumeID := "vol-concurrent-read-test"
 	cache := NewNodeCache(10 * 1024 * 1024)
-	rawFS := NewObjectFS(trackClient, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+	rawFS := NewObjectFS(trackClient, volumeID, pb.WriteMode_LAZY, cache)
 
 	var createOut fuse.CreateOut
 	if status := rawFS.Create(nil, &fuse.CreateIn{
@@ -3956,7 +3956,7 @@ func TestPushDirtyChunksToStaging_DrainAndRetryOnInitialENOSPC(t *testing.T) {
 	client := pb.NewObjectFSControllerClient(conn)
 	volumeID := "vol-enospc-drain-retry"
 	cache := NewNodeCache(10 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY_WRITE, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_LAZY, cache)
 
 	// Create file A and file B
 	var createA, createB fuse.CreateOut
@@ -3983,7 +3983,7 @@ func TestPushDirtyChunksToStaging_DrainAndRetryOnInitialENOSPC(t *testing.T) {
 		Inode:     fileA,
 		Offset:    0,
 		Data:      make([]byte, 64*1024),
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile A failed: %v, errCode=%d", err, wResp.GetError())
@@ -4032,7 +4032,7 @@ func TestDiskBlobCacheColdAndWarmRead(t *testing.T) {
 	defer diskCache.Close()
 
 	memCache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, memCache)
 	rawFS.SetDiskBlobCache(diskCache)
 
 	// Create and write 5 chunks (320 KiB)
@@ -4112,7 +4112,7 @@ func TestDiskBlobCachePrefetchOnOpen(t *testing.T) {
 	defer diskCache.Close()
 
 	memCache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, memCache)
 	rawFS.SetDiskBlobCache(diskCache)
 
 	// Create and write 4 chunks (256 KiB)
@@ -4197,7 +4197,7 @@ func TestDiskBlobCacheSequentialReadPrefetchExtension(t *testing.T) {
 	defer diskCache.Close()
 
 	memCache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, memCache)
 	rawFS.SetDiskBlobCache(diskCache)
 
 	// Create 40 chunks (40 * 64KB = 2560 KB > 32 chunks default window)
@@ -4292,7 +4292,7 @@ func TestDiskBlobCacheRemountThroughput(t *testing.T) {
 	}
 
 	memCache1 := NewNodeCache(1024 * 1024)
-	fs1 := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache1)
+	fs1 := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, memCache1)
 
 	var createOut fuse.CreateOut
 	if status := fs1.Create(nil, &fuse.CreateIn{
@@ -4352,7 +4352,7 @@ func TestDiskBlobCacheRemountThroughput(t *testing.T) {
 	defer diskCache2.Close()
 
 	memCache2 := NewNodeCache(1024 * 1024)
-	fs2 := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, memCache2)
+	fs2 := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, memCache2)
 	fs2.SetDiskBlobCache(diskCache2)
 
 	tWarmStart := time.Now()
@@ -4387,7 +4387,7 @@ func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
 
 	volumeID := "vol-cross-node-watch"
 	cacheA := NewNodeCache(1024 * 1024)
-	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheA)
+	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_FSYNC, cacheA)
 	diskCacheA, err := NewDiskBlobCache(t.TempDir(), 10*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache failed: %v", err)
@@ -4453,7 +4453,7 @@ func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
 		Inode:     inode,
 		Offset:    0,
 		Data:      dataV2,
-		WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
+		WriteMode: pb.WriteMode_FSYNC,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("Client B WriteFile failed: %v, code=%d", err, wResp.GetError())
@@ -4518,11 +4518,11 @@ func TestSharedDiskBlobCacheAcrossMounts(t *testing.T) {
 	vol2 := "vol-mount-2"
 
 	cache1 := NewNodeCache(1024 * 1024)
-	fs1 := NewObjectFS(client, vol1, pb.WriteMode_WRITE_THROUGH_FSYNC, cache1)
+	fs1 := NewObjectFS(client, vol1, pb.WriteMode_FSYNC, cache1)
 	fs1.SetDiskBlobCache(sharedCache)
 
 	cache2 := NewNodeCache(1024 * 1024)
-	fs2 := NewObjectFS(client, vol2, pb.WriteMode_WRITE_THROUGH_FSYNC, cache2)
+	fs2 := NewObjectFS(client, vol2, pb.WriteMode_FSYNC, cache2)
 	fs2.SetDiskBlobCache(sharedCache)
 
 	// Create and write file in vol1 with specific content (100 bytes)
@@ -4652,7 +4652,7 @@ func TestDirtyReadSurvivesControllerRestartWhileSyncInFlight(t *testing.T) {
 
 	client := pb.NewObjectFSControllerClient(conn)
 	cache := NewNodeCache(10 * 1024 * 1024)
-	rawFS := NewObjectFSWithTimeout(client, volumeID, pb.WriteMode_LAZY_WRITE, cache, 5*time.Second)
+	rawFS := NewObjectFSWithTimeout(client, volumeID, pb.WriteMode_LAZY, cache, 5*time.Second)
 
 	// 2. Create file final.txt (committed to wal-buffer)
 	var createOut fuse.CreateOut
@@ -4793,7 +4793,7 @@ func TestFUSEFallocateAllocate(t *testing.T) {
 
 	volumeID := "vol-falloc-alloc"
 	cache := NewNodeCache(4 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if st := rawFS.Create(nil, &fuse.CreateIn{
@@ -4895,7 +4895,7 @@ func TestFUSEFallocateKeepSize(t *testing.T) {
 
 	volumeID := "vol-falloc-keepsize"
 	cache := NewNodeCache(4 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if st := rawFS.Create(nil, &fuse.CreateIn{
@@ -4957,7 +4957,7 @@ func TestFUSEFallocatePunchHoleWholeChunks(t *testing.T) {
 
 	volumeID := "vol-punch-whole"
 	cache := NewNodeCache(8 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if st := rawFS.Create(nil, &fuse.CreateIn{
@@ -5075,7 +5075,7 @@ func TestFUSEFallocatePunchHolePartialChunks(t *testing.T) {
 
 	volumeID := "vol-punch-partial"
 	cache := NewNodeCache(8 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if st := rawFS.Create(nil, &fuse.CreateIn{
@@ -5171,7 +5171,7 @@ func TestFUSEFallocateZeroRangeGrowsSize(t *testing.T) {
 
 	volumeID := "vol-zero-range"
 	cache := NewNodeCache(8 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if st := rawFS.Create(nil, &fuse.CreateIn{
@@ -5246,7 +5246,7 @@ func TestFUSEFallocateUnsupportedModes(t *testing.T) {
 
 	volumeID := "vol-unsupported"
 	cache := NewNodeCache(4 * 1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if st := rawFS.Create(nil, &fuse.CreateIn{
@@ -5325,10 +5325,10 @@ func TestFUSEFallocateMultiClientReadsZeros(t *testing.T) {
 
 	volumeID := "vol-multi-client-punch"
 	cache1 := NewNodeCache(8 * 1024 * 1024)
-	rawFS1 := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache1)
+	rawFS1 := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache1)
 
 	cache2 := NewNodeCache(8 * 1024 * 1024)
-	rawFS2 := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache2)
+	rawFS2 := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache2)
 
 	var createOut fuse.CreateOut
 	if st := rawFS1.Create(nil, &fuse.CreateIn{
@@ -5584,10 +5584,10 @@ func TestCrossNodeWatchVolumeKernelNotifications(t *testing.T) {
 
 	volumeID := "vol-cross-node-notify"
 	cacheA := NewNodeCache(1024 * 1024)
-	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheA)
+	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_FSYNC, cacheA)
 
 	cacheB := NewNodeCache(1024 * 1024)
-	fsB := NewObjectFS(clientB, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheB)
+	fsB := NewObjectFS(clientB, volumeID, pb.WriteMode_FSYNC, cacheB)
 
 	var notifyEvents []notifyEvent
 	var notifyMu sync.Mutex
@@ -5705,7 +5705,7 @@ func TestWriteCacheWritebackPastEOFStaleKernelSize(t *testing.T) {
 
 	volumeID := "vol-mmap-writeback"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if st := rawFS.Create(nil, &fuse.CreateIn{
@@ -5758,7 +5758,7 @@ func TestWriteCacheWritebackAfterRemoteTruncate(t *testing.T) {
 
 	volumeID := "vol-mmap-truncate"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var createOut fuse.CreateOut
 	if st := rawFS.Create(nil, &fuse.CreateIn{
@@ -5856,7 +5856,7 @@ func TestWriteCacheWritebackGetAttrFailureReturnsEIO(t *testing.T) {
 
 	volumeID := "vol-mmap-getattr-err"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// Write to non-existent inode with WRITE_CACHE flag when not in cache
 	nonExistentInode := uint64(999999)
@@ -6089,10 +6089,10 @@ func TestTwoClientNoSelfInvalidation(t *testing.T) {
 
 	volumeID := "vol-no-self-invalidation"
 	cacheA := NewNodeCache(1024 * 1024)
-	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheA)
+	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_FSYNC, cacheA)
 
 	cacheB := NewNodeCache(1024 * 1024)
-	fsB := NewObjectFS(clientB, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheB)
+	fsB := NewObjectFS(clientB, volumeID, pb.WriteMode_FSYNC, cacheB)
 
 	var notifyEventsA []notifyEvent
 	var notifyMuA sync.Mutex
@@ -6208,7 +6208,7 @@ func TestFOPENKeepCache(t *testing.T) {
 
 	volumeID := "test-keep-cache-vol"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// 1. Create sets FOPEN_KEEP_CACHE in OpenOut
 	var createOut fuse.CreateOut
@@ -6249,7 +6249,7 @@ func TestInodeLookupCountTracking(t *testing.T) {
 
 	volumeID := "test-lookup-tracking-vol"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// 1. Initial state: root directory (inode 1) has lookup count 1
 	if count := rawFS.LookupCount(fuse.FUSE_ROOT_ID); count != 1 {
@@ -6393,7 +6393,7 @@ func TestHealthGatedTimeouts(t *testing.T) {
 
 	volumeID := "test-gated-timeouts-vol"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	// Create test file
 	var createOut fuse.CreateOut
@@ -6512,7 +6512,7 @@ func TestReconnectSweep(t *testing.T) {
 
 	volumeID := "test-reconnect-sweep-vol"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var notifyMu sync.Mutex
 	var events []notifyEvent
@@ -6637,8 +6637,8 @@ func TestTwoClientsDentryAndInodeReconnectSweep(t *testing.T) {
 	volumeID := "test-two-clients-sweep-vol"
 	cacheA := NewNodeCache(1024 * 1024)
 	cacheB := NewNodeCache(1024 * 1024)
-	rawFSA := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheA)
-	rawFSB := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheB)
+	rawFSA := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cacheA)
+	rawFSB := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cacheB)
 
 	// A creates a file under root
 	var createA fuse.CreateOut
@@ -6735,7 +6735,7 @@ func TestStartWatcherHealthAndSweep(t *testing.T) {
 
 	volumeID := "test-watcher-health-vol"
 	cache := NewNodeCache(1024 * 1024)
-	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, volumeID, pb.WriteMode_FSYNC, cache)
 
 	var notifyMu sync.Mutex
 	var events []notifyEvent
@@ -6834,7 +6834,7 @@ func TestSyncVolumeNonBlockingTrigger(t *testing.T) {
 	recClient := &recordingControllerClient{ObjectFSControllerClient: client}
 	volumeID := "vol-sync-trigger-test"
 	cache := NewNodeCache(10 * 1024 * 1024)
-	rawFS := NewObjectFS(recClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(recClient, volumeID, pb.WriteMode_FSYNC, cache)
 
 	ctx := t.Context()
 	var createOut fuse.CreateOut
@@ -6904,7 +6904,7 @@ func TestSyncOnClose_SyncsOnlyClosedInode(t *testing.T) {
 	recClient := &recordingControllerClient{ObjectFSControllerClient: client}
 	volumeID := "vol-sync-on-close-inode-test"
 	cache := NewNodeCache(10 * 1024 * 1024)
-	rawFS := NewObjectFS(recClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(recClient, volumeID, pb.WriteMode_FSYNC, cache)
 
 	ctx := t.Context()
 	var createOutA, createOutB fuse.CreateOut
@@ -7032,7 +7032,7 @@ func TestSyncClosedInodes_TenClosedInodesOverlapInTime(t *testing.T) {
 	trackClient := &fsyncConcurrencyTrackingClient{ObjectFSControllerClient: client}
 	volumeID := "vol-concurrent-fsync-overlap-test"
 	cache := NewNodeCache(10 * 1024 * 1024)
-	rawFS := NewObjectFS(trackClient, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(trackClient, volumeID, pb.WriteMode_FSYNC, cache)
 
 	ctx := t.Context()
 	const numFiles = 10
@@ -7102,7 +7102,7 @@ func TestOpen_ReaderCacheInvalidationOnMovedStreamPosition(t *testing.T) {
 
 	client := pb.NewObjectFSControllerClient(conn)
 	cache := NewNodeCache(64 * 1024 * 1024)
-	rawFS := NewObjectFS(client, "test-open-inval-vol", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+	rawFS := NewObjectFS(client, "test-open-inval-vol", pb.WriteMode_FSYNC, cache)
 	rawFS.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
 
 	var notifyMu sync.Mutex
@@ -7126,7 +7126,7 @@ func TestOpen_ReaderCacheInvalidationOnMovedStreamPosition(t *testing.T) {
 	ino := createResp.GetAttr().GetInode().GetIno()
 
 	// Verify that standard mode keeps FOPEN_KEEP_CACHE and does not purge
-	stdFS := NewObjectFS(client, "test-open-inval-vol", pb.WriteMode_WRITE_THROUGH_FSYNC, NewNodeCache(64*1024*1024))
+	stdFS := NewObjectFS(client, "test-open-inval-vol", pb.WriteMode_FSYNC, NewNodeCache(64*1024*1024))
 	stdFS.SetConsistencyMode(pb.ConsistencyMode_STANDARD)
 	var stdOut fuse.OpenOut
 	if st := stdFS.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: ino}}, &stdOut); st != fuse.OK {
@@ -7221,8 +7221,8 @@ func TestCloseToOpen_TwoNodeReaderCacheInvalidation(t *testing.T) {
 	cacheA := NewNodeCache(64 * 1024 * 1024)
 	cacheB := NewNodeCache(64 * 1024 * 1024)
 
-	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_LAZY_WRITE, cacheA)
-	fsB := NewObjectFS(clientB, volumeID, pb.WriteMode_WRITE_THROUGH_FSYNC, cacheB)
+	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_LAZY, cacheA)
+	fsB := NewObjectFS(clientB, volumeID, pb.WriteMode_FSYNC, cacheB)
 	fsB.SetConsistencyMode(pb.ConsistencyMode_CLOSE_TO_OPEN)
 	fsA.SetSyncOnClose(true)
 

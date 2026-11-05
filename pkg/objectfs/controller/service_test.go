@@ -455,7 +455,7 @@ func TestControllerServiceOperations(t *testing.T) {
 		Inode:     fileIno,
 		Offset:    int64(len("initial ")),
 		Data:      []byte("objectfs!"),
-		WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
+		WriteMode: pb.WriteMode_FSYNC,
 	})
 	if err != nil {
 		t.Fatalf("Failed to write file: %v", err)
@@ -2761,15 +2761,15 @@ func TestStreamsDurabilityModes(t *testing.T) {
 		t.Fatalf("Expected local >= 1 and witness >= 1, got local=%d, witness=%d", local, witness)
 	}
 
-	// 2. WriteFile with WRITE_THROUGH_FSYNC (Permanent)
+	// 2. WriteFile with FSYNC (Permanent)
 	_, err = testCreateFile(ctx, server, volumeID, "/witness_dir/file.bin", 0644, []byte("data"), 0, 0)
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 
-	_, err = testWriteFile(ctx, server, volumeID, "/witness_dir/file.bin", 4, []byte("more"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	_, err = testWriteFile(ctx, server, volumeID, "/witness_dir/file.bin", 4, []byte("more"), pb.WriteMode_FSYNC)
 	if err != nil {
-		t.Fatalf("WriteFile with WRITE_THROUGH_FSYNC failed: %v", err)
+		t.Fatalf("WriteFile with FSYNC failed: %v", err)
 	}
 
 	// Staged write is not yet committed to WAL
@@ -3016,30 +3016,30 @@ func TestTargetlessWALDurabilityLocalOnly(t *testing.T) {
 	// requests wait for the strongest level supported, bounded by what was asked for.
 	// Write-through and eager replication succeed at local durability.
 	vol := mustGetVolume(t, server, volumeID)
-	_, _, _, err = volWriteFile(ctx, vol, "/test.txt", 0, []byte("data-permanent"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	_, _, _, err = volWriteFile(ctx, vol, "/test.txt", 0, []byte("data-permanent"), pb.WriteMode_FSYNC)
 	if err != nil {
-		t.Fatalf("vol.WriteFile(WRITE_THROUGH_FSYNC) failed: %v", err)
+		t.Fatalf("vol.WriteFile(FSYNC) failed: %v", err)
 	}
 
-	writeResp, err := testWriteFile(ctx, server, volumeID, "/test.txt", 0, []byte("data-permanent"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	writeResp, err := testWriteFile(ctx, server, volumeID, "/test.txt", 0, []byte("data-permanent"), pb.WriteMode_FSYNC)
 	if err != nil || writeResp.GetError() != 0 {
-		t.Fatalf("expected WriteFile(WRITE_THROUGH_FSYNC) to succeed on target-less WAL at local durability, got: err=%v, resp=%v", err, writeResp)
+		t.Fatalf("expected WriteFile(FSYNC) to succeed on target-less WAL at local durability, got: err=%v, resp=%v", err, writeResp)
 	}
 
-	_, _, _, err = volWriteFile(ctx, vol, "/test.txt", 0, []byte("data-witness"), pb.WriteMode_EAGER_REPLICATION)
+	_, _, _, err = volWriteFile(ctx, vol, "/test.txt", 0, []byte("data-witness"), pb.WriteMode_EAGER)
 	if err != nil {
-		t.Fatalf("vol.WriteFile(EAGER_REPLICATION) failed: %v", err)
+		t.Fatalf("vol.WriteFile(EAGER) failed: %v", err)
 	}
 
-	writeResp, err = testWriteFile(ctx, server, volumeID, "/test.txt", 0, []byte("data-witness"), pb.WriteMode_EAGER_REPLICATION)
+	writeResp, err = testWriteFile(ctx, server, volumeID, "/test.txt", 0, []byte("data-witness"), pb.WriteMode_EAGER)
 	if err != nil || writeResp.GetError() != 0 {
-		t.Fatalf("expected WriteFile(EAGER_REPLICATION) to succeed on target-less WAL at local durability, got: err=%v, resp=%v", err, writeResp)
+		t.Fatalf("expected WriteFile(EAGER) to succeed on target-less WAL at local durability, got: err=%v, resp=%v", err, writeResp)
 	}
 
-	// WriteFile with LAZY_WRITE (Local) should succeed
-	writeResp, err = testWriteFile(ctx, server, volumeID, "/test.txt", 0, []byte("data-local"), pb.WriteMode_LAZY_WRITE)
+	// WriteFile with LAZY (Local) should succeed
+	writeResp, err = testWriteFile(ctx, server, volumeID, "/test.txt", 0, []byte("data-local"), pb.WriteMode_LAZY)
 	if err != nil || writeResp.GetError() != 0 {
-		t.Fatalf("WriteFile(LAZY_WRITE) failed: err=%v, resp.Error=%d", err, writeResp.GetError())
+		t.Fatalf("WriteFile(LAZY) failed: err=%v, resp.Error=%d", err, writeResp.GetError())
 	}
 	if writeResp.BytesWritten != int64(len("data-local")) {
 		t.Fatalf("expected %d bytes written, got %d", len("data-local"), writeResp.BytesWritten)
@@ -3337,7 +3337,7 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 	})
 
 	// 2. WriteFile + Fsync
-	_, wErr := testWriteFile(ctx, server, volumeID, "/test_file.txt", 7, []byte("-appended"), pb.WriteMode_WRITE_THROUGH_FSYNC)
+	_, wErr := testWriteFile(ctx, server, volumeID, "/test_file.txt", 7, []byte("-appended"), pb.WriteMode_FSYNC)
 	if wErr != nil {
 		t.Errorf("WriteFile failed: %v", wErr)
 	}
@@ -3474,7 +3474,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	// 4. Random write touching chunk 1 (offset 20 KiB, length 4 KiB)
 	patch := []byte("random patch in chunk 1")
 	copy(largeData[20*1024:], patch)
-	_, newSize, _, err := volWriteFile(ctx, vol, "/large.bin", 20*1024, patch, pb.WriteMode_LAZY_WRITE)
+	_, newSize, _, err := volWriteFile(ctx, vol, "/large.bin", 20*1024, patch, pb.WriteMode_LAZY)
 	if err != nil {
 		t.Fatalf("WriteFile random write failed: %v", err)
 	}
@@ -3511,7 +3511,7 @@ func TestVolumeFixedBoundaryChunking(t *testing.T) {
 	for i := range growData {
 		growData[i] = 'G'
 	}
-	_, _, _, err = volWriteFile(ctx, vol, "/small.txt", 100, growData, pb.WriteMode_LAZY_WRITE)
+	_, _, _, err = volWriteFile(ctx, vol, "/small.txt", 100, growData, pb.WriteMode_LAZY)
 	if err != nil {
 		t.Fatalf("WriteFile growing small file failed: %v", err)
 	}
@@ -5327,7 +5327,7 @@ func TestChunkFetchFailurePropagated(t *testing.T) {
 	}
 
 	// Append chunk 1 and flush
-	_, _, _, err = vol.WriteFile(ctx, ino, int64(chunkSize), chunk1Data, pb.WriteMode_LAZY_WRITE)
+	_, _, _, err = vol.WriteFile(ctx, ino, int64(chunkSize), chunk1Data, pb.WriteMode_LAZY)
 	if err != nil {
 		t.Fatalf("WriteFile chunk 1 failed: %v", err)
 	}
@@ -5382,7 +5382,7 @@ func TestChunkFetchFailurePropagated(t *testing.T) {
 	}
 
 	patch := []byte("corrupt-overwrite")
-	_, _, _, err = vol.WriteFile(ctx, ino, int64(chunkSize)+100, patch, pb.WriteMode_LAZY_WRITE)
+	_, _, _, err = vol.WriteFile(ctx, ino, int64(chunkSize)+100, patch, pb.WriteMode_LAZY)
 	if err == nil {
 		t.Fatalf("expected WriteFile to fail when chunk fetch fails, got nil")
 	}
@@ -5545,7 +5545,7 @@ func TestServerEIOOnError(t *testing.T) {
 		Inode:     ino,
 		Offset:    int64(chunkSize),
 		Data:      chunk1Data,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || write1Resp.GetError() != 0 {
 		t.Fatalf("server WriteFile chunk 1 failed: %v (err %d)", err, write1Resp.GetError())
@@ -5584,7 +5584,7 @@ func TestServerEIOOnError(t *testing.T) {
 		Inode:     ino,
 		Offset:    int64(chunkSize) + 50,
 		Data:      []byte("mod"),
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil {
 		t.Fatalf("Server WriteFile RPC error: %v", err)
@@ -5671,7 +5671,7 @@ func TestInlineToChunkedTransitionUploadsChunk0OnRestart(t *testing.T) {
 		Inode:     ino,
 		Offset:    chunk2Offset,
 		Data:      chunk2Data,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || writeResp.GetError() != 0 {
 		var code int32
@@ -5749,7 +5749,7 @@ func TestGetManifest(t *testing.T) {
 	inoMulti := cfMulti.GetAttr().GetInode().GetIno()
 
 	for i := 0; i < 3; i++ {
-		wResp, err := testWriteFile(ctx, server, volumeID, "/multi.bin", int64(i*chunkSize), contentMulti[i*chunkSize:(i+1)*chunkSize], pb.WriteMode_WRITE_THROUGH_FSYNC)
+		wResp, err := testWriteFile(ctx, server, volumeID, "/multi.bin", int64(i*chunkSize), contentMulti[i*chunkSize:(i+1)*chunkSize], pb.WriteMode_FSYNC)
 		if err != nil || wResp.GetError() != 0 {
 			t.Fatalf("testWriteFile chunk %d failed: %v", i, err)
 		}
@@ -5804,7 +5804,7 @@ func TestPunchHoleWholeChunks(t *testing.T) {
 	ino := cf.GetAttr().GetInode().GetIno()
 
 	for i := 0; i < 3; i++ {
-		wResp, err := testWriteFile(ctx, server, volumeID, "/hole.bin", int64(i*chunkSize), content[i*chunkSize:(i+1)*chunkSize], pb.WriteMode_WRITE_THROUGH_FSYNC)
+		wResp, err := testWriteFile(ctx, server, volumeID, "/hole.bin", int64(i*chunkSize), content[i*chunkSize:(i+1)*chunkSize], pb.WriteMode_FSYNC)
 		if err != nil || wResp.GetError() != 0 {
 			t.Fatalf("testWriteFile %d failed: %v", i, err)
 		}
@@ -5884,7 +5884,7 @@ func TestPunchHolePartialEdgesAndGrowSize(t *testing.T) {
 	ino := cf.GetAttr().GetInode().GetIno()
 
 	// Write and fsync
-	wResp, err := testWriteFile(ctx, server, volumeID, "/edges.bin", 0, content, pb.WriteMode_WRITE_THROUGH_FSYNC)
+	wResp, err := testWriteFile(ctx, server, volumeID, "/edges.bin", 0, content, pb.WriteMode_FSYNC)
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
@@ -5963,10 +5963,10 @@ func TestPunchHoleStagedChunks(t *testing.T) {
 	}
 	ino := cf.GetAttr().GetInode().GetIno()
 
-	// Write using LAZY_WRITE (staged in server memory)
-	wResp, err := testWriteFile(ctx, server, volumeID, "/staged.bin", 0, content, pb.WriteMode_LAZY_WRITE)
+	// Write using LAZY (staged in server memory)
+	wResp, err := testWriteFile(ctx, server, volumeID, "/staged.bin", 0, content, pb.WriteMode_LAZY)
 	if err != nil || wResp.GetError() != 0 {
-		t.Fatalf("WriteFile LAZY_WRITE failed: %v", err)
+		t.Fatalf("WriteFile LAZY failed: %v", err)
 	}
 
 	// Punch chunk 0 in staged chunks
@@ -6018,7 +6018,7 @@ func TestPunchHoleChunkBoundaryCases(t *testing.T) {
 		t.Fatalf("testCreateFile /c1.bin failed: %v", err)
 	}
 	ino1 := cf1.GetAttr().GetInode().GetIno()
-	if _, err := testWriteFile(ctx, server, volumeID, "/c1.bin", 0, content128, pb.WriteMode_WRITE_THROUGH_FSYNC); err != nil {
+	if _, err := testWriteFile(ctx, server, volumeID, "/c1.bin", 0, content128, pb.WriteMode_FSYNC); err != nil {
 		t.Fatalf("Write /c1.bin failed: %v", err)
 	}
 	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino1, Blocking: true}); err != nil {
@@ -6055,7 +6055,7 @@ func TestPunchHoleChunkBoundaryCases(t *testing.T) {
 		t.Fatalf("testCreateFile /c2.bin failed: %v", err)
 	}
 	ino2 := cf2.GetAttr().GetInode().GetIno()
-	if _, err := testWriteFile(ctx, server, volumeID, "/c2.bin", 0, content100, pb.WriteMode_WRITE_THROUGH_FSYNC); err != nil {
+	if _, err := testWriteFile(ctx, server, volumeID, "/c2.bin", 0, content100, pb.WriteMode_FSYNC); err != nil {
 		t.Fatalf("Write /c2.bin failed: %v", err)
 	}
 	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino2, Blocking: true}); err != nil {
@@ -6092,7 +6092,7 @@ func TestPunchHoleChunkBoundaryCases(t *testing.T) {
 		t.Fatalf("testCreateFile /c3.bin failed: %v", err)
 	}
 	ino3 := cf3.GetAttr().GetInode().GetIno()
-	if _, err := testWriteFile(ctx, server, volumeID, "/c3.bin", 0, content200, pb.WriteMode_WRITE_THROUGH_FSYNC); err != nil {
+	if _, err := testWriteFile(ctx, server, volumeID, "/c3.bin", 0, content200, pb.WriteMode_FSYNC); err != nil {
 		t.Fatalf("Write /c3.bin failed: %v", err)
 	}
 	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino3, Blocking: true}); err != nil {
@@ -6139,9 +6139,9 @@ func TestPunchHoleStagedWriteKeepsSize(t *testing.T) {
 	ino := cf.GetAttr().GetInode().GetIno()
 
 	// WriteFile 64 KiB into empty file (no fsync, staged in server memory)
-	wResp, err := testWriteFile(ctx, server, volumeID, "/staged_size.bin", 0, content, pb.WriteMode_LAZY_WRITE)
+	wResp, err := testWriteFile(ctx, server, volumeID, "/staged_size.bin", 0, content, pb.WriteMode_LAZY)
 	if err != nil || wResp.GetError() != 0 {
-		t.Fatalf("WriteFile LAZY_WRITE failed: %v", err)
+		t.Fatalf("WriteFile LAZY failed: %v", err)
 	}
 
 	// PunchHole(0, 64 KiB, keep_size)

@@ -80,9 +80,9 @@ service ObjectFSController {
 
 enum WriteMode {
   WRITE_MODE_UNSPECIFIED = 0;
-  WRITE_THROUGH_FSYNC = 1;
-  LAZY_WRITE = 2;
-  EAGER_REPLICATION = 3;
+  FSYNC = 1;
+  LAZY = 2;
+  EAGER = 3;
 }
 
 enum ConsistencyMode {

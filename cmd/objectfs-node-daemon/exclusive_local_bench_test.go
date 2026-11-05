@@ -79,7 +79,7 @@ func BenchmarkExclusiveLocalVsFUSE(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			volID := fmt.Sprintf("bench-wt-fuse-%d-%d", time.Now().UnixNano(), i)
 			nodeCache := objectfuse.NewNodeCache(32 * 1024 * 1024)
-			rawFS := objectfuse.NewObjectFSWithTimeouts(client, volID, pb.WriteMode_WRITE_THROUGH_FSYNC, nodeCache, 30*time.Second, 10*time.Minute)
+			rawFS := objectfuse.NewObjectFSWithTimeouts(client, volID, pb.WriteMode_FSYNC, nodeCache, 30*time.Second, 10*time.Minute)
 
 			filename := fmt.Sprintf("large_%d.bin", i)
 			var createOut gofuse.CreateOut
@@ -176,7 +176,7 @@ func BenchmarkExclusiveLocalVsFUSE(b *testing.B) {
 		for it := 0; it < b.N; it++ {
 			volID := fmt.Sprintf("bench-untar-fuse-%d-%d", time.Now().UnixNano(), it)
 			nodeCache := objectfuse.NewNodeCache(32 * 1024 * 1024)
-			rawFS := objectfuse.NewObjectFSWithTimeouts(client, volID, pb.WriteMode_WRITE_THROUGH_FSYNC, nodeCache, 30*time.Second, 10*time.Minute)
+			rawFS := objectfuse.NewObjectFSWithTimeouts(client, volID, pb.WriteMode_FSYNC, nodeCache, 30*time.Second, 10*time.Minute)
 
 			baseDirName := fmt.Sprintf("pkg_%d_%d", time.Now().UnixNano(), it)
 			var mkdirOut gofuse.EntryOut

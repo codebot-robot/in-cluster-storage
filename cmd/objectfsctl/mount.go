@@ -50,7 +50,7 @@ type mountOptions struct {
 // newMountCommand mounts a volume via FUSE directly, without going through the
 // CSI node daemon. It is intended for local development and debugging.
 func newMountCommand(opts *options) *cobra.Command {
-	mountOpts := &mountOptions{options: opts, writeMode: pb.WriteMode_WRITE_THROUGH_FSYNC}
+	mountOpts := &mountOptions{options: opts, writeMode: pb.WriteMode_FSYNC}
 	cmd := &cobra.Command{
 		Use:   "mount <mountpoint>",
 		Short: "Mount a volume via FUSE (blocks until interrupted)",

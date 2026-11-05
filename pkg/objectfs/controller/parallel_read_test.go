@@ -110,7 +110,7 @@ func TestParallelReadFile_SleepingBackend(t *testing.T) {
 		Inode:     ino,
 		Offset:    0,
 		Data:      payload,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile failed: %v", err)
@@ -194,12 +194,12 @@ func TestParallelReadFile_DropVolumeLockDuringBlobIO(t *testing.T) {
 	dataB := bytes.Repeat([]byte("B"), chunkSize)
 
 	if _, err := server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId: volumeID, Inode: inoA, Offset: 0, Data: dataA, WriteMode: pb.WriteMode_LAZY_WRITE,
+		VolumeId: volumeID, Inode: inoA, Offset: 0, Data: dataA, WriteMode: pb.WriteMode_LAZY,
 	}); err != nil {
 		t.Fatalf("WriteFile A failed: %v", err)
 	}
 	if _, err := server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId: volumeID, Inode: inoB, Offset: 0, Data: dataB, WriteMode: pb.WriteMode_LAZY_WRITE,
+		VolumeId: volumeID, Inode: inoB, Offset: 0, Data: dataB, WriteMode: pb.WriteMode_LAZY,
 	}); err != nil {
 		t.Fatalf("WriteFile B failed: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestWriteFileWithEpoch_DoesNotHoldStagingMuDuringBaseChunkGet(t *testing.T)
 	chunkSize := 64 * 1024
 	dataA := bytes.Repeat([]byte("A"), chunkSize)
 	if _, err := server.WriteFile(ctx, &pb.WriteFileRequest{
-		VolumeId: volumeID, Inode: inoA, Offset: 0, Data: dataA, WriteMode: pb.WriteMode_LAZY_WRITE,
+		VolumeId: volumeID, Inode: inoA, Offset: 0, Data: dataA, WriteMode: pb.WriteMode_LAZY,
 	}); err != nil {
 		t.Fatalf("WriteFile A failed: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestWriteFileWithEpoch_DoesNotHoldStagingMuDuringBaseChunkGet(t *testing.T)
 	// Partial overwrite of file A chunk 0: requires fetching base chunk from backend
 	go func() {
 		patch := []byte("XXXX")
-		_, _, _, _, writeError := vol.WriteFileWithEpoch(ctx, inoA, 100, patch, pb.WriteMode_LAZY_WRITE)
+		_, _, _, _, writeError := vol.WriteFileWithEpoch(ctx, inoA, 100, patch, pb.WriteMode_LAZY)
 		writeADone <- writeError
 	}()
 
@@ -321,7 +321,7 @@ func TestWriteFileWithEpoch_DoesNotHoldStagingMuDuringBaseChunkGet(t *testing.T)
 	writeBDone := make(chan error, 1)
 	go func() {
 		dataB := []byte("fast write to file B")
-		_, _, _, _, writeError := vol.WriteFileWithEpoch(ctx, inoB, 0, dataB, pb.WriteMode_LAZY_WRITE)
+		_, _, _, _, writeError := vol.WriteFileWithEpoch(ctx, inoB, 0, dataB, pb.WriteMode_LAZY)
 		writeBDone <- writeError
 	}()
 
