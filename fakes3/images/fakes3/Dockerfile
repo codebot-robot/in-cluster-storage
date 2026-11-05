@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build context is the fakes3/ module directory.
 FROM golang:1.27.3 AS builder
 
 WORKDIR /app
 COPY . .
+WORKDIR /app/fakes3
 # The binary only depends on the standard library; the module's other
 # requirements are test-only and are not downloaded for this build.
 RUN CGO_ENABLED=0 go build -o fakes3 ./cmd/fakes3
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /app/fakes3 /usr/local/bin/fakes3
+COPY --from=builder /app/fakes3/fakes3 /usr/local/bin/fakes3
 
 EXPOSE 9000
 ENTRYPOINT ["/usr/local/bin/fakes3"]
