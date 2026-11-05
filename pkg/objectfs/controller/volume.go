@@ -6259,6 +6259,17 @@ func (v *Volume) GetSnapshotInfo(ctx context.Context, snapshotName string) (*pb.
 	return v.getSnapshotInfoLocked(ctx, snapshotName)
 }
 
+func snapshotInfoFromPointer(pointer *sdsv1.SnapshotPointer) *pb.SnapshotInfo {
+	if pointer == nil {
+		return nil
+	}
+	return &pb.SnapshotInfo{
+		Name:      pointer.GetName(),
+		Position:  pointer.GetPosition(),
+		CreatedAt: pointer.GetCreatedAt(),
+	}
+}
+
 func (v *Volume) getSnapshotInfoLocked(ctx context.Context, snapshotName string) (*pb.SnapshotInfo, error) {
 	pointers, err := v.listSnapshotsLocked(ctx)
 	if err != nil {
@@ -6266,12 +6277,7 @@ func (v *Volume) getSnapshotInfoLocked(ctx context.Context, snapshotName string)
 	}
 	for _, p := range pointers {
 		if p.GetName() == snapshotName || p.GetLocation() == snapshotName || path.Base(p.GetLocation()) == snapshotName {
-			info := &pb.SnapshotInfo{
-				Name:      p.GetName(),
-				Position:  p.GetPosition(),
-				CreatedAt: p.GetCreatedAt(),
-			}
-			return info, nil
+			return snapshotInfoFromPointer(p), nil
 		}
 	}
 	return nil, fmt.Errorf("snapshot %q not found", snapshotName)
@@ -6285,13 +6291,13 @@ var ErrSnapshotNotFound = errors.New("snapshot not found")
 // at the head (H+1). The index is restored from the snapshot, its position set to H+1, stats and
 // allocator re-initialized (with inode numbers monotonic across the restore), and a fresh index
 // snapshot published at H+1 so recovery has a snapshot that already reflects the restore.
-// Returns the published snapshot name on success.
-func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (string, error) {
+// Returns the published snapshot info on success.
+func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.SnapshotInfo, error) {
 	v.stagingMu.Lock()
 	v.waitForSyncIdleLocked()
 	if err := v.resetStagingDirLocked(); err != nil {
 		v.stagingMu.Unlock()
-		return "", err
+		return nil, err
 	}
 	v.stagedChunks = make(map[uint64]map[int]stagedChunkReference)
 	v.stagedSizes = make(map[uint64]int64)
@@ -6306,15 +6312,15 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (stri
 	defer v.mu.Unlock()
 
 	if v.backend == nil {
-		return "", fmt.Errorf("no backend configured")
+		return nil, fmt.Errorf("no backend configured")
 	}
 	if v.indexFactory == nil {
-		return "", fmt.Errorf("no index factory configured")
+		return nil, fmt.Errorf("no index factory configured")
 	}
 
 	pointers, err := v.listSnapshotsLocked(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to list snapshots: %w", err)
+		return nil, fmt.Errorf("failed to list snapshots: %w", err)
 	}
 
 	var targetPtr *sdsv1.SnapshotPointer
@@ -6325,11 +6331,11 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (stri
 		}
 	}
 	if targetPtr == nil {
-		return "", fmt.Errorf("%w: %q", ErrSnapshotNotFound, snapshotName)
+		return nil, fmt.Errorf("%w: %q", ErrSnapshotNotFound, snapshotName)
 	}
 
 	if err := v.flushOverlayLocked(ctx); err != nil {
-		return "", fmt.Errorf("failed to flush overlay before restore: %w", err)
+		return nil, fmt.Errorf("failed to flush overlay before restore: %w", err)
 	}
 
 	var preRestoreMaxIno uint64
@@ -6353,7 +6359,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (stri
 	if v.metadataStream != nil {
 		seq, err := v.metadataStream.AppendSnapshotPointer(ctx, restorePtr)
 		if err != nil {
-			return "", fmt.Errorf("failed to append restore record: %w", err)
+			return nil, fmt.Errorf("failed to append restore record: %w", err)
 		}
 		restoreSeq = seq
 	} else {
@@ -6363,7 +6369,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (stri
 
 	if v.stream.ReplicationLevel() == walclient.Permanent {
 		if err := v.stream.Flush(ctx); err != nil {
-			return "", fmt.Errorf("failed to flush WAL stream after restore: %w", err)
+			return nil, fmt.Errorf("failed to flush WAL stream after restore: %w", err)
 		}
 	}
 
@@ -6371,18 +6377,18 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (stri
 	if v.metadataView != nil {
 		oldIdx = v.metadataView.Index()
 		if err := v.metadataView.Close(); err != nil {
-			return "", fmt.Errorf("failed to close metadata view: %w", err)
+			return nil, fmt.Errorf("failed to close metadata view: %w", err)
 		}
 		v.metadataView = nil
 	}
 
 	restoredIdx, err := v.rebuildRestoreSnapshot(ctx, oldIdx, restorePtr, restoreSeq, preRestoreMaxIno)
 	if err != nil {
-		return "", fmt.Errorf("failed to restore snapshot %q: %w", snapshotName, err)
+		return nil, fmt.Errorf("failed to restore snapshot %q: %w", snapshotName, err)
 	}
 
 	if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
-		return "", fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
+		return nil, fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
 	}
 	v.lastCommitSeq = restoreSeq
 
@@ -6393,18 +6399,18 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (stri
 	// are retained across snapshot restore because they refer to the running clients.
 	v.initLiveStatsLocked()
 	if err := v.initNextInodeFromStatsLocked(ctx, preRestoreMaxIno); err != nil {
-		return "", fmt.Errorf("failed to initialize next inode from stats: %w", err)
+		return nil, fmt.Errorf("failed to initialize next inode from stats: %w", err)
 	}
 	v.assertStatsMatchLocked("after RestoreSnapshot")
 
 	snap, ok := v.metadataView.Index().(sds.Snapshotter)
 	if !ok {
-		return "", fmt.Errorf("volume metadata index does not support snapshots")
+		return nil, fmt.Errorf("volume metadata index does not support snapshots")
 	}
 
 	freshKey, freshPos, err := snap.PublishSnapshot(ctx, v.backend)
 	if err != nil {
-		return "", fmt.Errorf("failed to publish fresh index snapshot after restore: %w", err)
+		return nil, fmt.Errorf("failed to publish fresh index snapshot after restore: %w", err)
 	}
 
 	format := ""
@@ -6421,5 +6427,5 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (stri
 	}
 	v.snapshotPointers = append(v.snapshotPointers, restorePtr, freshPtr)
 
-	return freshPtr.GetName(), nil
+	return snapshotInfoFromPointer(freshPtr), nil
 }
