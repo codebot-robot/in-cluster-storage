@@ -35,6 +35,13 @@ service WalBuffer {
   rpc Tail(TailRequest) returns (stream TailResponse);
 }
 
+enum DurabilityLevel {
+  DURABILITY_LEVEL_UNSPECIFIED = 0;
+  LOCAL = 1;
+  WITNESS = 2;
+  PERMANENT = 3;
+}
+
 message AppendRequest {
   oneof msg {
     Hello hello = 1;

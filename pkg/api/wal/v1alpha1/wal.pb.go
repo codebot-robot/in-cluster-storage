@@ -35,6 +35,58 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type DurabilityLevel int32
+
+const (
+	DurabilityLevel_DURABILITY_LEVEL_UNSPECIFIED DurabilityLevel = 0
+	DurabilityLevel_LOCAL                        DurabilityLevel = 1
+	DurabilityLevel_WITNESS                      DurabilityLevel = 2
+	DurabilityLevel_PERMANENT                    DurabilityLevel = 3
+)
+
+// Enum value maps for DurabilityLevel.
+var (
+	DurabilityLevel_name = map[int32]string{
+		0: "DURABILITY_LEVEL_UNSPECIFIED",
+		1: "LOCAL",
+		2: "WITNESS",
+		3: "PERMANENT",
+	}
+	DurabilityLevel_value = map[string]int32{
+		"DURABILITY_LEVEL_UNSPECIFIED": 0,
+		"LOCAL":                        1,
+		"WITNESS":                      2,
+		"PERMANENT":                    3,
+	}
+)
+
+func (x DurabilityLevel) Enum() *DurabilityLevel {
+	p := new(DurabilityLevel)
+	*p = x
+	return p
+}
+
+func (x DurabilityLevel) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DurabilityLevel) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_wal_proto_enumTypes[0].Descriptor()
+}
+
+func (DurabilityLevel) Type() protoreflect.EnumType {
+	return &file_proto_wal_proto_enumTypes[0]
+}
+
+func (x DurabilityLevel) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DurabilityLevel.Descriptor instead.
+func (DurabilityLevel) EnumDescriptor() ([]byte, []int) {
+	return file_proto_wal_proto_rawDescGZIP(), []int{0}
+}
+
 type AppendRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Msg:
@@ -717,7 +769,12 @@ const file_proto_wal_proto_rawDesc = "" +
 	"\x06crc32c\x18\x05 \x01(\rR\x06crc32c\"b\n" +
 	"\fTailResponse\x12/\n" +
 	"\x06record\x18\x01 \x01(\v2\x17.wal.v1alpha1.LogRecordR\x06record\x12!\n" +
-	"\fresumed_from\x18\x02 \x01(\x04R\vresumedFrom2\xd7\x01\n" +
+	"\fresumed_from\x18\x02 \x01(\x04R\vresumedFrom*Z\n" +
+	"\x0fDurabilityLevel\x12 \n" +
+	"\x1cDURABILITY_LEVEL_UNSPECIFIED\x10\x00\x12\t\n" +
+	"\x05LOCAL\x10\x01\x12\v\n" +
+	"\aWITNESS\x10\x02\x12\r\n" +
+	"\tPERMANENT\x10\x032\xd7\x01\n" +
 	"\tWalBuffer\x12G\n" +
 	"\x06Append\x12\x1b.wal.v1alpha1.AppendRequest\x1a\x1c.wal.v1alpha1.AppendResponse(\x010\x01\x12@\n" +
 	"\x05Flush\x12\x1a.wal.v1alpha1.FlushRequest\x1a\x1b.wal.v1alpha1.FlushResponse\x12?\n" +
@@ -735,32 +792,34 @@ func file_proto_wal_proto_rawDescGZIP() []byte {
 	return file_proto_wal_proto_rawDescData
 }
 
+var file_proto_wal_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_proto_wal_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_proto_wal_proto_goTypes = []any{
-	(*AppendRequest)(nil),  // 0: wal.v1alpha1.AppendRequest
-	(*Hello)(nil),          // 1: wal.v1alpha1.Hello
-	(*AppendResponse)(nil), // 2: wal.v1alpha1.AppendResponse
-	(*HelloAck)(nil),       // 3: wal.v1alpha1.HelloAck
-	(*AppendRecord)(nil),   // 4: wal.v1alpha1.AppendRecord
-	(*Ack)(nil),            // 5: wal.v1alpha1.Ack
-	(*FlushRequest)(nil),   // 6: wal.v1alpha1.FlushRequest
-	(*FlushResponse)(nil),  // 7: wal.v1alpha1.FlushResponse
-	(*TailRequest)(nil),    // 8: wal.v1alpha1.TailRequest
-	(*LogRecord)(nil),      // 9: wal.v1alpha1.LogRecord
-	(*TailResponse)(nil),   // 10: wal.v1alpha1.TailResponse
+	(DurabilityLevel)(0),   // 0: wal.v1alpha1.DurabilityLevel
+	(*AppendRequest)(nil),  // 1: wal.v1alpha1.AppendRequest
+	(*Hello)(nil),          // 2: wal.v1alpha1.Hello
+	(*AppendResponse)(nil), // 3: wal.v1alpha1.AppendResponse
+	(*HelloAck)(nil),       // 4: wal.v1alpha1.HelloAck
+	(*AppendRecord)(nil),   // 5: wal.v1alpha1.AppendRecord
+	(*Ack)(nil),            // 6: wal.v1alpha1.Ack
+	(*FlushRequest)(nil),   // 7: wal.v1alpha1.FlushRequest
+	(*FlushResponse)(nil),  // 8: wal.v1alpha1.FlushResponse
+	(*TailRequest)(nil),    // 9: wal.v1alpha1.TailRequest
+	(*LogRecord)(nil),      // 10: wal.v1alpha1.LogRecord
+	(*TailResponse)(nil),   // 11: wal.v1alpha1.TailResponse
 }
 var file_proto_wal_proto_depIdxs = []int32{
-	1,  // 0: wal.v1alpha1.AppendRequest.hello:type_name -> wal.v1alpha1.Hello
-	4,  // 1: wal.v1alpha1.AppendRequest.record:type_name -> wal.v1alpha1.AppendRecord
-	3,  // 2: wal.v1alpha1.AppendResponse.hello_ack:type_name -> wal.v1alpha1.HelloAck
-	5,  // 3: wal.v1alpha1.AppendResponse.ack:type_name -> wal.v1alpha1.Ack
-	9,  // 4: wal.v1alpha1.TailResponse.record:type_name -> wal.v1alpha1.LogRecord
-	0,  // 5: wal.v1alpha1.WalBuffer.Append:input_type -> wal.v1alpha1.AppendRequest
-	6,  // 6: wal.v1alpha1.WalBuffer.Flush:input_type -> wal.v1alpha1.FlushRequest
-	8,  // 7: wal.v1alpha1.WalBuffer.Tail:input_type -> wal.v1alpha1.TailRequest
-	2,  // 8: wal.v1alpha1.WalBuffer.Append:output_type -> wal.v1alpha1.AppendResponse
-	7,  // 9: wal.v1alpha1.WalBuffer.Flush:output_type -> wal.v1alpha1.FlushResponse
-	10, // 10: wal.v1alpha1.WalBuffer.Tail:output_type -> wal.v1alpha1.TailResponse
+	2,  // 0: wal.v1alpha1.AppendRequest.hello:type_name -> wal.v1alpha1.Hello
+	5,  // 1: wal.v1alpha1.AppendRequest.record:type_name -> wal.v1alpha1.AppendRecord
+	4,  // 2: wal.v1alpha1.AppendResponse.hello_ack:type_name -> wal.v1alpha1.HelloAck
+	6,  // 3: wal.v1alpha1.AppendResponse.ack:type_name -> wal.v1alpha1.Ack
+	10, // 4: wal.v1alpha1.TailResponse.record:type_name -> wal.v1alpha1.LogRecord
+	1,  // 5: wal.v1alpha1.WalBuffer.Append:input_type -> wal.v1alpha1.AppendRequest
+	7,  // 6: wal.v1alpha1.WalBuffer.Flush:input_type -> wal.v1alpha1.FlushRequest
+	9,  // 7: wal.v1alpha1.WalBuffer.Tail:input_type -> wal.v1alpha1.TailRequest
+	3,  // 8: wal.v1alpha1.WalBuffer.Append:output_type -> wal.v1alpha1.AppendResponse
+	8,  // 9: wal.v1alpha1.WalBuffer.Flush:output_type -> wal.v1alpha1.FlushResponse
+	11, // 10: wal.v1alpha1.WalBuffer.Tail:output_type -> wal.v1alpha1.TailResponse
 	8,  // [8:11] is the sub-list for method output_type
 	5,  // [5:8] is the sub-list for method input_type
 	5,  // [5:5] is the sub-list for extension type_name
@@ -786,13 +845,14 @@ func file_proto_wal_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_wal_proto_rawDesc), len(file_proto_wal_proto_rawDesc)),
-			NumEnums:      0,
+			NumEnums:      1,
 			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_proto_wal_proto_goTypes,
 		DependencyIndexes: file_proto_wal_proto_depIdxs,
+		EnumInfos:         file_proto_wal_proto_enumTypes,
 		MessageInfos:      file_proto_wal_proto_msgTypes,
 	}.Build()
 	File_proto_wal_proto = out.File
