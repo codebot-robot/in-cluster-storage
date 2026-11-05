@@ -124,3 +124,12 @@ func TestNewTestServer_CleanupClosesWALClientStreams(t *testing.T) {
 		t.Fatalf("backgroundReplicationLoop still running after test return:\n%s", stacks)
 	}
 }
+
+func (v *Volume) evictAllUploadedPacksForTest() {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+	originalMaxStagingBytes := v.maxStagingBytes
+	v.maxStagingBytes = 0
+	v.evictUploadedPacksLocked(0)
+	v.maxStagingBytes = originalMaxStagingBytes
+}

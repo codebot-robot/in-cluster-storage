@@ -109,6 +109,7 @@ type Volume struct {
 	packs              map[uint64]*blob.IncrementalPack
 	packLiveReferences map[uint64]int
 	packUploaded       map[uint64]bool
+	packKeys           map[uint64]string
 
 	stagingMu       sync.Mutex
 	stagingEpoch    int64
@@ -189,6 +190,15 @@ func WithMaxStagingBytes(b int64) VolumeOption {
 	return func(v *Volume) {
 		if b > 0 {
 			v.maxStagingBytes = b
+		}
+	}
+}
+
+// WithBlobStore sets the blob store used by the volume.
+func WithBlobStore(store *blob.Store) VolumeOption {
+	return func(v *Volume) {
+		if store != nil {
+			v.blobStore = store
 		}
 	}
 }
@@ -483,6 +493,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		packs:              make(map[uint64]*blob.IncrementalPack),
 		packLiveReferences: make(map[uint64]int),
 		packUploaded:       make(map[uint64]bool),
+		packKeys:           make(map[uint64]string),
 		coalesceWindow:     1 * time.Second,
 		syncTimeout:        10 * time.Minute,
 		openBarrierTimeout: 5 * time.Second,
@@ -518,17 +529,44 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	return v, nil
 }
 
-func (v *Volume) cleanupPackIfUnreferencedLocked(packID uint64) {
-	if v.packUploaded[packID] && v.packLiveReferences[packID] <= 0 {
-		if pack, ok := v.packs[packID]; ok {
-			errutil.CloseAndLog(pack, "uploaded pack")
-			packPath := v.scratchPackPath(packID)
-			if removeErr := os.Remove(packPath); removeErr != nil && !os.IsNotExist(removeErr) {
-				klog.Warningf("failed removing uploaded pack %s: %v", packPath, removeErr)
-			}
-			delete(v.packs, packID)
-			delete(v.packUploaded, packID)
-			delete(v.packLiveReferences, packID)
+func (v *Volume) deletePackLocked(packID uint64) {
+	pack, ok := v.packs[packID]
+	if !ok {
+		return
+	}
+	errutil.CloseAndLog(pack, "uploaded pack")
+	packPath := v.scratchPackPath(packID)
+	if removeErr := os.Remove(packPath); removeErr != nil && !os.IsNotExist(removeErr) {
+		klog.Warningf("failed removing uploaded pack %s: %v", packPath, removeErr)
+	}
+	if key, ok := v.packKeys[packID]; ok && v.blobStore != nil {
+		v.blobStore.UnregisterLocalPack(key)
+	}
+	delete(v.packKeys, packID)
+	delete(v.packs, packID)
+	delete(v.packUploaded, packID)
+	delete(v.packLiveReferences, packID)
+}
+
+func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
+	var total int64
+	var eligible []uint64
+	for packID, pack := range v.packs {
+		total += pack.ByteSize()
+		if v.packUploaded[packID] && v.packLiveReferences[packID] <= 0 {
+			eligible = append(eligible, packID)
+		}
+	}
+	if total+neededBytes <= v.maxStagingBytes || len(eligible) == 0 {
+		return
+	}
+	sort.Slice(eligible, func(i, j int) bool { return eligible[i] < eligible[j] })
+	for _, packID := range eligible {
+		packSize := v.packs[packID].ByteSize()
+		v.deletePackLocked(packID)
+		total -= packSize
+		if total+neededBytes <= v.maxStagingBytes {
+			break
 		}
 	}
 }
@@ -537,7 +575,6 @@ func (v *Volume) dropPackReferenceLocked(packID uint64) {
 	v.packLiveReferences[packID]--
 	if v.packLiveReferences[packID] <= 0 {
 		delete(v.packLiveReferences, packID)
-		v.cleanupPackIfUnreferencedLocked(packID)
 	}
 }
 
@@ -555,9 +592,7 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 			v.lastSyncError[sIno] = err
 		}
 	} else {
-		for packID := range v.packs {
-			v.cleanupPackIfUnreferencedLocked(packID)
-		}
+		v.evictUploadedPacksLocked(0)
 
 		for ino, chunks := range snapshotChunks {
 			for index, reference := range chunks {
@@ -913,7 +948,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 			packKey := v.blobStore.PackKey(packIDString, pack.Count())
 			packStream := blob.NewByteStreamFromFile(file, pack.ByteSize(), false)
 
-			if err := v.blobStore.PutPackFile(ctx, packKey, packStream, pack.Entries()); err != nil {
+			if err := v.blobStore.PutPackFile(ctx, packKey, packStream, pack.Entries(), pack); err != nil {
 				errutil.CloseAndLog(packStream, "failed pack stream")
 				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to upload sealed pack %s: %w", packKey, err), snapshotChunks, 0, inodeFilter)
 			}
@@ -922,6 +957,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 			}
 			v.stagingMu.Lock()
 			v.packUploaded[packID] = true
+			v.packKeys[packID] = packKey
 			v.stagingMu.Unlock()
 		}
 	} else {
@@ -3648,12 +3684,16 @@ func (v *Volume) removeStagingDirLocked() error {
 		errutil.CloseAndLog(v.activePack, "active scratch pack")
 		v.activePack = nil
 	}
-	for _, pack := range v.packs {
+	for packID, pack := range v.packs {
 		errutil.CloseAndLog(pack, "staged pack")
+		if key, ok := v.packKeys[packID]; ok && v.blobStore != nil {
+			v.blobStore.UnregisterLocalPack(key)
+		}
 	}
 	v.packs = make(map[uint64]*blob.IncrementalPack)
 	v.packLiveReferences = make(map[uint64]int)
 	v.packUploaded = make(map[uint64]bool)
+	v.packKeys = make(map[uint64]string)
 	if removeErr := os.RemoveAll(v.stagingDir); removeErr != nil && !os.IsNotExist(removeErr) {
 		return fmt.Errorf("failed removing staging directory %s: %w", v.stagingDir, removeErr)
 	}
@@ -3671,6 +3711,7 @@ func (v *Volume) resetStagingDirLocked() error {
 }
 
 func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
+	v.evictUploadedPacksLocked(int64(len(data)))
 	if v.activePack == nil {
 		v.nextPackID++
 		packID := v.nextPackID

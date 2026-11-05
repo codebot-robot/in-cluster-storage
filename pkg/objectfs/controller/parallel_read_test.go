@@ -96,6 +96,7 @@ func TestParallelReadFile_SleepingBackend(t *testing.T) {
 
 	// Reset getCalls counter before ReadFile
 	rawBackend.getCalls.Store(0)
+	vol.evictAllUploadedPacksForTest()
 
 	start := time.Now()
 	data, total, _, err := vol.ReadFile(ctx, ino, 0, int64(len(payload)))

@@ -5126,6 +5126,8 @@ func TestChunkFetchFailurePropagated(t *testing.T) {
 		t.Fatalf("initial read chunk 1 failed: %v", err)
 	}
 
+	vol.evictAllUploadedPacksForTest()
+
 	// 2. Fail chunk 1 fetch only.
 	backend.setFailPack(chunk1Pack, true)
 
@@ -5332,6 +5334,8 @@ func TestServerEIOOnError(t *testing.T) {
 		t.Fatalf("expected at least 2 packfiles, got %d", len(backend.packFiles))
 	}
 	chunk1Pack := backend.packFiles[len(backend.packFiles)-1]
+
+	vol.evictAllUploadedPacksForTest()
 
 	// Fail chunk 1 fetch
 	backend.setFailPack(chunk1Pack, true)

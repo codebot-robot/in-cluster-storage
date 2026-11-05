@@ -31,6 +31,7 @@ import (
 )
 
 var ErrPackSlotsFull = errors.New("incremental pack slots are full")
+var ErrPackClosed = errors.New("incremental pack is closed")
 
 type IncrementalPack struct {
 	mu      sync.Mutex
@@ -79,7 +80,7 @@ func NewIncrementalPack(path string, slots uint32) (*IncrementalPack, error) {
 
 func (p *IncrementalPack) verifyOpenLocked() error {
 	if p.file == nil {
-		return errors.New("incremental pack is closed")
+		return ErrPackClosed
 	}
 	return nil
 }

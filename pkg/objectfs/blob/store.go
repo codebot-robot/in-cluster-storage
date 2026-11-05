@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -64,8 +65,9 @@ type Store struct {
 	largeThreshold int64
 
 	mu            sync.RWMutex
-	packIndexes   map[string][]BlobEntry  // packKey -> sorted entries
-	shaToLocation map[string]BlobLocation // sha256Hex -> location
+	packIndexes   map[string][]BlobEntry      // packKey -> sorted entries
+	shaToLocation map[string]BlobLocation     // sha256Hex -> location
+	localPacks    map[string]*IncrementalPack // packKey -> local open or sealed pack
 }
 
 // NewStore creates a new Blob Store with the given backend and threshold.
@@ -78,6 +80,7 @@ func NewStore(backend ObjectStorageBackend, largeThreshold int64) *Store {
 		largeThreshold: largeThreshold,
 		packIndexes:    make(map[string][]BlobEntry),
 		shaToLocation:  make(map[string]BlobLocation),
+		localPacks:     make(map[string]*IncrementalPack),
 	}
 }
 
@@ -94,13 +97,24 @@ func (s *Store) PackKey(packID string, count int) string {
 	return s.packKey(packID, count)
 }
 
+// UnregisterLocalPack removes local pack retention for the given key.
+func (s *Store) UnregisterLocalPack(key string) {
+	s.mu.Lock()
+	delete(s.localPacks, key)
+	s.mu.Unlock()
+}
+
 // PutPackFile uploads an already-constructed packfile stream to object storage at packKey and indexes its entries.
-func (s *Store) PutPackFile(ctx context.Context, packKey string, stream ByteStream, entries []BlobEntry) error {
+// If localPack is non-nil, it is retained for local reads to avoid round-tripping through object storage.
+func (s *Store) PutPackFile(ctx context.Context, packKey string, stream ByteStream, entries []BlobEntry, localPack *IncrementalPack) error {
 	if _, err := s.backend.PutObject(ctx, "", packKey, stream); err != nil {
 		return fmt.Errorf("failed to write packfile %s to backend: %w", packKey, err)
 	}
 	s.mu.Lock()
 	s.packIndexes[packKey] = entries
+	if localPack != nil {
+		s.localPacks[packKey] = localPack
+	}
 	for _, entry := range entries {
 		s.shaToLocation[entry.SHA256Hex()] = BlobLocation{
 			IsStandalone: false,
@@ -326,9 +340,26 @@ func (s *Store) ListBlobs(ctx context.Context, opts ListBlobsOptions) ([]string,
 func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, error) {
 	s.mu.RLock()
 	loc, found := s.shaToLocation[sha256Hex]
+	var localPack *IncrementalPack
+	if found && loc.PackKey != "" {
+		localPack = s.localPacks[loc.PackKey]
+	}
 	s.mu.RUnlock()
 
 	if found {
+		if localPack != nil {
+			stream, err := localPack.ReadBlob(loc.Entry)
+			if err != nil {
+				if errors.Is(err, ErrPackClosed) {
+					klog.V(2).Infof("local pack %s closed during read of blob %s, falling back to backend: %v", loc.PackKey, sha256Hex, err)
+				} else {
+					klog.Warningf("failed to read blob %s from local pack %s, falling back to backend: %v", sha256Hex, loc.PackKey, err)
+				}
+			} else {
+				return stream, nil
+			}
+		}
+
 		if loc.IsStandalone {
 			var buf bytes.Buffer
 			if err := s.backend.GetObject(ctx, "", s.blobKey(sha256Hex), 0, 0, &buf); err != nil {

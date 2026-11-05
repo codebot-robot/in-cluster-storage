@@ -531,6 +531,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 		if s.acceptUnversioned {
 			volOpts = append(volOpts, WithAcceptUnversioned(true))
 		}
+		if s.blobStore != nil {
+			volOpts = append(volOpts, WithBlobStore(s.blobStore))
+		}
 
 		vol, err = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
 		if err != nil {
