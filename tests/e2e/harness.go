@@ -408,3 +408,68 @@ func (h *Harness) WaitForPodReady(name, namespace string, timeout time.Duration)
 
 	return waitErr
 }
+
+// resolveApCommand returns the command name and initial arguments to execute ap.
+// It prefers an "ap" executable already found on PATH, falling back to
+// "go run github.com/gke-labs/gke-labs-infra/ap@latest" as used by presubmits.
+func resolveApCommand() (string, []string) {
+	apPath, err := exec.LookPath("ap")
+	if err != nil {
+		return "go", []string{"run", "github.com/gke-labs/gke-labs-infra/ap@latest"}
+	}
+	return apPath, nil
+}
+
+// ApDeploy writes the provided manifest contents into a scratch directory inside
+// the repository checkout (under a k8s/ path segment), invokes "ap deploy" to build,
+// kind-load, rewrite, and apply the manifests, and removes the scratch directory
+// during test cleanup.
+func (h *Harness) ApDeploy(t *testing.T, manifests map[string]string) {
+	t.Helper()
+
+	repositoryRoot := h.GetGitRoot()
+	scratchDirectory := filepath.Join(repositoryRoot, "tests", "e2e", "deploy-scratch", h.ClusterName)
+	k8sDirectory := filepath.Join(scratchDirectory, "k8s")
+
+	t.Cleanup(func() {
+		if err := os.RemoveAll(scratchDirectory); err != nil {
+			t.Errorf("failed to remove scratch directory %s: %v", scratchDirectory, err)
+		}
+	})
+
+	if err := os.RemoveAll(scratchDirectory); err != nil {
+		t.Errorf("failed to clean up existing scratch directory %s: %v", scratchDirectory, err)
+	}
+	if err := os.MkdirAll(k8sDirectory, 0755); err != nil {
+		t.Fatalf("failed to create scratch directory %s: %v", k8sDirectory, err)
+	}
+
+	for name, content := range manifests {
+		manifestFileName := name
+		if !strings.HasSuffix(manifestFileName, ".yaml") && !strings.HasSuffix(manifestFileName, ".yml") {
+			manifestFileName += ".yaml"
+		}
+		manifestPath := filepath.Join(k8sDirectory, manifestFileName)
+		if err := os.WriteFile(manifestPath, []byte(content), 0644); err != nil {
+			t.Fatalf("failed to write manifest %s: %v", manifestPath, err)
+		}
+	}
+
+	commandName, initialArguments := resolveApCommand()
+	arguments := append([]string{}, initialArguments...)
+
+	namespace := h.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	arguments = append(arguments, "deploy", "--skip-push", "--cluster", fmt.Sprintf("kind://%s", h.ClusterName), "--namespace", namespace, k8sDirectory)
+
+	command := exec.Command(commandName, arguments...)
+	command.Dir = repositoryRoot
+	command.Env = append(os.Environ(), "IMAGE_TAG=e2e", "IMAGE_PREFIX=images.local")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ap deploy failed: %v\nOutput: %s", err, string(output))
+	}
+}
