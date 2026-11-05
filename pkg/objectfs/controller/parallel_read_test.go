@@ -160,10 +160,15 @@ func TestParallelReadFile_SleepingBackend(t *testing.T) {
 
 func TestParallelReadFile_DropVolumeLockDuringBlobIO(t *testing.T) {
 	ctx := t.Context()
-	sleepDur := 250 * time.Millisecond
-	rawBackend := newSleepingBackend(NewMemoryBackend(), sleepDur)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	rawBackend := newGatedGetBackend(NewMemoryBackend(), entered, release)
 	server := NewTestServer(t, rawBackend)
-	defer func() { _ = server.Close() }()
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
 
 	volumeID := "test-lock-drop-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
@@ -202,38 +207,54 @@ func TestParallelReadFile_DropVolumeLockDuringBlobIO(t *testing.T) {
 	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: inoA, Blocking: true}); err != nil {
 		t.Fatalf("Fsync failed: %v", err)
 	}
+	vol.evictAllUploadedPacksForTest()
 
-	readStarted := make(chan struct{})
-	readDone := make(chan struct{})
+	readADone := make(chan error, 1)
 
 	go func() {
-		close(readStarted)
-		_, _, _, _ = vol.ReadFile(ctx, inoA, 0, int64(len(dataA)))
-		close(readDone)
+		_, _, _, readError := vol.ReadFile(ctx, inoA, 0, int64(len(dataA)))
+		readADone <- readError
 	}()
 
-	<-readStarted
-	// Give the goroutine time to resolve hashes and enter backend GetObject
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-entered:
+	case readErrorA := <-readADone:
+		t.Fatalf("ReadFile A finished before entering backend GetObject: %v", readErrorA)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for file A to enter backend GetObject")
+	}
 
 	// An independent volume operation (GetAttr) must NOT block on the backend I/O of file A
-	startOp := time.Now()
-	attrB, err := vol.GetAttr(ctx, inoB)
-	opElapsed := time.Since(startOp)
+	getAttrDone := make(chan error, 1)
+	var attrB *pb.EntryAttr
+	go func() {
+		var getAttrError error
+		attrB, getAttrError = vol.GetAttr(ctx, inoB)
+		getAttrDone <- getAttrError
+	}()
 
-	if err != nil {
-		t.Fatalf("GetAttr B failed: %v", err)
+	select {
+	case getAttrError := <-getAttrDone:
+		if getAttrError != nil {
+			t.Fatalf("GetAttr B failed: %v", getAttrError)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("GetAttr B blocked on volume lock during blob I/O")
 	}
 	if attrB.GetInode().GetSize() != int64(len(dataB)) {
 		t.Fatalf("GetAttr B size = %d, want %d", attrB.GetInode().GetSize(), len(dataB))
 	}
 
-	// Operation must complete well before the 250ms backend sleep finishes
-	if opElapsed >= 150*time.Millisecond {
-		t.Fatalf("GetAttr blocked on volume lock during blob I/O: took %v, want < 150ms", opElapsed)
-	}
+	close(release)
 
-	<-readDone
+	select {
+	case readErrorA := <-readADone:
+		if readErrorA != nil {
+			t.Fatalf("ReadFile A failed: %v", readErrorA)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for ReadFile A to complete")
+	}
 }
 
 func TestWriteFileWithEpoch_DoesNotHoldStagingMuDuringBaseChunkGet(t *testing.T) {
