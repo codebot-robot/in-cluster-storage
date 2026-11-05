@@ -91,6 +91,12 @@ enum ConsistencyMode {
   CLOSE_TO_OPEN = 2;
 }
 
+enum VolumeMode {
+  VOLUME_MODE_UNSPECIFIED = 0;
+  FUSE = 1;
+  EXCLUSIVE_LOCAL = 2;
+}
+
 message EntryAttr {
   Inode inode = 1;
   string name = 2;
