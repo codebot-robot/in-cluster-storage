@@ -2046,8 +2046,12 @@ func TestStagedPackRetainedUntilAllReferencingInodesCommit(t *testing.T) {
 	inspectPack := func(packID uint64) (bool, int, string) {
 		volume.stagingMu.Lock()
 		defer volume.stagingMu.Unlock()
-		_, tracked := volume.packs[packID]
-		return tracked, volume.packLiveReferences[packID], volume.scratchPackPath(packID)
+		info, tracked := volume.packs[packID]
+		var liveReferences int
+		if tracked && info != nil {
+			liveReferences = info.liveReferences
+		}
+		return tracked, liveReferences, volume.scratchPackPath(packID)
 	}
 
 	createResponseA, err := testCreateFile(ctx, server, volumeID, "/fileA.bin", 0644, nil, 0, 0)

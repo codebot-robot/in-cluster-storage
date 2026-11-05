@@ -98,6 +98,24 @@ type stagedChunkReference struct {
 	Length uint32
 }
 
+// packState represents the upload lifecycle of a staged packfile.
+type packState int
+
+const (
+	packNotStarted packState = iota
+	packUploading
+	packUploaded
+	packFailed
+)
+
+type packInfo struct {
+	pack           *blob.IncrementalPack
+	liveReferences int
+	state          packState
+	key            string
+	uploadError    error
+}
+
 type Volume struct {
 	mu           sync.RWMutex
 	volumeID     string
@@ -109,15 +127,16 @@ type Volume struct {
 	maxInlineLen int64
 	chunkSize    uint32
 
-	stagingDir         string
-	activePack         *blob.IncrementalPack
-	activePackID       uint64
-	nextPackID         uint64
-	packs              map[uint64]*blob.IncrementalPack
-	packLiveReferences map[uint64]int
-	packUploaded       map[uint64]bool
-	packKeys           map[uint64]string
-	slotSeals          int64
+	stagingDir      string
+	activePack      *blob.IncrementalPack
+	activePackID    uint64
+	nextPackID      uint64
+	packs           map[uint64]*packInfo
+	slotSeals       int64
+	uploadSemaphore chan struct{}
+	uploadWaitGroup sync.WaitGroup
+	uploadContext   context.Context
+	cancelUpload    context.CancelFunc
 
 	stagingMu       sync.Mutex
 	stagingEpoch    int64
@@ -500,15 +519,16 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		stagedMtimes:       make(map[uint64]time.Time),
 		lastSyncError:      make(map[uint64]error),
 		maxStagingBytes:    64 * 1024 * 1024,
-		packs:              make(map[uint64]*blob.IncrementalPack),
-		packLiveReferences: make(map[uint64]int),
-		packUploaded:       make(map[uint64]bool),
-		packKeys:           make(map[uint64]string),
+		packs:              make(map[uint64]*packInfo),
+		uploadSemaphore:    make(chan struct{}, 2),
 		coalesceWindow:     1 * time.Second,
 		syncTimeout:        10 * time.Minute,
 		openBarrierTimeout: 30 * time.Second,
 		syncingInodes:      make(map[uint64]struct{}),
 	}
+	uploadContext, cancelUpload := context.WithCancel(context.Background())
+	v.uploadContext = uploadContext
+	v.cancelUpload = cancelUpload
 	v.syncCond = sync.NewCond(&v.stagingMu)
 	v.batchCheckCond = sync.NewCond(&v.batchCheckMu)
 
@@ -520,9 +540,12 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		return nil, errors.New("volume requires local storage directory for metadata and write staging (use WithLocalStorageDir)")
 	}
 	v.stagingDir = filepath.Join(v.localStorageDir, "staging")
+	v.stagingMu.Lock()
 	if err := v.resetStagingDirLocked(); err != nil {
+		v.stagingMu.Unlock()
 		return nil, err
 	}
+	v.stagingMu.Unlock()
 
 	if v.stream == nil {
 		return nil, errors.New("volume requires a WAL stream (use WithStream)")
@@ -540,30 +563,31 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 }
 
 func (v *Volume) deletePackLocked(packID uint64) {
-	pack, ok := v.packs[packID]
+	info, ok := v.packs[packID]
 	if !ok {
 		return
 	}
-	errutil.CloseAndLog(pack, "uploaded pack")
+	if info.pack != nil {
+		errutil.CloseAndLog(info.pack, "uploaded pack")
+	}
 	packPath := v.scratchPackPath(packID)
 	if removeErr := os.Remove(packPath); removeErr != nil && !os.IsNotExist(removeErr) {
 		klog.Warningf("failed removing uploaded pack %s: %v", packPath, removeErr)
 	}
-	if key, ok := v.packKeys[packID]; ok && v.blobStore != nil {
-		v.blobStore.UnregisterLocalPack(key)
+	if info.key != "" && v.blobStore != nil {
+		v.blobStore.UnregisterLocalPack(info.key)
 	}
-	delete(v.packKeys, packID)
 	delete(v.packs, packID)
-	delete(v.packUploaded, packID)
-	delete(v.packLiveReferences, packID)
 }
 
 func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 	var total int64
 	var eligible []uint64
-	for packID, pack := range v.packs {
-		total += pack.ByteSize()
-		if v.packUploaded[packID] && v.packLiveReferences[packID] <= 0 {
+	for packID, info := range v.packs {
+		if info.pack != nil {
+			total += info.pack.ByteSize()
+		}
+		if info.state == packUploaded && info.liveReferences <= 0 {
 			eligible = append(eligible, packID)
 		}
 	}
@@ -572,7 +596,11 @@ func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 	}
 	sort.Slice(eligible, func(i, j int) bool { return eligible[i] < eligible[j] })
 	for _, packID := range eligible {
-		packSize := v.packs[packID].ByteSize()
+		info := v.packs[packID]
+		var packSize int64
+		if info != nil && info.pack != nil {
+			packSize = info.pack.ByteSize()
+		}
 		v.deletePackLocked(packID)
 		total -= packSize
 		if total+neededBytes <= v.maxStagingBytes {
@@ -582,9 +610,8 @@ func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 }
 
 func (v *Volume) dropPackReferenceLocked(packID uint64) {
-	v.packLiveReferences[packID]--
-	if v.packLiveReferences[packID] <= 0 {
-		delete(v.packLiveReferences, packID)
+	if info, ok := v.packs[packID]; ok {
+		info.liveReferences--
 	}
 }
 
@@ -927,8 +954,8 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 	}
 
 	var packIDsToUpload []uint64
-	for packID := range v.packs {
-		if !v.packUploaded[packID] {
+	for packID, info := range v.packs {
+		if info.state != packUploaded {
 			packIDsToUpload = append(packIDsToUpload, packID)
 		}
 	}
@@ -938,51 +965,63 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 	v.stagingMu.Unlock()
 
 	if v.blobStore != nil {
+		stopTimer := context.AfterFunc(ctx, func() {
+			v.stagingMu.Lock()
+			v.syncCond.Broadcast()
+			v.stagingMu.Unlock()
+		})
+		defer stopTimer()
+
 		for _, packID := range packIDsToUpload {
 			v.stagingMu.Lock()
-			pack := v.packs[packID]
+			for {
+				info, ok := v.packs[packID]
+				if !ok || info.state != packUploading {
+					break
+				}
+				if ctx.Err() != nil {
+					v.stagingMu.Unlock()
+					return 0, v.finishSync(snapshotSeq, ctx.Err(), snapshotChunks, 0, inodeFilter)
+				}
+				v.syncCond.Wait()
+			}
+			info, ok := v.packs[packID]
 			v.stagingMu.Unlock()
-			if pack == nil {
+
+			if !ok || info.state == packUploaded || info.pack == nil {
 				continue
 			}
-			packPath := v.scratchPackPath(packID)
 
-			file, openErr := os.Open(packPath)
-			if openErr != nil {
-				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to open sealed pack %s: %w", packPath, openErr), snapshotChunks, 0, inodeFilter)
-			}
-			hasher := sha256.New()
-			if _, copyErr := io.Copy(hasher, file); copyErr != nil {
-				errutil.CloseAndLog(file, "pack file")
-				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed hashing sealed pack %s: %w", packPath, copyErr), snapshotChunks, 0, inodeFilter)
-			}
-			if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
-				errutil.CloseAndLog(file, "pack file")
-				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed seeking sealed pack %s: %w", packPath, seekErr), snapshotChunks, 0, inodeFilter)
-			}
-			packIDString := hex.EncodeToString(hasher.Sum(nil))
-			packKey := v.blobStore.PackKey(packIDString, pack.Count())
-			packStream := blob.NewByteStreamFromFile(file, pack.ByteSize(), false)
-
-			uploadStartTime := time.Now()
-			if err := v.blobStore.PutPackFile(ctx, packKey, packStream, pack.Entries(), pack); err != nil {
-				errutil.CloseAndLog(packStream, "failed pack stream")
+			packKey, err := v.uploadPackFile(ctx, packID)
+			if err != nil {
+				v.stagingMu.Lock()
+				if info, ok := v.packs[packID]; ok {
+					info.state = packFailed
+					if info.uploadError == nil {
+						info.uploadError = err
+					}
+				}
+				v.syncCond.Broadcast()
+				v.stagingMu.Unlock()
+				klog.Warningf("ObjectFS volume %s: sync upload failed for pack %s (id %d): %v", v.volumeID, packKey, packID, err)
 				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to upload sealed pack %s: %w", packKey, err), snapshotChunks, 0, inodeFilter)
 			}
-			uploadDuration := time.Since(uploadStartTime)
-			klog.Infof("ObjectFS volume %s uploaded sealed pack %s (%d bytes, %d entries) in %v", v.volumeID, packKey, pack.ByteSize(), pack.Count(), uploadDuration)
-			if err := packStream.Close(); err != nil {
-				klog.Warningf("failed to close pack stream %s: %v", packKey, err)
-			}
+
 			v.stagingMu.Lock()
-			v.packUploaded[packID] = true
-			v.packKeys[packID] = packKey
+			if info, ok := v.packs[packID]; ok {
+				info.state = packUploaded
+				info.key = packKey
+				info.uploadError = nil
+			}
+			v.syncCond.Broadcast()
 			v.stagingMu.Unlock()
 		}
 	} else {
 		v.stagingMu.Lock()
 		for _, packID := range packIDsToUpload {
-			v.packUploaded[packID] = true
+			if info, ok := v.packs[packID]; ok {
+				info.state = packUploaded
+			}
 		}
 		v.stagingMu.Unlock()
 	}
@@ -1522,6 +1561,14 @@ func (v *Volume) Close() error {
 		close(w.ch)
 	}
 	v.coalesceWaiters = nil
+	if v.cancelUpload != nil {
+		v.cancelUpload()
+	}
+	v.stagingMu.Unlock()
+
+	v.uploadWaitGroup.Wait()
+
+	v.stagingMu.Lock()
 	if removeErr := v.removeStagingDirLocked(); removeErr != nil {
 		klog.Warningf("failed removing staging directory: %v", removeErr)
 	}
@@ -3686,11 +3733,11 @@ func (v *Volume) scratchPackPath(packID uint64) string {
 }
 
 func (v *Volume) readStagedChunkStreamLocked(reference stagedChunkReference) (blob.ByteStream, error) {
-	pack, ok := v.packs[reference.PackID]
-	if !ok {
+	info, ok := v.packs[reference.PackID]
+	if !ok || info.pack == nil {
 		return nil, fmt.Errorf("staged pack %d not found", reference.PackID)
 	}
-	return pack.ReadBlob(reference.Entry)
+	return info.pack.ReadBlob(reference.Entry)
 }
 
 // readStagedChunkBytesLocked reads a single staged chunk's payload into memory for modification.
@@ -3715,16 +3762,15 @@ func (v *Volume) removeStagingDirLocked() error {
 		errutil.CloseAndLog(v.activePack, "active scratch pack")
 		v.activePack = nil
 	}
-	for packID, pack := range v.packs {
-		errutil.CloseAndLog(pack, "staged pack")
-		if key, ok := v.packKeys[packID]; ok && v.blobStore != nil {
-			v.blobStore.UnregisterLocalPack(key)
+	for _, info := range v.packs {
+		if info.pack != nil {
+			errutil.CloseAndLog(info.pack, "staged pack")
+		}
+		if info.key != "" && v.blobStore != nil {
+			v.blobStore.UnregisterLocalPack(info.key)
 		}
 	}
-	v.packs = make(map[uint64]*blob.IncrementalPack)
-	v.packLiveReferences = make(map[uint64]int)
-	v.packUploaded = make(map[uint64]bool)
-	v.packKeys = make(map[uint64]string)
+	v.packs = make(map[uint64]*packInfo)
 	if removeErr := os.RemoveAll(v.stagingDir); removeErr != nil && !os.IsNotExist(removeErr) {
 		return fmt.Errorf("failed removing staging directory %s: %w", v.stagingDir, removeErr)
 	}
@@ -3732,6 +3778,14 @@ func (v *Volume) removeStagingDirLocked() error {
 }
 
 func (v *Volume) resetStagingDirLocked() error {
+	if v.cancelUpload != nil {
+		v.cancelUpload()
+	}
+	v.stagingMu.Unlock()
+	v.uploadWaitGroup.Wait()
+	v.stagingMu.Lock()
+
+	v.uploadContext, v.cancelUpload = context.WithCancel(context.Background())
 	if err := v.removeStagingDirLocked(); err != nil {
 		return err
 	}
@@ -3739,6 +3793,107 @@ func (v *Volume) resetStagingDirLocked() error {
 		return fmt.Errorf("failed creating staging directory %s: %w", v.stagingDir, mkdirErr)
 	}
 	return nil
+}
+
+func (v *Volume) uploadPackFile(ctx context.Context, packID uint64) (string, error) {
+	v.stagingMu.Lock()
+	info, ok := v.packs[packID]
+	v.stagingMu.Unlock()
+	if !ok || info.pack == nil {
+		return "", fmt.Errorf("pack %d not found", packID)
+	}
+	if v.blobStore == nil {
+		return "", nil
+	}
+	pack := info.pack
+	packPath := v.scratchPackPath(packID)
+	file, openErr := os.Open(packPath)
+	if openErr != nil {
+		return "", fmt.Errorf("failed to open sealed pack %s: %w", packPath, openErr)
+	}
+	hasher := sha256.New()
+	if _, copyErr := io.Copy(hasher, file); copyErr != nil {
+		errutil.CloseAndLog(file, "pack file")
+		return "", fmt.Errorf("failed hashing sealed pack %s: %w", packPath, copyErr)
+	}
+	if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+		errutil.CloseAndLog(file, "pack file")
+		return "", fmt.Errorf("failed seeking sealed pack %s: %w", packPath, seekErr)
+	}
+	packIDString := hex.EncodeToString(hasher.Sum(nil))
+	packKey := v.blobStore.PackKey(packIDString, pack.Count())
+	packStream := blob.NewByteStreamFromFile(file, pack.ByteSize(), false)
+
+	uploadStartTime := time.Now()
+	if err := v.blobStore.PutPackFile(ctx, packKey, packStream, pack.Entries(), pack); err != nil {
+		errutil.CloseAndLog(packStream, "failed pack stream")
+		return packKey, fmt.Errorf("failed to upload sealed pack %s: %w", packKey, err)
+	}
+	uploadDuration := time.Since(uploadStartTime)
+	klog.Infof("ObjectFS volume %s uploaded sealed pack %s (%d bytes, %d entries) in %v", v.volumeID, packKey, pack.ByteSize(), pack.Count(), uploadDuration)
+	if err := packStream.Close(); err != nil {
+		klog.Warningf("failed to close pack stream %s: %v", packKey, err)
+	}
+	return packKey, nil
+}
+
+func (v *Volume) startPackUploadLocked(packID uint64) {
+	info, ok := v.packs[packID]
+	if !ok {
+		return
+	}
+	if v.blobStore == nil {
+		info.state = packUploaded
+		return
+	}
+	if info.state == packUploading || info.state == packUploaded {
+		return
+	}
+	info.state = packUploading
+	uploadContext := v.uploadContext
+
+	v.uploadWaitGroup.Add(1)
+	go func() {
+		defer v.uploadWaitGroup.Done()
+
+		select {
+		case v.uploadSemaphore <- struct{}{}:
+		case <-uploadContext.Done():
+			v.stagingMu.Lock()
+			if info, ok := v.packs[packID]; ok {
+				info.state = packNotStarted
+			}
+			v.syncCond.Broadcast()
+			v.stagingMu.Unlock()
+			return
+		}
+		defer func() { <-v.uploadSemaphore }()
+
+		packKey, err := v.uploadPackFile(uploadContext, packID)
+
+		v.stagingMu.Lock()
+		defer v.stagingMu.Unlock()
+		info, ok := v.packs[packID]
+		if !ok {
+			return
+		}
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				info.state = packNotStarted
+			} else {
+				info.state = packFailed
+				if info.uploadError == nil {
+					info.uploadError = err
+				}
+				klog.Warningf("ObjectFS volume %s: background upload failed for pack %s (id %d): %v", v.volumeID, packKey, packID, err)
+			}
+		} else {
+			info.state = packUploaded
+			info.key = packKey
+			info.uploadError = nil
+		}
+		v.syncCond.Broadcast()
+	}()
 }
 
 func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
@@ -3753,7 +3908,10 @@ func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
 		}
 		v.activePack = pack
 		v.activePackID = packID
-		v.packs[packID] = pack
+		v.packs[packID] = &packInfo{
+			pack:  pack,
+			state: packNotStarted,
+		}
 	}
 
 	entry, err := v.activePack.Append(data)
@@ -3781,6 +3939,7 @@ func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
 		v.slotSeals++
 		v.activePack = nil
 		klog.Infof("ObjectFS volume %s: sealed pack %d (%d entries) on slot cap", v.volumeID, sealedPackID, entryCount)
+		v.startPackUploadLocked(sealedPackID)
 	}
 
 	return ref, nil
@@ -3797,7 +3956,9 @@ func (v *Volume) setStagedChunkLocked(inodeID uint64, index int, reference stage
 	}
 	chunks[index] = reference
 	v.stagedBytes += int64(reference.Length)
-	v.packLiveReferences[reference.PackID]++
+	if info, ok := v.packs[reference.PackID]; ok {
+		info.liveReferences++
+	}
 }
 
 func (v *Volume) dropStagedChunkLocked(inodeID uint64, index int) {
