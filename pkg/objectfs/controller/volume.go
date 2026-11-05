@@ -6319,6 +6319,15 @@ func (v *Volume) GetSnapshotInfo(ctx context.Context, snapshotName string) (*pb.
 	return v.getSnapshotInfoLocked(ctx, snapshotName)
 }
 
+// snapshotMatches reports whether pointer matches the specified name by Name, Location,
+// or basename of Location.
+func snapshotMatches(pointer *sdsv1.SnapshotPointer, name string) bool {
+	if pointer == nil || name == "" {
+		return false
+	}
+	return pointer.GetName() == name || pointer.GetLocation() == name || path.Base(pointer.GetLocation()) == name
+}
+
 func snapshotInfoFromPointer(pointer *sdsv1.SnapshotPointer) *pb.SnapshotInfo {
 	if pointer == nil {
 		return nil
@@ -6328,13 +6337,6 @@ func snapshotInfoFromPointer(pointer *sdsv1.SnapshotPointer) *pb.SnapshotInfo {
 		Position:  pointer.GetPosition(),
 		CreatedAt: pointer.GetCreatedAt(),
 	}
-}
-
-func snapshotMatches(pointer *sdsv1.SnapshotPointer, name string) bool {
-	if pointer == nil {
-		return false
-	}
-	return pointer.GetName() == name || pointer.GetLocation() == name || path.Base(pointer.GetLocation()) == name
 }
 
 func (v *Volume) getSnapshotInfoLocked(ctx context.Context, snapshotName string) (*pb.SnapshotInfo, error) {
@@ -6413,6 +6415,9 @@ func (v *Volume) DeleteSnapshot(ctx context.Context, name string) error {
 
 	return nil
 }
+
+// ErrVolumeAlreadyExists indicates that the volume already has durable state.
+var ErrVolumeAlreadyExists = errors.New("volume already exists")
 
 // RestoreSnapshot restores the volume filesystem state to a specific snapshot.
 // A restore is appended to the stream as a Restore record (SnapshotPointer with restored_from set)
@@ -6558,4 +6563,128 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 	v.snapshotPointers = append(v.snapshotPointers, restorePtr, freshPtr)
 
 	return snapshotInfoFromPointer(freshPtr), nil
+}
+
+// InitFromSnapshot initializes the volume with a fresh metadata stream whose initial state
+// is loaded from the specified source snapshot, and publishes the new volume's first snapshot.
+func (v *Volume) InitFromSnapshot(ctx context.Context, sourceVolumeID, snapshotName, snapshotLocation string) error {
+	v.stagingMu.Lock()
+	v.waitForSyncIdleLocked()
+	if err := v.resetStagingDirLocked(); err != nil {
+		v.stagingMu.Unlock()
+		return err
+	}
+	v.stagedChunks = make(map[uint64]map[int]stagedChunkReference)
+	v.stagedSizes = make(map[uint64]int64)
+	v.stagedMtimes = make(map[uint64]time.Time)
+	v.stagedBytes = 0
+	v.stagingMu.Unlock()
+
+	v.snapshotMu.Lock()
+	defer v.snapshotMu.Unlock()
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.backend == nil {
+		return fmt.Errorf("no backend configured")
+	}
+	if v.indexFactory == nil {
+		return fmt.Errorf("no index factory configured")
+	}
+
+	if v.stream != nil {
+		localHead, witnessHead, permanentHead := v.stream.Watermarks()
+		if localHead > 0 || witnessHead > 0 || permanentHead > 0 || len(v.stream.RecoveredRecords()) > 0 {
+			return fmt.Errorf("%w: volume %s stream has existing records", ErrVolumeAlreadyExists, v.volumeID)
+		}
+	}
+	existingSnapshots, err := v.listSnapshotsLocked(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check existing snapshots: %w", err)
+	}
+	if len(existingSnapshots) > 0 {
+		return fmt.Errorf("%w: volume %s has existing snapshots", ErrVolumeAlreadyExists, v.volumeID)
+	}
+
+	if v.metadataView != nil {
+		if err := v.metadataView.Close(); err != nil {
+			return fmt.Errorf("failed to close existing metadata view: %w", err)
+		}
+		v.metadataView = nil
+	}
+
+	restoredIndex, _, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), snapshotLocation, v.localStorageDir)
+	if err != nil {
+		return fmt.Errorf("failed to restore snapshot index: %w", err)
+	}
+
+	if err := restoredIndex.SetPosition(0); err != nil {
+		if closeErr := restoredIndex.Close(); closeErr != nil {
+			return fmt.Errorf("failed to set position (%v) and close failed: %w", err, closeErr)
+		}
+		return fmt.Errorf("failed to set position on restored index: %w", err)
+	}
+
+	if err := v.importIndexRegistryLocked(restoredIndex); err != nil {
+		if closeErr := restoredIndex.Close(); closeErr != nil {
+			return fmt.Errorf("failed to import snapshot registry (%v) and close failed: %w", err, closeErr)
+		}
+		return err
+	}
+
+	if err := v.registerMetadataTypesLocked(ctx, restoredIndex); err != nil {
+		if closeErr := restoredIndex.Close(); closeErr != nil {
+			return fmt.Errorf("failed to register metadata types (%v) and close failed: %w", err, closeErr)
+		}
+		return err
+	}
+
+	if err := v.initMetadataViewLocked(ctx, restoredIndex); err != nil {
+		return fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
+	}
+	v.lastCommitSeq = 0
+
+	v.metadataView.ClearCache()
+	v.dirParents = make(map[uint64]uint64)
+	v.dirParents[1] = 1
+	v.initLiveStatsLocked()
+	if err := v.initNextInodeFromStatsLocked(ctx, 0); err != nil {
+		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
+	}
+	v.assertStatsMatchLocked("after InitFromSnapshot")
+
+	snapshotter, ok := v.metadataView.Index().(sds.Snapshotter)
+	if !ok {
+		return fmt.Errorf("volume metadata index does not support snapshots")
+	}
+
+	freshKey, freshPosition, err := snapshotter.PublishSnapshot(ctx, v.backend)
+	if err != nil {
+		return fmt.Errorf("failed to publish initial snapshot: %w", err)
+	}
+
+	pointer := &sdsv1.SnapshotPointer{
+		Position:   freshPosition,
+		Format:     v.indexFactory.Format(),
+		Location:   freshKey,
+		Name:       path.Base(freshKey),
+		CreatedAt:  timestamppb.Now(),
+		ClonedFrom: fmt.Sprintf("%s/%s", sourceVolumeID, snapshotName),
+	}
+
+	if v.metadataStream != nil {
+		if _, err := v.metadataStream.AppendSnapshotPointer(ctx, pointer); err != nil {
+			return fmt.Errorf("failed to append initial snapshot pointer: %w", err)
+		}
+	}
+
+	if v.stream != nil && v.stream.ReplicationLevel() == walclient.Permanent {
+		if err := v.stream.Flush(ctx); err != nil {
+			return fmt.Errorf("failed to flush WAL stream: %w", err)
+		}
+	}
+
+	v.snapshotPointers = append(v.snapshotPointers, pointer)
+	return nil
 }

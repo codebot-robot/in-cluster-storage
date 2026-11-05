@@ -31,6 +31,7 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
@@ -466,6 +467,69 @@ func (s *Server) openStreamForVolume(volumeID string, dir string) (walclient.Str
 	return walclient.Open(context.Background(), dir, streamID, s.walTarget, walOpts...)
 }
 
+func (s *Server) createVolumeInstanceLocked(volumeID string) (*Volume, error) {
+	var volumeOptions []VolumeOption
+	stream, err := s.openStreamForVolume(volumeID, s.walDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open stream for volume %s: %w", volumeID, err)
+	}
+	if stream != nil {
+		volumeOptions = append(volumeOptions, WithStream(stream))
+	}
+	volumeOptions = append(volumeOptions, WithDurability(s.defaultDurability))
+	if s.metadataIndex != "" {
+		volumeOptions = append(volumeOptions, WithMetadataIndex(s.metadataIndex))
+	}
+	if s.metadataDir != "" {
+		volumeDirectory := filepath.Join(s.metadataDir, volumeID)
+		if err := os.MkdirAll(volumeDirectory, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create metadata dir %s for volume %s: %w", volumeDirectory, volumeID, err)
+		}
+		volumeOptions = append(volumeOptions, WithLocalStorageDir(volumeDirectory))
+	}
+	if s.metadataCacheEntries > 0 || s.metadataCacheBytes > 0 {
+		volumeOptions = append(volumeOptions, WithMetadataCacheLimits(s.metadataCacheEntries, s.metadataCacheBytes))
+	}
+	if s.metadataOverlayMaxBytes > 0 {
+		volumeOptions = append(volumeOptions, WithMaxUnappliedBytes(s.metadataOverlayMaxBytes))
+	}
+	if s.metadataApplierBatchSize > 0 {
+		volumeOptions = append(volumeOptions, WithApplierBatchSize(s.metadataApplierBatchSize))
+	}
+	if s.localStorageDir != "" {
+		volumeOptions = append(volumeOptions, WithLocalStorageDir(s.localStorageDir))
+	}
+	if len(s.viewOpts) > 0 {
+		volumeOptions = append(volumeOptions, WithVolumeViewOptions(s.viewOpts...))
+	}
+	if s.debugMutationCheck {
+		volumeOptions = append(volumeOptions, WithVolumeMutationCheck())
+	}
+	if s.debugStatsCheck {
+		volumeOptions = append(volumeOptions, WithVolumeStatsCheck())
+	}
+	if s.syncCoalesceWindow > 0 {
+		volumeOptions = append(volumeOptions, WithSyncCoalesceWindow(s.syncCoalesceWindow))
+	}
+	if s.maxStagingBytes > 0 {
+		volumeOptions = append(volumeOptions, WithMaxStagingBytes(s.maxStagingBytes))
+	}
+	if s.syncTimeout > 0 {
+		volumeOptions = append(volumeOptions, WithSyncTimeout(s.syncTimeout))
+	}
+	if s.openBarrierTimeout > 0 {
+		volumeOptions = append(volumeOptions, WithOpenBarrierTimeout(s.openBarrierTimeout))
+	}
+	if s.acceptUnversioned {
+		volumeOptions = append(volumeOptions, WithAcceptUnversioned(true))
+	}
+	if s.blobStore != nil {
+		volumeOptions = append(volumeOptions, WithBlobStore(s.blobStore))
+	}
+
+	return NewVolume(volumeID, s.backend, s.broadcaster, volumeOptions...)
+}
+
 func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	if !isValidVolumeID(volumeID) {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", volumeID)
@@ -474,77 +538,19 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	vol, ok := s.volumes[volumeID]
+	volume, ok := s.volumes[volumeID]
 	if !ok {
-		var volOpts []VolumeOption
-		stream, err := s.openStreamForVolume(volumeID, s.walDir)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open stream for volume %s: %w", volumeID, err)
-		}
-		if stream != nil {
-			volOpts = append(volOpts, WithStream(stream))
-		}
-		volOpts = append(volOpts, WithDurability(s.defaultDurability))
-		if s.metadataIndex != "" {
-			volOpts = append(volOpts, WithMetadataIndex(s.metadataIndex))
-		}
-		if s.metadataDir != "" {
-			volDir := filepath.Join(s.metadataDir, volumeID)
-			if err := os.MkdirAll(volDir, 0755); err != nil {
-				return nil, fmt.Errorf("failed to create metadata dir %s for volume %s: %w", volDir, volumeID, err)
-			}
-			volOpts = append(volOpts, WithLocalStorageDir(volDir))
-		}
-		if s.metadataCacheEntries > 0 || s.metadataCacheBytes > 0 {
-			volOpts = append(volOpts, WithMetadataCacheLimits(s.metadataCacheEntries, s.metadataCacheBytes))
-		}
-		if s.metadataOverlayMaxBytes > 0 {
-			volOpts = append(volOpts, WithMaxUnappliedBytes(s.metadataOverlayMaxBytes))
-		}
-		if s.metadataApplierBatchSize > 0 {
-			volOpts = append(volOpts, WithApplierBatchSize(s.metadataApplierBatchSize))
-		}
-		if s.localStorageDir != "" {
-			volOpts = append(volOpts, WithLocalStorageDir(s.localStorageDir))
-		}
-		if len(s.viewOpts) > 0 {
-			volOpts = append(volOpts, WithVolumeViewOptions(s.viewOpts...))
-		}
-		if s.debugMutationCheck {
-			volOpts = append(volOpts, WithVolumeMutationCheck())
-		}
-		if s.debugStatsCheck {
-			volOpts = append(volOpts, WithVolumeStatsCheck())
-		}
-		if s.syncCoalesceWindow > 0 {
-			volOpts = append(volOpts, WithSyncCoalesceWindow(s.syncCoalesceWindow))
-		}
-		if s.maxStagingBytes > 0 {
-			volOpts = append(volOpts, WithMaxStagingBytes(s.maxStagingBytes))
-		}
-		if s.syncTimeout > 0 {
-			volOpts = append(volOpts, WithSyncTimeout(s.syncTimeout))
-		}
-		if s.openBarrierTimeout > 0 {
-			volOpts = append(volOpts, WithOpenBarrierTimeout(s.openBarrierTimeout))
-		}
-		if s.acceptUnversioned {
-			volOpts = append(volOpts, WithAcceptUnversioned(true))
-		}
-		if s.blobStore != nil {
-			volOpts = append(volOpts, WithBlobStore(s.blobStore))
-		}
-
-		vol, err = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
+		var err error
+		volume, err = s.createVolumeInstanceLocked(volumeID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create volume %s: %w", volumeID, err)
 		}
-		if err := vol.LoadFromBackend(context.Background()); err != nil {
+		if err := volume.LoadFromBackend(context.Background()); err != nil {
 			return nil, fmt.Errorf("failed to load volume %s from backend: %w", volumeID, err)
 		}
-		s.volumes[volumeID] = vol
+		s.volumes[volumeID] = volume
 	}
-	return vol, nil
+	return volume, nil
 }
 
 // Close stops periodic flushing and closes all active volumes and streams.
@@ -664,6 +670,69 @@ func (s *Server) Target() string {
 // GetVolume returns the Volume instance for the given volumeID, or an error if creation fails.
 func (s *Server) GetVolume(volumeID string) (*Volume, error) {
 	return s.getOrCreateVolume(volumeID)
+}
+
+// CreateVolumeFromSnapshot creates a new volume initialized from a snapshot of a source volume.
+func (s *Server) CreateVolumeFromSnapshot(ctx context.Context, newVolumeID, sourceVolumeID, snapshotName string) error {
+	if !isValidVolumeID(newVolumeID) {
+		return status.Errorf(codes.InvalidArgument, "invalid new volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", newVolumeID)
+	}
+	if !isValidVolumeID(sourceVolumeID) {
+		return status.Errorf(codes.InvalidArgument, "invalid source volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", sourceVolumeID)
+	}
+	if snapshotName == "" {
+		return status.Error(codes.InvalidArgument, "snapshot_name is required")
+	}
+
+	sourceVolume, err := s.getOrCreateVolume(sourceVolumeID)
+	if err != nil {
+		return volInitError(err)
+	}
+
+	sourceSnapshots, err := sourceVolume.ListSnapshots(ctx)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to list snapshots for source volume %s: %v", sourceVolumeID, err)
+	}
+
+	var targetPointer *sdsv1.SnapshotPointer
+	for _, pointer := range sourceSnapshots {
+		if snapshotMatches(pointer, snapshotName) {
+			targetPointer = pointer
+			break
+		}
+	}
+	if targetPointer == nil {
+		return status.Errorf(codes.NotFound, "snapshot %q not found on source volume %s", snapshotName, sourceVolumeID)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.volumes[newVolumeID]; exists {
+		return status.Errorf(codes.AlreadyExists, "volume %s already exists", newVolumeID)
+	}
+
+	newVolume, err := s.createVolumeInstanceLocked(newVolumeID)
+	if err != nil {
+		return fmt.Errorf("failed to create volume %s: %w", newVolumeID, err)
+	}
+
+	targetName := targetPointer.GetName()
+	if targetName == "" {
+		targetName = snapshotName
+	}
+	if err := newVolume.InitFromSnapshot(ctx, sourceVolumeID, targetName, targetPointer.GetLocation()); err != nil {
+		if closeErr := newVolume.Close(); closeErr != nil {
+			return fmt.Errorf("failed to initialize volume from snapshot (%v) and close failed: %w", err, closeErr)
+		}
+		if errors.Is(err, ErrVolumeAlreadyExists) {
+			return status.Errorf(codes.AlreadyExists, "volume %s already exists", newVolumeID)
+		}
+		return fmt.Errorf("failed to initialize volume %s from snapshot %s: %w", newVolumeID, snapshotName, err)
+	}
+
+	s.volumes[newVolumeID] = newVolume
+	return nil
 }
 
 // RestoreSnapshot restores the volume filesystem state to a specific snapshot in-place.

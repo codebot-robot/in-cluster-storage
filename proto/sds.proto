@@ -55,6 +55,7 @@ message SnapshotPointer {
   string name = 5;
   google.protobuf.Timestamp created_at = 6;
   string restored_from = 7;
+  string cloned_from = 8;
 }
 
 message StreamHeader {

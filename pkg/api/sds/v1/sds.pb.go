@@ -299,6 +299,7 @@ type SnapshotPointer struct {
 	Name                string                 `protobuf:"bytes,5,opt,name=name,proto3" json:"name,omitempty"`
 	CreatedAt           *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	RestoredFrom        string                 `protobuf:"bytes,7,opt,name=restored_from,json=restoredFrom,proto3" json:"restored_from,omitempty"`
+	ClonedFrom          string                 `protobuf:"bytes,8,opt,name=cloned_from,json=clonedFrom,proto3" json:"cloned_from,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
@@ -378,6 +379,13 @@ func (x *SnapshotPointer) GetCreatedAt() *timestamppb.Timestamp {
 func (x *SnapshotPointer) GetRestoredFrom() string {
 	if x != nil {
 		return x.RestoredFrom
+	}
+	return ""
+}
+
+func (x *SnapshotPointer) GetClonedFrom() string {
+	if x != nil {
+		return x.ClonedFrom
 	}
 	return ""
 }
@@ -514,7 +522,7 @@ const file_proto_sds_proto_rawDesc = "" +
 	"\bTxCommit\x12\x13\n" +
 	"\x05tx_id\x18\x01 \x01(\x04R\x04txId\x12;\n" +
 	"\vcommit_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"commitTime\"\x88\x02\n" +
+	"commitTime\"\xa9\x02\n" +
 	"\x0fSnapshotPointer\x12\x1a\n" +
 	"\bposition\x18\x01 \x01(\x04R\bposition\x12\x16\n" +
 	"\x06format\x18\x02 \x01(\tR\x06format\x12\x1a\n" +
@@ -523,7 +531,9 @@ const file_proto_sds_proto_rawDesc = "" +
 	"\x04name\x18\x05 \x01(\tR\x04name\x129\n" +
 	"\n" +
 	"created_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12#\n" +
-	"\rrestored_from\x18\a \x01(\tR\frestoredFrom\"\x99\x01\n" +
+	"\rrestored_from\x18\a \x01(\tR\frestoredFrom\x12\x1f\n" +
+	"\vcloned_from\x18\b \x01(\tR\n" +
+	"clonedFrom\"\x99\x01\n" +
 	"\fStreamHeader\x12%\n" +
 	"\x0eformat_version\x18\x01 \x01(\rR\rformatVersion\x12'\n" +
 	"\x0fcreator_version\x18\x02 \x01(\tR\x0ecreatorVersion\x129\n" +
