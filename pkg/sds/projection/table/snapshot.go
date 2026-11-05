@@ -32,6 +32,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	"github.com/gke-labs/in-cluster-storage/pkg/tempfile"
 )
 
 var (
@@ -240,20 +241,15 @@ func PublishSnapshot(ctx context.Context, db *DB, backend objectstore.Backend, t
 		errutil.CloseAndLog(snap, "db snapshot")
 	}()
 
-	tmpFile, err := os.CreateTemp(tempDir, "sds-table-snap-*.sst")
+	tempFile, err := tempfile.Create(tempDir, "sds-table-snap-*.sst")
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to create temp file for snapshot: %w", err)
 	}
-	tmpPath := tmpFile.Name()
-	if err := tmpFile.Close(); err != nil {
-		removeAndLog(tmpPath, "temp snapshot file")
-		return "", 0, fmt.Errorf("failed to close temp file %q: %w", tmpPath, err)
-	}
-	defer removeAndLog(tmpPath, "temp snapshot file")
+	defer tempFile.CloseAndLog(ctx)
 
-	f, err := vfs.Default.Create(tmpPath, vfs.WriteCategoryUnspecified)
+	f, err := vfs.Default.Create(tempFile.Name(), vfs.WriteCategoryUnspecified)
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to open vfs file %q: %w", tmpPath, err)
+		return "", 0, fmt.Errorf("failed to open vfs file %q: %w", tempFile.Name(), err)
 	}
 
 	w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
@@ -285,12 +281,12 @@ func PublishSnapshot(ctx context.Context, db *DB, backend objectstore.Backend, t
 		return "", 0, fmt.Errorf("failed to finish snapshot sstable writer: %w", err)
 	}
 
-	stat, err := os.Stat(tmpPath)
+	stat, err := os.Stat(tempFile.Name())
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to stat snapshot sstable: %w", err)
 	}
 
-	fIn, err := os.Open(tmpPath)
+	fIn, err := os.Open(tempFile.Name())
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to open snapshot sstable for upload: %w", err)
 	}
