@@ -1149,8 +1149,10 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 		})
 	}
 
+	recordsAppended := len(tx.Changes()) + 1
 	syncDuration := time.Since(syncStartTime)
-	klog.Infof("ObjectFS volume %s sync completed in %v (%d chunks, %d inodes, commitSeq=%d)", v.volumeID, syncDuration, totalChunks, len(snapshotChunks), commitSeq)
+	klog.Infof("ObjectFS volume %s sync completed in %v (%d records appended, %d chunks, %d inodes, commitSeq=%d)",
+		v.volumeID, syncDuration, recordsAppended, totalChunks, len(snapshotChunks), commitSeq)
 
 	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
 }
@@ -1575,8 +1577,7 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 		case walclient.Witness:
 			return v.stream.Wait(waitCtx, commitSeq, walclient.Witness, false)
 		case walclient.Local:
-			// Append already fsynced locally
-			return nil
+			return v.stream.Wait(waitCtx, commitSeq, walclient.Local, false)
 		}
 		return nil
 	}

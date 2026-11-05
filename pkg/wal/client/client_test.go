@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1721,5 +1722,72 @@ func TestClientOpen_RequiresTargetOrGRPCClient(t *testing.T) {
 	_, err := Open(ctx, dir, streamID, "")
 	if err == nil {
 		t.Fatal("expected Open without target or gRPC client to fail, got nil")
+	}
+}
+
+type syncCountingSegmentStore struct {
+	SegmentStore
+	syncCount atomic.Int64
+}
+
+func (s *syncCountingSegmentStore) Sync() error {
+	s.syncCount.Add(1)
+	return s.SegmentStore.Sync()
+}
+
+// TestAppendDefersFsyncToWait verifies that streamImpl.Append does not sync
+// the local segment store per record, but defers Sync() until Wait(Local) is called.
+func TestAppendDefersFsyncToWait(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir())
+	defer handle.StopGraceful()
+
+	clientDir := t.TempDir()
+	streamID := uuid.New()
+
+	realStore, recovered, err := wal.NewClientSegmentStore(clientDir, fmt.Sprintf("stream-%s", streamID.String()), 1024*1024)
+	if err != nil {
+		t.Fatalf("NewClientSegmentStore failed: %v", err)
+	}
+
+	countingStore := &syncCountingSegmentStore{SegmentStore: realStore}
+	stream, err := Open(ctx, clientDir, streamID, handle.addr, WithStore(countingStore, recovered))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() {
+		if closeErr := stream.Close(); closeErr != nil {
+			t.Errorf("stream.Close failed: %v", closeErr)
+		}
+	}()
+
+	// Append N records
+	const recordCount = 10
+	var lastSequence uint64
+	for i := 0; i < recordCount; i++ {
+		seq, appendErr := stream.Append(ctx, []byte(fmt.Sprintf("record-%d", i)))
+		if appendErr != nil {
+			t.Fatalf("Append record %d failed: %v", i, appendErr)
+		}
+		lastSequence = seq
+	}
+
+	// Zero syncs should have occurred during Appends
+	syncsBeforeWait := countingStore.syncCount.Load()
+	if syncsBeforeWait != 0 {
+		t.Fatalf("expected 0 syncs during Appends, got %d", syncsBeforeWait)
+	}
+
+	// One Wait(Local) must execute exactly one Sync()
+	if waitErr := stream.Wait(ctx, lastSequence, Local, false); waitErr != nil {
+		t.Fatalf("Wait(Local) failed: %v", waitErr)
+	}
+
+	syncsAfterWait := countingStore.syncCount.Load()
+	if syncsAfterWait != 1 {
+		t.Fatalf("expected exactly 1 sync after Wait(Local), got %d", syncsAfterWait)
 	}
 }
