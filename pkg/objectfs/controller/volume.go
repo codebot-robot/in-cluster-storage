@@ -964,6 +964,11 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 	})
 	v.stagingMu.Unlock()
 
+	var uploadedBytes int64
+	var uploadDuration time.Duration
+	var waitedBytes int64
+	var waitDuration time.Duration
+
 	if v.blobStore != nil {
 		stopTimer := context.AfterFunc(ctx, func() {
 			v.stagingMu.Lock()
@@ -974,16 +979,23 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 
 		for _, packID := range packIDsToUpload {
 			v.stagingMu.Lock()
-			for {
-				info, ok := v.packs[packID]
-				if !ok || info.state != packUploading {
-					break
+			if info, ok := v.packs[packID]; ok && info.state == packUploading {
+				waitStartTime := time.Now()
+				for {
+					info, ok = v.packs[packID]
+					if !ok || info.state != packUploading {
+						break
+					}
+					if ctx.Err() != nil {
+						v.stagingMu.Unlock()
+						return 0, v.finishSync(snapshotSeq, ctx.Err(), snapshotChunks, 0, inodeFilter)
+					}
+					v.syncCond.Wait()
 				}
-				if ctx.Err() != nil {
-					v.stagingMu.Unlock()
-					return 0, v.finishSync(snapshotSeq, ctx.Err(), snapshotChunks, 0, inodeFilter)
+				waitDuration += time.Since(waitStartTime)
+				if ok && info.state == packUploaded && info.pack != nil {
+					waitedBytes += info.pack.ByteSize()
 				}
-				v.syncCond.Wait()
 			}
 			info, ok := v.packs[packID]
 			v.stagingMu.Unlock()
@@ -992,6 +1004,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 				continue
 			}
 
+			packUploadStartTime := time.Now()
 			packKey, err := v.uploadPackFile(ctx, packID)
 			if err != nil {
 				v.stagingMu.Lock()
@@ -1005,6 +1018,10 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 				v.stagingMu.Unlock()
 				klog.Warningf("ObjectFS volume %s: sync upload failed for pack %s (id %d): %v", v.volumeID, packKey, packID, err)
 				return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to upload sealed pack %s: %w", packKey, err), snapshotChunks, 0, inodeFilter)
+			}
+			uploadDuration += time.Since(packUploadStartTime)
+			if info.pack != nil {
+				uploadedBytes += info.pack.ByteSize()
 			}
 
 			v.stagingMu.Lock()
@@ -1053,6 +1070,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 		nodes[ino] = node
 	}
 
+	recordAppendStartTime := time.Now()
 	for ino, chunks := range snapshotChunks {
 		node := nodes[ino]
 		cs := int64(v.chunkSize)
@@ -1167,6 +1185,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 		v.mu.Unlock()
 		return 0, v.finishSync(snapshotSeq, fmt.Errorf("failed to commit sync transaction: %w", err), snapshotChunks, 0, inodeFilter)
 	}
+	recordAppendDuration := time.Since(recordAppendStartTime)
 
 	for ino := range snapshotChunks {
 		node := nodes[ino]
@@ -1178,6 +1197,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 	waitFn := v.makeWaitFn(commitSeq, &reqLevel)
 	v.mu.Unlock()
 
+	commitWaitStartTime := time.Now()
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
 			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
@@ -1188,6 +1208,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 			return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 		}
 	}
+	commitWaitDuration := time.Since(commitWaitStartTime)
 
 	for _, attr := range modifiedAttrs {
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -1200,8 +1221,8 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 
 	recordsAppended := len(tx.Changes()) + 1
 	syncDuration := time.Since(syncStartTime)
-	klog.Infof("ObjectFS volume %s sync completed in %v (%d records appended, %d chunks, %d inodes, commitSeq=%d)",
-		v.volumeID, syncDuration, recordsAppended, totalChunks, len(snapshotChunks), commitSeq)
+	klog.Infof("ObjectFS volume %s sync completed in %v (uploaded %d bytes in %v, waited %d bytes in %v; record append %v, %d records; commit wait %v; %d chunks, %d inodes, commitSeq=%d)",
+		v.volumeID, syncDuration, uploadedBytes, uploadDuration, waitedBytes, waitDuration, recordAppendDuration, recordsAppended, commitWaitDuration, totalChunks, len(snapshotChunks), commitSeq)
 
 	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
 }
