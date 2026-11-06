@@ -2091,7 +2091,7 @@ func TestStagedPackRetainedUntilAllReferencingInodesCommit(t *testing.T) {
 
 	// Close-sync Inode A only (seals the active pack and uploads it to object storage)
 	volume.stagingMu.Lock()
-	if _, err := volume.syncInodesLocked(ctx, map[uint64]struct{}{inoA: {}}); err != nil {
+	if _, err := volume.syncInodesLocked(ctx, map[uint64]struct{}{inoA: {}}, pb.FsyncRequest_SYNC_TRIGGER_CLOSE); err != nil {
 		t.Fatalf("syncInodesLocked A failed: %v", err)
 	}
 
