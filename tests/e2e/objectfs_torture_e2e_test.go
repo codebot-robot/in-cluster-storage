@@ -844,6 +844,10 @@ disruptionLoop:
 					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
 					t.Fatalf("ObjectFS Controller failed to recover after kill: %v", err)
 				}
+				if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
+					t.Fatalf("ObjectFS provisioner failed to recover after kill: %v", err)
+				}
 				t.Logf("[%s] DISRUPTION: objectfs-controller-0 recovered", time.Now().Format("15:04:05"))
 				nextControllerKill = time.Now().Add(90 * time.Second)
 				if time.Until(nextWalBufferKill) < 60*time.Second {
@@ -887,6 +891,10 @@ disruptionLoop:
 				if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
 					t.Fatalf("ObjectFS Controller failed to recover from scale to 0: %v", err)
+				}
+				if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
+					t.Fatalf("ObjectFS provisioner failed to recover from scale to 0: %v", err)
 				}
 				tracker.EndOutage(5 * time.Second)
 				t.Logf("[%s] DISRUPTION: Outage recovery complete (5s recovery window bounded)", time.Now().Format("15:04:05"))

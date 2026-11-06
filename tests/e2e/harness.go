@@ -473,3 +473,109 @@ func (h *Harness) ApDeploy(t *testing.T, manifests map[string]string) {
 		t.Fatalf("ap deploy failed: %v\nOutput: %s", err, string(output))
 	}
 }
+
+// WaitForProvisionerReady verifies that the CSI provisioner is functional by creating
+// a small probe PVC, waiting until it binds, and deleting it.
+func (h *Harness) WaitForProvisionerReady(timeout time.Duration) error {
+	h.t.Helper()
+	h.t.Logf("Waiting up to %v for objectfs provisioner to be ready", timeout)
+	startTime := time.Now()
+
+	readyCommand := exec.Command("kubectl", "wait", "--for=condition=Ready", "pod/objectfs-controller-0", "-n", "default", fmt.Sprintf("--timeout=%s", timeout))
+	if readyOutput, readyError := readyCommand.CombinedOutput(); readyError != nil {
+		return fmt.Errorf("controller pod not ready: %w (output: %s)", readyError, strings.TrimSpace(string(readyOutput)))
+	}
+
+	probeClaimName := fmt.Sprintf("provisioner-probe-%d", time.Now().UnixNano())
+	probeClaimYaml := fmt.Sprintf(`apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: objectfs-standard
+  resources:
+    requests:
+      storage: 1Mi
+`, probeClaimName)
+
+	applyCommand := exec.Command("kubectl", "apply", "-f", "-")
+	applyCommand.Stdin = strings.NewReader(probeClaimYaml)
+	if applyOutput, applyError := applyCommand.CombinedOutput(); applyError != nil {
+		return fmt.Errorf("failed to apply probe PVC %s: %w (output: %s)", probeClaimName, applyError, strings.TrimSpace(string(applyOutput)))
+	}
+
+	var lastPhase string
+	for {
+		if time.Since(startTime) > timeout {
+			var eventMessages []string
+			eventsCommand := exec.Command("kubectl", "get", "events", "-n", "default", "--field-selector", "involvedObject.name="+probeClaimName, "-o", "json")
+			eventsOutput, eventsError := eventsCommand.CombinedOutput()
+			if eventsError != nil {
+				h.t.Logf("Warning: failed to get events for probe PVC %s: %v", probeClaimName, eventsError)
+			} else {
+				var eventsData struct {
+					Items []struct {
+						Reason  string `json:"reason"`
+						Message string `json:"message"`
+					} `json:"items"`
+				}
+				if jsonError := json.Unmarshal(eventsOutput, &eventsData); jsonError != nil {
+					h.t.Logf("Warning: failed to parse events for probe PVC %s: %v", probeClaimName, jsonError)
+				} else {
+					for _, item := range eventsData.Items {
+						eventMessages = append(eventMessages, fmt.Sprintf("%s: %s", item.Reason, strings.TrimSpace(item.Message)))
+					}
+				}
+			}
+
+			cleanupCommand := exec.Command("kubectl", "delete", "pvc", probeClaimName, "-n", "default", "--ignore-not-found")
+			if cleanupOutput, cleanupError := cleanupCommand.CombinedOutput(); cleanupError != nil {
+				h.t.Logf("Warning: failed to clean up probe PVC %s: %v (output: %s)", probeClaimName, cleanupError, strings.TrimSpace(string(cleanupOutput)))
+			}
+
+			if len(eventMessages) > 0 {
+				return fmt.Errorf("timed out waiting %v for probe PVC %s to bind (last phase: %s): events: %s", timeout, probeClaimName, lastPhase, strings.Join(eventMessages, "; "))
+			}
+			return fmt.Errorf("timed out waiting %v for probe PVC %s to bind (last phase: %s)", timeout, probeClaimName, lastPhase)
+		}
+
+		phaseCommand := exec.Command("kubectl", "get", "pvc", probeClaimName, "-n", "default", "-o", "jsonpath={.status.phase}")
+		phaseOutput, phaseError := phaseCommand.CombinedOutput()
+		if phaseError != nil {
+			h.t.Logf("Warning: failed to get phase for probe PVC %s: %v", probeClaimName, phaseError)
+		} else {
+			lastPhase = strings.TrimSpace(string(phaseOutput))
+			if lastPhase == "Bound" {
+				break
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	bindDuration := time.Since(startTime)
+
+	deleteCommand := exec.Command("kubectl", "delete", "pvc", probeClaimName, "-n", "default", "--ignore-not-found")
+	if deleteOutput, deleteError := deleteCommand.CombinedOutput(); deleteError != nil {
+		return fmt.Errorf("failed to delete probe PVC %s: %w (output: %s)", probeClaimName, deleteError, strings.TrimSpace(string(deleteOutput)))
+	}
+
+	for {
+		if time.Since(startTime) > timeout {
+			return fmt.Errorf("timed out waiting for probe PVC %s to be deleted after %v", probeClaimName, timeout)
+		}
+		checkCommand := exec.Command("kubectl", "get", "pvc", probeClaimName, "-n", "default", "--ignore-not-found", "-o", "jsonpath={.metadata.name}")
+		checkOutput, checkError := checkCommand.CombinedOutput()
+		if checkError != nil {
+			h.t.Logf("Warning: failed to query probe PVC %s deletion: %v", probeClaimName, checkError)
+		} else if strings.TrimSpace(string(checkOutput)) == "" {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	h.t.Logf("WaitForProvisionerReady: probe PVC %s bound in %v (total wait %v)", probeClaimName, bindDuration.Round(time.Millisecond), time.Since(startTime).Round(time.Millisecond))
+	return nil
+}

@@ -873,6 +873,9 @@ spec:
 		t.Logf("Events:\n%s\n", h.GetEvents("default"))
 		t.Fatalf("ObjectFS Controller failed to restart: %v", err)
 	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner failed to become ready: %v", err)
+	}
 
 	// Step 3: Start Pod 2, read back existing data, and append new files
 	pod2Name := "persistent-pod-2"
@@ -921,6 +924,9 @@ spec:
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Logf("Events:\n%s\n", h.GetEvents("default"))
 		t.Fatalf("ObjectFS Controller failed to restart (2nd time): %v", err)
+	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner failed to become ready (2nd time): %v", err)
 	}
 
 	// Step 5: Start Pod 3 to verify both original and post-restart modifications
@@ -1311,6 +1317,9 @@ spec:
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS Controller not ready on %s: %v", node1, err)
 	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner not ready on %s: %v", node1, err)
+	}
 	if err := h.WaitForDaemonSet("objectfs-fuse-holder", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS FUSE Holder not ready: %v", err)
 	}
@@ -1404,6 +1413,9 @@ spec:
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS Controller failed to restart on %s: %v", node2, err)
 	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner failed to restart on %s: %v", node2, err)
+	}
 
 	// Step 4: Verify files are intact on node2, and perform new writes on node2
 	readerPod2Name := "failover-reader-node2"
@@ -1474,6 +1486,9 @@ spec:
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS Controller failed to restart back on %s: %v", node1, err)
 	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner failed to restart back on %s: %v", node1, err)
+	}
 	<-readDone
 	close(readErrors)
 	for rErr := range readErrors {
@@ -1505,6 +1520,9 @@ spec:
 	h.RunCommand("kubectl", "delete", "pod", "objectfs-controller-0", "-n", "default", "--force", "--grace-period=0")
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS Controller failed to restart on Node 1: %v", err)
+	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner failed to restart on Node 1: %v", err)
 	}
 
 	if logs := h.getContainerLogs("objectfs-controller-0", "objectfs-controller", "default", false); logs != "" {
@@ -1804,6 +1822,9 @@ spec:
 	h.RunCommand("kubectl", "delete", "pod", "objectfs-controller-0", "-n", "default", "--force", "--grace-period=0")
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("Controller failed to restart: %v", err)
+	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner failed to restart: %v", err)
 	}
 
 	// Pod 1 deletes d/x and syncs
@@ -2254,6 +2275,9 @@ echo $? > /tmp/workload.status
 			t.Fatalf("ObjectFS Controller failed to restart on %s during crash iteration %d: %v", currentNode, i+1, err)
 		}
 	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner failed to become ready after crash iterations: %v", err)
+	}
 
 	t.Logf("Waiting for workload in writer pod to finish")
 	deadline := time.Now().Add(2 * time.Minute)
@@ -2429,6 +2453,9 @@ spec:
 	// Wait for controller to recover
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("Controller failed to recover: %v", err)
+	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner failed to recover: %v", err)
 	}
 
 	// Step 3: Close the descriptor by terminating the holder process so the close push and sync
@@ -2614,6 +2641,9 @@ spec:
 	h.RunCommand("kubectl", "scale", "statefulset", "objectfs-controller", "-n", "default", "--replicas=1")
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
 		t.Fatalf("ObjectFS Controller failed to restart after outage: %v", err)
+	}
+	if err := h.WaitForProvisionerReady(2 * time.Minute); err != nil {
+		t.Fatalf("ObjectFS provisioner failed to become ready after outage: %v", err)
 	}
 
 	t.Logf("Verifying existing mount on Pod 1 works after controller is back up")
