@@ -40,24 +40,24 @@ type WriteMode int32
 
 const (
 	WriteMode_WRITE_MODE_UNSPECIFIED WriteMode = 0
-	WriteMode_WRITE_THROUGH_FSYNC    WriteMode = 1
-	WriteMode_LAZY_WRITE             WriteMode = 2
-	WriteMode_EAGER_REPLICATION      WriteMode = 3
+	WriteMode_FSYNC                  WriteMode = 1
+	WriteMode_LAZY                   WriteMode = 2
+	WriteMode_EAGER                  WriteMode = 3
 )
 
 // Enum value maps for WriteMode.
 var (
 	WriteMode_name = map[int32]string{
 		0: "WRITE_MODE_UNSPECIFIED",
-		1: "WRITE_THROUGH_FSYNC",
-		2: "LAZY_WRITE",
-		3: "EAGER_REPLICATION",
+		1: "FSYNC",
+		2: "LAZY",
+		3: "EAGER",
 	}
 	WriteMode_value = map[string]int32{
 		"WRITE_MODE_UNSPECIFIED": 0,
-		"WRITE_THROUGH_FSYNC":    1,
-		"LAZY_WRITE":             2,
-		"EAGER_REPLICATION":      3,
+		"FSYNC":                  1,
+		"LAZY":                   2,
+		"EAGER":                  3,
 	}
 )
 
@@ -6603,13 +6603,12 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05force\x18\x02 \x01(\bR\x05force\"V\n" +
 	"\x14RepairVolumeResponse\x12\x19\n" +
 	"\bold_path\x18\x01 \x01(\tR\aoldPath\x12#\n" +
-	"\rnew_watermark\x18\x02 \x01(\x04R\fnewWatermark*g\n" +
+	"\rnew_watermark\x18\x02 \x01(\x04R\fnewWatermark*G\n" +
 	"\tWriteMode\x12\x1a\n" +
-	"\x16WRITE_MODE_UNSPECIFIED\x10\x00\x12\x17\n" +
-	"\x13WRITE_THROUGH_FSYNC\x10\x01\x12\x0e\n" +
-	"\n" +
-	"LAZY_WRITE\x10\x02\x12\x15\n" +
-	"\x11EAGER_REPLICATION\x10\x03*T\n" +
+	"\x16WRITE_MODE_UNSPECIFIED\x10\x00\x12\t\n" +
+	"\x05FSYNC\x10\x01\x12\b\n" +
+	"\x04LAZY\x10\x02\x12\t\n" +
+	"\x05EAGER\x10\x03*T\n" +
 	"\x0fConsistencyMode\x12 \n" +
 	"\x1cCONSISTENCY_MODE_UNSPECIFIED\x10\x00\x12\f\n" +
 	"\bSTANDARD\x10\x01\x12\x11\n" +

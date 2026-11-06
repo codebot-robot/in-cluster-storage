@@ -14,73 +14,32 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package writemode provides parsing and flag binding for ObjectFS write modes.
 package writemode
 
 import (
-	"flag"
-	"fmt"
-
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/protoenum"
 )
 
-// ParseWriteMode parses a write mode string into a WriteMode enum.
+// Parse parses a write mode string into a WriteMode enum.
 // Accepted canonical values are "fsync", "lazy", and "eager".
-// An empty string parses as the documented default (WRITE_THROUGH_FSYNC).
+// An empty string parses as WRITE_MODE_UNSPECIFIED.
 // Any other value returns an error naming the accepted values.
-func ParseWriteMode(value string) (pb.WriteMode, error) {
-	switch value {
-	case "", "fsync":
-		return pb.WriteMode_WRITE_THROUGH_FSYNC, nil
-	case "lazy":
-		return pb.WriteMode_LAZY_WRITE, nil
-	case "eager":
-		return pb.WriteMode_EAGER_REPLICATION, nil
-	default:
-		return pb.WriteMode_WRITE_MODE_UNSPECIFIED, fmt.Errorf("unknown write mode %q (accepted values: fsync, lazy, eager)", value)
-	}
+func Parse(value string) (pb.WriteMode, error) {
+	number, err := protoenum.Parse(pb.WriteMode(0).Descriptor(), value)
+	return pb.WriteMode(number), err
 }
 
-// WriteModeString returns the canonical user-facing string for mode ("fsync", "lazy", or "eager").
-func WriteModeString(mode pb.WriteMode) string {
-	switch mode {
-	case pb.WriteMode_WRITE_THROUGH_FSYNC:
-		return "fsync"
-	case pb.WriteMode_LAZY_WRITE:
-		return "lazy"
-	case pb.WriteMode_EAGER_REPLICATION:
-		return "eager"
-	default:
-		return ""
-	}
+// String returns the canonical user-facing string for mode ("fsync", "lazy", or "eager").
+func String(mode pb.WriteMode) string {
+	return protoenum.Name(mode)
 }
 
-type Value struct {
-	target *pb.WriteMode
-}
+// Value wraps a *pb.WriteMode to implement flag.Value and pflag.Value.
+type Value = protoenum.Value[pb.WriteMode]
 
-var _ flag.Value = (*Value)(nil)
-
+// NewValue returns a Value that sets target when parsed.
 func NewValue(target *pb.WriteMode) *Value {
-	return &Value{target: target}
+	return protoenum.NewValue(target)
 }
-
-func (v *Value) String() string {
-	if v == nil || v.target == nil {
-		return ""
-	}
-	return WriteModeString(*v.target)
-}
-
-func (v *Value) Set(value string) error {
-	if v == nil || v.target == nil {
-		return fmt.Errorf("write mode value target is nil")
-	}
-	mode, err := ParseWriteMode(value)
-	if err != nil {
-		return err
-	}
-	*v.target = mode
-	return nil
-}
-
-func (v *Value) Type() string { return "write-mode" }

@@ -495,9 +495,9 @@ When `--wal-durability=witness` is used, metadata transactions are acknowledged 
 
 ### 5. Configurable Write-Through Modes
 ObjectFS supports three distinct write synchronization modes:
-1. `WRITE_THROUGH_FSYNC`: Default mode. Writes are staged on the controller and committed to durable pack storage upon `fsync(2)` or background coalesce window sync.
-2. `LAZY_WRITE`: Writes are buffered asynchronously and flushed in background batches, maximizing write throughput for scratch and temporary workloads.
-3. `EAGER_REPLICATION`: Writes are streamed immediately to the central controller memory and change-log, providing cross-node visibility and crash resilience without waiting for object store commits.
+1. `FSYNC`: Default mode. Writes are staged on the controller and committed to durable pack storage upon `fsync(2)` or background coalesce window sync.
+2. `LAZY`: Writes are buffered asynchronously and flushed in background batches, maximizing write throughput for scratch and temporary workloads.
+3. `EAGER`: Writes are streamed immediately to the central controller memory and change-log, providing cross-node visibility and crash resilience without waiting for object store commits.
 
 ---
 

@@ -24,45 +24,76 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 )
 
+func TestDerivedNamesEqualDocs(t *testing.T) {
+	testCases := []struct {
+		mode pb.WriteMode
+		want string
+	}{
+		{pb.WriteMode_WRITE_MODE_UNSPECIFIED, ""},
+		{pb.WriteMode_FSYNC, "fsync"},
+		{pb.WriteMode_LAZY, "lazy"},
+		{pb.WriteMode_EAGER, "eager"},
+	}
+	for _, testCase := range testCases {
+		if got := String(testCase.mode); got != testCase.want {
+			t.Errorf("String(%v) = %q, want %q", testCase.mode, got, testCase.want)
+		}
+	}
+}
+
 func TestWriteModeRoundTrip(t *testing.T) {
-	for _, mode := range []pb.WriteMode{
-		pb.WriteMode_WRITE_THROUGH_FSYNC,
-		pb.WriteMode_LAZY_WRITE,
-		pb.WriteMode_EAGER_REPLICATION,
-	} {
-		modeString := WriteModeString(mode)
-		parsed, err := ParseWriteMode(modeString)
-		if err != nil || parsed != mode {
+	modes := []pb.WriteMode{
+		pb.WriteMode_WRITE_MODE_UNSPECIFIED,
+		pb.WriteMode_FSYNC,
+		pb.WriteMode_LAZY,
+		pb.WriteMode_EAGER,
+	}
+	for _, mode := range modes {
+		modeString := String(mode)
+		if parsed, err := Parse(modeString); err != nil || parsed != mode {
 			t.Errorf("round trip failed for %v: string %q, parsed %v, err %v", mode, modeString, parsed, err)
 		}
 	}
-	if parsed, err := ParseWriteMode(""); err != nil || parsed != pb.WriteMode_WRITE_THROUGH_FSYNC {
-		t.Errorf("ParseWriteMode(\"\") = (%v, %v), want (%v, nil)", parsed, err, pb.WriteMode_WRITE_THROUGH_FSYNC)
-	}
-	if got := WriteModeString(pb.WriteMode_WRITE_MODE_UNSPECIFIED); got != "" {
-		t.Errorf("WriteModeString(UNSPECIFIED) = %q, want empty", got)
-	}
 }
 
-func TestParseWriteMode_Errors(t *testing.T) {
-	for _, input := range []string{"writethrough", "write_through_fsync", "lazywrite", "lazy_write", "eagerreplication", "eager_replication", "unknown", "FSYNC"} {
-		if _, err := ParseWriteMode(input); err == nil || !strings.Contains(err.Error(), "fsync") || !strings.Contains(err.Error(), "lazy") || !strings.Contains(err.Error(), "eager") {
-			t.Errorf("ParseWriteMode(%q) = %v; want error naming accepted values", input, err)
+func TestParse_AcceptedValues(t *testing.T) {
+	testCases := []struct {
+		input    string
+		wantMode pb.WriteMode
+	}{
+		{"", pb.WriteMode_WRITE_MODE_UNSPECIFIED},
+		{"fsync", pb.WriteMode_FSYNC},
+		{"lazy", pb.WriteMode_LAZY},
+		{"eager", pb.WriteMode_EAGER},
+	}
+	for _, testCase := range testCases {
+		got, err := Parse(testCase.input)
+		if err != nil {
+			t.Errorf("Parse(%q) unexpected error: %v", testCase.input, err)
+		}
+		if got != testCase.wantMode {
+			t.Errorf("Parse(%q) = %v, want %v", testCase.input, got, testCase.wantMode)
 		}
 	}
 }
 
-func TestValue_FlagIntegration(t *testing.T) {
-	var target pb.WriteMode
+func TestParse_Errors(t *testing.T) {
+	inputs := []string{"writethrough", "write_through_fsync", "lazywrite", "lazy_write", "eagerreplication", "eager_replication", "unknown", "FSYNC"}
+	for _, input := range inputs {
+		if parsed, err := Parse(input); err == nil || !strings.Contains(err.Error(), "fsync") || !strings.Contains(err.Error(), "lazy") || !strings.Contains(err.Error(), "eager") {
+			t.Errorf("Parse(%q) = %v, %v; want error naming accepted values", input, parsed, err)
+		}
+	}
+}
+
+func TestFlagValue(t *testing.T) {
+	var mode pb.WriteMode
+	flagValue := NewValue(&mode)
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
-	flagValue := NewValue(&target)
 	flagSet.Var(flagValue, "write-mode", "Write mode")
 
-	if err := flagSet.Parse([]string{"--write-mode=lazy"}); err != nil {
-		t.Fatalf("Parse failed: %v", err)
-	}
-	if target != pb.WriteMode_LAZY_WRITE {
-		t.Errorf("target = %v, want LAZY_WRITE", target)
+	if err := flagSet.Parse([]string{"--write-mode=lazy"}); err != nil || mode != pb.WriteMode_LAZY {
+		t.Fatalf("parse lazy: err=%v, mode=%v", err, mode)
 	}
 	if flagValue.String() != "lazy" || flagValue.Type() != "write-mode" {
 		t.Errorf("flagValue String/Type mismatch: %q, %q", flagValue.String(), flagValue.Type())

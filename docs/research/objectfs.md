@@ -21,9 +21,9 @@ ObjectFS enables multi-writer shared storage backed by object storage (such as S
 - **Local Node Caching:** Automatically caches recently read file blocks and small files in memory/disk to reduce network round-trips.
 - **Push Notification Listener:** Subscribes to the controller's `WatchVolume` stream and proactively invalidates local cache entries when external modifications occur.
 - **Configurable Write-Through Modes:** Configurable via StorageClass or volume attributes:
-  1. `WRITE_THROUGH_FSYNC`: Synchronously flushes data to backing storage on `fsync`/`flush`.
-  2. `LAZY_WRITE`: Buffered asynchronous writes for maximum throughput with relaxed durability.
-  3. `EAGER_REPLICATION`: Immediate memory replication to the central service to prevent data loss without paying full object store commit latency.
+  1. `FSYNC`: Synchronously flushes data to backing storage on `fsync`/`flush`.
+  2. `LAZY`: Buffered asynchronous writes for maximum throughput with relaxed durability.
+  3. `EAGER`: Immediate memory replication to the central service to prevent data loss without paying full object store commit latency.
 
 ---
 

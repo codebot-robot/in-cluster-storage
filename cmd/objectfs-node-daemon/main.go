@@ -361,9 +361,12 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return d.publishExclusiveLocal(ctx, req, volumeID)
 	}
 
-	writeMode, err := writemode.ParseWriteMode(req.GetVolumeContext()["writeMode"])
+	writeMode, err := writemode.Parse(req.GetVolumeContext()["writeMode"])
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if writeMode == pb.WriteMode_WRITE_MODE_UNSPECIFIED {
+		writeMode = pb.WriteMode_FSYNC
 	}
 
 	klog.Infof("Publishing ObjectFS volume %s (writeMode=%v, consistency=%v) to %s", volumeID, writeMode, consistencyMode, targetPath)

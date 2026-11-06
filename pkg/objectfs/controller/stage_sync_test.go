@@ -184,7 +184,7 @@ func TestStageAndSync_SinglePackMultiInode(t *testing.T) {
 			Inode:     ino,
 			Offset:    0,
 			Data:      data,
-			WriteMode: pb.WriteMode_LAZY_WRITE,
+			WriteMode: pb.WriteMode_LAZY,
 		})
 		if err != nil || wResp.GetError() != 0 {
 			t.Fatalf("WriteFile %s failed: %v", name, err)
@@ -267,7 +267,7 @@ func TestStageAndSync_CrossNodeVisibility(t *testing.T) {
 		Inode:     ino,
 		Offset:    0,
 		Data:      updatedContent,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile failed: %v", err)
@@ -341,7 +341,7 @@ func TestStageAndSync_ControllerCrashBeforeSyncRePush(t *testing.T) {
 		Inode:     ino,
 		Offset:    0,
 		Data:      stagedData,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp1.GetError() != 0 {
 		t.Fatalf("WriteFile failed: %v", err)
@@ -376,7 +376,7 @@ func TestStageAndSync_ControllerCrashBeforeSyncRePush(t *testing.T) {
 		Inode:     ino,
 		Offset:    0,
 		Data:      stagedData,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp2.GetError() != 0 {
 		t.Fatalf("WriteFile re-push failed: %v", err)
@@ -1241,7 +1241,7 @@ func TestFsyncDurability_WithWAL_DurableAcrossRestart(t *testing.T) {
 		Inode:     fIno,
 		Offset:    0,
 		Data:      []byte("hello"),
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile failed: %v", err)
@@ -1319,7 +1319,7 @@ func TestOpenBarrier_StagedInodeBlocksAndReturnsFreshAttrs(t *testing.T) {
 		Inode:     ino,
 		Offset:    0,
 		Data:      payload,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile failed: %v", err)
@@ -1395,7 +1395,7 @@ func TestOpenBarrier_CleanInodeDoesNotBlock(t *testing.T) {
 		Inode:     stagedIno,
 		Offset:    0,
 		Data:      []byte("dirty-data"),
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile failed: %v", err)
@@ -1456,7 +1456,7 @@ func TestOpenBarrier_TimeoutReturnsEIO(t *testing.T) {
 		Inode:     ino,
 		Offset:    0,
 		Data:      payload,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile failed: %v", err)
@@ -1512,7 +1512,7 @@ func TestOpenBarrier_WaitsOnInFlightSync(t *testing.T) {
 		Inode:     inodeID,
 		Offset:    0,
 		Data:      payload,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile failed: %v", err)
@@ -1763,7 +1763,7 @@ func TestOpenBarrier_SurvivesControllerRestartOverSameMetadataDir(t *testing.T) 
 		Inode:     ino,
 		Offset:    0,
 		Data:      payload,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp.GetError() != 0 {
 		t.Fatalf("WriteFile failed on server1: %v", err)
@@ -1806,7 +1806,7 @@ func TestOpenBarrier_SurvivesControllerRestartOverSameMetadataDir(t *testing.T) 
 		Inode:     ino,
 		Offset:    0,
 		Data:      payload2,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || wResp2.GetError() != 0 {
 		t.Fatalf("WriteFile failed on server2: %v", err)
@@ -1891,7 +1891,7 @@ func (h *scratchStagingHelper) write(offset int64, data []byte) int64 {
 		Inode:     h.inodeID,
 		Offset:    offset,
 		Data:      data,
-		WriteMode: pb.WriteMode_LAZY_WRITE,
+		WriteMode: pb.WriteMode_LAZY,
 	})
 	if err != nil || writeResponse.GetError() != 0 {
 		h.t.Fatalf("WriteFile failed: %v, err=%d", err, writeResponse.GetError())
@@ -2064,12 +2064,12 @@ func TestStagedPackRetainedUntilAllReferencingInodesCommit(t *testing.T) {
 
 	// Stage writes for Inode B (below inline threshold) and Inode A in the same open pack
 	dataB := []byte("hello from inode B inline data")
-	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, inoB, 0, dataB, pb.WriteMode_LAZY_WRITE); err != nil {
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, inoB, 0, dataB, pb.WriteMode_LAZY); err != nil {
 		t.Fatalf("WriteFile B failed: %v", err)
 	}
 
 	dataA := bytes.Repeat([]byte("A"), 64*1024)
-	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, inoA, 0, dataA, pb.WriteMode_LAZY_WRITE); err != nil {
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, inoA, 0, dataA, pb.WriteMode_LAZY); err != nil {
 		t.Fatalf("WriteFile A failed: %v", err)
 	}
 
@@ -2106,7 +2106,7 @@ func TestStagedPackRetainedUntilAllReferencingInodesCommit(t *testing.T) {
 
 	// Partially overwrite one of B's chunks: tests readStagedChunkBytesLocked on the uploaded pack
 	partialData := []byte("UPDATED")
-	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, inoB, 6, partialData, pb.WriteMode_LAZY_WRITE); err != nil {
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, inoB, 6, partialData, pb.WriteMode_LAZY); err != nil {
 		t.Fatalf("partial overwrite on Inode B failed: %v", err)
 	}
 
@@ -2171,7 +2171,7 @@ func TestPackObjectKeysDistinctAcrossRestart(t *testing.T) {
 
 	// Write 64 KiB of 'A' and sync
 	payload1 := bytes.Repeat([]byte("A"), 64*1024)
-	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, ino1, 0, payload1, pb.WriteMode_LAZY_WRITE); err != nil {
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, ino1, 0, payload1, pb.WriteMode_LAZY); err != nil {
 		t.Fatalf("WriteFile 1 failed: %v", err)
 	}
 	fsyncResponse1, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino1, Blocking: true})
@@ -2202,7 +2202,7 @@ func TestPackObjectKeysDistinctAcrossRestart(t *testing.T) {
 
 	// Write 64 KiB of 'B' (identical size, different content) and sync
 	payload2 := bytes.Repeat([]byte("B"), 64*1024)
-	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, ino2, 0, payload2, pb.WriteMode_LAZY_WRITE); err != nil {
+	if _, _, _, _, err := volume.WriteFileWithEpoch(ctx, ino2, 0, payload2, pb.WriteMode_LAZY); err != nil {
 		t.Fatalf("WriteFile 2 failed: %v", err)
 	}
 	fsyncResponse2, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: ino2, Blocking: true})
@@ -2362,7 +2362,7 @@ func TestSync_SingleDurabilityWaitPerCommit(t *testing.T) {
 			countingStream.waitCount.Store(0)
 			countingStream.appendCount.Store(0)
 
-			// Write 16 chunks with LAZY_WRITE so chunks are staged in memory
+			// Write 16 chunks with LAZY so chunks are staged in memory
 			chunkSize := 64 * 1024
 			numChunks := 16
 			payload := bytes.Repeat([]byte("X"), numChunks*chunkSize)
@@ -2370,7 +2370,7 @@ func TestSync_SingleDurabilityWaitPerCommit(t *testing.T) {
 			for chunkIndex := 0; chunkIndex < numChunks; chunkIndex++ {
 				offset := int64(chunkIndex * chunkSize)
 				chunkData := payload[offset : offset+int64(chunkSize)]
-				writeResponse, err := testWriteFile(ctx, server, volumeID, "/multi_chunk.bin", offset, chunkData, pb.WriteMode_LAZY_WRITE)
+				writeResponse, err := testWriteFile(ctx, server, volumeID, "/multi_chunk.bin", offset, chunkData, pb.WriteMode_LAZY)
 				if err != nil || writeResponse.GetError() != 0 {
 					t.Fatalf("testWriteFile chunk %d failed: %v (code %d)", chunkIndex, err, writeResponse.GetError())
 				}
@@ -2441,7 +2441,7 @@ func TestStagingSlotSeals_RotationAndMetrics(t *testing.T) {
 		if i == 1024 {
 			lastChunkData = append([]byte(nil), data...)
 		}
-		_, _, _, _, err := vol.WriteFileWithEpoch(ctx, ino, int64(i*64*1024), data, pb.WriteMode_LAZY_WRITE)
+		_, _, _, _, err := vol.WriteFileWithEpoch(ctx, ino, int64(i*64*1024), data, pb.WriteMode_LAZY)
 		if err != nil {
 			t.Fatalf("WriteFile chunk %d failed: %v", i, err)
 		}
@@ -2537,7 +2537,7 @@ func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
 	// Write 16 MiB (multi-chunk)
 	data := bytes.Repeat([]byte("X"), 16*1024*1024)
 	for chunkIndex := 0; chunkIndex < 16; chunkIndex++ {
-		if _, _, _, _, writeError := volume.WriteFileWithEpoch(ctx, inodeID, int64(chunkIndex*1024*1024), data[chunkIndex*1024*1024:(chunkIndex+1)*1024*1024], pb.WriteMode_WRITE_THROUGH_FSYNC); writeError != nil {
+		if _, _, _, _, writeError := volume.WriteFileWithEpoch(ctx, inodeID, int64(chunkIndex*1024*1024), data[chunkIndex*1024*1024:(chunkIndex+1)*1024*1024], pb.WriteMode_FSYNC); writeError != nil {
 			t.Fatalf("WriteFile chunk %d failed: %v", chunkIndex, writeError)
 		}
 	}
