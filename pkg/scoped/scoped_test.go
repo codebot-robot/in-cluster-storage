@@ -96,7 +96,7 @@ func TestWithLog(t *testing.T) {
 	}
 }
 
-func TestStartWithProvider(t *testing.T) {
+func TestStartSpanWithProvider(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tracerProvider := trace.NewTracerProvider(trace.WithSyncer(exporter))
 	previousProvider := otel.GetTracerProvider()
@@ -111,7 +111,7 @@ func TestStartWithProvider(t *testing.T) {
 	sink := newTestSink()
 	ctx := WithLog(t.Context(), logr.New(sink))
 
-	ctx, span := Start(ctx, "test_operation")
+	ctx, span := StartSpan(ctx, "test_operation")
 	span.SetAttributes(attribute.String("test.key", "test.value"))
 
 	logger := Log(ctx)
@@ -149,11 +149,11 @@ func TestStartWithProvider(t *testing.T) {
 	}
 }
 
-func TestStartWithoutProvider(t *testing.T) {
+func TestStartSpanWithoutProvider(t *testing.T) {
 	sink := newTestSink()
 	ctx := WithLog(t.Context(), logr.New(sink))
 
-	ctx, span := Start(ctx, "test_operation")
+	ctx, span := StartSpan(ctx, "test_operation")
 	if span.IsRecording() {
 		t.Fatal("expected span to be non-recording without provider")
 	}
