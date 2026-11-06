@@ -33,6 +33,8 @@ import (
 	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
+	"github.com/go-logr/logr"
 )
 
 type testMemoryObject struct {
@@ -1579,7 +1581,7 @@ func writePackfileWithSlotsForTest(t *testing.T, inputs []*EncodedBlob, slots ui
 func writePackfileForTest(t *testing.T, inputs []*EncodedBlob) ([]byte, *PackFile, error) {
 	t.Helper()
 	return writePackfileWithFnForTest(t, func(file *os.File) (*PackFile, error) {
-		return WritePackfile(file, inputs)
+		return WritePackfile(t.Context(), file, inputs)
 	})
 }
 
@@ -1663,5 +1665,60 @@ func TestNewIncrementalPackFromFile(t *testing.T) {
 	}
 	if foundEntry, ok := parsed.Lookup(entry.SHA256); !ok || foundEntry.SHA256 != entry.SHA256 {
 		t.Fatalf("parsed lookup mismatch")
+	}
+}
+
+type blobLogCaptureSink struct {
+	mu            sync.Mutex
+	messages      []string
+	keysAndValues [][]any
+}
+
+func (s *blobLogCaptureSink) Init(info logr.RuntimeInfo) {}
+func (s *blobLogCaptureSink) Enabled(level int) bool     { return true }
+func (s *blobLogCaptureSink) Info(level int, message string, keysAndValues ...any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messages = append(s.messages, message)
+	s.keysAndValues = append(s.keysAndValues, keysAndValues)
+}
+func (s *blobLogCaptureSink) Error(err error, message string, keysAndValues ...any) {}
+func (s *blobLogCaptureSink) WithName(name string) logr.LogSink                     { return s }
+func (s *blobLogCaptureSink) WithValues(keysAndValues ...any) logr.LogSink          { return s }
+
+func TestWritePackfile_ScopedLog(t *testing.T) {
+	sink := &blobLogCaptureSink{}
+	logger := logr.New(sink)
+	ctx := scoped.WithLog(t.Context(), logger)
+
+	tempFile, err := os.CreateTemp(t.TempDir(), "test-log-pack-*")
+	if err != nil {
+		t.Fatalf("os.CreateTemp: %v", err)
+	}
+	defer errutil.CloseAndLog(tempFile, "tempFile")
+
+	var inputs []*EncodedBlob
+	for index := 0; index < int(DefaultPackSlots)+1; index++ {
+		data := []byte(fmt.Sprintf("chunk-%d", index))
+		encoded, err := EncodeBlob(NewByteStreamFromBytes(data), false)
+		if err != nil {
+			t.Fatalf("EncodeBlob: %v", err)
+		}
+		inputs = append(inputs, encoded)
+	}
+
+	_, err = WritePackfile(ctx, tempFile, inputs)
+	if err != nil {
+		t.Fatalf("WritePackfile: %v", err)
+	}
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.messages) == 0 {
+		t.Fatal("expected at least one log message from WritePackfile")
+	}
+	expectedMessage := "batch size exceeds default pack slots; reserving for pack"
+	if sink.messages[0] != expectedMessage {
+		t.Fatalf("expected message %q, got %q", expectedMessage, sink.messages[0])
 	}
 }

@@ -21,6 +21,7 @@ import (
 
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -28,7 +29,6 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
-	"k8s.io/klog/v2"
 )
 
 type testServerHandle struct {
@@ -38,7 +38,8 @@ type testServerHandle struct {
 
 func (h *testServerHandle) StopGraceful() {
 	if err := h.bt.Close(); err != nil {
-		klog.Warningf("StopGraceful: buffertest close failed: %v", err)
+		// Test cleanup helper without context; use logger derived from root context.
+		scoped.Log(context.Background()).Info("StopGraceful: buffertest close failed", "err", err)
 	}
 }
 

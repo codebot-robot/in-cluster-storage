@@ -31,10 +31,10 @@ import (
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"google.golang.org/protobuf/proto"
-	"k8s.io/klog/v2"
 )
 
 const (
@@ -48,15 +48,15 @@ const (
 	SnapshotTableFormat = sstable.TableFormatPebblev4
 )
 
-func removeAndLog(path, what string) {
+func removeAndLog(ctx context.Context, path, what string) {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		klog.Warningf("failed to remove %s %s: %v", what, path, err)
+		scoped.Log(ctx).Info("failed to remove", "what", what, "path", path, "err", err)
 	}
 }
 
-func removeAllAndLog(path, what string) {
+func removeAllAndLog(ctx context.Context, path, what string) {
 	if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
-		klog.Warningf("failed to remove %s %s: %v", what, path, err)
+		scoped.Log(ctx).Info("failed to remove", "what", what, "path", path, "err", err)
 	}
 }
 
@@ -287,7 +287,7 @@ func Open(ctx context.Context, dir string, opts ...Option) (*DB, error) {
 		d.writeOpts = pebble.Sync
 	}
 
-	if err := d.loadMetadataLocked(); err != nil {
+	if err := d.loadMetadataLocked(ctx); err != nil {
 		errutil.CloseAndLog(pdb, "pebble db")
 		return nil, err
 	}
@@ -295,7 +295,7 @@ func Open(ctx context.Context, dir string, opts ...Option) (*DB, error) {
 	return d, nil
 }
 
-func (d *DB) loadMetadataLocked() error {
+func (d *DB) loadMetadataLocked(ctx context.Context) error {
 	// 0. Format Version
 	valVer, closerVer, err := d.db.Get(KeyFormatVersion)
 	if err == nil {
@@ -316,7 +316,7 @@ func (d *DB) loadMetadataLocked() error {
 			if !d.opts.acceptUnversioned {
 				return ErrUnversionedSnapshot
 			}
-			klog.Warning("accepting unversioned table snapshot (--accept-unversioned-segments)")
+			scoped.Log(ctx).Info("accepting unversioned table snapshot (--accept-unversioned-segments)")
 		} else if !errors.Is(posErr, pebble.ErrNotFound) {
 			return fmt.Errorf("failed to check position in db: %w", posErr)
 		}
@@ -901,7 +901,7 @@ func (f *Factory) RestoreSnapshot(ctx context.Context, backend objectstore.Backe
 // NewEmpty creates a new empty local table index in dir.
 func (f *Factory) NewEmpty(ctx context.Context, streamID string, dir string) (sds.LocalIndex, error) {
 	dbDir := filepath.Join(dir, "table.db")
-	removeAllAndLog(dbDir, "table db dir")
+	removeAllAndLog(ctx, dbDir, "table db dir")
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory %q: %w", dbDir, err)
 	}

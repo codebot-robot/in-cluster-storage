@@ -360,7 +360,7 @@ func TestTableSnapshotPublishRestoreAndReader(t *testing.T) {
 		t.Fatalf("GetObject failed: %v", err)
 	}
 
-	sr, err := table.OpenSnapshotBytes(buf.Bytes())
+	sr, err := table.OpenSnapshotBytes(ctx, buf.Bytes())
 	if err != nil {
 		t.Fatalf("OpenSnapshotBytes failed: %v", err)
 	}
@@ -664,7 +664,7 @@ func TestPublishedSnapshotCompactedTableInvariant(t *testing.T) {
 	}
 
 	// 2. Open with standalone SnapshotReader
-	sr, err := table.OpenSnapshotBytes(buf.Bytes())
+	sr, err := table.OpenSnapshotBytes(ctx, buf.Bytes())
 	if err != nil {
 		t.Fatalf("OpenSnapshotBytes failed: %v", err)
 	}

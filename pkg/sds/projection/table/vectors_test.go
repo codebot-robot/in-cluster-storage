@@ -123,7 +123,7 @@ func TestSnapshotGoldenVectors(t *testing.T) {
 			}
 
 			// 1. Read via standalone SnapshotReader
-			sr, err := table.OpenSnapshotBytes(sstBytes, table.WithReaderAcceptUnversioned(true))
+			sr, err := table.OpenSnapshotBytes(t.Context(), sstBytes, table.WithReaderAcceptUnversioned(true))
 			if err != nil {
 				t.Fatalf("OpenSnapshotBytes failed: %v", err)
 			}

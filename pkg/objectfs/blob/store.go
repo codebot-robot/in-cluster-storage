@@ -31,8 +31,8 @@ import (
 	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/tempfile"
-	"k8s.io/klog/v2"
 )
 
 // ObjectEntry represents an object entry returned by ListObjects.
@@ -178,7 +178,7 @@ func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error
 	}
 	defer tempPackFile.CloseAndLog(ctx)
 
-	packFile, err := WritePackfile(tempPackFile.File, smallInputs)
+	packFile, err := WritePackfile(ctx, tempPackFile.File, smallInputs)
 	if err != nil {
 		return fmt.Errorf("failed to write packfile: %w", err)
 	}
@@ -219,7 +219,7 @@ func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error
 func (s *Store) RefreshIndexes(ctx context.Context) error {
 	objects, err := s.backend.ListObjects(ctx, "", "blobs/")
 	if err != nil {
-		klog.Warningf("Failed to list blobs during RefreshIndexes: %v", err)
+		scoped.Log(ctx).Info("failed to list blobs during RefreshIndexes", "err", err)
 		return fmt.Errorf("failed to list blobs: %w", err)
 	}
 
@@ -237,14 +237,14 @@ func (s *Store) RefreshIndexes(ctx context.Context) error {
 			// Read at least PackV1HeaderSize (16 bytes) to inspect base header and version
 			var hdrBuf bytes.Buffer
 			if err := s.backend.GetObject(ctx, "", obj, 0, int64(PackV1HeaderSize), &hdrBuf); err != nil || hdrBuf.Len() < PackV1HeaderSize {
-				klog.Warningf("Failed reading header for packfile %s: %v", obj, err)
+				scoped.Log(ctx).Info("failed reading header for packfile", "path", obj, "err", err)
 				continue
 			}
 
 			rawHdr := hdrBuf.Bytes()
 			baseHdr, err := ParseFileHeader(rawHdr[0:8])
 			if err != nil || baseHdr.FileType != FileTypePack {
-				klog.Warningf("Invalid packfile header for %s: %v", obj, err)
+				scoped.Log(ctx).Info("invalid packfile header", "path", obj, "err", err)
 				continue
 			}
 
@@ -256,19 +256,19 @@ func (s *Store) RefreshIndexes(ctx context.Context) error {
 				slotsCount := int(binary.BigEndian.Uint32(rawHdr[8:12]))
 				totalTableSize = int64(PackV2HeaderSize + slotsCount*int(PackV2SlotSize))
 			} else {
-				klog.Warningf("Unsupported packfile version %d for %s", baseHdr.Version, obj)
+				scoped.Log(ctx).Info("unsupported packfile version", "version", baseHdr.Version, "path", obj)
 				continue
 			}
 
 			var totalBuf bytes.Buffer
 			if err := s.backend.GetObject(ctx, "", obj, 0, totalTableSize, &totalBuf); err != nil || int64(totalBuf.Len()) < totalTableSize {
-				klog.Warningf("Failed reading tables for packfile %s: %v", obj, err)
+				scoped.Log(ctx).Info("failed reading tables for packfile", "path", obj, "err", err)
 				continue
 			}
 
 			packFile, err := DecodePackTable(bytes.NewReader(totalBuf.Bytes()))
 			if err != nil {
-				klog.Warningf("Failed to decode table for packfile %s: %v", obj, err)
+				scoped.Log(ctx).Info("failed to decode table for packfile", "path", obj, "err", err)
 				continue
 			}
 
@@ -351,9 +351,9 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 			stream, err := localPack.ReadBlob(loc.Entry)
 			if err != nil {
 				if errors.Is(err, ErrPackClosed) {
-					klog.V(2).Infof("local pack %s closed during read of blob %s, falling back to backend: %v", loc.PackKey, sha256Hex, err)
+					scoped.Log(ctx).V(2).Info("local pack closed during read of blob, falling back to backend", "pack", loc.PackKey, "blob", sha256Hex, "err", err)
 				} else {
-					klog.Warningf("failed to read blob %s from local pack %s, falling back to backend: %v", sha256Hex, loc.PackKey, err)
+					scoped.Log(ctx).Info("failed to read blob from local pack, falling back to backend", "blob", sha256Hex, "pack", loc.PackKey, "err", err)
 				}
 			} else {
 				return stream, nil
@@ -408,7 +408,7 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 	if err := s.backend.GetObject(ctx, "", standaloneKey, 0, 0, &looseBuf); err == nil && looseBuf.Len() >= SingleBlobHeaderSize {
 		stream, _, err := DecodeLooseBlob(&looseBuf)
 		if err != nil {
-			klog.Warningf("failed to decode standalone loose blob %s: %v", standaloneKey, err)
+			scoped.Log(ctx).Info("failed to decode standalone loose blob", "path", standaloneKey, "err", err)
 		} else {
 			s.mu.Lock()
 			s.shaToLocation[sha256Hex] = BlobLocation{IsStandalone: true}
@@ -420,7 +420,7 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 	// 2. Try refreshing pack indexes
 	// TODO: cache miss rate limiting to avoid refreshing on every unknown blob
 	if err := s.RefreshIndexes(ctx); err != nil {
-		klog.Warningf("RefreshIndexes failed during blob fetch %s: %v", sha256Hex, err)
+		scoped.Log(ctx).Info("RefreshIndexes failed during blob fetch", "blob", sha256Hex, "err", err)
 	}
 
 	s.mu.RLock()

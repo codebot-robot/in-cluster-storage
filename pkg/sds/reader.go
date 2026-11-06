@@ -14,14 +14,15 @@
 package sds
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
 	"sync"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
-	"k8s.io/klog/v2"
 )
 
 const (
@@ -165,7 +166,8 @@ func (r *ChangeReader) Feed(seq uint64, payload []byte) ([]Change, error) {
 				if !r.acceptUnversioned {
 					return nil, fmt.Errorf("%w: first record type is %d (use --accept-unversioned-segments to allow)", ErrMissingStreamHeader, rec.TypeID)
 				}
-				klog.Warningf("accepting stream without stream header record (first record type %d, --accept-unversioned-segments)", rec.TypeID)
+				// ChangeReader.Feed has no context parameter; use logger derived from root context.
+				scoped.Log(context.Background()).Info("accepting stream without stream header record (--accept-unversioned-segments)", "firstRecordType", rec.TypeID)
 			}
 		}
 	}
