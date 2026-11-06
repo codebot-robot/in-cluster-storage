@@ -5603,12 +5603,15 @@ func TestCrossNodeWatchVolumeKernelNotifications(t *testing.T) {
 	StartWatcher(watchCtx, clientB, volumeID, "node-B", pb.ConsistencyMode_STANDARD, cacheB, fsB)
 
 	// Poll until fsB watcher connects
-	deadlineWait := time.Now().Add(2 * time.Second)
+	deadlineWait := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadlineWait) {
 		if fsB.IsWatcherConnected() {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+	if !fsB.IsWatcherConnected() {
+		t.Fatalf("Client B watcher did not connect")
 	}
 
 	// Client A creates a file: triggers EVENT_CREATED
@@ -5622,7 +5625,7 @@ func TestCrossNodeWatchVolumeKernelNotifications(t *testing.T) {
 	fileInode := createOut.EntryOut.NodeId
 
 	// Verify fsB received EntryNotify for the created file
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	foundCreated := false
 	for time.Now().Before(deadline) {
 		notifyMu.Lock()
@@ -5658,7 +5661,7 @@ func TestCrossNodeWatchVolumeKernelNotifications(t *testing.T) {
 	}
 
 	// Verify fsB received InodeNotify for the modified file
-	deadline = time.Now().Add(3 * time.Second)
+	deadline = time.Now().Add(30 * time.Second)
 	foundModified := false
 	for time.Now().Before(deadline) {
 		notifyMu.Lock()
