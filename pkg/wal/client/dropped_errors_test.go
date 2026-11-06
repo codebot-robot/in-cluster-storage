@@ -29,6 +29,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	"github.com/google/uuid"
@@ -210,6 +211,9 @@ func TestHandleHelloAck_TruncateFailureDegradedErr(t *testing.T) {
 		t.Fatalf("mkdir child failed: %v", err)
 	}
 
+	logger := scoped.Log(ctx).WithValues("stream", streamID.String())
+	ctx = scoped.WithLog(ctx, logger)
+
 	impl := &streamImpl{
 		streamID:            streamID,
 		store:               store,
@@ -241,7 +245,7 @@ func TestHandleHelloAck_TruncateFailureDegradedErr(t *testing.T) {
 	}()
 	beforeErrors := klog.Stats.Error.Lines()
 
-	err = impl.handleHelloAck(helloAck)
+	err = impl.handleHelloAck(ctx, helloAck)
 	if err == nil {
 		t.Fatalf("expected handleHelloAck to fail when TruncateAfter fails, got nil")
 	}
@@ -282,9 +286,8 @@ func TestHandleHelloAck_TruncateFailureDegradedErr(t *testing.T) {
 	if diff := klog.Stats.Error.Lines() - beforeErrors; diff != 1 {
 		t.Fatalf("expected exactly 1 error log after stream degradation, got %d", diff)
 	}
-	expectedLog := fmt.Sprintf("WAL client stream %s degraded", streamID)
-	if !strings.Contains(logBuf.String(), expectedLog) {
-		t.Fatalf("expected log output to contain %q, got: %s", expectedLog, logBuf.String())
+	if !strings.Contains(logBuf.String(), "WAL client stream degraded") || !strings.Contains(logBuf.String(), streamID.String()) {
+		t.Fatalf("expected log output to contain degradation message and stream ID, got: %s", logBuf.String())
 	}
 }
 

@@ -21,8 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-
-	"k8s.io/klog/v2"
 )
 
 const (
@@ -165,7 +163,7 @@ func ReadSegmentHeader(r io.ReadSeeker, acceptUnversioned bool) (SegmentHeader, 
 	// Unknown magic: check if this is an unversioned segment file
 	if magic == ClientMagicBytes || magic == LogMagicBytes {
 		if acceptUnversioned {
-			klog.Warning("accepting unversioned segment file (--accept-unversioned-segments)")
+			rootLogger().Info("accepting unversioned segment file (--accept-unversioned-segments)")
 			if _, seekErr := r.Seek(0, io.SeekStart); seekErr != nil {
 				return SegmentHeader{}, 0, seekErr
 			}

@@ -7233,11 +7233,11 @@ type faultInjectingTruncateStore struct {
 	fail bool
 }
 
-func (f *faultInjectingTruncateStore) TruncateAfter(seq uint64) error {
+func (f *faultInjectingTruncateStore) TruncateAfter(ctx context.Context, seq uint64) error {
 	if f.fail {
 		return fmt.Errorf("injected TruncateAfter failure on store")
 	}
-	return f.SegmentStore.TruncateAfter(seq)
+	return f.SegmentStore.TruncateAfter(ctx, seq)
 }
 
 func TestControllerRestartDivergenceRecovery(t *testing.T) {

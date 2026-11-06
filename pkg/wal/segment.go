@@ -17,6 +17,7 @@ limitations under the License.
 package wal
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -29,9 +30,17 @@ import (
 	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
+	"github.com/go-logr/logr"
 	"github.com/google/uuid"
-	"k8s.io/klog/v2"
 )
+
+// rootLogger returns a root-derived logger for low-level segment file operations
+// and format readers whose callers live in packages migrated separately (buffer
+// package, cmd/sds, or store scan paths).
+func rootLogger() logr.Logger {
+	return scoped.Log(context.Background())
+}
 
 const (
 	// DefaultMaxSegmentSize is 64 MB.
@@ -55,14 +64,14 @@ func backupCorruptedSegment(path string) {
 	recoverPath := fmt.Sprintf("%s.%d.recover", path, time.Now().UnixNano())
 	data, err := os.ReadFile(path)
 	if err != nil {
-		klog.Warningf("failed to read corrupted segment file %s for backup: %v", path, err)
+		rootLogger().Info("failed to read corrupted segment file for backup", "err", err, "path", path)
 		return
 	}
 	if writeErr := os.WriteFile(recoverPath, data, 0644); writeErr != nil {
-		klog.Warningf("failed to write corrupted segment backup to %s: %v", recoverPath, writeErr)
+		rootLogger().Info("failed to write corrupted segment backup", "err", writeErr, "path", recoverPath)
 		return
 	}
-	klog.Infof("Saved copy of corrupted segment file to %s", recoverPath)
+	rootLogger().Info("saved copy of corrupted segment file", "path", recoverPath)
 }
 
 // ScanClientSegmentFile reads a client segment file from disk, validating all records.
@@ -98,7 +107,7 @@ func ScanClientSegmentFile(path string, opts ...ScanOption) (records []*ClientRe
 				break
 			}
 			if errors.Is(decErr, ErrTruncatedRecord) || errors.Is(decErr, ErrChecksumMismatch) || errors.Is(decErr, ErrCorruptedRecord) {
-				klog.Warningf("Torn trailing record detected in client segment %s at offset %d (%v), creating recover backup and truncating file", path, validOffset, decErr)
+				rootLogger().Info("torn trailing record detected in client segment, creating recover backup and truncating file", "err", decErr, "path", path, "offset", validOffset)
 				backupCorruptedSegment(path)
 				if err := f.Truncate(validOffset); err != nil {
 					return nil, nil, fmt.Errorf("failed to truncate segment file %s at %d: %w", path, validOffset, err)
@@ -160,7 +169,7 @@ func ScanLogSegmentFile(path string, opts ...ScanOption) (records []*LogRecord, 
 				break
 			}
 			if errors.Is(decErr, ErrTruncatedRecord) || errors.Is(decErr, ErrChecksumMismatch) || errors.Is(decErr, ErrCorruptedRecord) {
-				klog.Warningf("Torn trailing record detected in log segment %s at offset %d (%v), creating recover backup and truncating file", path, validOffset, decErr)
+				rootLogger().Info("torn trailing record detected in log segment, creating recover backup and truncating file", "err", decErr, "path", path, "offset", validOffset)
 				backupCorruptedSegment(path)
 				if err := f.Truncate(validOffset); err != nil {
 					return nil, nil, fmt.Errorf("failed to truncate segment file %s at %d: %w", path, validOffset, err)
@@ -347,7 +356,7 @@ func (s *ClientSegmentStore) rotateLocked(firstSeq uint64) error {
 }
 
 // TruncateAfter removes all records with StreamSeq > maxSeq from the segment store and disk.
-func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
+func (s *ClientSegmentStore) TruncateAfter(ctx context.Context, maxSeq uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -383,8 +392,8 @@ func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
 		f, err := os.OpenFile(seg.Path, os.O_RDWR, 0644)
 		if err != nil {
 			if os.IsNotExist(err) {
-				klog.Warningf("Client segment store %s: segment file %s (seqs %d..%d) not found during truncate",
-					s.filePrefix, seg.Path, seg.FirstSeq, seg.LastSeq)
+				scoped.Log(ctx).Info("client segment store segment file not found during truncate",
+					"prefix", s.filePrefix, "path", seg.Path, "firstSeq", seg.FirstSeq, "lastSeq", seg.LastSeq)
 				continue
 			}
 			errs = append(errs, fmt.Errorf("failed to open segment file %s for truncate: %w", seg.Path, err))
@@ -454,7 +463,7 @@ func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
 }
 
 // DeleteSegmentsBeforeS3Ack deletes completed segment files whose records are all <= s3AckedSeq.
-func (s *ClientSegmentStore) DeleteSegmentsBeforeS3Ack(s3AckedSeq uint64) error {
+func (s *ClientSegmentStore) DeleteSegmentsBeforeS3Ack(ctx context.Context, s3AckedSeq uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -467,7 +476,7 @@ func (s *ClientSegmentStore) DeleteSegmentsBeforeS3Ack(s3AckedSeq uint64) error 
 
 		if seg.LastSeq <= s3AckedSeq && seg.RecordCount > 0 {
 			if err := os.Remove(seg.Path); err != nil && !os.IsNotExist(err) {
-				klog.Warningf("Failed to remove old segment file %s: %v", seg.Path, err)
+				scoped.Log(ctx).Info("failed to remove old segment file", "err", err, "path", seg.Path)
 				remaining = append(remaining, seg)
 				continue
 			}
@@ -734,7 +743,7 @@ func (s *LogSegmentStore) DeleteSegmentsThrough(flushedPosition uint64, maxRetai
 		}
 
 		if err := os.Remove(seg.Path); err != nil && !os.IsNotExist(err) {
-			klog.Warningf("Failed to remove flushed segment file %s: %v", seg.Path, err)
+			rootLogger().Info("failed to remove flushed segment file", "err", err, "path", seg.Path)
 			remaining = append(remaining, seg)
 			continue
 		}

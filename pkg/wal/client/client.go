@@ -32,11 +32,11 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"k8s.io/klog/v2"
 )
 
 // Level represents the durability level of an appended record.
@@ -119,8 +119,8 @@ type SegmentStore interface {
 	Append(rec *wal.ClientRecord) error
 	Sync() error
 	Close() error
-	TruncateAfter(seq uint64) error
-	DeleteSegmentsBeforeS3Ack(seq uint64) error
+	TruncateAfter(ctx context.Context, seq uint64) error
+	DeleteSegmentsBeforeS3Ack(ctx context.Context, seq uint64) error
 }
 
 type options struct {
@@ -291,7 +291,8 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		retainedBytes += int64(wal.ClientHeaderSize + len(rec.Payload))
 	}
 
-	cancelCtx, cancelFunc := context.WithCancel(context.Background())
+	logger := scoped.Log(ctx).WithValues("stream", streamID.String())
+	cancelCtx, cancelFunc := context.WithCancel(scoped.WithLog(context.Background(), logger))
 
 	s := &streamImpl{
 		dir:                 dir,
@@ -573,7 +574,7 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 	//    (commitItems appends to unflushedRecords before sending the ack).
 	if requestFlush {
 		if _, err := s.grpcClient.Flush(ctx, &pb.FlushRequest{}); err != nil {
-			klog.Warningf("WalBuffer.Flush RPC error (will still wait for permanent ack): %v", err)
+			scoped.Log(ctx).Info("WalBuffer.Flush RPC error (will still wait for permanent ack)", "err", err, "stream", s.streamID)
 		}
 	}
 
@@ -618,7 +619,7 @@ func (s *streamImpl) Flush(ctx context.Context) error {
 
 	// 2. Issue Flush RPC
 	if _, err := s.grpcClient.Flush(ctx, &pb.FlushRequest{}); err != nil {
-		klog.Warningf("WalBuffer.Flush RPC error (will still wait for permanent ack): %v", err)
+		scoped.Log(ctx).Info("WalBuffer.Flush RPC error (will still wait for permanent ack)", "err", err, "stream", s.streamID)
 	}
 
 	// 3. Wait for permanent watermark
@@ -653,7 +654,7 @@ func (s *streamImpl) Degraded() *DegradedError {
 	return s.degradedErr
 }
 
-func (s *streamImpl) setDegradedLocked(cause error, truncateSeq uint64) *DegradedError {
+func (s *streamImpl) setDegradedLocked(ctx context.Context, cause error, truncateSeq uint64) *DegradedError {
 	if s.degradedErr != nil {
 		return s.degradedErr
 	}
@@ -663,7 +664,7 @@ func (s *streamImpl) setDegradedLocked(cause error, truncateSeq uint64) *Degrade
 	}
 	s.degradedTruncateSeq = truncateSeq
 	s.reconciling = true
-	klog.Errorf("WAL client stream %s degraded: %v", s.streamID, s.degradedErr)
+	scoped.Log(ctx).Error(s.degradedErr, "WAL client stream degraded")
 	for _, w := range s.waiters {
 		w.done <- s.degradedErr
 	}
@@ -704,7 +705,7 @@ func (s *streamImpl) Close() error {
 	return nil
 }
 
-func (s *streamImpl) retryDegradedTruncate() bool {
+func (s *streamImpl) retryDegradedTruncate(ctx context.Context) bool {
 	backoff := 1 * time.Second
 	if s.opts.degradedRetryInitialBackoff > 0 {
 		backoff = s.opts.degradedRetryInitialBackoff
@@ -731,8 +732,9 @@ func (s *streamImpl) retryDegradedTruncate() bool {
 		s.mu.RUnlock()
 
 		if s.store != nil {
-			if err := s.store.TruncateAfter(targetSeq); err != nil {
-				klog.V(4).Infof("WAL client stream %s: retry truncate to %d failed: %v, retrying in %v", s.streamID, targetSeq, err, backoff)
+			if err := s.store.TruncateAfter(ctx, targetSeq); err != nil {
+				scoped.Log(ctx).V(4).Info("WAL client stream retry truncate failed",
+					"targetSeq", targetSeq, "err", err, "backoff", backoff)
 				backoff *= 2
 				if backoff > maxBackoff {
 					backoff = maxBackoff
@@ -748,7 +750,8 @@ func (s *streamImpl) retryDegradedTruncate() bool {
 		s.cond.Broadcast()
 		s.mu.Unlock()
 
-		klog.Infof("WAL client stream %s: recovered from degraded state after %v", s.streamID, time.Since(degradedAt))
+		scoped.Log(ctx).Info("WAL client stream recovered from degraded state",
+			"duration", time.Since(degradedAt))
 		return true
 	}
 }
@@ -771,7 +774,7 @@ func (s *streamImpl) backgroundReplicationLoop() {
 		degErr := s.degradedErr
 		s.mu.RUnlock()
 		if degErr != nil {
-			if !s.retryDegradedTruncate() {
+			if !s.retryDegradedTruncate(s.cancelCtx) {
 				return
 			}
 			backoff = 50 * time.Millisecond
@@ -785,7 +788,7 @@ func (s *streamImpl) backgroundReplicationLoop() {
 			degErr := s.degradedErr
 			s.mu.RUnlock()
 			if degErr != nil {
-				if !s.retryDegradedTruncate() {
+				if !s.retryDegradedTruncate(s.cancelCtx) {
 					return
 				}
 				backoff = 50 * time.Millisecond
@@ -794,10 +797,12 @@ func (s *streamImpl) backgroundReplicationLoop() {
 			}
 
 			if firstFailure || backoff >= maxBackoff {
-				klog.Warningf("WAL client stream %s: replication session failed: %v, reconnecting in %v", s.streamID, err, backoff)
+				scoped.Log(s.cancelCtx).Info("WAL client stream replication session failed",
+					"err", err, "backoff", backoff)
 				firstFailure = false
 			} else {
-				klog.V(4).Infof("WAL client replication session ended: %v, reconnecting in %v", err, backoff)
+				scoped.Log(s.cancelCtx).V(4).Info("WAL client replication session ended",
+					"err", err, "backoff", backoff)
 			}
 
 			select {
@@ -852,7 +857,7 @@ func (s *streamImpl) runStreamSession() error {
 		return fmt.Errorf("expected HelloAck as first response, got: %+v", resp)
 	}
 
-	if err := s.handleHelloAck(helloAck); err != nil {
+	if err := s.handleHelloAck(ctx, helloAck); err != nil {
 		s.initialHelloAckOnce.Do(func() {
 			s.initialHelloAckErr = err
 			close(s.initialHelloAckDone)
@@ -866,10 +871,12 @@ func (s *streamImpl) runStreamSession() error {
 		close(s.initialHelloAckDone)
 	})
 
+	// The stream ID is kept in the message string because tests/e2e matches it verbatim.
 	if s.target != "" {
-		klog.Infof("WAL client stream %s: replication session established with %s", s.streamID, s.target)
+		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID),
+			"target", s.target)
 	} else {
-		klog.Infof("WAL client stream %s: replication session established", s.streamID)
+		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID))
 	}
 
 	// 3. Concurrently receive Acks while replaying and sending newly appended records.
@@ -886,10 +893,10 @@ func (s *streamImpl) runStreamSession() error {
 			}
 			if ack := ackResp.GetAck(); ack != nil {
 				firstAck.Do(func() {
-					klog.Infof("WAL client stream %s: first ack after reconnect: witness=%d, s3=%d",
-						s.streamID, ack.WitnessAckedStreamSeq, ack.S3AckedStreamSeq)
+					scoped.Log(ctx).Info("WAL client stream first ack after reconnect",
+						"witnessWatermark", ack.WitnessAckedStreamSeq, "s3Watermark", ack.S3AckedStreamSeq)
 				})
-				s.handleAck(ack)
+				s.handleAck(ctx, ack)
 			}
 		}
 	}()
@@ -905,10 +912,10 @@ func (s *streamImpl) runStreamSession() error {
 	s.retainedMu.RUnlock()
 
 	if len(recordsToReplay) > 0 {
-		klog.Infof("WAL client stream %s: replaying %d unacknowledged records (%d..%d)",
-			s.streamID, len(recordsToReplay), recordsToReplay[0].StreamSeq, recordsToReplay[len(recordsToReplay)-1].StreamSeq)
+		scoped.Log(ctx).Info("WAL client stream replaying unacknowledged records",
+			"count", len(recordsToReplay), "fromSeq", recordsToReplay[0].StreamSeq, "toSeq", recordsToReplay[len(recordsToReplay)-1].StreamSeq)
 	} else {
-		klog.Infof("WAL client stream %s: no unacknowledged records to replay", s.streamID)
+		scoped.Log(ctx).Info("WAL client stream no unacknowledged records to replay")
 	}
 
 	for _, rec := range recordsToReplay {
@@ -963,16 +970,16 @@ func (s *streamImpl) runStreamSession() error {
 	}
 }
 
-func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
+func (s *streamImpl) handleHelloAck(ctx context.Context, helloAck *pb.HelloAck) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	witnessHead := helloAck.WitnessAckedStreamSeq
-	klog.Infof("WAL client stream %s: HelloAck received: witness watermark=%d, s3 watermark=%d (local head=%d)",
-		s.streamID, witnessHead, helloAck.S3AckedStreamSeq, s.localSeq)
+	scoped.Log(ctx).Info("WAL client stream HelloAck received",
+		"witnessWatermark", witnessHead, "s3Watermark", helloAck.S3AckedStreamSeq, "localHead", s.localSeq)
 	if witnessHead > s.localSeq {
-		klog.Infof("Stream %s: buffer witness watermark (%d) is ahead of local stream head (%d); continuing sequence numbering from buffer head",
-			s.streamID, witnessHead, s.localSeq)
+		scoped.Log(ctx).Info("buffer witness watermark is ahead of local stream head; continuing sequence numbering from buffer head",
+			"witnessWatermark", witnessHead, "localHead", s.localSeq)
 		s.localSeq = witnessHead
 	} else if witnessHead > 0 && s.localSeq > witnessHead {
 		// Local history has records above the buffer's witness watermark.
@@ -1015,8 +1022,8 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 				// 1. Order on-disk truncate before the memory mutation so that a failure
 				// leaves memory and disk consistent, allowing divergence to be re-detected on retry.
 				if s.store != nil {
-					if err := s.store.TruncateAfter(witnessHead); err != nil {
-						truncErr := s.setDegradedLocked(fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err), witnessHead)
+					if err := s.store.TruncateAfter(ctx, witnessHead); err != nil {
+						truncErr := s.setDegradedLocked(ctx, fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err), witnessHead)
 						s.initialHelloAckOnce.Do(func() {
 							s.initialHelloAckErr = truncErr
 							close(s.initialHelloAckDone)
@@ -1054,8 +1061,8 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 				}
 				s.waiters = remainingWaiters
 
-				klog.Warningf("Stream %s: local records above buffer witness watermark (%d) diverged from authoritative buffer history; discarded %d local unacknowledged records",
-					s.streamID, witnessHead, discarded)
+				scoped.Log(ctx).Info("local records above buffer witness watermark diverged from authoritative buffer history",
+					"witnessWatermark", witnessHead, "discarded", discarded)
 
 				s.reconciling = false
 				if s.cond != nil {
@@ -1066,13 +1073,14 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 	}
 
 	if witnessHead < s.witnessSeq {
-		klog.Warningf("Witness watermark dropped on restart from %d to %d (replaying unacknowledged records)", s.witnessSeq, witnessHead)
+		scoped.Log(ctx).Info("witness watermark dropped on restart (replaying unacknowledged records)",
+			"from", s.witnessSeq, "to", witnessHead)
 	}
 	s.witnessSeq = witnessHead
 
 	if helloAck.S3AckedStreamSeq > s.s3Seq {
 		s.s3Seq = helloAck.S3AckedStreamSeq
-		s.cleanupS3AckedLocked(helloAck.S3AckedStreamSeq)
+		s.cleanupS3AckedLocked(ctx, helloAck.S3AckedStreamSeq)
 	}
 
 	s.notifyWaitersLocked()
@@ -1086,7 +1094,7 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 	return nil
 }
 
-func (s *streamImpl) handleAck(ack *pb.Ack) {
+func (s *streamImpl) handleAck(ctx context.Context, ack *pb.Ack) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1095,7 +1103,7 @@ func (s *streamImpl) handleAck(ack *pb.Ack) {
 	}
 	if ack.S3AckedStreamSeq > s.s3Seq {
 		s.s3Seq = ack.S3AckedStreamSeq
-		s.cleanupS3AckedLocked(ack.S3AckedStreamSeq)
+		s.cleanupS3AckedLocked(ctx, ack.S3AckedStreamSeq)
 	}
 
 	s.notifyWaitersLocked()
@@ -1105,10 +1113,10 @@ func (s *streamImpl) handleAck(ack *pb.Ack) {
 	}
 }
 
-func (s *streamImpl) cleanupS3AckedLocked(s3AckedSeq uint64) {
+func (s *streamImpl) cleanupS3AckedLocked(ctx context.Context, s3AckedSeq uint64) {
 	// Clean up local segment files where all records are <= s3AckedSeq
-	if err := s.store.DeleteSegmentsBeforeS3Ack(s3AckedSeq); err != nil {
-		klog.Warningf("Failed to delete S3-acked segment files: %v", err)
+	if err := s.store.DeleteSegmentsBeforeS3Ack(ctx, s3AckedSeq); err != nil {
+		scoped.Log(ctx).Info("failed to delete S3-acked segment files", "err", err)
 	}
 
 	// Clean up in-memory retained records
@@ -1151,7 +1159,7 @@ func TailStream(ctx context.Context, target string, streamID uuid.UUID, fromSeq 
 			dialOpts := append(grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())), opt.dialOpts...)
 			conn, err := grpc.NewClient(target, dialOpts...)
 			if err != nil {
-				klog.Errorf("TailStream failed to dial target %s: %v", target, err)
+				scoped.Log(ctx).Error(err, "TailStream failed to dial target", "target", target, "stream", streamID)
 				return
 			}
 			localConn = conn
@@ -1167,7 +1175,7 @@ func TailStream(ctx context.Context, target string, streamID uuid.UUID, fromSeq 
 			FromStreamSeq: fromSeq,
 		})
 		if err != nil {
-			klog.V(4).Infof("TailStream RPC failed: %v", err)
+			scoped.Log(tailCtx).V(4).Info("TailStream RPC failed", "stream", streamID, "err", err)
 			return
 		}
 
