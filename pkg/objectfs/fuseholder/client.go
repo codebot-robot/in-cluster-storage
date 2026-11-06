@@ -23,10 +23,22 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
+	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+const (
+	defaultDialTimeout  = 10 * time.Second
+	defaultDialInterval = 200 * time.Millisecond
+)
+
+func isRetryableDialError(err error) bool {
+	return errors.Is(err, syscall.ENOENT) || errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED)
+}
 
 // Client is a Go client for communicating with a FUSE holder process over a Unix domain socket.
 type Client struct {
@@ -34,14 +46,36 @@ type Client struct {
 	connection *net.UnixConn
 }
 
-// Dial connects to a FUSE holder listening on socketPath.
+// Dial connects to a FUSE holder listening on socketPath, retrying transient
+// errors (socket not yet present or connection refused during restart) for a bounded window.
 func Dial(socketPath string) (*Client, error) {
+	return dialWithRetry(socketPath, defaultDialTimeout, defaultDialInterval, nil)
+}
+
+func dialWithRetry(socketPath string, timeout, interval time.Duration, onRetry func()) (*Client, error) {
 	address := &net.UnixAddr{Name: socketPath, Net: "unix"}
-	connection, err := net.DialUnix("unix", nil, address)
-	if err != nil {
-		return nil, fmt.Errorf("dial fuse holder at %s: %w", socketPath, err)
+	deadline := time.Now().Add(timeout)
+	for {
+		connection, err := net.DialUnix("unix", nil, address)
+		if err == nil {
+			return &Client{connection: connection}, nil
+		}
+		if !isRetryableDialError(err) {
+			return nil, fmt.Errorf("dial fuse holder at %s: %w", socketPath, err)
+		}
+		if onRetry != nil {
+			onRetry()
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("dial fuse holder at %s: %w", socketPath, err)
+		}
+		remaining := time.Until(deadline)
+		sleepDuration := interval
+		if remaining < sleepDuration {
+			sleepDuration = remaining
+		}
+		time.Sleep(sleepDuration)
 	}
-	return &Client{connection: connection}, nil
 }
 
 // NewClient creates a Client wrapping an existing Unix domain socket connection.
