@@ -22,7 +22,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuseholder"
@@ -37,10 +36,6 @@ func main() {
 
 	if *socketPath == "" {
 		klog.Fatal("--socket-path is required")
-	}
-
-	if err := os.MkdirAll(filepath.Dir(*socketPath), 0755); err != nil {
-		klog.Fatalf("failed to create socket directory: %v", err)
 	}
 
 	listener, err := fuseholder.Listen(*socketPath)

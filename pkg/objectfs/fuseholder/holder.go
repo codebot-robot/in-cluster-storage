@@ -40,6 +40,8 @@ type heldMount struct {
 // Listen creates a Unix domain socket listener that publishes atomically to socketPath.
 // It listens on a temporary path in the same directory and renames it over socketPath,
 // disabling unlink-on-close so shutting down the listener does not remove a successor's socket.
+// A temporary socket left behind by a process crash between listen and rename is never
+// swept; this is harmless because each listener uses a unique filename.
 func Listen(socketPath string) (net.Listener, error) {
 	directory := filepath.Dir(socketPath)
 	if err := os.MkdirAll(directory, 0755); err != nil {
@@ -50,7 +52,7 @@ func Listen(socketPath string) (net.Listener, error) {
 	if _, err := rand.Read(randomBytes[:]); err != nil {
 		return nil, fmt.Errorf("generate random suffix: %w", err)
 	}
-	temporaryPath := filepath.Join(directory, fmt.Sprintf(".%s.%d.%x.temporary", filepath.Base(socketPath), os.Getpid(), randomBytes))
+	temporaryPath := filepath.Join(directory, fmt.Sprintf(".%d.%x.tmp", os.Getpid(), randomBytes))
 
 	listener, err := net.Listen("unix", temporaryPath)
 	if err != nil {

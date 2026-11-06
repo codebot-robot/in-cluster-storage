@@ -433,12 +433,11 @@ func TestDialRetryDelayedListener(t *testing.T) {
 
 	dialAttempted := make(chan struct{})
 	var closeOnce sync.Once
-	SetDialRetryHookForTesting(func() {
+	onRetry := func() {
 		closeOnce.Do(func() {
 			close(dialAttempted)
 		})
-	})
-	defer SetDialRetryHookForTesting(nil)
+	}
 
 	listenerChannel := make(chan net.Listener, 1)
 	holderChannel := make(chan *Holder, 1)
@@ -485,7 +484,7 @@ func TestDialRetryDelayedListener(t *testing.T) {
 		holderChannel <- holder
 	}()
 
-	client, err := dialWithRetry(socketPath, 5*time.Second, 10*time.Millisecond)
+	client, err := dialWithRetry(socketPath, 5*time.Second, 10*time.Millisecond, onRetry)
 	if err != nil {
 		t.Fatalf("dialWithRetry failed: %v", err)
 	}
@@ -533,12 +532,11 @@ func TestDialRetryConnectionRefused(t *testing.T) {
 
 	dialAttempted := make(chan struct{})
 	var closeOnce sync.Once
-	SetDialRetryHookForTesting(func() {
+	onRetry := func() {
 		closeOnce.Do(func() {
 			close(dialAttempted)
 		})
-	})
-	defer SetDialRetryHookForTesting(nil)
+	}
 
 	listenerChannel := make(chan net.Listener, 1)
 	holderChannel := make(chan *Holder, 1)
@@ -585,7 +583,7 @@ func TestDialRetryConnectionRefused(t *testing.T) {
 		holderChannel <- holder
 	}()
 
-	client, err := dialWithRetry(socketPath, 5*time.Second, 10*time.Millisecond)
+	client, err := dialWithRetry(socketPath, 5*time.Second, 10*time.Millisecond, onRetry)
 	if err != nil {
 		t.Fatalf("dialWithRetry failed: %v", err)
 	}
@@ -621,7 +619,7 @@ func TestDialRetryTimeout(t *testing.T) {
 	temporaryDirectory := t.TempDir()
 	socketPath := filepath.Join(temporaryDirectory, "nonexistent.sock")
 
-	client, err := dialWithRetry(socketPath, 50*time.Millisecond, 10*time.Millisecond)
+	client, err := dialWithRetry(socketPath, 50*time.Millisecond, 10*time.Millisecond, nil)
 	if err == nil {
 		if closeErr := client.Close(); closeErr != nil {
 			t.Errorf("failed to close client: %v", closeErr)

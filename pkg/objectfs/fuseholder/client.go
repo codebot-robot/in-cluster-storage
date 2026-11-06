@@ -36,24 +36,6 @@ const (
 	defaultDialInterval = 200 * time.Millisecond
 )
 
-var (
-	dialRetryHookMutex sync.RWMutex
-	dialRetryHook      func()
-)
-
-// SetDialRetryHookForTesting registers a callback invoked when Dial retries.
-func SetDialRetryHookForTesting(hook func()) {
-	dialRetryHookMutex.Lock()
-	defer dialRetryHookMutex.Unlock()
-	dialRetryHook = hook
-}
-
-func getDialRetryHook() func() {
-	dialRetryHookMutex.RLock()
-	defer dialRetryHookMutex.RUnlock()
-	return dialRetryHook
-}
-
 func isRetryableDialError(err error) bool {
 	return errors.Is(err, syscall.ENOENT) || errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED)
 }
@@ -67,10 +49,10 @@ type Client struct {
 // Dial connects to a FUSE holder listening on socketPath, retrying transient
 // errors (socket not yet present or connection refused during restart) for a bounded window.
 func Dial(socketPath string) (*Client, error) {
-	return dialWithRetry(socketPath, defaultDialTimeout, defaultDialInterval)
+	return dialWithRetry(socketPath, defaultDialTimeout, defaultDialInterval, nil)
 }
 
-func dialWithRetry(socketPath string, timeout, interval time.Duration) (*Client, error) {
+func dialWithRetry(socketPath string, timeout, interval time.Duration, onRetry func()) (*Client, error) {
 	address := &net.UnixAddr{Name: socketPath, Net: "unix"}
 	deadline := time.Now().Add(timeout)
 	for {
@@ -81,8 +63,8 @@ func dialWithRetry(socketPath string, timeout, interval time.Duration) (*Client,
 		if !isRetryableDialError(err) {
 			return nil, fmt.Errorf("dial fuse holder at %s: %w", socketPath, err)
 		}
-		if hook := getDialRetryHook(); hook != nil {
-			hook()
+		if onRetry != nil {
+			onRetry()
 		}
 		if !time.Now().Before(deadline) {
 			return nil, fmt.Errorf("dial fuse holder at %s: %w", socketPath, err)
