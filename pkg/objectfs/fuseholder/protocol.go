@@ -40,13 +40,14 @@ var ErrNotFound = errors.New("target not found")
 
 // Entry holds the metadata of an active FUSE mount.
 type Entry struct {
-	Target   string   `json:"target"`
-	VolumeID string   `json:"volume_id"`
-	Mode     string   `json:"mode"`
-	FsName   string   `json:"fs_name,omitempty"`
-	Name     string   `json:"name,omitempty"`
-	MaxRead  int      `json:"max_read,omitempty"`
-	Options  []string `json:"options,omitempty"`
+	Target     string            `json:"target"`
+	VolumeID   string            `json:"volume_id"`
+	Mode       string            `json:"mode"`
+	FsName     string            `json:"fs_name,omitempty"`
+	Name       string            `json:"name,omitempty"`
+	MaxRead    int               `json:"max_read,omitempty"`
+	Options    []string          `json:"options,omitempty"`
+	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
 // MountRequest requests mounting a FUSE filesystem.

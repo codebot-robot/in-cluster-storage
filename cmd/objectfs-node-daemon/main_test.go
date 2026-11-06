@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -63,18 +65,63 @@ func TestParseEndpoint(t *testing.T) {
 	}
 }
 
-func TestNodePublishVolume_InvalidWriteModeFails(t *testing.T) {
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+func setupTestDriver(t *testing.T) *objectFSDriver {
+	server := controllertest.NewTestServer(nil)
+	listener := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Logf("grpc server error: %v", err)
+		}
+	}()
+	t.Cleanup(grpcServer.Stop)
+
+	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "/run/objectfs/fuse-holder.sock")
 	if err != nil {
-		t.Fatalf("newDriver: %v", err)
+		t.Fatalf("newDriver failed: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := driver.Close(); err != nil {
-			t.Errorf("driver.Close failed: %v", err)
+		if closeErr := driver.Close(); closeErr != nil {
+			t.Errorf("driver.Close failed: %v", closeErr)
 		}
 	})
 
-	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+	connection, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := connection.Close(); closeErr != nil {
+			t.Errorf("connection.Close failed: %v", closeErr)
+		}
+	})
+	driver.client = pb.NewObjectFSControllerClient(connection)
+	return driver
+}
+
+func newFakeMountSocketPair(t *testing.T) (int, int) {
+	descriptors, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("unix.Socketpair failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := unix.Close(descriptors[1]); closeErr != nil && !errors.Is(closeErr, unix.EBADF) {
+			t.Errorf("close peer descriptor: %v", closeErr)
+		}
+		if closeErr := unix.Close(descriptors[0]); closeErr != nil && !errors.Is(closeErr, unix.EBADF) {
+			t.Errorf("close mount descriptor: %v", closeErr)
+		}
+	})
+	return descriptors[0], descriptors[1]
+}
+
+func TestNodePublishVolume_InvalidWriteModeFails(t *testing.T) {
+	driver := setupTestDriver(t)
+	_, err := driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:      "test-vol",
 		TargetPath:    t.TempDir(),
 		VolumeContext: map[string]string{"writeMode": "writethrough"},
@@ -85,11 +132,7 @@ func TestNodePublishVolume_InvalidWriteModeFails(t *testing.T) {
 }
 
 func TestPluginInfo(t *testing.T) {
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
-	if err != nil {
-		t.Fatalf("newDriver failed: %v", err)
-	}
-	defer func() { _ = driver.Close() }()
+	driver := setupTestDriver(t)
 	ctx := t.Context()
 
 	info, err := driver.GetPluginInfo(ctx, &csi.GetPluginInfoRequest{})
@@ -111,31 +154,8 @@ func TestPluginInfo(t *testing.T) {
 
 func TestNodeGetVolumeStats(t *testing.T) {
 	ctx := t.Context()
-	server := controllertest.NewTestServer(nil)
+	driver := setupTestDriver(t)
 	volumeID := "test-csi-stats-vol"
-
-	lis := bufconn.Listen(1024 * 1024)
-	grpcServer := grpc.NewServer()
-	pb.RegisterObjectFSControllerServer(grpcServer, server)
-	go func() { _ = grpcServer.Serve(lis) }()
-	defer grpcServer.Stop()
-
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
-	if err != nil {
-		t.Fatalf("newDriver failed: %v", err)
-	}
-	defer func() { _ = driver.Close() }()
-	conn, err := grpc.NewClient("passthrough://bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return lis.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("grpc.NewClient failed: %v", err)
-	}
-	defer conn.Close()
-	driver.client = pb.NewObjectFSControllerClient(conn)
 
 	resp, err := driver.NodeGetVolumeStats(ctx, &csi.NodeGetVolumeStatsRequest{
 		VolumeId: volumeID,
@@ -182,17 +202,8 @@ func TestNodeDaemonSecurityFlags(t *testing.T) {
 }
 
 func TestNodePublishVolume_ConsistencyModeValidation(t *testing.T) {
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
-	if err != nil {
-		t.Fatalf("newDriver: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := driver.Close(); err != nil {
-			t.Errorf("driver.Close failed: %v", err)
-		}
-	})
-
-	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+	driver := setupTestDriver(t)
+	_, err := driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:      "test-vol",
 		TargetPath:    t.TempDir(),
 		VolumeContext: map[string]string{"consistency": "close_to_open"},
@@ -203,17 +214,8 @@ func TestNodePublishVolume_ConsistencyModeValidation(t *testing.T) {
 }
 
 func TestNodePublishVolume_ExclusiveLocalMisspellingFails(t *testing.T) {
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
-	if err != nil {
-		t.Fatalf("newDriver: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := driver.Close(); err != nil {
-			t.Errorf("driver.Close failed: %v", err)
-		}
-	})
-
-	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+	driver := setupTestDriver(t)
+	_, err := driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:   "test-vol",
 		TargetPath: t.TempDir(),
 		VolumeContext: map[string]string{
@@ -227,23 +229,37 @@ func TestNodePublishVolume_ExclusiveLocalMisspellingFails(t *testing.T) {
 }
 
 func TestNodePublishVolume_InvalidVolumeModeFails(t *testing.T) {
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
-	if err != nil {
-		t.Fatalf("newDriver: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := driver.Close(); err != nil {
-			t.Errorf("driver.Close failed: %v", err)
-		}
-	})
-
-	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+	driver := setupTestDriver(t)
+	_, err := driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:      "test-vol",
 		TargetPath:    t.TempDir(),
 		VolumeContext: map[string]string{"mode": "exclusive_local"},
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("got status %v, want InvalidArgument", status.Code(err))
+	}
+}
+
+type fakeHeldMount struct {
+	entry           fuseholder.Entry
+	mountDescriptor int
+	peerDescriptor  int
+}
+
+func newFakeHeldMount(target, volumeID, consistency string, mountDescriptor, peerDescriptor int) *fakeHeldMount {
+	return &fakeHeldMount{
+		entry: fuseholder.Entry{
+			Target:   target,
+			VolumeID: volumeID,
+			Mode:     volumemode.String(pb.VolumeMode_FUSE),
+			MaxRead:  128 * 1024,
+			Attributes: map[string]string{
+				"consistency": consistency,
+				"writeMode":   "fsync",
+			},
+		},
+		mountDescriptor: mountDescriptor,
+		peerDescriptor:  peerDescriptor,
 	}
 }
 
@@ -256,11 +272,10 @@ type fakeHolderClient struct {
 	unmountCalled   bool
 	unmountError    error
 	closeCalled     bool
+	heldMounts      map[string]*fakeHeldMount
 }
 
-func (f *fakeHolderClient) Mount(request fuseholder.MountRequest) (int, error) {
-	f.mountRequest = request
-	f.mountCalled = true
+func sendFakeInit(peerDescriptor int) error {
 	packet := make([]byte, 56)
 	binary.LittleEndian.PutUint32(packet[0:4], 56)
 	binary.LittleEndian.PutUint32(packet[4:8], 26) // _OP_INIT
@@ -269,23 +284,69 @@ func (f *fakeHolderClient) Mount(request fuseholder.MountRequest) (int, error) {
 	binary.LittleEndian.PutUint32(packet[40:44], 7)
 	binary.LittleEndian.PutUint32(packet[44:48], 36)
 	binary.LittleEndian.PutUint32(packet[48:52], 128*1024)
-	if err := unix.Send(f.peerDescriptor, packet, 0); err != nil {
-		return -1, fmt.Errorf("failed to send fake init: %w", err)
+	if err := unix.Send(peerDescriptor, packet, 0); err != nil {
+		return fmt.Errorf("failed to send fake init: %w", err)
+	}
+	return nil
+}
+
+func (f *fakeHolderClient) Mount(request fuseholder.MountRequest) (int, error) {
+	f.mountRequest = request
+	f.mountCalled = true
+	if f.heldMounts != nil {
+		if _, exists := f.heldMounts[request.Target]; exists {
+			return -1, fmt.Errorf("target %s already mounted", request.Target)
+		}
+	}
+	if f.peerDescriptor != 0 {
+		if err := sendFakeInit(f.peerDescriptor); err != nil {
+			return -1, err
+		}
+	}
+	if f.heldMounts != nil {
+		f.heldMounts[request.Target] = &fakeHeldMount{
+			entry:           request.Entry,
+			mountDescriptor: f.mountDescriptor,
+			peerDescriptor:  f.peerDescriptor,
+		}
 	}
 	return f.mountDescriptor, nil
 }
 
 func (f *fakeHolderClient) Get(target string) (int, fuseholder.Entry, error) {
+	if f.heldMounts != nil {
+		if held, ok := f.heldMounts[target]; ok {
+			if held.peerDescriptor != 0 {
+				if err := sendFakeInit(held.peerDescriptor); err != nil {
+					return -1, fuseholder.Entry{}, err
+				}
+			}
+			return held.mountDescriptor, held.entry, nil
+		}
+	}
 	return -1, fuseholder.Entry{}, fuseholder.ErrNotFound
 }
 
 func (f *fakeHolderClient) List() ([]fuseholder.Entry, error) {
+	if f.heldMounts != nil {
+		entries := make([]fuseholder.Entry, 0, len(f.heldMounts))
+		for _, held := range f.heldMounts {
+			entries = append(entries, held.entry)
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Target < entries[j].Target
+		})
+		return entries, nil
+	}
 	return nil, nil
 }
 
 func (f *fakeHolderClient) Unmount(target string, detach bool) error {
 	f.unmountTarget = target
 	f.unmountCalled = true
+	if f.heldMounts != nil {
+		delete(f.heldMounts, target)
+	}
 	return f.unmountError
 }
 
@@ -296,54 +357,13 @@ func (f *fakeHolderClient) Close() error {
 
 func TestNodePublishAndUnpublishVolume_WithHolderClient(t *testing.T) {
 	ctx := t.Context()
-	server := controllertest.NewTestServer(nil)
+	driver := setupTestDriver(t)
 	volumeID := "test-fuse-publish-vol"
 
-	listener := bufconn.Listen(1024 * 1024)
-	grpcServer := grpc.NewServer()
-	pb.RegisterObjectFSControllerServer(grpcServer, server)
-	go func() {
-		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
-			t.Logf("grpc server error: %v", err)
-		}
-	}()
-	defer grpcServer.Stop()
-
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "/run/objectfs/fuse-holder.sock")
-	if err != nil {
-		t.Fatalf("newDriver failed: %v", err)
-	}
-	defer func() {
-		if closeErr := driver.Close(); closeErr != nil {
-			t.Errorf("driver.Close failed: %v", closeErr)
-		}
-	}()
-
-	connection, err := grpc.NewClient("passthrough://bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return listener.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("grpc.NewClient failed: %v", err)
-	}
-	defer connection.Close()
-	driver.client = pb.NewObjectFSControllerClient(connection)
-
-	socketDescriptors, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		t.Fatalf("unix.Socketpair failed: %v", err)
-	}
-	defer func() {
-		if closeErr := unix.Close(socketDescriptors[1]); closeErr != nil {
-			t.Errorf("failed to close peer descriptor: %v", closeErr)
-		}
-	}()
-
+	mountDescriptor, peerDescriptor := newFakeMountSocketPair(t)
 	fakeHolder := &fakeHolderClient{
-		mountDescriptor: socketDescriptors[0],
-		peerDescriptor:  socketDescriptors[1],
+		mountDescriptor: mountDescriptor,
+		peerDescriptor:  peerDescriptor,
 	}
 	driver.dialHolder = func(socketPath string) (fuseHolderClient, error) {
 		return fakeHolder, nil
@@ -398,60 +418,20 @@ func TestNodePublishAndUnpublishVolume_WithHolderClient(t *testing.T) {
 
 func TestNodePublishVolume_SurvivesHolderRestart(t *testing.T) {
 	ctx := t.Context()
-	server := controllertest.NewTestServer(nil)
-
-	listener := bufconn.Listen(1024 * 1024)
-	grpcServer := grpc.NewServer()
-	pb.RegisterObjectFSControllerServer(grpcServer, server)
-	go func() {
-		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
-			t.Logf("grpc server error: %v", err)
-		}
-	}()
-	defer grpcServer.Stop()
-
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "/run/objectfs/fuse-holder.sock")
-	if err != nil {
-		t.Fatalf("newDriver failed: %v", err)
-	}
-	defer func() {
-		if closeErr := driver.Close(); closeErr != nil {
-			t.Errorf("driver.Close failed: %v", closeErr)
-		}
-	}()
-
-	connection, err := grpc.NewClient("passthrough://bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return listener.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("grpc.NewClient failed: %v", err)
-	}
-	defer connection.Close()
-	driver.client = pb.NewObjectFSControllerClient(connection)
+	driver := setupTestDriver(t)
 
 	callCount := 0
 	driver.dialHolder = func(socketPath string) (fuseHolderClient, error) {
 		callCount++
-		socketDescriptors, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-		if err != nil {
-			return nil, fmt.Errorf("unix.Socketpair failed: %w", err)
-		}
-		t.Cleanup(func() {
-			if closeErr := unix.Close(socketDescriptors[1]); closeErr != nil && !errors.Is(closeErr, unix.EBADF) {
-				t.Errorf("failed to close peer descriptor: %v", closeErr)
-			}
-		})
+		mountDescriptor, peerDescriptor := newFakeMountSocketPair(t)
 		return &fakeHolderClient{
-			mountDescriptor: socketDescriptors[0],
-			peerDescriptor:  socketDescriptors[1],
+			mountDescriptor: mountDescriptor,
+			peerDescriptor:  peerDescriptor,
 		}, nil
 	}
 
 	target1 := t.TempDir()
-	_, err = driver.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
+	_, err := driver.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
 		VolumeId:   "vol-1",
 		TargetPath: target1,
 		VolumeContext: map[string]string{
@@ -496,39 +476,7 @@ func TestNodePublishVolume_SurvivesHolderRestart(t *testing.T) {
 
 func TestNodeUnpublishVolume_HolderFailurePreservesMount(t *testing.T) {
 	ctx := t.Context()
-	server := controllertest.NewTestServer(nil)
-
-	listener := bufconn.Listen(1024 * 1024)
-	grpcServer := grpc.NewServer()
-	pb.RegisterObjectFSControllerServer(grpcServer, server)
-	go func() {
-		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
-			t.Logf("grpc server error: %v", err)
-		}
-	}()
-	defer grpcServer.Stop()
-
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "/run/objectfs/fuse-holder.sock")
-	if err != nil {
-		t.Fatalf("newDriver failed: %v", err)
-	}
-	defer func() {
-		if closeErr := driver.Close(); closeErr != nil {
-			t.Errorf("driver.Close failed: %v", closeErr)
-		}
-	}()
-
-	connection, err := grpc.NewClient("passthrough://bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return listener.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("grpc.NewClient failed: %v", err)
-	}
-	defer connection.Close()
-	driver.client = pb.NewObjectFSControllerClient(connection)
+	driver := setupTestDriver(t)
 
 	targetDirectory := t.TempDir()
 	driver.mounts[targetDirectory] = &activeMount{
@@ -543,7 +491,7 @@ func TestNodeUnpublishVolume_HolderFailurePreservesMount(t *testing.T) {
 		}, nil
 	}
 
-	_, err = driver.NodeUnpublishVolume(ctx, &csi.NodeUnpublishVolumeRequest{
+	_, err := driver.NodeUnpublishVolume(ctx, &csi.NodeUnpublishVolumeRequest{
 		VolumeId:   "test-vol",
 		TargetPath: targetDirectory,
 	})
@@ -580,5 +528,195 @@ func TestNodePublishVolume_RequiresFuseHolderSocket(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error without fuse-holder-socket in FUSE mode, got nil")
+	}
+}
+
+func TestStartupReattach_ServesHeldMountsAndDuplicatePublishDoesNotMount(t *testing.T) {
+	ctx := t.Context()
+	driver := setupTestDriver(t)
+
+	firstMountDescriptor, firstPeerDescriptor := newFakeMountSocketPair(t)
+	secondMountDescriptor, secondPeerDescriptor := newFakeMountSocketPair(t)
+	firstTargetDirectory := t.TempDir()
+	secondTargetDirectory := t.TempDir()
+	badTargetDirectory := t.TempDir()
+
+	fakeHolder := &fakeHolderClient{
+		heldMounts: map[string]*fakeHeldMount{
+			firstTargetDirectory:  newFakeHeldMount(firstTargetDirectory, "vol-reattach-1", "", firstMountDescriptor, firstPeerDescriptor),
+			secondTargetDirectory: newFakeHeldMount(secondTargetDirectory, "vol-reattach-2", "", secondMountDescriptor, secondPeerDescriptor),
+			badTargetDirectory: {
+				entry: fuseholder.Entry{
+					Target:   badTargetDirectory,
+					VolumeID: "vol-bad",
+					Mode:     volumemode.String(pb.VolumeMode_FUSE),
+					Attributes: map[string]string{
+						"consistency": "invalid-consistency",
+						"writeMode":   "fsync",
+					},
+				},
+			},
+		},
+	}
+	driver.dialHolder = func(socketPath string) (fuseHolderClient, error) {
+		return fakeHolder, nil
+	}
+
+	if err := driver.reattachHeldMounts(); err != nil {
+		t.Fatalf("reattachHeldMounts failed: %v", err)
+	}
+
+	driver.mu.Lock()
+	for _, expected := range []struct {
+		target   string
+		volumeID string
+	}{
+		{firstTargetDirectory, "vol-reattach-1"},
+		{secondTargetDirectory, "vol-reattach-2"},
+	} {
+		mount, exists := driver.mounts[expected.target]
+		if !exists || mount == nil {
+			t.Fatalf("expected mount at %s to be reattached", expected.target)
+		}
+		expectedVolumeDir := filepath.Join(driver.cacheDir, expected.volumeID)
+		if mount.volumeID != expected.volumeID || mount.mode != "fuse" || mount.volumeDir != expectedVolumeDir {
+			t.Errorf("mount at %s: got volumeID=%s mode=%s volumeDir=%s; want %s, fuse, %s", expected.target, mount.volumeID, mount.mode, mount.volumeDir, expected.volumeID, expectedVolumeDir)
+		}
+	}
+	if _, badExists := driver.mounts[badTargetDirectory]; badExists {
+		t.Errorf("expected bad mount %s to be skipped, but found in active mounts", badTargetDirectory)
+	}
+	driver.mu.Unlock()
+
+	// Duplicate publish of an already-held mount must not call holder Mount.
+	publishResponse, err := driver.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol-reattach-1",
+		TargetPath: firstTargetDirectory,
+		VolumeContext: map[string]string{
+			"mode": "fuse",
+		},
+	})
+	if err != nil {
+		t.Fatalf("duplicate NodePublishVolume failed: %v", err)
+	}
+	if publishResponse == nil {
+		t.Fatal("expected non-nil NodePublishVolumeResponse")
+	}
+	if fakeHolder.mountCalled {
+		t.Error("expected duplicate publish not to call holder Mount")
+	}
+}
+
+func TestStartupReattach_CloseToOpen(t *testing.T) {
+	ctx := t.Context()
+	driver := setupTestDriver(t)
+	mountDescriptor, peerDescriptor := newFakeMountSocketPair(t)
+	targetDirectory := t.TempDir()
+
+	fakeHolder := &fakeHolderClient{
+		mountDescriptor: mountDescriptor,
+		peerDescriptor:  peerDescriptor,
+		heldMounts:      make(map[string]*fakeHeldMount),
+	}
+	driver.dialHolder = func(socketPath string) (fuseHolderClient, error) {
+		return fakeHolder, nil
+	}
+
+	publishResponse, err := driver.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol-c2o",
+		TargetPath: targetDirectory,
+		VolumeContext: map[string]string{
+			"mode":        "fuse",
+			"consistency": "close-to-open",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NodePublishVolume failed: %v", err)
+	}
+	if publishResponse == nil {
+		t.Fatal("expected non-nil NodePublishVolumeResponse")
+	}
+
+	// Simulate daemon stop: cancel old watcher and close peer descriptor to disconnect old server.
+	driver.mu.Lock()
+	oldMount := driver.mounts[targetDirectory]
+	driver.mounts = make(map[string]*activeMount)
+	driver.mu.Unlock()
+	if oldMount != nil && oldMount.cancelFunc != nil {
+		oldMount.cancelFunc()
+	}
+	if closeErr := unix.Close(peerDescriptor); closeErr != nil {
+		t.Fatalf("failed to close old peer descriptor: %v", closeErr)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	// The holder retains the mount and yields a new descriptor upon Get.
+	newMountDescriptor, newPeerDescriptor := newFakeMountSocketPair(t)
+	fakeHolder.heldMounts[targetDirectory].mountDescriptor = newMountDescriptor
+	fakeHolder.heldMounts[targetDirectory].peerDescriptor = newPeerDescriptor
+
+	if err := driver.reattachHeldMounts(); err != nil {
+		t.Fatalf("reattachHeldMounts failed: %v", err)
+	}
+
+	driver.mu.Lock()
+	mount, exists := driver.mounts[targetDirectory]
+	driver.mu.Unlock()
+
+	if !exists || mount == nil {
+		t.Fatalf("expected mount at %s to be reattached", targetDirectory)
+	}
+	if mount.consistencyMode != pb.ConsistencyMode_CLOSE_TO_OPEN {
+		t.Errorf("expected consistencyMode CLOSE_TO_OPEN, got %v", mount.consistencyMode)
+	}
+	if mount.writeMode != pb.WriteMode_FSYNC {
+		t.Errorf("expected writeMode FSYNC, got %v", mount.writeMode)
+	}
+}
+
+func TestNodePublishVolume_ServesAlreadyHeldTarget(t *testing.T) {
+	ctx := t.Context()
+	driver := setupTestDriver(t)
+
+	mountDescriptor, peerDescriptor := newFakeMountSocketPair(t)
+	targetDirectory := t.TempDir()
+
+	fakeHolder := &fakeHolderClient{
+		heldMounts: map[string]*fakeHeldMount{
+			targetDirectory: newFakeHeldMount(targetDirectory, "vol-lost-reply", "", mountDescriptor, peerDescriptor),
+		},
+	}
+	driver.dialHolder = func(socketPath string) (fuseHolderClient, error) {
+		return fakeHolder, nil
+	}
+
+	// Publish target that is already held in the holder without active server (e.g. after lost reply).
+	publishResponse, err := driver.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol-lost-reply",
+		TargetPath: targetDirectory,
+		VolumeContext: map[string]string{
+			"mode": "fuse",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NodePublishVolume on already-held target failed: %v", err)
+	}
+	if publishResponse == nil {
+		t.Fatal("expected non-nil NodePublishVolumeResponse")
+	}
+	if fakeHolder.mountCalled {
+		t.Error("expected publish of already-held target not to call holder Mount")
+	}
+
+	driver.mu.Lock()
+	active, exists := driver.mounts[targetDirectory]
+	driver.mu.Unlock()
+
+	if !exists || active == nil {
+		t.Fatalf("expected mount for %s to be active after publish", targetDirectory)
+	}
+	expectedVolumeDir := filepath.Join(driver.cacheDir, "vol-lost-reply")
+	if active.volumeID != "vol-lost-reply" || active.mode != "fuse" || active.volumeDir != expectedVolumeDir {
+		t.Errorf("active mount: got volumeID=%s mode=%s volumeDir=%s; want vol-lost-reply, fuse, %s", active.volumeID, active.mode, active.volumeDir, expectedVolumeDir)
 	}
 }
