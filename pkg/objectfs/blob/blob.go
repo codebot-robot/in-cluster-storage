@@ -19,6 +19,7 @@ package blob
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -30,7 +31,7 @@ import (
 	"sync"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 )
 
 const (
@@ -170,12 +171,18 @@ func (f *fileByteStream) Seek(offset int64, whence int) (int64, error) {
 	return f.file.Seek(offset, whence)
 }
 
+// removeTempFileAndLog removes a temporary file and logs if removal fails (ignoring os.ErrNotExist).
+// Temporary file cleanup without a request context; use logger derived from root context.
+func removeTempFileAndLog(path, what string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		scoped.Log(context.Background()).Info("failed to remove", "what", what, "path", path, "err", err)
+	}
+}
+
 func (f *fileByteStream) Close() error {
 	err := f.file.Close()
 	if f.autoDelete && f.path != "" {
-		if remErr := os.Remove(f.path); remErr != nil && !os.IsNotExist(remErr) {
-			klog.Warningf("failed to remove temporary file %s: %v", f.path, remErr)
-		}
+		removeTempFileAndLog(f.path, "temporary file")
 	}
 	return err
 }
@@ -360,18 +367,14 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 		errutil.CloseAndLog(zw, "zlib compressor")
 		if outputTempFile != nil {
 			errutil.CloseAndLog(outputTempFile, "temp compression file")
-			if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
-				klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
-			}
+			removeTempFileAndLog(outputTempPath, "temporary compression file")
 		}
 		return nil, fmt.Errorf("compression failed: %w", err)
 	}
 	if err := zw.Close(); err != nil {
 		if outputTempFile != nil {
 			errutil.CloseAndLog(outputTempFile, "temp compression file")
-			if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
-				klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
-			}
+			removeTempFileAndLog(outputTempPath, "temporary compression file")
 		}
 		return nil, fmt.Errorf("compression close failed: %w", err)
 	}
@@ -384,9 +387,7 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 		st, err := outputTempFile.Stat()
 		if err != nil {
 			errutil.CloseAndLog(outputTempFile, "temp compression file")
-			if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
-				klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
-			}
+			removeTempFileAndLog(outputTempPath, "temporary compression file")
 			return nil, fmt.Errorf("failed to stat temp compression file: %w", err)
 		}
 		outputLen = st.Size()
@@ -400,9 +401,7 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 		if useTemp {
 			if _, err := outputTempFile.Seek(0, io.SeekStart); err != nil {
 				errutil.CloseAndLog(outputTempFile, "temp compression file")
-				if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
-					klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
-				}
+				removeTempFileAndLog(outputTempPath, "temporary compression file")
 				return nil, fmt.Errorf("failed to seek temp compression file: %w", err)
 			}
 			return &EncodedBlob{
@@ -425,9 +424,7 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 	// Compression was not a win, discard compressed output and use raw src
 	if outputTempFile != nil {
 		errutil.CloseAndLog(outputTempFile, "temp compression file")
-		if remErr := os.Remove(outputTempPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.Warningf("failed to remove temporary compression file %s: %v", outputTempPath, remErr)
-		}
+		removeTempFileAndLog(outputTempPath, "temporary compression file")
 	}
 	if err := src.Rewind(); err != nil {
 		return nil, err
@@ -550,24 +547,18 @@ func decodePayloadToByteStream(r io.Reader, encoding uint32, finalLen int64) (By
 	written, err := io.Copy(tf, src)
 	if err != nil {
 		errutil.CloseAndLog(tf, "temp payload file")
-		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.Warningf("failed to remove temporary payload file %s: %v", tempPath, remErr)
-		}
+		removeTempFileAndLog(tempPath, "temporary payload file")
 		return nil, fmt.Errorf("failed writing to temp file: %w", err)
 	}
 	if written != finalLen {
 		errutil.CloseAndLog(tf, "temp payload file")
-		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.Warningf("failed to remove temporary payload file %s: %v", tempPath, remErr)
-		}
+		removeTempFileAndLog(tempPath, "temporary payload file")
 		return nil, fmt.Errorf("decoded payload length mismatch: expected %d bytes, got %d", finalLen, written)
 	}
 
 	if _, err := tf.Seek(0, io.SeekStart); err != nil {
 		errutil.CloseAndLog(tf, "temp payload file")
-		if remErr := os.Remove(tempPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.Warningf("failed to remove temporary payload file %s: %v", tempPath, remErr)
-		}
+		removeTempFileAndLog(tempPath, "temporary payload file")
 		return nil, fmt.Errorf("failed to seek temp payload file: %w", err)
 	}
 
@@ -673,11 +664,11 @@ func (p *PackFile) DecodeBlob(r io.Reader, entry BlobEntry) (ByteStream, error) 
 
 // WritePackfile writes a v2 packfile directly to destination using the default slot count (1024).
 // WritePackfile does not close destination; ownership remains with the caller.
-func WritePackfile(destination *os.File, inputs []*EncodedBlob) (*PackFile, error) {
+func WritePackfile(ctx context.Context, destination *os.File, inputs []*EncodedBlob) (*PackFile, error) {
 	slots := DefaultPackSlots
 	if uint32(len(inputs)) > slots {
 		slots = uint32(len(inputs))
-		klog.V(2).Infof("batch size %d exceeds default pack slots %d; reserving S = %d for pack", len(inputs), DefaultPackSlots, slots)
+		scoped.Log(ctx).V(2).Info("batch size exceeds default pack slots; reserving for pack", "batchSize", len(inputs), "defaultSlots", DefaultPackSlots, "slots", slots)
 	}
 	return WritePackfileWithSlots(destination, inputs, slots)
 }

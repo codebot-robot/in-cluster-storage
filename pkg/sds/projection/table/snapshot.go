@@ -161,20 +161,20 @@ func RestoreSnapshotKey(ctx context.Context, backend objectstore.Backend, stream
 	}()
 
 	if err := backend.GetObject(ctx, "", key, 0, 0, tmpFile); err != nil {
-		removeAndLog(tmpSST, "incomplete snapshot download")
+		removeAndLog(ctx, tmpSST, "incomplete snapshot download")
 		return nil, 0, fmt.Errorf("failed to get snapshot object %q: %w", key, err)
 	}
 	if err := tmpFile.Sync(); err != nil {
-		removeAndLog(tmpSST, "incomplete snapshot download")
+		removeAndLog(ctx, tmpSST, "incomplete snapshot download")
 		return nil, 0, fmt.Errorf("failed to sync downloaded snapshot file: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
 		tmpFile = nil
-		removeAndLog(tmpSST, "incomplete snapshot download")
+		removeAndLog(ctx, tmpSST, "incomplete snapshot download")
 		return nil, 0, fmt.Errorf("failed to close downloaded snapshot file: %w", err)
 	}
 	tmpFile = nil
-	defer removeAndLog(tmpSST, "downloaded snapshot file")
+	defer removeAndLog(ctx, tmpSST, "downloaded snapshot file")
 
 	// Validate the snapshot SST before creating or ingesting into the database
 	var readerOpts []SnapshotReaderOption
@@ -185,14 +185,14 @@ func RestoreSnapshotKey(ctx context.Context, backend objectstore.Backend, stream
 	if o.acceptUnversioned {
 		readerOpts = append(readerOpts, WithReaderAcceptUnversioned(true))
 	}
-	sr, err := OpenSnapshotFile(tmpSST, readerOpts...)
+	sr, err := OpenSnapshotFile(ctx, tmpSST, readerOpts...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to validate snapshot %q: %w", key, err)
 	}
 	errutil.CloseAndLog(sr, "snapshot reader")
 
 	dbDir := filepath.Join(targetDir, "table.db")
-	removeAllAndLog(dbDir, "table db dir")
+	removeAllAndLog(ctx, dbDir, "table db dir")
 
 	allOpts := append([]Option{WithStreamID(streamID)}, opts...)
 	db, err := Open(ctx, dbDir, allOpts...)
@@ -206,7 +206,7 @@ func RestoreSnapshotKey(ctx context.Context, backend objectstore.Backend, stream
 	}
 
 	db.mu.Lock()
-	err = db.loadMetadataLocked()
+	err = db.loadMetadataLocked(ctx)
 	db.mu.Unlock()
 	if err != nil {
 		errutil.CloseAndLog(db, "table db")
@@ -315,7 +315,7 @@ func BuildSnapshot(ctx context.Context, streamID string, payloads [][]byte, back
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to create temp directory for build snapshot: %w", err)
 	}
-	defer removeAllAndLog(buildDir, "build directory")
+	defer removeAllAndLog(ctx, buildDir, "build directory")
 
 	db, err := Open(ctx, buildDir,
 		WithStreamID(streamID),

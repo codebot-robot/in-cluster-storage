@@ -18,6 +18,7 @@ package blob
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -27,7 +28,7 @@ import (
 	"sync"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 )
 
 var ErrPackSlotsFull = errors.New("incremental pack slots are full")
@@ -71,7 +72,8 @@ func NewIncrementalPack(path string, slots uint32) (*IncrementalPack, error) {
 	if err != nil {
 		errutil.CloseAndLog(file, "incremental pack")
 		if removeErr := os.Remove(path); removeErr != nil {
-			klog.Warningf("failed to remove packfile %s: %v", path, removeErr)
+			// File creation cleanup without a request context; use logger derived from root context.
+			scoped.Log(context.Background()).Info("failed to remove packfile", "path", path, "err", removeErr)
 		}
 		return nil, err
 	}
@@ -188,7 +190,8 @@ func (p *IncrementalPack) Seal() error {
 		packSlotsFullCount++
 		count := packSlotsFullCount
 		packSlotsFullMu.Unlock()
-		klog.V(2).Infof("packfile sealed with all %d slots full (total full packs: %d)", p.slots, count)
+		// IncrementalPack.Seal has no request context; use logger derived from root context.
+		scoped.Log(context.Background()).V(2).Info("packfile sealed with all slots full", "slots", p.slots, "totalFullPacks", count)
 	}
 	sort.Slice(p.entries, func(i, j int) bool {
 		return bytes.Compare(p.entries[i].SHA256[:], p.entries[j].SHA256[:]) < 0

@@ -25,10 +25,10 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"google.golang.org/protobuf/proto"
-	"k8s.io/klog/v2"
 )
 
 type snapshotReaderOptions struct {
@@ -64,7 +64,7 @@ func defaultReaderOptions() sstable.ReaderOptions {
 }
 
 // OpenSnapshotFile opens an SSTable snapshot from a file path using a standalone table reader.
-func OpenSnapshotFile(path string, opts ...SnapshotReaderOption) (*SnapshotReader, error) {
+func OpenSnapshotFile(ctx context.Context, path string, opts ...SnapshotReaderOption) (*SnapshotReader, error) {
 	var o snapshotReaderOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -81,17 +81,17 @@ func OpenSnapshotFile(path string, opts ...SnapshotReaderOption) (*SnapshotReade
 		return nil, fmt.Errorf("failed to initialize readable for %q: %w", path, err)
 	}
 
-	r, err := sstable.NewReader(context.Background(), readable, defaultReaderOptions())
+	r, err := sstable.NewReader(ctx, readable, defaultReaderOptions())
 	if err != nil {
 		errutil.CloseAndLog(readable, "readable for "+path)
 		return nil, fmt.Errorf("failed to create sstable reader for %q: %w", path, err)
 	}
 
-	return newSnapshotReader(r, o.acceptUnversioned)
+	return newSnapshotReader(ctx, r, o.acceptUnversioned)
 }
 
 // OpenSnapshotBytes opens an SSTable snapshot directly from an in-memory byte buffer.
-func OpenSnapshotBytes(buf []byte, opts ...SnapshotReaderOption) (*SnapshotReader, error) {
+func OpenSnapshotBytes(ctx context.Context, buf []byte, opts ...SnapshotReaderOption) (*SnapshotReader, error) {
 	var o snapshotReaderOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -101,10 +101,10 @@ func OpenSnapshotBytes(buf []byte, opts ...SnapshotReaderOption) (*SnapshotReade
 	if err != nil {
 		return nil, fmt.Errorf("failed to open in-memory sstable reader: %w", err)
 	}
-	return newSnapshotReader(r, o.acceptUnversioned)
+	return newSnapshotReader(ctx, r, o.acceptUnversioned)
 }
 
-func newSnapshotReader(r *sstable.Reader, acceptUnversioned bool) (*SnapshotReader, error) {
+func newSnapshotReader(ctx context.Context, r *sstable.Reader, acceptUnversioned bool) (*SnapshotReader, error) {
 	sr := &SnapshotReader{
 		reader:            r,
 		registry:          record.NewRegistry(),
@@ -141,7 +141,7 @@ func newSnapshotReader(r *sstable.Reader, acceptUnversioned bool) (*SnapshotRead
 			errutil.CloseAndLog(r, "sstable reader")
 			return nil, ErrUnversionedSnapshot
 		}
-		klog.Warning("accepting unversioned table snapshot (--accept-unversioned-segments)")
+		scoped.Log(ctx).Info("accepting unversioned table snapshot (--accept-unversioned-segments)")
 	}
 
 	// Read KeyPosition

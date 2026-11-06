@@ -22,9 +22,9 @@ import (
 	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"google.golang.org/protobuf/proto"
-	"k8s.io/klog/v2"
 )
 
 const (
@@ -97,6 +97,10 @@ func (a *applier) enqueueLocked(changes []sds.Change) {
 
 func (a *applier) loop() {
 	defer close(a.doneCh)
+
+	// Background worker loop without a request context; derive logger from the root context.
+	ctx := context.Background()
+	log := scoped.Log(ctx)
 
 	for {
 		// 1. Wait for work under view mutex
@@ -192,13 +196,13 @@ func (a *applier) loop() {
 
 			var toApply []sds.Change
 			var newStats proto.Message
-			toApply, newStats, applyErr = a.v.computeBatchStats(context.Background(), batch, currentStats, batchMaxSeq)
+			toApply, newStats, applyErr = a.v.computeBatchStats(ctx, batch, currentStats, batchMaxSeq)
 			if applyErr == nil {
 				if len(toApply) > len(batch) {
 					statsChange := toApply[len(toApply)-1]
 					coalescedChanges = append(coalescedChanges, statsChange)
 				}
-				applyErr = a.v.index.ApplyBatch(context.Background(), coalescedChanges)
+				applyErr = a.v.index.ApplyBatch(ctx, coalescedChanges)
 			}
 			if applyErr == nil && a.v.statsUpdate != nil {
 				a.v.mu.Lock()
@@ -214,7 +218,7 @@ func (a *applier) loop() {
 			if fails >= defaultDegradedThreshold && !a.isDegraded.Load() {
 				a.isDegraded.Store(true)
 				a.degradedSince = time.Now()
-				klog.Warningf("View applier marked DEGRADED after %d consecutive failures: %v", fails, applyErr)
+				log.Info("View applier marked DEGRADED after consecutive failures", "failures", fails, "err", applyErr)
 			} else if !a.isDegraded.Load() && a.degradedSince.IsZero() {
 				a.degradedSince = time.Now()
 			}
@@ -239,13 +243,13 @@ func (a *applier) loop() {
 
 			if shouldRebuild && !a.isRebuilding.Load() {
 				a.isRebuilding.Store(true)
-				klog.Warningf("View index triggered rebuild due to error: %v", applyErr)
-				newIndex, newPos, err := a.v.rebuildFunc(context.Background())
+				log.Info("View index triggered rebuild due to error", "err", applyErr)
+				newIndex, newPos, err := a.v.rebuildFunc(ctx)
 				if err != nil {
-					klog.Errorf("View index rebuild failed: %v", err)
+					log.Error(err, "View index rebuild failed")
 					a.isRebuilding.Store(false)
 				} else {
-					klog.Infof("View index rebuild succeeded at position %d", newPos)
+					log.Info("View index rebuild succeeded", "position", newPos)
 					a.v.indexMu.Lock()
 					a.v.mu.Lock()
 					oldIndex := a.v.index
@@ -255,7 +259,7 @@ func (a *applier) loop() {
 						a.v.appliedPos = newPos
 					}
 					if newIndex != nil {
-						if err := a.v.loadStatsLocked(context.Background()); err != nil {
+						if err := a.v.loadStatsLocked(ctx); err != nil {
 							a.v.loadErr = err
 						}
 					}
@@ -314,7 +318,7 @@ func (a *applier) loop() {
 		a.v.mu.Lock()
 		if a.isDegraded.Load() {
 			a.isDegraded.Store(false)
-			klog.Infof("View applier recovered from degraded state at seq %d", batchMaxSeq)
+			log.Info("View applier recovered from degraded state", "seq", batchMaxSeq)
 		}
 		a.consecutiveErr.Store(0)
 		a.degradedSince = time.Time{}

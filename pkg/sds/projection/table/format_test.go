@@ -52,7 +52,7 @@ func TestTableSnapshot_Golden(t *testing.T) {
 		t.Fatalf("GetObject failed: %v", err)
 	}
 
-	sr, err := OpenSnapshotBytes(snapBuf.Bytes())
+	sr, err := OpenSnapshotBytes(ctx, snapBuf.Bytes())
 	if err != nil {
 		t.Fatalf("OpenSnapshotBytes failed: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestTableSnapshot_RejectsNewer(t *testing.T) {
 	buildTestSSTable(t, sstPath, entries)
 
 	// 1. OpenSnapshotFile directly must reject newer version
-	_, err := OpenSnapshotFile(sstPath)
+	_, err := OpenSnapshotFile(ctx, sstPath)
 	if err == nil {
 		t.Fatal("expected error opening newer snapshot, got nil")
 	}
@@ -165,7 +165,7 @@ func TestTableSnapshot_UnversionedUpgrade(t *testing.T) {
 	buildTestSSTable(t, sstPath, entries)
 
 	// 1. Standalone reader without flag: reject
-	_, err := OpenSnapshotFile(sstPath)
+	_, err := OpenSnapshotFile(ctx, sstPath)
 	if err == nil {
 		t.Fatal("expected error opening unversioned snapshot without flag, got nil")
 	}
@@ -174,7 +174,7 @@ func TestTableSnapshot_UnversionedUpgrade(t *testing.T) {
 	}
 
 	// 2. Standalone reader with flag: accept
-	sr, err := OpenSnapshotFile(sstPath, WithReaderAcceptUnversioned(true))
+	sr, err := OpenSnapshotFile(ctx, sstPath, WithReaderAcceptUnversioned(true))
 	if err != nil {
 		t.Fatalf("unexpected error with WithReaderAcceptUnversioned: %v", err)
 	}
