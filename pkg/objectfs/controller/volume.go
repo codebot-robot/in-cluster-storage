@@ -3981,14 +3981,13 @@ func (v *Volume) startPackUploadLocked(packID uint64) {
 	if v.blobStore == nil {
 		info.state = packUploaded
 		info.lastRead = time.Now()
-		var packSize int64
-		if info.pack != nil {
-			packSize = info.pack.ByteSize()
+		var bytesToEvict int64
+		if v.server != nil && info.pack != nil {
+			bytesToEvict = v.server.addLocalPackCacheBytes(info.pack.ByteSize())
 		}
-		if v.server != nil && packSize > 0 {
+		if bytesToEvict > 0 && v.server != nil {
 			server := v.server
-			volumeID := v.volumeID
-			go server.onPackUploaded(volumeID, packID, packSize)
+			go server.evictLocalPackCache(bytesToEvict)
 		}
 		return
 	}
@@ -4017,7 +4016,7 @@ func (v *Volume) startPackUploadLocked(packID uint64) {
 
 		packKey, err := v.uploadPackFile(uploadContext, packID)
 
-		var uploadedPackSize int64
+		var bytesToEvict int64
 		v.stagingMu.Lock()
 		info, ok := v.packs[packID]
 		if !ok {
@@ -4039,15 +4038,15 @@ func (v *Volume) startPackUploadLocked(packID uint64) {
 			info.key = packKey
 			info.uploadError = nil
 			info.lastRead = time.Now()
-			if info.pack != nil {
-				uploadedPackSize = info.pack.ByteSize()
+			if v.server != nil && info.pack != nil {
+				bytesToEvict = v.server.addLocalPackCacheBytes(info.pack.ByteSize())
 			}
 		}
 		v.syncCond.Broadcast()
 		v.stagingMu.Unlock()
 
-		if v.server != nil && uploadedPackSize > 0 {
-			v.server.onPackUploaded(v.volumeID, packID, uploadedPackSize)
+		if bytesToEvict > 0 && v.server != nil {
+			v.server.evictLocalPackCache(bytesToEvict)
 		}
 	}()
 }

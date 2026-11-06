@@ -1958,18 +1958,15 @@ func (s *Server) subLocalPackCacheBytes(delta int64) {
 	s.diskLimitsMu.Unlock()
 }
 
-func (s *Server) onPackUploaded(volumeID string, packID uint64, packSize int64) {
+func (s *Server) addLocalPackCacheBytes(delta int64) int64 {
 	s.diskLimitsMu.Lock()
-	s.localPackCacheBytes += packSize
-	var bytesToEvict int64
-	if s.maxLocalPackCacheBytes > 0 && s.localPackCacheBytes > s.maxLocalPackCacheBytes {
-		bytesToEvict = s.localPackCacheBytes - s.maxLocalPackCacheBytes
-	}
-	s.diskLimitsMu.Unlock()
+	defer s.diskLimitsMu.Unlock()
 
-	if bytesToEvict > 0 {
-		s.evictLocalPackCache(bytesToEvict)
+	s.localPackCacheBytes += delta
+	if s.maxLocalPackCacheBytes > 0 && s.localPackCacheBytes > s.maxLocalPackCacheBytes {
+		return s.localPackCacheBytes - s.maxLocalPackCacheBytes
 	}
+	return 0
 }
 
 func (s *Server) evictLocalPackCache(bytesToEvict int64) {
