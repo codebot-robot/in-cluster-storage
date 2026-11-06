@@ -349,11 +349,11 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	mode, err := volumemode.ParseVolumeMode(req.GetVolumeContext()["mode"])
+	mode, err := volumemode.Parse(req.GetVolumeContext()["mode"])
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	if mode == volumemode.ModeExclusiveLocal {
+	if mode == pb.VolumeMode_EXCLUSIVE_LOCAL {
 		cap := req.GetVolumeCapability()
 		if cap == nil || cap.GetAccessMode() == nil || cap.GetAccessMode().GetMode() != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
 			return nil, status.Errorf(codes.InvalidArgument, "exclusive-local mode requires SINGLE_NODE_SINGLE_WRITER access mode (ReadWriteOncePod)")
@@ -405,7 +405,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		Entry: fuseholder.Entry{
 			Target:   targetPath,
 			VolumeID: volumeID,
-			Mode:     volumemode.VolumeModeString(volumemode.ModeFuse),
+			Mode:     volumemode.String(pb.VolumeMode_FUSE),
 			FsName:   "objectfs",
 			Name:     "objectfs",
 			MaxRead:  maxWrite,
@@ -464,7 +464,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		server:     server,
 		cancelFunc: cancel,
 		volumeID:   volumeID,
-		mode:       volumemode.VolumeModeString(volumemode.ModeFuse),
+		mode:       volumemode.String(pb.VolumeMode_FUSE),
 	}
 	d.mu.Unlock()
 
@@ -485,7 +485,7 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 		volumeID = mountInfo.volumeID
 	}
 	volumeDir := filepath.Join(d.cacheDir, volumeID)
-	if (ok && mountInfo != nil && mountInfo.mode == volumemode.VolumeModeString(volumemode.ModeExclusiveLocal)) || isExclusiveLocalDir(volumeDir) {
+	if (ok && mountInfo != nil && mountInfo.mode == volumemode.String(pb.VolumeMode_EXCLUSIVE_LOCAL)) || isExclusiveLocalDir(volumeDir) {
 		d.mu.Lock()
 		delete(d.mounts, targetPath)
 		d.mu.Unlock()

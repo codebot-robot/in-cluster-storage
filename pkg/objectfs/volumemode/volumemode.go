@@ -17,73 +17,29 @@ limitations under the License.
 package volumemode
 
 import (
-	"flag"
-	"fmt"
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/protoenum"
 )
 
-// Mode represents the mount mode of an ObjectFS volume.
-type Mode int
-
-const (
-	ModeFuse Mode = iota
-	ModeExclusiveLocal
-)
-
-// ParseVolumeMode parses a volume mode string into a Mode enum.
+// Parse parses a volume mode string into a VolumeMode enum.
 // In accordance with ObjectFS StorageClass parameter conventions, accepted canonical
 // values are lowercase-hyphenated: "fuse" and "exclusive-local".
-// An empty string parses as the documented default (ModeFuse).
+// An empty string parses as VOLUME_MODE_UNSPECIFIED.
 // Any other value returns an error naming the accepted values.
-func ParseVolumeMode(value string) (Mode, error) {
-	switch value {
-	case "", "fuse":
-		return ModeFuse, nil
-	case "exclusive-local":
-		return ModeExclusiveLocal, nil
-	default:
-		return ModeFuse, fmt.Errorf("unknown volume mode %q (accepted values: fuse, exclusive-local)", value)
-	}
+func Parse(value string) (pb.VolumeMode, error) {
+	number, err := protoenum.Parse(pb.VolumeMode(0).Descriptor(), value)
+	return pb.VolumeMode(number), err
 }
 
-// VolumeModeString returns the canonical user-facing string for mode ("fuse" or "exclusive-local").
-func VolumeModeString(mode Mode) string {
-	switch mode {
-	case ModeFuse:
-		return "fuse"
-	case ModeExclusiveLocal:
-		return "exclusive-local"
-	default:
-		return ""
-	}
+// String returns the canonical user-facing string for mode ("fuse" or "exclusive-local").
+func String(mode pb.VolumeMode) string {
+	return protoenum.Name(mode)
 }
 
-type Value struct {
-	target *Mode
+// Value wraps a *pb.VolumeMode to implement flag.Value and pflag.Value.
+type Value = protoenum.Value[pb.VolumeMode]
+
+// NewValue returns a Value that sets target when parsed.
+func NewValue(target *pb.VolumeMode) *Value {
+	return protoenum.NewValue(target)
 }
-
-var _ flag.Value = (*Value)(nil)
-
-func NewValue(target *Mode) *Value {
-	return &Value{target: target}
-}
-
-func (v *Value) String() string {
-	if v == nil || v.target == nil {
-		return ""
-	}
-	return VolumeModeString(*v.target)
-}
-
-func (v *Value) Set(value string) error {
-	if v == nil || v.target == nil {
-		return fmt.Errorf("volume mode value target is nil")
-	}
-	mode, err := ParseVolumeMode(value)
-	if err != nil {
-		return err
-	}
-	*v.target = mode
-	return nil
-}
-
-func (v *Value) Type() string { return "volume-mode" }
