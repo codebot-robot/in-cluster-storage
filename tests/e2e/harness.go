@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -327,4 +328,83 @@ func (h *Harness) WaitForPVDeleted(name string, timeout time.Duration) error {
 		}
 		time.Sleep(2 * time.Second)
 	}
+}
+
+func (h *Harness) kubectlOutput(description string, args ...string) (string, bool) {
+	h.t.Helper()
+	out, err := exec.Command("kubectl", args...).CombinedOutput()
+	output := strings.TrimSpace(string(out))
+	if err != nil {
+		h.t.Logf("Warning: failed to %s: %v (output: %s)", description, err, output)
+		return output, false
+	}
+	return output, true
+}
+
+// WaitForPodReady waits until a pod is ready by delegating to the embedded harness wait.
+// On timeout, it logs pod description, PVC and PV state, and node daemon log tail for objectfs volumes.
+func (h *Harness) WaitForPodReady(name, namespace string, timeout time.Duration) error {
+	h.t.Helper()
+	waitErr := h.Harness.WaitForPodReady(name, namespace, timeout)
+	if waitErr == nil {
+		return nil
+	}
+
+	if describe, ok := h.kubectlOutput(fmt.Sprintf("describe pod %s", name), "describe", "pod", name, "-n", namespace); ok {
+		h.t.Logf("Pod %s description:\n%s\n", name, describe)
+	}
+
+	storage, ok := h.kubectlOutput(fmt.Sprintf("get persistent volume claims and persistent volumes in %s", namespace), "get", "pvc,pv", "-n", namespace, "-o", "wide")
+	if ok {
+		h.t.Logf("Persistent volume claims and persistent volumes in %s:\n%s\n", namespace, storage)
+	}
+
+	driver, _ := h.kubectlOutput(fmt.Sprintf("get volume driver for pod %s", name), "get", "pod", name, "-n", namespace, "-o", "jsonpath={.spec.volumes[*].csi.driver}")
+	isObjectFSVolume := strings.Contains(driver, "objectfs")
+	if !isObjectFSVolume {
+		claim, _ := h.kubectlOutput(fmt.Sprintf("get persistent volume claims for pod %s", name), "get", "pod", name, "-n", namespace, "-o", "jsonpath={.spec.volumes[*].persistentVolumeClaim.claimName}")
+		if claim != "" && strings.Contains(storage, "objectfs") {
+			isObjectFSVolume = true
+		}
+	}
+
+	if isObjectFSVolume {
+		nodeName, ok := h.kubectlOutput(fmt.Sprintf("get node name for pod %s", name), "get", "pod", name, "-n", namespace, "-o", "jsonpath={.spec.nodeName}")
+		if ok && nodeName != "" {
+			daemonPods, ok := h.kubectlOutput(fmt.Sprintf("find node daemon pod for node %s", nodeName), "get", "pods", "-n", "default", "-l", "app=objectfs-node-daemon", "--field-selector", "spec.nodeName="+nodeName, "-o", "jsonpath={.items[*].metadata.name}")
+			daemonPodNames := strings.Fields(daemonPods)
+			if ok && len(daemonPodNames) > 0 {
+				daemonLogs := h.getContainerLogs(daemonPodNames[0], "objectfs-node-daemon", "default", false)
+				if daemonLogs != "" {
+					lines := strings.Split(daemonLogs, "\n")
+					if len(lines) > 50 {
+						lines = lines[len(lines)-50:]
+					}
+					h.t.Logf("Node Daemon %s on %s tail logs:\n%s\n", daemonPodNames[0], nodeName, strings.Join(lines, "\n"))
+				}
+			}
+		}
+	}
+
+	if phase, ok := h.kubectlOutput(fmt.Sprintf("get pod %s phase on timeout", name), "get", "pod", name, "-n", namespace, "-o", "jsonpath={.status.phase}"); ok && phase == "Pending" {
+		if eventsOutput, ok := h.kubectlOutput(fmt.Sprintf("get events for pod %s", name), "get", "events", "-n", namespace, "--field-selector", "involvedObject.name="+name, "-o", "json"); ok {
+			var eventsData struct {
+				Items []struct {
+					Reason  string `json:"reason"`
+					Message string `json:"message"`
+				} `json:"items"`
+			}
+			if err := json.Unmarshal([]byte(eventsOutput), &eventsData); err != nil {
+				h.t.Logf("Warning: failed to parse events for pod %s: %v", name, err)
+			} else {
+				for _, item := range eventsData.Items {
+					if item.Reason == "FailedScheduling" || item.Reason == "FailedMount" {
+						return fmt.Errorf("%w: %s", waitErr, strings.TrimSpace(item.Message))
+					}
+				}
+			}
+		}
+	}
+
+	return waitErr
 }
