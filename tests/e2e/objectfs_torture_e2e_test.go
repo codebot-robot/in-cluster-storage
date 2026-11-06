@@ -226,21 +226,6 @@ func setupObjectFSTortureCluster(t *testing.T, clusterName string) (*Harness, st
 		}
 	}
 
-	// Build and load docker images
-	h.DockerBuild("objectfs-controller:e2e", filepath.Join(experimentRoot, "images/objectfs-controller/Dockerfile"), experimentRoot)
-	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/objectfs-node-daemon/Dockerfile"), experimentRoot)
-	h.DockerBuild("objectfs-fuse-holder:e2e", filepath.Join(experimentRoot, "images/objectfs-fuse-holder/Dockerfile"), experimentRoot)
-	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
-	h.DockerBuild("fakes3:e2e", filepath.Join(experimentRoot, "fakes3/images/fakes3/Dockerfile"), experimentRoot)
-	h.DockerBuild("certsigner:e2e", filepath.Join(experimentRoot, "certsigner/images/certsigner/Dockerfile"), experimentRoot)
-
-	h.KindLoad("objectfs-controller:e2e")
-	h.KindLoad("objectfs-node-daemon:e2e")
-	h.KindLoad("objectfs-fuse-holder:e2e")
-	h.KindLoad("wal-buffer:e2e")
-	h.KindLoad("fakes3:e2e")
-	h.KindLoad("certsigner:e2e")
-
 	// Deploy FakeS3
 	fakes3Manifest := `
 apiVersion: v1
@@ -272,17 +257,11 @@ spec:
     spec:
       containers:
         - name: fakes3
-          image: fakes3:e2e
-          imagePullPolicy: Never
+          image: fakes3
           args: ["--listen=0.0.0.0:9000", "--buckets=objectfs-bucket", "--quiet"]
           ports:
             - containerPort: 9000
 `
-	t.Logf("Deploying FakeS3 backing object storage")
-	h.KubectlApplyContent("fakes3", fakes3Manifest)
-	if err := h.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
-		t.Fatalf("FakeS3 deployment failed to start: %v", err)
-	}
 
 	s3BackendURL := "s3://objectfs-bucket?endpoint=http://fakes3:9000&region=us-east-1&s3ForcePathStyle=true"
 
@@ -294,10 +273,6 @@ spec:
 	}
 	objectfsManifest := string(b)
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-fuse-holder:latest", "image: objectfs-fuse-holder:e2e\n          imagePullPolicy: Never")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: certsigner:latest", "image: certsigner:e2e\n          imagePullPolicy: Never")
 	objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
 
 	// Enable --debug-mutation-check on controller
@@ -328,7 +303,6 @@ spec:
 	}
 	walManifest := string(b)
 	walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
-	walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
 	walNodeSelectorNode1 := fmt.Sprintf("nodeSelector:\n        kubernetes.io/hostname: %s\n      terminationGracePeriodSeconds: 5\n      tolerations:\n        - key: \"node-role.kubernetes.io/control-plane\"\n          operator: \"Exists\"\n          effect: \"NoSchedule\"\n      serviceAccountName: wal-buffer", node1)
 	walManifest = strings.ReplaceAll(walManifest, "serviceAccountName: wal-buffer", walNodeSelectorNode1)
 
@@ -343,8 +317,15 @@ spec:
 	walManifest = strings.ReplaceAll(walManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvWAL)
 
 	t.Logf("Deploying ObjectFS (on %s) and WAL Buffer with --debug-mutation-check and mounts --debug", node1)
-	h.KubectlApplyContent("objectfs", objectfsManifest)
-	h.KubectlApplyContent("wal-buffer", walManifest)
+	h.ApDeploy(t, map[string]string{
+		"fakes3":     fakes3Manifest,
+		"objectfs":   objectfsManifest,
+		"wal-buffer": walManifest,
+	})
+
+	if err := h.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
+		t.Fatalf("FakeS3 deployment failed to start: %v", err)
+	}
 
 	h.RunCommand("kubectl", "wait", "--for=condition=complete", "job/objectfs-certsigner", "-n", "default", "--timeout=60s")
 
@@ -372,7 +353,7 @@ metadata:
 spec:
   containers:
     - name: client
-      image: objectfs-controller:e2e
+      image: images.local/objectfs-controller:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 36000"]
       volumeMounts:

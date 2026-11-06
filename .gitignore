@@ -1,4 +1,5 @@
 .build/
+tests/e2e/deploy-scratch/
 
 # website build outputs
 site/public/

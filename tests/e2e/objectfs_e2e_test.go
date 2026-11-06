@@ -73,22 +73,6 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func buildAndLoadE2EImages(h *Harness, gitRoot string) {
-	h.DockerBuild("objectfs-controller:e2e", filepath.Join(gitRoot, "images/objectfs-controller/Dockerfile"), gitRoot)
-	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(gitRoot, "images/objectfs-node-daemon/Dockerfile"), gitRoot)
-	h.DockerBuild("objectfs-fuse-holder:e2e", filepath.Join(gitRoot, "images/objectfs-fuse-holder/Dockerfile"), gitRoot)
-	h.DockerBuild("wal-buffer:e2e", filepath.Join(gitRoot, "images/wal-buffer/Dockerfile"), gitRoot)
-	h.DockerBuild("fakes3:e2e", filepath.Join(gitRoot, "fakes3/images/fakes3/Dockerfile"), gitRoot)
-	h.DockerBuild("certsigner:e2e", filepath.Join(gitRoot, "certsigner/images/certsigner/Dockerfile"), gitRoot)
-
-	h.KindLoad("objectfs-controller:e2e")
-	h.KindLoad("objectfs-node-daemon:e2e")
-	h.KindLoad("objectfs-fuse-holder:e2e")
-	h.KindLoad("wal-buffer:e2e")
-	h.KindLoad("fakes3:e2e")
-	h.KindLoad("certsigner:e2e")
-}
-
 func setupSharedObjectFSCluster(t *testing.T) (*Harness, string) {
 	t.Helper()
 
@@ -112,9 +96,6 @@ func setupSharedObjectFSCluster(t *testing.T) (*Harness, string) {
 
 		initH := NewHarness(t, sharedSingleNodeClusterName)
 		gitRoot := initH.GetGitRoot()
-
-		// Build and load all E2E images into kind
-		buildAndLoadE2EImages(initH, gitRoot)
 
 		// Deploy FakeS3 backing object storage in default namespace
 		fakes3Manifest := `
@@ -147,17 +128,11 @@ spec:
     spec:
       containers:
         - name: fakes3
-          image: fakes3:e2e
-          imagePullPolicy: Never
+          image: fakes3
           args: ["--listen=0.0.0.0:9000", "--buckets=objectfs-bucket", "--quiet"]
           ports:
             - containerPort: 9000
 `
-		initH.KubectlApplyContent("fakes3", fakes3Manifest)
-		if err := initH.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
-			sharedSingleNodeErr = fmt.Errorf("fakes3 deployment failed to start: %w", err)
-			return
-		}
 
 		s3BackendURL := "s3://objectfs-bucket?endpoint=http://fakes3:9000&region=us-east-1&s3ForcePathStyle=true"
 
@@ -170,10 +145,6 @@ spec:
 		}
 		objectfsManifest := string(b)
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
-		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
-		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
-		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-fuse-holder:latest", "image: objectfs-fuse-holder:e2e\n          imagePullPolicy: Never")
-		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: certsigner:latest", "image: certsigner:e2e\n          imagePullPolicy: Never")
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
 
 		awsEnvController := `env:
@@ -195,7 +166,6 @@ spec:
 		}
 		walManifest := string(b)
 		walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
-		walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
 
 		awsEnvWAL := `env:
             - name: AWS_ACCESS_KEY_ID
@@ -207,8 +177,16 @@ spec:
             - name: OBJECT_STORAGE_BACKEND`
 		walManifest = strings.ReplaceAll(walManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvWAL)
 
-		initH.KubectlApplyContent("wal-buffer", walManifest)
-		initH.KubectlApplyContent("objectfs", objectfsManifest)
+		initH.ApDeploy(t, map[string]string{
+			"fakes3":     fakes3Manifest,
+			"objectfs":   objectfsManifest,
+			"wal-buffer": walManifest,
+		})
+
+		if err := initH.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
+			sharedSingleNodeErr = fmt.Errorf("fakes3 deployment failed to start: %w", err)
+			return
+		}
 
 		initH.RunCommand("kubectl", "wait", "--for=condition=complete", "job/objectfs-certsigner", "-n", "default", "--timeout=60s")
 
@@ -240,7 +218,7 @@ metadata:
 spec:
   containers:
     - name: client
-      image: objectfs-controller:e2e
+      image: images.local/objectfs-controller:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 36000"]
       volumeMounts:
@@ -435,7 +413,7 @@ metadata:
 spec:
   containers:
     - name: client
-      image: objectfs-controller:e2e
+      image: images.local/objectfs-controller:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 3600"]
       volumeMounts:
@@ -516,7 +494,7 @@ metadata:
 spec:
   containers:
     - name: client
-      image: objectfs-controller:e2e
+      image: images.local/objectfs-controller:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 3600"]
       volumeMounts:
@@ -582,7 +560,7 @@ spec:
       serviceAccountName: objectfs-certsigner
       containers:
         - name: certsigner
-          image: certsigner:e2e
+          image: images.local/certsigner:e2e
           imagePullPolicy: Never
           env:
             - name: POD_NAMESPACE
@@ -1012,7 +990,7 @@ spec:
   restartPolicy: Never
   containers:
     - name: app
-      image: objectfs-node-daemon:e2e
+      image: images.local/objectfs-node-daemon:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 3600"]
       volumeMounts:
@@ -1134,9 +1112,6 @@ func setupObjectFSMultiNodeCluster(t *testing.T) (*Harness, string, string) {
 
 		gitRoot := initH.GetGitRoot()
 
-		// Build and load all E2E images into kind
-		buildAndLoadE2EImages(initH, gitRoot)
-
 		// Deploy FakeS3
 		fakes3Manifest := `
 apiVersion: v1
@@ -1168,17 +1143,11 @@ spec:
     spec:
       containers:
         - name: fakes3
-          image: fakes3:e2e
-          imagePullPolicy: Never
+          image: fakes3
           args: ["--listen=0.0.0.0:9000", "--buckets=objectfs-bucket", "--quiet"]
           ports:
             - containerPort: 9000
 `
-		initH.KubectlApplyContent("fakes3", fakes3Manifest)
-		if err := initH.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
-			sharedMultiNodeErr = fmt.Errorf("fakes3 deployment failed to start: %w", err)
-			return
-		}
 
 		s3BackendURL := "s3://objectfs-bucket?endpoint=http://fakes3:9000&region=us-east-1&s3ForcePathStyle=true"
 
@@ -1191,10 +1160,6 @@ spec:
 		}
 		objectfsManifest := string(b)
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
-		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
-		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
-		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-fuse-holder:latest", "image: objectfs-fuse-holder:e2e\n          imagePullPolicy: Never")
-		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: certsigner:latest", "image: certsigner:e2e\n          imagePullPolicy: Never")
 		objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
 
 		awsEnvController := `env:
@@ -1220,7 +1185,6 @@ spec:
 		}
 		walManifest := string(b)
 		walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
-		walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
 		walNodeSelectorNode1 := fmt.Sprintf("nodeSelector:\n        kubernetes.io/hostname: %s\n      tolerations:\n        - key: \"node-role.kubernetes.io/control-plane\"\n          operator: \"Exists\"\n          effect: \"NoSchedule\"\n      serviceAccountName: wal-buffer", sharedMultiNode1)
 		walManifest = strings.ReplaceAll(walManifest, "serviceAccountName: wal-buffer", walNodeSelectorNode1)
 
@@ -1234,8 +1198,16 @@ spec:
             - name: OBJECT_STORAGE_BACKEND`
 		walManifest = strings.ReplaceAll(walManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvWAL)
 
-		initH.KubectlApplyContent("objectfs", objectfsManifest)
-		initH.KubectlApplyContent("wal-buffer", walManifest)
+		initH.ApDeploy(t, map[string]string{
+			"fakes3":     fakes3Manifest,
+			"objectfs":   objectfsManifest,
+			"wal-buffer": walManifest,
+		})
+
+		if err := initH.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("fakes3 deployment failed to start: %w", err)
+			return
+		}
 
 		initH.RunCommand("kubectl", "wait", "--for=condition=complete", "job/objectfs-certsigner", "-n", "default", "--timeout=60s")
 
@@ -1267,7 +1239,7 @@ metadata:
 spec:
   containers:
     - name: client
-      image: objectfs-controller:e2e
+      image: images.local/objectfs-controller:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 36000"]
       volumeMounts:
@@ -1896,7 +1868,7 @@ spec:
     kubernetes.io/hostname: %s
   containers:
     - name: app
-      image: objectfs-node-daemon:e2e
+      image: images.local/objectfs-node-daemon:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 3600"]
       volumeMounts:
@@ -1921,7 +1893,7 @@ spec:
     kubernetes.io/hostname: %s
   containers:
     - name: app
-      image: objectfs-node-daemon:e2e
+      image: images.local/objectfs-node-daemon:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 3600"]
       volumeMounts:
@@ -3827,7 +3799,7 @@ spec:
     kubernetes.io/hostname: %s
   containers:
     - name: app
-      image: objectfs-node-daemon:e2e
+      image: images.local/objectfs-node-daemon:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 3600"]
       volumeMounts:
@@ -3886,7 +3858,7 @@ spec:
     kubernetes.io/hostname: %s
   containers:
     - name: app
-      image: objectfs-node-daemon:e2e
+      image: images.local/objectfs-node-daemon:e2e
       imagePullPolicy: Never
       command: ["/bin/sh", "-c", "sleep 3600"]
       volumeMounts:
