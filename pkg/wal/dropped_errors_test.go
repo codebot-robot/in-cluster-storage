@@ -135,7 +135,7 @@ func TestClientSegmentStore_TruncateAfterRemovalFailure(t *testing.T) {
 	}
 
 	// Truncate to seq targetSeg.FirstSeq - 1 (requiring targetSeg removal)
-	err = store.TruncateAfter(targetSeg.FirstSeq - 1)
+	err = store.TruncateAfter(t.Context(), targetSeg.FirstSeq-1)
 	if err == nil {
 		t.Fatalf("expected error from TruncateAfter when segment removal fails, got nil")
 	}

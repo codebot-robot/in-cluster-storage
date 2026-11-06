@@ -1524,7 +1524,7 @@ type faultInjectingStore struct {
 	successCount int
 }
 
-func (f *faultInjectingStore) TruncateAfter(seq uint64) error {
+func (f *faultInjectingStore) TruncateAfter(ctx context.Context, seq uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failCount < 2 {
@@ -1532,7 +1532,7 @@ func (f *faultInjectingStore) TruncateAfter(seq uint64) error {
 		return fmt.Errorf("injected TruncateAfter failure #%d", f.failCount)
 	}
 	f.successCount++
-	return f.SegmentStore.TruncateAfter(seq)
+	return f.SegmentStore.TruncateAfter(ctx, seq)
 }
 
 func TestDivergenceTruncateRetryRecovery(t *testing.T) {
