@@ -401,3 +401,25 @@ func TestRBAC_TLSInitSecurity(t *testing.T) {
 		}
 	}
 }
+
+func TestSharedClusterSystemPodRetention(t *testing.T) {
+	cases := []struct {
+		podName  string
+		isSystem bool
+	}{
+		{"fakes3-6dc78bc8bd-abcde", true},
+		{"objectfs-controller-0", true},
+		{"wal-buffer-0", true},
+		{"objectfs-node-daemon-w7x2k", true},
+		{"objectfs-fuse-holder-z9y1m", true},
+		{"objectfs-admin-pod", true},
+		{"test-pod-1", false},
+		{"failover-writer", false},
+		{"outage-client", false},
+	}
+	for _, tc := range cases {
+		if got := isSharedClusterSystemPod(tc.podName); got != tc.isSystem {
+			t.Errorf("isSharedClusterSystemPod(%q) = %v; want %v", tc.podName, got, tc.isSystem)
+		}
+	}
+}

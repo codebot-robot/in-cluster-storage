@@ -1056,6 +1056,25 @@ var (
 
 const sharedMultiNodeClusterName = "objectfs-shared-multinode"
 
+// isSharedClusterSystemPod returns true if the pod name matches one of the long-lived
+// system workloads in the default namespace that should not be cleaned up between tests.
+func isSharedClusterSystemPod(p string) bool {
+	systemPrefixes := []string{
+		"fakes3",
+		"objectfs-controller",
+		"wal-buffer",
+		"objectfs-node-daemon",
+		"objectfs-fuse-holder",
+		"objectfs-admin-pod",
+	}
+	for _, prefix := range systemPrefixes {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func setupObjectFSMultiNodeCluster(t *testing.T) (*Harness, string, string) {
 	t.Helper()
 
@@ -1276,11 +1295,7 @@ spec:
 	// Clean up any leftover test pods or PVCs in default from a prior test
 	pods := h.getPodNames("", "default")
 	for _, p := range pods {
-		if !strings.HasPrefix(p, "fakes3") &&
-			!strings.HasPrefix(p, "objectfs-controller") &&
-			!strings.HasPrefix(p, "wal-buffer") &&
-			!strings.HasPrefix(p, "objectfs-node-daemon") &&
-			!strings.HasPrefix(p, "objectfs-admin-pod") {
+		if !isSharedClusterSystemPod(p) {
 			if err := exec.Command("kubectl", "delete", "pod", p, "-n", "default", "--force", "--grace-period=0", "--ignore-not-found").Run(); err != nil {
 				t.Logf("Warning: failed to delete leftover pod %s in default: %v", p, err)
 			}
