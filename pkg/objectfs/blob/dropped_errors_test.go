@@ -100,7 +100,7 @@ func TestEncodeBlob_ReadFailureCleanup(t *testing.T) {
 	}
 	fStream.failRead.Store(true)
 
-	_, err := EncodeBlob(fStream, true)
+	_, err := EncodeBlob(t.Context(), fStream, true)
 	if err == nil {
 		t.Fatal("expected EncodeBlob to fail on read failure, got nil")
 	}

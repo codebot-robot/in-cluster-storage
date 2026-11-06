@@ -899,7 +899,7 @@ func (v *Volume) sealActivePackLocked(ctx context.Context) error {
 	defer span.End()
 
 	if v.activePack != nil {
-		if err := v.activePack.Seal(); err != nil {
+		if err := v.activePack.Seal(ctx); err != nil {
 			return fmt.Errorf("failed to seal active pack: %w", err)
 		}
 		v.activePack = nil
@@ -1044,7 +1044,7 @@ func (v *Volume) appendSyncRecordsLocked(
 			var inlineData []byte
 			if reference0, ok := chunks[0]; ok {
 				var err error
-				inlineData, err = v.readStagedChunkBytes(reference0)
+				inlineData, err = v.readStagedChunkBytes(appendCtx, reference0)
 				if err != nil {
 					return 0, 0, nil, fmt.Errorf("failed reading inline staged chunk: %w", err)
 				}
@@ -3818,18 +3818,18 @@ func (v *Volume) scratchPackPath(packID uint64) string {
 	return filepath.Join(v.stagingDir, fmt.Sprintf("pack-%016x.pack", packID))
 }
 
-func (v *Volume) readStagedChunkStreamLocked(reference stagedChunkReference) (blob.ByteStream, error) {
+func (v *Volume) readStagedChunkStreamLocked(ctx context.Context, reference stagedChunkReference) (blob.ByteStream, error) {
 	info, ok := v.packs[reference.PackID]
 	if !ok || info.pack == nil {
 		return nil, fmt.Errorf("staged pack %d not found", reference.PackID)
 	}
-	return info.pack.ReadBlob(reference.Entry)
+	return info.pack.ReadBlob(ctx, reference.Entry)
 }
 
 // readStagedChunkBytesLocked reads a single staged chunk's payload into memory for modification.
 // Staging memory overhead here is bounded by a single chunkSize buffer.
-func (v *Volume) readStagedChunkBytesLocked(reference stagedChunkReference) ([]byte, error) {
-	stream, err := v.readStagedChunkStreamLocked(reference)
+func (v *Volume) readStagedChunkBytesLocked(ctx context.Context, reference stagedChunkReference) ([]byte, error) {
+	stream, err := v.readStagedChunkStreamLocked(ctx, reference)
 	if err != nil {
 		return nil, err
 	}
@@ -3837,10 +3837,10 @@ func (v *Volume) readStagedChunkBytesLocked(reference stagedChunkReference) ([]b
 	return io.ReadAll(stream)
 }
 
-func (v *Volume) readStagedChunkBytes(reference stagedChunkReference) ([]byte, error) {
+func (v *Volume) readStagedChunkBytes(ctx context.Context, reference stagedChunkReference) ([]byte, error) {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
-	return v.readStagedChunkBytesLocked(reference)
+	return v.readStagedChunkBytesLocked(ctx, reference)
 }
 
 func (v *Volume) removeStagingDirLocked() error {
@@ -3982,13 +3982,13 @@ func (v *Volume) startPackUploadLocked(packID uint64) {
 	}()
 }
 
-func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
+func (v *Volume) appendChunkLocked(ctx context.Context, data []byte) (stagedChunkReference, error) {
 	v.evictUploadedPacksLocked(int64(len(data)))
 	if v.activePack == nil {
 		v.nextPackID++
 		packID := v.nextPackID
 		packPath := v.scratchPackPath(packID)
-		pack, err := blob.NewIncrementalPack(packPath, blob.DefaultPackSlots)
+		pack, err := blob.NewIncrementalPack(ctx, packPath, blob.DefaultPackSlots)
 		if err != nil {
 			return stagedChunkReference{}, fmt.Errorf("failed creating incremental pack %s: %w", packPath, err)
 		}
@@ -4000,7 +4000,7 @@ func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
 		}
 	}
 
-	entry, err := v.activePack.Append(data)
+	entry, err := v.activePack.Append(ctx, data)
 	if err != nil {
 		if errors.Is(err, blob.ErrPackSlotsFull) {
 			return stagedChunkReference{}, fmt.Errorf("active pack %d is full despite eager sealing: %w", v.activePackID, err)
@@ -4019,7 +4019,7 @@ func (v *Volume) appendChunkLocked(data []byte) (stagedChunkReference, error) {
 	if v.activePack.Count() >= int(blob.DefaultPackSlots) {
 		sealedPackID := v.activePackID
 		entryCount := v.activePack.Count()
-		if sealErr := v.activePack.Seal(); sealErr != nil {
+		if sealErr := v.activePack.Seal(ctx); sealErr != nil {
 			return stagedChunkReference{}, fmt.Errorf("failed sealing full pack: %w", sealErr)
 		}
 		v.slotSeals++
@@ -4080,17 +4080,17 @@ func (v *Volume) dropStagedChunksLocked(inodeID uint64) {
 
 // rewriteStagedChunkLocked modifies an existing staged chunk in-place by reading, transforming, and re-appending it.
 // Kept for Truncate only.
-func (v *Volume) rewriteStagedChunkLocked(inodeID uint64, index int, modify func([]byte) []byte) error {
+func (v *Volume) rewriteStagedChunkLocked(ctx context.Context, inodeID uint64, index int, modify func([]byte) []byte) error {
 	existing, ok := v.stagedChunks[inodeID][index]
 	if !ok {
 		return fmt.Errorf("staged chunk %d on inode %d not found for rewrite", index, inodeID)
 	}
-	chunkData, err := v.readStagedChunkBytesLocked(existing)
+	chunkData, err := v.readStagedChunkBytesLocked(ctx, existing)
 	if err != nil {
 		return fmt.Errorf("failed reading staged chunk %d for rewrite: %w", index, err)
 	}
 	modifiedData := modify(chunkData)
-	reference, err := v.appendChunkLocked(modifiedData)
+	reference, err := v.appendChunkLocked(ctx, modifiedData)
 	if err != nil {
 		return err
 	}
@@ -4205,7 +4205,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	// ensure base inline data is transferred to staged chunk 0
 	if len(node.InlineData) > 0 {
 		if _, ok := v.stagedChunks[inodeID][0]; !ok {
-			reference, err := v.appendChunkLocked(node.InlineData)
+			reference, err := v.appendChunkLocked(ctx, node.InlineData)
 			if err != nil {
 				return 0, 0, time.Time{}, 0, err
 			}
@@ -4241,7 +4241,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		var chunkData []byte
 		if existing, ok := v.stagedChunks[inodeID][i]; ok {
 			var err error
-			chunkData, err = v.readStagedChunkBytesLocked(existing)
+			chunkData, err = v.readStagedChunkBytesLocked(ctx, existing)
 			if err != nil {
 				return 0, 0, time.Time{}, 0, fmt.Errorf("failed reading staged chunk %d: %w", i, err)
 			}
@@ -4256,7 +4256,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 			chunkData = newBuffer
 		}
 		copy(chunkData[writeStart:writeEnd], data[dataStart:dataEnd])
-		reference, err := v.appendChunkLocked(chunkData)
+		reference, err := v.appendChunkLocked(ctx, chunkData)
 		if err != nil {
 			return 0, 0, time.Time{}, 0, err
 		}
@@ -4291,7 +4291,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			} else if int64(index+1)*cs > size {
 				keep := size - int64(index)*cs
 				if int64(reference.Length) > keep {
-					err := v.rewriteStagedChunkLocked(inodeID, index, func(data []byte) []byte {
+					err := v.rewriteStagedChunkLocked(ctx, inodeID, index, func(data []byte) []byte {
 						return data[:keep]
 					})
 					if err != nil {
