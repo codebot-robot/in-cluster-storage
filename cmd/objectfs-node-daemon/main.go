@@ -102,6 +102,9 @@ func main() {
 		klog.Fatalf("failed to initialize driver: %v", err)
 	}
 	driver.debug = *debug
+	if err := driver.reattachHeldMounts(); err != nil {
+		klog.Fatalf("failed to re-attach held mounts: %v", err)
+	}
 	defer func() {
 		if closeErr := driver.Close(); closeErr != nil {
 			klog.V(4).Infof("driver close error: %v", closeErr)
@@ -139,6 +142,10 @@ type activeMount struct {
 	mode        string
 	volumeDir   string
 	mountID     string
+
+	// consistencyMode and writeMode record the published modes for tests verifying re-attach.
+	consistencyMode pb.ConsistencyMode
+	writeMode       pb.WriteMode
 }
 
 type fuseHolderClient interface {
@@ -249,6 +256,163 @@ func (d *objectFSDriver) unmountFUSEViaHolder(targetPath string) error {
 	return nil
 }
 
+const (
+	volumeAttributeConsistency = "consistency"
+	volumeAttributeWriteMode   = "writeMode"
+)
+
+func parseMountModes(values map[string]string) (pb.WriteMode, pb.ConsistencyMode, error) {
+	consistencyMode, err := consistency.Parse(values[volumeAttributeConsistency])
+	if err != nil {
+		return pb.WriteMode_WRITE_MODE_UNSPECIFIED, pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, fmt.Errorf("invalid consistency: %w", err)
+	}
+
+	writeMode, err := writemode.Parse(values[volumeAttributeWriteMode])
+	if err != nil {
+		return pb.WriteMode_WRITE_MODE_UNSPECIFIED, pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED, fmt.Errorf("invalid writeMode: %w", err)
+	}
+	if writeMode == pb.WriteMode_WRITE_MODE_UNSPECIFIED {
+		writeMode = pb.WriteMode_FSYNC
+	}
+
+	return writeMode, consistencyMode, nil
+}
+
+func (d *objectFSDriver) reattachHeldMounts() error {
+	if d.fuseHolderSocket == "" {
+		return nil
+	}
+	holder, err := d.dialHolder(d.fuseHolderSocket)
+	if err != nil {
+		return fmt.Errorf("failed to connect to fuse holder: %w", err)
+	}
+	defer func() {
+		if closeErr := holder.Close(); closeErr != nil {
+			klog.Warningf("failed to close fuse holder client: %v", closeErr)
+		}
+	}()
+
+	entries, err := holder.List()
+	if err != nil {
+		return fmt.Errorf("failed to list held mounts: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.Mode != volumemode.String(pb.VolumeMode_FUSE) {
+			continue
+		}
+		mountLogger := scoped.Log(context.Background()).WithValues("volume", entry.VolumeID, "target", entry.Target)
+		if entry.Attributes == nil {
+			mountLogger.Info("skipping held mount: missing attributes")
+			continue
+		}
+		writeMode, consistencyMode, err := parseMountModes(entry.Attributes)
+		if err != nil {
+			mountLogger.Error(err, "skipping held mount: invalid mount modes")
+			continue
+		}
+
+		descriptor, _, err := holder.Get(entry.Target)
+		if err != nil {
+			mountLogger.Error(err, "failed to get descriptor for held mount")
+			continue
+		}
+		maxWrite := entry.MaxRead
+		if maxWrite <= 0 {
+			maxWrite = 128 * 1024
+		}
+		if err := d.serveFUSE(entry.Target, entry.VolumeID, descriptor, maxWrite, writeMode, consistencyMode); err != nil {
+			mountLogger.Error(err, "failed to serve reattached mount")
+			continue
+		}
+		mountLogger.Info("reattached held FUSE mount")
+	}
+	return nil
+}
+
+func (d *objectFSDriver) newObjectFS(volumeID string, writeMode pb.WriteMode, consistencyMode pb.ConsistencyMode) (pb.ObjectFSControllerClient, *objectfuse.NodeCache, *objectfuse.ObjectFS, error) {
+	client, err := d.getClient()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	nodeCache := objectfuse.NewNodeCache(d.cacheBytes)
+	rawFS := objectfuse.NewObjectFSWithTimeouts(client, volumeID, writeMode, nodeCache, d.rpcTimeout, d.syncTimeout)
+	rawFS.SetSyncOnClose(d.syncOnClose)
+	rawFS.SetBackgroundSyncInterval(d.backgroundSyncInterval)
+	rawFS.SetConsistencyMode(consistencyMode)
+
+	if d.diskCache != nil {
+		rawFS.SetDiskBlobCache(d.diskCache)
+	}
+	return client, nodeCache, rawFS, nil
+}
+
+func (d *objectFSDriver) serveFUSE(targetPath, volumeID string, descriptor int, maxWrite int, writeMode pb.WriteMode, consistencyMode pb.ConsistencyMode) error {
+	client, nodeCache, rawFS, err := d.newObjectFS(volumeID, writeMode, consistencyMode)
+	if err != nil {
+		if closeErr := unix.Close(descriptor); closeErr != nil {
+			klog.Warningf("failed to close descriptor %d: %v", descriptor, closeErr)
+		}
+		return err
+	}
+
+	mountOptions := &gofuse.MountOptions{
+		AllowOther: true,
+		FsName:     "objectfs",
+		Name:       "objectfs",
+		Options:    []string{"default_permissions", "allow_other"},
+		MaxWrite:   maxWrite,
+		Debug:      d.debug,
+	}
+
+	mountPoint := fmt.Sprintf("/dev/fd/%d", descriptor)
+	server, err := gofuse.NewServer(rawFS, mountPoint, mountOptions)
+	if err != nil {
+		if closeErr := unix.Close(descriptor); closeErr != nil {
+			klog.Warningf("failed to close descriptor %d after NewServer error: %v", descriptor, closeErr)
+		}
+		return fmt.Errorf("failed to create FUSE server for %s at %s: %w", targetPath, mountPoint, err)
+	}
+	go server.Serve()
+	if err := server.WaitMount(); err != nil {
+		// WaitMount is unreachable for /dev/fd/N mountpoints because go-fuse closes
+		// ready during mount before Serve runs, but the error check is kept for
+		// symmetry with the fusermount path.
+		return fmt.Errorf("failed waiting for FUSE mount at %s: %w", targetPath, err)
+	}
+
+	mountLogger := scoped.Log(context.Background()).WithValues("volume", volumeID, "target", targetPath)
+	watchCtx, cancel := context.WithCancel(scoped.WithLog(context.Background(), mountLogger))
+	objectfuse.StartWatcher(watchCtx, client, volumeID, d.nodeID, consistencyMode, nodeCache, rawFS)
+	scoped.Log(watchCtx).Info("started volume watcher")
+	rawFS.StartBackgroundSync(watchCtx)
+
+	d.mu.Lock()
+	if old, ok := d.mounts[targetPath]; ok {
+		if old.cancelFunc != nil {
+			old.cancelFunc()
+		}
+		if old.server != nil {
+			if unmountErr := old.server.Unmount(); unmountErr != nil {
+				mountLogger.Error(unmountErr, "failed to unmount previous mount")
+			}
+		}
+	}
+	d.mounts[targetPath] = &activeMount{
+		server:          server,
+		cancelFunc:      cancel,
+		volumeID:        volumeID,
+		mode:            volumemode.String(pb.VolumeMode_FUSE),
+		volumeDir:       filepath.Join(d.cacheDir, volumeID),
+		consistencyMode: consistencyMode,
+		writeMode:       writeMode,
+	}
+	d.mu.Unlock()
+
+	return nil
+}
+
 func (d *objectFSDriver) getClient() (pb.ObjectFSControllerClient, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -348,11 +512,6 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return nil, fmt.Errorf("volumeID is required")
 	}
 
-	consistencyMode, err := consistency.Parse(req.GetVolumeContext()["consistency"])
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
 	mode, err := volumemode.Parse(req.GetVolumeContext()["mode"])
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -365,33 +524,26 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return d.publishExclusiveLocal(ctx, req, volumeID)
 	}
 
-	writeMode, err := writemode.Parse(req.GetVolumeContext()["writeMode"])
+	writeMode, consistencyMode, err := parseMountModes(req.GetVolumeContext())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	if writeMode == pb.WriteMode_WRITE_MODE_UNSPECIFIED {
-		writeMode = pb.WriteMode_FSYNC
 	}
 
 	klog.Infof("Publishing ObjectFS volume %s (writeMode=%v, consistency=%v) to %s", volumeID, writeMode, consistencyMode, targetPath)
 
+	d.mu.Lock()
+	if active, ok := d.mounts[targetPath]; ok {
+		d.mu.Unlock()
+		if active.volumeID != volumeID {
+			return nil, status.Errorf(codes.AlreadyExists, "target path %s is already mounted for volume %s, not %s", targetPath, active.volumeID, volumeID)
+		}
+		klog.Infof("Volume %s is already published at %s", volumeID, targetPath)
+		return &csi.NodePublishVolumeResponse{}, nil
+	}
+	d.mu.Unlock()
+
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create target path %s: %w", targetPath, err)
-	}
-
-	client, err := d.getClient()
-	if err != nil {
-		return nil, err
-	}
-
-	nodeCache := objectfuse.NewNodeCache(d.cacheBytes)
-	rawFS := objectfuse.NewObjectFSWithTimeouts(client, volumeID, writeMode, nodeCache, d.rpcTimeout, d.syncTimeout)
-	rawFS.SetSyncOnClose(d.syncOnClose)
-	rawFS.SetBackgroundSyncInterval(d.backgroundSyncInterval)
-	rawFS.SetConsistencyMode(consistencyMode)
-
-	if d.diskCache != nil {
-		rawFS.SetDiskBlobCache(d.diskCache)
 	}
 
 	maxWrite := 128 * 1024
@@ -405,74 +557,43 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		}
 	}()
 
-	fd, err := holder.Mount(fuseholder.MountRequest{
-		Entry: fuseholder.Entry{
-			Target:   targetPath,
-			VolumeID: volumeID,
-			Mode:     volumemode.String(pb.VolumeMode_FUSE),
-			FsName:   "objectfs",
-			Name:     "objectfs",
-			MaxRead:  maxWrite,
-			Options:  []string{"default_permissions", "allow_other"},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to mount FUSE filesystem at %s via holder: %w", targetPath, err)
-	}
-
-	mountOpts := &gofuse.MountOptions{
-		AllowOther: true,
-		FsName:     "objectfs",
-		Name:       "objectfs",
-		Options:    []string{"default_permissions", "allow_other"},
-		MaxWrite:   maxWrite,
-		Debug:      d.debug,
-	}
-
-	mountPoint := fmt.Sprintf("/dev/fd/%d", fd)
-	server, err := gofuse.NewServer(rawFS, mountPoint, mountOpts)
-	if err != nil {
-		if closeErr := unix.Close(fd); closeErr != nil {
-			klog.Warningf("failed to close descriptor %d after NewServer error: %v", fd, closeErr)
+	descriptor, heldEntry, err := holder.Get(targetPath)
+	if errors.Is(err, fuseholder.ErrNotFound) {
+		descriptor, err = holder.Mount(fuseholder.MountRequest{
+			Entry: fuseholder.Entry{
+				Target:   targetPath,
+				VolumeID: volumeID,
+				Mode:     volumemode.String(pb.VolumeMode_FUSE),
+				FsName:   "objectfs",
+				Name:     "objectfs",
+				MaxRead:  maxWrite,
+				Options:  []string{"default_permissions", "allow_other"},
+				Attributes: map[string]string{
+					volumeAttributeConsistency: consistency.String(consistencyMode),
+					volumeAttributeWriteMode:   writemode.String(writeMode),
+				},
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to mount FUSE filesystem at %s via holder: %w", targetPath, err)
 		}
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to check existing mount for %s via holder: %w", targetPath, err)
+	} else if heldEntry.VolumeID != "" && heldEntry.VolumeID != volumeID {
+		if closeErr := unix.Close(descriptor); closeErr != nil {
+			klog.Warningf("failed to close descriptor %d for %s: %v", descriptor, targetPath, closeErr)
+		}
+		return nil, status.Errorf(codes.AlreadyExists, "target %s is already held for volume %s, not %s", targetPath, heldEntry.VolumeID, volumeID)
+	} else if heldEntry.MaxRead > 0 {
+		maxWrite = heldEntry.MaxRead
+	}
+
+	if err := d.serveFUSE(targetPath, volumeID, descriptor, maxWrite, writeMode, consistencyMode); err != nil {
 		if unmountErr := holder.Unmount(targetPath, false); unmountErr != nil {
-			klog.Warningf("failed to unmount %s via holder after NewServer failure: %v", targetPath, unmountErr)
+			klog.Warningf("failed to unmount %s via holder after serve error: %v", targetPath, unmountErr)
 		}
-		return nil, fmt.Errorf("failed to create FUSE server for %s at %s: %w", targetPath, mountPoint, err)
+		return nil, fmt.Errorf("failed to serve FUSE mount for %s: %w", targetPath, err)
 	}
-	go server.Serve()
-	if err := server.WaitMount(); err != nil {
-		if unmountErr := holder.Unmount(targetPath, false); unmountErr != nil {
-			klog.Warningf("failed to unmount %s after WaitMount failure: %v", targetPath, unmountErr)
-		}
-		return nil, fmt.Errorf("failed waiting for FUSE mount at %s: %w", targetPath, err)
-	}
-
-	mountLogger := scoped.Log(context.Background()).WithValues("volume", volumeID, "target", targetPath)
-	watchCtx, cancel := context.WithCancel(scoped.WithLog(context.Background(), mountLogger))
-	objectfuse.StartWatcher(watchCtx, client, volumeID, d.nodeID, consistencyMode, nodeCache, rawFS)
-	scoped.Log(watchCtx).Info("started volume watcher")
-	rawFS.StartBackgroundSync(watchCtx)
-
-	d.mu.Lock()
-	// Clean up any previous mount at this targetPath if any
-	if old, ok := d.mounts[targetPath]; ok {
-		if old.cancelFunc != nil {
-			old.cancelFunc()
-		}
-		if old.server != nil {
-			if unmountErr := old.server.Unmount(); unmountErr != nil {
-				klog.Warningf("failed to unmount previous mount at %s: %v", targetPath, unmountErr)
-			}
-		}
-	}
-	d.mounts[targetPath] = &activeMount{
-		server:     server,
-		cancelFunc: cancel,
-		volumeID:   volumeID,
-		mode:       volumemode.String(pb.VolumeMode_FUSE),
-	}
-	d.mu.Unlock()
 
 	klog.Infof("Successfully mounted ObjectFS FUSE volume %s at %s", volumeID, targetPath)
 	return &csi.NodePublishVolumeResponse{}, nil
