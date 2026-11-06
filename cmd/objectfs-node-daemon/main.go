@@ -36,6 +36,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuseholder"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/volumemode"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/writemode"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
@@ -91,7 +92,10 @@ func main() {
 		klog.Fatalf("failed to listen: %v", err)
 	}
 
-	server := grpc.NewServer()
+	server := grpc.NewServer(
+		grpc.UnaryInterceptor(grpcutil.UnaryServerInterceptor()),
+		grpc.StreamInterceptor(grpcutil.StreamServerInterceptor()),
+	)
 
 	driver, err := newDriver(*nodeID, *controllerAddress, *cacheDir, *cacheSizeMB*1024*1024, *diskCacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval, *clientCertDir, *insecureFlag, *fuseHolderSocket)
 	if err != nil {
@@ -444,8 +448,10 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		return nil, fmt.Errorf("failed waiting for FUSE mount at %s: %w", targetPath, err)
 	}
 
-	watchCtx, cancel := context.WithCancel(context.Background())
+	mountLogger := scoped.Log(context.Background()).WithValues("volume", volumeID, "target", targetPath)
+	watchCtx, cancel := context.WithCancel(scoped.WithLog(context.Background(), mountLogger))
 	objectfuse.StartWatcher(watchCtx, client, volumeID, d.nodeID, consistencyMode, nodeCache, rawFS)
+	scoped.Log(watchCtx).Info("started volume watcher")
 	rawFS.StartBackgroundSync(watchCtx)
 
 	d.mu.Lock()

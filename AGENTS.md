@@ -1,6 +1,6 @@
 # Developer & Agent Guidelines
 
-This document describes how to set up your environment and run the full end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), how to write commit messages and PR descriptions (section 5), the Go API rules we hold code to (section 6), PR scope (section 7), and naming (section 8).
+This document describes how to set up your environment and run the full end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), how to write commit messages and PR descriptions (section 5), the Go API rules we hold code to (section 6), PR scope (section 7), naming (section 8), and logging (section 9).
 
 ---
 
@@ -207,3 +207,12 @@ Exceptions, all of them conventional Go and nothing else:
 
 Names must also match signatures: a function returning `[]byte` is `build...`, not `write...`; `write...` takes an `io.Writer` or a destination slice. Use one name per concept: do not introduce `prepared` beside `encoded` for the same thing.
 
+---
+
+## 9. Logging
+
+New and touched code logs through `scoped.Log(ctx)` with key/value pairs (`log.Info("sealed pack", "volume", id, "pack", packID)`), errors through `log.Error(err, "...")`.
+
+- **No new package-level `klog.*` calls.** All logging in new or touched code must go through `scoped.Log(ctx)`.
+- **Verbosity:** `klog.V(n)` becomes `log.V(n)`.
+- **Migration per package:** Existing call sites are migrated per package in their own issues, not mixed into feature PRs.

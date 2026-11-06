@@ -36,6 +36,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
@@ -252,7 +253,7 @@ func run(options Options) error {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
-	ctx := context.Background()
+	ctx := scoped.WithLog(context.Background(), klog.Background())
 	backend, err := objectstore.Open(ctx, options.Backend)
 	if err != nil {
 		return fmt.Errorf("failed to initialize backend %q: %w", options.Backend, err)
@@ -300,7 +301,10 @@ func run(options Options) error {
 	var grpcServer *grpc.Server
 	if options.Insecure {
 		klog.Warning("Serving plaintext gRPC without TLS or authentication (--insecure is set)")
-		grpcServer = grpc.NewServer()
+		grpcServer = grpc.NewServer(
+			grpc.UnaryInterceptor(grpcutil.UnaryServerInterceptor()),
+			grpc.StreamInterceptor(grpcutil.StreamServerInterceptor()),
+		)
 	} else {
 		if !grpcutil.DirExists(options.ServerCertDir) {
 			return fmt.Errorf("server certificate directory %s does not exist; pass --insecure for plaintext local dev", options.ServerCertDir)
@@ -340,8 +344,8 @@ func run(options Options) error {
 
 		grpcServer = grpc.NewServer(
 			grpc.Creds(tlsCreds),
-			grpc.UnaryInterceptor(authInterceptor.UnaryServerInterceptor()),
-			grpc.StreamInterceptor(authInterceptor.StreamServerInterceptor()),
+			grpc.ChainUnaryInterceptor(grpcutil.UnaryServerInterceptor(), authInterceptor.UnaryServerInterceptor()),
+			grpc.ChainStreamInterceptor(grpcutil.StreamServerInterceptor(), authInterceptor.StreamServerInterceptor()),
 		)
 	}
 	server := controller.NewServer(backend, serverOptions...)
@@ -374,7 +378,10 @@ func run(options Options) error {
 			return fmt.Errorf("failed to listen on CSI endpoint %s: %w", options.CSIEndpoint, err)
 		}
 
-		csiServer = grpc.NewServer()
+		csiServer = grpc.NewServer(
+			grpc.UnaryInterceptor(grpcutil.UnaryServerInterceptor()),
+			grpc.StreamInterceptor(grpcutil.StreamServerInterceptor()),
+		)
 		csi.RegisterIdentityServer(csiServer, csiController)
 		csi.RegisterControllerServer(csiServer, csiController)
 

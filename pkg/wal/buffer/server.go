@@ -31,6 +31,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -471,6 +472,15 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 	return st
 }
 
+type appendServerWithContext struct {
+	pb.WalBuffer_AppendServer
+	ctx context.Context
+}
+
+func (s *appendServerWithContext) Context() context.Context {
+	return s.ctx
+}
+
 // Append handles the bidirectional client append stream.
 func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	ctx, cancel := context.WithCancel(stream.Context())
@@ -492,6 +502,13 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	var streamID uuid.UUID
 	copy(streamID[:], hello.StreamId)
 
+	logger := scoped.Log(ctx).WithValues("stream", streamID.String())
+	ctx = scoped.WithLog(ctx, logger)
+	stream = &appendServerWithContext{
+		WalBuffer_AppendServer: stream,
+		ctx:                    ctx,
+	}
+
 	st := s.getOrCreateStream(ctx, streamID)
 
 	st.mu.Lock()
@@ -506,7 +523,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		st.mu.Unlock()
 	}()
 
-	klog.Infof("WAL buffer: Hello received for stream %s: witness watermark=%d, s3 watermark=%d", streamID, witnessSeq, s3Seq)
+	scoped.Log(ctx).Info("WAL buffer: Hello received", "witnessWatermark", witnessSeq, "s3Watermark", s3Seq)
 
 	// Deduped / single sender channel to prevent concurrent stream.Send calls
 	outCh := make(chan *pb.AppendResponse, 64)
