@@ -28,9 +28,9 @@ import (
 
 const tracerName = "github.com/gke-labs/in-cluster-storage"
 
-// Start starts a span from the package tracer using the global provider.
+// StartSpan starts a span from the package tracer using the global provider.
 // Callers must end the returned span.
-func Start(ctx context.Context, name string) (context.Context, trace.Span) {
+func StartSpan(ctx context.Context, name string) (context.Context, trace.Span) {
 	return otel.Tracer(tracerName).Start(ctx, name)
 }
 
