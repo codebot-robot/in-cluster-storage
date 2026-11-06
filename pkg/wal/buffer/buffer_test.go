@@ -38,12 +38,16 @@ import (
 )
 
 func startTestServer(t *testing.T, backend objectstore.Backend, dataDir string) (*Server, string, func()) {
+	return startTestServerWithBatchDelay(t, backend, dataDir, 2*time.Millisecond)
+}
+
+func startTestServerWithBatchDelay(t *testing.T, backend objectstore.Backend, dataDir string, batchMaxDelay time.Duration) (*Server, string, func()) {
 	ctx := t.Context()
-	srv, err := NewServer(ctx, ServerConfig{
+	server, err := NewServer(ctx, ServerConfig{
 		Backend:       backend,
 		DataDir:       dataDir,
 		FlushInterval: 10 * time.Second,
-		BatchMaxDelay: 2 * time.Millisecond,
+		BatchMaxDelay: batchMaxDelay,
 	})
 	if err != nil {
 		t.Fatalf("failed to create server: %v", err)
@@ -55,19 +59,48 @@ func startTestServer(t *testing.T, backend objectstore.Backend, dataDir string) 
 	}
 
 	grpcServer := grpc.NewServer()
-	pb.RegisterWalBufferServer(grpcServer, srv)
+	pb.RegisterWalBufferServer(grpcServer, server)
 
 	go func() {
-		_ = grpcServer.Serve(listener)
+		if serveErr := grpcServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+			t.Errorf("grpc serve error: %v", serveErr)
+		}
 	}()
 
 	cleanup := func() {
 		grpcServer.Stop()
-		_ = srv.Close()
-		_ = listener.Close()
+		if closeErr := server.Close(); closeErr != nil {
+			t.Errorf("server close failed: %v", closeErr)
+		}
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Errorf("listener close failed: %v", closeErr)
+		}
 	}
 
-	return srv, listener.Addr().String(), cleanup
+	return server, listener.Addr().String(), cleanup
+}
+
+func appendDirectRecord(t *testing.T, server *Server, streamID uuid.UUID, streamSeq uint64, payload []byte) {
+	ctx := t.Context()
+	st := server.getOrCreateStream(ctx, streamID)
+	st.mu.Lock()
+	st.inFlight++
+	st.mu.Unlock()
+
+	server.incomingChan <- incomingItem{
+		streamID:  streamID,
+		streamSeq: streamSeq,
+		payload:   payload,
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for st.witnessSeq < streamSeq && st.commitErr == nil {
+		st.cond.Wait()
+	}
+	if st.commitErr != nil {
+		t.Fatalf("commit failed for stream %s at %d: %v", streamID, streamSeq, st.commitErr)
+	}
 }
 
 type testBufferHandle struct {
@@ -534,18 +567,7 @@ func TestTailMemoryBounded(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		for i := uint64(1); i <= recordCount; i++ {
-			ackChan := make(chan ackResult, 1)
-			srv.incomingChan <- incomingItem{
-				streamID:  streamID,
-				streamSeq: i,
-				payload:   []byte("x"),
-				ackChan:   ackChan,
-			}
-			res := <-ackChan
-			if res.err != nil {
-				errCh <- fmt.Errorf("commit failed at %d: %w", i, res.err)
-				return
-			}
+			appendDirectRecord(t, srv, streamID, i, []byte("x"))
 		}
 		errCh <- nil
 	}()
@@ -594,17 +616,7 @@ func TestRetentionPreservesUnflushedFiles(t *testing.T) {
 	streamID := uuid.New()
 	// Append 10 records
 	for i := uint64(1); i <= 10; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamID,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("payload-long-string-to-cause-rotation-%d", i)),
-			ackChan:   ackChan,
-		}
-		res := <-ackChan
-		if res.err != nil {
-			t.Fatalf("append %d failed: %v", i, res.err)
-		}
+		appendDirectRecord(t, srv, streamID, i, []byte(fmt.Sprintf("payload-long-string-to-cause-rotation-%d", i)))
 	}
 
 	// Flush the first 10 records
@@ -614,17 +626,7 @@ func TestRetentionPreservesUnflushedFiles(t *testing.T) {
 
 	// Now append 10 MORE records that remain unflushed
 	for i := uint64(11); i <= 20; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv.incomingChan <- incomingItem{
-			streamID:  streamID,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("payload-long-string-to-cause-rotation-%d", i)),
-			ackChan:   ackChan,
-		}
-		res := <-ackChan
-		if res.err != nil {
-			t.Fatalf("append %d failed: %v", i, res.err)
-		}
+		appendDirectRecord(t, srv, streamID, i, []byte(fmt.Sprintf("payload-long-string-to-cause-rotation-%d", i)))
 	}
 
 	// Check disk: files containing records > 10 (unflushed) must still exist
@@ -671,14 +673,7 @@ func TestRestartOnPersistentDataDir(t *testing.T) {
 
 	streamID := uuid.New()
 	for i := uint64(1); i <= 10; i++ {
-		ackChan := make(chan ackResult, 1)
-		srv1.incomingChan <- incomingItem{
-			streamID:  streamID,
-			streamSeq: i,
-			payload:   []byte(fmt.Sprintf("incarnation-1-rec-%d", i)),
-			ackChan:   ackChan,
-		}
-		<-ackChan
+		appendDirectRecord(t, srv1, streamID, i, []byte(fmt.Sprintf("incarnation-1-rec-%d", i)))
 	}
 
 	if _, err := srv1.Flush(ctx, &pb.FlushRequest{}); err != nil {
