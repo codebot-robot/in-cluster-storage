@@ -594,6 +594,9 @@ func (v *Volume) deletePackLocked(packID uint64) {
 	if !ok {
 		return
 	}
+	if info.state == packUploaded && info.pack != nil && v.server != nil {
+		v.server.subLocalPackCacheBytes(info.pack.ByteSize())
+	}
 	if info.pack != nil {
 		errutil.CloseAndLog(info.pack, "uploaded pack")
 	}
@@ -627,7 +630,6 @@ func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 		}
 		return v.packs[eligible[i]].lastRead.Before(v.packs[eligible[j]].lastRead)
 	})
-	var evictedBytes int64
 	for _, packID := range eligible {
 		info := v.packs[packID]
 		var packSize int64
@@ -636,13 +638,9 @@ func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 		}
 		v.deletePackLocked(packID)
 		total -= packSize
-		evictedBytes += packSize
 		if total+neededBytes <= v.maxStagingBytes {
 			break
 		}
-	}
-	if v.server != nil && evictedBytes > 0 {
-		v.server.subLocalPackCacheBytes(evictedBytes)
 	}
 }
 
@@ -3905,20 +3903,8 @@ func (v *Volume) removeStagingDirLocked() error {
 		errutil.CloseAndLog(v.activePack, "active scratch pack")
 		v.activePack = nil
 	}
-	var uploadedBytes int64
-	for _, info := range v.packs {
-		if info.state == packUploaded && info.pack != nil {
-			uploadedBytes += info.pack.ByteSize()
-		}
-		if info.pack != nil {
-			errutil.CloseAndLog(info.pack, "staged pack")
-		}
-		if info.key != "" && v.blobStore != nil {
-			v.blobStore.UnregisterLocalPack(info.key)
-		}
-	}
-	if v.server != nil && uploadedBytes > 0 {
-		v.server.subLocalPackCacheBytes(uploadedBytes)
+	for packID := range v.packs {
+		v.deletePackLocked(packID)
 	}
 	v.packs = make(map[uint64]*packInfo)
 	if removeErr := os.RemoveAll(v.stagingDir); removeErr != nil && !os.IsNotExist(removeErr) {
@@ -4000,7 +3986,9 @@ func (v *Volume) startPackUploadLocked(packID uint64) {
 			packSize = info.pack.ByteSize()
 		}
 		if v.server != nil && packSize > 0 {
-			v.server.onPackUploaded(v.volumeID, packID, packSize)
+			server := v.server
+			volumeID := v.volumeID
+			go server.onPackUploaded(volumeID, packID, packSize)
 		}
 		return
 	}
@@ -4122,10 +4110,9 @@ func (v *Volume) addStagedBytes(delta int64) {
 }
 
 func (v *Volume) subStagedBytes(delta int64) {
-	if v.stagedBytes < delta {
-		v.stagedBytes = 0
-	} else {
-		v.stagedBytes -= delta
+	v.stagedBytes -= delta
+	if v.stagedBytes < 0 {
+		klog.Errorf("ObjectFS volume %s: negative staged bytes: %d", v.volumeID, v.stagedBytes)
 	}
 	if v.server != nil {
 		v.server.subLocalStagingBytes(delta)

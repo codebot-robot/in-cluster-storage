@@ -423,10 +423,10 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		backend = NewMemoryBackend()
 	}
 	s := &Server{
-		volumes:           make(map[string]*Volume),
-		backend:           backend,
-		blobStore:         blob.NewStore(backend, 0),
-		broadcaster:       NewEventBroadcaster(),
+		volumes:                make(map[string]*Volume),
+		backend:                backend,
+		blobStore:              blob.NewStore(backend, 0),
+		broadcaster:            NewEventBroadcaster(),
 		checkpointWaiters:      make(map[string]chan uint64),
 		exclusiveHolds:         make(map[string]*ExclusiveHold),
 		exclusiveLeaseTTL:      30 * time.Second,
@@ -1942,35 +1942,37 @@ func (s *Server) addLocalStagingBytes(delta int64) {
 
 func (s *Server) subLocalStagingBytes(delta int64) {
 	s.diskLimitsMu.Lock()
-	if s.localStagingBytes < delta {
-		s.localStagingBytes = 0
-	} else {
-		s.localStagingBytes -= delta
+	s.localStagingBytes -= delta
+	if s.localStagingBytes < 0 {
+		klog.Errorf("negative local staging bytes: %d", s.localStagingBytes)
 	}
 	s.diskLimitsMu.Unlock()
 }
 
 func (s *Server) subLocalPackCacheBytes(delta int64) {
 	s.diskLimitsMu.Lock()
-	if s.localPackCacheBytes < delta {
-		s.localPackCacheBytes = 0
-	} else {
-		s.localPackCacheBytes -= delta
+	s.localPackCacheBytes -= delta
+	if s.localPackCacheBytes < 0 {
+		klog.Errorf("negative local pack cache bytes: %d", s.localPackCacheBytes)
 	}
 	s.diskLimitsMu.Unlock()
 }
 
 func (s *Server) onPackUploaded(volumeID string, packID uint64, packSize int64) {
 	s.diskLimitsMu.Lock()
-	defer s.diskLimitsMu.Unlock()
-
-	if s.maxLocalPackCacheBytes > 0 && s.localPackCacheBytes+packSize > s.maxLocalPackCacheBytes {
-		s.evictLocalPackCacheLocked(packSize)
-	}
 	s.localPackCacheBytes += packSize
+	var bytesToEvict int64
+	if s.maxLocalPackCacheBytes > 0 && s.localPackCacheBytes > s.maxLocalPackCacheBytes {
+		bytesToEvict = s.localPackCacheBytes - s.maxLocalPackCacheBytes
+	}
+	s.diskLimitsMu.Unlock()
+
+	if bytesToEvict > 0 {
+		s.evictLocalPackCache(bytesToEvict)
+	}
 }
 
-func (s *Server) evictLocalPackCacheLocked(neededBytes int64) {
+func (s *Server) evictLocalPackCache(bytesToEvict int64) {
 	type candidatePack struct {
 		volume   *Volume
 		packID   uint64
@@ -2006,8 +2008,9 @@ func (s *Server) evictLocalPackCacheLocked(neededBytes int64) {
 		return candidates[i].lastRead.Before(candidates[j].lastRead)
 	})
 
+	var evictedBytes int64
 	for _, candidate := range candidates {
-		if s.localPackCacheBytes+neededBytes <= s.maxLocalPackCacheBytes {
+		if evictedBytes >= bytesToEvict {
 			break
 		}
 		candidate.volume.stagingMu.Lock()
@@ -2018,11 +2021,7 @@ func (s *Server) evictLocalPackCacheLocked(neededBytes int64) {
 				packSize = info.pack.ByteSize()
 			}
 			candidate.volume.deletePackLocked(candidate.packID)
-			if s.localPackCacheBytes < packSize {
-				s.localPackCacheBytes = 0
-			} else {
-				s.localPackCacheBytes -= packSize
-			}
+			evictedBytes += packSize
 		}
 		candidate.volume.stagingMu.Unlock()
 	}
