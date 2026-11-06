@@ -17,10 +17,15 @@ limitations under the License.
 package scoped
 
 import (
+	"context"
 	"sync"
 	"testing"
 
 	"github.com/go-logr/logr"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 type testSink struct {
@@ -89,4 +94,81 @@ func TestWithLog(t *testing.T) {
 	if got := retrievedSink.Value("key"); got != "value" {
 		t.Fatalf("expected key=value, got %v", got)
 	}
+}
+
+func TestStartWithProvider(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tracerProvider := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	previousProvider := otel.GetTracerProvider()
+	otel.SetTracerProvider(tracerProvider)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(previousProvider)
+		if err := tracerProvider.Shutdown(context.WithoutCancel(t.Context())); err != nil {
+			t.Errorf("failed to shut down tracer provider: %v", err)
+		}
+	})
+
+	sink := newTestSink()
+	ctx := WithLog(t.Context(), logr.New(sink))
+
+	ctx, span := Start(ctx, "test_operation")
+	span.SetAttributes(attribute.String("test.key", "test.value"))
+
+	logger := Log(ctx)
+	retrievedSink, ok := logger.GetSink().(*testSink)
+	if !ok {
+		t.Fatalf("expected *testSink, got %T", logger.GetSink())
+	}
+	expectedTraceID := span.SpanContext().TraceID().String()
+	if got := retrievedSink.Value("trace_id"); got != expectedTraceID {
+		t.Fatalf("expected trace_id=%s, got %v", expectedTraceID, got)
+	}
+	expectedSpanID := span.SpanContext().SpanID().String()
+	if got := retrievedSink.Value("span_id"); got != expectedSpanID {
+		t.Fatalf("expected span_id=%s, got %v", expectedSpanID, got)
+	}
+
+	span.End()
+
+	exportedSpans := exporter.GetSpans()
+	if len(exportedSpans) != 1 {
+		t.Fatalf("expected 1 exported span, got %d", len(exportedSpans))
+	}
+	exportedSpan := exportedSpans[0]
+	if exportedSpan.Name != "test_operation" {
+		t.Fatalf("expected span name test_operation, got %s", exportedSpan.Name)
+	}
+	if len(exportedSpan.Attributes) != 1 {
+		t.Fatalf("expected 1 attribute, got %d", len(exportedSpan.Attributes))
+	}
+	if key := exportedSpan.Attributes[0].Key; key != "test.key" {
+		t.Fatalf("expected attribute key test.key, got %s", key)
+	}
+	if value := exportedSpan.Attributes[0].Value.AsString(); value != "test.value" {
+		t.Fatalf("expected attribute value test.value, got %s", value)
+	}
+}
+
+func TestStartWithoutProvider(t *testing.T) {
+	sink := newTestSink()
+	ctx := WithLog(t.Context(), logr.New(sink))
+
+	ctx, span := Start(ctx, "test_operation")
+	if span.IsRecording() {
+		t.Fatal("expected span to be non-recording without provider")
+	}
+
+	logger := Log(ctx)
+	retrievedSink, ok := logger.GetSink().(*testSink)
+	if !ok {
+		t.Fatalf("expected *testSink, got %T", logger.GetSink())
+	}
+	if got := retrievedSink.Value("trace_id"); got != nil {
+		t.Fatalf("expected trace_id to be unset, got %v", got)
+	}
+	if got := retrievedSink.Value("span_id"); got != nil {
+		t.Fatalf("expected span_id to be unset, got %v", got)
+	}
+
+	span.End()
 }
