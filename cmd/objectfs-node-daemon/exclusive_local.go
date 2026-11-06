@@ -29,6 +29,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -211,9 +212,10 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	}
 
 	var syncWg sync.WaitGroup
-	watchCtx, cancel := context.WithCancel(context.Background())
+	mountLogger := scoped.Log(context.Background()).WithValues("volume", volumeID, "target", targetPath)
+	watchCtx, cancel := context.WithCancel(scoped.WithLog(context.Background(), mountLogger))
 	var renewWg sync.WaitGroup
-	renewCtx, renewCancel := context.WithCancel(context.Background())
+	renewCtx, renewCancel := context.WithCancel(scoped.WithLog(context.Background(), mountLogger))
 	d.startExclusiveLocalSync(watchCtx, &syncWg, renewCtx, &renewWg, client, volumeID, volumeDir, lowerPath, upperPath, mountID, checkpointInterval)
 
 	d.mu.Lock()

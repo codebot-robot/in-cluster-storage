@@ -28,6 +28,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
@@ -58,7 +59,7 @@ func main() {
 		klog.Fatalf("failed to listen on port %d: %v", *port, err)
 	}
 
-	ctx := context.Background()
+	ctx := scoped.WithLog(context.Background(), klog.Background())
 	backend, err := objectstore.Open(ctx, *backendType)
 	if err != nil {
 		klog.Fatalf("failed to initialize backend %q: %v", *backendType, err)
