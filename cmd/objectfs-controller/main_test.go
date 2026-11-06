@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/x509"
 	"flag"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,32 @@ func TestParseEndpoint(t *testing.T) {
 				t.Errorf("parseEndpoint(%q) = (%q, %q), want (%q, %q)", tt.endpoint, proto, addr, tt.wantProto, tt.wantAddr)
 			}
 		}
+	}
+}
+
+func TestMetadataIndexFlag(t *testing.T) {
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	flagSet.SetOutput(io.Discard)
+	options.AddFlags(flagSet)
+	flagOption := flagSet.Lookup("metadata-index")
+	if flagOption == nil {
+		t.Fatal("flag --metadata-index not registered")
+	}
+	if flagOption.DefValue != "sqlite" {
+		t.Errorf("default value = %q, want sqlite", flagOption.DefValue)
+	}
+	for _, accepted := range []string{"table", "sqlite"} {
+		if err := flagOption.Value.Set(accepted); err != nil || options.MetadataIndex != accepted {
+			t.Fatalf("Set(%q) error = %v, got %q", accepted, err, options.MetadataIndex)
+		}
+	}
+	err := flagOption.Value.Set("memory")
+	if err == nil || !strings.Contains(err.Error(), "sqlite") || !strings.Contains(err.Error(), "table") {
+		t.Errorf("Set(memory) error = %v, want error naming accepted values sqlite and table", err)
+	}
+	if err := flagSet.Parse([]string{"--metadata-index=memory"}); err == nil {
+		t.Fatal("expected flagSet.Parse to fail for --metadata-index=memory")
 	}
 }
 
@@ -150,6 +177,7 @@ func TestOptionsParseAndValidate(t *testing.T) {
 		{"missing metadata dir", func(o *Options) { o.MetadataDir = "" }, "--metadata-dir"},
 		{"missing wal dir", func(o *Options) { o.WALDir = "" }, "--wal-dir"},
 		{"missing wal target", func(o *Options) { o.WALTarget = "" }, "--wal-target"},
+		{"invalid metadata index", func(o *Options) { o.MetadataIndex = "memory" }, "accepted values"},
 		{"invalid csi endpoint", func(o *Options) { o.CSIEndpoint = "http://invalid" }, "invalid endpoint"},
 	}
 
