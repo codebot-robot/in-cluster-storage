@@ -25,7 +25,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -321,5 +324,311 @@ func TestHolderMountFUSE(t *testing.T) {
 	_, _, err = client.Get(targetDirectory)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after unmount, got: %v", err)
+	}
+}
+
+func TestHolderReplacementSurvivesPredecessorStop(t *testing.T) {
+	temporaryDirectory := t.TempDir()
+	socketPath := filepath.Join(temporaryDirectory, "fuse-holder.sock")
+
+	// 1. Start holder A
+	listenerA, err := Listen(socketPath)
+	if err != nil {
+		t.Fatalf("failed to listen for holder A: %v", err)
+	}
+	holderA := New()
+	go func() {
+		if serveErr := holderA.Serve(listenerA); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+			t.Errorf("holder A Serve failed: %v", serveErr)
+		}
+	}()
+
+	// Verify holder A is reachable
+	clientA, err := Dial(socketPath)
+	if err != nil {
+		t.Fatalf("failed to dial holder A: %v", err)
+	}
+	entriesA, err := clientA.List()
+	if err != nil {
+		t.Fatalf("client A List failed: %v", err)
+	}
+	if len(entriesA) != 0 {
+		t.Fatalf("expected empty list from holder A, got %+v", entriesA)
+	}
+	if err := clientA.Close(); err != nil {
+		t.Fatalf("failed to close client A: %v", err)
+	}
+
+	// 2. Start holder B on the same final socket path
+	listenerB, err := Listen(socketPath)
+	if err != nil {
+		t.Fatalf("failed to listen for holder B: %v", err)
+	}
+	mockReaderB, mockWriterB, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create mock pipe: %v", err)
+	}
+	defer func() {
+		if closeErr := mockWriterB.Close(); closeErr != nil {
+			t.Errorf("failed to close mock writer B: %v", closeErr)
+		}
+	}()
+	holderB := New()
+	holderB.mountFunc = func(request MountRequest) (int, error) {
+		return int(mockReaderB.Fd()), nil
+	}
+	if _, err := holderB.Mount(MountRequest{
+		Entry: Entry{
+			Target:   "/mock/holder-b-target",
+			VolumeID: "volume-b",
+		},
+	}); err != nil {
+		t.Fatalf("failed to mount on holder B: %v", err)
+	}
+	go func() {
+		if serveErr := holderB.Serve(listenerB); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+			t.Errorf("holder B Serve failed: %v", serveErr)
+		}
+	}()
+
+	// 3. Stop holder A (closing listenerA and holderA)
+	if err := listenerA.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("failed to close listener A: %v", err)
+	}
+	if err := holderA.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("failed to close holder A: %v", err)
+	}
+
+	// 4. Assert a dial to socketPath still reaches B
+	clientB, err := Dial(socketPath)
+	if err != nil {
+		t.Fatalf("failed to dial socket after holder A stopped: %v", err)
+	}
+	defer func() {
+		if err := clientB.Close(); err != nil {
+			t.Errorf("failed to close client B: %v", err)
+		}
+	}()
+
+	entriesB, err := clientB.List()
+	if err != nil {
+		t.Fatalf("client B List failed: %v", err)
+	}
+	if len(entriesB) != 1 || entriesB[0].Target != "/mock/holder-b-target" {
+		t.Fatalf("expected entries from holder B, got %+v", entriesB)
+	}
+
+	// Cleanup B
+	if err := listenerB.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Errorf("failed to close listener B: %v", err)
+	}
+	if err := holderB.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Errorf("failed to close holder B: %v", err)
+	}
+}
+
+func TestDialRetryDelayedListener(t *testing.T) {
+	temporaryDirectory := t.TempDir()
+	socketPath := filepath.Join(temporaryDirectory, "fuse-holder.sock")
+
+	dialAttempted := make(chan struct{})
+	var closeOnce sync.Once
+	SetDialRetryHookForTesting(func() {
+		closeOnce.Do(func() {
+			close(dialAttempted)
+		})
+	})
+	defer SetDialRetryHookForTesting(nil)
+
+	listenerChannel := make(chan net.Listener, 1)
+	holderChannel := make(chan *Holder, 1)
+
+	mockReader, mockWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create mock pipe: %v", err)
+	}
+	defer func() {
+		if closeErr := mockWriter.Close(); closeErr != nil {
+			t.Errorf("failed to close mock writer pipe: %v", closeErr)
+		}
+	}()
+
+	go func() {
+		// Wait until the initial dial attempt has failed with ENOENT before starting the listener
+		<-dialAttempted
+
+		listener, err := Listen(socketPath)
+		if err != nil {
+			t.Errorf("failed to listen on socket %s: %v", socketPath, err)
+			return
+		}
+		holder := New()
+		holder.mountFunc = func(request MountRequest) (int, error) {
+			return int(mockReader.Fd()), nil
+		}
+		if _, err := holder.Mount(MountRequest{
+			Entry: Entry{
+				Target:   "/delayed/target",
+				VolumeID: "delayed-volume",
+			},
+		}); err != nil {
+			t.Errorf("failed to mount on delayed holder: %v", err)
+			return
+		}
+		go func() {
+			if serveErr := holder.Serve(listener); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+				t.Errorf("delayed holder Serve failed: %v", serveErr)
+			}
+		}()
+
+		listenerChannel <- listener
+		holderChannel <- holder
+	}()
+
+	client, err := dialWithRetry(socketPath, 5*time.Second, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("dialWithRetry failed: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("failed to close client: %v", err)
+		}
+	}()
+
+	listener := <-listenerChannel
+	defer func() {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("failed to close listener: %v", err)
+		}
+	}()
+	holder := <-holderChannel
+	defer func() {
+		if err := holder.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("failed to close holder: %v", err)
+		}
+	}()
+
+	entries, err := client.List()
+	if err != nil {
+		t.Fatalf("client List failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Target != "/delayed/target" {
+		t.Fatalf("expected entries from delayed holder, got %+v", entries)
+	}
+}
+
+func TestDialRetryConnectionRefused(t *testing.T) {
+	temporaryDirectory := t.TempDir()
+	socketPath := filepath.Join(temporaryDirectory, "fuse-holder.sock")
+
+	// Create and immediately close a listener so the socket file exists on disk
+	// but nothing is listening, causing dial to return ECONNREFUSED.
+	initialListener, err := Listen(socketPath)
+	if err != nil {
+		t.Fatalf("failed to create initial listener: %v", err)
+	}
+	if err := initialListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("failed to close initial listener: %v", err)
+	}
+
+	dialAttempted := make(chan struct{})
+	var closeOnce sync.Once
+	SetDialRetryHookForTesting(func() {
+		closeOnce.Do(func() {
+			close(dialAttempted)
+		})
+	})
+	defer SetDialRetryHookForTesting(nil)
+
+	listenerChannel := make(chan net.Listener, 1)
+	holderChannel := make(chan *Holder, 1)
+
+	mockReader, mockWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create mock pipe: %v", err)
+	}
+	defer func() {
+		if closeErr := mockWriter.Close(); closeErr != nil {
+			t.Errorf("failed to close mock writer pipe: %v", closeErr)
+		}
+	}()
+
+	go func() {
+		// Wait until the initial dial attempt has failed with ECONNREFUSED before replacing the socket
+		<-dialAttempted
+
+		replacementListener, err := Listen(socketPath)
+		if err != nil {
+			t.Errorf("failed to listen on replacement socket %s: %v", socketPath, err)
+			return
+		}
+		holder := New()
+		holder.mountFunc = func(request MountRequest) (int, error) {
+			return int(mockReader.Fd()), nil
+		}
+		if _, err := holder.Mount(MountRequest{
+			Entry: Entry{
+				Target:   "/replacement/target",
+				VolumeID: "replacement-volume",
+			},
+		}); err != nil {
+			t.Errorf("failed to mount on replacement holder: %v", err)
+			return
+		}
+		go func() {
+			if serveErr := holder.Serve(replacementListener); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+				t.Errorf("replacement holder Serve failed: %v", serveErr)
+			}
+		}()
+
+		listenerChannel <- replacementListener
+		holderChannel <- holder
+	}()
+
+	client, err := dialWithRetry(socketPath, 5*time.Second, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("dialWithRetry failed: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("failed to close client: %v", err)
+		}
+	}()
+
+	replacementListener := <-listenerChannel
+	defer func() {
+		if err := replacementListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("failed to close replacement listener: %v", err)
+		}
+	}()
+	holder := <-holderChannel
+	defer func() {
+		if err := holder.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("failed to close holder: %v", err)
+		}
+	}()
+
+	entries, err := client.List()
+	if err != nil {
+		t.Fatalf("client List failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Target != "/replacement/target" {
+		t.Fatalf("expected entries from replacement holder, got %+v", entries)
+	}
+}
+
+func TestDialRetryTimeout(t *testing.T) {
+	temporaryDirectory := t.TempDir()
+	socketPath := filepath.Join(temporaryDirectory, "nonexistent.sock")
+
+	client, err := dialWithRetry(socketPath, 50*time.Millisecond, 10*time.Millisecond)
+	if err == nil {
+		if closeErr := client.Close(); closeErr != nil {
+			t.Errorf("failed to close client: %v", closeErr)
+		}
+		t.Fatalf("expected dial to fail for nonexistent socket")
+	}
+	if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected error wrapping ENOENT, got: %v", err)
 	}
 }

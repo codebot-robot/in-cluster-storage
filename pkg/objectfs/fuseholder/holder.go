@@ -17,11 +17,14 @@ limitations under the License.
 package fuseholder
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 
@@ -32,6 +35,51 @@ import (
 type heldMount struct {
 	entry Entry
 	fd    int
+}
+
+// Listen creates a Unix domain socket listener that publishes atomically to socketPath.
+// It listens on a temporary path in the same directory and renames it over socketPath,
+// disabling unlink-on-close so shutting down the listener does not remove a successor's socket.
+func Listen(socketPath string) (net.Listener, error) {
+	directory := filepath.Dir(socketPath)
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		return nil, fmt.Errorf("create socket directory: %w", err)
+	}
+
+	var randomBytes [4]byte
+	if _, err := rand.Read(randomBytes[:]); err != nil {
+		return nil, fmt.Errorf("generate random suffix: %w", err)
+	}
+	temporaryPath := filepath.Join(directory, fmt.Sprintf(".%s.%d.%x.temporary", filepath.Base(socketPath), os.Getpid(), randomBytes))
+
+	listener, err := net.Listen("unix", temporaryPath)
+	if err != nil {
+		return nil, fmt.Errorf("listen on temporary socket %s: %w", temporaryPath, err)
+	}
+
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			klog.Warningf("failed to close listener: %v", closeErr)
+		}
+		if removeErr := os.Remove(temporaryPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			klog.Warningf("failed to remove temporary socket %s: %v", temporaryPath, removeErr)
+		}
+		return nil, errors.New("listener is not a Unix listener")
+	}
+	unixListener.SetUnlinkOnClose(false)
+
+	if err := os.Rename(temporaryPath, socketPath); err != nil {
+		if closeErr := unixListener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			klog.Warningf("failed to close listener after rename failure: %v", closeErr)
+		}
+		if removeErr := os.Remove(temporaryPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			klog.Warningf("failed to remove temporary socket %s: %v", temporaryPath, removeErr)
+		}
+		return nil, fmt.Errorf("rename socket from %s to %s: %w", temporaryPath, socketPath, err)
+	}
+
+	return unixListener, nil
 }
 
 // Holder manages active FUSE mount descriptors and serves requests over a Unix domain socket.

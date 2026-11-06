@@ -42,11 +42,8 @@ func main() {
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0755); err != nil {
 		klog.Fatalf("failed to create socket directory: %v", err)
 	}
-	if err := os.Remove(*socketPath); err != nil && !os.IsNotExist(err) {
-		klog.Fatalf("failed to remove existing socket: %v", err)
-	}
 
-	listener, err := net.Listen("unix", *socketPath)
+	listener, err := fuseholder.Listen(*socketPath)
 	if err != nil {
 		klog.Fatalf("failed to listen on socket %s: %v", *socketPath, err)
 	}
