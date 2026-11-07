@@ -60,7 +60,7 @@ func NewIncrementalPackFromFile(file *os.File, slots uint32) (*IncrementalPack, 
 }
 
 // NewIncrementalPack creates a new packfile on disk at the specified path.
-func NewIncrementalPack(path string, slots uint32) (*IncrementalPack, error) {
+func NewIncrementalPack(ctx context.Context, path string, slots uint32) (*IncrementalPack, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
@@ -71,10 +71,7 @@ func NewIncrementalPack(path string, slots uint32) (*IncrementalPack, error) {
 	pack, err := NewIncrementalPackFromFile(file, slots)
 	if err != nil {
 		errutil.CloseAndLog(file, "incremental pack")
-		if removeErr := os.Remove(path); removeErr != nil {
-			// File creation cleanup without a request context; use logger derived from root context.
-			scoped.Log(context.Background()).Info("failed to remove packfile", "path", path, "err", removeErr)
-		}
+		removeTempFileAndLog(ctx, path, "packfile")
 		return nil, err
 	}
 	return pack, nil
@@ -87,8 +84,8 @@ func (p *IncrementalPack) verifyOpenLocked() error {
 	return nil
 }
 
-func (p *IncrementalPack) Append(data []byte) (BlobEntry, error) {
-	blob, err := EncodeBlob(NewByteStreamFromBytes(data), true)
+func (p *IncrementalPack) Append(ctx context.Context, data []byte) (BlobEntry, error) {
+	blob, err := EncodeBlob(ctx, NewByteStreamFromBytes(data), true)
 	if err != nil {
 		return BlobEntry{}, err
 	}
@@ -148,14 +145,14 @@ func (p *IncrementalPack) Lookup(target [32]byte) (BlobEntry, bool) {
 }
 
 // ReadBlob reads and decodes the blob payload corresponding to entry.
-func (p *IncrementalPack) ReadBlob(entry BlobEntry) (ByteStream, error) {
+func (p *IncrementalPack) ReadBlob(ctx context.Context, entry BlobEntry) (ByteStream, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.verifyOpenLocked(); err != nil {
 		return nil, err
 	}
 	sectionReader := io.NewSectionReader(p.file, int64(entry.DataOffset), int64(entry.StoredLength))
-	return decodePayloadToByteStream(sectionReader, entry.Encoding, int64(entry.FinalLength))
+	return decodePayloadToByteStream(ctx, sectionReader, entry.Encoding, int64(entry.FinalLength))
 }
 
 func buildItemHeader(encoding uint32, finalLength uint32) []byte {
@@ -176,7 +173,7 @@ func buildSlot(e BlobEntry) []byte {
 }
 
 // Seal marks the pack sealed without syncing; caller syncs if durability is needed.
-func (p *IncrementalPack) Seal() error {
+func (p *IncrementalPack) Seal(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.sealed {
@@ -190,8 +187,7 @@ func (p *IncrementalPack) Seal() error {
 		packSlotsFullCount++
 		count := packSlotsFullCount
 		packSlotsFullMu.Unlock()
-		// IncrementalPack.Seal has no request context; use logger derived from root context.
-		scoped.Log(context.Background()).V(2).Info("packfile sealed with all slots full", "slots", p.slots, "totalFullPacks", count)
+		scoped.Log(ctx).V(2).Info("packfile sealed with all slots full", "slots", p.slots, "totalFullPacks", count)
 	}
 	sort.Slice(p.entries, func(i, j int) bool {
 		return bytes.Compare(p.entries[i].SHA256[:], p.entries[j].SHA256[:]) < 0

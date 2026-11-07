@@ -172,17 +172,18 @@ func (f *fileByteStream) Seek(offset int64, whence int) (int64, error) {
 }
 
 // removeTempFileAndLog removes a temporary file and logs if removal fails (ignoring os.ErrNotExist).
-// Temporary file cleanup without a request context; use logger derived from root context.
-func removeTempFileAndLog(path, what string) {
+func removeTempFileAndLog(ctx context.Context, path, what string) {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		scoped.Log(context.Background()).Info("failed to remove", "what", what, "path", path, "err", err)
+		scoped.Log(ctx).Info("failed to remove", "what", what, "path", path, "err", err)
 	}
 }
 
 func (f *fileByteStream) Close() error {
 	err := f.file.Close()
 	if f.autoDelete && f.path != "" {
-		removeTempFileAndLog(f.path, "temporary file")
+		if removeErr := os.Remove(f.path); removeErr != nil && !os.IsNotExist(removeErr) {
+			err = errors.Join(err, removeErr)
+		}
 	}
 	return err
 }
@@ -316,7 +317,7 @@ func (b *EncodedBlob) Close() error {
 
 // EncodeBlob takes a ByteStream and encodes it, computing the SHA256 and compressing by default.
 // It performs a single pass over src when compressing. If compression is not a win, it rewinds src and uses raw uncompressed data.
-func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
+func EncodeBlob(ctx context.Context, src ByteStream, compress bool) (*EncodedBlob, error) {
 	if err := src.Rewind(); err != nil {
 		return nil, fmt.Errorf("failed to rewind input stream: %w", err)
 	}
@@ -367,14 +368,14 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 		errutil.CloseAndLog(zw, "zlib compressor")
 		if outputTempFile != nil {
 			errutil.CloseAndLog(outputTempFile, "temp compression file")
-			removeTempFileAndLog(outputTempPath, "temporary compression file")
+			removeTempFileAndLog(ctx, outputTempPath, "temporary compression file")
 		}
 		return nil, fmt.Errorf("compression failed: %w", err)
 	}
 	if err := zw.Close(); err != nil {
 		if outputTempFile != nil {
 			errutil.CloseAndLog(outputTempFile, "temp compression file")
-			removeTempFileAndLog(outputTempPath, "temporary compression file")
+			removeTempFileAndLog(ctx, outputTempPath, "temporary compression file")
 		}
 		return nil, fmt.Errorf("compression close failed: %w", err)
 	}
@@ -387,7 +388,7 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 		st, err := outputTempFile.Stat()
 		if err != nil {
 			errutil.CloseAndLog(outputTempFile, "temp compression file")
-			removeTempFileAndLog(outputTempPath, "temporary compression file")
+			removeTempFileAndLog(ctx, outputTempPath, "temporary compression file")
 			return nil, fmt.Errorf("failed to stat temp compression file: %w", err)
 		}
 		outputLen = st.Size()
@@ -401,7 +402,7 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 		if useTemp {
 			if _, err := outputTempFile.Seek(0, io.SeekStart); err != nil {
 				errutil.CloseAndLog(outputTempFile, "temp compression file")
-				removeTempFileAndLog(outputTempPath, "temporary compression file")
+				removeTempFileAndLog(ctx, outputTempPath, "temporary compression file")
 				return nil, fmt.Errorf("failed to seek temp compression file: %w", err)
 			}
 			return &EncodedBlob{
@@ -424,7 +425,7 @@ func EncodeBlob(src ByteStream, compress bool) (*EncodedBlob, error) {
 	// Compression was not a win, discard compressed output and use raw src
 	if outputTempFile != nil {
 		errutil.CloseAndLog(outputTempFile, "temp compression file")
-		removeTempFileAndLog(outputTempPath, "temporary compression file")
+		removeTempFileAndLog(ctx, outputTempPath, "temporary compression file")
 	}
 	if err := src.Rewind(); err != nil {
 		return nil, err
@@ -509,7 +510,7 @@ func computeStreamSHA256(stream ByteStream) ([32]byte, error) {
 	return sum, nil
 }
 
-func decodePayloadToByteStream(r io.Reader, encoding uint32, finalLen int64) (ByteStream, error) {
+func decodePayloadToByteStream(ctx context.Context, r io.Reader, encoding uint32, finalLen int64) (ByteStream, error) {
 	var src io.Reader = r
 	if encoding == EncodingCompressed {
 		zr, err := zlib.NewReader(r)
@@ -547,18 +548,18 @@ func decodePayloadToByteStream(r io.Reader, encoding uint32, finalLen int64) (By
 	written, err := io.Copy(tf, src)
 	if err != nil {
 		errutil.CloseAndLog(tf, "temp payload file")
-		removeTempFileAndLog(tempPath, "temporary payload file")
+		removeTempFileAndLog(ctx, tempPath, "temporary payload file")
 		return nil, fmt.Errorf("failed writing to temp file: %w", err)
 	}
 	if written != finalLen {
 		errutil.CloseAndLog(tf, "temp payload file")
-		removeTempFileAndLog(tempPath, "temporary payload file")
+		removeTempFileAndLog(ctx, tempPath, "temporary payload file")
 		return nil, fmt.Errorf("decoded payload length mismatch: expected %d bytes, got %d", finalLen, written)
 	}
 
 	if _, err := tf.Seek(0, io.SeekStart); err != nil {
 		errutil.CloseAndLog(tf, "temp payload file")
-		removeTempFileAndLog(tempPath, "temporary payload file")
+		removeTempFileAndLog(ctx, tempPath, "temporary payload file")
 		return nil, fmt.Errorf("failed to seek temp payload file: %w", err)
 	}
 
@@ -567,7 +568,7 @@ func decodePayloadToByteStream(r io.Reader, encoding uint32, finalLen int64) (By
 
 // DecodeLooseBlob parses the standalone loose blob header from r and returns a ByteStream for the decoded data.
 // It is the caller's responsibility to verify the SHA256 if needed.
-func DecodeLooseBlob(r io.Reader) (ByteStream, BlobEntry, error) {
+func DecodeLooseBlob(ctx context.Context, r io.Reader) (ByteStream, BlobEntry, error) {
 	hdrBuf := make([]byte, SingleBlobHeaderSize)
 	if _, err := io.ReadFull(r, hdrBuf); err != nil {
 		return nil, BlobEntry{}, fmt.Errorf("failed to read loose blob header: %w", err)
@@ -592,7 +593,7 @@ func DecodeLooseBlob(r io.Reader) (ByteStream, BlobEntry, error) {
 		Encoding:    encoding,
 	}
 
-	stream, err := decodePayloadToByteStream(r, encoding, int64(finalLen))
+	stream, err := decodePayloadToByteStream(ctx, r, encoding, int64(finalLen))
 	if err != nil {
 		return nil, BlobEntry{}, err
 	}
@@ -631,9 +632,9 @@ func PackSlotsFullCount() uint64 {
 }
 
 // DecodeBlob decodes a blob payload read from the packfile.
-func (p *PackFile) DecodeBlob(r io.Reader, entry BlobEntry) (ByteStream, error) {
+func (p *PackFile) DecodeBlob(ctx context.Context, r io.Reader, entry BlobEntry) (ByteStream, error) {
 	if p.Version == VersionV1 {
-		return DecodeBlobFromPayload(r, entry)
+		return DecodeBlobFromPayload(ctx, r, entry)
 	}
 	// For v2: require exactly stored_length bytes from the input
 	storedBuf := make([]byte, entry.StoredLength)
@@ -641,7 +642,7 @@ func (p *PackFile) DecodeBlob(r io.Reader, entry BlobEntry) (ByteStream, error) 
 		return nil, fmt.Errorf("corrupt packfile entry for sha256 %s at offset %d: expected stored length %d: %w",
 			entry.SHA256Hex(), entry.DataOffset, entry.StoredLength, err)
 	}
-	stream, err := decodePayloadToByteStream(bytes.NewReader(storedBuf), entry.Encoding, int64(entry.FinalLength))
+	stream, err := decodePayloadToByteStream(ctx, bytes.NewReader(storedBuf), entry.Encoding, int64(entry.FinalLength))
 	if err != nil {
 		return nil, fmt.Errorf("corrupt packfile entry for sha256 %s at offset %d: %w",
 			entry.SHA256Hex(), entry.DataOffset, err)
@@ -670,7 +671,7 @@ func WritePackfile(ctx context.Context, destination *os.File, inputs []*EncodedB
 		slots = uint32(len(inputs))
 		scoped.Log(ctx).V(2).Info("batch size exceeds default pack slots; reserving for pack", "batchSize", len(inputs), "defaultSlots", DefaultPackSlots, "slots", slots)
 	}
-	return WritePackfileWithSlots(destination, inputs, slots)
+	return WritePackfileWithSlots(ctx, destination, inputs, slots)
 }
 
 // WritePackfileWithSlots writes a v2 packfile with explicit slot reservation to destination:
@@ -678,7 +679,7 @@ func WritePackfile(ctx context.Context, destination *os.File, inputs []*EncodedB
 // [Table: S * 48B slots: first N sorted by SHA256, remaining S - N zeroed]
 // [Data: for each blob in inputs order: 16B BlobItemHeader + payload data]
 // WritePackfileWithSlots does not close destination; ownership remains with the caller.
-func WritePackfileWithSlots(destination *os.File, inputs []*EncodedBlob, slots uint32) (*PackFile, error) {
+func WritePackfileWithSlots(ctx context.Context, destination *os.File, inputs []*EncodedBlob, slots uint32) (*PackFile, error) {
 	n := len(inputs)
 	if n == 0 {
 		return nil, errors.New("cannot create empty packfile with 0 blobs")
@@ -698,7 +699,7 @@ func WritePackfileWithSlots(destination *os.File, inputs []*EncodedBlob, slots u
 		}
 	}
 
-	if err := pack.Seal(); err != nil {
+	if err := pack.Seal(ctx); err != nil {
 		return nil, err
 	}
 
@@ -895,7 +896,7 @@ func DecodePackTable(r io.Reader) (*PackFile, error) {
 
 // DecodeBlobFromPayload reads the per-blob item header and returns a ByteStream for the blob payload.
 // It is the caller's responsibility to verify the SHA256 if desired.
-func DecodeBlobFromPayload(r io.Reader, entry BlobEntry) (ByteStream, error) {
+func DecodeBlobFromPayload(ctx context.Context, r io.Reader, entry BlobEntry) (ByteStream, error) {
 	itemHdr := make([]byte, BlobItemHeaderSize)
 	if _, err := io.ReadFull(r, itemHdr); err != nil {
 		return nil, fmt.Errorf("failed to read blob item header: %w", err)
@@ -910,7 +911,7 @@ func DecodeBlobFromPayload(r io.Reader, entry BlobEntry) (ByteStream, error) {
 	}
 
 	limited := io.LimitReader(r, payloadStoredLen)
-	return decodePayloadToByteStream(limited, encoding, finalLen)
+	return decodePayloadToByteStream(ctx, limited, encoding, finalLen)
 }
 
 // Manifest describes a chunked file consisting of fixed-size chunk blobs.
@@ -982,7 +983,7 @@ func DecodeManifest(r io.Reader) (*Manifest, error) {
 }
 
 // ChunkBlobs splits a ByteStream into fixed-size chunk blobs and produces a Manifest.
-func ChunkBlobs(src ByteStream, chunkSize uint32, compress bool) ([]*EncodedBlob, *Manifest, *EncodedBlob, error) {
+func ChunkBlobs(ctx context.Context, src ByteStream, chunkSize uint32, compress bool) ([]*EncodedBlob, *Manifest, *EncodedBlob, error) {
 	if chunkSize == 0 {
 		return nil, nil, nil, fmt.Errorf("chunkSize must be greater than 0")
 	}
@@ -1002,7 +1003,7 @@ func ChunkBlobs(src ByteStream, chunkSize uint32, compress bool) ([]*EncodedBlob
 			totalLen += uint64(n)
 			chunkData := make([]byte, n)
 			copy(chunkData, buf[:n])
-			chunkBlob, encodeErr := EncodeBlob(NewByteStreamFromBytes(chunkData), compress)
+			chunkBlob, encodeErr := EncodeBlob(ctx, NewByteStreamFromBytes(chunkData), compress)
 			if encodeErr != nil {
 				return nil, nil, nil, fmt.Errorf("failed encoding chunk: %w", encodeErr)
 			}

@@ -199,7 +199,7 @@ func TestTestMemoryBackendListObjectsMetadata(t *testing.T) {
 func TestSingleBlobEncodeDecode(t *testing.T) {
 	data := []byte(strings.Repeat("This is repetitive data to test compression. ", 100))
 	stream := NewByteStreamFromBytes(data)
-	prep, err := EncodeBlob(stream, true)
+	prep, err := EncodeBlob(t.Context(), stream, true)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestSingleBlobEncodeDecode(t *testing.T) {
 		t.Fatalf("expected FileTypeBlob (1), got %d", hdr.FileType)
 	}
 
-	decStream, entry, err := DecodeLooseBlob(bytes.NewReader(encoded))
+	decStream, entry, err := DecodeLooseBlob(t.Context(), bytes.NewReader(encoded))
 	if err != nil {
 		t.Fatalf("failed to decode loose blob: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestLargeTempFileStreaming(t *testing.T) {
 	largeData := []byte(strings.Repeat("0123456789abcdef", 25*1024)) // 400KB
 	stream := NewByteStreamFromBytes(largeData)
 
-	prep, err := EncodeBlob(stream, true)
+	prep, err := EncodeBlob(t.Context(), stream, true)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestLargeTempFileStreaming(t *testing.T) {
 		t.Fatalf("EncodeLooseBlob failed: %v", err)
 	}
 
-	decStream, entry, err := DecodeLooseBlob(encodedStream)
+	decStream, entry, err := DecodeLooseBlob(t.Context(), encodedStream)
 	if err != nil {
 		t.Fatalf("DecodeLooseBlob failed: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestPackfileEncodeDecode(t *testing.T) {
 
 	var preps []*EncodedBlob
 	for _, c := range origContents {
-		p, err := EncodeBlob(NewByteStreamFromBytes(c), true)
+		p, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(c), true)
 		if err != nil {
 			t.Fatalf("EncodeBlob failed: %v", err)
 		}
@@ -319,7 +319,7 @@ func TestPackfileEncodeDecode(t *testing.T) {
 		}
 
 		payloadReader := bytes.NewReader(packData[entry.DataOffset:])
-		blobStream, err := parsedPack.DecodeBlob(payloadReader, entry)
+		blobStream, err := parsedPack.DecodeBlob(t.Context(), payloadReader, entry)
 		if err != nil {
 			t.Fatalf("failed to decode blob payload: %v", err)
 		}
@@ -480,13 +480,13 @@ func TestManifestEncodeDecodeAndChunkBlobs(t *testing.T) {
 	src := NewByteStreamFromBytes(data)
 
 	// Test chunkSize 0 error
-	if _, _, _, err := ChunkBlobs(src, 0, true); err == nil {
+	if _, _, _, err := ChunkBlobs(t.Context(), src, 0, true); err == nil {
 		t.Fatalf("expected error for chunkSize 0, got nil")
 	}
 
 	chunkSize := uint32(16 * 1024)
 
-	chunkBlobs, manifest, manifestBlob, err := ChunkBlobs(src, chunkSize, true)
+	chunkBlobs, manifest, manifestBlob, err := ChunkBlobs(t.Context(), src, chunkSize, true)
 	if err != nil {
 		t.Fatalf("ChunkBlobs failed: %v", err)
 	}
@@ -636,7 +636,7 @@ func TestAdaptiveCompressionByContentKind(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			stream := NewByteStreamFromBytes(tc.data)
 			start := time.Now()
-			encoded, err := EncodeBlob(stream, true)
+			encoded, err := EncodeBlob(t.Context(), stream, true)
 			encodeElapsed := time.Since(start)
 			if err != nil {
 				t.Fatalf("EncodeBlob failed: %v", err)
@@ -651,7 +651,7 @@ func TestAdaptiveCompressionByContentKind(t *testing.T) {
 
 			// Verify decode
 			readStart := time.Now()
-			decStream, err := decodePayloadToByteStream(encoded.Stream, encoded.Encoding, int64(encoded.FinalLength))
+			decStream, err := decodePayloadToByteStream(t.Context(), encoded.Stream, encoded.Encoding, int64(encoded.FinalLength))
 			if err != nil {
 				t.Fatalf("%s: decode failed: %v", tc.name, err)
 			}
@@ -706,7 +706,7 @@ func BenchmarkAdaptiveCompressionByContentKind(b *testing.B) {
 			stream := NewByteStreamFromBytes(k.data)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				enc, err := EncodeBlob(stream, true)
+				enc, err := EncodeBlob(b.Context(), stream, true)
 				if err != nil {
 					b.Fatalf("EncodeBlob failed: %v", err)
 				}
@@ -715,7 +715,7 @@ func BenchmarkAdaptiveCompressionByContentKind(b *testing.B) {
 		})
 		b.Run(k.name+"/read", func(b *testing.B) {
 			stream := NewByteStreamFromBytes(k.data)
-			enc, err := EncodeBlob(stream, true)
+			enc, err := EncodeBlob(b.Context(), stream, true)
 			if err != nil {
 				b.Fatalf("EncodeBlob failed: %v", err)
 			}
@@ -723,7 +723,7 @@ func BenchmarkAdaptiveCompressionByContentKind(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				_ = enc.Stream.Rewind()
-				dec, err := decodePayloadToByteStream(enc.Stream, enc.Encoding, int64(enc.FinalLength))
+				dec, err := decodePayloadToByteStream(b.Context(), enc.Stream, enc.Encoding, int64(enc.FinalLength))
 				if err != nil {
 					b.Fatalf("decode failed: %v", err)
 				}
@@ -744,7 +744,7 @@ func TestPackfileV2RoundTripUnsorted(t *testing.T) {
 
 	var preps []*EncodedBlob
 	for _, c := range origContents {
-		p, err := EncodeBlob(NewByteStreamFromBytes(c), true)
+		p, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(c), true)
 		if err != nil {
 			t.Fatalf("EncodeBlob failed: %v", err)
 		}
@@ -834,7 +834,7 @@ func TestPackfileV2RoundTripUnsorted(t *testing.T) {
 			t.Fatalf("blob %d (%x) not found via Lookup", i, targetSHA)
 		}
 		r := bytes.NewReader(packData[entry.DataOffset : entry.DataOffset+entry.StoredLength])
-		stream, err := parsedPack.DecodeBlob(r, entry)
+		stream, err := parsedPack.DecodeBlob(t.Context(), r, entry)
 		if err != nil {
 			t.Fatalf("DecodeBlob failed: %v", err)
 		}
@@ -860,7 +860,7 @@ func TestPackfileV2BinarySearchLessSlots(t *testing.T) {
 
 	var preps []*EncodedBlob
 	for _, c := range origContents {
-		p, err := EncodeBlob(NewByteStreamFromBytes(c), true)
+		p, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(c), true)
 		if err != nil {
 			t.Fatalf("EncodeBlob failed: %v", err)
 		}
@@ -937,7 +937,7 @@ func TestPackfileV2FullSlots(t *testing.T) {
 	for i := 0; i < int(slotCount); i++ {
 		data := []byte(fmt.Sprintf("full-slot-blob-%d-payload", i))
 		origs = append(origs, data)
-		p, err := EncodeBlob(NewByteStreamFromBytes(data), true)
+		p, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(data), true)
 		if err != nil {
 			t.Fatalf("EncodeBlob failed: %v", err)
 		}
@@ -971,7 +971,7 @@ func TestPackfileV2FullSlots(t *testing.T) {
 			t.Fatalf("item %d (%x) not found in full pack", i, targetSHA)
 		}
 		r := bytes.NewReader(packBytes[entry.DataOffset : entry.DataOffset+entry.StoredLength])
-		stream, err := parsed.DecodeBlob(r, entry)
+		stream, err := parsed.DecodeBlob(t.Context(), r, entry)
 		if err != nil {
 			t.Fatalf("DecodeBlob failed: %v", err)
 		}
@@ -1029,7 +1029,7 @@ func TestPackfileV1FixtureRead(t *testing.T) {
 			t.Fatalf("blob %d (%x) not found in v1 fixture", i, targetSHA)
 		}
 		r := bytes.NewReader(fixtureData[entry.DataOffset : entry.DataOffset+entry.StoredLength])
-		stream, err := parsed.DecodeBlob(r, entry)
+		stream, err := parsed.DecodeBlob(t.Context(), r, entry)
 		if err != nil {
 			t.Fatalf("DecodeBlob failed on fixture blob %d: %v", i, err)
 		}
@@ -1088,11 +1088,11 @@ func TestMixedStoreV1V2(t *testing.T) {
 	v2SHA2 := fmt.Sprintf("%x", sha256.Sum256(v2Data2))
 
 	// Write v1 packfile
-	prepV1_1, err := EncodeBlob(NewByteStreamFromBytes(v1Data1), true)
+	prepV1_1, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(v1Data1), true)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
-	prepV1_2, err := EncodeBlob(NewByteStreamFromBytes(v1Data2), true)
+	prepV1_2, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(v1Data2), true)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
@@ -1105,11 +1105,11 @@ func TestMixedStoreV1V2(t *testing.T) {
 	}
 
 	// Write v2 packfile
-	prepV2_1, err := EncodeBlob(NewByteStreamFromBytes(v2Data1), true)
+	prepV2_1, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(v2Data1), true)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
-	prepV2_2, err := EncodeBlob(NewByteStreamFromBytes(v2Data2), true)
+	prepV2_2, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(v2Data2), true)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
@@ -1176,7 +1176,7 @@ func TestPackfileV2CorruptEntry_Raw(t *testing.T) {
 
 	// 4096 bytes of incompressible raw data
 	rawData := generateHighEntropyData([]byte("raw-head"), 4096, 777)
-	prep, err := EncodeBlob(NewByteStreamFromBytes(rawData), true)
+	prep, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(rawData), true)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
@@ -1237,7 +1237,7 @@ func TestPackfileV2CorruptEntry_Raw(t *testing.T) {
 		t.Fatalf("entry not found")
 	}
 	emptyReader := bytes.NewReader(nil)
-	decStream, err := parsedPack.DecodeBlob(emptyReader, entry)
+	decStream, err := parsedPack.DecodeBlob(t.Context(), emptyReader, entry)
 	if err == nil {
 		if decStream != nil {
 			_ = decStream.Close()
@@ -1252,7 +1252,7 @@ func TestPackfileV2CorruptEntry_Compressed(t *testing.T) {
 
 	// Compressible repetitive data
 	compData := []byte(strings.Repeat("compressed-repetitive-data-chunk-", 150))
-	prep, err := EncodeBlob(NewByteStreamFromBytes(compData), true)
+	prep, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(compData), true)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
@@ -1305,7 +1305,7 @@ func TestPackfileV2CorruptEntry_ShortRangeRead(t *testing.T) {
 	backend := newTestMemoryBackend()
 
 	data := []byte("short-range-read-test-payload-data")
-	prep, err := EncodeBlob(NewByteStreamFromBytes(data), true)
+	prep, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(data), true)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
@@ -1346,7 +1346,7 @@ func TestPackfileV2CorruptEntry_ChecksumMismatch(t *testing.T) {
 	backend := newTestMemoryBackend()
 
 	data := []byte("checksum-mismatch-test-payload-data")
-	prep, err := EncodeBlob(NewByteStreamFromBytes(data), false)
+	prep, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(data), false)
 	if err != nil {
 		t.Fatalf("EncodeBlob failed: %v", err)
 	}
@@ -1397,7 +1397,7 @@ func TestWritePackfile_ByteIdenticalToBatch(t *testing.T) {
 	}
 	blobs := make([]*EncodedBlob, len(rawBlobs))
 	for i, raw := range rawBlobs {
-		encoded, err := EncodeBlob(NewByteStreamFromBytes(raw), true)
+		encoded, err := EncodeBlob(t.Context(), NewByteStreamFromBytes(raw), true)
 		if err != nil {
 			t.Fatalf("EncodeBlob %d: %v", i, err)
 		}
@@ -1421,7 +1421,7 @@ func TestWritePackfile_ByteIdenticalToBatch(t *testing.T) {
 
 func TestIncrementalPack_LookupAndReadBlob(t *testing.T) {
 	packPath := filepath.Join(t.TempDir(), "lookup-read.pack")
-	pack, err := NewIncrementalPack(packPath, 4)
+	pack, err := NewIncrementalPack(t.Context(), packPath, 4)
 	if err != nil {
 		t.Fatalf("NewIncrementalPack: %v", err)
 	}
@@ -1432,11 +1432,11 @@ func TestIncrementalPack_LookupAndReadBlob(t *testing.T) {
 	}()
 
 	chunk1, chunk2 := []byte("payload-one"), []byte("payload-two")
-	entry1, err := pack.Append(chunk1)
+	entry1, err := pack.Append(t.Context(), chunk1)
 	if err != nil {
 		t.Fatalf("Append 1: %v", err)
 	}
-	entry2, err := pack.Append(chunk2)
+	entry2, err := pack.Append(t.Context(), chunk2)
 	if err != nil {
 		t.Fatalf("Append 2: %v", err)
 	}
@@ -1448,7 +1448,7 @@ func TestIncrementalPack_LookupAndReadBlob(t *testing.T) {
 		if got, ok := pack.Lookup(testCase.entry.SHA256); !ok || got != testCase.entry {
 			t.Fatalf("Lookup open: got %v, want %v", got, testCase.entry)
 		}
-		stream, err := pack.ReadBlob(testCase.entry)
+		stream, err := pack.ReadBlob(t.Context(), testCase.entry)
 		if err != nil {
 			t.Fatalf("ReadBlob open: %v", err)
 		}
@@ -1462,13 +1462,13 @@ func TestIncrementalPack_LookupAndReadBlob(t *testing.T) {
 		t.Fatalf("expected missing lookup false")
 	}
 
-	if err := pack.Seal(); err != nil {
+	if err := pack.Seal(t.Context()); err != nil {
 		t.Fatalf("Seal failed: %v", err)
 	}
 	if got, ok := pack.Lookup(entry2.SHA256); !ok || got != entry2 {
 		t.Fatalf("Lookup sealed: got %v, want %v", got, entry2)
 	}
-	stream, err := pack.ReadBlob(entry2)
+	stream, err := pack.ReadBlob(t.Context(), entry2)
 	if err != nil {
 		t.Fatalf("ReadBlob sealed: %v", err)
 	}
@@ -1482,7 +1482,7 @@ func TestIncrementalPack_LookupAndReadBlob(t *testing.T) {
 func TestIncrementalPack_SealWriteFailureLeavesPackAppendable(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "pack.pack")
-	pack, err := NewIncrementalPack(packPath, 10)
+	pack, err := NewIncrementalPack(t.Context(), packPath, 10)
 	if err != nil {
 		t.Fatalf("NewIncrementalPack failed: %v", err)
 	}
@@ -1493,7 +1493,7 @@ func TestIncrementalPack_SealWriteFailureLeavesPackAppendable(t *testing.T) {
 	})
 
 	chunk1 := []byte("first chunk data")
-	entry1, err := pack.Append(chunk1)
+	entry1, err := pack.Append(t.Context(), chunk1)
 	if err != nil {
 		t.Fatalf("Append 1 failed: %v", err)
 	}
@@ -1506,7 +1506,7 @@ func TestIncrementalPack_SealWriteFailureLeavesPackAppendable(t *testing.T) {
 	}
 	pack.file = roFile
 
-	if err := pack.Seal(); err == nil {
+	if err := pack.Seal(t.Context()); err == nil {
 		t.Fatalf("expected Seal to fail on read-only file descriptor")
 	}
 
@@ -1518,18 +1518,18 @@ func TestIncrementalPack_SealWriteFailureLeavesPackAppendable(t *testing.T) {
 
 	// Verify that the pack was NOT marked sealed: Append of a new chunk must succeed.
 	chunk2 := []byte("second chunk data")
-	entry2, err := pack.Append(chunk2)
+	entry2, err := pack.Append(t.Context(), chunk2)
 	if err != nil {
 		t.Fatalf("Append 2 failed after seal failure: %v", err)
 	}
 
 	// Retry Seal with the writable descriptor; should succeed.
-	if err := pack.Seal(); err != nil {
+	if err := pack.Seal(t.Context()); err != nil {
 		t.Fatalf("Seal retry failed: %v", err)
 	}
 
 	// Once sealed, Append must be refused with "incremental pack is sealed".
-	if _, err := pack.Append([]byte("third chunk")); err == nil || !strings.Contains(err.Error(), "sealed") {
+	if _, err := pack.Append(t.Context(), []byte("third chunk")); err == nil || !strings.Contains(err.Error(), "sealed") {
 		t.Fatalf("expected Append on sealed pack to fail with sealed error, got: %v", err)
 	}
 
@@ -1538,7 +1538,7 @@ func TestIncrementalPack_SealWriteFailureLeavesPackAppendable(t *testing.T) {
 		entry BlobEntry
 		want  []byte
 	}{{entry1, chunk1}, {entry2, chunk2}} {
-		stream, err := pack.ReadBlob(testCase.entry)
+		stream, err := pack.ReadBlob(t.Context(), testCase.entry)
 		if err != nil {
 			t.Fatalf("ReadBlob failed: %v", err)
 		}
@@ -1574,7 +1574,7 @@ func writePackfileWithFnForTest(t *testing.T, writeFn func(*os.File) (*PackFile,
 func writePackfileWithSlotsForTest(t *testing.T, inputs []*EncodedBlob, slots uint32) ([]byte, *PackFile, error) {
 	t.Helper()
 	return writePackfileWithFnForTest(t, func(file *os.File) (*PackFile, error) {
-		return WritePackfileWithSlots(file, inputs, slots)
+		return WritePackfileWithSlots(t.Context(), file, inputs, slots)
 	})
 }
 
@@ -1594,7 +1594,7 @@ func TestIncrementalPack_Close(t *testing.T) {
 
 	// 2. Normal close clears p.file and subsequent close returns nil.
 	tempPath := filepath.Join(t.TempDir(), "test-close.pack")
-	pack, err := NewIncrementalPack(tempPath, 4)
+	pack, err := NewIncrementalPack(t.Context(), tempPath, 4)
 	if err != nil {
 		t.Fatalf("NewIncrementalPack: %v", err)
 	}
@@ -1610,7 +1610,7 @@ func TestIncrementalPack_Close(t *testing.T) {
 
 	// 3. Failed file close returns error and leaves p.file set so descriptor is not leaked.
 	tempPath2 := filepath.Join(t.TempDir(), "test-close-fail.pack")
-	pack2, err := NewIncrementalPack(tempPath2, 4)
+	pack2, err := NewIncrementalPack(t.Context(), tempPath2, 4)
 	if err != nil {
 		t.Fatalf("NewIncrementalPack: %v", err)
 	}
@@ -1637,11 +1637,11 @@ func TestNewIncrementalPackFromFile(t *testing.T) {
 		errutil.CloseAndLog(file, "temp packfile")
 		t.Fatalf("NewIncrementalPackFromFile: %v", err)
 	}
-	entry, err := pack.Append([]byte("hello-from-file"))
+	entry, err := pack.Append(t.Context(), []byte("hello-from-file"))
 	if err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	if err := pack.Seal(); err != nil {
+	if err := pack.Seal(t.Context()); err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
 	if got, ok := pack.Lookup(entry.SHA256); !ok || got.SHA256 != entry.SHA256 {
@@ -1672,19 +1672,53 @@ type blobLogCaptureSink struct {
 	mu            sync.Mutex
 	messages      []string
 	keysAndValues [][]any
+	entries       []map[string]any
+	parent        *blobLogCaptureSink
+	values        map[string]any
 }
 
 func (s *blobLogCaptureSink) Init(info logr.RuntimeInfo) {}
 func (s *blobLogCaptureSink) Enabled(level int) bool     { return true }
 func (s *blobLogCaptureSink) Info(level int, message string, keysAndValues ...any) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.messages = append(s.messages, message)
-	s.keysAndValues = append(s.keysAndValues, keysAndValues)
+	root := s
+	for root.parent != nil {
+		root = root.parent
+	}
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	entry := make(map[string]any, len(s.values)+len(keysAndValues)/2)
+	for key, value := range s.values {
+		entry[key] = value
+	}
+	for index := 0; index < len(keysAndValues)-1; index += 2 {
+		if key, ok := keysAndValues[index].(string); ok {
+			entry[key] = keysAndValues[index+1]
+		}
+	}
+	root.messages = append(root.messages, message)
+	root.keysAndValues = append(root.keysAndValues, keysAndValues)
+	root.entries = append(root.entries, entry)
 }
 func (s *blobLogCaptureSink) Error(err error, message string, keysAndValues ...any) {}
 func (s *blobLogCaptureSink) WithName(name string) logr.LogSink                     { return s }
-func (s *blobLogCaptureSink) WithValues(keysAndValues ...any) logr.LogSink          { return s }
+func (s *blobLogCaptureSink) WithValues(keysAndValues ...any) logr.LogSink {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	newValues := make(map[string]any, len(s.values)+len(keysAndValues)/2)
+	for key, value := range s.values {
+		newValues[key] = value
+	}
+	for index := 0; index < len(keysAndValues)-1; index += 2 {
+		if key, ok := keysAndValues[index].(string); ok {
+			newValues[key] = keysAndValues[index+1]
+		}
+	}
+	root := s
+	for root.parent != nil {
+		root = root.parent
+	}
+	return &blobLogCaptureSink{parent: root, values: newValues}
+}
 
 func TestWritePackfile_ScopedLog(t *testing.T) {
 	sink := &blobLogCaptureSink{}
@@ -1700,7 +1734,7 @@ func TestWritePackfile_ScopedLog(t *testing.T) {
 	var inputs []*EncodedBlob
 	for index := 0; index < int(DefaultPackSlots)+1; index++ {
 		data := []byte(fmt.Sprintf("chunk-%d", index))
-		encoded, err := EncodeBlob(NewByteStreamFromBytes(data), false)
+		encoded, err := EncodeBlob(ctx, NewByteStreamFromBytes(data), false)
 		if err != nil {
 			t.Fatalf("EncodeBlob: %v", err)
 		}
@@ -1720,5 +1754,55 @@ func TestWritePackfile_ScopedLog(t *testing.T) {
 	expectedMessage := "batch size exceeds default pack slots; reserving for pack"
 	if sink.messages[0] != expectedMessage {
 		t.Fatalf("expected message %q, got %q", expectedMessage, sink.messages[0])
+	}
+}
+
+func TestIncrementalPack_Seal_ScopedLog(t *testing.T) {
+	sink := &blobLogCaptureSink{}
+	logger := logr.New(sink).WithValues("callerKey", "callerValue")
+	ctx := scoped.WithLog(t.Context(), logger)
+
+	packPath := filepath.Join(t.TempDir(), "test-seal-log.pack")
+	pack, err := NewIncrementalPack(ctx, packPath, 2)
+	if err != nil {
+		t.Fatalf("NewIncrementalPack: %v", err)
+	}
+	defer func() {
+		if closeErr := pack.Close(); closeErr != nil {
+			t.Errorf("Close failed: %v", closeErr)
+		}
+	}()
+
+	chunk1 := []byte("first-chunk")
+	chunk2 := []byte("second-chunk")
+	if _, err := pack.Append(ctx, chunk1); err != nil {
+		t.Fatalf("Append 1: %v", err)
+	}
+	if _, err := pack.Append(ctx, chunk2); err != nil {
+		t.Fatalf("Append 2: %v", err)
+	}
+
+	if err := pack.Seal(ctx); err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.messages) == 0 {
+		t.Fatal("expected at least one log message from Seal")
+	}
+	expectedMessage := "packfile sealed with all slots full"
+	var found bool
+	for _, entry := range sink.entries {
+		if entry["callerKey"] == "callerValue" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected sealed log entry to carry callerKey, got entries: %v", sink.entries)
+	}
+	if sink.messages[len(sink.messages)-1] != expectedMessage {
+		t.Fatalf("expected last message %q, got %q", expectedMessage, sink.messages[len(sink.messages)-1])
 	}
 }

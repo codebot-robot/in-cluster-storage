@@ -28,7 +28,7 @@ import (
 
 func TestIncrementalPack(t *testing.T) {
 	packPath := filepath.Join(t.TempDir(), "test.pack")
-	pack, err := NewIncrementalPack(packPath, 2)
+	pack, err := NewIncrementalPack(t.Context(), packPath, 2)
 	if err != nil {
 		t.Fatalf("NewIncrementalPack: %v", err)
 	}
@@ -36,17 +36,17 @@ func TestIncrementalPack(t *testing.T) {
 
 	c1, c2 := []byte("gamma"), []byte("alpha")
 	for _, c := range [][]byte{c1, c2} {
-		if _, err := pack.Append(c); err != nil {
+		if _, err := pack.Append(t.Context(), c); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	if entry, err := pack.Append(c1); err != nil || entry.SHA256 != sha256.Sum256(c1) {
+	if entry, err := pack.Append(t.Context(), c1); err != nil || entry.SHA256 != sha256.Sum256(c1) {
 		t.Fatalf("duplicate: got %v err %v", entry, err)
 	}
-	if _, err := pack.Append([]byte("overflow")); !errors.Is(err, ErrPackSlotsFull) {
+	if _, err := pack.Append(t.Context(), []byte("overflow")); !errors.Is(err, ErrPackSlotsFull) {
 		t.Fatalf("expected ErrPackSlotsFull, got: %v", err)
 	}
-	if pack.Count() != 2 || pack.ByteSize() == 0 || pack.Entries()[0].SHA256 != sha256.Sum256(c1) || pack.Seal() != nil {
+	if pack.Count() != 2 || pack.ByteSize() == 0 || pack.Entries()[0].SHA256 != sha256.Sum256(c1) || pack.Seal(t.Context()) != nil {
 		t.Fatalf("unexpected pack state or seal failed")
 	}
 
@@ -57,7 +57,7 @@ func TestIncrementalPack(t *testing.T) {
 	}
 	for _, c := range [][]byte{c1, c2} {
 		entry, ok := parsed.Lookup(sha256.Sum256(c))
-		s, err := parsed.DecodeBlob(bytes.NewReader(data[entry.DataOffset:]), entry)
+		s, err := parsed.DecodeBlob(t.Context(), bytes.NewReader(data[entry.DataOffset:]), entry)
 		if !ok || err != nil {
 			t.Fatalf("lookup/decode: ok=%v err=%v", ok, err)
 		}

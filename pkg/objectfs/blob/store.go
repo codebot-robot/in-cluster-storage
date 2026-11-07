@@ -135,7 +135,7 @@ func (s *Store) PutBlobs(ctx context.Context, blobs map[string]ByteStream) error
 
 	var smallInputs []*EncodedBlob
 	for _, stream := range blobs {
-		prep, err := EncodeBlob(stream, true)
+		prep, err := EncodeBlob(ctx, stream, true)
 		if err != nil {
 			return fmt.Errorf("failed to encode blob: %w", err)
 		}
@@ -348,7 +348,7 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 
 	if found {
 		if localPack != nil {
-			stream, err := localPack.ReadBlob(loc.Entry)
+			stream, err := localPack.ReadBlob(ctx, loc.Entry)
 			if err != nil {
 				if errors.Is(err, ErrPackClosed) {
 					scoped.Log(ctx).V(2).Info("local pack closed during read of blob, falling back to backend", "pack", loc.PackKey, "blob", sha256Hex, "err", err)
@@ -365,7 +365,7 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 			if err := s.backend.GetObject(ctx, "", s.blobKey(sha256Hex), 0, 0, &buf); err != nil {
 				return nil, err
 			}
-			stream, _, err := DecodeLooseBlob(&buf)
+			stream, _, err := DecodeLooseBlob(ctx, &buf)
 			return stream, err
 		}
 
@@ -375,13 +375,13 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 			return nil, fmt.Errorf("failed to read blob slice from pack %s: %w", loc.PackKey, err)
 		}
 		if loc.PackVersion == VersionV1 {
-			return DecodeBlobFromPayload(&buf, loc.Entry)
+			return DecodeBlobFromPayload(ctx, &buf, loc.Entry)
 		}
 		if int64(buf.Len()) != int64(loc.Entry.StoredLength) {
 			return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: expected stored length %d, got %d",
 				loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, loc.Entry.StoredLength, buf.Len())
 		}
-		stream, err := decodePayloadToByteStream(&buf, loc.Entry.Encoding, int64(loc.Entry.FinalLength))
+		stream, err := decodePayloadToByteStream(ctx, &buf, loc.Entry.Encoding, int64(loc.Entry.FinalLength))
 		if err != nil {
 			return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: %w",
 				loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, err)
@@ -406,7 +406,7 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 	standaloneKey := s.blobKey(sha256Hex)
 	var looseBuf bytes.Buffer
 	if err := s.backend.GetObject(ctx, "", standaloneKey, 0, 0, &looseBuf); err == nil && looseBuf.Len() >= SingleBlobHeaderSize {
-		stream, _, err := DecodeLooseBlob(&looseBuf)
+		stream, _, err := DecodeLooseBlob(ctx, &looseBuf)
 		if err != nil {
 			scoped.Log(ctx).Info("failed to decode standalone loose blob", "path", standaloneKey, "err", err)
 		} else {
@@ -433,13 +433,13 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 			return nil, fmt.Errorf("failed to read blob from pack %s: %w", loc.PackKey, err)
 		}
 		if loc.PackVersion == VersionV1 {
-			return DecodeBlobFromPayload(&buf, loc.Entry)
+			return DecodeBlobFromPayload(ctx, &buf, loc.Entry)
 		}
 		if int64(buf.Len()) != int64(loc.Entry.StoredLength) {
 			return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: expected stored length %d, got %d",
 				loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, loc.Entry.StoredLength, buf.Len())
 		}
-		stream, err := decodePayloadToByteStream(&buf, loc.Entry.Encoding, int64(loc.Entry.FinalLength))
+		stream, err := decodePayloadToByteStream(ctx, &buf, loc.Entry.Encoding, int64(loc.Entry.FinalLength))
 		if err != nil {
 			return nil, fmt.Errorf("corrupt packfile entry in %s for sha256 %s at offset %d: %w",
 				loc.PackKey, loc.Entry.SHA256Hex(), loc.Entry.DataOffset, err)
