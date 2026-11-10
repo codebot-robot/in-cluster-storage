@@ -101,7 +101,11 @@ func (b *recordingBackend) PutObject(ctx context.Context, volumeID, key string, 
 		case gateEntered <- struct{}{}:
 		default:
 		}
-		<-gateRelease
+		select {
+		case <-gateRelease:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
 	return b.ObjectStorageBackend.PutObject(ctx, volumeID, key, stream)
 }
@@ -2640,5 +2644,198 @@ func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
 	}
 	if !bytes.Equal(readResponse.GetData(), data[:1024]) {
 		t.Fatalf("ReadFile content mismatch on committed multi-chunk file")
+	}
+}
+
+func setupStagedVolume(t *testing.T, backend ObjectStorageBackend, opts ...ServerOption) (*Server, *Volume, uint64) {
+	t.Helper()
+	server := NewTestServer(t, backend, opts...)
+	volume, err := server.getOrCreateVolume("test-vol")
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	createResp, err := testCreateFile(t.Context(), server, "test-vol", "/test.bin", 0644, nil, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResp.GetAttr().GetInode().GetIno()
+	if _, _, _, _, writeErr := volume.WriteFileWithEpoch(t.Context(), inodeID, 0, []byte("data"), pb.WriteMode_FSYNC); writeErr != nil {
+		t.Fatalf("WriteFile failed: %v", writeErr)
+	}
+	return server, volume, inodeID
+}
+
+func setupParkedSync(t *testing.T) (*Volume, uint64, <-chan error, func()) {
+	t.Helper()
+	backend := newRecordingBackend(NewMemoryBackend())
+	gateEntered, gateRelease := make(chan struct{}, 1), make(chan struct{})
+	backend.setGate(gateEntered, gateRelease)
+	unblock := sync.OnceFunc(func() { close(gateRelease) })
+	t.Cleanup(unblock)
+
+	_, volume, inodeID := setupStagedVolume(t, backend, WithServerSyncTimeout(50*time.Millisecond))
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- volume.Fsync(t.Context(), inodeID) }()
+
+	select {
+	case <-gateEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for pack upload gate")
+	}
+	return volume, inodeID, syncDone, unblock
+}
+
+func waitSyncDone(t *testing.T, syncDone <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-syncDone:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync goroutine left parked")
+		return nil
+	}
+}
+
+func TestVolume_Stop_TimesOutAndIsRetryable(t *testing.T) {
+	ctx := t.Context()
+	volume, inodeID, syncDone, unblock := setupParkedSync(t)
+
+	stopCtx, stopCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer stopCancel()
+	if stopErr := volume.Stop(stopCtx); !errors.Is(stopErr, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got: %v", stopErr)
+	}
+	if _, _, _, _, writeErr := volume.WriteFileWithEpoch(ctx, inodeID, 0, []byte("data2"), pb.WriteMode_FSYNC); !errors.Is(writeErr, ErrVolumeStopping) {
+		t.Fatalf("expected ErrVolumeStopping on post-stop write, got: %v", writeErr)
+	}
+
+	unblock()
+	if err := waitSyncDone(t, syncDone); err != nil {
+		t.Fatalf("in-flight sync failed after release: %v", err)
+	}
+
+	if err := errors.Join(volume.Stop(ctx), volume.Close()); err != nil {
+		t.Fatalf("expected Stop and Close to return nil, got: %v", err)
+	}
+}
+
+func TestVolume_Close_WithoutStopCancelsParkedSync(t *testing.T) {
+	volume, _, syncDone, unblock := setupParkedSync(t)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- volume.Close() }()
+	if err := waitSyncDone(t, closeDone); err != nil {
+		t.Fatalf("expected Close to return nil, got: %v", err)
+	}
+
+	unblock()
+	if err := waitSyncDone(t, syncDone); !errors.Is(err, context.Canceled) && !errors.Is(err, ErrVolumeStopping) {
+		t.Fatalf("expected cancellation or stopping error, got: %v", err)
+	}
+
+	volume.stagingMu.Lock()
+	defer volume.stagingMu.Unlock()
+	if volume.coalesceTimer != nil || !os.IsNotExist(retErr(os.Stat(volume.stagingDir))) {
+		t.Fatal("coalesceTimer re-armed or staging directory still exists after Close")
+	}
+}
+
+func TestVolume_Stop_FlushesStagedWrites(t *testing.T) {
+	ctx := t.Context()
+	backend := newRecordingBackend(NewMemoryBackend())
+	server, volume, inodeID := setupStagedVolume(t, backend)
+	if backend.getPackCount() != 0 {
+		t.Fatal("expected 0 packs before Stop")
+	}
+	if err := volume.Stop(ctx); err != nil || backend.getPackCount() == 0 {
+		t.Fatalf("Stop failed or did not upload packs: %v", err)
+	}
+
+	readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{VolumeId: "test-vol", Inode: inodeID, Offset: 0, Size: 4})
+	if err != nil || readResp.GetError() != 0 || !bytes.Equal(readResp.GetData(), []byte("data")) {
+		t.Fatalf("ReadFile failed after Stop: %v, code=%d", err, readResp.GetError())
+	}
+}
+
+func retErr(_ any, err error) error                       { return err }
+func retErr3(_ any, _ any, err error) error               { return err }
+func retErr5(_ any, _ any, _ any, _ any, err error) error { return err }
+
+func TestVolume_Stop_RejectsMutations(t *testing.T) {
+	ctx := t.Context()
+	_, volume, inodeID := setupStagedVolume(t, NewMemoryBackend())
+	if err := volume.Stop(ctx); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+
+	for name, call := range map[string]func() error{
+		"Mkdir":              func() error { return retErr(volume.Mkdir(ctx, 1, "d", 0755, 0, 0)) },
+		"CreateFile":         func() error { return retErr(volume.CreateFile(ctx, 1, "f", 0644, nil, 0, 0, 0)) },
+		"WriteFileWithEpoch": func() error { return retErr5(volume.WriteFileWithEpoch(ctx, inodeID, 0, nil, 0)) },
+		"TruncateFile":       func() error { return retErr(volume.TruncateFile(ctx, inodeID, 0)) },
+		"PunchHole":          func() error { return retErr(volume.PunchHole(ctx, inodeID, 0, 1, false)) },
+		"Unlink":             func() error { return retErr(volume.Unlink(ctx, 1, "test.bin")) },
+		"Rmdir":              func() error { return retErr(volume.Rmdir(ctx, 1, "d")) },
+		"Rename":             func() error { return retErr(volume.Rename(ctx, 1, "a", 1, "b")) },
+		"Symlink":            func() error { return retErr(volume.Symlink(ctx, 1, "s", "t", 0, 0)) },
+		"Link":               func() error { return retErr(volume.Link(ctx, 1, 1, "l")) },
+		"SetAttr":            func() error { return retErr(volume.SetAttr(ctx, 1, nil, nil, nil, nil, false, nil, false, nil, false)) },
+		"SetXAttr":           func() error { return volume.SetXAttr(ctx, 1, "k", nil, 0) },
+		"RemoveXAttr":        func() error { return volume.RemoveXAttr(ctx, 1, "k") },
+		"FsyncWithEpoch":     func() error { return retErr3(volume.FsyncWithEpoch(ctx, 1, true, 0, 0)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.Is(err, ErrVolumeStopping) {
+				t.Fatalf("expected ErrVolumeStopping, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestVolume_Stop_Guards(t *testing.T) {
+	canceledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	for _, tc := range []struct {
+		name    string
+		doneCtx bool
+		failPut bool
+	}{
+		{name: "done context returns error without sync", doneCtx: true},
+		{name: "failed drain returns error", failPut: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := newRecordingBackend(NewMemoryBackend())
+			_, volume, _ := setupStagedVolume(t, backend)
+
+			stopCtx := t.Context()
+			if tc.doneCtx {
+				stopCtx = canceledCtx
+			}
+			if tc.failPut {
+				backend.mu.Lock()
+				backend.failPut = true
+				backend.mu.Unlock()
+				t.Cleanup(func() {
+					backend.mu.Lock()
+					backend.failPut = false
+					backend.mu.Unlock()
+				})
+			}
+
+			stopErr := volume.Stop(stopCtx)
+			if tc.doneCtx {
+				if !errors.Is(stopErr, context.Canceled) {
+					t.Fatalf("expected context.Canceled, got: %v", stopErr)
+				}
+				volume.stagingMu.Lock()
+				defer volume.stagingMu.Unlock()
+				if volume.syncInProgress || volume.stopping || len(volume.stagedChunks) == 0 || backend.getPackCount() != 0 {
+					t.Fatal("expected volume untouched after done context Stop")
+				}
+			} else if stopErr == nil || !strings.Contains(stopErr.Error(), "failed to drain") {
+				t.Fatalf("expected error containing 'failed to drain', got: %v", stopErr)
+			}
+		})
 	}
 }
