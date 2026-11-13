@@ -109,6 +109,14 @@ type syncWaiter struct {
 	ch      chan syncResult
 }
 
+// syncOperation describes the currently running in-flight sync operation.
+type syncOperation struct {
+	trigger       pb.FsyncRequest_SyncTrigger
+	commitSeq     uint64
+	startTime     time.Time
+	syncingInodes map[uint64]struct{}
+}
+
 // stagedChunkReference references a chunk payload stored in an incremental v2 packfile.
 type stagedChunkReference struct {
 	PackID uint64
@@ -173,15 +181,11 @@ type Volume struct {
 	coalesceWindow     time.Duration
 	closeTimer         *time.Timer
 	closeInodes        map[uint64]struct{}
-	syncingInodes      map[uint64]struct{}
+	currentSync        *syncOperation
 	syncTimeout        time.Duration
 	openBarrierTimeout time.Duration
 	consistencyMode    pb.ConsistencyMode
-	syncInProgress     bool
 	syncCond           *sync.Cond
-	syncTrigger        pb.FsyncRequest_SyncTrigger
-	syncCommitSeq      uint64
-	syncStartTime      time.Time
 	stagingClosed      bool
 	stopping           bool
 
@@ -549,7 +553,6 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		coalesceWindow:     1 * time.Second,
 		syncTimeout:        10 * time.Minute,
 		openBarrierTimeout: 30 * time.Second,
-		syncingInodes:      make(map[uint64]struct{}),
 	}
 	uploadContext, cancelUpload := context.WithCancel(context.Background())
 	v.uploadContext = uploadContext
@@ -644,13 +647,7 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
 
-	v.syncInProgress = false
-	v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED
-	v.syncCommitSeq = 0
-	v.syncStartTime = time.Time{}
-	for sIno := range snapshotChunks {
-		delete(v.syncingInodes, sIno)
-	}
+	v.currentSync = nil
 
 	if err != nil {
 		for sIno := range snapshotChunks {
@@ -707,7 +704,7 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 func (v *Volume) triggerCoalesceSync() {
 	v.stagingMu.Lock()
 	v.coalesceTimer = nil
-	if v.rejectMutationLocked() != nil || v.syncInProgress {
+	if v.rejectMutationLocked() != nil || v.currentSync != nil {
 		v.stagingMu.Unlock()
 		return
 	}
@@ -727,7 +724,6 @@ func (v *Volume) triggerCoalesceSync() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_PERIODIC
 	requirePermanent := v.stream.ReplicationLevel() >= walclient.Permanent
 	if _, err := v.executeSyncLocked(ctx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC, requirePermanent, nil); err != nil {
 		klog.Warningf("ObjectFS volume %s coalesce sync failed: %v", v.volumeID, err)
@@ -762,7 +758,7 @@ func (v *Volume) syncInodesLocked(ctx context.Context, targetInodes map[uint64]s
 }
 
 func (v *Volume) waitForSyncIdleLocked() {
-	for v.syncInProgress {
+	for v.currentSync != nil {
 		v.syncCond.Wait()
 	}
 }
@@ -779,7 +775,6 @@ func (v *Volume) triggerCloseSync() {
 		v.stagingMu.Unlock()
 		return
 	}
-	v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_CLOSE
 	targetInodes := v.closeInodes
 	v.closeInodes = make(map[uint64]struct{})
 
@@ -858,7 +853,6 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 			return epoch, pos, v.finishSync(snapSeq, nil, nil, pos, nil)
 		}
 
-		v.syncTrigger = trigger
 		pos, err := v.executeSyncLocked(ctx, trigger, requirePermanent, nil)
 		return epoch, pos, err
 	}
@@ -1270,14 +1264,14 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 		totalChunks += len(chunks)
 	}
 
-	v.syncInProgress = true
-	v.syncStartTime = syncStartTime
-	v.syncCommitSeq = 0
-	if v.syncingInodes == nil {
-		v.syncingInodes = make(map[uint64]struct{})
-	}
+	syncingInodes := make(map[uint64]struct{}, len(snapshotChunks))
 	for ino := range snapshotChunks {
-		v.syncingInodes[ino] = struct{}{}
+		syncingInodes[ino] = struct{}{}
+	}
+	v.currentSync = &syncOperation{
+		trigger:       trigger,
+		startTime:     syncStartTime,
+		syncingInodes: syncingInodes,
 	}
 
 	var packIDsToUpload []uint64
@@ -1308,7 +1302,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	v.mu.Unlock()
 
 	v.stagingMu.Lock()
-	v.syncCommitSeq = commitSeq
+	v.currentSync.commitSeq = commitSeq
 	v.stagingMu.Unlock()
 
 	if err := v.waitForCommit(syncCtx, waitFn, requirePermanent); err != nil {
@@ -1709,7 +1703,7 @@ func (v *Volume) Stop(ctx context.Context) error {
 	v.stopping = true
 	v.startFinalSyncLocked()
 
-	if !v.syncInProgress {
+	if v.currentSync == nil {
 		return v.finishStopLocked()
 	}
 
@@ -1720,14 +1714,14 @@ func (v *Volume) Stop(ctx context.Context) error {
 	})
 	defer stopTimer()
 
-	for v.syncInProgress && ctx.Err() == nil {
+	for v.currentSync != nil && ctx.Err() == nil {
 		v.syncCond.Wait()
 	}
 
-	if v.syncInProgress {
-		elapsed := time.Since(v.syncStartTime)
+	if v.currentSync != nil {
+		elapsed := time.Since(v.currentSync.startTime)
 		klog.Warningf("ObjectFS volume %s stop timed out waiting for sync in flight: trigger=%v, commitSeq=%d, elapsed=%v",
-			v.volumeID, v.syncTrigger, v.syncCommitSeq, elapsed)
+			v.volumeID, v.currentSync.trigger, v.currentSync.commitSeq, elapsed)
 		v.stagingMu.Unlock()
 		return fmt.Errorf("volume %s stop timed out waiting for in-flight sync: %w", v.volumeID, ctx.Err())
 	}
@@ -1735,7 +1729,7 @@ func (v *Volume) Stop(ctx context.Context) error {
 }
 
 func (v *Volume) startFinalSyncLocked() {
-	if len(v.stagedChunks) == 0 || v.syncInProgress {
+	if len(v.stagedChunks) == 0 || v.currentSync != nil {
 		return
 	}
 	if v.coalesceTimer != nil {
@@ -1746,12 +1740,11 @@ func (v *Volume) startFinalSyncLocked() {
 		v.closeTimer.Stop()
 		v.closeTimer = nil
 	}
-	v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED
 	requirePermanent := v.stream.ReplicationLevel() >= walclient.Permanent
 	syncStarted := make(chan struct{})
 	go func() {
 		v.stagingMu.Lock()
-		if v.stagingClosed || v.syncInProgress || len(v.stagedChunks) == 0 {
+		if v.stagingClosed || v.currentSync != nil || len(v.stagedChunks) == 0 {
 			close(syncStarted)
 			v.stagingMu.Unlock()
 			return
@@ -1789,7 +1782,7 @@ func (v *Volume) closeStagingLocked() bool {
 	defer v.stagingMu.Unlock()
 	v.stopping = true
 	v.stagingClosed = true
-	drained := !v.syncInProgress && len(v.stagedChunks) == 0
+	drained := v.currentSync == nil && len(v.stagedChunks) == 0
 	if v.coalesceTimer != nil {
 		v.coalesceTimer.Stop()
 		v.coalesceTimer = nil
@@ -4469,7 +4462,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	v.stagedMtimes[inodeID] = now
 	v.stagingSeq++
 
-	if v.syncInProgress && v.coalesceTimer == nil {
+	if v.currentSync != nil && v.coalesceTimer == nil {
 		v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
 	}
 
@@ -5572,8 +5565,8 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 
 		hasStaged := len(v.stagedChunks[inodeID]) > 0
 		inFlight := false
-		if v.syncingInodes != nil {
-			_, inFlight = v.syncingInodes[inodeID]
+		if v.currentSync != nil {
+			_, inFlight = v.currentSync.syncingInodes[inodeID]
 		}
 
 		if !hasStaged && !inFlight {
@@ -5583,7 +5576,7 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 			return nil
 		}
 
-		if inFlight || v.syncInProgress {
+		if inFlight || v.currentSync != nil {
 			if inFlight {
 				waitReason = "in_flight_inode_sync"
 			} else {
@@ -5606,7 +5599,6 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 		}
 
 		waitReason = "staged_inode_sync"
-		v.syncTrigger = trigger
 		_, err := v.syncInodesLocked(barrierCtx, map[uint64]struct{}{inodeID: {}}, trigger)
 		v.stagingMu.Lock()
 		if err != nil {
@@ -5777,7 +5769,6 @@ func (v *Volume) FlushToBackend(ctx context.Context) error {
 	}
 	v.waitForSyncIdleLocked()
 	if len(v.stagedChunks) > 0 {
-		v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED
 		if _, err := v.executeSyncLocked(ctx, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED, false, nil); err != nil {
 			return err
 		}
