@@ -217,6 +217,8 @@ func (c *syncCoalesceState) failWaiters(err error) {
 }
 
 type Volume struct {
+	server *Server
+
 	// Lock order: stagingMu may be held while taking mu for reading; mu must never be held while taking stagingMu.
 	mu           sync.RWMutex
 	volumeID     string
@@ -303,6 +305,13 @@ type Volume struct {
 
 // VolumeOption configures a Volume instance.
 type VolumeOption func(*Volume)
+
+// WithServer associates the volume with its owning controller server for shared staged-bytes accounting.
+func WithServer(server *Server) VolumeOption {
+	return func(v *Volume) {
+		v.server = server
+	}
+}
 
 // WithAcceptUnversioned configures whether unversioned segments, streams, and snapshots are accepted.
 func WithAcceptUnversioned(accept bool) VolumeOption {
@@ -2143,6 +2152,7 @@ func (v *Volume) Close() error {
 	v.uploadWaitGroup.Wait()
 
 	v.stagingMu.Lock()
+	v.subtractStagedBytesLocked(v.stagedBytes)
 	if removeErr := v.removeStagingDirLocked(); removeErr != nil {
 		klog.Warningf("failed removing staging directory: %v", removeErr)
 	}
@@ -4546,17 +4556,31 @@ func (v *Volume) appendChunkLocked(ctx context.Context, data []byte) (stagedChun
 	return ref, nil
 }
 
+func (v *Volume) addStagedBytesLocked(delta int64) {
+	v.stagedBytes += delta
+	if v.server != nil {
+		v.server.addLocalStagingBytes(delta)
+	}
+}
+
+func (v *Volume) subtractStagedBytesLocked(delta int64) {
+	v.stagedBytes -= delta
+	if v.server != nil {
+		v.server.subtractLocalStagingBytes(delta)
+	}
+}
+
 func (v *Volume) setStagedChunkLocked(inodeID uint64, index int, reference stagedChunkReference) {
 	chunks, ok := v.stagedChunks[inodeID]
 	if !ok {
 		chunks = make(map[int]stagedChunkReference)
 		v.stagedChunks[inodeID] = chunks
 	} else if existing, ok := chunks[index]; ok {
-		v.stagedBytes -= int64(existing.Length)
+		v.subtractStagedBytesLocked(int64(existing.Length))
 		v.dropPackReferenceLocked(existing.PackID)
 	}
 	chunks[index] = reference
-	v.stagedBytes += int64(reference.Length)
+	v.addStagedBytesLocked(int64(reference.Length))
 	if info, ok := v.packs[reference.PackID]; ok {
 		info.liveReferences++
 	}
@@ -4568,7 +4592,7 @@ func (v *Volume) dropStagedChunkLocked(inodeID uint64, index int) {
 		return
 	}
 	if existing, ok := chunks[index]; ok {
-		v.stagedBytes -= int64(existing.Length)
+		v.subtractStagedBytesLocked(int64(existing.Length))
 		delete(chunks, index)
 		v.dropPackReferenceLocked(existing.PackID)
 		if len(chunks) == 0 {
@@ -4585,7 +4609,7 @@ func (v *Volume) dropStagedChunksLocked(inodeID uint64) {
 		return
 	}
 	for _, reference := range chunks {
-		v.stagedBytes -= int64(reference.Length)
+		v.subtractStagedBytesLocked(int64(reference.Length))
 		v.dropPackReferenceLocked(reference.PackID)
 	}
 	delete(v.stagedChunks, inodeID)
@@ -7276,7 +7300,7 @@ func (v *Volume) writeRestoreRecord(ctx context.Context, snapshotName string) (*
 	v.stagedChunks = make(map[uint64]map[int]stagedChunkReference)
 	v.stagedSizes = make(map[uint64]int64)
 	v.stagedMtimes = make(map[uint64]time.Time)
-	v.stagedBytes = 0
+	v.subtractStagedBytesLocked(v.stagedBytes)
 	v.stagingMu.Unlock()
 
 	v.snapshotMu.Lock()
@@ -7416,7 +7440,7 @@ func (v *Volume) InitFromSnapshot(ctx context.Context, sourceVolumeID, snapshotN
 	v.stagedChunks = make(map[uint64]map[int]stagedChunkReference)
 	v.stagedSizes = make(map[uint64]int64)
 	v.stagedMtimes = make(map[uint64]time.Time)
-	v.stagedBytes = 0
+	v.subtractStagedBytesLocked(v.stagedBytes)
 	v.stagingMu.Unlock()
 
 	v.snapshotMu.Lock()
