@@ -643,11 +643,13 @@ func (v *Volume) dropPackReferenceLocked(packID uint64) {
 	}
 }
 
-func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int]stagedChunkReference, pos uint64, inodeFilter map[uint64]struct{}) error {
+func (v *Volume) finishSync(operation *syncOperation, snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int]stagedChunkReference, pos uint64, inodeFilter map[uint64]struct{}) error {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
 
-	v.currentSync = nil
+	if operation != nil && v.currentSync == operation {
+		v.currentSync = nil
+	}
 
 	if err != nil {
 		for sIno := range snapshotChunks {
@@ -746,7 +748,7 @@ func (v *Volume) syncInodesLocked(ctx context.Context, targetInodes map[uint64]s
 		snapSeq := v.stagingSeq
 		pos := v.Position()
 		v.stagingMu.Unlock()
-		if err := v.finishSync(snapSeq, nil, nil, pos, targetInodes); err != nil {
+		if err := v.finishSync(nil, snapSeq, nil, nil, pos, targetInodes); err != nil {
 			klog.Warningf("ObjectFS volume %s close finishSync failed: %v", v.volumeID, err)
 			return pos, err
 		}
@@ -850,7 +852,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 					return epoch, 0, err
 				}
 			}
-			return epoch, pos, v.finishSync(snapSeq, nil, nil, pos, nil)
+			return epoch, pos, v.finishSync(nil, snapSeq, nil, nil, pos, nil)
 		}
 
 		pos, err := v.executeSyncLocked(ctx, trigger, requirePermanent, nil)
@@ -1205,7 +1207,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	if err := v.sealActivePackLocked(syncCtx); err != nil {
 		snapSeq := v.stagingSeq
 		v.stagingMu.Unlock()
-		return 0, v.finishSync(snapSeq, err, nil, 0, inodeFilter)
+		return 0, v.finishSync(nil, snapSeq, err, nil, 0, inodeFilter)
 	}
 
 	if len(v.stagedChunks) == 0 {
@@ -1217,7 +1219,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
 			}
 		}
-		return pos, v.finishSync(snapSeq, nil, nil, pos, inodeFilter)
+		return pos, v.finishSync(nil, snapSeq, nil, nil, pos, inodeFilter)
 	}
 
 	snapshotSeq := v.stagingSeq
@@ -1243,7 +1245,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
 			}
 		}
-		return pos, v.finishSync(snapSeq, nil, nil, pos, inodeFilter)
+		return pos, v.finishSync(nil, snapSeq, nil, nil, pos, inodeFilter)
 	}
 
 	snapshotSizes := make(map[uint64]int64, len(snapshotChunks))
@@ -1268,11 +1270,12 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	for ino := range snapshotChunks {
 		syncingInodes[ino] = struct{}{}
 	}
-	v.currentSync = &syncOperation{
+	operation := &syncOperation{
 		trigger:       trigger,
 		startTime:     syncStartTime,
 		syncingInodes: syncingInodes,
 	}
+	v.currentSync = operation
 
 	var packIDsToUpload []uint64
 	for packID, info := range v.packs {
@@ -1287,14 +1290,14 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 
 	syncBytes, syncPacks, err := v.uploadPacks(syncCtx, packIDsToUpload)
 	if err != nil {
-		return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
+		return 0, v.finishSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 	}
 
 	v.mu.Lock()
 	commitSeq, recordsAppended, modifiedAttrs, err := v.appendSyncRecordsLocked(syncCtx, snapshotChunks, snapshotSizes, snapshotMtimes)
 	if err != nil {
 		v.mu.Unlock()
-		return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
+		return 0, v.finishSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 	}
 
 	reqLevel := v.durability
@@ -1302,11 +1305,11 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	v.mu.Unlock()
 
 	v.stagingMu.Lock()
-	v.currentSync.commitSeq = commitSeq
+	operation.commitSeq = commitSeq
 	v.stagingMu.Unlock()
 
 	if err := v.waitForCommit(syncCtx, waitFn, requirePermanent); err != nil {
-		return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
+		return 0, v.finishSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 	}
 
 	for _, attr := range modifiedAttrs {
@@ -1328,7 +1331,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 		attribute.Int64(attributeSyncPacks, syncPacks),
 	)
 
-	return commitSeq, v.finishSync(snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
+	return commitSeq, v.finishSync(operation, snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
 }
 
 type metadataStreamType struct {
