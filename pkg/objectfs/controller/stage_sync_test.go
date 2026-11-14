@@ -1540,7 +1540,7 @@ func TestOpenBarrier_WaitsOnInFlightSync(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		vol.stagingMu.Lock()
-		inProgress := vol.syncInProgress
+		inProgress := vol.currentSync != nil
 		vol.stagingMu.Unlock()
 		if inProgress {
 			break
@@ -2830,7 +2830,7 @@ func TestVolume_Stop_Guards(t *testing.T) {
 				}
 				volume.stagingMu.Lock()
 				defer volume.stagingMu.Unlock()
-				if volume.syncInProgress || volume.stopping || len(volume.stagedChunks) == 0 || backend.getPackCount() != 0 {
+				if volume.currentSync != nil || volume.stopping || len(volume.stagedChunks) == 0 || backend.getPackCount() != 0 {
 					t.Fatal("expected volume untouched after done context Stop")
 				}
 			} else if stopErr == nil || !strings.Contains(stopErr.Error(), "failed to drain") {
