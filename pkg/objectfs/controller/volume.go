@@ -176,11 +176,11 @@ type Volume struct {
 	maxStagingBytes int64
 	lastSyncError   map[uint64]error
 
-	coalesceTimer      *time.Timer
-	coalesceWaiters    []*syncWaiter
-	coalesceWindow     time.Duration
-	closeTimer         *time.Timer
-	closeInodes        map[uint64]struct{}
+	coalesceTimer   *time.Timer
+	coalesceWaiters []*syncWaiter
+	coalesceWindow  time.Duration
+	closeTimer      *time.Timer
+	closeInodes     map[uint64]struct{}
 	// currentSync tracks the single real sync operation currently in flight, or nil if idle.
 	// At most one real sync is in flight at a time. Every path that starts one waits for
 	// idle (waitForSyncIdleLocked) or skips if a sync is already running, all under stagingMu.
@@ -653,11 +653,7 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
 
-	// At most one real sync is in flight at a time. Every path that starts one
-	// waits for idle (waitForSyncIdleLocked) or skips if a sync is already running,
-	// all under stagingMu. Empty syncs never install themselves and may run alongside
-	// a real sync harmlessly. This is why there is one pointer and not a list of
-	// operations; we only clear currentSync when it matches this completed operation.
+	// Clear only the operation this sync installed; see Volume.currentSync for the single-operation rule.
 	if v.currentSync == operation {
 		v.currentSync = nil
 	}
@@ -686,6 +682,10 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 func (v *Volume) finishEmptySync(snapshotSeq uint64, err error, pos uint64, inodeFilter map[uint64]struct{}) error {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
+
+	if err == nil {
+		v.evictUploadedPacksLocked(0)
+	}
 
 	v.completeWaitersAndRearmLocked(snapshotSeq, err, pos, inodeFilter)
 	return err
@@ -1211,12 +1211,20 @@ func (v *Volume) waitForCommit(ctx context.Context, waitFn func(context.Context)
 	return nil
 }
 
+// executeSyncLocked executes a sync under stagingMu.
+// Preconditions:
+//   - Must be called with v.stagingMu held.
+//   - Must be called with no sync in flight (v.currentSync == nil).
+//
+// Invariant: ALWAYS returns with v.stagingMu UNLOCKED.
 func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_SyncTrigger, requirePermanent bool, inodeFilter map[uint64]struct{}) (uint64, error) {
-	// Must be called with v.stagingMu held.
-	// Invariant: ALWAYS returns with v.stagingMu UNLOCKED.
 	if v.stagingClosed {
 		v.stagingMu.Unlock()
 		return 0, fmt.Errorf("volume closed")
+	}
+	if v.currentSync != nil {
+		v.stagingMu.Unlock()
+		return 0, fmt.Errorf("volume %s cannot start sync with trigger %v: sync with trigger %v is already in flight", v.volumeID, trigger, v.currentSync.trigger)
 	}
 	syncStartTime := time.Now()
 	syncCtx, syncSpan := scoped.StartSpan(ctx, spanVolumeSync)
@@ -1287,11 +1295,6 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	totalChunks := 0
 	for _, chunks := range snapshotChunks {
 		totalChunks += len(chunks)
-	}
-
-	if v.currentSync != nil {
-		v.stagingMu.Unlock()
-		return 0, fmt.Errorf("volume %s cannot start sync with trigger %v: sync with trigger %v is already in flight", v.volumeID, trigger, v.currentSync.trigger)
 	}
 
 	syncingInodes := make(map[uint64]struct{}, len(snapshotChunks))
