@@ -28,9 +28,16 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
+	"github.com/go-logr/logr"
 	"google.golang.org/grpc/credentials"
-	"k8s.io/klog/v2"
 )
+
+// rootLogger returns a root-derived logger for TLS certificate reloader background
+// loops and initialization paths where no request context exists.
+func rootLogger() logr.Logger {
+	return scoped.Log(context.Background())
+}
 
 // CertReloader dynamically monitors and reloads TLS certificates and trust pools from a directory.
 type CertReloader struct {
@@ -90,14 +97,14 @@ func (r *CertReloader) Reload() error {
 	if err != nil {
 		if !r.lastFailed {
 			r.lastFailed = true
-			klog.Warningf("failed to reload TLS material from %s (keeping last good material): %v", r.dir, err)
+			rootLogger().Info("failed to reload TLS material (keeping last good material)", "dir", r.dir, "err", err)
 		}
 		return err
 	}
 
 	if r.lastFailed {
 		r.lastFailed = false
-		klog.Infof("successfully reloaded TLS material from %s", r.dir)
+		rootLogger().Info("successfully reloaded TLS material", "dir", r.dir)
 	}
 	return nil
 }
@@ -116,7 +123,7 @@ func (r *CertReloader) run() {
 			return
 		case <-ticker.C:
 			if err := r.Reload(); err != nil {
-				klog.V(4).Infof("periodic reload failed for %s: %v", r.dir, err)
+				rootLogger().V(4).Info("periodic reload failed", "dir", r.dir, "err", err)
 			}
 		case event, ok := <-r.watcher.Events:
 			if !ok {
@@ -124,17 +131,17 @@ func (r *CertReloader) run() {
 			}
 			if event.Op&fsnotify.Create != 0 && DirExists(trustDir) {
 				if err := r.watcher.Add(trustDir); err != nil {
-					klog.V(4).Infof("watching trust directory %s: %v", trustDir, err)
+					rootLogger().V(4).Info("watching trust directory", "dir", trustDir, "err", err)
 				}
 			}
 			if err := r.Reload(); err != nil {
-				klog.V(4).Infof("event-triggered reload failed for %s: %v", r.dir, err)
+				rootLogger().V(4).Info("event-triggered reload failed", "dir", r.dir, "err", err)
 			}
 		case err, ok := <-r.watcher.Errors:
 			if !ok {
 				return
 			}
-			klog.Warningf("watcher error for %s: %v", r.dir, err)
+			rootLogger().Info("watcher error", "dir", r.dir, "err", err)
 		}
 	}
 }
@@ -164,7 +171,7 @@ func NewCertReloader(dir string) (*CertReloader, error) {
 
 	if err := watcher.Add(dir); err != nil {
 		if closeErr := watcher.Close(); closeErr != nil {
-			klog.Warningf("failed to close watcher: %v", closeErr)
+			rootLogger().Info("failed to close watcher", "err", closeErr)
 		}
 		return nil, fmt.Errorf("failed to watch directory %s: %w", dir, err)
 	}
@@ -173,7 +180,7 @@ func NewCertReloader(dir string) (*CertReloader, error) {
 	if DirExists(trustDir) {
 		if err := watcher.Add(trustDir); err != nil {
 			if closeErr := watcher.Close(); closeErr != nil {
-				klog.Warningf("failed to close watcher: %v", closeErr)
+				rootLogger().Info("failed to close watcher", "err", closeErr)
 			}
 			return nil, fmt.Errorf("failed to watch trust directory %s: %w", trustDir, err)
 		}
@@ -328,7 +335,7 @@ func (c *clientTransportCredentials) ClientHandshake(ctx context.Context, author
 	if err != nil {
 		if isVerificationError(err) {
 			if reloadErr := c.reloader.Reload(); reloadErr != nil {
-				klog.V(4).Infof("reload after handshake verification error: %v", reloadErr)
+				scoped.Log(ctx).V(4).Info("reload after handshake verification error", "err", reloadErr)
 			}
 		}
 		return nil, nil, err
