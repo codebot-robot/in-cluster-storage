@@ -33,8 +33,8 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
-// rootLogger returns a root-derived logger for TLS certificate reloader background
-// loops and initialization paths where no request context exists.
+// rootLogger returns a root-derived logger for run and NewCertReloader where no
+// caller context exists.
 func rootLogger() logr.Logger {
 	return scoped.Log(context.Background())
 }
@@ -86,7 +86,7 @@ func (r *CertReloader) reload() error {
 
 // Reload forces a reload of the certificate and trust bundle from disk.
 // If reload fails, the last valid material is retained and a warning is logged once.
-func (r *CertReloader) Reload() error {
+func (r *CertReloader) Reload(ctx context.Context) error {
 	r.reloadMu.Lock()
 	defer r.reloadMu.Unlock()
 
@@ -97,20 +97,22 @@ func (r *CertReloader) Reload() error {
 	if err != nil {
 		if !r.lastFailed {
 			r.lastFailed = true
-			rootLogger().Info("failed to reload TLS material (keeping last good material)", "dir", r.dir, "err", err)
+			scoped.Log(ctx).Info("failed to reload TLS material (keeping last good material)", "dir", r.dir, "err", err)
 		}
 		return err
 	}
 
 	if r.lastFailed {
 		r.lastFailed = false
-		rootLogger().Info("successfully reloaded TLS material", "dir", r.dir)
+		scoped.Log(ctx).Info("successfully reloaded TLS material", "dir", r.dir)
 	}
 	return nil
 }
 
 func (r *CertReloader) run() {
 	defer close(r.doneCh)
+
+	ctx := scoped.WithLog(context.Background(), rootLogger())
 
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
@@ -122,7 +124,7 @@ func (r *CertReloader) run() {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
-			if err := r.Reload(); err != nil {
+			if err := r.Reload(ctx); err != nil {
 				rootLogger().V(4).Info("periodic reload failed", "dir", r.dir, "err", err)
 			}
 		case event, ok := <-r.watcher.Events:
@@ -134,7 +136,7 @@ func (r *CertReloader) run() {
 					rootLogger().V(4).Info("watching trust directory", "dir", trustDir, "err", err)
 				}
 			}
-			if err := r.Reload(); err != nil {
+			if err := r.Reload(ctx); err != nil {
 				rootLogger().V(4).Info("event-triggered reload failed", "dir", r.dir, "err", err)
 			}
 		case err, ok := <-r.watcher.Errors:
@@ -334,7 +336,7 @@ func (c *clientTransportCredentials) ClientHandshake(ctx context.Context, author
 	conn, authInfo, err := inner.ClientHandshake(ctx, authority, rawConn)
 	if err != nil {
 		if isVerificationError(err) {
-			if reloadErr := c.reloader.Reload(); reloadErr != nil {
+			if reloadErr := c.reloader.Reload(ctx); reloadErr != nil {
 				scoped.Log(ctx).V(4).Info("reload after handshake verification error", "err", reloadErr)
 			}
 		}

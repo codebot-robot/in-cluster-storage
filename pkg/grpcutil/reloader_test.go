@@ -521,6 +521,7 @@ func TestIsVerificationError(t *testing.T) {
 }
 
 func TestConcurrentReloadAndHandshake(t *testing.T) {
+	ctx := t.Context()
 	bServerCA := generateCertBundle(t, "server-ca", "localhost", true, 901)
 	bServer2 := generateLeafCert(t, bServerCA, "localhost", true, 902)
 	bClient := generateCertBundle(t, "client-ca", "client", false, 903)
@@ -583,7 +584,7 @@ func TestConcurrentReloadAndHandshake(t *testing.T) {
 					writeMaterial(t, serverDir, bServer2.certPEM, bServer2.keyPEM, bClient.caPEM)
 				}
 				toggle = !toggle
-				if rErr := reloader.Reload(); rErr != nil {
+				if rErr := reloader.Reload(ctx); rErr != nil {
 					t.Logf("reloader.Reload: %v", rErr)
 				}
 			}
@@ -621,6 +622,7 @@ func TestConcurrentReloadAndHandshake(t *testing.T) {
 }
 
 func TestReloader_FailedReloadKeepsLastGoodMaterial(t *testing.T) {
+	ctx := t.Context()
 	b := generateCertBundle(t, "ca-1", "localhost", true, 701)
 	dir := t.TempDir()
 	writeMaterial(t, dir, b.certPEM, b.keyPEM, b.caPEM)
@@ -649,7 +651,7 @@ func TestReloader_FailedReloadKeepsLastGoodMaterial(t *testing.T) {
 	}
 
 	// Force reload; should return error and retain last good material
-	if err := reloader.Reload(); err == nil {
+	if err := reloader.Reload(ctx); err == nil {
 		t.Fatalf("expected Reload to fail for corrupted key, but succeeded")
 	}
 
@@ -665,7 +667,7 @@ func TestReloader_FailedReloadKeepsLastGoodMaterial(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "tls.key"), b.keyPEM, 0600); err != nil {
 		t.Fatalf("failed to restore key: %v", err)
 	}
-	if err := reloader.Reload(); err != nil {
+	if err := reloader.Reload(ctx); err != nil {
 		t.Fatalf("expected reload to succeed after key restore, got: %v", err)
 	}
 }

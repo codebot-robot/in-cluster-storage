@@ -183,8 +183,7 @@ func evaluateLeafExpiry(ctx context.Context, cert *x509.Certificate, now time.Ti
 	}
 	remaining := cert.NotAfter.Sub(now)
 	if remaining <= 0 {
-		err := fmt.Errorf("certificate expired %s ago", (-remaining).Round(time.Second))
-		scoped.Log(ctx).Error(err, "TLS leaf certificate expired. Rotate secret and rollout restart controller and node daemons immediately!", "notAfter", cert.NotAfter.Format(time.RFC3339), "expiredAgo", (-remaining).Round(time.Second))
+		scoped.Log(ctx).Error(nil, "TLS leaf certificate expired. Rotate secret and rollout restart controller and node daemons immediately!", "notAfter", cert.NotAfter.Format(time.RFC3339), "expiredAgo", (-remaining).Round(time.Second))
 	} else if remaining <= 30*24*time.Hour {
 		days := int(remaining.Hours() / 24)
 		scoped.Log(ctx).Info("TLS leaf certificate will expire soon. Rotate secret and rollout restart controller and node daemons to avoid outage!", "days", days, "notAfter", cert.NotAfter.Format(time.RFC3339))
