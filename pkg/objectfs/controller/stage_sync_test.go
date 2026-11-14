@@ -2877,9 +2877,17 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 	var realSyncPanic any
 	defer func() {
 		if realSyncPanic != nil {
-			if vol, _ := server.getOrCreateVolume(volumeID); vol != nil {
-				_ = vol.stagingMu.TryLock()
-				vol.stagingMu.Unlock()
+			// If the real sync panicked while holding stagingMu, release the orphaned
+			// lock so server.Close does not deadlock during cleanup.
+			volume, err := server.getOrCreateVolume(volumeID)
+			if err != nil {
+				t.Errorf("getOrCreateVolume failed during cleanup: %v", err)
+			} else if volume != nil {
+				if volume.stagingMu.TryLock() {
+					volume.stagingMu.Unlock()
+				} else {
+					volume.stagingMu.Unlock()
+				}
 			}
 		}
 		if err := server.Close(); err != nil {
@@ -2914,7 +2922,7 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 	realUploadContinue := make(chan struct{})
 	var realUploadArmed atomic.Bool
 	realUploadArmed.Store(true)
-	backend.onPutObject = func(putCtx context.Context, volID, key string, bStream blob.ByteStream) (string, error) {
+	backend.onPutObject = func(putCtx context.Context, volumeID, key string, byteStream blob.ByteStream) (string, error) {
 		if realUploadArmed.CompareAndSwap(true, false) {
 			realUploadStarted <- struct{}{}
 			select {
@@ -2923,7 +2931,7 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 				return "", putCtx.Err()
 			}
 		}
-		return backend.ObjectStorageBackend.PutObject(putCtx, volID, key, bStream)
+		return backend.ObjectStorageBackend.PutObject(putCtx, volumeID, key, byteStream)
 	}
 
 	// 1. Start empty sync: volume has no staged chunks.
@@ -2937,8 +2945,8 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 	// 2. Wait until empty sync has released stagingMu and is parked in Flush.
 	select {
 	case <-emptyFlushStarted:
-	case <-ctx.Done():
-		t.Fatalf("timed out waiting for empty sync to park in flush: %v", ctx.Err())
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for empty sync to park in flush")
 	}
 
 	// 3. Stage data for real sync.
@@ -2954,8 +2962,8 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 	go func() {
 		defer close(realSyncDone)
 		defer func() {
-			if r := recover(); r != nil {
-				realSyncPanic = r
+			if recovered := recover(); recovered != nil {
+				realSyncPanic = recovered
 			}
 		}()
 		_, realSyncErr = server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: inodeID, Blocking: true})
@@ -2964,16 +2972,16 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 	// 5. Wait until real sync has installed currentSync and is parked in PutObject.
 	select {
 	case <-realUploadStarted:
-	case <-ctx.Done():
-		t.Fatalf("timed out waiting for real sync to reach upload: %v", ctx.Err())
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for real sync to reach upload")
 	}
 
 	// 6. Resume empty sync: must not clear real sync's in-flight currentSync.
 	close(emptyFlushContinue)
 	select {
 	case <-emptySyncDone:
-	case <-ctx.Done():
-		t.Fatalf("timed out waiting for empty sync: %v", ctx.Err())
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for empty sync to complete")
 	}
 	if emptySyncErr != nil {
 		t.Fatalf("empty sync failed: %v", emptySyncErr)
@@ -2983,8 +2991,8 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 	close(realUploadContinue)
 	select {
 	case <-realSyncDone:
-	case <-ctx.Done():
-		t.Fatalf("timed out waiting for real sync: %v", ctx.Err())
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for real sync to complete")
 	}
 
 	if realSyncPanic != nil {
@@ -3001,13 +3009,13 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 		t.Fatalf("ReadFile failed: err=%v, resp=%v", err, readResponse)
 	}
 
-	vol, err := server.getOrCreateVolume(volumeID)
+	volume, err := server.getOrCreateVolume(volumeID)
 	if err != nil {
 		t.Fatalf("getOrCreateVolume failed: %v", err)
 	}
-	vol.stagingMu.Lock()
-	if vol.currentSync != nil {
-		t.Fatalf("expected volume to be idle after real sync finished, got currentSync=%+v", vol.currentSync)
+	volume.stagingMu.Lock()
+	if volume.currentSync != nil {
+		t.Fatalf("expected volume to be idle after real sync finished, got currentSync=%+v", volume.currentSync)
 	}
-	vol.stagingMu.Unlock()
+	volume.stagingMu.Unlock()
 }

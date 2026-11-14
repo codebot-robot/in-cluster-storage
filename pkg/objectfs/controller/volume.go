@@ -1305,7 +1305,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	v.mu.Unlock()
 
 	v.stagingMu.Lock()
-	v.currentSync.commitSeq = commitSeq
+	operation.commitSeq = commitSeq
 	v.stagingMu.Unlock()
 
 	if err := v.waitForCommit(syncCtx, waitFn, requirePermanent); err != nil {
