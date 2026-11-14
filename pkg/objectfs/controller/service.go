@@ -601,6 +601,45 @@ func (s *Server) Close() error {
 	return errors.Join(errs...)
 }
 
+func (s *Server) stopVolumes(ctx context.Context, volumes []*Volume) []error {
+	stopErrors := make([]error, len(volumes))
+	var waitGroup sync.WaitGroup
+	for index, volume := range volumes {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			stopErrors[index] = volume.Stop(ctx)
+		}()
+	}
+	waitGroup.Wait()
+	return stopErrors
+}
+
+// Shutdown gracefully stops periodic flushing, drains all volumes concurrently
+// under ctx with Volume.Stop, reports all drain errors joined together, and then
+// releases everything by calling Close.
+func (s *Server) Shutdown(ctx context.Context) error {
+	var errs []error
+	if err := s.StopPeriodicFlush(); err != nil {
+		errs = append(errs, err)
+	}
+
+	s.mu.RLock()
+	volumes := make([]*Volume, 0, len(s.volumes))
+	for _, volume := range s.volumes {
+		volumes = append(volumes, volume)
+	}
+	s.mu.RUnlock()
+
+	errs = append(errs, s.stopVolumes(ctx, volumes)...)
+
+	if err := s.Close(); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
 func (s *Server) FlushAll(ctx context.Context) error {
 	s.mu.RLock()
 	vols := make([]*Volume, 0, len(s.volumes))

@@ -3019,3 +3019,139 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 	}
 	volume.stagingMu.Unlock()
 }
+
+func TestServer_Shutdown_ParkedUploadsTimeoutAndCloseVolumes(t *testing.T) {
+	ctx := t.Context()
+	backend := newRecordingBackend(NewMemoryBackend())
+	gateEntered, gateRelease := make(chan struct{}, 2), make(chan struct{})
+	backend.setGate(gateEntered, gateRelease)
+	unblock := sync.OnceFunc(func() { close(gateRelease) })
+	t.Cleanup(unblock)
+
+	server := NewTestServer(t, backend, WithServerSyncTimeout(50*time.Millisecond))
+	volume1ID := "test-parked-vol-1"
+	volume2ID := "test-parked-vol-2"
+
+	setupVolume := func(volumeID string) (*Volume, uint64) {
+		volume, err := server.getOrCreateVolume(volumeID)
+		if err != nil {
+			t.Fatalf("getOrCreateVolume %s failed: %v", volumeID, err)
+		}
+		createResp, err := testCreateFile(ctx, server, volumeID, "/file.bin", 0644, nil, 0, 0)
+		if err != nil || createResp.GetError() != 0 {
+			t.Fatalf("CreateFile %s failed: %v", volumeID, err)
+		}
+		inodeID := createResp.GetAttr().GetInode().GetIno()
+		if _, _, _, _, writeErr := volume.WriteFileWithEpoch(ctx, inodeID, 0, []byte("data"), pb.WriteMode_FSYNC); writeErr != nil {
+			t.Fatalf("WriteFile %s failed: %v", volumeID, writeErr)
+		}
+		return volume, inodeID
+	}
+
+	volume1, inodeID1 := setupVolume(volume1ID)
+	volume2, inodeID2 := setupVolume(volume2ID)
+
+	syncDone1 := make(chan error, 1)
+	syncDone2 := make(chan error, 1)
+	go func() { syncDone1 <- volume1.Fsync(ctx, inodeID1) }()
+	go func() { syncDone2 <- volume2.Fsync(ctx, inodeID2) }()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-gateEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for pack upload gate")
+		}
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer shutdownCancel()
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- server.Shutdown(shutdownCtx)
+	}()
+
+	shutdownErr := waitSyncDone(t, shutdownDone)
+	if shutdownErr == nil {
+		t.Fatal("expected Shutdown to return an error, got nil")
+	}
+	if !errors.Is(shutdownErr, context.DeadlineExceeded) {
+		t.Fatalf("expected error wrapping context.DeadlineExceeded, got: %v", shutdownErr)
+	}
+	if !strings.Contains(shutdownErr.Error(), volume1ID) || !strings.Contains(shutdownErr.Error(), volume2ID) {
+		t.Fatalf("expected error naming both volumes (%s and %s), got: %v", volume1ID, volume2ID, shutdownErr)
+	}
+
+	volume1.mu.Lock()
+	volume1Closed := volume1.closed
+	volume1.mu.Unlock()
+
+	volume2.mu.Lock()
+	volume2Closed := volume2.closed
+	volume2.mu.Unlock()
+
+	if !volume1Closed || !volume2Closed {
+		t.Fatalf("expected both volumes closed after Shutdown, got volume1Closed=%v volume2Closed=%v", volume1Closed, volume2Closed)
+	}
+
+	unblock()
+	if err := waitSyncDone(t, syncDone1); !errors.Is(err, context.Canceled) && !errors.Is(err, ErrVolumeStopping) {
+		t.Fatalf("expected cancellation or stopping error for volume 1, got: %v", err)
+	}
+	if err := waitSyncDone(t, syncDone2); !errors.Is(err, context.Canceled) && !errors.Is(err, ErrVolumeStopping) {
+		t.Fatalf("expected cancellation or stopping error for volume 2, got: %v", err)
+	}
+}
+
+func TestServer_Shutdown_FlushesStagedData(t *testing.T) {
+	ctx := t.Context()
+	backend := newRecordingBackend(NewMemoryBackend())
+	server := NewTestServer(t, backend)
+	volumeID := "test-shutdown-flush-vol"
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	createResp, err := testCreateFile(ctx, server, volumeID, "/test.bin", 0644, nil, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResp.GetAttr().GetInode().GetIno()
+
+	data := []byte("staged data flushed by Server.Shutdown")
+	if _, _, _, _, writeErr := volume.WriteFileWithEpoch(ctx, inodeID, 0, data, pb.WriteMode_FSYNC); writeErr != nil {
+		t.Fatalf("WriteFile failed: %v", writeErr)
+	}
+
+	if count := backend.getPackCount(); count != 0 {
+		t.Fatalf("expected 0 uploaded packs before Shutdown, got %d", count)
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer shutdownCancel()
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- server.Shutdown(shutdownCtx)
+	}()
+
+	if shutdownErr := waitSyncDone(t, shutdownDone); shutdownErr != nil {
+		t.Fatalf("expected Shutdown to succeed, got: %v", shutdownErr)
+	}
+
+	if count := backend.getPackCount(); count == 0 {
+		t.Fatal("expected at least 1 uploaded pack in object store after Shutdown, got 0")
+	}
+
+	newServer := NewTestServer(t, backend)
+	readResp, err := testReadFile(ctx, newServer, volumeID, "/test.bin", 0, int64(len(data)))
+	if err != nil || readResp.GetError() != 0 {
+		t.Fatalf("ReadFile from recovered server failed: %v, code=%d", err, readResp.GetError())
+	}
+	if !bytes.Equal(readResp.GetData(), data) {
+		t.Fatalf("ReadFile content mismatch: got %q, want %q", string(readResp.GetData()), string(data))
+	}
+}
