@@ -690,3 +690,38 @@ func TestNodeDaemon_FUSELogging(t *testing.T) {
 		t.Fatalf("expected target=%q, got %v", targetDirectory, unpublishEntry["target"])
 	}
 }
+
+// TestNodeDaemon_DiskBlobCacheInitWarningLogging verifies that when DiskBlobCache initialization
+// fails during newDriver, a warning is logged through scoped.Log(ctx) as Info with path and err.
+func TestNodeDaemon_DiskBlobCacheInitWarningLogging(t *testing.T) {
+	sink := newNodeLoggingTestSink()
+	rootLogger := logr.New(sink)
+	ctx := scoped.WithLog(t.Context(), rootLogger)
+
+	// Create a regular file so using it as a directory component causes MkdirAll to fail.
+	invalidDir := filepath.Join(t.TempDir(), "regular-file", "cache")
+	if err := os.WriteFile(filepath.Dir(invalidDir), []byte("blocking-file"), 0644); err != nil {
+		t.Fatalf("failed to create regular file: %v", err)
+	}
+
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", invalidDir, 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "/run/objectfs/fuse-holder.sock")
+	if err != nil {
+		t.Fatalf("unexpected error from newDriver: %v", err)
+	}
+	defer func() {
+		if closeErr := driver.Close(); closeErr != nil {
+			t.Errorf("driver.Close failed: %v", closeErr)
+		}
+	}()
+
+	entry, found := sink.FindEntry("failed to initialize DiskBlobCache")
+	if !found {
+		t.Fatal("expected log entry for 'failed to initialize DiskBlobCache'")
+	}
+	if entry["path"] != invalidDir {
+		t.Fatalf("expected path=%q, got %v", invalidDir, entry["path"])
+	}
+	if entry["err"] == nil {
+		t.Fatal("expected err to be set on log entry")
+	}
+}

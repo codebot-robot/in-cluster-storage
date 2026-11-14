@@ -211,7 +211,7 @@ func newDriver(ctx context.Context, nodeID, controllerAddress, cacheDir string, 
 	}
 	diskCache, err := objectfuse.NewDiskBlobCache(ctx, cacheDir, diskCacheBytes)
 	if err != nil {
-		klog.Warningf("Failed to initialize DiskBlobCache at %s: %v", cacheDir, err)
+		scoped.Log(ctx).Info("failed to initialize DiskBlobCache", "path", cacheDir, "err", err)
 	}
 	return &objectFSDriver{
 		nodeID:                 nodeID,
