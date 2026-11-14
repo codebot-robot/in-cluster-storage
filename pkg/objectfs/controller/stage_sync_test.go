@@ -2839,3 +2839,175 @@ func TestVolume_Stop_Guards(t *testing.T) {
 		})
 	}
 }
+
+type flushHookStream struct {
+	durabilityCountingStream
+	onFlush func(ctx context.Context) error
+}
+
+func (s *flushHookStream) Flush(ctx context.Context) error {
+	if s.onFlush != nil {
+		return s.onFlush(ctx)
+	}
+	return s.durabilityCountingStream.Flush(ctx)
+}
+
+type putObjectHookBackend struct {
+	ObjectStorageBackend
+	onPutObject func(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error)
+}
+
+func (b *putObjectHookBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
+	if b.onPutObject != nil {
+		return b.onPutObject(ctx, volumeID, key, stream)
+	}
+	return b.ObjectStorageBackend.PutObject(ctx, volumeID, key, stream)
+}
+
+func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
+	ctx := t.Context()
+	stream := &flushHookStream{}
+	backend := &putObjectHookBackend{ObjectStorageBackend: NewMemoryBackend()}
+
+	server := NewTestServer(t, backend,
+		WithServerStreamFactory(func(string) (walclient.Stream, error) { return stream, nil }),
+		WithServerDurability(walclient.Permanent),
+	)
+	volumeID := "test-empty-sync-race"
+	var realSyncPanic any
+	defer func() {
+		if realSyncPanic != nil {
+			if vol, _ := server.getOrCreateVolume(volumeID); vol != nil {
+				_ = vol.stagingMu.TryLock()
+				vol.stagingMu.Unlock()
+			}
+		}
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close failed: %v", err)
+		}
+	}()
+
+	createResponse, err := testCreateFile(ctx, server, volumeID, "/test.txt", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	emptyFlushStarted := make(chan struct{}, 1)
+	emptyFlushContinue := make(chan struct{})
+	var emptyFlushArmed atomic.Bool
+	emptyFlushArmed.Store(true)
+	stream.onFlush = func(flushCtx context.Context) error {
+		if emptyFlushArmed.CompareAndSwap(true, false) {
+			emptyFlushStarted <- struct{}{}
+			select {
+			case <-emptyFlushContinue:
+				return nil
+			case <-flushCtx.Done():
+				return flushCtx.Err()
+			}
+		}
+		return stream.durabilityCountingStream.Flush(flushCtx)
+	}
+
+	realUploadStarted := make(chan struct{}, 1)
+	realUploadContinue := make(chan struct{})
+	var realUploadArmed atomic.Bool
+	realUploadArmed.Store(true)
+	backend.onPutObject = func(putCtx context.Context, volID, key string, bStream blob.ByteStream) (string, error) {
+		if realUploadArmed.CompareAndSwap(true, false) {
+			realUploadStarted <- struct{}{}
+			select {
+			case <-realUploadContinue:
+			case <-putCtx.Done():
+				return "", putCtx.Err()
+			}
+		}
+		return backend.ObjectStorageBackend.PutObject(putCtx, volID, key, bStream)
+	}
+
+	// 1. Start empty sync: volume has no staged chunks.
+	var emptySyncErr, realSyncErr error
+	emptySyncDone, realSyncDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(emptySyncDone)
+		_, emptySyncErr = server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: 1, Blocking: true})
+	}()
+
+	// 2. Wait until empty sync has released stagingMu and is parked in Flush.
+	select {
+	case <-emptyFlushStarted:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for empty sync to park in flush: %v", ctx.Err())
+	}
+
+	// 3. Stage data for real sync.
+	payload := []byte("concurrent-sync-data")
+	writeResponse, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID, Inode: inodeID, Offset: 0, Data: payload, WriteMode: pb.WriteMode_LAZY,
+	})
+	if err != nil || writeResponse.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// 4. Start real sync: installs currentSync and releases stagingMu to upload.
+	go func() {
+		defer close(realSyncDone)
+		defer func() {
+			if r := recover(); r != nil {
+				realSyncPanic = r
+			}
+		}()
+		_, realSyncErr = server.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: inodeID, Blocking: true})
+	}()
+
+	// 5. Wait until real sync has installed currentSync and is parked in PutObject.
+	select {
+	case <-realUploadStarted:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for real sync to reach upload: %v", ctx.Err())
+	}
+
+	// 6. Resume empty sync: must not clear real sync's in-flight currentSync.
+	close(emptyFlushContinue)
+	select {
+	case <-emptySyncDone:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for empty sync: %v", ctx.Err())
+	}
+	if emptySyncErr != nil {
+		t.Fatalf("empty sync failed: %v", emptySyncErr)
+	}
+
+	// 7. Resume real sync upload: dereferencing currentSync.commitSeq panics if cleared.
+	close(realUploadContinue)
+	select {
+	case <-realSyncDone:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for real sync: %v", ctx.Err())
+	}
+
+	if realSyncPanic != nil {
+		t.Fatalf("real sync panicked (empty sync finish cleared currentSync): %v", realSyncPanic)
+	}
+	if realSyncErr != nil {
+		t.Fatalf("real sync failed: %v", realSyncErr)
+	}
+
+	readResponse, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID, Inode: inodeID, Offset: 0, Size: int64(len(payload)),
+	})
+	if err != nil || readResponse.GetError() != 0 || !bytes.Equal(readResponse.GetData(), payload) {
+		t.Fatalf("ReadFile failed: err=%v, resp=%v", err, readResponse)
+	}
+
+	vol, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	vol.stagingMu.Lock()
+	if vol.currentSync != nil {
+		t.Fatalf("expected volume to be idle after real sync finished, got currentSync=%+v", vol.currentSync)
+	}
+	vol.stagingMu.Unlock()
+}
