@@ -58,103 +58,103 @@ func newMetadataDurabilityTestServer(t *testing.T, stream *recordingStream, mode
 // asserting the expected durability wait count after each operation. Takes no locks.
 func runMetadataOperations(t *testing.T, ctx context.Context, server *Server, volume *Volume, stream *recordingStream, wantWaits int) {
 	t.Helper()
-	assertWaits := func(opName string, expected int) {
+	assertWaits := func(operationName string, expected int) {
 		t.Helper()
 		if got := stream.waitCount.Swap(0); got != int64(expected) {
-			t.Fatalf("%s: expected %d durability waits, got %d", opName, expected, got)
+			t.Fatalf("%s: expected %d durability waits, got %d", operationName, expected, got)
 		}
 	}
 
 	// 1. CreateFile (new file)
-	createResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "file.txt", Mode: 0644})
-	if err != nil || createResp.GetError() != 0 {
+	createResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "file.txt", Mode: 0644})
+	if err != nil || createResponse.GetError() != 0 {
 		t.Fatalf("CreateFile: %v", err)
 	}
-	fileIno := createResp.GetAttr().GetInode().GetIno()
+	fileIno := createResponse.GetAttr().GetInode().GetIno()
 	assertWaits("CreateFile (new)", wantWaits)
 
 	// 2. CreateFile (overwrite existing file)
-	if resp, err := server.CreateFile(ctx, &pb.CreateFileRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "file.txt", Mode: 0644}); err != nil || resp.GetError() != 0 {
+	if response, err := server.CreateFile(ctx, &pb.CreateFileRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "file.txt", Mode: 0644}); err != nil || response.GetError() != 0 {
 		t.Fatalf("CreateFile overwrite: %v", err)
 	}
 	assertWaits("CreateFile (overwrite)", wantWaits)
 
 	// 3. Mkdir
-	if resp, err := server.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "sub", Mode: 0755}); err != nil || resp.GetError() != 0 {
+	if response, err := server.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "sub", Mode: 0755}); err != nil || response.GetError() != 0 {
 		t.Fatalf("Mkdir: %v", err)
 	}
 	assertWaits("Mkdir", wantWaits)
 
 	// 4. SetAttr
-	if resp, err := server.SetAttr(ctx, &pb.SetAttrRequest{VolumeId: volume.volumeID, Inode: fileIno, Mode: proto.Uint32(0600)}); err != nil || resp.GetError() != 0 {
+	if response, err := server.SetAttr(ctx, &pb.SetAttrRequest{VolumeId: volume.volumeID, Inode: fileIno, Mode: proto.Uint32(0600)}); err != nil || response.GetError() != 0 {
 		t.Fatalf("SetAttr: %v", err)
 	}
 	assertWaits("SetAttr", wantWaits)
 
 	// 5. SetXAttr
-	if resp, err := server.SetXAttr(ctx, &pb.SetXAttrRequest{VolumeId: volume.volumeID, Inode: fileIno, Name: "user.tag", Value: []byte("val")}); err != nil || resp.GetError() != 0 {
+	if response, err := server.SetXAttr(ctx, &pb.SetXAttrRequest{VolumeId: volume.volumeID, Inode: fileIno, Name: "user.tag", Value: []byte("val")}); err != nil || response.GetError() != 0 {
 		t.Fatalf("SetXAttr: %v", err)
 	}
 	assertWaits("SetXAttr", wantWaits)
 
 	// 6. RemoveXAttr
-	if resp, err := server.RemoveXAttr(ctx, &pb.RemoveXAttrRequest{VolumeId: volume.volumeID, Inode: fileIno, Name: "user.tag"}); err != nil || resp.GetError() != 0 {
+	if response, err := server.RemoveXAttr(ctx, &pb.RemoveXAttrRequest{VolumeId: volume.volumeID, Inode: fileIno, Name: "user.tag"}); err != nil || response.GetError() != 0 {
 		t.Fatalf("RemoveXAttr: %v", err)
 	}
 	assertWaits("RemoveXAttr", wantWaits)
 
 	// 7. Symlink
-	if resp, err := server.Symlink(ctx, &pb.SymlinkRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "sym", Target: "file.txt"}); err != nil || resp.GetError() != 0 {
+	if response, err := server.Symlink(ctx, &pb.SymlinkRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "sym", Target: "file.txt"}); err != nil || response.GetError() != 0 {
 		t.Fatalf("Symlink: %v", err)
 	}
 	assertWaits("Symlink", wantWaits)
 
 	// 8. Link
-	if resp, err := server.Link(ctx, &pb.LinkRequest{VolumeId: volume.volumeID, OldInode: fileIno, NewParentInode: 1, NewName: "link"}); err != nil || resp.GetError() != 0 {
+	if response, err := server.Link(ctx, &pb.LinkRequest{VolumeId: volume.volumeID, OldInode: fileIno, NewParentInode: 1, NewName: "link"}); err != nil || response.GetError() != 0 {
 		t.Fatalf("Link: %v", err)
 	}
 	assertWaits("Link", wantWaits)
 
 	// 9. TruncateFile
-	if resp, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{VolumeId: volume.volumeID, Inode: fileIno, Size: 10}); err != nil || resp.GetError() != 0 {
+	if response, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{VolumeId: volume.volumeID, Inode: fileIno, Size: 10}); err != nil || response.GetError() != 0 {
 		t.Fatalf("TruncateFile: %v", err)
 	}
 	assertWaits("TruncateFile", wantWaits)
 
 	// 10. PunchHole (pre-syncs staged state via Fsync barrier, which adds 1 wait)
-	if resp, err := server.PunchHole(ctx, &pb.PunchHoleRequest{VolumeId: volume.volumeID, Inode: fileIno, Offset: 0, Length: 5}); err != nil || resp.GetError() != 0 {
+	if response, err := server.PunchHole(ctx, &pb.PunchHoleRequest{VolumeId: volume.volumeID, Inode: fileIno, Offset: 0, Length: 5}); err != nil || response.GetError() != 0 {
 		t.Fatalf("PunchHole: %v", err)
 	}
 	assertWaits("PunchHole", wantWaits+1)
 
 	// 11. Rename
-	if resp, err := server.Rename(ctx, &pb.RenameRequest{VolumeId: volume.volumeID, OldParentInode: 1, OldName: "link", NewParentInode: 1, NewName: "link2"}); err != nil || resp.GetError() != 0 {
+	if response, err := server.Rename(ctx, &pb.RenameRequest{VolumeId: volume.volumeID, OldParentInode: 1, OldName: "link", NewParentInode: 1, NewName: "link2"}); err != nil || response.GetError() != 0 {
 		t.Fatalf("Rename: %v", err)
 	}
 	assertWaits("Rename", wantWaits)
 
 	// 12. Unlink
-	if resp, err := server.Unlink(ctx, &pb.UnlinkRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "link2"}); err != nil || resp.GetError() != 0 {
+	if response, err := server.Unlink(ctx, &pb.UnlinkRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "link2"}); err != nil || response.GetError() != 0 {
 		t.Fatalf("Unlink: %v", err)
 	}
 	assertWaits("Unlink", wantWaits)
 
 	// 13. Rmdir
-	if resp, err := server.Rmdir(ctx, &pb.RmdirRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "sub"}); err != nil || resp.GetError() != 0 {
+	if response, err := server.Rmdir(ctx, &pb.RmdirRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "sub"}); err != nil || response.GetError() != 0 {
 		t.Fatalf("Rmdir: %v", err)
 	}
 	assertWaits("Rmdir", wantWaits)
 
 	// 14. Release (orphan deletion)
-	orphanResp, err := server.CreateFile(ctx, &pb.CreateFileRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "orphan.txt", Mode: 0644})
-	if err != nil || orphanResp.GetError() != 0 {
+	orphanResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "orphan.txt", Mode: 0644})
+	if err != nil || orphanResponse.GetError() != 0 {
 		t.Fatalf("CreateFile orphan: %v", err)
 	}
 	if _, err := server.Unlink(ctx, &pb.UnlinkRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "orphan.txt"}); err != nil {
 		t.Fatalf("Unlink orphan: %v", err)
 	}
 	stream.waitCount.Store(0)
-	if err := volume.Release(ctx, orphanResp.GetAttr().GetInode().GetIno(), orphanResp.GetFh()); err != nil {
+	if err := volume.Release(ctx, orphanResponse.GetAttr().GetInode().GetIno(), orphanResponse.GetFh()); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 	assertWaits("Release", wantWaits)
@@ -175,26 +175,26 @@ func TestMetadataDurability_Modes(t *testing.T) {
 		{name: "unset", mode: pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED, wantWaits: 1},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
 			ctx := t.Context()
 			stream := &recordingStream{}
-			server, volume := newMetadataDurabilityTestServer(t, stream, tc.mode)
+			server, volume := newMetadataDurabilityTestServer(t, stream, testCase.mode)
 
 			// Reset counters after setup so assertions are not already true.
 			stream.waitCount.Store(0)
 			stream.lastWaitSequence.Store(0)
 
-			runMetadataOperations(t, ctx, server, volume, stream, tc.wantWaits)
+			runMetadataOperations(t, ctx, server, volume, stream, testCase.wantWaits)
 
-			if tc.wantWaits == 0 {
+			if testCase.wantWaits == 0 {
 				// In barrier mode, verify that Fsync barrier collects durability with exactly one wait.
-				fsyncResp, err := server.Fsync(ctx, &pb.FsyncRequest{
+				fsyncResponse, err := server.Fsync(ctx, &pb.FsyncRequest{
 					VolumeId: volume.volumeID,
 					Inode:    1,
 					Blocking: true,
 				})
-				if err != nil || !fsyncResp.GetSuccess() {
+				if err != nil || !fsyncResponse.GetSuccess() {
 					t.Fatalf("Fsync failed: %v", err)
 				}
 				if got := stream.waitCount.Swap(0); got != 1 {
@@ -273,7 +273,7 @@ func runBenchmarkCreateFile(b *testing.B, mode pb.MetadataDurability) {
 			Mode:        0644,
 		})
 		if err != nil || response.GetError() != 0 {
-			b.Fatalf("CreateFile %d failed: err=%v, resp=%v", i, err, response)
+			b.Fatalf("CreateFile %d failed: err=%v, response=%v", i, err, response)
 		}
 	}
 }
