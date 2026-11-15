@@ -550,3 +550,111 @@ func TestRename_DirectoryAncestryCycle_FailsWithELOOP(t *testing.T) {
 		t.Fatal("Rename hung due to cycle in directory ancestry")
 	}
 }
+
+// TestRename_DirectoryMovedColdVolume_LookupDotDotReturnsNewParent proves that
+// a directory move persists ParentIno on the directory's inode row, ensuring
+// that looking up ".." resolves to the new parent after a cold reopen.
+func TestRename_DirectoryMovedColdVolume_LookupDotDotReturnsNewParent(t *testing.T) {
+	ctx := t.Context()
+	storageBackend := inmemorystorage.New()
+	broadcaster := NewEventBroadcaster()
+	volumeID := "test-cold-rename-lookup-dotdot"
+	localDirectory := t.TempDir()
+
+	initialVolume := MustNewVolume(t, volumeID, storageBackend, broadcaster,
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDirectory),
+	)
+	if err := initialVolume.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed on initial volume: %v", err)
+	}
+
+	// 1. Create parent1 and parent2 under root (inode 1).
+	parent1Attr, err := initialVolume.Mkdir(ctx, 1, "parent1", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir parent1 failed: %v", err)
+	}
+	parent1Ino := parent1Attr.GetInode().GetIno()
+
+	parent2Attr, err := initialVolume.Mkdir(ctx, 1, "parent2", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir parent2 failed: %v", err)
+	}
+	parent2Ino := parent2Attr.GetInode().GetIno()
+
+	// 2. Create child_dir under parent1.
+	childAttr, err := initialVolume.Mkdir(ctx, parent1Ino, "child_dir", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir child_dir failed: %v", err)
+	}
+	childIno := childAttr.GetInode().GetIno()
+
+	// Verify child_dir's ".." points to parent1 initially.
+	dotDotAttr, err := initialVolume.Lookup(ctx, childIno, "..")
+	if err != nil {
+		t.Fatalf("Lookup '..' on child_dir failed: %v", err)
+	}
+	if dotDotAttr.GetInode().GetIno() != parent1Ino {
+		t.Fatalf("expected child_dir '..' before rename to be %d, got %d", parent1Ino, dotDotAttr.GetInode().GetIno())
+	}
+
+	// 3. Rename child_dir from parent1 to parent2.
+	_, err = initialVolume.Rename(ctx, parent1Ino, "child_dir", parent2Ino, "child_moved")
+	if err != nil {
+		t.Fatalf("Rename child_dir to parent2 failed: %v", err)
+	}
+
+	// Verify child_dir's ".." points to parent2 before closing.
+	dotDotAttr, err = initialVolume.Lookup(ctx, childIno, "..")
+	if err != nil {
+		t.Fatalf("Lookup '..' on child_dir after rename failed: %v", err)
+	}
+	if dotDotAttr.GetInode().GetIno() != parent2Ino {
+		t.Fatalf("expected child_dir '..' after rename to be %d, got %d", parent2Ino, dotDotAttr.GetInode().GetIno())
+	}
+
+	if err := initialVolume.Close(); err != nil {
+		t.Fatalf("Close failed on initial volume: %v", err)
+	}
+
+	// 4. Open a cold volume on the same storage and check '..' from child_dir.
+	coldVolume := MustNewVolume(t, volumeID, storageBackend, broadcaster,
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDirectory),
+	)
+	t.Cleanup(func() {
+		if closeErr := coldVolume.Close(); closeErr != nil {
+			t.Errorf("coldVolume.Close failed: %v", closeErr)
+		}
+	})
+	if err := coldVolume.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed on cold volume: %v", err)
+	}
+
+	// Lookup '..' on child_dir on the cold volume; must return parent2.
+	coldDotDotAttr, err := coldVolume.Lookup(ctx, childIno, "..")
+	if err != nil {
+		t.Fatalf("Lookup '..' on child_dir on cold volume failed: %v", err)
+	}
+	if coldDotDotAttr.GetInode().GetIno() != parent2Ino {
+		t.Fatalf("expected child_dir '..' on cold volume to be %d, got %d", parent2Ino, coldDotDotAttr.GetInode().GetIno())
+	}
+
+	// Verify parent2's '..' on cold volume points to root (1).
+	parent2DotDotAttr, err := coldVolume.Lookup(ctx, parent2Ino, "..")
+	if err != nil {
+		t.Fatalf("Lookup '..' on parent2 on cold volume failed: %v", err)
+	}
+	if parent2DotDotAttr.GetInode().GetIno() != 1 {
+		t.Fatalf("expected parent2 '..' on cold volume to be 1, got %d", parent2DotDotAttr.GetInode().GetIno())
+	}
+
+	// Verify root's '..' on cold volume points to root (1).
+	rootDirDotDotAttr, err := coldVolume.Lookup(ctx, 1, "..")
+	if err != nil {
+		t.Fatalf("Lookup '..' on root on cold volume failed: %v", err)
+	}
+	if rootDirDotDotAttr.GetInode().GetIno() != 1 {
+		t.Fatalf("expected root '..' on cold volume to be 1, got %d", rootDirDotDotAttr.GetInode().GetIno())
+	}
+}
