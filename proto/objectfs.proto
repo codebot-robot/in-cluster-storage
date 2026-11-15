@@ -97,6 +97,12 @@ enum VolumeMode {
   EXCLUSIVE_LOCAL = 2;
 }
 
+enum MetadataDurability {
+  METADATA_DURABILITY_UNSPECIFIED = 0;
+  BARRIER = 1;
+  OPERATION = 2;
+}
+
 message EntryAttr {
   Inode inode = 1;
   string name = 2;
