@@ -1862,14 +1862,6 @@ func (v *Volume) MetadataDurability() pb.MetadataDurability {
 	return v.metadataDurability
 }
 
-// SetMetadataDurability updates the metadata durability mode for this volume.
-// Takes v.mu for writing.
-func (v *Volume) SetMetadataDurability(mode pb.MetadataDurability) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.metadataDurability = mode
-}
-
 // PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store,
 // waiting until the persisted VolumeInfo record reaches the volume's durability level.
 func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
@@ -2218,7 +2210,7 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 // In barrier mode, operations past rejectMutation() that commit after Volume.Stop reads
 // the newest sequence do not wait, leaving them uncovered by Stop's durability wait;
 // callers must quiesce mutations before initiating graceful shutdown.
-// Takes no locks.
+// Requires v.mu held.
 func (v *Volume) makeOperationWaitFn(commitSeq uint64) func(context.Context) error {
 	if v.metadataDurability == pb.MetadataDurability_BARRIER {
 		return nil
