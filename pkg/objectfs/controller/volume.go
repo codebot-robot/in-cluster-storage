@@ -5934,49 +5934,59 @@ func (v *Volume) Open(ctx context.Context, inodeID uint64, flags uint32) (uint64
 	return fh, attr, pos, nil
 }
 
+// Release closes an open file handle and deletes the inode if it was an unlinked orphan.
+// Takes v.mu for mutations and commits; durability wait is performed outside v.mu.
 func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	waitFn, err := func() (func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
 
-	tx := v.beginTxLocked("Release")
+		tx := v.beginTxLocked("Release")
 
-	inodeID = v.normalizeInodeID(inodeID)
+		inodeID = v.normalizeInodeID(inodeID)
 
-	v.handlesMu.Lock()
-	if fh != 0 {
-		if ino, ok := v.handles[fh]; ok {
-			inodeID = ino
-			delete(v.handles, fh)
-		}
-	}
-	if v.openInodes != nil {
-		if v.openInodes[inodeID] > 1 {
-			v.openInodes[inodeID]--
-			v.handlesMu.Unlock()
-			return nil
-		}
-		delete(v.openInodes, inodeID)
-	}
-	v.handlesMu.Unlock()
-
-	node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
-	if err != nil || node == nil {
-		return nil
-	}
-
-	if !node.Row.GetIsDir() && node.Row.GetNlink() == 0 {
-		if err := v.deleteInodeRowsLocked(ctx, tx, inodeID); err != nil {
-			return err
-		}
-		commitSeq, err := v.commitTxLocked(ctx, tx)
-		if err != nil {
-			return fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
-		}
-		waitFn := v.makeWaitFn(commitSeq, nil)
-		if waitFn != nil {
-			if err := waitFn(ctx); err != nil {
-				return fmt.Errorf("failed to wait for orphan deletion sync: %w", err)
+		v.handlesMu.Lock()
+		if fh != 0 {
+			if ino, ok := v.handles[fh]; ok {
+				inodeID = ino
+				delete(v.handles, fh)
 			}
+		}
+		if v.openInodes != nil {
+			if v.openInodes[inodeID] > 1 {
+				v.openInodes[inodeID]--
+				v.handlesMu.Unlock()
+				return nil, nil
+			}
+			delete(v.openInodes, inodeID)
+		}
+		v.handlesMu.Unlock()
+
+		node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
+		if err != nil || node == nil {
+			return nil, nil
+		}
+
+		if !node.Row.GetIsDir() && node.Row.GetNlink() == 0 {
+			if err := v.deleteInodeRowsLocked(ctx, tx, inodeID); err != nil {
+				return nil, err
+			}
+			commitSeq, err := v.commitTxLocked(ctx, tx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
+			}
+			return v.makeWaitFn(commitSeq, nil), nil
+		}
+		return nil, nil
+	}()
+	if err != nil {
+		return err
+	}
+	if waitFn != nil {
+		// When the wait fails, the deletion has already been applied in memory
+		// and committed to the stream; no rollback is attempted.
+		if err := waitFn(ctx); err != nil {
+			return fmt.Errorf("failed to wait for orphan deletion sync: %w", err)
 		}
 	}
 	return nil
