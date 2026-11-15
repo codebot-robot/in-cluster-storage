@@ -1950,26 +1950,60 @@ func (v *Volume) rejectMutationLocked() error {
 }
 
 // Stop gracefully drains the volume by stopping new mutations and sync requests,
-// initiating one final sync of all staged chunks if none is currently in flight,
-// and waiting for any in-flight sync to complete, bounded by ctx.
+// flushing all staged chunks, and waiting for the volume's newest commit sequence
+// to reach its durability level, bounded by ctx.
 // If ctx is already done, Stop returns immediately without marking the volume
 // stopping or starting a sync, preserving crash semantics when followed by Close.
 // It is idempotent; subsequent calls wait for the active drain without starting another sync.
+// No volume locks are held across the durability wait.
 func (v *Volume) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("volume %s stop: %w", v.volumeID, err)
 	}
 
+	sequence, err := v.drainStagedData(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Guarantee: every transaction committed before Stop read the sequence has reached
+	// the configured durability level when Stop returns nil, because WAL stream durability
+	// waits track watermarks (witnessSeq/s3Seq >= sequence).
+	//
+	// Operations that were already past rejectMutation() before stopping was marked, or
+	// committers that do not check stopping (such as persistVolumeInfo, Release, or
+	// cleanOrphanInodesLocked), may commit later with a higher sequence and are not
+	// covered by this wait. Callers must stop sending operations before initiating
+	// graceful drain (in cmd/objectfs-controller/main.go, on the signal shutdown path
+	// Server.Shutdown relies on grpcServer.GracefulStop() completing before shutdown begins).
+	//
+	// Wait for metadata durability with no volume lock held, allowing concurrent reads
+	// to proceed while waiting.
+	if err := v.waitForSequence(ctx, sequence); err != nil {
+		return fmt.Errorf("volume %s stop failed to wait for metadata durability: %w", v.volumeID, err)
+	}
+	return nil
+}
+
+// drainStagedData stops accepting new mutations, initiates a final sync of all
+// staged chunks if needed, and waits for in-flight sync to complete under ctx.
+// It returns the volume's newest commit sequence once staging is drained, or
+// sequence 0 if staging is already closed.
+// Takes stagingMu, and takes v.mu for reading through Position() after stagingMu is released.
+func (v *Volume) drainStagedData(ctx context.Context) (uint64, error) {
 	v.stagingMu.Lock()
 	if v.stagingClosed {
 		v.stagingMu.Unlock()
-		return nil
+		return 0, nil
 	}
 	v.stopping = true
 	v.startFinalSyncLocked()
 
 	if v.currentSync == nil {
-		return v.finishStopLocked()
+		if err := v.finishStopLocked(); err != nil {
+			return 0, err
+		}
+		return v.Position(), nil
 	}
 
 	stopTimer := context.AfterFunc(ctx, func() {
@@ -1985,12 +2019,18 @@ func (v *Volume) Stop(ctx context.Context) error {
 
 	if v.currentSync != nil {
 		elapsed := time.Since(v.currentSync.startTime)
-		klog.Warningf("ObjectFS volume %s stop timed out waiting for sync in flight: trigger=%v, commitSeq=%d, elapsed=%v",
-			v.volumeID, v.currentSync.trigger, v.currentSync.commitSeq, elapsed)
+		scoped.Log(ctx).Info("ObjectFS volume stop timed out waiting for sync in flight",
+			"volume", v.volumeID,
+			"trigger", v.currentSync.trigger,
+			"commitSequence", v.currentSync.commitSeq,
+			"elapsed", elapsed)
 		v.stagingMu.Unlock()
-		return fmt.Errorf("volume %s stop timed out waiting for in-flight sync: %w", v.volumeID, ctx.Err())
+		return 0, fmt.Errorf("volume %s stop timed out waiting for in-flight sync: %w", v.volumeID, ctx.Err())
 	}
-	return v.finishStopLocked()
+	if err := v.finishStopLocked(); err != nil {
+		return 0, err
+	}
+	return v.Position(), nil
 }
 
 func (v *Volume) startFinalSyncLocked() {
@@ -2021,6 +2061,8 @@ func (v *Volume) startFinalSyncLocked() {
 	v.stagingMu.Lock()
 }
 
+// finishStopLocked verifies that all staged chunks were drained and unlocks stagingMu.
+// Requires stagingMu held; releases stagingMu before returning.
 func (v *Volume) finishStopLocked() error {
 	defer v.stagingMu.Unlock()
 	if len(v.stagedChunks) > 0 {

@@ -69,6 +69,9 @@ var ErrDurabilityUnavailable = errors.New("WAL has no remote target")
 // that was discarded due to divergence from authoritative buffer history.
 var ErrRecordDiscarded = errors.New("WAL record discarded due to history divergence")
 
+// ErrClosed is returned when an operation is attempted on a closed stream or when the stream is closed while waiting.
+var ErrClosed = errors.New("stream closed")
+
 // DegradedError indicates that the WAL stream encountered an unrecoverable local store failure
 // (such as segment truncation error) and cannot safely accept or wait for further writes.
 type DegradedError struct {
@@ -362,7 +365,7 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 // Append writes locally without per-record fsync, applying backpressure if retained bytes exceed maxRetainedBytes.
 func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error) {
 	if s.closed.Load() {
-		return 0, errors.New("stream closed")
+		return 0, ErrClosed
 	}
 
 	s.mu.RLock()
@@ -384,7 +387,7 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-s.cancelCtx.Done():
-		return 0, errors.New("stream closed")
+		return 0, ErrClosed
 	}
 
 	recordSize := int64(wal.ClientHeaderSize + len(payload))
@@ -407,7 +410,7 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		case <-s.cancelCtx.Done():
-			return 0, errors.New("stream closed")
+			return 0, ErrClosed
 		case <-doneCh:
 		}
 		s.mu.Lock()
@@ -467,7 +470,7 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 	}
 	if s.closed.Load() {
 		s.mu.Unlock()
-		return errors.New("stream closed")
+		return ErrClosed
 	}
 	if seq > s.localSeq {
 		s.mu.Unlock()
@@ -497,7 +500,7 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 		s.mu.Unlock()
 		return ctx.Err()
 	case <-s.cancelCtx.Done():
-		return errors.New("stream closed")
+		return ErrClosed
 	case err := <-w.done:
 		return err
 	}
@@ -528,7 +531,7 @@ func (s *streamImpl) notifyWaitersLocked() {
 // a Flush RPC is issued (coalesced server-side) before waiting instead of relying on the periodic flush.
 func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestFlush bool) error {
 	if s.closed.Load() {
-		return errors.New("stream closed")
+		return ErrClosed
 	}
 
 	s.mu.RLock()
@@ -585,7 +588,7 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 // Flush asks the service to flush to permanent storage and waits for the permanent ack of everything appended so far.
 func (s *streamImpl) Flush(ctx context.Context) error {
 	if s.closed.Load() {
-		return errors.New("stream closed")
+		return ErrClosed
 	}
 
 	s.mu.RLock()
@@ -687,7 +690,7 @@ func (s *streamImpl) Close() error {
 	})
 	s.mu.Lock()
 	for _, w := range s.waiters {
-		w.done <- errors.New("stream closed")
+		w.done <- ErrClosed
 	}
 	s.waiters = nil
 	s.cond.Broadcast()
