@@ -186,12 +186,16 @@ func (VolumeMode) EnumDescriptor() ([]byte, []int) {
 	return file_proto_objectfs_proto_rawDescGZIP(), []int{2}
 }
 
+// MetadataDurability controls whether metadata operations wait for WAL durability.
 type MetadataDurability int32
 
 const (
+	// Use the server default durability mode.
 	MetadataDurability_METADATA_DURABILITY_UNSPECIFIED MetadataDurability = 0
-	MetadataDurability_BARRIER                         MetadataDurability = 1
-	MetadataDurability_OPERATION                       MetadataDurability = 2
+	// Metadata operations return immediately without waiting on the WAL; durability is collected at barriers.
+	MetadataDurability_BARRIER MetadataDurability = 1
+	// Each metadata operation waits for WAL durability before returning.
+	MetadataDurability_OPERATION MetadataDurability = 2
 )
 
 // Enum value maps for MetadataDurability.
