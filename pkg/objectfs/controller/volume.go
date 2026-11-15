@@ -292,8 +292,6 @@ type Volume struct {
 	batchCheckCond   *sync.Cond
 	batchCheckActive int
 
-	dirParents map[uint64]uint64
-
 	nextFh     atomic.Uint64
 	handlesMu  sync.Mutex
 	handles    map[uint64]uint64
@@ -617,7 +615,6 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		indexFactory:       f,
 		streamID:           StreamIDForVolume(volumeID),
 		closedCh:           make(chan struct{}),
-		dirParents:         make(map[uint64]uint64),
 		handles:            make(map[uint64]uint64),
 		openInodes:         make(map[uint64]int),
 		stagingEpoch:       time.Now().UnixNano(),
@@ -2649,6 +2646,9 @@ func (v *Volume) deleteInodeRowsLocked(ctx context.Context, tx *sds.Tx, ino uint
 	return nil
 }
 
+// getOrLoadInodeLocked loads or retrieves the cached inode row for inodeID.
+// Contract: the caller holds v.mu for reading or writing, and because read
+// paths hold it shared, the function must not write any Volume state.
 func (v *Volume) getOrLoadInodeLocked(ctx context.Context, tx *sds.Tx, inodeID uint64) (*CachedInode, error) {
 	inodeID = v.normalizeInodeID(inodeID)
 
@@ -3150,9 +3150,6 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 		}
 		pIno := parentNode.Row.GetParentIno()
 		if pIno == 0 {
-			pIno = v.dirParents[parentInodeID]
-		}
-		if pIno == 0 {
 			pIno = v.rootInodeID
 		}
 		return v.toEntryAttrLocked(ctx, nil, pIno, "..")
@@ -3313,11 +3310,6 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			row.Ctime = timestamppb.New(now)
 		})
 
-		if v.dirParents == nil {
-			v.dirParents = make(map[uint64]uint64)
-		}
-		v.dirParents[childInodeID] = parentInodeID
-
 		childInodeMsg := &pb.Inode{
 			Ino:        proto.Uint64(childInodeID),
 			Mode:       mode,
@@ -3333,7 +3325,6 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			XattrCount: proto.Uint32(0),
 		}
 		if _, err := tx.Insert(ctx, childInodeMsg); err != nil {
-			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log child inode creation: %w", err)
 		}
 
@@ -3345,18 +3336,15 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			Mode:      mode,
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
-			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
 		}
 
 		if _, err := tx.Update(ctx, parentInode.Row); err != nil {
-			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to log parent inode update: %w", err)
 		}
 
 		commitSeq, err := v.commitTxLocked(ctx, tx)
 		if err != nil {
-			delete(v.dirParents, childInodeID)
 			return nil, nil, fmt.Errorf("failed to commit mkdir transaction: %w", err)
 		}
 
@@ -5460,8 +5448,6 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (
 			return nil, 0, fmt.Errorf("directory %s not empty: %w", name, syscall.ENOTEMPTY)
 		}
 
-		delete(v.dirParents, childInodeID)
-
 		now := time.Now()
 		parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
 		if err != nil {
@@ -5634,17 +5620,10 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 					}
 					parentInodeID := ancestorInode.Row.GetParentIno()
 					if parentInodeID == 0 {
-						parentInodeID = v.dirParents[currentInodeID]
-					}
-					if parentInodeID == 0 {
 						break
 					}
 					currentInodeID = parentInodeID
 				}
-				if v.dirParents == nil {
-					v.dirParents = make(map[uint64]uint64)
-				}
-				v.dirParents[childInode.Row.GetIno()] = newParentInodeID
 
 				if oldParentInode != nil {
 					oldParentInode.mutate(func(row *pb.Inode) {
@@ -5690,9 +5669,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 				}
 				targetInode.Data = nil
 			}
-			if targetInode.Row.GetIsDir() {
-				delete(v.dirParents, targetInodeID)
-			} else {
+			if !targetInode.Row.GetIsDir() {
 				targetInode.mutate(func(row *pb.Inode) {
 					if row.GetNlink() > 1 {
 						row.Nlink--
@@ -6328,8 +6305,6 @@ func (v *Volume) applyRestoreRecordLocked(ctx context.Context, ptr *sdsv1.Snapsh
 	v.replayStartPos = ptr.GetPosition()
 	v.replaySnapshotLocation = ptr.GetRestoredFrom()
 	v.lastCommitSeq = seq
-	v.dirParents = make(map[uint64]uint64)
-	v.dirParents[1] = 1
 	return nil
 }
 
@@ -6916,7 +6891,6 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		}
 		v.rootInodeID = 1
 		v.nextInode = erofs.DefaultInodeStride
-		v.dirParents[1] = 1
 	}
 
 	v.initLiveStatsLocked()
@@ -7342,8 +7316,6 @@ func (v *Volume) writeRestoreRecord(ctx context.Context, snapshotName string) (*
 	v.lastCommitSeq = restoreSeq
 
 	v.metadataView.ClearCache()
-	v.dirParents = make(map[uint64]uint64)
-	v.dirParents[1] = 1
 	// Active file handles (v.handles) and open inode refcounts (v.openInodes)
 	// are retained across snapshot restore because they refer to the running clients.
 	v.initLiveStatsLocked()
@@ -7462,8 +7434,6 @@ func (v *Volume) InitFromSnapshot(ctx context.Context, sourceVolumeID, snapshotN
 	v.lastCommitSeq = 0
 
 	v.metadataView.ClearCache()
-	v.dirParents = make(map[uint64]uint64)
-	v.dirParents[1] = 1
 	v.initLiveStatsLocked()
 	if err := v.initNextInodeFromStatsLocked(ctx, 0); err != nil {
 		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
