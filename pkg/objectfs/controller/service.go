@@ -141,33 +141,34 @@ type Server struct {
 	blobStore   *blob.Store
 	broadcaster *EventBroadcaster
 
-	walDir                   string
-	walDirErr                error
-	walTarget                string
-	walNoFsync               bool
-	tempWalDir               string
-	testBufferCleanup        func()
-	walDialOpts              []grpc.DialOption
-	walConn                  *grpc.ClientConn
-	walClient                walpb.WalBufferClient
-	walErr                   error
-	defaultDurability        walclient.Level
-	metadataIndex            string
-	metadataDir              string
-	metadataCacheEntries     int
-	metadataCacheBytes       int64
-	metadataOverlayMaxBytes  int64
-	metadataApplierBatchSize int
-	localStorageDir          string
-	debugStatsCheck          bool
-	debugMutationCheck       bool
-	viewOpts                 []view.Option
-	streamFactory            func(volumeID string) (walclient.Stream, error)
-	syncCoalesceWindow       time.Duration
-	maxStagingBytes          int64
-	syncTimeout              time.Duration
-	openBarrierTimeout       time.Duration
-	acceptUnversioned        bool
+	walDir                    string
+	walDirErr                 error
+	walTarget                 string
+	walNoFsync                bool
+	tempWalDir                string
+	testBufferCleanup         func()
+	walDialOpts               []grpc.DialOption
+	walConn                   *grpc.ClientConn
+	walClient                 walpb.WalBufferClient
+	walErr                    error
+	defaultDurability         walclient.Level
+	defaultMetadataDurability pb.MetadataDurability
+	metadataIndex             string
+	metadataDir               string
+	metadataCacheEntries      int
+	metadataCacheBytes        int64
+	metadataOverlayMaxBytes   int64
+	metadataApplierBatchSize  int
+	localStorageDir           string
+	debugStatsCheck           bool
+	debugMutationCheck        bool
+	viewOpts                  []view.Option
+	streamFactory             func(volumeID string) (walclient.Stream, error)
+	syncCoalesceWindow        time.Duration
+	maxStagingBytes           int64
+	syncTimeout               time.Duration
+	openBarrierTimeout        time.Duration
+	acceptUnversioned         bool
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -306,6 +307,16 @@ func WithServerDurability(durability walclient.Level) ServerOption {
 	}
 }
 
+// WithServerMetadataDurability sets the default metadata durability mode for volumes.
+// Takes no locks.
+func WithServerMetadataDurability(mode pb.MetadataDurability) ServerOption {
+	return func(s *Server) {
+		if mode != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+			s.defaultMetadataDurability = mode
+		}
+	}
+}
+
 // WithServerMetadataCacheLimits configures the metadata read cache entry and byte capacity.
 func WithServerMetadataCacheLimits(maxEntries int, maxBytes int64) ServerOption {
 	return func(s *Server) {
@@ -409,16 +420,17 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		backend = NewMemoryBackend()
 	}
 	s := &Server{
-		volumes:           make(map[string]*Volume),
-		backend:           backend,
-		blobStore:         blob.NewStore(backend, 0),
-		broadcaster:       NewEventBroadcaster(),
-		checkpointWaiters: make(map[string]chan uint64),
-		exclusiveHolds:    make(map[string]*ExclusiveHold),
-		exclusiveLeaseTTL: 30 * time.Second,
-		syncTimeout:       10 * time.Minute,
-		defaultDurability: walclient.Local,
-		restoring:         make(map[string]bool),
+		volumes:                   make(map[string]*Volume),
+		backend:                   backend,
+		blobStore:                 blob.NewStore(backend, 0),
+		broadcaster:               NewEventBroadcaster(),
+		checkpointWaiters:         make(map[string]chan uint64),
+		exclusiveHolds:            make(map[string]*ExclusiveHold),
+		exclusiveLeaseTTL:         30 * time.Second,
+		syncTimeout:               10 * time.Minute,
+		defaultDurability:         walclient.Local,
+		defaultMetadataDurability: pb.MetadataDurability_OPERATION,
+		restoring:                 make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -484,6 +496,7 @@ func (s *Server) createVolumeInstanceLocked(volumeID string) (*Volume, error) {
 		volumeOptions = append(volumeOptions, WithStream(stream))
 	}
 	volumeOptions = append(volumeOptions, WithDurability(s.defaultDurability))
+	volumeOptions = append(volumeOptions, WithMetadataDurability(s.defaultMetadataDurability))
 	if s.metadataIndex != "" {
 		volumeOptions = append(volumeOptions, WithMetadataIndex(s.metadataIndex))
 	}
