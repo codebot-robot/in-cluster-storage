@@ -210,6 +210,12 @@ type Server struct {
 	// acceptUnversioned configures whether unversioned segments, streams, and snapshots are accepted.
 	acceptUnversioned bool
 
+	// diskLimitsMu guards controller-wide disk accounting fields.
+	diskLimitsMu sync.Mutex
+	// localStagingBytes tracks the controller-wide total of unuploaded staged write bytes across all volumes.
+	// It is guarded by diskLimitsMu and modified exclusively by the volume helpers addStagedBytesLocked and subtractStagedBytesLocked.
+	localStagingBytes int64
+
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
 	flushWg     sync.WaitGroup
@@ -591,6 +597,7 @@ func (s *Server) createVolumeInstanceLocked(volumeID string) (*Volume, error) {
 	if s.blobStore != nil {
 		volumeOptions = append(volumeOptions, WithBlobStore(s.blobStore))
 	}
+	volumeOptions = append(volumeOptions, WithServer(s))
 
 	return NewVolume(volumeID, s.backend, s.broadcaster, volumeOptions...)
 }
@@ -2034,4 +2041,31 @@ func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) 
 		OldPath:      oldPath,
 		NewWatermark: witnessWatermark,
 	}, nil
+}
+
+// ServerStats contains aggregated operational and capacity metrics for the controller server.
+type ServerStats struct {
+	LocalStagingBytes int64
+}
+
+// Stats returns a snapshot of controller operational and capacity metrics.
+func (s *Server) Stats() ServerStats {
+	s.diskLimitsMu.Lock()
+	defer s.diskLimitsMu.Unlock()
+
+	return ServerStats{
+		LocalStagingBytes: s.localStagingBytes,
+	}
+}
+
+func (s *Server) addLocalStagingBytes(delta int64) {
+	s.diskLimitsMu.Lock()
+	s.localStagingBytes += delta
+	s.diskLimitsMu.Unlock()
+}
+
+func (s *Server) subtractLocalStagingBytes(delta int64) {
+	s.diskLimitsMu.Lock()
+	s.localStagingBytes -= delta
+	s.diskLimitsMu.Unlock()
 }
