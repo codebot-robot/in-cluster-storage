@@ -2203,7 +2203,7 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 	}
 }
 
-// makeOperationWaitFn returns a durability wait function for a metadata operation.
+// makeMetadataWaitFn returns a durability wait function for a metadata operation.
 // In barrier mode it returns nil without waiting. In per-operation mode it delegates
 // to makeWaitFn.
 //
@@ -2211,7 +2211,7 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 // the newest sequence do not wait, leaving them uncovered by Stop's durability wait;
 // callers must quiesce mutations before initiating graceful shutdown.
 // Requires v.mu held.
-func (v *Volume) makeOperationWaitFn(commitSeq uint64) func(context.Context) error {
+func (v *Volume) makeMetadataWaitFn(commitSeq uint64) func(context.Context) error {
 	if v.metadataDurability == pb.MetadataDurability_BARRIER {
 		return nil
 	}
@@ -2881,7 +2881,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 			return nil, nil, fmt.Errorf("failed to commit setattr transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return attr, waitFn, nil
@@ -3025,7 +3025,7 @@ func (v *Volume) SetXAttr(ctx context.Context, inodeID uint64, name string, valu
 			return nil, nil, fmt.Errorf("failed to commit setxattr transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return waitFn, attr, nil
 	}()
@@ -3142,7 +3142,7 @@ func (v *Volume) RemoveXAttr(ctx context.Context, inodeID uint64, name string) e
 			return nil, nil, fmt.Errorf("failed to commit removexattr transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return waitFn, attr, nil
 	}()
@@ -3389,7 +3389,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			return nil, nil, fmt.Errorf("failed to commit mkdir transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInodeMsg, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3611,7 +3611,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				return nil, nil, fmt.Errorf("failed to commit overwrite file transaction: %w", err)
 			}
 
-			waitFn := v.makeOperationWaitFn(commitSeq)
+			waitFn := v.makeMetadataWaitFn(commitSeq)
 
 			attr := v.toEntryAttr(childInode.Row, name, childInode.RedirectURL)
 			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3721,7 +3721,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("failed to commit create file transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInode.Row, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3838,7 +3838,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			return nil, nil, fmt.Errorf("failed to commit symlink transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInode.Row, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3964,7 +3964,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			return nil, nil, fmt.Errorf("failed to commit link transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(oldNode.Row, newName, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -5008,7 +5008,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			return nil, nil, fmt.Errorf("failed to commit truncate file transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -5283,7 +5283,7 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 			return nil, nil, fmt.Errorf("failed to commit punch hole transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -5416,7 +5416,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:      pb.WatchEventType_EVENT_DELETED,
@@ -5519,7 +5519,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (
 			return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:      pb.WatchEventType_EVENT_DELETED,
@@ -5804,7 +5804,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			return nil, nil, fmt.Errorf("failed to commit rename transaction: %w", err)
 		}
 
-		waitFn := v.makeOperationWaitFn(commitSeq)
+		waitFn := v.makeMetadataWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInode.Row, newName, childInode.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -6016,7 +6016,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 			if err != nil {
 				return nil, fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
 			}
-			return v.makeOperationWaitFn(commitSeq), nil
+			return v.makeMetadataWaitFn(commitSeq), nil
 		}
 		return nil, nil
 	}()
