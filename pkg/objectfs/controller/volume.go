@@ -263,6 +263,7 @@ type Volume struct {
 	syncTimeout        time.Duration
 	openBarrierTimeout time.Duration
 	consistencyMode    pb.ConsistencyMode
+	metadataDurability pb.MetadataDurability
 	syncCond           *sync.Cond
 	stagingClosed      bool
 	stopping           bool
@@ -359,6 +360,16 @@ func WithOpenBarrierTimeout(d time.Duration) VolumeOption {
 func WithConsistencyMode(mode pb.ConsistencyMode) VolumeOption {
 	return func(v *Volume) {
 		v.consistencyMode = mode
+	}
+}
+
+// WithMetadataDurability sets the metadata durability mode for the volume.
+// Takes no locks.
+func WithMetadataDurability(mode pb.MetadataDurability) VolumeOption {
+	return func(v *Volume) {
+		if mode != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+			v.metadataDurability = mode
+		}
 	}
 }
 
@@ -612,6 +623,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		maxInlineLen:       4096,      // 4KB default inline threshold for tiny files
 		chunkSize:          64 * 1024, // 64KB default chunk size
 		durability:         walclient.Local,
+		metadataDurability: pb.MetadataDurability_OPERATION,
 		indexFactory:       f,
 		streamID:           StreamIDForVolume(volumeID),
 		closedCh:           make(chan struct{}),
@@ -1842,6 +1854,14 @@ func (v *Volume) SetConsistencyMode(mode pb.ConsistencyMode) {
 	v.consistencyMode = mode
 }
 
+// MetadataDurability returns the configured metadata durability mode for this volume.
+// Takes v.mu for reading.
+func (v *Volume) MetadataDurability() pb.MetadataDurability {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.metadataDurability
+}
+
 // PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store,
 // waiting until the persisted VolumeInfo record reaches the volume's durability level.
 func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
@@ -1970,9 +1990,12 @@ func (v *Volume) Stop(ctx context.Context) error {
 	// Operations that were already past rejectMutation() before stopping was marked, or
 	// committers that do not check stopping (such as persistVolumeInfo, Release, or
 	// cleanOrphanInodesLocked), may commit later with a higher sequence and are not
-	// covered by this wait. Callers must stop sending operations before initiating
-	// graceful drain (in cmd/objectfs-controller/main.go, on the signal shutdown path
-	// Server.Shutdown relies on grpcServer.GracefulStop() completing before shutdown begins).
+	// covered by this wait. In per-operation mode, the operation's own wait covers it.
+	// In barrier mode, operations do not wait on WAL durability, so an operation that was
+	// past rejectMutation() when Stop read the sequence is not covered by Stop's wait;
+	// callers must stop sending operations before initiating graceful drain (in
+	// cmd/objectfs-controller/main.go, on the signal shutdown path Server.Shutdown
+	// relies on grpcServer.GracefulStop() completing before shutdown begins).
 	//
 	// Wait for metadata durability with no volume lock held, allowing concurrent reads
 	// to proceed while waiting.
@@ -2178,6 +2201,21 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 		}
 		return nil
 	}
+}
+
+// makeOperationWaitFn returns a durability wait function for a metadata operation.
+// In barrier mode it returns nil without waiting. In per-operation mode it delegates
+// to makeWaitFn.
+//
+// In barrier mode, operations past rejectMutation() that commit after Volume.Stop reads
+// the newest sequence do not wait, leaving them uncovered by Stop's durability wait;
+// callers must quiesce mutations before initiating graceful shutdown.
+// Requires v.mu held.
+func (v *Volume) makeOperationWaitFn(commitSeq uint64) func(context.Context) error {
+	if v.metadataDurability == pb.MetadataDurability_BARRIER {
+		return nil
+	}
+	return v.makeWaitFn(commitSeq, nil)
 }
 
 // waitForSequence waits until sequence reaches the volume's configured durability level.
@@ -2546,6 +2584,9 @@ func (v *Volume) normalizeInodeID(id uint64) uint64 {
 	return id
 }
 
+// cleanOrphanInodesLocked scans and deletes orphan inodes during volume open,
+// always waiting for the deletion transaction to achieve durability.
+// Requires v.mu held.
 func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) (int, error) {
 	tx := v.beginTxLocked("cleanOrphanInodes")
 
@@ -2840,7 +2881,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 			return nil, nil, fmt.Errorf("failed to commit setattr transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return attr, waitFn, nil
@@ -2984,7 +3025,7 @@ func (v *Volume) SetXAttr(ctx context.Context, inodeID uint64, name string, valu
 			return nil, nil, fmt.Errorf("failed to commit setxattr transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return waitFn, attr, nil
 	}()
@@ -3101,7 +3142,7 @@ func (v *Volume) RemoveXAttr(ctx context.Context, inodeID uint64, name string) e
 			return nil, nil, fmt.Errorf("failed to commit removexattr transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return waitFn, attr, nil
 	}()
@@ -3348,7 +3389,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			return nil, nil, fmt.Errorf("failed to commit mkdir transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInodeMsg, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3570,7 +3611,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				return nil, nil, fmt.Errorf("failed to commit overwrite file transaction: %w", err)
 			}
 
-			waitFn := v.makeWaitFn(commitSeq, nil)
+			waitFn := v.makeOperationWaitFn(commitSeq)
 
 			attr := v.toEntryAttr(childInode.Row, name, childInode.RedirectURL)
 			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3680,7 +3721,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("failed to commit create file transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInode.Row, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3797,7 +3838,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			return nil, nil, fmt.Errorf("failed to commit symlink transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInode.Row, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3923,7 +3964,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			return nil, nil, fmt.Errorf("failed to commit link transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(oldNode.Row, newName, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -4967,7 +5008,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			return nil, nil, fmt.Errorf("failed to commit truncate file transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -5242,7 +5283,7 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 			return nil, nil, fmt.Errorf("failed to commit punch hole transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -5375,7 +5416,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:      pb.WatchEventType_EVENT_DELETED,
@@ -5478,7 +5519,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (
 			return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:      pb.WatchEventType_EVENT_DELETED,
@@ -5763,7 +5804,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			return nil, nil, fmt.Errorf("failed to commit rename transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInode.Row, newName, childInode.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -5975,7 +6016,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 			if err != nil {
 				return nil, fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
 			}
-			return v.makeWaitFn(commitSeq, nil), nil
+			return v.makeOperationWaitFn(commitSeq), nil
 		}
 		return nil, nil
 	}()
