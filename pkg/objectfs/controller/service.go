@@ -1531,26 +1531,21 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 	var volInfos []*pb.VolumeInfo
 	s.mu.RLock()
 	for _, id := range filtered {
-		var degraded *pb.Degraded
-		var consistencyMode pb.ConsistencyMode
-		var metadataDurability pb.MetadataDurability
+		info := &pb.VolumeInfo{
+			VolumeId: id,
+		}
 		if volume, ok := s.volumes[id]; ok {
-			consistencyMode = volume.ConsistencyMode()
-			metadataDurability = volume.MetadataDurability()
+			info.ConsistencyMode = volume.ConsistencyMode()
+			info.MetadataDurability = volume.MetadataDurability()
 			if deg := volume.Degraded(); deg != nil {
-				degraded = &pb.Degraded{
+				info.Degraded = &pb.Degraded{
 					Code:    pb.Degraded_WAL_STREAM_DEGRADED,
 					Message: deg.Error(),
 					Since:   timestamppb.New(deg.At),
 				}
 			}
 		}
-		volInfos = append(volInfos, &pb.VolumeInfo{
-			VolumeId:           id,
-			Degraded:           degraded,
-			ConsistencyMode:    consistencyMode,
-			MetadataDurability: metadataDurability,
-		})
+		volInfos = append(volInfos, info)
 	}
 	s.mu.RUnlock()
 
