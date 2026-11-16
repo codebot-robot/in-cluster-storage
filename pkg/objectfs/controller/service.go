@@ -132,8 +132,8 @@ func checkRPCErr(err error) error {
 	return nil
 }
 
-// serverWALConfig groups configuration and connection state for the write-ahead log.
-type serverWALConfig struct {
+// serverWAL holds the WAL settings and the connection built from them.
+type serverWAL struct {
 	// dir is the base directory on the local filesystem where WAL segments are stored.
 	dir string
 	// dirErr records an error encountered when validating or preparing the WAL directory.
@@ -195,8 +195,8 @@ type Server struct {
 	blobStore   *blob.Store
 	broadcaster *EventBroadcaster
 
-	// wal groups configuration and connection state for the write-ahead log.
-	wal serverWALConfig
+	// wal holds the WAL settings and the connection built from them.
+	wal serverWAL
 	// metadata groups configuration options for volume metadata indexing, caching, and views.
 	metadata serverMetadataConfig
 	// syncCoalesceWindow sets the window duration for coalescing non-blocking sync requests across all volumes.
@@ -469,7 +469,7 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		exclusiveHolds:    make(map[string]*ExclusiveHold),
 		exclusiveLeaseTTL: 30 * time.Second,
 		syncTimeout:       10 * time.Minute,
-		wal: serverWALConfig{
+		wal: serverWAL{
 			defaultDurability: walclient.Local,
 		},
 		metadata: serverMetadataConfig{
