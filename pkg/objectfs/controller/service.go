@@ -2206,8 +2206,25 @@ func (l *serverDiskLimits) wait(ctx context.Context, volumeID string, neededByte
 	return nil
 }
 
-// triggerStagedVolumesSync initiates coalesce syncs for all volumes holding staged bytes.
-// Requires no locks held; acquires s.mu for reading.
+// volumeStagedBytes pairs a registered volume with its snapshot of unuploaded staged bytes
+// for sorting candidate volumes at the staging ceiling.
+type volumeStagedBytes struct {
+	// volume is the candidate Volume holding staged data.
+	volume *Volume
+	// stagedBytes is the number of unuploaded staged bytes measured on volume under stagingMu.
+	stagedBytes int64
+}
+
+// triggerStagedVolumesSync initiates coalesce syncs for all volumes holding staged bytes,
+// ordered descending by each volume's unuploaded staged byte count.
+//
+// Lock hierarchy and order:
+// Requires no locks held upon entry.
+// It acquires s.mu for reading to take a snapshot slice of registered volumes and releases s.mu
+// before inspecting any volume. Each volume's stagingMu is then acquired individually via StagedBytes
+// to read its unuploaded staged byte count without holding s.mu across any volume lock to prevent
+// lock-order deadlocks. Volumes with staged bytes are sorted in descending order of staged bytes
+// and triggerSyncIfStaged (which acquires stagingMu) is called in that order.
 func (s *Server) triggerStagedVolumesSync() {
 	s.mu.RLock()
 	volumes := make([]*Volume, 0, len(s.volumes))
@@ -2216,7 +2233,25 @@ func (s *Server) triggerStagedVolumesSync() {
 	}
 	s.mu.RUnlock()
 
+	stagedVolumes := make([]volumeStagedBytes, 0, len(volumes))
 	for _, volume := range volumes {
-		volume.triggerSyncIfStaged()
+		stagedBytes := volume.StagedBytes()
+		if stagedBytes > 0 {
+			stagedVolumes = append(stagedVolumes, volumeStagedBytes{
+				volume:      volume,
+				stagedBytes: stagedBytes,
+			})
+		}
+	}
+
+	sort.Slice(stagedVolumes, func(i, j int) bool {
+		if stagedVolumes[i].stagedBytes != stagedVolumes[j].stagedBytes {
+			return stagedVolumes[i].stagedBytes > stagedVolumes[j].stagedBytes
+		}
+		return stagedVolumes[i].volume.volumeID < stagedVolumes[j].volume.volumeID
+	})
+
+	for _, entry := range stagedVolumes {
+		entry.volume.triggerSyncIfStaged()
 	}
 }

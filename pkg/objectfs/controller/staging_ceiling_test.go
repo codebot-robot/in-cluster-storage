@@ -341,3 +341,101 @@ func TestStagingCeiling_Stats(t *testing.T) {
 		t.Fatalf("expected LocalStagingBytes = 0, got %d", stats.LocalStagingBytes)
 	}
 }
+
+// setSyncTriggerHook configures a callback invoked when triggerSyncIfStaged initiates a coalesce sync (testing only).
+// Requires no locks held; acquires stagingMu.
+func (v *Volume) setSyncTriggerHook(hook func()) {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+	v.syncTriggerHook = hook
+}
+
+// TestStagingCeiling_SyncsLargestStagedVolumesFirst verifies that when the staging ceiling is reached,
+// coalesce syncs are triggered in descending order of each volume's unuploaded staged bytes.
+// Driven by signals with no sleeps, and fails if the order is reversed or left to map iteration.
+// Requires no locks held.
+func TestStagingCeiling_SyncsLargestStagedVolumesFirst(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	ceilingBytes := int64(384 * 1024)
+	server := NewTestServer(t, backend, WithServerMaxLocalStagingBytes(ceilingBytes))
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
+
+	// Set up three volumes with different staged byte counts.
+	// Names are chosen so alphabetical order differs from staged byte order.
+	volumeLowID := "test-vol-a-low"
+	volumeHighID := "test-vol-b-high"
+	volumeMidID := "test-vol-c-mid"
+
+	orderSignal := make(chan string)
+
+	setupVolume := func(volumeID string, dataBytes int64) {
+		t.Helper()
+		createResponse, err := testCreateFile(ctx, server, volumeID, "/file.bin", 0644, nil, 0, 0)
+		if err != nil || createResponse.GetError() != 0 {
+			t.Fatalf("CreateFile %s failed: %v", volumeID, err)
+		}
+		inode := createResponse.GetAttr().GetInode().GetIno()
+		writeResponse, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId:  volumeID,
+			Inode:     inode,
+			Offset:    0,
+			Data:      make([]byte, dataBytes),
+			WriteMode: pb.WriteMode_LAZY,
+		})
+		if err != nil || writeResponse.GetError() != 0 {
+			t.Fatalf("WriteFile %s failed: %v", volumeID, err)
+		}
+
+		volume, getErr := server.getOrCreateVolume(volumeID)
+		if getErr != nil {
+			t.Fatalf("getOrCreateVolume %s failed: %v", volumeID, getErr)
+		}
+		volume.setSyncTriggerHook(func() {
+			orderSignal <- volumeID
+		})
+	}
+
+	setupVolume(volumeLowID, 64*1024)
+	setupVolume(volumeHighID, 192*1024)
+	setupVolume(volumeMidID, 128*1024)
+
+	// Volume for the waiting write that will hit the ceiling.
+	waiterVolumeID := "test-vol-d-waiter"
+	createResponse, err := testCreateFile(ctx, server, waiterVolumeID, "/waiter.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile waiter failed: %v", err)
+	}
+	waiterInode := createResponse.GetAttr().GetInode().GetIno()
+
+	writeResponseChannel, writeErrChannel := startAsyncWrite(ctx, server, waiterVolumeID, waiterInode, make([]byte, 10*1024))
+
+	expectedOrder := []string{volumeHighID, volumeMidID, volumeLowID}
+	for i, expectedVolume := range expectedOrder {
+		select {
+		case actualVolume := <-orderSignal:
+			if actualVolume != expectedVolume {
+				t.Fatalf("sync %d started on %s, want %s (expected order: %v)", i, actualVolume, expectedVolume, expectedOrder)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for sync %d on volume %s to start", i, expectedVolume)
+		}
+	}
+
+	select {
+	case writeErr := <-writeErrChannel:
+		if writeErr != nil {
+			t.Fatalf("WriteFile waiter returned RPC error: %v", writeErr)
+		}
+		writeResponse := <-writeResponseChannel
+		if writeResponse.GetError() != 0 {
+			t.Fatalf("WriteFile waiter returned unexpected syscall error code: %d", writeResponse.GetError())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for waiter write to complete")
+	}
+}
