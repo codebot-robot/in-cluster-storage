@@ -51,6 +51,18 @@ message AppendRequest {
 
 message Hello {
   bytes stream_id = 1;
+  // Epoch is an unsigned number chosen by whoever assigns ownership of the volume's WAL stream
+  // (such as the central control plane). The WAL buffer tracks the highest epoch accepted for each
+  // stream and fences any writer presenting a lower epoch. Optional; defaults to 0.
+  uint64 epoch = 2;
+}
+
+// Fenced is carried as a gRPC status detail when a stream writer is refused
+// because its epoch is lower than the highest epoch accepted by the WAL buffer for the stream.
+message Fenced {
+  bytes stream_id = 1;
+  uint64 writer_epoch = 2;
+  uint64 accepted_epoch = 3;
 }
 
 message AppendResponse {
