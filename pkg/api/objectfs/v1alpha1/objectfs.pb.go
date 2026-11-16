@@ -248,6 +248,10 @@ const (
 	WatchEventType_EVENT_DELETED            WatchEventType = 3
 	WatchEventType_EVENT_RENAMED            WatchEventType = 4
 	WatchEventType_EVENT_CHECKPOINT_REQUEST WatchEventType = 5
+	// EVENT_BOOKMARK reports no change; stream_position is the volume's newest
+	// commit sequence when it was sent. The first message on every WatchVolume
+	// stream is a bookmark, sent only after the subscription exists.
+	WatchEventType_EVENT_BOOKMARK WatchEventType = 6
 )
 
 // Enum value maps for WatchEventType.
@@ -259,6 +263,7 @@ var (
 		3: "EVENT_DELETED",
 		4: "EVENT_RENAMED",
 		5: "EVENT_CHECKPOINT_REQUEST",
+		6: "EVENT_BOOKMARK",
 	}
 	WatchEventType_value = map[string]int32{
 		"EVENT_UNKNOWN":            0,
@@ -267,6 +272,7 @@ var (
 		"EVENT_DELETED":            3,
 		"EVENT_RENAMED":            4,
 		"EVENT_CHECKPOINT_REQUEST": 5,
+		"EVENT_BOOKMARK":           6,
 	}
 )
 
@@ -6723,14 +6729,15 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x12MetadataDurability\x12#\n" +
 	"\x1fMETADATA_DURABILITY_UNSPECIFIED\x10\x00\x12\v\n" +
 	"\aBARRIER\x10\x01\x12\r\n" +
-	"\tOPERATION\x10\x02*\x8e\x01\n" +
+	"\tOPERATION\x10\x02*\xa2\x01\n" +
 	"\x0eWatchEventType\x12\x11\n" +
 	"\rEVENT_UNKNOWN\x10\x00\x12\x11\n" +
 	"\rEVENT_CREATED\x10\x01\x12\x12\n" +
 	"\x0eEVENT_MODIFIED\x10\x02\x12\x11\n" +
 	"\rEVENT_DELETED\x10\x03\x12\x11\n" +
 	"\rEVENT_RENAMED\x10\x04\x12\x1c\n" +
-	"\x18EVENT_CHECKPOINT_REQUEST\x10\x052\x81\x1d\n" +
+	"\x18EVENT_CHECKPOINT_REQUEST\x10\x05\x12\x12\n" +
+	"\x0eEVENT_BOOKMARK\x10\x062\x81\x1d\n" +
 	"\x12ObjectFSController\x12P\n" +
 	"\aGetAttr\x12!.objectfs.v1alpha1.GetAttrRequest\x1a\".objectfs.v1alpha1.GetAttrResponse\x12P\n" +
 	"\aSetAttr\x12!.objectfs.v1alpha1.SetAttrRequest\x1a\".objectfs.v1alpha1.SetAttrResponse\x12M\n" +

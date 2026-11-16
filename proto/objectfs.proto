@@ -329,6 +329,10 @@ enum WatchEventType {
   EVENT_DELETED = 3;
   EVENT_RENAMED = 4;
   EVENT_CHECKPOINT_REQUEST = 5;
+  // EVENT_BOOKMARK reports no change; stream_position is the volume's newest
+  // commit sequence when it was sent. The first message on every WatchVolume
+  // stream is a bookmark, sent only after the subscription exists.
+  EVENT_BOOKMARK = 6;
 }
 
 message WatchVolumeResponse {

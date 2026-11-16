@@ -1314,16 +1314,19 @@ func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSContr
 		return status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", req.GetVolumeId())
 	}
 
+	// The volume is now always loaded so the initial bookmark can carry its position,
+	// whereas previously it was loaded only when a consistency mode was sent.
+	volume, err := s.getOrCreateVolume(req.GetVolumeId())
+	if err != nil {
+		return volInitError(err)
+	}
+
 	if req.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-		vol, err := s.getOrCreateVolume(req.GetVolumeId())
-		if err != nil {
-			return volInitError(err)
-		}
-		currentMode := vol.ConsistencyMode()
+		currentMode := volume.ConsistencyMode()
 		clientMode := req.GetConsistencyMode()
 		if currentMode == pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
 			if clientMode == pb.ConsistencyMode_CLOSE_TO_OPEN {
-				if err := vol.PersistConsistencyMode(stream.Context(), clientMode); err != nil {
+				if err := volume.PersistConsistencyMode(stream.Context(), clientMode); err != nil {
 					klog.Warningf("WatchVolume %s: failed to persist consistency mode: %v", req.GetVolumeId(), err)
 				}
 			}
@@ -1335,6 +1338,17 @@ func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSContr
 
 	ch := s.broadcaster.Subscribe(req.GetVolumeId())
 	defer s.broadcaster.Unsubscribe(req.GetVolumeId(), ch)
+
+	// Read the position after subscribing so that any change committed in between
+	// is both at or below the bookmark and will still be delivered to this subscriber;
+	// the other order leaves a gap.
+	bookmark := &pb.WatchVolumeResponse{
+		EventType:      pb.WatchEventType_EVENT_BOOKMARK,
+		StreamPosition: volume.Position(),
+	}
+	if err := stream.Send(bookmark); err != nil {
+		return fmt.Errorf("failed to send bookmark: %w", err)
+	}
 
 	ctx := stream.Context()
 	for {
