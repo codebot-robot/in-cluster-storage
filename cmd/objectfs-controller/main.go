@@ -35,6 +35,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/metadatadurability"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -58,6 +59,7 @@ type Options struct {
 	WALDir                    string
 	WALTarget                 string
 	WALDurability             walclient.Level
+	MetadataDurability        pb.MetadataDurability
 	MetadataIndex             string
 	MetadataIndexCacheMB      int
 	MetadataCacheEntries      int
@@ -81,6 +83,7 @@ func NewOptions() *Options {
 		ServerCertDir:            "/etc/objectfs/certs/server",
 		FlushInterval:            1 * time.Hour,
 		WALDurability:            walclient.Local,
+		MetadataDurability:       pb.MetadataDurability_OPERATION,
 		MetadataIndex:            "sqlite",
 		MetadataIndexCacheMB:     64,
 		MetadataCacheBytes:       64 * 1024 * 1024,
@@ -133,6 +136,7 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.StringVar(&o.WALDir, "wal-dir", o.WALDir, "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
 	flagSet.StringVar(&o.WALTarget, "wal-target", o.WALTarget, "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
 	flagSet.Var(walclient.NewLevelValue(&o.WALDurability), "wal-durability", "Default WAL durability level (local, witness, permanent)")
+	flagSet.Var(metadatadurability.NewValue(&o.MetadataDurability), "metadata-durability", "Default metadata durability mode (barrier mode returns before the change is durable, durability is collected by fsync and at shutdown; operation mode waits for WAL durability per operation)")
 	flagSet.Var(&metadataIndexValue{target: &o.MetadataIndex}, "metadata-index", "Metadata local index type (sqlite, table)")
 	flagSet.IntVar(&o.MetadataIndexCacheMB, "metadata-index-cache-mb", o.MetadataIndexCacheMB, "Pebble shared block cache size in megabytes for table metadata index")
 	flagSet.IntVar(&o.MetadataCacheEntries, "metadata-cache-entries", o.MetadataCacheEntries, "Maximum number of entries in metadata read cache (0 for unconstrained, governed by --metadata-cache-bytes)")
@@ -302,6 +306,7 @@ func run(options Options) error {
 	if options.AcceptUnversionedSegments {
 		serverOptions = append(serverOptions, controller.WithServerAcceptUnversioned(true))
 	}
+	serverOptions = append(serverOptions, controller.WithServerMetadataDurability(options.MetadataDurability))
 	serverOptions = append(serverOptions, controller.WithServerWAL(options.WALDir, options.WALTarget, options.WALDurability))
 
 	var grpcServer *grpc.Server
