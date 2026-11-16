@@ -132,6 +132,60 @@ func checkRPCErr(err error) error {
 	return nil
 }
 
+// serverWAL holds the WAL settings and the connection built from them.
+type serverWAL struct {
+	// dir is the base directory on the local filesystem where WAL segments are stored.
+	dir string
+	// dirErr records an error encountered when validating or preparing the WAL directory.
+	dirErr error
+	// target is the gRPC endpoint address for the remote WAL buffer service.
+	target string
+	// noFsync configures WAL client streams to skip per-record fsync (intended for tests and benchmarks).
+	noFsync bool
+	// tempDir is a temporary WAL directory to be removed when the server is closed.
+	tempDir string
+	// testCleanup is an optional cleanup callback executed when the server is closed.
+	testCleanup func()
+	// dialOpts contains additional gRPC dial options when dialing the WAL buffer.
+	dialOpts []grpc.DialOption
+	// conn is the active gRPC client connection to the WAL buffer.
+	conn *grpc.ClientConn
+	// client is the gRPC client stub for the WAL buffer service.
+	client walpb.WalBufferClient
+	// err records any dial or configuration error encountered when setting up the WAL buffer connection.
+	err error
+	// defaultDurability is the default sync durability level requested for volume WAL streams.
+	defaultDurability walclient.Level
+	// streamFactory overrides stream creation with a custom factory function (useful for testing).
+	streamFactory func(volumeID string) (walclient.Stream, error)
+}
+
+// serverMetadataConfig groups configuration options for volume metadata indexing, caching, and views.
+type serverMetadataConfig struct {
+	// defaultDurability is the default durability mode for metadata operations (operation or barrier).
+	defaultDurability pb.MetadataDurability
+	// index configures the metadata index engine ("sqlite" or "memory").
+	index string
+	// dir is the base directory under which volume-specific metadata subdirectories are created.
+	dir string
+	// cacheEntries configures the maximum entry capacity for the metadata LRU read cache.
+	cacheEntries int
+	// cacheBytes configures the maximum byte capacity for the metadata LRU read cache.
+	cacheBytes int64
+	// overlayMaxBytes sets the maximum byte bound for unapplied overlay rows before applying backpressure.
+	overlayMaxBytes int64
+	// applierBatchSize sets the maximum batch size for the background SQLite applier.
+	applierBatchSize int
+	// localStorageDir sets the local directory for metadata storage across all volumes.
+	localStorageDir string
+	// debugStatsCheck enables debug stats assertions across all volumes.
+	debugStatsCheck bool
+	// debugMutationCheck enables debug mutation checking on metadata views created by the server.
+	debugMutationCheck bool
+	// viewOpts holds custom SDS view options applied to all volumes created by the server.
+	viewOpts []view.Option
+}
+
 type Server struct {
 	pb.UnimplementedObjectFSControllerServer
 	mu          sync.RWMutex
@@ -141,34 +195,20 @@ type Server struct {
 	blobStore   *blob.Store
 	broadcaster *EventBroadcaster
 
-	walDir                    string
-	walDirErr                 error
-	walTarget                 string
-	walNoFsync                bool
-	tempWalDir                string
-	testBufferCleanup         func()
-	walDialOpts               []grpc.DialOption
-	walConn                   *grpc.ClientConn
-	walClient                 walpb.WalBufferClient
-	walErr                    error
-	defaultDurability         walclient.Level
-	defaultMetadataDurability pb.MetadataDurability
-	metadataIndex             string
-	metadataDir               string
-	metadataCacheEntries      int
-	metadataCacheBytes        int64
-	metadataOverlayMaxBytes   int64
-	metadataApplierBatchSize  int
-	localStorageDir           string
-	debugStatsCheck           bool
-	debugMutationCheck        bool
-	viewOpts                  []view.Option
-	streamFactory             func(volumeID string) (walclient.Stream, error)
-	syncCoalesceWindow        time.Duration
-	maxStagingBytes           int64
-	syncTimeout               time.Duration
-	openBarrierTimeout        time.Duration
-	acceptUnversioned         bool
+	// wal holds the WAL settings and the connection built from them.
+	wal serverWAL
+	// metadata groups configuration options for volume metadata indexing, caching, and views.
+	metadata serverMetadataConfig
+	// syncCoalesceWindow sets the window duration for coalescing non-blocking sync requests across all volumes.
+	syncCoalesceWindow time.Duration
+	// maxStagingBytes sets the maximum byte bound for in-memory staged writes across all volumes.
+	maxStagingBytes int64
+	// syncTimeout sets the timeout duration for coalesced background sync operations.
+	syncTimeout time.Duration
+	// openBarrierTimeout sets the timeout duration for the open-side barrier on close-to-open volumes.
+	openBarrierTimeout time.Duration
+	// acceptUnversioned configures whether unversioned segments, streams, and snapshots are accepted.
+	acceptUnversioned bool
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -177,8 +217,9 @@ type Server struct {
 	checkpointMu      sync.Mutex
 	checkpointWaiters map[string]chan uint64
 
-	exclusiveHoldsMu  sync.RWMutex
-	exclusiveHolds    map[string]*ExclusiveHold
+	exclusiveHoldsMu sync.RWMutex
+	exclusiveHolds   map[string]*ExclusiveHold
+	// exclusiveLeaseTTL configures the lease duration for exclusive-local holds.
 	exclusiveLeaseTTL time.Duration
 
 	restoringMu sync.Mutex
@@ -222,44 +263,44 @@ type ServerOption func(*Server)
 // WithServerMutationCheck enables debug mutation checking on metadata views created by the server.
 func WithServerMutationCheck() ServerOption {
 	return func(s *Server) {
-		s.debugMutationCheck = true
-		s.viewOpts = append(s.viewOpts, view.WithMutationCheck())
-		s.debugStatsCheck = true
+		s.metadata.debugMutationCheck = true
+		s.metadata.viewOpts = append(s.metadata.viewOpts, view.WithMutationCheck())
+		s.metadata.debugStatsCheck = true
 	}
 }
 
 // WithServerStatsCheck enables debug stats assertions across all volumes.
 func WithServerStatsCheck() ServerOption {
 	return func(s *Server) {
-		s.debugStatsCheck = true
+		s.metadata.debugStatsCheck = true
 	}
 }
 
 // WithoutServerStatsCheck disables debug stats assertions.
 func WithoutServerStatsCheck() ServerOption {
 	return func(s *Server) {
-		s.debugStatsCheck = false
+		s.metadata.debugStatsCheck = false
 	}
 }
 
 // WithServerViewOptions appends custom view options for all volumes created by the server.
 func WithServerViewOptions(opts ...view.Option) ServerOption {
 	return func(s *Server) {
-		s.viewOpts = append(s.viewOpts, opts...)
+		s.metadata.viewOpts = append(s.metadata.viewOpts, opts...)
 	}
 }
 
 // WithServerMetadataIndex configures the metadata index engine ("sqlite" or "memory").
 func WithServerMetadataIndex(index string) ServerOption {
 	return func(s *Server) {
-		s.metadataIndex = index
+		s.metadata.index = index
 	}
 }
 
 // WithServerMetadataDir configures the base directory for persistent local metadata storage (e.g. SQLite databases).
 func WithServerMetadataDir(dir string) ServerOption {
 	return func(s *Server) {
-		s.metadataDir = dir
+		s.metadata.dir = dir
 	}
 }
 
@@ -267,12 +308,12 @@ func WithServerMetadataDir(dir string) ServerOption {
 func WithServerWAL(walDir, walTarget string, durability walclient.Level) ServerOption {
 	return func(s *Server) {
 		if walDir != "" {
-			s.walDir = walDir
+			s.wal.dir = walDir
 		}
 		if walTarget != "" {
-			s.walTarget = walTarget
+			s.wal.target = walTarget
 		}
-		s.defaultDurability = durability
+		s.wal.defaultDurability = durability
 	}
 }
 
@@ -282,28 +323,28 @@ func InspectServerTarget(opts ...ServerOption) string {
 	for _, opt := range opts {
 		opt(s)
 	}
-	return s.walTarget
+	return s.wal.target
 }
 
 // WithServerWALDialOptions configures additional gRPC dial options when dialing the WAL buffer.
 // This is the extension point for TLS/mTLS credentials (e.g. issue #319).
 func WithServerWALDialOptions(opts ...grpc.DialOption) ServerOption {
 	return func(s *Server) {
-		s.walDialOpts = append(s.walDialOpts, opts...)
+		s.wal.dialOpts = append(s.wal.dialOpts, opts...)
 	}
 }
 
 // WithServerStreamFactory sets a custom stream factory function (useful for testing).
 func WithServerStreamFactory(factory func(volumeID string) (walclient.Stream, error)) ServerOption {
 	return func(s *Server) {
-		s.streamFactory = factory
+		s.wal.streamFactory = factory
 	}
 }
 
 // WithServerDurability sets the default durability level for streams.
 func WithServerDurability(durability walclient.Level) ServerOption {
 	return func(s *Server) {
-		s.defaultDurability = durability
+		s.wal.defaultDurability = durability
 	}
 }
 
@@ -312,7 +353,7 @@ func WithServerDurability(durability walclient.Level) ServerOption {
 func WithServerMetadataDurability(mode pb.MetadataDurability) ServerOption {
 	return func(s *Server) {
 		if mode != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
-			s.defaultMetadataDurability = mode
+			s.metadata.defaultDurability = mode
 		}
 	}
 }
@@ -320,29 +361,29 @@ func WithServerMetadataDurability(mode pb.MetadataDurability) ServerOption {
 // WithServerMetadataCacheLimits configures the metadata read cache entry and byte capacity.
 func WithServerMetadataCacheLimits(maxEntries int, maxBytes int64) ServerOption {
 	return func(s *Server) {
-		s.metadataCacheEntries = maxEntries
-		s.metadataCacheBytes = maxBytes
+		s.metadata.cacheEntries = maxEntries
+		s.metadata.cacheBytes = maxBytes
 	}
 }
 
 // WithServerMetadataOverlayMaxBytes sets the maximum byte bound for unapplied overlay rows before applying backpressure.
 func WithServerMetadataOverlayMaxBytes(maxBytes int64) ServerOption {
 	return func(s *Server) {
-		s.metadataOverlayMaxBytes = maxBytes
+		s.metadata.overlayMaxBytes = maxBytes
 	}
 }
 
 // WithServerMetadataApplierBatchSize sets the maximum batch size for the background SQLite applier.
 func WithServerMetadataApplierBatchSize(batchSize int) ServerOption {
 	return func(s *Server) {
-		s.metadataApplierBatchSize = batchSize
+		s.metadata.applierBatchSize = batchSize
 	}
 }
 
 // WithServerLocalStorageDir sets the local directory for metadata storage for all volumes.
 func WithServerLocalStorageDir(dir string) ServerOption {
 	return func(s *Server) {
-		s.localStorageDir = dir
+		s.metadata.localStorageDir = dir
 	}
 }
 
@@ -389,29 +430,29 @@ func WithServerAcceptUnversioned(accept bool) ServerOption {
 // This is intended only for tests and benchmarks.
 func WithServerWithoutFsync() ServerOption {
 	return func(s *Server) {
-		s.walNoFsync = true
+		s.wal.noFsync = true
 	}
 }
 
 // WithServerWALClient sets an existing gRPC client for the WAL buffer service (for testing).
 func WithServerWALClient(client walpb.WalBufferClient) ServerOption {
 	return func(s *Server) {
-		s.walClient = client
+		s.wal.client = client
 	}
 }
 
 // WithServerTestCleanup sets a cleanup callback executed when the server is closed (for testing).
 func WithServerTestCleanup(cleanup func()) ServerOption {
 	return func(s *Server) {
-		s.testBufferCleanup = cleanup
+		s.wal.testCleanup = cleanup
 	}
 }
 
 // WithServerTempWALDir sets a temporary directory to be removed on server close (for testing).
 func WithServerTempWALDir(dir string) ServerOption {
 	return func(s *Server) {
-		s.walDir = dir
-		s.tempWalDir = dir
+		s.wal.dir = dir
+		s.wal.tempDir = dir
 	}
 }
 
@@ -420,112 +461,116 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		backend = NewMemoryBackend()
 	}
 	s := &Server{
-		volumes:                   make(map[string]*Volume),
-		backend:                   backend,
-		blobStore:                 blob.NewStore(backend, 0),
-		broadcaster:               NewEventBroadcaster(),
-		checkpointWaiters:         make(map[string]chan uint64),
-		exclusiveHolds:            make(map[string]*ExclusiveHold),
-		exclusiveLeaseTTL:         30 * time.Second,
-		syncTimeout:               10 * time.Minute,
-		defaultDurability:         walclient.Local,
-		defaultMetadataDurability: pb.MetadataDurability_OPERATION,
-		restoring:                 make(map[string]bool),
+		volumes:           make(map[string]*Volume),
+		backend:           backend,
+		blobStore:         blob.NewStore(backend, 0),
+		broadcaster:       NewEventBroadcaster(),
+		checkpointWaiters: make(map[string]chan uint64),
+		exclusiveHolds:    make(map[string]*ExclusiveHold),
+		exclusiveLeaseTTL: 30 * time.Second,
+		syncTimeout:       10 * time.Minute,
+		wal: serverWAL{
+			defaultDurability: walclient.Local,
+		},
+		metadata: serverMetadataConfig{
+			defaultDurability: pb.MetadataDurability_OPERATION,
+		},
+		restoring: make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
-	if s.walClient != nil {
+	if s.wal.client != nil {
 		// Existing WAL client provided by test constructor
-	} else if s.walTarget != "" {
-		dialOpts := append(grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())), s.walDialOpts...)
-		conn, err := grpc.NewClient(s.walTarget, dialOpts...)
+	} else if s.wal.target != "" {
+		dialOpts := append(grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())), s.wal.dialOpts...)
+		conn, err := grpc.NewClient(s.wal.target, dialOpts...)
 		if err != nil {
-			klog.Errorf("failed to dial WAL buffer target %s: %v", s.walTarget, err)
-			s.walErr = err
+			klog.Errorf("failed to dial WAL buffer target %s: %v", s.wal.target, err)
+			s.wal.err = err
 		} else {
-			s.walConn = conn
-			s.walClient = walpb.NewWalBufferClient(conn)
+			s.wal.conn = conn
+			s.wal.client = walpb.NewWalBufferClient(conn)
 		}
-	} else if s.streamFactory == nil {
-		s.walErr = errors.New("wal target is required: no --wal-target configured")
+	} else if s.wal.streamFactory == nil {
+		s.wal.err = errors.New("wal target is required: no --wal-target configured")
 	}
-	if s.walDir == "" && s.streamFactory == nil && s.testBufferCleanup == nil {
-		s.walDirErr = errors.New("wal directory is required: no --wal-dir configured")
+	if s.wal.dir == "" && s.wal.streamFactory == nil && s.wal.testCleanup == nil {
+		s.wal.dirErr = errors.New("wal directory is required: no --wal-dir configured")
 	}
 	return s
 }
 
 func (s *Server) openStreamForVolume(volumeID string, dir string) (walclient.Stream, error) {
-	if s.streamFactory != nil {
-		return s.streamFactory(volumeID)
+	if s.wal.streamFactory != nil {
+		return s.wal.streamFactory(volumeID)
 	}
-	if s.walDirErr != nil {
-		return nil, fmt.Errorf("failed to initialize WAL directory: %w", s.walDirErr)
+	if s.wal.dirErr != nil {
+		return nil, fmt.Errorf("failed to initialize WAL directory: %w", s.wal.dirErr)
 	}
 	if dir == "" {
-		dir = s.walDir
+		dir = s.wal.dir
 	}
-	if s.walErr != nil {
-		return nil, fmt.Errorf("failed to connect to WAL buffer: %w", s.walErr)
+	if s.wal.err != nil {
+		return nil, fmt.Errorf("failed to connect to WAL buffer: %w", s.wal.err)
 	}
 	streamID := StreamIDForVolume(volumeID)
 	var walOpts []walclient.Option
 	if s.acceptUnversioned {
 		walOpts = append(walOpts, walclient.WithAcceptUnversioned(true))
 	}
-	if s.walNoFsync {
+	if s.wal.noFsync {
 		walOpts = append(walOpts, walclient.WithoutFsync())
 	}
-	if s.walClient != nil {
-		walOpts = append(walOpts, walclient.WithGRPCClient(s.walClient))
+	if s.wal.client != nil {
+		walOpts = append(walOpts, walclient.WithGRPCClient(s.wal.client))
 	}
-	if len(s.walDialOpts) > 0 {
-		walOpts = append(walOpts, walclient.WithDialOptions(s.walDialOpts...))
+	if len(s.wal.dialOpts) > 0 {
+		walOpts = append(walOpts, walclient.WithDialOptions(s.wal.dialOpts...))
 	}
-	return walclient.Open(context.Background(), dir, streamID, s.walTarget, walOpts...)
+	return walclient.Open(context.Background(), dir, streamID, s.wal.target, walOpts...)
 }
 
 func (s *Server) createVolumeInstanceLocked(volumeID string) (*Volume, error) {
 	var volumeOptions []VolumeOption
-	stream, err := s.openStreamForVolume(volumeID, s.walDir)
+	stream, err := s.openStreamForVolume(volumeID, s.wal.dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open stream for volume %s: %w", volumeID, err)
 	}
 	if stream != nil {
 		volumeOptions = append(volumeOptions, WithStream(stream))
 	}
-	volumeOptions = append(volumeOptions, WithDurability(s.defaultDurability))
-	volumeOptions = append(volumeOptions, WithMetadataDurability(s.defaultMetadataDurability))
-	if s.metadataIndex != "" {
-		volumeOptions = append(volumeOptions, WithMetadataIndex(s.metadataIndex))
+	volumeOptions = append(volumeOptions, WithDurability(s.wal.defaultDurability))
+	volumeOptions = append(volumeOptions, WithMetadataDurability(s.metadata.defaultDurability))
+	if s.metadata.index != "" {
+		volumeOptions = append(volumeOptions, WithMetadataIndex(s.metadata.index))
 	}
-	if s.metadataDir != "" {
-		volumeDirectory := filepath.Join(s.metadataDir, volumeID)
+	if s.metadata.dir != "" {
+		volumeDirectory := filepath.Join(s.metadata.dir, volumeID)
 		if err := os.MkdirAll(volumeDirectory, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create metadata dir %s for volume %s: %w", volumeDirectory, volumeID, err)
 		}
 		volumeOptions = append(volumeOptions, WithLocalStorageDir(volumeDirectory))
 	}
-	if s.metadataCacheEntries > 0 || s.metadataCacheBytes > 0 {
-		volumeOptions = append(volumeOptions, WithMetadataCacheLimits(s.metadataCacheEntries, s.metadataCacheBytes))
+	if s.metadata.cacheEntries > 0 || s.metadata.cacheBytes > 0 {
+		volumeOptions = append(volumeOptions, WithMetadataCacheLimits(s.metadata.cacheEntries, s.metadata.cacheBytes))
 	}
-	if s.metadataOverlayMaxBytes > 0 {
-		volumeOptions = append(volumeOptions, WithMaxUnappliedBytes(s.metadataOverlayMaxBytes))
+	if s.metadata.overlayMaxBytes > 0 {
+		volumeOptions = append(volumeOptions, WithMaxUnappliedBytes(s.metadata.overlayMaxBytes))
 	}
-	if s.metadataApplierBatchSize > 0 {
-		volumeOptions = append(volumeOptions, WithApplierBatchSize(s.metadataApplierBatchSize))
+	if s.metadata.applierBatchSize > 0 {
+		volumeOptions = append(volumeOptions, WithApplierBatchSize(s.metadata.applierBatchSize))
 	}
-	if s.localStorageDir != "" {
-		volumeOptions = append(volumeOptions, WithLocalStorageDir(s.localStorageDir))
+	if s.metadata.localStorageDir != "" {
+		volumeOptions = append(volumeOptions, WithLocalStorageDir(s.metadata.localStorageDir))
 	}
-	if len(s.viewOpts) > 0 {
-		volumeOptions = append(volumeOptions, WithVolumeViewOptions(s.viewOpts...))
+	if len(s.metadata.viewOpts) > 0 {
+		volumeOptions = append(volumeOptions, WithVolumeViewOptions(s.metadata.viewOpts...))
 	}
-	if s.debugMutationCheck {
+	if s.metadata.debugMutationCheck {
 		volumeOptions = append(volumeOptions, WithVolumeMutationCheck())
 	}
-	if s.debugStatsCheck {
+	if s.metadata.debugStatsCheck {
 		volumeOptions = append(volumeOptions, WithVolumeStatsCheck())
 	}
 	if s.syncCoalesceWindow > 0 {
@@ -590,22 +635,22 @@ func (s *Server) Close() error {
 			}
 		}
 		clear(s.volumes)
-		if s.walConn != nil {
-			if err := s.walConn.Close(); err != nil {
+		if s.wal.conn != nil {
+			if err := s.wal.conn.Close(); err != nil {
 				errs = append(errs, err)
 			}
-			s.walConn = nil
-			s.walClient = nil
+			s.wal.conn = nil
+			s.wal.client = nil
 		}
-		if s.tempWalDir != "" {
-			if err := os.RemoveAll(s.tempWalDir); err != nil {
+		if s.wal.tempDir != "" {
+			if err := os.RemoveAll(s.wal.tempDir); err != nil {
 				errs = append(errs, err)
 			}
-			s.tempWalDir = ""
+			s.wal.tempDir = ""
 		}
-		if s.testBufferCleanup != nil {
-			s.testBufferCleanup()
-			s.testBufferCleanup = nil
+		if s.wal.testCleanup != nil {
+			s.wal.testCleanup()
+			s.wal.testCleanup = nil
 		}
 	})
 	if !ran {
@@ -723,7 +768,7 @@ func (s *Server) StopPeriodicFlush() error {
 
 // Target returns the configured WAL buffer target, if any.
 func (s *Server) Target() string {
-	return s.walTarget
+	return s.wal.target
 }
 
 // GetVolume returns the Volume instance for the given volumeID, or an error if creation fails.
@@ -1949,15 +1994,15 @@ func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) 
 	}
 
 	var oldPath string
-	if s.walDir != "" {
-		movedPath, err := walclient.MoveSegmentsAside(s.walDir, vol.StreamID())
+	if s.wal.dir != "" {
+		movedPath, err := walclient.MoveSegmentsAside(s.wal.dir, vol.StreamID())
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to move segment directory aside for volume %s: %v", volumeID, err)
 		}
 		oldPath = movedPath
 	}
 
-	newStream, err := s.openStreamForVolume(volumeID, s.walDir)
+	newStream, err := s.openStreamForVolume(volumeID, s.wal.dir)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to reopen stream for volume %s: %v", volumeID, err)
 	}
