@@ -78,15 +78,32 @@ type streamState struct {
 	ackNeeded   bool
 	attachments int
 	waiters     int
+	epoch       uint64
 }
 
-func newStreamState(witnessSeq, s3Seq uint64) *streamState {
+func newStreamState(witnessSeq, s3Seq, epoch uint64) *streamState {
 	st := &streamState{
 		witnessSeq: witnessSeq,
 		s3Seq:      s3Seq,
+		epoch:      epoch,
 	}
 	st.cond = sync.NewCond(&st.mu)
 	return st
+}
+
+// fencedStatus returns a gRPC status error indicating that the writer's epoch is lower
+// than the highest accepted epoch for the stream, carrying pb.Fenced in its details.
+func fencedStatus(streamID uuid.UUID, writerEpoch, acceptedEpoch uint64) error {
+	statusObject := status.New(codes.FailedPrecondition, fmt.Sprintf("stream %s writer epoch %d is lower than accepted epoch %d", streamID, writerEpoch, acceptedEpoch))
+	statusWithDetails, err := statusObject.WithDetails(&pb.Fenced{
+		StreamId:      streamID[:],
+		WriterEpoch:   writerEpoch,
+		AcceptedEpoch: acceptedEpoch,
+	})
+	if err != nil {
+		return statusObject.Err()
+	}
+	return statusWithDetails.Err()
 }
 
 // Server implements the WalBuffer gRPC service.
@@ -102,6 +119,7 @@ type Server struct {
 	flushedSegments     []string
 	streams             map[string]*streamState // streamID string -> streamState
 	streamStore         *StreamStore
+	epochStore          *EpochStore
 
 	localStore *wal.LogSegmentStore
 
@@ -270,6 +288,11 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		}
 	}
 
+	epochStore, err := NewEpochStore(dataDir, cfg.NoFsync)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize epoch store: %w", err)
+	}
+
 	s := &Server{
 		cfg:                 cfg,
 		backend:             cfg.Backend,
@@ -278,6 +301,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		flushedSegments:     discoveredSegments,
 		streams:             make(map[string]*streamState),
 		streamStore:         streamStore,
+		epochStore:          epochStore,
 		localStore:          localStore,
 		unflushedRecords:    unflushed,
 		unflushedBytes:      unflushedBytes,
@@ -289,7 +313,14 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 	// Populate initial streams state
 	for sid, watermark := range streamWatermarks {
-		s.streams[sid] = newStreamState(watermark, backendWatermarks[sid])
+		var streamEpoch uint64
+		streamID, parseErr := uuid.Parse(sid)
+		if parseErr != nil {
+			klog.Warningf("Failed to parse stream ID %s during startup: %v", sid, parseErr)
+		} else {
+			streamEpoch = epochStore.GetEpoch(streamID)
+		}
+		s.streams[sid] = newStreamState(watermark, backendWatermarks[sid], streamEpoch)
 	}
 	s.streamStore.SetEvictHook(s.evictIdleStreams)
 
@@ -467,7 +498,11 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 		return st
 	}
 
-	st = newStreamState(uploadedTo, uploadedTo)
+	var streamEpoch uint64
+	if s.epochStore != nil {
+		streamEpoch = s.epochStore.GetEpoch(streamID)
+	}
+	st = newStreamState(uploadedTo, uploadedTo, streamEpoch)
 	s.streams[sid] = st
 	return st
 }
@@ -501,8 +536,9 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	}
 	var streamID uuid.UUID
 	copy(streamID[:], hello.StreamId)
+	sessionEpoch := hello.GetEpoch()
 
-	logger := scoped.Log(ctx).WithValues("stream", streamID.String())
+	logger := scoped.Log(ctx).WithValues("stream", streamID.String(), "epoch", sessionEpoch)
 	ctx = scoped.WithLog(ctx, logger)
 	stream = &appendServerWithContext{
 		WalBuffer_AppendServer: stream,
@@ -512,6 +548,22 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	st := s.getOrCreateStream(ctx, streamID)
 
 	st.mu.Lock()
+	if sessionEpoch < st.epoch {
+		acceptedEpoch := st.epoch
+		st.mu.Unlock()
+		return fencedStatus(streamID, sessionEpoch, acceptedEpoch)
+	}
+	if sessionEpoch > st.epoch {
+		if s.epochStore != nil {
+			if err := s.epochStore.SaveEpoch(streamID, sessionEpoch); err != nil {
+				st.mu.Unlock()
+				return status.Errorf(codes.Internal, "failed to persist epoch: %v", err)
+			}
+		}
+		st.epoch = sessionEpoch
+		st.cond.Broadcast()
+	}
+
 	st.attachments++
 	witnessSeq := st.witnessSeq
 	s3Seq := st.s3Seq
@@ -582,7 +634,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		lastAckedS3 := s3Seq
 		for {
 			st.mu.Lock()
-			for st.witnessSeq <= lastAckedWitness && st.s3Seq <= lastAckedS3 && !st.ackNeeded && st.commitErr == nil {
+			for st.witnessSeq <= lastAckedWitness && st.s3Seq <= lastAckedS3 && !st.ackNeeded && st.commitErr == nil && sessionEpoch >= st.epoch {
 				select {
 				case <-ctx.Done():
 					st.mu.Unlock()
@@ -595,6 +647,11 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 				st.waiters++
 				st.cond.Wait()
 				st.waiters--
+			}
+
+			if sessionEpoch < st.epoch {
+				st.mu.Unlock()
+				return
 			}
 
 			if st.commitErr != nil {
@@ -682,7 +739,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		if result.err != nil {
 			if errors.Is(result.err, io.EOF) {
 				st.mu.Lock()
-				for st.inFlight > 0 && st.commitErr == nil {
+				for st.inFlight > 0 && st.commitErr == nil && sessionEpoch >= st.epoch {
 					select {
 					case <-ctx.Done():
 						st.mu.Unlock()
@@ -696,6 +753,11 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 					default:
 					}
 					st.cond.Wait()
+				}
+				if sessionEpoch < st.epoch {
+					acceptedEpoch := st.epoch
+					st.mu.Unlock()
+					return fencedStatus(streamID, sessionEpoch, acceptedEpoch)
 				}
 				if st.commitErr != nil {
 					commitErr := st.commitErr
@@ -714,6 +776,11 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		}
 
 		st.mu.Lock()
+		if sessionEpoch < st.epoch {
+			acceptedEpoch := st.epoch
+			st.mu.Unlock()
+			return fencedStatus(streamID, sessionEpoch, acceptedEpoch)
+		}
 		if st.commitErr != nil {
 			commitErr := st.commitErr
 			st.mu.Unlock()
@@ -729,7 +796,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		}
 
 		// Backpressure: wait while inFlight >= 1024
-		for st.inFlight >= 1024 && st.commitErr == nil {
+		for st.inFlight >= 1024 && st.commitErr == nil && sessionEpoch >= st.epoch {
 			select {
 			case <-ctx.Done():
 				st.mu.Unlock()
@@ -746,6 +813,11 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 			default:
 			}
 			st.cond.Wait()
+		}
+		if sessionEpoch < st.epoch {
+			acceptedEpoch := st.epoch
+			st.mu.Unlock()
+			return fencedStatus(streamID, sessionEpoch, acceptedEpoch)
 		}
 		if st.commitErr != nil {
 			commitErr := st.commitErr
@@ -890,7 +962,11 @@ func (s *Server) commitItems(items []incomingItem) {
 		sid := rec.StreamID.String()
 		st := s.streams[sid]
 		if st == nil {
-			st = newStreamState(rec.StreamSeq, 0)
+			var streamEpoch uint64
+			if s.epochStore != nil {
+				streamEpoch = s.epochStore.GetEpoch(rec.StreamID)
+			}
+			st = newStreamState(rec.StreamSeq, 0, streamEpoch)
 			s.streams[sid] = st
 		}
 
