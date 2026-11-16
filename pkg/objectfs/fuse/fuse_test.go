@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -5490,6 +5491,24 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 		t.Fatalf("Expected 0 notify events for dirty renamed inode 200, got %d", len(events))
 	}
 
+	// 2b. EVENT_BOOKMARK: reports no change, ignored explicitly with no notifications or invalidation.
+	fs.manifests[250] = &fileManifest{inode: 250}
+	cache.Put(250, []byte("bookmark-clean-data"), time.Now(), "")
+	events = nil
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
+		EventType: pb.WatchEventType_EVENT_BOOKMARK,
+		Inode:     250,
+	}, cache, []*ObjectFS{fs})
+	if len(events) != 0 {
+		t.Fatalf("Expected 0 notify events for EVENT_BOOKMARK, got %d (%+v)", len(events), events)
+	}
+	if fs.manifests[250] == nil {
+		t.Fatalf("Expected manifest to remain untouched for EVENT_BOOKMARK")
+	}
+	if _, ok := cache.Get(250); !ok {
+		t.Fatalf("Expected cache entry to remain untouched for EVENT_BOOKMARK")
+	}
+
 	// 3. EVENT_CREATED: emits EntryNotify(parent, name)
 	events = nil
 	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
@@ -6822,6 +6841,100 @@ func TestStartWatcherHealthAndSweep(t *testing.T) {
 	}
 	if lookupOut.EntryTimeout() != 1*time.Second {
 		t.Errorf("Expected 1s EntryTimeout after disconnect, got %v", lookupOut.EntryTimeout())
+	}
+}
+
+// fakeStartWatcherStream mocks a WatchVolume client stream for StartWatcher testing.
+type fakeStartWatcherStream struct {
+	grpc.ClientStream
+	recvCh          chan *pb.WatchVolumeResponse
+	firstRecvCalled chan struct{}
+	recvOnce        sync.Once
+}
+
+// Recv receives the next event from recvCh, closing firstRecvCalled on its initial invocation.
+func (s *fakeStartWatcherStream) Recv() (*pb.WatchVolumeResponse, error) {
+	s.recvOnce.Do(func() {
+		close(s.firstRecvCalled)
+	})
+	event, ok := <-s.recvCh
+	if !ok {
+		return nil, io.EOF
+	}
+	return event, nil
+}
+
+// fakeStartWatcherClient mocks an ObjectFSControllerClient that yields fakeStartWatcherStream.
+type fakeStartWatcherClient struct {
+	pb.ObjectFSControllerClient
+	stream *fakeStartWatcherStream
+}
+
+// WatchVolume returns the configured fakeStartWatcherStream.
+func (c *fakeStartWatcherClient) WatchVolume(ctx context.Context, in *pb.WatchVolumeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[pb.WatchVolumeResponse], error) {
+	return c.stream, nil
+}
+
+// TestStartWatcher_ConnectedOnFirstMessage verifies that the watcher is not marked
+// connected until its first message arrives, and that a non-bookmark first message
+// is handled as a real event.
+func TestStartWatcher_ConnectedOnFirstMessage(t *testing.T) {
+	ctx := t.Context()
+	cache := NewNodeCache(1024 * 1024)
+	fs := &ObjectFS{
+		manifests: make(map[uint64]*fileManifest),
+	}
+
+	var notified bool
+	var notifyMu sync.Mutex
+	fs.notifyHook = func(e notifyEvent) {
+		notifyMu.Lock()
+		defer notifyMu.Unlock()
+		if e.Inode == 100 {
+			notified = true
+		}
+	}
+
+	stream := &fakeStartWatcherStream{
+		recvCh:          make(chan *pb.WatchVolumeResponse),
+		firstRecvCalled: make(chan struct{}),
+	}
+	client := &fakeStartWatcherClient{stream: stream}
+
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
+
+	StartWatcher(watchCtx, client, "vol-start-watcher-test", "node-1", pb.ConsistencyMode_STANDARD, cache, fs)
+
+	// Wait until the watcher is blocked in its first Recv call.
+	<-stream.firstRecvCalled
+
+	// Verify watcher is not marked connected before the first message arrives.
+	if fs.IsWatcherConnected() {
+		t.Fatalf("watcher marked connected before first message arrived")
+	}
+
+	// Send a non-bookmark first event (e.g. from a pre-bookmark controller).
+	stream.recvCh <- &pb.WatchVolumeResponse{
+		EventType: pb.WatchEventType_EVENT_MODIFIED,
+		Inode:     100,
+	}
+
+	// Send a second message through unbuffered recvCh. This unblocks only after the
+	// watcher finishes marking itself connected, handling the first event, and calling Recv again.
+	stream.recvCh <- &pb.WatchVolumeResponse{
+		EventType: pb.WatchEventType_EVENT_BOOKMARK,
+	}
+
+	if !fs.IsWatcherConnected() {
+		t.Fatalf("watcher was not marked connected after first message arrived")
+	}
+
+	notifyMu.Lock()
+	gotNotified := notified
+	notifyMu.Unlock()
+	if !gotNotified {
+		t.Fatalf("first non-bookmark message was not handled by handleWatchEvent")
 	}
 }
 

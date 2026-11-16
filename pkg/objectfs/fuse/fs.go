@@ -2672,7 +2672,7 @@ func (fs *ObjectFS) notifyDelete(ctx context.Context, parent, child uint64, name
 }
 
 func handleWatchEvent(ctx context.Context, ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*ObjectFS) {
-	if ev == nil || ev.GetEventType() == pb.WatchEventType_EVENT_CHECKPOINT_REQUEST {
+	if ev == nil || ev.GetEventType() == pb.WatchEventType_EVENT_CHECKPOINT_REQUEST || ev.GetEventType() == pb.WatchEventType_EVENT_BOOKMARK {
 		return
 	}
 	ino := ev.GetInode()
@@ -2823,6 +2823,13 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				NodeId:          nodeID,
 				ConsistencyMode: consistency,
 			})
+			var firstEvent *pb.WatchVolumeResponse
+			if err == nil {
+				// Connected now means the first message has arrived, and against a controller
+				// from before this change that is the first real event, so on an idle volume
+				// the watcher stays disconnected until something changes.
+				firstEvent, err = stream.Recv()
+			}
 			if err != nil {
 				if !hasDisconnected {
 					hasDisconnected = true
@@ -2875,6 +2882,10 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				}
 			}
 			backoff = 100 * time.Millisecond
+
+			if firstEvent.GetEventType() != pb.WatchEventType_EVENT_BOOKMARK {
+				handleWatchEvent(ctx, firstEvent, cache, fs)
+			}
 
 			for {
 				ev, err := stream.Recv()

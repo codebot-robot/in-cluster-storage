@@ -1648,14 +1648,18 @@ func TestOpenBarrier_DegradedReturnsEIOImmediately(t *testing.T) {
 
 type mockWatchStream struct {
 	grpc.ServerStream
-	ctx context.Context
+	ctx      context.Context
+	sendFunc func(*pb.WatchVolumeResponse) error
 }
 
 func (m *mockWatchStream) Context() context.Context {
 	return m.ctx
 }
 
-func (m *mockWatchStream) Send(*pb.WatchVolumeResponse) error {
+func (m *mockWatchStream) Send(resp *pb.WatchVolumeResponse) error {
+	if m.sendFunc != nil {
+		return m.sendFunc(resp)
+	}
 	return nil
 }
 

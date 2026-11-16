@@ -362,6 +362,9 @@ func (d *objectFSDriver) startExclusiveLocalSync(
 				if err != nil {
 					break // reconnect loop or stream canceled
 				}
+				if ev.GetEventType() == pb.WatchEventType_EVENT_BOOKMARK {
+					continue
+				}
 				if ev.GetEventType() == pb.WatchEventType_EVENT_CHECKPOINT_REQUEST {
 					requestID := ev.GetCheckpointRequestId()
 					scoped.Log(ctx).Info("received EVENT_CHECKPOINT_REQUEST, executing checkpoint", "requestID", requestID)
@@ -385,6 +388,12 @@ func (d *objectFSDriver) startExclusiveLocalSync(
 						scoped.Log(ctx).Info("checkpoint acknowledged", "position", commitSeq)
 					}
 				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
 			}
 		}
 	}()
