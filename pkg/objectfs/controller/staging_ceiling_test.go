@@ -342,6 +342,14 @@ func TestStagingCeiling_Stats(t *testing.T) {
 	}
 }
 
+// setSyncTriggerHook configures a callback invoked when triggerSyncIfStaged initiates a coalesce sync (testing only).
+// Requires no locks held; acquires stagingMu.
+func (v *Volume) setSyncTriggerHook(hook func()) {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+	v.syncTriggerHook = hook
+}
+
 // TestStagingCeiling_SyncsLargestStagedVolumesFirst verifies that when the staging ceiling is reached,
 // coalesce syncs are triggered in descending order of each volume's unuploaded staged bytes.
 // Driven by signals with no sleeps, and fails if the order is reversed or left to map iteration.
@@ -387,7 +395,7 @@ func TestStagingCeiling_SyncsLargestStagedVolumesFirst(t *testing.T) {
 		if getErr != nil {
 			t.Fatalf("getOrCreateVolume %s failed: %v", volumeID, getErr)
 		}
-		volume.SetSyncTriggerHook(func() {
+		volume.setSyncTriggerHook(func() {
 			orderSignal <- volumeID
 		})
 	}

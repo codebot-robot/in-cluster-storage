@@ -893,15 +893,9 @@ func (v *Volume) StagedBytes() int64 {
 	return v.stagedBytes
 }
 
-// SetSyncTriggerHook configures a callback invoked when triggerSyncIfStaged initiates a coalesce sync (testing only).
-// Requires no locks held; acquires stagingMu.
-func (v *Volume) SetSyncTriggerHook(hook func()) {
-	v.stagingMu.Lock()
-	defer v.stagingMu.Unlock()
-	v.syncTriggerHook = hook
-}
-
 // triggerSyncIfStaged initiates a coalesce sync in the background if the volume holds staged chunks and no sync is in flight.
+// If a syncTriggerHook is configured, it runs with no locks held, before the sync goroutine is started, and only
+// when a sync is actually initiated (not on early returns).
 // Requires no locks held; acquires stagingMu.
 func (v *Volume) triggerSyncIfStaged() {
 	v.stagingMu.Lock()

@@ -2206,8 +2206,12 @@ func (l *serverDiskLimits) wait(ctx context.Context, volumeID string, neededByte
 	return nil
 }
 
+// volumeStagedBytes pairs a registered volume with its snapshot of unuploaded staged bytes
+// for sorting candidate volumes at the staging ceiling.
 type volumeStagedBytes struct {
-	volume      *Volume
+	// volume is the candidate Volume holding staged data.
+	volume *Volume
+	// stagedBytes is the number of unuploaded staged bytes measured on volume under stagingMu.
 	stagedBytes int64
 }
 
