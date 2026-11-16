@@ -107,6 +107,18 @@ enum MetadataDurability {
   OPERATION = 2;
 }
 
+// WalDurability controls the sync durability level for WAL streams.
+enum WalDurability {
+  // Use the server default durability level.
+  WAL_DURABILITY_UNSPECIFIED = 0;
+  // Append fsynced on local node disk.
+  LOCAL = 1;
+  // Append fsynced on central WAL buffer disk.
+  WITNESS = 2;
+  // Append flushed to permanent cloud object storage.
+  PERMANENT = 3;
+}
+
 message EntryAttr {
   Inode inode = 1;
   string name = 2;
@@ -518,6 +530,7 @@ message VolumeInfo {
   bool deleted = 5;
   optional int32 retention = 6;
   MetadataDurability metadata_durability = 7;
+  WalDurability wal_durability = 8;
 }
 
 message ListVolumesResponse {

@@ -239,6 +239,63 @@ func (MetadataDurability) EnumDescriptor() ([]byte, []int) {
 	return file_proto_objectfs_proto_rawDescGZIP(), []int{3}
 }
 
+// WalDurability controls the sync durability level for WAL streams.
+type WalDurability int32
+
+const (
+	// Use the server default durability level.
+	WalDurability_WAL_DURABILITY_UNSPECIFIED WalDurability = 0
+	// Append fsynced on local node disk.
+	WalDurability_LOCAL WalDurability = 1
+	// Append fsynced on central WAL buffer disk.
+	WalDurability_WITNESS WalDurability = 2
+	// Append flushed to permanent cloud object storage.
+	WalDurability_PERMANENT WalDurability = 3
+)
+
+// Enum value maps for WalDurability.
+var (
+	WalDurability_name = map[int32]string{
+		0: "WAL_DURABILITY_UNSPECIFIED",
+		1: "LOCAL",
+		2: "WITNESS",
+		3: "PERMANENT",
+	}
+	WalDurability_value = map[string]int32{
+		"WAL_DURABILITY_UNSPECIFIED": 0,
+		"LOCAL":                      1,
+		"WITNESS":                    2,
+		"PERMANENT":                  3,
+	}
+)
+
+func (x WalDurability) Enum() *WalDurability {
+	p := new(WalDurability)
+	*p = x
+	return p
+}
+
+func (x WalDurability) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (WalDurability) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_objectfs_proto_enumTypes[4].Descriptor()
+}
+
+func (WalDurability) Type() protoreflect.EnumType {
+	return &file_proto_objectfs_proto_enumTypes[4]
+}
+
+func (x WalDurability) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use WalDurability.Descriptor instead.
+func (WalDurability) EnumDescriptor() ([]byte, []int) {
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{4}
+}
+
 type WatchEventType int32
 
 const (
@@ -287,11 +344,11 @@ func (x WatchEventType) String() string {
 }
 
 func (WatchEventType) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_objectfs_proto_enumTypes[4].Descriptor()
+	return file_proto_objectfs_proto_enumTypes[5].Descriptor()
 }
 
 func (WatchEventType) Type() protoreflect.EnumType {
-	return &file_proto_objectfs_proto_enumTypes[4]
+	return &file_proto_objectfs_proto_enumTypes[5]
 }
 
 func (x WatchEventType) Number() protoreflect.EnumNumber {
@@ -300,7 +357,7 @@ func (x WatchEventType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use WatchEventType.Descriptor instead.
 func (WatchEventType) EnumDescriptor() ([]byte, []int) {
-	return file_proto_objectfs_proto_rawDescGZIP(), []int{4}
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{5}
 }
 
 type FsyncRequest_SyncTrigger int32
@@ -337,11 +394,11 @@ func (x FsyncRequest_SyncTrigger) String() string {
 }
 
 func (FsyncRequest_SyncTrigger) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_objectfs_proto_enumTypes[5].Descriptor()
+	return file_proto_objectfs_proto_enumTypes[6].Descriptor()
 }
 
 func (FsyncRequest_SyncTrigger) Type() protoreflect.EnumType {
-	return &file_proto_objectfs_proto_enumTypes[5]
+	return &file_proto_objectfs_proto_enumTypes[6]
 }
 
 func (x FsyncRequest_SyncTrigger) Number() protoreflect.EnumNumber {
@@ -386,11 +443,11 @@ func (x SetXAttrRequest_Flags) String() string {
 }
 
 func (SetXAttrRequest_Flags) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_objectfs_proto_enumTypes[6].Descriptor()
+	return file_proto_objectfs_proto_enumTypes[7].Descriptor()
 }
 
 func (SetXAttrRequest_Flags) Type() protoreflect.EnumType {
-	return &file_proto_objectfs_proto_enumTypes[6]
+	return &file_proto_objectfs_proto_enumTypes[7]
 }
 
 func (x SetXAttrRequest_Flags) Number() protoreflect.EnumNumber {
@@ -432,11 +489,11 @@ func (x Degraded_Code) String() string {
 }
 
 func (Degraded_Code) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_objectfs_proto_enumTypes[7].Descriptor()
+	return file_proto_objectfs_proto_enumTypes[8].Descriptor()
 }
 
 func (Degraded_Code) Type() protoreflect.EnumType {
-	return &file_proto_objectfs_proto_enumTypes[7]
+	return &file_proto_objectfs_proto_enumTypes[8]
 }
 
 func (x Degraded_Code) Number() protoreflect.EnumNumber {
@@ -4100,6 +4157,7 @@ type VolumeInfo struct {
 	Deleted            bool                   `protobuf:"varint,5,opt,name=deleted,proto3" json:"deleted,omitempty"`
 	Retention          *int32                 `protobuf:"varint,6,opt,name=retention,proto3,oneof" json:"retention,omitempty"`
 	MetadataDurability MetadataDurability     `protobuf:"varint,7,opt,name=metadata_durability,json=metadataDurability,proto3,enum=objectfs.v1alpha1.MetadataDurability" json:"metadata_durability,omitempty"`
+	WalDurability      WalDurability          `protobuf:"varint,8,opt,name=wal_durability,json=walDurability,proto3,enum=objectfs.v1alpha1.WalDurability" json:"wal_durability,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -4174,6 +4232,13 @@ func (x *VolumeInfo) GetMetadataDurability() MetadataDurability {
 		return x.MetadataDurability
 	}
 	return MetadataDurability_METADATA_DURABILITY_UNSPECIFIED
+}
+
+func (x *VolumeInfo) GetWalDurability() WalDurability {
+	if x != nil {
+		return x.WalDurability
+	}
+	return WalDurability_WAL_DURABILITY_UNSPECIFIED
 }
 
 type ListVolumesResponse struct {
@@ -6544,7 +6609,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05since\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x05since\">\n" +
 	"\x04Code\x12\x1d\n" +
 	"\x19DEGRADED_CODE_UNSPECIFIED\x10\x00\x12\x17\n" +
-	"\x13WAL_STREAM_DEGRADED\x10\x01\"\xeb\x02\n" +
+	"\x13WAL_STREAM_DEGRADED\x10\x01\"\xb4\x03\n" +
 	"\n" +
 	"VolumeInfo\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x127\n" +
@@ -6552,7 +6617,8 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x10consistency_mode\x18\x04 \x01(\x0e2\".objectfs.v1alpha1.ConsistencyModeR\x0fconsistencyMode\x12\x18\n" +
 	"\adeleted\x18\x05 \x01(\bR\adeleted\x12!\n" +
 	"\tretention\x18\x06 \x01(\x05H\x00R\tretention\x88\x01\x01\x12V\n" +
-	"\x13metadata_durability\x18\a \x01(\x0e2%.objectfs.v1alpha1.MetadataDurabilityR\x12metadataDurabilityB\f\n" +
+	"\x13metadata_durability\x18\a \x01(\x0e2%.objectfs.v1alpha1.MetadataDurabilityR\x12metadataDurability\x12G\n" +
+	"\x0ewal_durability\x18\b \x01(\x0e2 .objectfs.v1alpha1.WalDurabilityR\rwalDurabilityB\f\n" +
 	"\n" +
 	"_retentionJ\x04\b\x02\x10\x03R\x0fdegraded_reason\"n\n" +
 	"\x13ListVolumesResponse\x127\n" +
@@ -6738,7 +6804,12 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x12MetadataDurability\x12#\n" +
 	"\x1fMETADATA_DURABILITY_UNSPECIFIED\x10\x00\x12\v\n" +
 	"\aBARRIER\x10\x01\x12\r\n" +
-	"\tOPERATION\x10\x02*\xa2\x01\n" +
+	"\tOPERATION\x10\x02*V\n" +
+	"\rWalDurability\x12\x1e\n" +
+	"\x1aWAL_DURABILITY_UNSPECIFIED\x10\x00\x12\t\n" +
+	"\x05LOCAL\x10\x01\x12\v\n" +
+	"\aWITNESS\x10\x02\x12\r\n" +
+	"\tPERMANENT\x10\x03*\xa2\x01\n" +
 	"\x0eWatchEventType\x12\x11\n" +
 	"\rEVENT_UNKNOWN\x10\x00\x12\x11\n" +
 	"\rEVENT_CREATED\x10\x01\x12\x12\n" +
@@ -6804,246 +6875,248 @@ func file_proto_objectfs_proto_rawDescGZIP() []byte {
 	return file_proto_objectfs_proto_rawDescData
 }
 
-var file_proto_objectfs_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
+var file_proto_objectfs_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
 var file_proto_objectfs_proto_msgTypes = make([]protoimpl.MessageInfo, 93)
 var file_proto_objectfs_proto_goTypes = []any{
 	(WriteMode)(0),                   // 0: objectfs.v1alpha1.WriteMode
 	(ConsistencyMode)(0),             // 1: objectfs.v1alpha1.ConsistencyMode
 	(VolumeMode)(0),                  // 2: objectfs.v1alpha1.VolumeMode
 	(MetadataDurability)(0),          // 3: objectfs.v1alpha1.MetadataDurability
-	(WatchEventType)(0),              // 4: objectfs.v1alpha1.WatchEventType
-	(FsyncRequest_SyncTrigger)(0),    // 5: objectfs.v1alpha1.FsyncRequest.SyncTrigger
-	(SetXAttrRequest_Flags)(0),       // 6: objectfs.v1alpha1.SetXAttrRequest.Flags
-	(Degraded_Code)(0),               // 7: objectfs.v1alpha1.Degraded.Code
-	(*EntryAttr)(nil),                // 8: objectfs.v1alpha1.EntryAttr
-	(*GetAttrRequest)(nil),           // 9: objectfs.v1alpha1.GetAttrRequest
-	(*GetAttrResponse)(nil),          // 10: objectfs.v1alpha1.GetAttrResponse
-	(*SetAttrRequest)(nil),           // 11: objectfs.v1alpha1.SetAttrRequest
-	(*SetAttrResponse)(nil),          // 12: objectfs.v1alpha1.SetAttrResponse
-	(*LookupRequest)(nil),            // 13: objectfs.v1alpha1.LookupRequest
-	(*LookupResponse)(nil),           // 14: objectfs.v1alpha1.LookupResponse
-	(*ReadDirRequest)(nil),           // 15: objectfs.v1alpha1.ReadDirRequest
-	(*ReadDirResponse)(nil),          // 16: objectfs.v1alpha1.ReadDirResponse
-	(*MkdirRequest)(nil),             // 17: objectfs.v1alpha1.MkdirRequest
-	(*MkdirResponse)(nil),            // 18: objectfs.v1alpha1.MkdirResponse
-	(*CreateFileRequest)(nil),        // 19: objectfs.v1alpha1.CreateFileRequest
-	(*CreateFileResponse)(nil),       // 20: objectfs.v1alpha1.CreateFileResponse
-	(*ReadFileRequest)(nil),          // 21: objectfs.v1alpha1.ReadFileRequest
-	(*ReadFileResponse)(nil),         // 22: objectfs.v1alpha1.ReadFileResponse
-	(*WriteFileRequest)(nil),         // 23: objectfs.v1alpha1.WriteFileRequest
-	(*WriteFileResponse)(nil),        // 24: objectfs.v1alpha1.WriteFileResponse
-	(*TruncateFileRequest)(nil),      // 25: objectfs.v1alpha1.TruncateFileRequest
-	(*TruncateFileResponse)(nil),     // 26: objectfs.v1alpha1.TruncateFileResponse
-	(*PunchHoleRequest)(nil),         // 27: objectfs.v1alpha1.PunchHoleRequest
-	(*PunchHoleResponse)(nil),        // 28: objectfs.v1alpha1.PunchHoleResponse
-	(*UnlinkRequest)(nil),            // 29: objectfs.v1alpha1.UnlinkRequest
-	(*UnlinkResponse)(nil),           // 30: objectfs.v1alpha1.UnlinkResponse
-	(*RmdirRequest)(nil),             // 31: objectfs.v1alpha1.RmdirRequest
-	(*RmdirResponse)(nil),            // 32: objectfs.v1alpha1.RmdirResponse
-	(*RenameRequest)(nil),            // 33: objectfs.v1alpha1.RenameRequest
-	(*RenameResponse)(nil),           // 34: objectfs.v1alpha1.RenameResponse
-	(*FsyncRequest)(nil),             // 35: objectfs.v1alpha1.FsyncRequest
-	(*FsyncResponse)(nil),            // 36: objectfs.v1alpha1.FsyncResponse
-	(*WatchVolumeRequest)(nil),       // 37: objectfs.v1alpha1.WatchVolumeRequest
-	(*WatchVolumeResponse)(nil),      // 38: objectfs.v1alpha1.WatchVolumeResponse
-	(*SymlinkRequest)(nil),           // 39: objectfs.v1alpha1.SymlinkRequest
-	(*SymlinkResponse)(nil),          // 40: objectfs.v1alpha1.SymlinkResponse
-	(*ReadlinkRequest)(nil),          // 41: objectfs.v1alpha1.ReadlinkRequest
-	(*ReadlinkResponse)(nil),         // 42: objectfs.v1alpha1.ReadlinkResponse
-	(*LinkRequest)(nil),              // 43: objectfs.v1alpha1.LinkRequest
-	(*LinkResponse)(nil),             // 44: objectfs.v1alpha1.LinkResponse
-	(*OpenRequest)(nil),              // 45: objectfs.v1alpha1.OpenRequest
-	(*OpenResponse)(nil),             // 46: objectfs.v1alpha1.OpenResponse
-	(*ReleaseRequest)(nil),           // 47: objectfs.v1alpha1.ReleaseRequest
-	(*ReleaseResponse)(nil),          // 48: objectfs.v1alpha1.ReleaseResponse
-	(*GetXAttrRequest)(nil),          // 49: objectfs.v1alpha1.GetXAttrRequest
-	(*GetXAttrResponse)(nil),         // 50: objectfs.v1alpha1.GetXAttrResponse
-	(*SetXAttrRequest)(nil),          // 51: objectfs.v1alpha1.SetXAttrRequest
-	(*SetXAttrResponse)(nil),         // 52: objectfs.v1alpha1.SetXAttrResponse
-	(*ListXAttrRequest)(nil),         // 53: objectfs.v1alpha1.ListXAttrRequest
-	(*ListXAttrResponse)(nil),        // 54: objectfs.v1alpha1.ListXAttrResponse
-	(*RemoveXAttrRequest)(nil),       // 55: objectfs.v1alpha1.RemoveXAttrRequest
-	(*RemoveXAttrResponse)(nil),      // 56: objectfs.v1alpha1.RemoveXAttrResponse
-	(*ListBlobsRequest)(nil),         // 57: objectfs.v1alpha1.ListBlobsRequest
-	(*ListBlobsResponse)(nil),        // 58: objectfs.v1alpha1.ListBlobsResponse
-	(*GetBlobRequest)(nil),           // 59: objectfs.v1alpha1.GetBlobRequest
-	(*GetBlobResponse)(nil),          // 60: objectfs.v1alpha1.GetBlobResponse
-	(*GetManifestRequest)(nil),       // 61: objectfs.v1alpha1.GetManifestRequest
-	(*GetManifestResponse)(nil),      // 62: objectfs.v1alpha1.GetManifestResponse
-	(*ListVolumesRequest)(nil),       // 63: objectfs.v1alpha1.ListVolumesRequest
-	(*Degraded)(nil),                 // 64: objectfs.v1alpha1.Degraded
-	(*VolumeInfo)(nil),               // 65: objectfs.v1alpha1.VolumeInfo
-	(*ListVolumesResponse)(nil),      // 66: objectfs.v1alpha1.ListVolumesResponse
-	(*DeleteVolumeRequest)(nil),      // 67: objectfs.v1alpha1.DeleteVolumeRequest
-	(*DeleteVolumeResponse)(nil),     // 68: objectfs.v1alpha1.DeleteVolumeResponse
-	(*SnapshotInfo)(nil),             // 69: objectfs.v1alpha1.SnapshotInfo
-	(*ListSnapshotsRequest)(nil),     // 70: objectfs.v1alpha1.ListSnapshotsRequest
-	(*ListSnapshotsResponse)(nil),    // 71: objectfs.v1alpha1.ListSnapshotsResponse
-	(*CreateSnapshotRequest)(nil),    // 72: objectfs.v1alpha1.CreateSnapshotRequest
-	(*CreateSnapshotResponse)(nil),   // 73: objectfs.v1alpha1.CreateSnapshotResponse
-	(*RestoreSnapshotRequest)(nil),   // 74: objectfs.v1alpha1.RestoreSnapshotRequest
-	(*RestoreSnapshotResponse)(nil),  // 75: objectfs.v1alpha1.RestoreSnapshotResponse
-	(*DeleteSnapshotRequest)(nil),    // 76: objectfs.v1alpha1.DeleteSnapshotRequest
-	(*DeleteSnapshotResponse)(nil),   // 77: objectfs.v1alpha1.DeleteSnapshotResponse
-	(*GetVolumeStatsRequest)(nil),    // 78: objectfs.v1alpha1.GetVolumeStatsRequest
-	(*VolumeStats)(nil),              // 79: objectfs.v1alpha1.VolumeStats
-	(*GetVolumeStatsResponse)(nil),   // 80: objectfs.v1alpha1.GetVolumeStatsResponse
-	(*CheckpointRequest)(nil),        // 81: objectfs.v1alpha1.CheckpointRequest
-	(*CheckpointResponse)(nil),       // 82: objectfs.v1alpha1.CheckpointResponse
-	(*AckCheckpointRequest)(nil),     // 83: objectfs.v1alpha1.AckCheckpointRequest
-	(*AckCheckpointResponse)(nil),    // 84: objectfs.v1alpha1.AckCheckpointResponse
-	(*ExclusiveHold)(nil),            // 85: objectfs.v1alpha1.ExclusiveHold
-	(*AcquireExclusiveRequest)(nil),  // 86: objectfs.v1alpha1.AcquireExclusiveRequest
-	(*AcquireExclusiveResponse)(nil), // 87: objectfs.v1alpha1.AcquireExclusiveResponse
-	(*RenewExclusiveRequest)(nil),    // 88: objectfs.v1alpha1.RenewExclusiveRequest
-	(*RenewExclusiveResponse)(nil),   // 89: objectfs.v1alpha1.RenewExclusiveResponse
-	(*ReleaseExclusiveRequest)(nil),  // 90: objectfs.v1alpha1.ReleaseExclusiveRequest
-	(*ReleaseExclusiveResponse)(nil), // 91: objectfs.v1alpha1.ReleaseExclusiveResponse
-	(*GetExclusiveHoldRequest)(nil),  // 92: objectfs.v1alpha1.GetExclusiveHoldRequest
-	(*GetExclusiveHoldResponse)(nil), // 93: objectfs.v1alpha1.GetExclusiveHoldResponse
-	(*Inode)(nil),                    // 94: objectfs.v1alpha1.Inode
-	(*DirEntry)(nil),                 // 95: objectfs.v1alpha1.DirEntry
-	(*Content)(nil),                  // 96: objectfs.v1alpha1.Content
-	(*FileChunk)(nil),                // 97: objectfs.v1alpha1.FileChunk
-	(*XAttr)(nil),                    // 98: objectfs.v1alpha1.XAttr
-	(*RepairVolumeRequest)(nil),      // 99: objectfs.v1alpha1.RepairVolumeRequest
-	(*RepairVolumeResponse)(nil),     // 100: objectfs.v1alpha1.RepairVolumeResponse
-	(*timestamppb.Timestamp)(nil),    // 101: google.protobuf.Timestamp
+	(WalDurability)(0),               // 4: objectfs.v1alpha1.WalDurability
+	(WatchEventType)(0),              // 5: objectfs.v1alpha1.WatchEventType
+	(FsyncRequest_SyncTrigger)(0),    // 6: objectfs.v1alpha1.FsyncRequest.SyncTrigger
+	(SetXAttrRequest_Flags)(0),       // 7: objectfs.v1alpha1.SetXAttrRequest.Flags
+	(Degraded_Code)(0),               // 8: objectfs.v1alpha1.Degraded.Code
+	(*EntryAttr)(nil),                // 9: objectfs.v1alpha1.EntryAttr
+	(*GetAttrRequest)(nil),           // 10: objectfs.v1alpha1.GetAttrRequest
+	(*GetAttrResponse)(nil),          // 11: objectfs.v1alpha1.GetAttrResponse
+	(*SetAttrRequest)(nil),           // 12: objectfs.v1alpha1.SetAttrRequest
+	(*SetAttrResponse)(nil),          // 13: objectfs.v1alpha1.SetAttrResponse
+	(*LookupRequest)(nil),            // 14: objectfs.v1alpha1.LookupRequest
+	(*LookupResponse)(nil),           // 15: objectfs.v1alpha1.LookupResponse
+	(*ReadDirRequest)(nil),           // 16: objectfs.v1alpha1.ReadDirRequest
+	(*ReadDirResponse)(nil),          // 17: objectfs.v1alpha1.ReadDirResponse
+	(*MkdirRequest)(nil),             // 18: objectfs.v1alpha1.MkdirRequest
+	(*MkdirResponse)(nil),            // 19: objectfs.v1alpha1.MkdirResponse
+	(*CreateFileRequest)(nil),        // 20: objectfs.v1alpha1.CreateFileRequest
+	(*CreateFileResponse)(nil),       // 21: objectfs.v1alpha1.CreateFileResponse
+	(*ReadFileRequest)(nil),          // 22: objectfs.v1alpha1.ReadFileRequest
+	(*ReadFileResponse)(nil),         // 23: objectfs.v1alpha1.ReadFileResponse
+	(*WriteFileRequest)(nil),         // 24: objectfs.v1alpha1.WriteFileRequest
+	(*WriteFileResponse)(nil),        // 25: objectfs.v1alpha1.WriteFileResponse
+	(*TruncateFileRequest)(nil),      // 26: objectfs.v1alpha1.TruncateFileRequest
+	(*TruncateFileResponse)(nil),     // 27: objectfs.v1alpha1.TruncateFileResponse
+	(*PunchHoleRequest)(nil),         // 28: objectfs.v1alpha1.PunchHoleRequest
+	(*PunchHoleResponse)(nil),        // 29: objectfs.v1alpha1.PunchHoleResponse
+	(*UnlinkRequest)(nil),            // 30: objectfs.v1alpha1.UnlinkRequest
+	(*UnlinkResponse)(nil),           // 31: objectfs.v1alpha1.UnlinkResponse
+	(*RmdirRequest)(nil),             // 32: objectfs.v1alpha1.RmdirRequest
+	(*RmdirResponse)(nil),            // 33: objectfs.v1alpha1.RmdirResponse
+	(*RenameRequest)(nil),            // 34: objectfs.v1alpha1.RenameRequest
+	(*RenameResponse)(nil),           // 35: objectfs.v1alpha1.RenameResponse
+	(*FsyncRequest)(nil),             // 36: objectfs.v1alpha1.FsyncRequest
+	(*FsyncResponse)(nil),            // 37: objectfs.v1alpha1.FsyncResponse
+	(*WatchVolumeRequest)(nil),       // 38: objectfs.v1alpha1.WatchVolumeRequest
+	(*WatchVolumeResponse)(nil),      // 39: objectfs.v1alpha1.WatchVolumeResponse
+	(*SymlinkRequest)(nil),           // 40: objectfs.v1alpha1.SymlinkRequest
+	(*SymlinkResponse)(nil),          // 41: objectfs.v1alpha1.SymlinkResponse
+	(*ReadlinkRequest)(nil),          // 42: objectfs.v1alpha1.ReadlinkRequest
+	(*ReadlinkResponse)(nil),         // 43: objectfs.v1alpha1.ReadlinkResponse
+	(*LinkRequest)(nil),              // 44: objectfs.v1alpha1.LinkRequest
+	(*LinkResponse)(nil),             // 45: objectfs.v1alpha1.LinkResponse
+	(*OpenRequest)(nil),              // 46: objectfs.v1alpha1.OpenRequest
+	(*OpenResponse)(nil),             // 47: objectfs.v1alpha1.OpenResponse
+	(*ReleaseRequest)(nil),           // 48: objectfs.v1alpha1.ReleaseRequest
+	(*ReleaseResponse)(nil),          // 49: objectfs.v1alpha1.ReleaseResponse
+	(*GetXAttrRequest)(nil),          // 50: objectfs.v1alpha1.GetXAttrRequest
+	(*GetXAttrResponse)(nil),         // 51: objectfs.v1alpha1.GetXAttrResponse
+	(*SetXAttrRequest)(nil),          // 52: objectfs.v1alpha1.SetXAttrRequest
+	(*SetXAttrResponse)(nil),         // 53: objectfs.v1alpha1.SetXAttrResponse
+	(*ListXAttrRequest)(nil),         // 54: objectfs.v1alpha1.ListXAttrRequest
+	(*ListXAttrResponse)(nil),        // 55: objectfs.v1alpha1.ListXAttrResponse
+	(*RemoveXAttrRequest)(nil),       // 56: objectfs.v1alpha1.RemoveXAttrRequest
+	(*RemoveXAttrResponse)(nil),      // 57: objectfs.v1alpha1.RemoveXAttrResponse
+	(*ListBlobsRequest)(nil),         // 58: objectfs.v1alpha1.ListBlobsRequest
+	(*ListBlobsResponse)(nil),        // 59: objectfs.v1alpha1.ListBlobsResponse
+	(*GetBlobRequest)(nil),           // 60: objectfs.v1alpha1.GetBlobRequest
+	(*GetBlobResponse)(nil),          // 61: objectfs.v1alpha1.GetBlobResponse
+	(*GetManifestRequest)(nil),       // 62: objectfs.v1alpha1.GetManifestRequest
+	(*GetManifestResponse)(nil),      // 63: objectfs.v1alpha1.GetManifestResponse
+	(*ListVolumesRequest)(nil),       // 64: objectfs.v1alpha1.ListVolumesRequest
+	(*Degraded)(nil),                 // 65: objectfs.v1alpha1.Degraded
+	(*VolumeInfo)(nil),               // 66: objectfs.v1alpha1.VolumeInfo
+	(*ListVolumesResponse)(nil),      // 67: objectfs.v1alpha1.ListVolumesResponse
+	(*DeleteVolumeRequest)(nil),      // 68: objectfs.v1alpha1.DeleteVolumeRequest
+	(*DeleteVolumeResponse)(nil),     // 69: objectfs.v1alpha1.DeleteVolumeResponse
+	(*SnapshotInfo)(nil),             // 70: objectfs.v1alpha1.SnapshotInfo
+	(*ListSnapshotsRequest)(nil),     // 71: objectfs.v1alpha1.ListSnapshotsRequest
+	(*ListSnapshotsResponse)(nil),    // 72: objectfs.v1alpha1.ListSnapshotsResponse
+	(*CreateSnapshotRequest)(nil),    // 73: objectfs.v1alpha1.CreateSnapshotRequest
+	(*CreateSnapshotResponse)(nil),   // 74: objectfs.v1alpha1.CreateSnapshotResponse
+	(*RestoreSnapshotRequest)(nil),   // 75: objectfs.v1alpha1.RestoreSnapshotRequest
+	(*RestoreSnapshotResponse)(nil),  // 76: objectfs.v1alpha1.RestoreSnapshotResponse
+	(*DeleteSnapshotRequest)(nil),    // 77: objectfs.v1alpha1.DeleteSnapshotRequest
+	(*DeleteSnapshotResponse)(nil),   // 78: objectfs.v1alpha1.DeleteSnapshotResponse
+	(*GetVolumeStatsRequest)(nil),    // 79: objectfs.v1alpha1.GetVolumeStatsRequest
+	(*VolumeStats)(nil),              // 80: objectfs.v1alpha1.VolumeStats
+	(*GetVolumeStatsResponse)(nil),   // 81: objectfs.v1alpha1.GetVolumeStatsResponse
+	(*CheckpointRequest)(nil),        // 82: objectfs.v1alpha1.CheckpointRequest
+	(*CheckpointResponse)(nil),       // 83: objectfs.v1alpha1.CheckpointResponse
+	(*AckCheckpointRequest)(nil),     // 84: objectfs.v1alpha1.AckCheckpointRequest
+	(*AckCheckpointResponse)(nil),    // 85: objectfs.v1alpha1.AckCheckpointResponse
+	(*ExclusiveHold)(nil),            // 86: objectfs.v1alpha1.ExclusiveHold
+	(*AcquireExclusiveRequest)(nil),  // 87: objectfs.v1alpha1.AcquireExclusiveRequest
+	(*AcquireExclusiveResponse)(nil), // 88: objectfs.v1alpha1.AcquireExclusiveResponse
+	(*RenewExclusiveRequest)(nil),    // 89: objectfs.v1alpha1.RenewExclusiveRequest
+	(*RenewExclusiveResponse)(nil),   // 90: objectfs.v1alpha1.RenewExclusiveResponse
+	(*ReleaseExclusiveRequest)(nil),  // 91: objectfs.v1alpha1.ReleaseExclusiveRequest
+	(*ReleaseExclusiveResponse)(nil), // 92: objectfs.v1alpha1.ReleaseExclusiveResponse
+	(*GetExclusiveHoldRequest)(nil),  // 93: objectfs.v1alpha1.GetExclusiveHoldRequest
+	(*GetExclusiveHoldResponse)(nil), // 94: objectfs.v1alpha1.GetExclusiveHoldResponse
+	(*Inode)(nil),                    // 95: objectfs.v1alpha1.Inode
+	(*DirEntry)(nil),                 // 96: objectfs.v1alpha1.DirEntry
+	(*Content)(nil),                  // 97: objectfs.v1alpha1.Content
+	(*FileChunk)(nil),                // 98: objectfs.v1alpha1.FileChunk
+	(*XAttr)(nil),                    // 99: objectfs.v1alpha1.XAttr
+	(*RepairVolumeRequest)(nil),      // 100: objectfs.v1alpha1.RepairVolumeRequest
+	(*RepairVolumeResponse)(nil),     // 101: objectfs.v1alpha1.RepairVolumeResponse
+	(*timestamppb.Timestamp)(nil),    // 102: google.protobuf.Timestamp
 }
 var file_proto_objectfs_proto_depIdxs = []int32{
-	94,  // 0: objectfs.v1alpha1.EntryAttr.inode:type_name -> objectfs.v1alpha1.Inode
-	8,   // 1: objectfs.v1alpha1.GetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	101, // 2: objectfs.v1alpha1.SetAttrRequest.atime:type_name -> google.protobuf.Timestamp
-	101, // 3: objectfs.v1alpha1.SetAttrRequest.mtime:type_name -> google.protobuf.Timestamp
-	101, // 4: objectfs.v1alpha1.SetAttrRequest.ctime:type_name -> google.protobuf.Timestamp
-	8,   // 5: objectfs.v1alpha1.SetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	8,   // 6: objectfs.v1alpha1.LookupResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	8,   // 7: objectfs.v1alpha1.ReadDirResponse.entries:type_name -> objectfs.v1alpha1.EntryAttr
-	8,   // 8: objectfs.v1alpha1.MkdirResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	8,   // 9: objectfs.v1alpha1.CreateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	95,  // 0: objectfs.v1alpha1.EntryAttr.inode:type_name -> objectfs.v1alpha1.Inode
+	9,   // 1: objectfs.v1alpha1.GetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	102, // 2: objectfs.v1alpha1.SetAttrRequest.atime:type_name -> google.protobuf.Timestamp
+	102, // 3: objectfs.v1alpha1.SetAttrRequest.mtime:type_name -> google.protobuf.Timestamp
+	102, // 4: objectfs.v1alpha1.SetAttrRequest.ctime:type_name -> google.protobuf.Timestamp
+	9,   // 5: objectfs.v1alpha1.SetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	9,   // 6: objectfs.v1alpha1.LookupResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	9,   // 7: objectfs.v1alpha1.ReadDirResponse.entries:type_name -> objectfs.v1alpha1.EntryAttr
+	9,   // 8: objectfs.v1alpha1.MkdirResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	9,   // 9: objectfs.v1alpha1.CreateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	0,   // 10: objectfs.v1alpha1.WriteFileRequest.write_mode:type_name -> objectfs.v1alpha1.WriteMode
-	101, // 11: objectfs.v1alpha1.WriteFileResponse.mod_time:type_name -> google.protobuf.Timestamp
-	8,   // 12: objectfs.v1alpha1.TruncateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	8,   // 13: objectfs.v1alpha1.PunchHoleResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	8,   // 14: objectfs.v1alpha1.RenameResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	5,   // 15: objectfs.v1alpha1.FsyncRequest.trigger:type_name -> objectfs.v1alpha1.FsyncRequest.SyncTrigger
+	102, // 11: objectfs.v1alpha1.WriteFileResponse.mod_time:type_name -> google.protobuf.Timestamp
+	9,   // 12: objectfs.v1alpha1.TruncateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	9,   // 13: objectfs.v1alpha1.PunchHoleResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	9,   // 14: objectfs.v1alpha1.RenameResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	6,   // 15: objectfs.v1alpha1.FsyncRequest.trigger:type_name -> objectfs.v1alpha1.FsyncRequest.SyncTrigger
 	1,   // 16: objectfs.v1alpha1.WatchVolumeRequest.consistency_mode:type_name -> objectfs.v1alpha1.ConsistencyMode
-	4,   // 17: objectfs.v1alpha1.WatchVolumeResponse.event_type:type_name -> objectfs.v1alpha1.WatchEventType
-	8,   // 18: objectfs.v1alpha1.WatchVolumeResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	8,   // 19: objectfs.v1alpha1.SymlinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	8,   // 20: objectfs.v1alpha1.LinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	8,   // 21: objectfs.v1alpha1.OpenResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
-	6,   // 22: objectfs.v1alpha1.SetXAttrRequest.flags:type_name -> objectfs.v1alpha1.SetXAttrRequest.Flags
-	98,  // 23: objectfs.v1alpha1.ListXAttrResponse.xattrs:type_name -> objectfs.v1alpha1.XAttr
-	7,   // 24: objectfs.v1alpha1.Degraded.code:type_name -> objectfs.v1alpha1.Degraded.Code
-	101, // 25: objectfs.v1alpha1.Degraded.since:type_name -> google.protobuf.Timestamp
-	64,  // 26: objectfs.v1alpha1.VolumeInfo.degraded:type_name -> objectfs.v1alpha1.Degraded
+	5,   // 17: objectfs.v1alpha1.WatchVolumeResponse.event_type:type_name -> objectfs.v1alpha1.WatchEventType
+	9,   // 18: objectfs.v1alpha1.WatchVolumeResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	9,   // 19: objectfs.v1alpha1.SymlinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	9,   // 20: objectfs.v1alpha1.LinkResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	9,   // 21: objectfs.v1alpha1.OpenResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
+	7,   // 22: objectfs.v1alpha1.SetXAttrRequest.flags:type_name -> objectfs.v1alpha1.SetXAttrRequest.Flags
+	99,  // 23: objectfs.v1alpha1.ListXAttrResponse.xattrs:type_name -> objectfs.v1alpha1.XAttr
+	8,   // 24: objectfs.v1alpha1.Degraded.code:type_name -> objectfs.v1alpha1.Degraded.Code
+	102, // 25: objectfs.v1alpha1.Degraded.since:type_name -> google.protobuf.Timestamp
+	65,  // 26: objectfs.v1alpha1.VolumeInfo.degraded:type_name -> objectfs.v1alpha1.Degraded
 	1,   // 27: objectfs.v1alpha1.VolumeInfo.consistency_mode:type_name -> objectfs.v1alpha1.ConsistencyMode
 	3,   // 28: objectfs.v1alpha1.VolumeInfo.metadata_durability:type_name -> objectfs.v1alpha1.MetadataDurability
-	65,  // 29: objectfs.v1alpha1.ListVolumesResponse.volumes:type_name -> objectfs.v1alpha1.VolumeInfo
-	101, // 30: objectfs.v1alpha1.SnapshotInfo.created_at:type_name -> google.protobuf.Timestamp
-	101, // 31: objectfs.v1alpha1.ListSnapshotsRequest.from_time:type_name -> google.protobuf.Timestamp
-	101, // 32: objectfs.v1alpha1.ListSnapshotsRequest.to_time:type_name -> google.protobuf.Timestamp
-	69,  // 33: objectfs.v1alpha1.ListSnapshotsResponse.snapshots:type_name -> objectfs.v1alpha1.SnapshotInfo
-	69,  // 34: objectfs.v1alpha1.CreateSnapshotResponse.snapshot:type_name -> objectfs.v1alpha1.SnapshotInfo
-	69,  // 35: objectfs.v1alpha1.RestoreSnapshotResponse.snapshot:type_name -> objectfs.v1alpha1.SnapshotInfo
-	79,  // 36: objectfs.v1alpha1.GetVolumeStatsResponse.stats:type_name -> objectfs.v1alpha1.VolumeStats
-	64,  // 37: objectfs.v1alpha1.GetVolumeStatsResponse.degraded:type_name -> objectfs.v1alpha1.Degraded
-	101, // 38: objectfs.v1alpha1.ExclusiveHold.acquired_at:type_name -> google.protobuf.Timestamp
-	101, // 39: objectfs.v1alpha1.ExclusiveHold.lease_expiry:type_name -> google.protobuf.Timestamp
-	85,  // 40: objectfs.v1alpha1.AcquireExclusiveResponse.hold:type_name -> objectfs.v1alpha1.ExclusiveHold
-	85,  // 41: objectfs.v1alpha1.RenewExclusiveResponse.hold:type_name -> objectfs.v1alpha1.ExclusiveHold
-	85,  // 42: objectfs.v1alpha1.GetExclusiveHoldResponse.hold:type_name -> objectfs.v1alpha1.ExclusiveHold
-	101, // 43: objectfs.v1alpha1.Inode.mtime:type_name -> google.protobuf.Timestamp
-	101, // 44: objectfs.v1alpha1.Inode.atime:type_name -> google.protobuf.Timestamp
-	101, // 45: objectfs.v1alpha1.Inode.ctime:type_name -> google.protobuf.Timestamp
-	9,   // 46: objectfs.v1alpha1.ObjectFSController.GetAttr:input_type -> objectfs.v1alpha1.GetAttrRequest
-	11,  // 47: objectfs.v1alpha1.ObjectFSController.SetAttr:input_type -> objectfs.v1alpha1.SetAttrRequest
-	13,  // 48: objectfs.v1alpha1.ObjectFSController.Lookup:input_type -> objectfs.v1alpha1.LookupRequest
-	15,  // 49: objectfs.v1alpha1.ObjectFSController.ReadDir:input_type -> objectfs.v1alpha1.ReadDirRequest
-	17,  // 50: objectfs.v1alpha1.ObjectFSController.Mkdir:input_type -> objectfs.v1alpha1.MkdirRequest
-	19,  // 51: objectfs.v1alpha1.ObjectFSController.CreateFile:input_type -> objectfs.v1alpha1.CreateFileRequest
-	21,  // 52: objectfs.v1alpha1.ObjectFSController.ReadFile:input_type -> objectfs.v1alpha1.ReadFileRequest
-	23,  // 53: objectfs.v1alpha1.ObjectFSController.WriteFile:input_type -> objectfs.v1alpha1.WriteFileRequest
-	25,  // 54: objectfs.v1alpha1.ObjectFSController.TruncateFile:input_type -> objectfs.v1alpha1.TruncateFileRequest
-	27,  // 55: objectfs.v1alpha1.ObjectFSController.PunchHole:input_type -> objectfs.v1alpha1.PunchHoleRequest
-	29,  // 56: objectfs.v1alpha1.ObjectFSController.Unlink:input_type -> objectfs.v1alpha1.UnlinkRequest
-	31,  // 57: objectfs.v1alpha1.ObjectFSController.Rmdir:input_type -> objectfs.v1alpha1.RmdirRequest
-	33,  // 58: objectfs.v1alpha1.ObjectFSController.Rename:input_type -> objectfs.v1alpha1.RenameRequest
-	35,  // 59: objectfs.v1alpha1.ObjectFSController.Fsync:input_type -> objectfs.v1alpha1.FsyncRequest
-	37,  // 60: objectfs.v1alpha1.ObjectFSController.WatchVolume:input_type -> objectfs.v1alpha1.WatchVolumeRequest
-	39,  // 61: objectfs.v1alpha1.ObjectFSController.Symlink:input_type -> objectfs.v1alpha1.SymlinkRequest
-	41,  // 62: objectfs.v1alpha1.ObjectFSController.Readlink:input_type -> objectfs.v1alpha1.ReadlinkRequest
-	43,  // 63: objectfs.v1alpha1.ObjectFSController.Link:input_type -> objectfs.v1alpha1.LinkRequest
-	45,  // 64: objectfs.v1alpha1.ObjectFSController.Open:input_type -> objectfs.v1alpha1.OpenRequest
-	47,  // 65: objectfs.v1alpha1.ObjectFSController.Release:input_type -> objectfs.v1alpha1.ReleaseRequest
-	49,  // 66: objectfs.v1alpha1.ObjectFSController.GetXAttr:input_type -> objectfs.v1alpha1.GetXAttrRequest
-	51,  // 67: objectfs.v1alpha1.ObjectFSController.SetXAttr:input_type -> objectfs.v1alpha1.SetXAttrRequest
-	53,  // 68: objectfs.v1alpha1.ObjectFSController.ListXAttr:input_type -> objectfs.v1alpha1.ListXAttrRequest
-	55,  // 69: objectfs.v1alpha1.ObjectFSController.RemoveXAttr:input_type -> objectfs.v1alpha1.RemoveXAttrRequest
-	57,  // 70: objectfs.v1alpha1.ObjectFSController.ListBlobs:input_type -> objectfs.v1alpha1.ListBlobsRequest
-	59,  // 71: objectfs.v1alpha1.ObjectFSController.GetBlob:input_type -> objectfs.v1alpha1.GetBlobRequest
-	61,  // 72: objectfs.v1alpha1.ObjectFSController.GetManifest:input_type -> objectfs.v1alpha1.GetManifestRequest
-	63,  // 73: objectfs.v1alpha1.ObjectFSController.ListVolumes:input_type -> objectfs.v1alpha1.ListVolumesRequest
-	70,  // 74: objectfs.v1alpha1.ObjectFSController.ListSnapshots:input_type -> objectfs.v1alpha1.ListSnapshotsRequest
-	72,  // 75: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:input_type -> objectfs.v1alpha1.CreateSnapshotRequest
-	74,  // 76: objectfs.v1alpha1.ObjectFSController.RestoreSnapshot:input_type -> objectfs.v1alpha1.RestoreSnapshotRequest
-	76,  // 77: objectfs.v1alpha1.ObjectFSController.DeleteSnapshot:input_type -> objectfs.v1alpha1.DeleteSnapshotRequest
-	78,  // 78: objectfs.v1alpha1.ObjectFSController.GetVolumeStats:input_type -> objectfs.v1alpha1.GetVolumeStatsRequest
-	81,  // 79: objectfs.v1alpha1.ObjectFSController.Checkpoint:input_type -> objectfs.v1alpha1.CheckpointRequest
-	83,  // 80: objectfs.v1alpha1.ObjectFSController.AckCheckpoint:input_type -> objectfs.v1alpha1.AckCheckpointRequest
-	86,  // 81: objectfs.v1alpha1.ObjectFSController.AcquireExclusive:input_type -> objectfs.v1alpha1.AcquireExclusiveRequest
-	88,  // 82: objectfs.v1alpha1.ObjectFSController.RenewExclusive:input_type -> objectfs.v1alpha1.RenewExclusiveRequest
-	90,  // 83: objectfs.v1alpha1.ObjectFSController.ReleaseExclusive:input_type -> objectfs.v1alpha1.ReleaseExclusiveRequest
-	92,  // 84: objectfs.v1alpha1.ObjectFSController.GetExclusiveHold:input_type -> objectfs.v1alpha1.GetExclusiveHoldRequest
-	99,  // 85: objectfs.v1alpha1.ObjectFSController.RepairVolume:input_type -> objectfs.v1alpha1.RepairVolumeRequest
-	67,  // 86: objectfs.v1alpha1.ObjectFSController.DeleteVolume:input_type -> objectfs.v1alpha1.DeleteVolumeRequest
-	10,  // 87: objectfs.v1alpha1.ObjectFSController.GetAttr:output_type -> objectfs.v1alpha1.GetAttrResponse
-	12,  // 88: objectfs.v1alpha1.ObjectFSController.SetAttr:output_type -> objectfs.v1alpha1.SetAttrResponse
-	14,  // 89: objectfs.v1alpha1.ObjectFSController.Lookup:output_type -> objectfs.v1alpha1.LookupResponse
-	16,  // 90: objectfs.v1alpha1.ObjectFSController.ReadDir:output_type -> objectfs.v1alpha1.ReadDirResponse
-	18,  // 91: objectfs.v1alpha1.ObjectFSController.Mkdir:output_type -> objectfs.v1alpha1.MkdirResponse
-	20,  // 92: objectfs.v1alpha1.ObjectFSController.CreateFile:output_type -> objectfs.v1alpha1.CreateFileResponse
-	22,  // 93: objectfs.v1alpha1.ObjectFSController.ReadFile:output_type -> objectfs.v1alpha1.ReadFileResponse
-	24,  // 94: objectfs.v1alpha1.ObjectFSController.WriteFile:output_type -> objectfs.v1alpha1.WriteFileResponse
-	26,  // 95: objectfs.v1alpha1.ObjectFSController.TruncateFile:output_type -> objectfs.v1alpha1.TruncateFileResponse
-	28,  // 96: objectfs.v1alpha1.ObjectFSController.PunchHole:output_type -> objectfs.v1alpha1.PunchHoleResponse
-	30,  // 97: objectfs.v1alpha1.ObjectFSController.Unlink:output_type -> objectfs.v1alpha1.UnlinkResponse
-	32,  // 98: objectfs.v1alpha1.ObjectFSController.Rmdir:output_type -> objectfs.v1alpha1.RmdirResponse
-	34,  // 99: objectfs.v1alpha1.ObjectFSController.Rename:output_type -> objectfs.v1alpha1.RenameResponse
-	36,  // 100: objectfs.v1alpha1.ObjectFSController.Fsync:output_type -> objectfs.v1alpha1.FsyncResponse
-	38,  // 101: objectfs.v1alpha1.ObjectFSController.WatchVolume:output_type -> objectfs.v1alpha1.WatchVolumeResponse
-	40,  // 102: objectfs.v1alpha1.ObjectFSController.Symlink:output_type -> objectfs.v1alpha1.SymlinkResponse
-	42,  // 103: objectfs.v1alpha1.ObjectFSController.Readlink:output_type -> objectfs.v1alpha1.ReadlinkResponse
-	44,  // 104: objectfs.v1alpha1.ObjectFSController.Link:output_type -> objectfs.v1alpha1.LinkResponse
-	46,  // 105: objectfs.v1alpha1.ObjectFSController.Open:output_type -> objectfs.v1alpha1.OpenResponse
-	48,  // 106: objectfs.v1alpha1.ObjectFSController.Release:output_type -> objectfs.v1alpha1.ReleaseResponse
-	50,  // 107: objectfs.v1alpha1.ObjectFSController.GetXAttr:output_type -> objectfs.v1alpha1.GetXAttrResponse
-	52,  // 108: objectfs.v1alpha1.ObjectFSController.SetXAttr:output_type -> objectfs.v1alpha1.SetXAttrResponse
-	54,  // 109: objectfs.v1alpha1.ObjectFSController.ListXAttr:output_type -> objectfs.v1alpha1.ListXAttrResponse
-	56,  // 110: objectfs.v1alpha1.ObjectFSController.RemoveXAttr:output_type -> objectfs.v1alpha1.RemoveXAttrResponse
-	58,  // 111: objectfs.v1alpha1.ObjectFSController.ListBlobs:output_type -> objectfs.v1alpha1.ListBlobsResponse
-	60,  // 112: objectfs.v1alpha1.ObjectFSController.GetBlob:output_type -> objectfs.v1alpha1.GetBlobResponse
-	62,  // 113: objectfs.v1alpha1.ObjectFSController.GetManifest:output_type -> objectfs.v1alpha1.GetManifestResponse
-	66,  // 114: objectfs.v1alpha1.ObjectFSController.ListVolumes:output_type -> objectfs.v1alpha1.ListVolumesResponse
-	71,  // 115: objectfs.v1alpha1.ObjectFSController.ListSnapshots:output_type -> objectfs.v1alpha1.ListSnapshotsResponse
-	73,  // 116: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:output_type -> objectfs.v1alpha1.CreateSnapshotResponse
-	75,  // 117: objectfs.v1alpha1.ObjectFSController.RestoreSnapshot:output_type -> objectfs.v1alpha1.RestoreSnapshotResponse
-	77,  // 118: objectfs.v1alpha1.ObjectFSController.DeleteSnapshot:output_type -> objectfs.v1alpha1.DeleteSnapshotResponse
-	80,  // 119: objectfs.v1alpha1.ObjectFSController.GetVolumeStats:output_type -> objectfs.v1alpha1.GetVolumeStatsResponse
-	82,  // 120: objectfs.v1alpha1.ObjectFSController.Checkpoint:output_type -> objectfs.v1alpha1.CheckpointResponse
-	84,  // 121: objectfs.v1alpha1.ObjectFSController.AckCheckpoint:output_type -> objectfs.v1alpha1.AckCheckpointResponse
-	87,  // 122: objectfs.v1alpha1.ObjectFSController.AcquireExclusive:output_type -> objectfs.v1alpha1.AcquireExclusiveResponse
-	89,  // 123: objectfs.v1alpha1.ObjectFSController.RenewExclusive:output_type -> objectfs.v1alpha1.RenewExclusiveResponse
-	91,  // 124: objectfs.v1alpha1.ObjectFSController.ReleaseExclusive:output_type -> objectfs.v1alpha1.ReleaseExclusiveResponse
-	93,  // 125: objectfs.v1alpha1.ObjectFSController.GetExclusiveHold:output_type -> objectfs.v1alpha1.GetExclusiveHoldResponse
-	100, // 126: objectfs.v1alpha1.ObjectFSController.RepairVolume:output_type -> objectfs.v1alpha1.RepairVolumeResponse
-	68,  // 127: objectfs.v1alpha1.ObjectFSController.DeleteVolume:output_type -> objectfs.v1alpha1.DeleteVolumeResponse
-	87,  // [87:128] is the sub-list for method output_type
-	46,  // [46:87] is the sub-list for method input_type
-	46,  // [46:46] is the sub-list for extension type_name
-	46,  // [46:46] is the sub-list for extension extendee
-	0,   // [0:46] is the sub-list for field type_name
+	4,   // 29: objectfs.v1alpha1.VolumeInfo.wal_durability:type_name -> objectfs.v1alpha1.WalDurability
+	66,  // 30: objectfs.v1alpha1.ListVolumesResponse.volumes:type_name -> objectfs.v1alpha1.VolumeInfo
+	102, // 31: objectfs.v1alpha1.SnapshotInfo.created_at:type_name -> google.protobuf.Timestamp
+	102, // 32: objectfs.v1alpha1.ListSnapshotsRequest.from_time:type_name -> google.protobuf.Timestamp
+	102, // 33: objectfs.v1alpha1.ListSnapshotsRequest.to_time:type_name -> google.protobuf.Timestamp
+	70,  // 34: objectfs.v1alpha1.ListSnapshotsResponse.snapshots:type_name -> objectfs.v1alpha1.SnapshotInfo
+	70,  // 35: objectfs.v1alpha1.CreateSnapshotResponse.snapshot:type_name -> objectfs.v1alpha1.SnapshotInfo
+	70,  // 36: objectfs.v1alpha1.RestoreSnapshotResponse.snapshot:type_name -> objectfs.v1alpha1.SnapshotInfo
+	80,  // 37: objectfs.v1alpha1.GetVolumeStatsResponse.stats:type_name -> objectfs.v1alpha1.VolumeStats
+	65,  // 38: objectfs.v1alpha1.GetVolumeStatsResponse.degraded:type_name -> objectfs.v1alpha1.Degraded
+	102, // 39: objectfs.v1alpha1.ExclusiveHold.acquired_at:type_name -> google.protobuf.Timestamp
+	102, // 40: objectfs.v1alpha1.ExclusiveHold.lease_expiry:type_name -> google.protobuf.Timestamp
+	86,  // 41: objectfs.v1alpha1.AcquireExclusiveResponse.hold:type_name -> objectfs.v1alpha1.ExclusiveHold
+	86,  // 42: objectfs.v1alpha1.RenewExclusiveResponse.hold:type_name -> objectfs.v1alpha1.ExclusiveHold
+	86,  // 43: objectfs.v1alpha1.GetExclusiveHoldResponse.hold:type_name -> objectfs.v1alpha1.ExclusiveHold
+	102, // 44: objectfs.v1alpha1.Inode.mtime:type_name -> google.protobuf.Timestamp
+	102, // 45: objectfs.v1alpha1.Inode.atime:type_name -> google.protobuf.Timestamp
+	102, // 46: objectfs.v1alpha1.Inode.ctime:type_name -> google.protobuf.Timestamp
+	10,  // 47: objectfs.v1alpha1.ObjectFSController.GetAttr:input_type -> objectfs.v1alpha1.GetAttrRequest
+	12,  // 48: objectfs.v1alpha1.ObjectFSController.SetAttr:input_type -> objectfs.v1alpha1.SetAttrRequest
+	14,  // 49: objectfs.v1alpha1.ObjectFSController.Lookup:input_type -> objectfs.v1alpha1.LookupRequest
+	16,  // 50: objectfs.v1alpha1.ObjectFSController.ReadDir:input_type -> objectfs.v1alpha1.ReadDirRequest
+	18,  // 51: objectfs.v1alpha1.ObjectFSController.Mkdir:input_type -> objectfs.v1alpha1.MkdirRequest
+	20,  // 52: objectfs.v1alpha1.ObjectFSController.CreateFile:input_type -> objectfs.v1alpha1.CreateFileRequest
+	22,  // 53: objectfs.v1alpha1.ObjectFSController.ReadFile:input_type -> objectfs.v1alpha1.ReadFileRequest
+	24,  // 54: objectfs.v1alpha1.ObjectFSController.WriteFile:input_type -> objectfs.v1alpha1.WriteFileRequest
+	26,  // 55: objectfs.v1alpha1.ObjectFSController.TruncateFile:input_type -> objectfs.v1alpha1.TruncateFileRequest
+	28,  // 56: objectfs.v1alpha1.ObjectFSController.PunchHole:input_type -> objectfs.v1alpha1.PunchHoleRequest
+	30,  // 57: objectfs.v1alpha1.ObjectFSController.Unlink:input_type -> objectfs.v1alpha1.UnlinkRequest
+	32,  // 58: objectfs.v1alpha1.ObjectFSController.Rmdir:input_type -> objectfs.v1alpha1.RmdirRequest
+	34,  // 59: objectfs.v1alpha1.ObjectFSController.Rename:input_type -> objectfs.v1alpha1.RenameRequest
+	36,  // 60: objectfs.v1alpha1.ObjectFSController.Fsync:input_type -> objectfs.v1alpha1.FsyncRequest
+	38,  // 61: objectfs.v1alpha1.ObjectFSController.WatchVolume:input_type -> objectfs.v1alpha1.WatchVolumeRequest
+	40,  // 62: objectfs.v1alpha1.ObjectFSController.Symlink:input_type -> objectfs.v1alpha1.SymlinkRequest
+	42,  // 63: objectfs.v1alpha1.ObjectFSController.Readlink:input_type -> objectfs.v1alpha1.ReadlinkRequest
+	44,  // 64: objectfs.v1alpha1.ObjectFSController.Link:input_type -> objectfs.v1alpha1.LinkRequest
+	46,  // 65: objectfs.v1alpha1.ObjectFSController.Open:input_type -> objectfs.v1alpha1.OpenRequest
+	48,  // 66: objectfs.v1alpha1.ObjectFSController.Release:input_type -> objectfs.v1alpha1.ReleaseRequest
+	50,  // 67: objectfs.v1alpha1.ObjectFSController.GetXAttr:input_type -> objectfs.v1alpha1.GetXAttrRequest
+	52,  // 68: objectfs.v1alpha1.ObjectFSController.SetXAttr:input_type -> objectfs.v1alpha1.SetXAttrRequest
+	54,  // 69: objectfs.v1alpha1.ObjectFSController.ListXAttr:input_type -> objectfs.v1alpha1.ListXAttrRequest
+	56,  // 70: objectfs.v1alpha1.ObjectFSController.RemoveXAttr:input_type -> objectfs.v1alpha1.RemoveXAttrRequest
+	58,  // 71: objectfs.v1alpha1.ObjectFSController.ListBlobs:input_type -> objectfs.v1alpha1.ListBlobsRequest
+	60,  // 72: objectfs.v1alpha1.ObjectFSController.GetBlob:input_type -> objectfs.v1alpha1.GetBlobRequest
+	62,  // 73: objectfs.v1alpha1.ObjectFSController.GetManifest:input_type -> objectfs.v1alpha1.GetManifestRequest
+	64,  // 74: objectfs.v1alpha1.ObjectFSController.ListVolumes:input_type -> objectfs.v1alpha1.ListVolumesRequest
+	71,  // 75: objectfs.v1alpha1.ObjectFSController.ListSnapshots:input_type -> objectfs.v1alpha1.ListSnapshotsRequest
+	73,  // 76: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:input_type -> objectfs.v1alpha1.CreateSnapshotRequest
+	75,  // 77: objectfs.v1alpha1.ObjectFSController.RestoreSnapshot:input_type -> objectfs.v1alpha1.RestoreSnapshotRequest
+	77,  // 78: objectfs.v1alpha1.ObjectFSController.DeleteSnapshot:input_type -> objectfs.v1alpha1.DeleteSnapshotRequest
+	79,  // 79: objectfs.v1alpha1.ObjectFSController.GetVolumeStats:input_type -> objectfs.v1alpha1.GetVolumeStatsRequest
+	82,  // 80: objectfs.v1alpha1.ObjectFSController.Checkpoint:input_type -> objectfs.v1alpha1.CheckpointRequest
+	84,  // 81: objectfs.v1alpha1.ObjectFSController.AckCheckpoint:input_type -> objectfs.v1alpha1.AckCheckpointRequest
+	87,  // 82: objectfs.v1alpha1.ObjectFSController.AcquireExclusive:input_type -> objectfs.v1alpha1.AcquireExclusiveRequest
+	89,  // 83: objectfs.v1alpha1.ObjectFSController.RenewExclusive:input_type -> objectfs.v1alpha1.RenewExclusiveRequest
+	91,  // 84: objectfs.v1alpha1.ObjectFSController.ReleaseExclusive:input_type -> objectfs.v1alpha1.ReleaseExclusiveRequest
+	93,  // 85: objectfs.v1alpha1.ObjectFSController.GetExclusiveHold:input_type -> objectfs.v1alpha1.GetExclusiveHoldRequest
+	100, // 86: objectfs.v1alpha1.ObjectFSController.RepairVolume:input_type -> objectfs.v1alpha1.RepairVolumeRequest
+	68,  // 87: objectfs.v1alpha1.ObjectFSController.DeleteVolume:input_type -> objectfs.v1alpha1.DeleteVolumeRequest
+	11,  // 88: objectfs.v1alpha1.ObjectFSController.GetAttr:output_type -> objectfs.v1alpha1.GetAttrResponse
+	13,  // 89: objectfs.v1alpha1.ObjectFSController.SetAttr:output_type -> objectfs.v1alpha1.SetAttrResponse
+	15,  // 90: objectfs.v1alpha1.ObjectFSController.Lookup:output_type -> objectfs.v1alpha1.LookupResponse
+	17,  // 91: objectfs.v1alpha1.ObjectFSController.ReadDir:output_type -> objectfs.v1alpha1.ReadDirResponse
+	19,  // 92: objectfs.v1alpha1.ObjectFSController.Mkdir:output_type -> objectfs.v1alpha1.MkdirResponse
+	21,  // 93: objectfs.v1alpha1.ObjectFSController.CreateFile:output_type -> objectfs.v1alpha1.CreateFileResponse
+	23,  // 94: objectfs.v1alpha1.ObjectFSController.ReadFile:output_type -> objectfs.v1alpha1.ReadFileResponse
+	25,  // 95: objectfs.v1alpha1.ObjectFSController.WriteFile:output_type -> objectfs.v1alpha1.WriteFileResponse
+	27,  // 96: objectfs.v1alpha1.ObjectFSController.TruncateFile:output_type -> objectfs.v1alpha1.TruncateFileResponse
+	29,  // 97: objectfs.v1alpha1.ObjectFSController.PunchHole:output_type -> objectfs.v1alpha1.PunchHoleResponse
+	31,  // 98: objectfs.v1alpha1.ObjectFSController.Unlink:output_type -> objectfs.v1alpha1.UnlinkResponse
+	33,  // 99: objectfs.v1alpha1.ObjectFSController.Rmdir:output_type -> objectfs.v1alpha1.RmdirResponse
+	35,  // 100: objectfs.v1alpha1.ObjectFSController.Rename:output_type -> objectfs.v1alpha1.RenameResponse
+	37,  // 101: objectfs.v1alpha1.ObjectFSController.Fsync:output_type -> objectfs.v1alpha1.FsyncResponse
+	39,  // 102: objectfs.v1alpha1.ObjectFSController.WatchVolume:output_type -> objectfs.v1alpha1.WatchVolumeResponse
+	41,  // 103: objectfs.v1alpha1.ObjectFSController.Symlink:output_type -> objectfs.v1alpha1.SymlinkResponse
+	43,  // 104: objectfs.v1alpha1.ObjectFSController.Readlink:output_type -> objectfs.v1alpha1.ReadlinkResponse
+	45,  // 105: objectfs.v1alpha1.ObjectFSController.Link:output_type -> objectfs.v1alpha1.LinkResponse
+	47,  // 106: objectfs.v1alpha1.ObjectFSController.Open:output_type -> objectfs.v1alpha1.OpenResponse
+	49,  // 107: objectfs.v1alpha1.ObjectFSController.Release:output_type -> objectfs.v1alpha1.ReleaseResponse
+	51,  // 108: objectfs.v1alpha1.ObjectFSController.GetXAttr:output_type -> objectfs.v1alpha1.GetXAttrResponse
+	53,  // 109: objectfs.v1alpha1.ObjectFSController.SetXAttr:output_type -> objectfs.v1alpha1.SetXAttrResponse
+	55,  // 110: objectfs.v1alpha1.ObjectFSController.ListXAttr:output_type -> objectfs.v1alpha1.ListXAttrResponse
+	57,  // 111: objectfs.v1alpha1.ObjectFSController.RemoveXAttr:output_type -> objectfs.v1alpha1.RemoveXAttrResponse
+	59,  // 112: objectfs.v1alpha1.ObjectFSController.ListBlobs:output_type -> objectfs.v1alpha1.ListBlobsResponse
+	61,  // 113: objectfs.v1alpha1.ObjectFSController.GetBlob:output_type -> objectfs.v1alpha1.GetBlobResponse
+	63,  // 114: objectfs.v1alpha1.ObjectFSController.GetManifest:output_type -> objectfs.v1alpha1.GetManifestResponse
+	67,  // 115: objectfs.v1alpha1.ObjectFSController.ListVolumes:output_type -> objectfs.v1alpha1.ListVolumesResponse
+	72,  // 116: objectfs.v1alpha1.ObjectFSController.ListSnapshots:output_type -> objectfs.v1alpha1.ListSnapshotsResponse
+	74,  // 117: objectfs.v1alpha1.ObjectFSController.CreateSnapshot:output_type -> objectfs.v1alpha1.CreateSnapshotResponse
+	76,  // 118: objectfs.v1alpha1.ObjectFSController.RestoreSnapshot:output_type -> objectfs.v1alpha1.RestoreSnapshotResponse
+	78,  // 119: objectfs.v1alpha1.ObjectFSController.DeleteSnapshot:output_type -> objectfs.v1alpha1.DeleteSnapshotResponse
+	81,  // 120: objectfs.v1alpha1.ObjectFSController.GetVolumeStats:output_type -> objectfs.v1alpha1.GetVolumeStatsResponse
+	83,  // 121: objectfs.v1alpha1.ObjectFSController.Checkpoint:output_type -> objectfs.v1alpha1.CheckpointResponse
+	85,  // 122: objectfs.v1alpha1.ObjectFSController.AckCheckpoint:output_type -> objectfs.v1alpha1.AckCheckpointResponse
+	88,  // 123: objectfs.v1alpha1.ObjectFSController.AcquireExclusive:output_type -> objectfs.v1alpha1.AcquireExclusiveResponse
+	90,  // 124: objectfs.v1alpha1.ObjectFSController.RenewExclusive:output_type -> objectfs.v1alpha1.RenewExclusiveResponse
+	92,  // 125: objectfs.v1alpha1.ObjectFSController.ReleaseExclusive:output_type -> objectfs.v1alpha1.ReleaseExclusiveResponse
+	94,  // 126: objectfs.v1alpha1.ObjectFSController.GetExclusiveHold:output_type -> objectfs.v1alpha1.GetExclusiveHoldResponse
+	101, // 127: objectfs.v1alpha1.ObjectFSController.RepairVolume:output_type -> objectfs.v1alpha1.RepairVolumeResponse
+	69,  // 128: objectfs.v1alpha1.ObjectFSController.DeleteVolume:output_type -> objectfs.v1alpha1.DeleteVolumeResponse
+	88,  // [88:129] is the sub-list for method output_type
+	47,  // [47:88] is the sub-list for method input_type
+	47,  // [47:47] is the sub-list for extension type_name
+	47,  // [47:47] is the sub-list for extension extendee
+	0,   // [0:47] is the sub-list for field type_name
 }
 
 func init() { file_proto_objectfs_proto_init() }
@@ -7063,7 +7136,7 @@ func file_proto_objectfs_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_objectfs_proto_rawDesc), len(file_proto_objectfs_proto_rawDesc)),
-			NumEnums:      8,
+			NumEnums:      9,
 			NumMessages:   93,
 			NumExtensions: 0,
 			NumServices:   1,
