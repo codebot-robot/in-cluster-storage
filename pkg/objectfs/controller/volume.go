@@ -883,9 +883,28 @@ func (v *Volume) completeWaitersAndRearmLocked(snapshotSeq uint64, err error, po
 	v.syncCond.Broadcast()
 }
 
+// triggerSyncIfStaged initiates a coalesce sync in the background if the volume holds staged chunks and no sync is in flight.
+// Requires no locks held; acquires stagingMu.
+func (v *Volume) triggerSyncIfStaged() {
+	v.stagingMu.Lock()
+	if len(v.stagedChunks) == 0 || v.currentSync != nil || v.rejectMutationLocked() != nil {
+		v.stagingMu.Unlock()
+		return
+	}
+	v.coalesce.stopTimer()
+	if v.closeTimer != nil {
+		v.closeTimer.Stop()
+		v.closeTimer = nil
+	}
+	v.closeInodes = nil
+	v.stagingMu.Unlock()
+
+	go v.triggerCoalesceSync()
+}
+
 func (v *Volume) triggerCoalesceSync() {
 	v.stagingMu.Lock()
-	v.coalesce.timer = nil
+	v.coalesce.stopTimer()
 	if v.rejectMutationLocked() != nil || v.currentSync != nil {
 		v.stagingMu.Unlock()
 		return
@@ -4586,14 +4605,14 @@ func (v *Volume) appendChunkLocked(ctx context.Context, data []byte) (stagedChun
 func (v *Volume) addStagedBytesLocked(delta int64) {
 	v.stagedBytes += delta
 	if v.server != nil {
-		v.server.addLocalStagingBytes(delta)
+		v.server.diskLimits.add(delta)
 	}
 }
 
 func (v *Volume) subtractStagedBytesLocked(delta int64) {
 	v.stagedBytes -= delta
 	if v.server != nil {
-		v.server.subtractLocalStagingBytes(delta)
+		v.server.diskLimits.subtract(delta)
 	}
 }
 
@@ -4697,6 +4716,17 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 
 	startChunk := int(offset / chunkSize)
 	endChunk := int((offset + dataLength - 1) / chunkSize)
+
+	if err := v.rejectMutation(); err != nil {
+		return 0, 0, time.Time{}, 0, err
+	}
+	if v.server != nil && dataLength > 0 {
+		numChunks := int64(endChunk - startChunk + 1)
+		stagingBytesNeeded := numChunks * chunkSize
+		if err := v.server.diskLimits.wait(ctx, v.volumeID, stagingBytesNeeded, v.server.triggerStagedVolumesSync); err != nil {
+			return 0, 0, time.Time{}, 0, err
+		}
+	}
 
 	// Identify which chunks require base chunk reads (partial chunk writes not yet staged).
 	// To avoid holding stagingMu across backend GetBlob, check staged chunks under stagingMu,
