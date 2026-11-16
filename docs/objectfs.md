@@ -493,6 +493,13 @@ When `--wal-durability=witness` is used, metadata transactions are acknowledged 
 - The default deployment manifest (`k8s/wal.yaml`) configures a `PersistentVolumeClaim` via `volumeClaimTemplates` for `data-dir` (using the cluster's default `StorageClass`), ensuring the volume re-attaches across pod restarts and rescheduling.
 - If using `hostPath` storage for local development instead of PVCs, `wal-buffer` **must be node-pinned** (via `nodeSelector: kubernetes.io/hostname: <node>`). Otherwise, rescheduling the pod to a different node mounts an empty directory, regressing the local witness watermark to the last object-store flush and violating witness durability.
 
+8. **Metadata Durability Modes (`parameters: metadata-durability`):**
+
+The metadata durability mode can be configured per StorageClass via `parameters: metadata-durability`:
+
+- **`operation` (default):** Waits for WAL durability per operation before returning. When no parameter is specified, nothing is stored on the volume and the controller default applies (`--metadata-durability`, default `operation`).
+- **`barrier`:** Barrier mode returns before the change is durable; durability is collected by fsync and at shutdown.
+
 ### 5. Configurable Write-Through Modes
 ObjectFS supports three distinct write synchronization modes:
 1. `FSYNC`: Default mode. Writes are staged on the controller and committed to durable pack storage upon `fsync(2)` or background coalesce window sync.
