@@ -128,8 +128,8 @@ func TestNewTestServer_CleanupClosesWALClientStreams(t *testing.T) {
 func (v *Volume) evictAllUploadedPacksForTest() {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
-	originalMaxStagingBytes := v.maxStagingBytes
-	v.maxStagingBytes = 0
+	originalMaxStagingBytes := v.settings.maxStagingBytes
+	v.settings.maxStagingBytes = 0
 	v.evictUploadedPacksLocked(0)
-	v.maxStagingBytes = originalMaxStagingBytes
+	v.settings.maxStagingBytes = originalMaxStagingBytes
 }

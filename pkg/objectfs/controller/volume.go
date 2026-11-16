@@ -216,8 +216,46 @@ func (c *syncCoalesceState) failWaiters(err error) {
 	c.waiters = nil
 }
 
+// volumeSettings groups per-volume configuration options and policies.
+type volumeSettings struct {
+	// consistencyMode controls the consistency model (e.g. STANDARD or CLOSE_TO_OPEN) for this volume.
+	// Written by WithConsistencyMode, SetConsistencyMode, PersistConsistencyMode, loadFromBackendMetadataLocked,
+	// and loadVolumeInfoLocked. Guarded by Volume.mu.
+	consistencyMode pb.ConsistencyMode
+
+	// metadataDurability controls whether metadata operations wait for durability per operation or at barriers.
+	// Effective runtime value used for operations. Defaults to OPERATION. Written by WithMetadataDurability,
+	// PersistMetadataDurability, loadFromBackendMetadataLocked, and loadVolumeInfoLocked. Guarded by Volume.mu.
+	metadataDurability pb.MetadataDurability
+
+	// storedMetadataDurability tracks the durability mode explicitly persisted in the volume's info row,
+	// or METADATA_DURABILITY_UNSPECIFIED if no mode was stored at creation. Persisted to SDS VolumeInfo
+	// in PersistMetadataDurability, and set by loadFromBackendMetadataLocked and loadVolumeInfoLocked.
+	// Guarded by Volume.mu.
+	storedMetadataDurability pb.MetadataDurability
+
+	// syncTimeout sets the timeout duration for coalesced background sync operations.
+	// Defaults to 10 minutes. Immutable after construction.
+	syncTimeout time.Duration
+
+	// openBarrierTimeout sets the timeout duration for the open-side barrier on close-to-open volumes.
+	// Defaults to 30 seconds. Immutable after construction.
+	openBarrierTimeout time.Duration
+
+	// maxStagingBytes sets the maximum byte bound for in-memory staged writes on this volume.
+	// Defaults to 64 MiB. Immutable after construction.
+	maxStagingBytes int64
+
+	// durability sets the default sync durability level requested for volume WAL streams.
+	// Defaults to Local. Immutable after construction.
+	durability walclient.Level
+}
+
 type Volume struct {
 	server *Server
+
+	// settings groups per-volume configuration options and policies.
+	settings volumeSettings
 
 	// Lock order: stagingMu may be held while taking mu for reading; mu must never be held while taking stagingMu.
 	mu           sync.RWMutex
@@ -242,15 +280,14 @@ type Volume struct {
 	cancelUpload    context.CancelFunc
 
 	// Lock order: stagingMu may be held while taking mu for reading; mu must never be held while taking stagingMu.
-	stagingMu       sync.Mutex
-	stagingEpoch    int64
-	stagingSeq      uint64
-	stagedChunks    map[uint64]map[int]stagedChunkReference
-	stagedSizes     map[uint64]int64
-	stagedMtimes    map[uint64]time.Time
-	stagedBytes     int64
-	maxStagingBytes int64
-	lastSyncError   map[uint64]error
+	stagingMu     sync.Mutex
+	stagingEpoch  int64
+	stagingSeq    uint64
+	stagedChunks  map[uint64]map[int]stagedChunkReference
+	stagedSizes   map[uint64]int64
+	stagedMtimes  map[uint64]time.Time
+	stagedBytes   int64
+	lastSyncError map[uint64]error
 
 	coalesce    syncCoalesceState
 	closeTimer  *time.Timer
@@ -263,21 +300,13 @@ type Volume struct {
 	// Empty syncs (which find no staged chunks) never install themselves and may run alongside
 	// a real sync harmlessly; they only wait for durability and answer waiters. This is why
 	// there is one pointer and not a list of operations.
-	currentSync        *syncOperation
-	syncTimeout        time.Duration
-	openBarrierTimeout time.Duration
-	consistencyMode    pb.ConsistencyMode
-	metadataDurability pb.MetadataDurability
-	syncCond           *sync.Cond
-	stagingClosed      bool
-	stopping           bool
-	// storedMetadataDurability tracks the durability mode stored in VolumeInfo, if any.
-	// Protected by mu.
-	storedMetadataDurability pb.MetadataDurability
+	currentSync   *syncOperation
+	syncCond      *sync.Cond
+	stagingClosed bool
+	stopping      bool
 
-	stream     walclient.Stream
-	durability walclient.Level
-	streamID   uuid.UUID
+	stream   walclient.Stream
+	streamID uuid.UUID
 
 	metadataStream         *sds.Writer
 	lastCommitSeq          uint64
@@ -338,7 +367,7 @@ func WithSyncCoalesceWindow(d time.Duration) VolumeOption {
 func WithMaxStagingBytes(b int64) VolumeOption {
 	return func(v *Volume) {
 		if b > 0 {
-			v.maxStagingBytes = b
+			v.settings.maxStagingBytes = b
 		}
 	}
 }
@@ -356,7 +385,7 @@ func WithBlobStore(store *blob.Store) VolumeOption {
 func WithSyncTimeout(d time.Duration) VolumeOption {
 	return func(v *Volume) {
 		if d > 0 {
-			v.syncTimeout = d
+			v.settings.syncTimeout = d
 		}
 	}
 }
@@ -365,7 +394,7 @@ func WithSyncTimeout(d time.Duration) VolumeOption {
 func WithOpenBarrierTimeout(d time.Duration) VolumeOption {
 	return func(v *Volume) {
 		if d > 0 {
-			v.openBarrierTimeout = d
+			v.settings.openBarrierTimeout = d
 		}
 	}
 }
@@ -373,7 +402,7 @@ func WithOpenBarrierTimeout(d time.Duration) VolumeOption {
 // WithConsistencyMode sets the consistency mode for the volume.
 func WithConsistencyMode(mode pb.ConsistencyMode) VolumeOption {
 	return func(v *Volume) {
-		v.consistencyMode = mode
+		v.settings.consistencyMode = mode
 	}
 }
 
@@ -382,7 +411,7 @@ func WithConsistencyMode(mode pb.ConsistencyMode) VolumeOption {
 func WithMetadataDurability(mode pb.MetadataDurability) VolumeOption {
 	return func(v *Volume) {
 		if mode != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
-			v.metadataDurability = mode
+			v.settings.metadataDurability = mode
 		}
 	}
 }
@@ -425,7 +454,7 @@ func WithStream(stream walclient.Stream) VolumeOption {
 // WithDurability sets the default durability level for metadata changes.
 func WithDurability(level walclient.Level) VolumeOption {
 	return func(v *Volume) {
-		v.durability = level
+		v.settings.durability = level
 	}
 }
 
@@ -628,32 +657,34 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 
 	v := &Volume{
-		volumeID:           volumeID,
-		rootInodeID:        1,
-		nextInode:          erofs.DefaultInodeStride,
-		backend:            backend,
-		blobStore:          blobStore,
-		broadcaster:        broadcaster,
-		maxInlineLen:       4096,      // 4KB default inline threshold for tiny files
-		chunkSize:          64 * 1024, // 64KB default chunk size
-		durability:         walclient.Local,
-		metadataDurability: pb.MetadataDurability_OPERATION,
-		indexFactory:       f,
-		streamID:           StreamIDForVolume(volumeID),
-		closedCh:           make(chan struct{}),
-		handles:            make(map[uint64]uint64),
-		openInodes:         make(map[uint64]int),
-		stagingEpoch:       time.Now().UnixNano(),
-		stagedChunks:       make(map[uint64]map[int]stagedChunkReference),
-		stagedSizes:        make(map[uint64]int64),
-		stagedMtimes:       make(map[uint64]time.Time),
-		lastSyncError:      make(map[uint64]error),
-		maxStagingBytes:    64 * 1024 * 1024,
-		packs:              make(map[uint64]*packInfo),
-		uploadSemaphore:    make(chan struct{}, 2),
-		coalesce:           syncCoalesceState{window: 1 * time.Second},
-		syncTimeout:        10 * time.Minute,
-		openBarrierTimeout: 30 * time.Second,
+		settings: volumeSettings{
+			durability:         walclient.Local,
+			metadataDurability: pb.MetadataDurability_OPERATION,
+			maxStagingBytes:    64 * 1024 * 1024,
+			syncTimeout:        10 * time.Minute,
+			openBarrierTimeout: 30 * time.Second,
+		},
+		volumeID:        volumeID,
+		rootInodeID:     1,
+		nextInode:       erofs.DefaultInodeStride,
+		backend:         backend,
+		blobStore:       blobStore,
+		broadcaster:     broadcaster,
+		maxInlineLen:    4096,      // 4KB default inline threshold for tiny files
+		chunkSize:       64 * 1024, // 64KB default chunk size
+		indexFactory:    f,
+		streamID:        StreamIDForVolume(volumeID),
+		closedCh:        make(chan struct{}),
+		handles:         make(map[uint64]uint64),
+		openInodes:      make(map[uint64]int),
+		stagingEpoch:    time.Now().UnixNano(),
+		stagedChunks:    make(map[uint64]map[int]stagedChunkReference),
+		stagedSizes:     make(map[uint64]int64),
+		stagedMtimes:    make(map[uint64]time.Time),
+		lastSyncError:   make(map[uint64]error),
+		packs:           make(map[uint64]*packInfo),
+		uploadSemaphore: make(chan struct{}, 2),
+		coalesce:        syncCoalesceState{window: 1 * time.Second},
 	}
 	uploadContext, cancelUpload := context.WithCancel(context.Background())
 	v.uploadContext = uploadContext
@@ -720,7 +751,7 @@ func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 			eligible = append(eligible, packID)
 		}
 	}
-	if total+neededBytes <= v.maxStagingBytes || len(eligible) == 0 {
+	if total+neededBytes <= v.settings.maxStagingBytes || len(eligible) == 0 {
 		return
 	}
 	sort.Slice(eligible, func(i, j int) bool { return eligible[i] < eligible[j] })
@@ -732,7 +763,7 @@ func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 		}
 		v.deletePackLocked(packID)
 		total -= packSize
-		if total+neededBytes <= v.maxStagingBytes {
+		if total+neededBytes <= v.settings.maxStagingBytes {
 			break
 		}
 	}
@@ -939,7 +970,7 @@ func (v *Volume) triggerCoalesceSync() {
 	}
 	v.closeInodes = nil
 
-	timeout := v.syncTimeout
+	timeout := v.settings.syncTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
@@ -999,7 +1030,7 @@ func (v *Volume) triggerCloseSync() {
 	targetInodes := v.closeInodes
 	v.closeInodes = make(map[uint64]struct{})
 
-	timeout := v.syncTimeout
+	timeout := v.settings.syncTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
@@ -1592,7 +1623,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 		return 0, v.finishRealSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 	}
 
-	reqLevel := v.durability
+	reqLevel := v.settings.durability
 	waitFn := v.makeWaitFn(commitSeq, &reqLevel)
 	v.mu.Unlock()
 
@@ -1866,7 +1897,7 @@ func (v *Volume) StreamID() uuid.UUID {
 func (v *Volume) Durability() walclient.Level {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.durability
+	return v.settings.durability
 }
 
 // Degraded returns the DegradedError if the underlying WAL stream is degraded, or nil if healthy.
@@ -1892,14 +1923,14 @@ func (v *Volume) ResetStream(stream walclient.Stream) error {
 func (v *Volume) ConsistencyMode() pb.ConsistencyMode {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.consistencyMode
+	return v.settings.consistencyMode
 }
 
 // SetConsistencyMode updates the consistency mode for this volume.
 func (v *Volume) SetConsistencyMode(mode pb.ConsistencyMode) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.consistencyMode = mode
+	v.settings.consistencyMode = mode
 }
 
 // MetadataDurability returns the configured metadata durability mode for this volume.
@@ -1907,7 +1938,7 @@ func (v *Volume) SetConsistencyMode(mode pb.ConsistencyMode) {
 func (v *Volume) MetadataDurability() pb.MetadataDurability {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.metadataDurability
+	return v.settings.metadataDurability
 }
 
 // StoredMetadataDurability returns the metadata durability mode stored in the volume's info row,
@@ -1916,14 +1947,14 @@ func (v *Volume) MetadataDurability() pb.MetadataDurability {
 func (v *Volume) StoredMetadataDurability() pb.MetadataDurability {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.storedMetadataDurability
+	return v.settings.storedMetadataDurability
 }
 
 // PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store,
 // waiting until the persisted VolumeInfo record reaches the volume's durability level.
 func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
 	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
-		v.consistencyMode = mode
+		v.settings.consistencyMode = mode
 		volumeInfo.ConsistencyMode = mode
 	})
 	if err != nil {
@@ -1942,8 +1973,8 @@ func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.Consistency
 // waiting until the persisted VolumeInfo record reaches the volume's durability level.
 func (v *Volume) PersistMetadataDurability(ctx context.Context, mode pb.MetadataDurability) error {
 	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
-		v.metadataDurability = mode
-		v.storedMetadataDurability = mode
+		v.settings.metadataDurability = mode
+		v.settings.storedMetadataDurability = mode
 		volumeInfo.MetadataDurability = mode
 	})
 	if err != nil {
@@ -2271,7 +2302,7 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 	if commitSeq == 0 {
 		return nil
 	}
-	durability := v.durability
+	durability := v.settings.durability
 	if reqLevel != nil {
 		durability = *reqLevel
 	}
@@ -2298,7 +2329,7 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 // callers must quiesce mutations before initiating graceful shutdown.
 // Requires v.mu held.
 func (v *Volume) makeMetadataWaitFn(commitSeq uint64) func(context.Context) error {
-	if v.metadataDurability == pb.MetadataDurability_BARRIER {
+	if v.settings.metadataDurability == pb.MetadataDurability_BARRIER {
 		return nil
 	}
 	return v.makeWaitFn(commitSeq, nil)
@@ -4766,7 +4797,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		v.stagingMu.Unlock()
 		return 0, 0, time.Time{}, 0, err
 	}
-	if v.stagedBytes+dataLength > v.maxStagingBytes {
+	if v.stagedBytes+dataLength > v.settings.maxStagingBytes {
 		v.stagingMu.Unlock()
 		return 0, 0, time.Time{}, 0, syscall.ENOSPC
 	}
@@ -4821,7 +4852,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	if err := v.rejectMutationLocked(); err != nil {
 		return 0, 0, time.Time{}, 0, err
 	}
-	if v.stagedBytes+dataLength > v.maxStagingBytes {
+	if v.stagedBytes+dataLength > v.settings.maxStagingBytes {
 		return 0, 0, time.Time{}, 0, syscall.ENOSPC
 	}
 
@@ -5969,7 +6000,7 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 		return syscall.EIO
 	}
 
-	timeout := v.openBarrierTimeout
+	timeout := v.settings.openBarrierTimeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -6059,7 +6090,7 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 func (v *Volume) Open(ctx context.Context, inodeID uint64, flags uint32) (uint64, *pb.EntryAttr, uint64, error) {
 	v.mu.RLock()
 	inodeID = v.normalizeInodeID(inodeID)
-	isCloseToOpen := v.consistencyMode == pb.ConsistencyMode_CLOSE_TO_OPEN
+	isCloseToOpen := v.settings.consistencyMode == pb.ConsistencyMode_CLOSE_TO_OPEN
 	v.mu.RUnlock()
 
 	if isCloseToOpen {
@@ -6160,7 +6191,7 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		flushCtx := ctx
 		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 			var cancel context.CancelFunc
-			flushTimeout := v.syncTimeout
+			flushTimeout := v.settings.syncTimeout
 			if flushTimeout <= 0 {
 				flushTimeout = 10 * time.Minute
 			}
@@ -6894,11 +6925,11 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			if ch.TypeName == VolumeInfoTypeName {
 				if volumeInfo, ok := ch.Row.(*pb.VolumeInfo); ok && volumeInfo != nil {
 					if volumeInfo.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-						v.consistencyMode = volumeInfo.GetConsistencyMode()
+						v.settings.consistencyMode = volumeInfo.GetConsistencyMode()
 					}
 					if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
-						v.metadataDurability = volumeInfo.GetMetadataDurability()
-						v.storedMetadataDurability = volumeInfo.GetMetadataDurability()
+						v.settings.metadataDurability = volumeInfo.GetMetadataDurability()
+						v.settings.storedMetadataDurability = volumeInfo.GetMetadataDurability()
 					}
 				}
 			}
@@ -7111,11 +7142,11 @@ func (v *Volume) loadVolumeInfoLocked(ctx context.Context) error {
 	if ok && storedMessage != nil {
 		if volumeInfo, ok := storedMessage.(*pb.VolumeInfo); ok && volumeInfo != nil {
 			if volumeInfo.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-				v.consistencyMode = volumeInfo.GetConsistencyMode()
+				v.settings.consistencyMode = volumeInfo.GetConsistencyMode()
 			}
 			if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
-				v.metadataDurability = volumeInfo.GetMetadataDurability()
-				v.storedMetadataDurability = volumeInfo.GetMetadataDurability()
+				v.settings.metadataDurability = volumeInfo.GetMetadataDurability()
+				v.settings.storedMetadataDurability = volumeInfo.GetMetadataDurability()
 			}
 		}
 	}
