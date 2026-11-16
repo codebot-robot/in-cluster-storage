@@ -7775,3 +7775,148 @@ func TestMetadataStreamRegisteredTypeIDs(t *testing.T) {
 		}
 	}
 }
+
+type trackingStream struct {
+	walclient.Stream
+	onClose func()
+}
+
+func (s *trackingStream) Close() error {
+	if s.onClose != nil {
+		s.onClose()
+	}
+	return s.Stream.Close()
+}
+
+func TestVolume_DeletionMarker_Lifecycle(t *testing.T) {
+	ctx := t.Context()
+	backend, volumeID := NewMemoryBackend(), "vol-del-lifecycle"
+	bufferTest, _ := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
+	walDirectory := t.TempDir()
+	newServer := func(options ...ServerOption) *Server {
+		baseOptions := []ServerOption{
+			WithServerWAL(walDirectory, bufferTest.Target, walclient.Witness),
+			WithServerWALClient(bufferTest.Client),
+			WithServerWALDialOptions(bufferTest.DialOpts...),
+			WithServerLocalStorageDir(t.TempDir()),
+			WithServerWithoutFsync(),
+		}
+		return NewServer(backend, append(baseOptions, options...)...)
+	}
+
+	// 1. Write file
+	server1 := newServer()
+	if _, err := testCreateFile(ctx, server1, volumeID, "/old.txt", 0644, []byte("content"), 0, 0); err != nil {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+
+	// 2. Delete: repeated deletes are idempotent; operations on deleted volume return NotFound
+	volume, err := server1.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
+	if err := volume.RecordDeletion(ctx); err != nil {
+		t.Fatalf("first RecordDeletion failed: %v", err)
+	}
+	if err := volume.RecordDeletion(ctx); err != nil {
+		t.Fatalf("repeated RecordDeletion failed: %v", err)
+	}
+	if _, err := server1.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1}); status.Code(err) != codes.NotFound || !strings.Contains(err.Error(), "has been deleted") {
+		t.Fatalf("expected NotFound with 'has been deleted' on ReadDir after delete, got: %v", err)
+	}
+	if _, err := server1.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Inode: 1}); status.Code(err) != codes.NotFound || !strings.Contains(err.Error(), "has been deleted") {
+		t.Fatalf("expected NotFound with 'has been deleted' on GetAttr after delete, got: %v", err)
+	}
+	if err := server1.Close(); err != nil {
+		t.Fatalf("server1.Close failed: %v", err)
+	}
+	if err := volume.RecordDeletion(ctx); err == nil {
+		t.Fatal("expected error from RecordDeletion on closed volume, got nil")
+	}
+
+	// 3. Restart keeps it deleted; multiple calls return NotFound and leak no attached streams
+	var attachedCount atomic.Int32
+	server2 := newServer(WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
+		stream, err := walclient.Open(ctx, walDirectory, StreamIDForVolume(volumeID), bufferTest.Target, walclient.WithGRPCClient(bufferTest.Client), walclient.WithDialOptions(bufferTest.DialOpts...), walclient.WithoutFsync())
+		if err != nil {
+			return nil, err
+		}
+		attachedCount.Add(1)
+		return &trackingStream{Stream: stream, onClose: func() { attachedCount.Add(-1) }}, nil
+	}))
+	t.Cleanup(func() {
+		if err := server2.Close(); err != nil {
+			t.Errorf("server2.Close failed: %v", err)
+		}
+	})
+	for i := 0; i < 3; i++ {
+		if _, err := server2.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1}); status.Code(err) != codes.NotFound || !strings.Contains(err.Error(), "has been deleted") {
+			t.Fatalf("expected NotFound with 'has been deleted' on restart (attempt %d), got: %v", i+1, err)
+		}
+	}
+	if attachedCount.Load() != 0 {
+		t.Fatalf("expected 0 attached streams after NotFound, got %d", attachedCount.Load())
+	}
+}
+
+func TestVolume_DeletionMarker_LoadedRejectsOperations(t *testing.T) {
+	ctx := t.Context()
+	backend, volumeID := NewMemoryBackend(), "vol-loaded-rejects"
+	bufferTest, _ := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
+	server := NewServer(backend,
+		WithServerWAL(t.TempDir(), bufferTest.Target, walclient.Witness),
+		WithServerWALClient(bufferTest.Client),
+		WithServerWALDialOptions(bufferTest.DialOpts...),
+		WithServerLocalStorageDir(t.TempDir()),
+		WithServerWithoutFsync(),
+	)
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close failed: %v", err)
+		}
+	})
+
+	createResponse, err := testCreateFile(ctx, server, volumeID, "/test.txt", 0644, []byte("hello"), 0, 0)
+	if err != nil {
+		t.Fatalf("testCreateFile failed: %v", err)
+	}
+
+	volume, err := server.GetVolume(volumeID)
+	if err != nil {
+		t.Fatalf("GetVolume failed: %v", err)
+	}
+
+	// RecordDeletion on volume without metadataStream returns not loaded error
+	unloadedVol := &Volume{volumeID: "unloaded-test", stream: volume.stream}
+	if err := unloadedVol.RecordDeletion(ctx); err == nil || !strings.Contains(err.Error(), "is not loaded") {
+		t.Fatalf("expected 'is not loaded' error, got: %v", err)
+	}
+
+	// Failing commit (canceled context) leaves volume alive in memory and operations succeed
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := volume.RecordDeletion(canceledCtx); err == nil {
+		t.Fatal("expected RecordDeletion to fail with canceled context, got nil")
+	}
+	if volume.IsDeleted() {
+		t.Fatal("volume marked deleted in memory after failed RecordDeletion")
+	}
+	if _, err := server.ReadDir(ctx, &pb.ReadDirRequest{VolumeId: volumeID, Inode: 1}); err != nil {
+		t.Fatalf("ReadDir failed after canceled deletion: %v", err)
+	}
+
+	if err := volume.RecordDeletion(ctx); err != nil {
+		t.Fatalf("RecordDeletion on loaded volume failed: %v", err)
+	}
+
+	ino := createResponse.GetAttr().GetInode().GetIno()
+	if _, err := server.WriteFile(ctx, &pb.WriteFileRequest{VolumeId: volumeID, Inode: ino, Data: []byte("fail")}); status.Code(err) != codes.NotFound || !strings.Contains(err.Error(), "has been deleted") {
+		t.Fatalf("expected NotFound with 'has been deleted' on WriteFile, got: %v", err)
+	}
+	if _, err := server.Open(ctx, &pb.OpenRequest{VolumeId: volumeID, Inode: ino}); status.Code(err) != codes.NotFound || !strings.Contains(err.Error(), "has been deleted") {
+		t.Fatalf("expected NotFound with 'has been deleted' on Open, got: %v", err)
+	}
+	if _, err := server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: volumeID}); status.Code(err) != codes.NotFound || !strings.Contains(err.Error(), "has been deleted") {
+		t.Fatalf("expected NotFound with 'has been deleted' on GetVolumeStats, got: %v", err)
+	}
+}

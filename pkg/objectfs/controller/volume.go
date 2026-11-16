@@ -354,6 +354,9 @@ type Volume struct {
 
 	closed   bool
 	closedCh chan struct{}
+	// deleted tracks whether this volume has been marked deleted (tombstoned).
+	// Guarded by mu.
+	deleted bool
 
 	snapshotMu       sync.Mutex
 	batchCheckMu     sync.Mutex
@@ -2379,6 +2382,55 @@ func (v *Volume) Close() error {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// RecordDeletion appends a VolumeInfo record with deleted=true to the volume's metadata stream
+// using a read-modify-write pattern, commits it, waits for durability, and flushes the stream.
+// It sets v.deleted under v.mu only after the transaction commit succeeds, ensuring that a failed
+// write does not mark the volume deleted in memory. Durability waits and stream flushing run
+// outside v.mu. If the volume is closed or not loaded, an error is returned.
+func (v *Volume) RecordDeletion(ctx context.Context) error {
+	v.mu.RLock()
+	closed := v.closed
+	stream := v.stream
+	metadataStream := v.metadataStream
+	v.mu.RUnlock()
+
+	if closed {
+		return fmt.Errorf("volume %s is closed", v.volumeID)
+	}
+	if stream == nil {
+		return errors.New("volume stream is required for deletion")
+	}
+	if metadataStream == nil {
+		return fmt.Errorf("volume %s is not loaded", v.volumeID)
+	}
+
+	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
+		volumeInfo.Deleted = true
+	})
+	if err != nil {
+		return fmt.Errorf("failed to commit deletion marker: %w", err)
+	}
+	v.mu.Lock()
+	v.deleted = true
+	v.mu.Unlock()
+
+	if err := v.waitForSequence(ctx, commitSequence); err != nil {
+		return fmt.Errorf("failed to wait for deletion marker: %w", err)
+	}
+	if err := stream.Flush(ctx); err != nil {
+		return fmt.Errorf("failed to flush stream after deletion marker: %w", err)
+	}
+	return nil
+}
+
+// IsDeleted reports whether the volume has been marked deleted.
+// Takes v.mu for reading.
+func (v *Volume) IsDeleted() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.deleted
 }
 
 // makeWaitFn returns a durability wait function for commitSeq using the specified WAL durability.
@@ -7202,7 +7254,7 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 	return v.loadFromBackendMetadataLocked(ctx)
 }
 
-// loadVolumeInfoLocked refreshes the volume's consistency mode, metadata durability, and WAL durability from its stored VolumeInfo row.
+// loadVolumeInfoLocked refreshes the volume's deleted state, consistency mode, metadata durability, and WAL durability from its stored VolumeInfo row.
 // Requires v.mu held.
 func (v *Volume) loadVolumeInfoLocked(ctx context.Context) error {
 	if v.metadataView == nil {
@@ -7218,6 +7270,7 @@ func (v *Volume) loadVolumeInfoLocked(ctx context.Context) error {
 	}
 	if ok && storedMessage != nil {
 		if volumeInfo, ok := storedMessage.(*pb.VolumeInfo); ok && volumeInfo != nil {
+			v.deleted = volumeInfo.GetDeleted()
 			if volumeInfo.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
 				v.configured.consistencyMode = volumeInfo.GetConsistencyMode()
 			}
