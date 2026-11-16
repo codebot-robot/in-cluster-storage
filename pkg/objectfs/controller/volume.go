@@ -269,6 +269,9 @@ type Volume struct {
 	syncCond           *sync.Cond
 	stagingClosed      bool
 	stopping           bool
+	// storedMetadataDurability tracks the durability mode stored in VolumeInfo, if any.
+	// Protected by mu.
+	storedMetadataDurability pb.MetadataDurability
 
 	stream     walclient.Stream
 	durability walclient.Level
@@ -1890,6 +1893,15 @@ func (v *Volume) MetadataDurability() pb.MetadataDurability {
 	return v.metadataDurability
 }
 
+// StoredMetadataDurability returns the metadata durability mode stored in the volume's info row,
+// or METADATA_DURABILITY_UNSPECIFIED if no mode has been stored.
+// Takes v.mu for reading.
+func (v *Volume) StoredMetadataDurability() pb.MetadataDurability {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.storedMetadataDurability
+}
+
 // PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store,
 // waiting until the persisted VolumeInfo record reaches the volume's durability level.
 func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
@@ -1914,6 +1926,7 @@ func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.Consistency
 func (v *Volume) PersistMetadataDurability(ctx context.Context, mode pb.MetadataDurability) error {
 	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
 		v.metadataDurability = mode
+		v.storedMetadataDurability = mode
 		volumeInfo.MetadataDurability = mode
 	})
 	if err != nil {
@@ -6868,6 +6881,7 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 					}
 					if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
 						v.metadataDurability = volumeInfo.GetMetadataDurability()
+						v.storedMetadataDurability = volumeInfo.GetMetadataDurability()
 					}
 				}
 			}
@@ -7084,6 +7098,7 @@ func (v *Volume) loadVolumeInfoLocked(ctx context.Context) error {
 			}
 			if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
 				v.metadataDurability = volumeInfo.GetMetadataDurability()
+				v.storedMetadataDurability = volumeInfo.GetMetadataDurability()
 			}
 		}
 	}
