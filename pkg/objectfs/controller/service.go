@@ -1570,6 +1570,7 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 		if volume, ok := s.volumes[id]; ok {
 			info.ConsistencyMode = volume.ConsistencyMode()
 			info.MetadataDurability = volume.MetadataDurability()
+			info.WalDurability = volume.WalDurability()
 			if deg := volume.Degraded(); deg != nil {
 				info.Degraded = &pb.Degraded{
 					Code:    pb.Degraded_WAL_STREAM_DEGRADED,

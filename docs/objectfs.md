@@ -501,6 +501,14 @@ The metadata durability mode can be configured per StorageClass via `parameters:
 - **`operation` (default):** Waits for WAL durability per operation before returning. When no parameter is specified, nothing is stored on the volume and the controller default applies (`--metadata-durability`, default `operation`).
 - **`barrier`:** Barrier mode returns before the change is durable; durability is collected by fsync and at shutdown.
 
+9. **WAL Durability Levels (`parameters: wal-durability`):**
+
+The WAL durability level can be configured per StorageClass via `parameters: wal-durability`:
+
+- **`local` (default):** Fsyncs metadata transactions to node-local WAL segment files on host disk. When no parameter is specified, nothing is stored on the volume and the controller default applies (`--wal-durability`, default `local`).
+- **`witness`:** Fsyncs metadata transactions to the central `wal-buffer` witness disk.
+- **`permanent`:** Commits metadata transactions to permanent cloud object storage.
+
 ### 5. Configurable Write-Through Modes
 ObjectFS supports three distinct write synchronization modes:
 1. `FSYNC`: Default mode. Writes are staged on the controller and committed to durable pack storage upon `fsync(2)` or background coalesce window sync.

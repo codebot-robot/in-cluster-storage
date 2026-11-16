@@ -39,6 +39,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/waldurability"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
@@ -246,8 +247,19 @@ type volumeSettings struct {
 	// Defaults to 64 MiB. Immutable after construction.
 	maxStagingBytes int64
 
+	// walDurability controls the sync durability level for WAL streams on this volume.
+	// Effective runtime value used for operations. Defaults to LOCAL. Written by WithWalDurability,
+	// WithDurability, PersistWalDurability, loadFromBackendMetadataLocked, and loadVolumeInfoLocked. Guarded by Volume.mu.
+	walDurability pb.WalDurability
+
+	// storedWalDurability tracks the durability level explicitly persisted in the volume's info row,
+	// or WAL_DURABILITY_UNSPECIFIED if no level was stored at creation. Persisted to SDS VolumeInfo
+	// in PersistWalDurability, and set by loadFromBackendMetadataLocked and loadVolumeInfoLocked. Guarded by Volume.mu.
+	storedWalDurability pb.WalDurability
+
 	// durability sets the default sync durability level requested for volume WAL streams.
-	// Defaults to Local. Immutable after construction.
+	// Defaults to Local. Written by WithWalDurability, WithDurability, PersistWalDurability,
+	// loadFromBackendMetadataLocked, and loadVolumeInfoLocked. Guarded by Volume.mu.
 	durability walclient.Level
 }
 
@@ -455,6 +467,17 @@ func WithStream(stream walclient.Stream) VolumeOption {
 func WithDurability(level walclient.Level) VolumeOption {
 	return func(v *Volume) {
 		v.settings.durability = level
+		v.settings.walDurability = waldurability.FromLevel(level)
+	}
+}
+
+// WithWalDurability sets the WAL durability level for the volume.
+func WithWalDurability(durability pb.WalDurability) VolumeOption {
+	return func(v *Volume) {
+		if durability != pb.WalDurability_WAL_DURABILITY_UNSPECIFIED {
+			v.settings.walDurability = durability
+			v.settings.durability = waldurability.ToLevel(durability)
+		}
 	}
 }
 
@@ -659,6 +682,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	v := &Volume{
 		settings: volumeSettings{
 			durability:         walclient.Local,
+			walDurability:      pb.WalDurability_LOCAL,
 			metadataDurability: pb.MetadataDurability_OPERATION,
 			maxStagingBytes:    64 * 1024 * 1024,
 			syncTimeout:        10 * time.Minute,
@@ -1985,6 +2009,45 @@ func (v *Volume) PersistMetadataDurability(ctx context.Context, mode pb.Metadata
 	// in memory, so the updated metadata durability is visible although the caller gets an error.
 	if err := v.waitForSequence(ctx, commitSequence); err != nil {
 		return fmt.Errorf("failed to wait for metadata durability mode durability: %w", err)
+	}
+	return nil
+}
+
+// WalDurability returns the configured WAL durability level for this volume.
+// Takes v.mu for reading.
+func (v *Volume) WalDurability() pb.WalDurability {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.settings.walDurability
+}
+
+// StoredWalDurability returns the WAL durability level stored in the volume's info row,
+// or WAL_DURABILITY_UNSPECIFIED if no level has been stored.
+// Takes v.mu for reading.
+func (v *Volume) StoredWalDurability() pb.WalDurability {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.settings.storedWalDurability
+}
+
+// PersistWalDurability updates the volume's WAL durability level and persists it to the metadata store,
+// waiting until the persisted VolumeInfo record reaches the volume's durability level.
+func (v *Volume) PersistWalDurability(ctx context.Context, durability pb.WalDurability) error {
+	level := waldurability.ToLevel(durability)
+	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
+		v.settings.durability = level
+		v.settings.walDurability = durability
+		v.settings.storedWalDurability = durability
+		volumeInfo.WalDurability = durability
+	})
+	if err != nil {
+		return err
+	}
+	// Wait for the VolumeInfo record's sequence to reach the volume's durability level
+	// with no locks held. On wait failure, the record is already sequenced and applied
+	// in memory, so the updated WAL durability is visible although the caller gets an error.
+	if err := v.waitForSequence(ctx, commitSequence); err != nil {
+		return fmt.Errorf("failed to wait for WAL durability level durability: %w", err)
 	}
 	return nil
 }
@@ -6931,6 +6994,11 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 						v.settings.metadataDurability = volumeInfo.GetMetadataDurability()
 						v.settings.storedMetadataDurability = volumeInfo.GetMetadataDurability()
 					}
+					if volumeInfo.GetWalDurability() != pb.WalDurability_WAL_DURABILITY_UNSPECIFIED {
+						v.settings.walDurability = volumeInfo.GetWalDurability()
+						v.settings.storedWalDurability = volumeInfo.GetWalDurability()
+						v.settings.durability = waldurability.ToLevel(volumeInfo.GetWalDurability())
+					}
 				}
 			}
 		}
@@ -7147,6 +7215,11 @@ func (v *Volume) loadVolumeInfoLocked(ctx context.Context) error {
 			if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
 				v.settings.metadataDurability = volumeInfo.GetMetadataDurability()
 				v.settings.storedMetadataDurability = volumeInfo.GetMetadataDurability()
+			}
+			if volumeInfo.GetWalDurability() != pb.WalDurability_WAL_DURABILITY_UNSPECIFIED {
+				v.settings.walDurability = volumeInfo.GetWalDurability()
+				v.settings.storedWalDurability = volumeInfo.GetWalDurability()
+				v.settings.durability = waldurability.ToLevel(volumeInfo.GetWalDurability())
 			}
 		}
 	}

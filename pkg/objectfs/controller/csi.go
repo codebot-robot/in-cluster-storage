@@ -23,6 +23,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/consistency"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/metadatadurability"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/waldurability"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -99,6 +100,11 @@ func (c *CSIController) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	walDurability, err := waldurability.Parse(req.GetParameters()[waldurability.ParameterName])
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	// Initialize the volume in the server
 	volume, err := c.server.getOrCreateVolume(volumeID)
 	if err != nil {
@@ -115,6 +121,13 @@ func (c *CSIController) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 		}
 	}
 
+	storedWALDurability := volume.StoredWalDurability()
+	if walDurability != pb.WalDurability_WAL_DURABILITY_UNSPECIFIED {
+		if storedWALDurability != pb.WalDurability_WAL_DURABILITY_UNSPECIFIED && storedWALDurability != walDurability {
+			return nil, status.Errorf(codes.AlreadyExists, "volume %q already exists with wal durability %v, requested %v", volumeID, storedWALDurability, walDurability)
+		}
+	}
+
 	if consistencyMode != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
 		if err := volume.PersistConsistencyMode(ctx, consistencyMode); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to persist consistency mode: %v", err)
@@ -124,6 +137,12 @@ func (c *CSIController) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 	if metadataDurability != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED && storedMode == pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
 		if err := volume.PersistMetadataDurability(ctx, metadataDurability); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to persist metadata durability: %v", err)
+		}
+	}
+
+	if walDurability != pb.WalDurability_WAL_DURABILITY_UNSPECIFIED && storedWALDurability == pb.WalDurability_WAL_DURABILITY_UNSPECIFIED {
+		if err := volume.PersistWalDurability(ctx, walDurability); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to persist wal durability: %v", err)
 		}
 	}
 

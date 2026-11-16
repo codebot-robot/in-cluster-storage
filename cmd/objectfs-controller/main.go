@@ -36,6 +36,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/metadatadurability"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/waldurability"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -137,7 +138,7 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.DurationVar(&o.FlushInterval, "flush-interval", o.FlushInterval, "Periodic flush interval to backend object storage")
 	flagSet.StringVar(&o.WALDir, "wal-dir", o.WALDir, "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
 	flagSet.StringVar(&o.WALTarget, "wal-target", o.WALTarget, "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
-	flagSet.Var(walclient.NewLevelValue(&o.WALDurability), "wal-durability", "Default WAL durability level (local, witness, permanent)")
+	flagSet.Var(walclient.NewLevelValue(&o.WALDurability), waldurability.ParameterName, "Default WAL durability level (local, witness, permanent)")
 	flagSet.Var(metadatadurability.NewValue(&o.MetadataDurability), "metadata-durability", "Default metadata durability mode (barrier mode returns before the change is durable, durability is collected by fsync and at shutdown; operation mode waits for WAL durability per operation)")
 	flagSet.Var(&metadataIndexValue{target: &o.MetadataIndex}, "metadata-index", "Metadata local index type (sqlite, table)")
 	flagSet.IntVar(&o.MetadataIndexCacheMB, "metadata-index-cache-mb", o.MetadataIndexCacheMB, "Pebble shared block cache size in megabytes for table metadata index")
