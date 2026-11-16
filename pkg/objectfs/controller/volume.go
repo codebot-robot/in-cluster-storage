@@ -255,6 +255,8 @@ type Volume struct {
 	coalesce    syncCoalesceState
 	closeTimer  *time.Timer
 	closeInodes map[uint64]struct{}
+	// syncTriggerHook is an optional callback invoked when triggerSyncIfStaged initiates a coalesce sync (testing only).
+	syncTriggerHook func()
 	// currentSync tracks the single real sync operation currently in flight, or nil if idle.
 	// At most one real sync is in flight at a time. Every path that starts one waits for
 	// idle (waitForSyncIdleLocked) or skips if a sync is already running, all under stagingMu.
@@ -883,6 +885,22 @@ func (v *Volume) completeWaitersAndRearmLocked(snapshotSeq uint64, err error, po
 	v.syncCond.Broadcast()
 }
 
+// StagedBytes returns the total unuploaded staged write bytes for this volume.
+// Requires no locks held; acquires stagingMu.
+func (v *Volume) StagedBytes() int64 {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+	return v.stagedBytes
+}
+
+// SetSyncTriggerHook configures a callback invoked when triggerSyncIfStaged initiates a coalesce sync (testing only).
+// Requires no locks held; acquires stagingMu.
+func (v *Volume) SetSyncTriggerHook(hook func()) {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+	v.syncTriggerHook = hook
+}
+
 // triggerSyncIfStaged initiates a coalesce sync in the background if the volume holds staged chunks and no sync is in flight.
 // Requires no locks held; acquires stagingMu.
 func (v *Volume) triggerSyncIfStaged() {
@@ -897,7 +915,12 @@ func (v *Volume) triggerSyncIfStaged() {
 		v.closeTimer = nil
 	}
 	v.closeInodes = nil
+	hook := v.syncTriggerHook
 	v.stagingMu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
 
 	go v.triggerCoalesceSync()
 }
