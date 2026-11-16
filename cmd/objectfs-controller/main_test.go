@@ -97,6 +97,21 @@ func TestMetadataIndexCacheMBFlag(t *testing.T) {
 	}
 }
 
+// TestMaxLocalStagingBytesFlag verifies that --max-local-staging-bytes is registered with a 16 GiB default.
+// Requires no locks held.
+func TestMaxLocalStagingBytesFlag(t *testing.T) {
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	options.AddFlags(flagSet)
+	flagOption := flagSet.Lookup("max-local-staging-bytes")
+	if flagOption == nil {
+		t.Fatal("flag --max-local-staging-bytes not registered")
+	}
+	if flagOption.DefValue != "17179869184" {
+		t.Errorf("default value = %q, want 17179869184", flagOption.DefValue)
+	}
+}
+
 func TestWalDurabilityFlag(t *testing.T) {
 	options := NewOptions()
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)

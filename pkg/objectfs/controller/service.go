@@ -36,6 +36,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
@@ -129,6 +130,12 @@ func checkRPCErr(err error) error {
 	if errors.Is(err, ErrVolumeStopping) {
 		return status.Errorf(codes.Unavailable, "%v", err)
 	}
+	if errors.Is(err, context.Canceled) {
+		return status.Errorf(codes.Canceled, "%v", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return status.Errorf(codes.DeadlineExceeded, "%v", err)
+	}
 	return nil
 }
 
@@ -186,6 +193,23 @@ type serverMetadataConfig struct {
 	viewOpts []view.Option
 }
 
+// serverDiskLimits groups configuration, accounting, and synchronization for controller-wide staging limits.
+type serverDiskLimits struct {
+	// mu guards controller-wide disk accounting fields and coordinates spaceAvailable.
+	mu sync.Mutex
+	// stagedBytes tracks the controller-wide total of unuploaded staged write bytes across all volumes.
+	stagedBytes int64
+	// maxStagingBytes configures the controller-wide ceiling of unuploaded staged write bytes across all volumes (0 disables).
+	maxStagingBytes int64
+	// spaceAvailable coordinates writers waiting for unuploaded staged bytes to fall below maxStagingBytes.
+	spaceAvailable *sync.Cond
+	// lastCeilingLog records the last time the ceiling log line was emitted for rate limiting.
+	lastCeilingLog time.Time
+}
+
+// DefaultMaxLocalStagingBytes sets the default controller-wide ceiling of unuploaded staged bytes (16 GiB).
+const DefaultMaxLocalStagingBytes int64 = 16 * 1024 * 1024 * 1024
+
 type Server struct {
 	pb.UnimplementedObjectFSControllerServer
 	mu          sync.RWMutex
@@ -210,11 +234,8 @@ type Server struct {
 	// acceptUnversioned configures whether unversioned segments, streams, and snapshots are accepted.
 	acceptUnversioned bool
 
-	// diskLimitsMu guards controller-wide disk accounting fields.
-	diskLimitsMu sync.Mutex
-	// localStagingBytes tracks the controller-wide total of unuploaded staged write bytes across all volumes.
-	// It is guarded by diskLimitsMu and modified exclusively by the volume helpers addStagedBytesLocked and subtractStagedBytesLocked.
-	localStagingBytes int64
+	// diskLimits groups configuration, accounting, and synchronization for controller-wide staging limits.
+	diskLimits serverDiskLimits
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -407,6 +428,14 @@ func WithServerMaxStagingBytes(b int64) ServerOption {
 	}
 }
 
+// WithServerMaxLocalStagingBytes sets the controller-wide ceiling for unuploaded staged bytes across all volumes (0 disables).
+// Requires no locks held.
+func WithServerMaxLocalStagingBytes(bytes int64) ServerOption {
+	return func(s *Server) {
+		s.diskLimits.maxStagingBytes = bytes
+	}
+}
+
 // WithServerSyncTimeout sets the timeout duration for coalesced background sync operations.
 func WithServerSyncTimeout(d time.Duration) ServerOption {
 	return func(s *Server) {
@@ -481,8 +510,12 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		metadata: serverMetadataConfig{
 			defaultDurability: pb.MetadataDurability_OPERATION,
 		},
+		diskLimits: serverDiskLimits{
+			maxStagingBytes: DefaultMaxLocalStagingBytes,
+		},
 		restoring: make(map[string]bool),
 	}
+	s.diskLimits.spaceAvailable = sync.NewCond(&s.diskLimits.mu)
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -2045,27 +2078,147 @@ func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) 
 
 // ServerStats contains aggregated operational and capacity metrics for the controller server.
 type ServerStats struct {
-	LocalStagingBytes int64
+	LocalStagingBytes    int64
+	MaxLocalStagingBytes int64
 }
 
 // Stats returns a snapshot of controller operational and capacity metrics.
+// Requires no locks held; acquires diskLimits.mu.
 func (s *Server) Stats() ServerStats {
-	s.diskLimitsMu.Lock()
-	defer s.diskLimitsMu.Unlock()
+	s.diskLimits.mu.Lock()
+	defer s.diskLimits.mu.Unlock()
 
 	return ServerStats{
-		LocalStagingBytes: s.localStagingBytes,
+		LocalStagingBytes:    s.diskLimits.stagedBytes,
+		MaxLocalStagingBytes: s.diskLimits.maxStagingBytes,
 	}
 }
 
-func (s *Server) addLocalStagingBytes(delta int64) {
-	s.diskLimitsMu.Lock()
-	s.localStagingBytes += delta
-	s.diskLimitsMu.Unlock()
+// add adds delta to the controller-wide total of unuploaded staged bytes.
+// Always called with the volume's stagingMu held. Lock order: Server.mu, then Volume.stagingMu, then serverDiskLimits.mu.
+func (l *serverDiskLimits) add(delta int64) {
+	l.mu.Lock()
+	l.stagedBytes += delta
+	l.mu.Unlock()
 }
 
-func (s *Server) subtractLocalStagingBytes(delta int64) {
-	s.diskLimitsMu.Lock()
-	s.localStagingBytes -= delta
-	s.diskLimitsMu.Unlock()
+// subtract subtracts delta from the controller-wide total of unuploaded staged bytes
+// and signals waiters on spaceAvailable.
+// Always called with the volume's stagingMu held. Lock order: Server.mu, then Volume.stagingMu, then serverDiskLimits.mu.
+func (l *serverDiskLimits) subtract(delta int64) {
+	l.mu.Lock()
+	l.stagedBytes -= delta
+	l.spaceAvailable.Broadcast()
+	l.mu.Unlock()
+}
+
+const (
+	// stagingWaitDeadlineMargin is the duration subtracted from an incoming context deadline
+	// before which waiting stops, allowing the ENOSPC response to be delivered before the client gives up with DeadlineExceeded.
+	stagingWaitDeadlineMargin = 500 * time.Millisecond
+
+	// stagingWaitIndefiniteTimeout is the maximum duration a writer will wait when the incoming context has no deadline.
+	stagingWaitIndefiniteTimeout = 30 * time.Second
+)
+
+// logCeilingReachedLocked emits a rate-limited log line when the staging ceiling wait times out.
+// Requires l.mu held.
+func (l *serverDiskLimits) logCeilingReachedLocked(ctx context.Context, volumeID string) {
+	now := time.Now()
+	if l.lastCeilingLog.IsZero() || now.Sub(l.lastCeilingLog) >= 5*time.Second {
+		l.lastCeilingLog = now
+		scoped.Log(ctx).Info("local staging ceiling reached",
+			"volume", volumeID,
+			"total", l.stagedBytes,
+			"ceiling", l.maxStagingBytes)
+	}
+}
+
+// wait enforces backpressure when total staged bytes would exceed maxStagingBytes.
+// If the write can never fit (neededBytes > maxStagingBytes), it returns ENOSPC immediately.
+// Otherwise, it initiates coalesce syncs and waits on spaceAvailable until total staged bytes
+// fall far enough, the write call's deadline is within stagingWaitDeadlineMargin (500ms),
+// or stagingWaitIndefiniteTimeout (30s) elapses for deadline-free contexts.
+//
+// The ceiling is a soft bound: concurrent writers that each pass capacity checks when space is available
+// can proceed simultaneously and add on top of each other, exceeding the ceiling by up to the sum of
+// in-flight touched chunk writes (or by up to one write's touched chunks, numChunks * chunkSize, for sequential writes).
+// Other paths that stage bytes (such as inline data migration or metadata operations) are not covered by this check.
+//
+// If ctx is cancelled, wait returns ctx.Err() without logging. If the wait expires, it logs a rate-limited
+// message and returns ENOSPC.
+// Requires no locks held; acquires l.mu and calls triggerSyncs with no locks held.
+func (l *serverDiskLimits) wait(ctx context.Context, volumeID string, neededBytes int64, triggerSyncs func()) error {
+	if neededBytes <= 0 {
+		return nil
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	ceiling := l.maxStagingBytes
+	if ceiling <= 0 {
+		return nil
+	}
+	if neededBytes > ceiling {
+		return syscall.ENOSPC
+	}
+	if l.stagedBytes+neededBytes <= ceiling {
+		return nil
+	}
+
+	now := time.Now()
+	var waitCtx context.Context
+	var waitCancel context.CancelFunc
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		waitDeadline := deadline.Add(-stagingWaitDeadlineMargin)
+		if !now.Before(waitDeadline) {
+			l.logCeilingReachedLocked(ctx, volumeID)
+			return syscall.ENOSPC
+		}
+		waitCtx, waitCancel = context.WithDeadline(ctx, waitDeadline)
+	} else {
+		waitCtx, waitCancel = context.WithTimeout(ctx, stagingWaitIndefiniteTimeout)
+	}
+	defer waitCancel()
+
+	stopTimer := context.AfterFunc(waitCtx, func() {
+		l.mu.Lock()
+		l.spaceAvailable.Broadcast()
+		l.mu.Unlock()
+	})
+	defer stopTimer()
+
+	for l.maxStagingBytes > 0 && l.stagedBytes+neededBytes > l.maxStagingBytes && waitCtx.Err() == nil {
+		l.mu.Unlock()
+		triggerSyncs()
+		l.mu.Lock()
+		if l.maxStagingBytes > 0 && l.stagedBytes+neededBytes > l.maxStagingBytes && waitCtx.Err() == nil {
+			l.spaceAvailable.Wait()
+		}
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if waitCtx.Err() != nil {
+		l.logCeilingReachedLocked(ctx, volumeID)
+		return syscall.ENOSPC
+	}
+	return nil
+}
+
+// triggerStagedVolumesSync initiates coalesce syncs for all volumes holding staged bytes.
+// Requires no locks held; acquires s.mu for reading.
+func (s *Server) triggerStagedVolumesSync() {
+	s.mu.RLock()
+	volumes := make([]*Volume, 0, len(s.volumes))
+	for _, volume := range s.volumes {
+		volumes = append(volumes, volume)
+	}
+	s.mu.RUnlock()
+
+	for _, volume := range volumes {
+		volume.triggerSyncIfStaged()
+	}
 }
