@@ -1533,9 +1533,11 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 	for _, id := range filtered {
 		var degraded *pb.Degraded
 		var consistencyMode pb.ConsistencyMode
-		if vol, ok := s.volumes[id]; ok {
-			consistencyMode = vol.ConsistencyMode()
-			if deg := vol.Degraded(); deg != nil {
+		var metadataDurability pb.MetadataDurability
+		if volume, ok := s.volumes[id]; ok {
+			consistencyMode = volume.ConsistencyMode()
+			metadataDurability = volume.MetadataDurability()
+			if deg := volume.Degraded(); deg != nil {
 				degraded = &pb.Degraded{
 					Code:    pb.Degraded_WAL_STREAM_DEGRADED,
 					Message: deg.Error(),
@@ -1544,9 +1546,10 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 			}
 		}
 		volInfos = append(volInfos, &pb.VolumeInfo{
-			VolumeId:        id,
-			Degraded:        degraded,
-			ConsistencyMode: consistencyMode,
+			VolumeId:           id,
+			Degraded:           degraded,
+			ConsistencyMode:    consistencyMode,
+			MetadataDurability: metadataDurability,
 		})
 	}
 	s.mu.RUnlock()

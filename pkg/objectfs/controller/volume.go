@@ -1874,7 +1874,10 @@ func (v *Volume) MetadataDurability() pb.MetadataDurability {
 // PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store,
 // waiting until the persisted VolumeInfo record reaches the volume's durability level.
 func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
-	commitSequence, err := v.persistVolumeInfo(ctx, mode)
+	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
+		v.consistencyMode = mode
+		volumeInfo.ConsistencyMode = mode
+	})
 	if err != nil {
 		return err
 	}
@@ -1887,47 +1890,71 @@ func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.Consistency
 	return nil
 }
 
-// persistVolumeInfo updates consistency mode in memory and commits VolumeInfo to the metadata stream.
+// PersistMetadataDurability updates the volume's metadata durability mode and persists it to the metadata store,
+// waiting until the persisted VolumeInfo record reaches the volume's durability level.
+func (v *Volume) PersistMetadataDurability(ctx context.Context, mode pb.MetadataDurability) error {
+	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
+		v.metadataDurability = mode
+		volumeInfo.MetadataDurability = mode
+	})
+	if err != nil {
+		return err
+	}
+	// Wait for the VolumeInfo record's sequence to reach the volume's durability level
+	// with no locks held. On wait failure, the record is already sequenced and applied
+	// in memory, so the updated metadata durability is visible although the caller gets an error.
+	if err := v.waitForSequence(ctx, commitSequence); err != nil {
+		return fmt.Errorf("failed to wait for metadata durability mode durability: %w", err)
+	}
+	return nil
+}
+
+// persistVolumeInfo updates volume configuration in memory and commits the VolumeInfo row to the metadata stream
+// using a read-modify-write pattern that preserves any pre-existing fields in the row.
 // Takes v.mu.
-func (v *Volume) persistVolumeInfo(ctx context.Context, mode pb.ConsistencyMode) (uint64, error) {
+func (v *Volume) persistVolumeInfo(ctx context.Context, mutate func(*pb.VolumeInfo)) (uint64, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	v.consistencyMode = mode
-
-	volInfo := &pb.VolumeInfo{
-		VolumeId:        v.volumeID,
-		ConsistencyMode: mode,
-	}
-
-	volInfoKey, err := pkVolumeInfo.Extract(volInfo)
+	volumeInfoKey, err := pkVolumeInfo.Extract(&pb.VolumeInfo{VolumeId: v.volumeID})
 	if err != nil {
 		return 0, fmt.Errorf("failed to extract VolumeInfo key: %w", err)
 	}
 
-	var beforeMsg proto.Message
+	var beforeMessage proto.Message
 	exists := false
+	var volumeInfo *pb.VolumeInfo
 	if v.metadataView != nil {
-		msg, ok, err := v.metadataView.Get(ctx, VolumeInfoTypeName, volInfoKey)
+		storedMessage, ok, err := v.metadataView.Get(ctx, VolumeInfoTypeName, volumeInfoKey)
 		if err != nil {
 			return 0, fmt.Errorf("failed to get VolumeInfo: %w", err)
 		}
-		if ok && msg != nil {
-			beforeMsg = msg
+		if ok && storedMessage != nil {
+			beforeMessage = storedMessage
 			exists = true
+			if existing, ok := storedMessage.(*pb.VolumeInfo); ok && existing != nil {
+				volumeInfo = proto.Clone(existing).(*pb.VolumeInfo)
+			}
+		}
+	}
+	if volumeInfo == nil {
+		volumeInfo = &pb.VolumeInfo{
+			VolumeId: v.volumeID,
 		}
 	}
 
+	mutate(volumeInfo)
+
 	var commitSequence uint64
-	tx := v.beginTxLocked("PersistConsistencyMode")
+	tx := v.beginTxLocked("persistVolumeInfo")
 	if tx != nil {
-		v.recordReadLocked(tx, VolumeInfoTypeName, volInfoKey, beforeMsg)
+		v.recordReadLocked(tx, VolumeInfoTypeName, volumeInfoKey, beforeMessage)
 		if exists {
-			if _, err := tx.Update(ctx, volInfo); err != nil {
+			if _, err := tx.Update(ctx, volumeInfo); err != nil {
 				return 0, fmt.Errorf("failed to update VolumeInfo: %w", err)
 			}
 		} else {
-			if _, err := tx.Insert(ctx, volInfo); err != nil {
+			if _, err := tx.Insert(ctx, volumeInfo); err != nil {
 				return 0, fmt.Errorf("failed to insert VolumeInfo: %w", err)
 			}
 		}
@@ -6805,8 +6832,13 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				}
 			}
 			if ch.TypeName == VolumeInfoTypeName {
-				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-					v.consistencyMode = vi.GetConsistencyMode()
+				if volumeInfo, ok := ch.Row.(*pb.VolumeInfo); ok && volumeInfo != nil {
+					if volumeInfo.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+						v.consistencyMode = volumeInfo.GetConsistencyMode()
+					}
+					if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+						v.metadataDurability = volumeInfo.GetMetadataDurability()
+					}
 				}
 			}
 		}
@@ -6982,18 +7014,8 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 
 	if v.metadataView != nil {
 		v.metadataView.ClearCache()
-		volInfoKey, err := pkVolumeInfo.Extract(&pb.VolumeInfo{VolumeId: v.volumeID})
-		if err != nil {
-			return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
-		}
-		msg, ok, err := v.metadataView.Get(ctx, VolumeInfoTypeName, volInfoKey)
-		if err != nil {
-			return fmt.Errorf("failed to get VolumeInfo: %w", err)
-		}
-		if ok && msg != nil {
-			if vi, ok := msg.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-				v.consistencyMode = vi.GetConsistencyMode()
-			}
+		if err := v.loadVolumeInfoLocked(ctx); err != nil {
+			return err
 		}
 	}
 
@@ -7009,6 +7031,33 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 	defer v.mu.Unlock()
 
 	return v.loadFromBackendMetadataLocked(ctx)
+}
+
+// loadVolumeInfoLocked refreshes the volume's consistency mode and metadata durability from its stored VolumeInfo row.
+// Requires v.mu held.
+func (v *Volume) loadVolumeInfoLocked(ctx context.Context) error {
+	if v.metadataView == nil {
+		return nil
+	}
+	volumeInfoKey, err := pkVolumeInfo.Extract(&pb.VolumeInfo{VolumeId: v.volumeID})
+	if err != nil {
+		return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
+	}
+	storedMessage, ok, err := v.metadataView.Get(ctx, VolumeInfoTypeName, volumeInfoKey)
+	if err != nil {
+		return fmt.Errorf("failed to get VolumeInfo: %w", err)
+	}
+	if ok && storedMessage != nil {
+		if volumeInfo, ok := storedMessage.(*pb.VolumeInfo); ok && volumeInfo != nil {
+			if volumeInfo.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+				v.consistencyMode = volumeInfo.GetConsistencyMode()
+			}
+			if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+				v.metadataDurability = volumeInfo.GetMetadataDurability()
+			}
+		}
+	}
+	return nil
 }
 
 // CreateSnapshot creates and returns a new index snapshot of the current volume state,

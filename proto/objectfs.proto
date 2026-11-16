@@ -517,6 +517,7 @@ message VolumeInfo {
   ConsistencyMode consistency_mode = 4;
   bool deleted = 5;
   optional int32 retention = 6;
+  MetadataDurability metadata_durability = 7;
 }
 
 message ListVolumesResponse {
