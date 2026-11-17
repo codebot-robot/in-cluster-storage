@@ -1940,6 +1940,15 @@ func (v *Volume) WalDurability() pb.WalDurability {
 	return v.effective.walDurability
 }
 
+// StoredWalDurability returns the WAL durability level stored in the volume's info row,
+// or WAL_DURABILITY_UNSPECIFIED if no level has been stored.
+// Reads configured.walDurability; takes v.mu for reading.
+func (v *Volume) StoredWalDurability() pb.WalDurability {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.configured.walDurability
+}
+
 // Degraded returns the DegradedError if the underlying WAL stream is degraded, or nil if healthy.
 func (v *Volume) Degraded() *walclient.DegradedError {
 	v.mu.RLock()
@@ -2038,6 +2047,37 @@ func (v *Volume) PersistMetadataDurability(ctx context.Context, mode pb.Metadata
 	// in memory, so the updated metadata durability is visible although the caller gets an error.
 	if err := v.waitForSequence(ctx, commitSequence); err != nil {
 		return fmt.Errorf("failed to wait for metadata durability mode durability: %w", err)
+	}
+	return nil
+}
+
+// PersistWalDurability updates the volume's WAL durability level and persists it to the metadata store.
+// Takes Volume.mu in persistVolumeInfo, then waits for the VolumeInfo record with no locks held.
+//
+// The in-memory durability level changes even when the persist returns an error (such as a
+// cancelled context): the caller gets an error, the level and row have changed in memory and on the
+// WAL stream, and no durability wait completed.
+//
+// The VolumeInfo record that stores the new level is itself waited for at the new level, so lowering
+// Permanent to Local waits for that record at Local. Paths that read the level at wait time (empty fsync,
+// Stop, snapshot, restore) use whatever level is current when they wait.
+func (v *Volume) PersistWalDurability(ctx context.Context, durability pb.WalDurability) error {
+	if _, err := waldurability.ToLevel(durability); err != nil {
+		return err
+	}
+	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
+		v.configured.walDurability = durability
+		v.recomputeEffectiveLocked()
+		volumeInfo.WalDurability = durability
+	})
+	if err != nil {
+		return err
+	}
+	// Wait for the VolumeInfo record's sequence to reach the volume's durability level
+	// with no locks held. On wait failure, the record is already sequenced and applied
+	// in memory, so the updated WAL durability is visible although the caller gets an error.
+	if err := v.waitForSequence(ctx, commitSequence); err != nil {
+		return fmt.Errorf("failed to wait for WAL durability level durability: %w", err)
 	}
 	return nil
 }
@@ -7162,7 +7202,7 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 	return v.loadFromBackendMetadataLocked(ctx)
 }
 
-// loadVolumeInfoLocked refreshes the volume's consistency mode and metadata durability from its stored VolumeInfo row.
+// loadVolumeInfoLocked refreshes the volume's consistency mode, metadata durability, and WAL durability from its stored VolumeInfo row.
 // Requires v.mu held.
 func (v *Volume) loadVolumeInfoLocked(ctx context.Context) error {
 	if v.metadataView == nil {
@@ -7183,6 +7223,12 @@ func (v *Volume) loadVolumeInfoLocked(ctx context.Context) error {
 			}
 			if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
 				v.configured.metadataDurability = volumeInfo.GetMetadataDurability()
+			}
+			if volumeInfo.GetWalDurability() != pb.WalDurability_WAL_DURABILITY_UNSPECIFIED {
+				if _, err := waldurability.ToLevel(volumeInfo.GetWalDurability()); err != nil {
+					return fmt.Errorf("invalid WAL durability %v in VolumeInfo: %w", volumeInfo.GetWalDurability(), err)
+				}
+				v.configured.walDurability = volumeInfo.GetWalDurability()
 			}
 			v.recomputeEffectiveLocked()
 		}
