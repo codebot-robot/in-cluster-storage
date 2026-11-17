@@ -894,6 +894,13 @@ func TestStagingDrain_FailedSyncAfterEpisodeEndsDoesNotStaleSkip(t *testing.T) {
 	// With draining ended, the failed sync must not be recorded in skippedThisEpisode.
 	setupTestVolume(ctx, t, server, "test-stale-vol-between", 1500*1024, nil)
 	close(gateRelease)
+
+	// Wait for Volume High's failed sync to finish so its result is delivered to drainDone
+	// before awaiting the drain loop evaluation pass that handles the result.
+	volumeHigh.stagingMu.Lock()
+	volumeHigh.waitForSyncIdleLocked()
+	volumeHigh.stagingMu.Unlock()
+
 	wakeAndAwaitPass(t, server)
 
 	// Step 4: Total rises above the high-water mark:
