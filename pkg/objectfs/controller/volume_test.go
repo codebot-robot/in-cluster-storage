@@ -658,3 +658,133 @@ func TestRename_DirectoryMovedColdVolume_LookupDotDotReturnsNewParent(t *testing
 		t.Fatalf("expected root '..' on cold volume to be 1, got %d", rootDirDotDotAttr.GetInode().GetIno())
 	}
 }
+
+func TestVolumeSettings_ConfiguredAndEffective(t *testing.T) {
+	ctx := t.Context()
+	broadcaster := NewEventBroadcaster()
+	volume := MustNewVolume(t, "vol-settings-test", nil, broadcaster,
+		WithWalDurability(pb.WalDurability_WITNESS),
+		WithMetadataDurability(pb.MetadataDurability_BARRIER),
+	)
+	t.Cleanup(func() {
+		if err := volume.Close(); err != nil {
+			t.Errorf("volume.Close failed: %v", err)
+		}
+	})
+
+	// Before explicit configuration, configured is zero/unspecified while effective resolves defaults.
+	if mode := volume.StoredConsistencyMode(); mode != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+		t.Errorf("stored consistency mode = %v, want UNSPECIFIED", mode)
+	}
+	if mode := volume.ConsistencyMode(); mode != pb.ConsistencyMode_STANDARD {
+		t.Errorf("effective consistency mode = %v, want STANDARD", mode)
+	}
+	if mode := volume.StoredMetadataDurability(); mode != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+		t.Errorf("stored metadata durability = %v, want UNSPECIFIED", mode)
+	}
+	if mode := volume.MetadataDurability(); mode != pb.MetadataDurability_BARRIER {
+		t.Errorf("effective metadata durability = %v, want BARRIER", mode)
+	}
+	if level := volume.WalDurability(); level != pb.WalDurability_WITNESS {
+		t.Errorf("effective wal durability = %v, want WITNESS", level)
+	}
+
+	// Persisting updates configured and recomputes effective.
+	if err := volume.PersistConsistencyMode(ctx, pb.ConsistencyMode_CLOSE_TO_OPEN); err != nil {
+		t.Fatalf("PersistConsistencyMode failed: %v", err)
+	}
+	if err := volume.PersistMetadataDurability(ctx, pb.MetadataDurability_OPERATION); err != nil {
+		t.Fatalf("PersistMetadataDurability failed: %v", err)
+	}
+	if mode := volume.StoredConsistencyMode(); mode != pb.ConsistencyMode_CLOSE_TO_OPEN {
+		t.Errorf("stored consistency mode = %v, want CLOSE_TO_OPEN", mode)
+	}
+	if mode := volume.ConsistencyMode(); mode != pb.ConsistencyMode_CLOSE_TO_OPEN {
+		t.Errorf("effective consistency mode = %v, want CLOSE_TO_OPEN", mode)
+	}
+	if mode := volume.StoredMetadataDurability(); mode != pb.MetadataDurability_OPERATION {
+		t.Errorf("stored metadata durability = %v, want OPERATION", mode)
+	}
+	if mode := volume.MetadataDurability(); mode != pb.MetadataDurability_OPERATION {
+		t.Errorf("effective metadata durability = %v, want OPERATION", mode)
+	}
+}
+
+func TestVolumeSettings_MakeWaitFn_UnspecifiedOrUnknownFails(t *testing.T) {
+	ctx := t.Context()
+	broadcaster := NewEventBroadcaster()
+	volume := MustNewVolume(t, "vol-wait-test", nil, broadcaster)
+	t.Cleanup(func() {
+		if err := volume.Close(); err != nil {
+			t.Errorf("volume.Close failed: %v", err)
+		}
+	})
+
+	if waitFn := volume.makeWaitFn(0, pb.WalDurability_WAL_DURABILITY_UNSPECIFIED); waitFn != nil {
+		t.Errorf("expected commitSeq=0 to return nil waitFn, got non-nil")
+	}
+
+	unspecifiedWait := volume.makeWaitFn(1, pb.WalDurability_WAL_DURABILITY_UNSPECIFIED)
+	if unspecifiedWait == nil {
+		t.Fatalf("expected non-nil waitFn for commitSeq=1")
+	}
+	if err := unspecifiedWait(ctx); err == nil {
+		t.Errorf("expected waitFn to fail for UNSPECIFIED wal durability, got nil")
+	}
+
+	unknownWait := volume.makeWaitFn(1, pb.WalDurability(999))
+	if unknownWait == nil {
+		t.Fatalf("expected non-nil waitFn for commitSeq=1")
+	}
+	if err := unknownWait(ctx); err == nil {
+		t.Errorf("expected waitFn to fail for unknown wal durability, got nil")
+	}
+}
+
+func TestVolumeSettings_ConcurrentFsyncAndSettingsMutation_NoRace(t *testing.T) {
+	ctx := t.Context()
+	broadcaster := NewEventBroadcaster()
+	volume := MustNewVolume(t, "vol-race-test", nil, broadcaster)
+	t.Cleanup(func() {
+		if err := volume.Close(); err != nil {
+			t.Errorf("volume.Close failed: %v", err)
+		}
+	})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Goroutine alternating PersistMetadataDurability and SetConsistencyMode.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			mode := pb.MetadataDurability_OPERATION
+			if i%2 == 0 {
+				mode = pb.MetadataDurability_BARRIER
+			}
+			_ = volume.PersistMetadataDurability(ctx, mode)
+
+			consistency := pb.ConsistencyMode_STANDARD
+			if i%2 == 0 {
+				consistency = pb.ConsistencyMode_CLOSE_TO_OPEN
+			}
+			volume.SetConsistencyMode(consistency)
+		}
+	}()
+
+	// Run blocking Fsync on the volume with nothing staged.
+	for i := 0; i < 50; i++ {
+		if err := volume.Fsync(ctx, 1); err != nil {
+			t.Fatalf("Fsync failed: %v", err)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+}

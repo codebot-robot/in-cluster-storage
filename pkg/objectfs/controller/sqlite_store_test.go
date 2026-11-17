@@ -1337,7 +1337,7 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("memory"),
 		WithStream(stream),
-		WithDurability(walclient.Local),
+		WithWalDurability(pb.WalDurability_LOCAL),
 	)
 	defer vol.Close()
 
@@ -1416,7 +1416,7 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 			vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 				WithMetadataIndex(indexMode),
 				WithStream(stream),
-				WithDurability(walclient.Local),
+				WithWalDurability(pb.WalDurability_LOCAL),
 				WithLocalStorageDir(t.TempDir()),
 			)
 			defer vol.Close()

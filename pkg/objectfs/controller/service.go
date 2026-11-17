@@ -36,6 +36,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/waldurability"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -579,7 +580,7 @@ func (s *Server) createVolumeInstanceLocked(volumeID string) (*Volume, error) {
 	if stream != nil {
 		volumeOptions = append(volumeOptions, WithStream(stream))
 	}
-	volumeOptions = append(volumeOptions, WithDurability(s.wal.defaultDurability))
+	volumeOptions = append(volumeOptions, WithWalDurability(waldurability.FromLevel(s.wal.defaultDurability)))
 	volumeOptions = append(volumeOptions, WithMetadataDurability(s.metadata.defaultDurability))
 	if s.metadata.index != "" {
 		volumeOptions = append(volumeOptions, WithMetadataIndex(s.metadata.index))
@@ -1362,7 +1363,7 @@ func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSContr
 	}
 
 	if req.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-		currentMode := volume.ConsistencyMode()
+		currentMode := volume.StoredConsistencyMode()
 		clientMode := req.GetConsistencyMode()
 		if currentMode == pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
 			if clientMode == pb.ConsistencyMode_CLOSE_TO_OPEN {
@@ -1568,7 +1569,7 @@ func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*
 			VolumeId: id,
 		}
 		if volume, ok := s.volumes[id]; ok {
-			info.ConsistencyMode = volume.ConsistencyMode()
+			info.ConsistencyMode = volume.StoredConsistencyMode()
 			info.MetadataDurability = volume.MetadataDurability()
 			if deg := volume.Degraded(); deg != nil {
 				info.Degraded = &pb.Degraded{
