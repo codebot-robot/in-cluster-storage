@@ -367,6 +367,9 @@ func run(options Options) error {
 		)
 	}
 	server := controller.NewServer(backend, serverOptions...)
+	if err := server.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start server: %w", err)
+	}
 	csiController := controller.NewCSIController(server)
 
 	if options.FlushInterval > 0 {

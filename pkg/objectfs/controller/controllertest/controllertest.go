@@ -43,7 +43,11 @@ func NewTestServer(backend controller.ObjectStorageBackend, opts ...controller.S
 				}
 			}),
 		}, opts...)
-		return controller.NewServer(backend, opts...)
+		server := controller.NewServer(backend, opts...)
+		if err := server.Start(context.Background()); err != nil {
+			panic(err)
+		}
+		return server
 	}
 
 	ctx := context.Background()
@@ -75,5 +79,9 @@ func NewTestServer(backend controller.ObjectStorageBackend, opts ...controller.S
 		controller.WithServerTestCleanup(combinedCleanup),
 	}
 	testOpts = append(testOpts, opts...)
-	return controller.NewServer(backend, testOpts...)
+	server := controller.NewServer(backend, testOpts...)
+	if err := server.Start(ctx); err != nil {
+		panic(err)
+	}
+	return server
 }

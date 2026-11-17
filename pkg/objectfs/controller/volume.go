@@ -323,7 +323,7 @@ type Volume struct {
 	coalesce    syncCoalesceState
 	closeTimer  *time.Timer
 	closeInodes map[uint64]struct{}
-	// syncTriggerHook is an optional callback invoked when triggerSyncIfStaged initiates a coalesce sync (testing only).
+	// syncTriggerHook is an optional callback invoked when a coalesce sync is initiated (testing only).
 	syncTriggerHook func()
 	// currentSync tracks the single real sync operation currently in flight, or nil if idle.
 	// At most one real sync is in flight at a time. Every path that starts one waits for
@@ -877,6 +877,9 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 	}
 
 	v.completeWaitersAndRearmLocked(snapshotSeq, err, pos, inodeFilter)
+	if v.server != nil {
+		v.server.onStagedBytesReleased()
+	}
 	return err
 }
 
@@ -951,7 +954,7 @@ func (v *Volume) completeWaitersAndRearmLocked(snapshotSeq uint64, err error, po
 
 	if v.rejectMutationLocked() == nil {
 		if len(v.coalesce.waiters) > 0 || len(v.stagedChunks) > 0 {
-			v.coalesce.armTimer(v.triggerCoalesceSync)
+			v.coalesce.armTimer(v.runCoalesceSyncAndLog)
 		}
 		if len(v.closeInodes) > 0 && v.closeTimer == nil {
 			v.closeTimer = time.AfterFunc(closeCoalesceWindow, v.triggerCloseSync)
@@ -969,42 +972,86 @@ func (v *Volume) StagedBytes() int64 {
 	return v.stagedBytes
 }
 
+// stagingStatus returns the volume's staged bytes and whether an active sync is currently running.
+// Requires no locks held; acquires stagingMu.
+func (v *Volume) stagingStatus() (stagedBytes int64, isSyncRunning bool) {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+	if v.stagingClosed || v.rejectMutationLocked() != nil {
+		return 0, false
+	}
+	if v.currentSync != nil {
+		return v.stagedBytes, true
+	}
+	return v.stagedBytes, false
+}
+
+// stagedSyncEligibleLocked reports whether the volume has staged chunks, has no sync running,
+// and is not rejecting mutations, returning the staged byte count and syncTriggerHook.
+// Requires stagingMu held.
+func (v *Volume) stagedSyncEligibleLocked() (eligible bool, stagedBytes int64, hook func()) {
+	if len(v.stagedChunks) == 0 || v.currentSync != nil || v.rejectMutationLocked() != nil {
+		return false, 0, nil
+	}
+	return true, v.stagedBytes, v.syncTriggerHook
+}
+
 // triggerSyncIfStaged initiates a coalesce sync in the background if the volume holds staged chunks and no sync is in flight.
 // If a syncTriggerHook is configured, it runs with no locks held, before the sync goroutine is started, and only
 // when a sync is actually initiated (not on early returns).
 // Requires no locks held; acquires stagingMu.
 func (v *Volume) triggerSyncIfStaged() {
 	v.stagingMu.Lock()
-	if len(v.stagedChunks) == 0 || v.currentSync != nil || v.rejectMutationLocked() != nil {
-		v.stagingMu.Unlock()
-		return
-	}
-	v.coalesce.stopTimer()
-	if v.closeTimer != nil {
-		v.closeTimer.Stop()
-		v.closeTimer = nil
-	}
-	v.closeInodes = nil
-	hook := v.syncTriggerHook
+	eligible, _, hook := v.stagedSyncEligibleLocked()
 	v.stagingMu.Unlock()
 
+	if !eligible {
+		return
+	}
 	if hook != nil {
 		hook()
 	}
 
-	go v.triggerCoalesceSync()
+	go v.runCoalesceSyncAndLog()
 }
 
-func (v *Volume) triggerCoalesceSync() {
+// triggerDrainSync prepares the volume for a drain sync. If eligible and stagedBytes > 0,
+// it runs syncTriggerHook if configured and returns the staged bytes to sync.
+// It leaves timers and closeInodes untouched; the sync goroutine manages them when started.
+// Requires no locks held; acquires stagingMu.
+func (v *Volume) triggerDrainSync() int64 {
+	v.stagingMu.Lock()
+	eligible, stagedBytes, hook := v.stagedSyncEligibleLocked()
+	v.stagingMu.Unlock()
+
+	if !eligible || stagedBytes <= 0 {
+		return 0
+	}
+	if hook != nil {
+		hook()
+	}
+	return stagedBytes
+}
+
+// runCoalesceSyncAndLog executes a coalesce sync for staged chunks and logs a warning on failure.
+func (v *Volume) runCoalesceSyncAndLog() {
+	if err := v.runCoalesceSync(); err != nil {
+		klog.Warningf("ObjectFS volume %s coalesce sync failed: %v", v.volumeID, err)
+	}
+}
+
+// runCoalesceSync executes a single coalesce sync for staged chunks and returns any sync error.
+// Requires no locks held; acquires and releases stagingMu.
+func (v *Volume) runCoalesceSync() error {
 	v.stagingMu.Lock()
 	v.coalesce.stopTimer()
 	if v.rejectMutationLocked() != nil || v.currentSync != nil {
 		v.stagingMu.Unlock()
-		return
+		return nil
 	}
 	if len(v.stagedChunks) == 0 {
 		v.stagingMu.Unlock()
-		return
+		return nil
 	}
 	if v.closeTimer != nil {
 		v.closeTimer.Stop()
@@ -1019,9 +1066,8 @@ func (v *Volume) triggerCoalesceSync() {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	requirePermanent := v.stream.ReplicationLevel() >= walclient.Permanent
-	if _, err := v.executeSyncLocked(ctx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC, requirePermanent, nil); err != nil {
-		klog.Warningf("ObjectFS volume %s coalesce sync failed: %v", v.volumeID, err)
-	}
+	_, err := v.executeSyncLocked(ctx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC, requirePermanent, nil)
+	return err
 }
 
 // syncInodesLocked executes a per-inode sync for targetInodes under stagingMu.
@@ -1195,7 +1241,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 	waitSeq := v.stagingSeq
 	waitCh := make(chan syncResult, 1)
 	v.coalesce.addWaiter(waitSeq, inodeID, waitCh)
-	v.coalesce.armTimer(v.triggerCoalesceSync)
+	v.coalesce.armTimer(v.runCoalesceSyncAndLog)
 
 	v.stagingMu.Unlock()
 
@@ -4795,7 +4841,7 @@ func (v *Volume) appendChunkLocked(ctx context.Context, data []byte) (stagedChun
 func (v *Volume) addStagedBytesLocked(delta int64) {
 	v.stagedBytes += delta
 	if v.server != nil {
-		v.server.diskLimits.add(delta)
+		v.server.addStagedDiskBytes(delta)
 	}
 }
 
@@ -5061,7 +5107,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	v.stagingSeq++
 
 	if v.currentSync != nil {
-		v.coalesce.armTimer(v.triggerCoalesceSync)
+		v.coalesce.armTimer(v.runCoalesceSyncAndLog)
 	}
 
 	return dataLength, calculatedSize, now, v.stagingEpoch, nil
