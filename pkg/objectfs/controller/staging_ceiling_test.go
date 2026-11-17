@@ -1148,12 +1148,15 @@ func TestStagingDrain_ExternalSyncsDoNotCountTowardLimit(t *testing.T) {
 	externalVolume1 := setupTestVolume(ctx, t, server, "test-ext-limit-vol-1", 1100*1024, nil)
 	externalVolume2 := setupTestVolume(ctx, t, server, "test-ext-limit-vol-2", 1100*1024, nil)
 
+	externalVolume1SyncError := make(chan error, 1)
+	externalVolume2SyncError := make(chan error, 1)
+
 	// Start external syncs on both volumes and wait for both to enter the upload gate.
 	go func() {
-		_ = externalVolume1.runCoalesceSync()
+		externalVolume1SyncError <- externalVolume1.runCoalesceSync()
 	}()
 	go func() {
-		_ = externalVolume2.runCoalesceSync()
+		externalVolume2SyncError <- externalVolume2.runCoalesceSync()
 	}()
 
 	for i := 0; i < 2; i++ {
@@ -1216,5 +1219,24 @@ func TestStagingDrain_ExternalSyncsDoNotCountTowardLimit(t *testing.T) {
 
 	// Release all uploads (both external and drain) to allow clean shutdown.
 	close(backend.releaseAll)
+
+	select {
+	case err := <-externalVolume1SyncError:
+		if err != nil {
+			t.Fatalf("externalVolume1.runCoalesceSync returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for externalVolume1 sync to complete")
+	}
+
+	select {
+	case err := <-externalVolume2SyncError:
+		if err != nil {
+			t.Fatalf("externalVolume2.runCoalesceSync returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for externalVolume2 sync to complete")
+	}
+
 	waitStagedAtOrBelow(t, server, 16384*1024)
 }
