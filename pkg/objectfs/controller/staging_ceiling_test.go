@@ -183,6 +183,24 @@ func waitForDrainPass(t *testing.T, server *Server, targetPass int64) {
 	}
 }
 
+// drainResultCount returns the number of volume drain results handled by the drain loop (testing only).
+func (s *Server) drainResultCount() int64 {
+	return s.drain.resultCount.Load()
+}
+
+// waitForDrainResult waits until the drain loop has handled at least targetResult drain results.
+// Requires no locks held.
+func waitForDrainResult(t *testing.T, server *Server, targetResult int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for server.drainResultCount() < targetResult {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for drain result %d (current: %d)", targetResult, server.drainResultCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // wakeAndAwaitPass wakes the drain loop and waits until the subsequent evaluation pass completes.
 // Requires no locks held.
 func wakeAndAwaitPass(t *testing.T, server *Server) {
@@ -893,15 +911,12 @@ func TestStagingDrain_FailedSyncAfterEpisodeEndsDoesNotStaleSkip(t *testing.T) {
 	// Stage 1500 KiB so total is strictly between low-water (4096 KiB) and high-water (6144 KiB).
 	// With draining ended, the failed sync must not be recorded in skippedThisEpisode.
 	setupTestVolume(ctx, t, server, "test-stale-vol-between", 1500*1024, nil)
+	resultsBefore := server.drainResultCount()
 	close(gateRelease)
 
-	// Wait for Volume High's failed sync to finish so its result is delivered to drainDone
-	// before awaiting the drain loop evaluation pass that handles the result.
-	volumeHigh.stagingMu.Lock()
-	volumeHigh.waitForSyncIdleLocked()
-	volumeHigh.stagingMu.Unlock()
-
-	wakeAndAwaitPass(t, server)
+	// Wait for the drain loop to handle the failed sync result outside draining
+	// before staging the trigger volume that starts Episode 2.
+	waitForDrainResult(t, server, resultsBefore+1)
 
 	// Step 4: Total rises above the high-water mark:
 	// Stage 1500 KiB on a trigger volume: total becomes 5512 + 1500 = 7012 KiB > 6144 KiB.

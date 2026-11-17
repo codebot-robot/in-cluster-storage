@@ -218,6 +218,8 @@ type stagingDrain struct {
 	loopDone chan struct{}
 	// passCount is atomic and tracks completed evaluation passes for test synchronization.
 	passCount atomic.Int64
+	// resultCount is atomic and tracks handled volume drain results for test synchronization.
+	resultCount atomic.Int64
 }
 
 // wakeDrain sends a non-blocking signal to wake the drain loop.
@@ -2367,6 +2369,7 @@ func (s *Server) drainLoop(ctx context.Context) {
 	drainDone := make(chan volumeDrainResult, 16)
 
 	handleDrainResult := func(result volumeDrainResult) {
+		s.drain.resultCount.Add(1)
 		delete(activeDrainSyncs, result.volumeID)
 		if result.err != nil {
 			if draining {
