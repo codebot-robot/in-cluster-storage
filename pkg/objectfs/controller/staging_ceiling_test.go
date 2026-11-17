@@ -889,15 +889,17 @@ func TestStagingDrain_FailedSyncAfterEpisodeEndsDoesNotStaleSkip(t *testing.T) {
 	}
 	waitStagedAtOrBelow(t, server, 4096*1024)
 
-	// Step 3: Total sits between the marks (4012 KiB), and the gated sync fails:
-	// Release gate so Volume High fails with an error outside draining.
+	// Step 3: Total sits strictly between the marks (5512 KiB), and the gated sync fails:
+	// Stage 1500 KiB so total is strictly between low-water (4096 KiB) and high-water (6144 KiB).
+	// With draining ended, the failed sync must not be recorded in skippedThisEpisode.
+	setupTestVolume(ctx, t, server, "test-stale-vol-between", 1500*1024, nil)
 	close(gateRelease)
 	wakeAndAwaitPass(t, server)
 
 	// Step 4: Total rises above the high-water mark:
-	// Stage 3000 KiB on a trigger volume: total becomes 4012 + 3000 = 7012 KiB > 6144 KiB.
-	// Episode 2 begins. Volume High must be retried.
-	setupTestVolume(ctx, t, server, "test-stale-vol-trigger", 3000*1024, nil)
+	// Stage 1500 KiB on a trigger volume: total becomes 5512 + 1500 = 7012 KiB > 6144 KiB.
+	// Episode 2 begins. Volume High, still the largest, must be retried.
+	setupTestVolume(ctx, t, server, "test-stale-vol-trigger", 1500*1024, nil)
 
 	waitStagedAtOrBelow(t, server, 4096*1024)
 
