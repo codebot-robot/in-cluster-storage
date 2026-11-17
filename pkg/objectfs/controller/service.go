@@ -242,6 +242,11 @@ const (
 	// stagingDrainMinimumBytes is the minimum unuploaded staged bytes a volume must hold to be eligible
 	// for background drain syncing (1 MiB).
 	stagingDrainMinimumBytes int64 = 1024 * 1024
+
+	// stagingDrainMaxConcurrentSyncs is the maximum number of volume syncs started by the background drain
+	// that can run concurrently. Four is the maintainer's provisional estimate to stagger uploads without
+	// saturating the network and object store, not a measured number.
+	stagingDrainMaxConcurrentSyncs = 4
 )
 
 type Server struct {
@@ -2355,6 +2360,9 @@ func (s *Server) drainLoop(ctx context.Context) {
 
 	draining := false
 	skippedThisEpisode := make(map[string]bool)
+	// activeDrainSyncs tracks unuploaded staged bytes for volumes currently syncing from a drain start.
+	// Only syncs the drain started count toward the limit; syncs started by a volume's own timer,
+	// an fsync, a close or a writer at the ceiling do not.
 	activeDrainSyncs := make(map[string]int64)
 	drainDone := make(chan volumeDrainResult, 16)
 
@@ -2464,6 +2472,11 @@ func (s *Server) drainLoop(ctx context.Context) {
 		})
 
 		for _, candidate := range candidates {
+			// Only syncs started by the drain count toward stagingDrainMaxConcurrentSyncs; syncs started
+			// by a volume's own timer, an fsync, a close or a writer at the ceiling do not.
+			if len(activeDrainSyncs) >= stagingDrainMaxConcurrentSyncs {
+				break
+			}
 			if stagedBytes-totalInFlight <= lowWaterBytes {
 				break
 			}

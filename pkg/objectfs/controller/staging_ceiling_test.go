@@ -962,3 +962,281 @@ func TestStagingDrain_LoopStopsOnCloseAndShutdown(t *testing.T) {
 		}
 	})
 }
+
+// tokenGateBackend gates pack uploads with arrival notifications and single-token releases.
+type tokenGateBackend struct {
+	// recordingBackend tracks recorded storage operations and base storage calls.
+	*recordingBackend
+	// uploadEntered signals whenever a pack upload enters PutObject and reaches the gate.
+	uploadEntered chan struct{}
+	// uploadTokens provides permits to release individual pack uploads from the gate.
+	uploadTokens chan struct{}
+	// releaseAll unblocks all current and future gated pack uploads when closed.
+	releaseAll chan struct{}
+}
+
+func newTokenGateBackend(base ObjectStorageBackend) *tokenGateBackend {
+	return &tokenGateBackend{
+		recordingBackend: newRecordingBackend(base),
+		uploadEntered:    make(chan struct{}, 16),
+		uploadTokens:     make(chan struct{}, 16),
+		releaseAll:       make(chan struct{}),
+	}
+}
+
+func (b *tokenGateBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
+	isPack := strings.HasSuffix(key, ".pack") || strings.Contains(key, "blobs/")
+	if isPack {
+		b.uploadEntered <- struct{}{}
+		select {
+		case <-b.uploadTokens:
+		case <-b.releaseAll:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return b.recordingBackend.PutObject(ctx, volumeID, key, stream)
+}
+
+// TestStagingDrain_AtMostFourSyncsAtOnce verifies that at most four syncs started by the drain
+// run at once. With more than four candidates whose uploads are gated, exactly four are started
+// in order of staged bytes and no fifth; releasing one starts exactly one more; and the test fails
+// if the limit is removed or raised. Driven entirely by signals with no sleeps.
+func TestStagingDrain_AtMostFourSyncsAtOnce(t *testing.T) {
+	ctx := t.Context()
+	backend := newTokenGateBackend(NewMemoryBackend())
+	ceilingBytes := int64(32 * 1024 * 1024)
+	server := NewTestServer(t, backend, WithServerMaxLocalStagingBytes(ceilingBytes), WithServerSyncCoalesceWindow(10*time.Minute))
+
+	// Ceiling: 32 MiB (32768 KiB). High-water (75%): 24576 KiB. Low-water (50%): 16384 KiB.
+	// Minimum eligible for background drain: 1 MiB (1024 KiB).
+	// Base: 18 volumes of 800 KiB = 14400 KiB (< 1 MiB minimum, ineligible for drain).
+	for i := 0; i < 18; i++ {
+		setupTestVolume(ctx, t, server, fmt.Sprintf("test-four-limit-base-%d", i), 800*1024, nil)
+	}
+
+	type candidateInfo struct {
+		volumeID    string
+		stagedBytes int64
+	}
+	candidates := []candidateInfo{
+		{volumeID: "test-four-limit-cand-1", stagedBytes: 2200 * 1024},
+		{volumeID: "test-four-limit-cand-2", stagedBytes: 2000 * 1024},
+		{volumeID: "test-four-limit-cand-3", stagedBytes: 1800 * 1024},
+		{volumeID: "test-four-limit-cand-4", stagedBytes: 1600 * 1024},
+		{volumeID: "test-four-limit-cand-5", stagedBytes: 1400 * 1024},
+		{volumeID: "test-four-limit-cand-6", stagedBytes: 1300 * 1024},
+	}
+
+	var startCounts [6]atomic.Int32
+	var startOrder []string
+	var startOrderMu sync.Mutex
+
+	for candidateIndex, candidate := range candidates {
+		index := candidateIndex
+		candidateVolumeID := candidate.volumeID
+		hook := func() {
+			startCounts[index].Add(1)
+			startOrderMu.Lock()
+			startOrder = append(startOrder, candidateVolumeID)
+			startOrderMu.Unlock()
+		}
+
+		setupTestVolume(ctx, t, server, candidate.volumeID, candidate.stagedBytes, hook)
+	}
+
+	// Step 1: Writing Candidate 6 crossed the 75% high-water mark (24700 KiB >= 24576 KiB).
+	// Exactly four candidates (Candidates 1-4) must be started and enter their upload gates.
+	// Candidate 5 must NOT be started because of the limit of four, even though projected staged
+	// bytes (24700 - 7600 = 17100 KiB) is still above the 50% low-water mark (16384 KiB).
+	for i := 0; i < 4; i++ {
+		select {
+		case <-backend.uploadEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for candidate %d to enter upload gate", i+1)
+		}
+	}
+	waitForDrainPass(t, server, 1)
+
+	for i := 0; i < 4; i++ {
+		if count := startCounts[i].Load(); count != 1 {
+			t.Fatalf("Candidate %d started %d times, want 1", i+1, count)
+		}
+	}
+	if count := startCounts[4].Load(); count != 0 {
+		t.Fatalf("Candidate 5 started %d times before release, want 0 (proves at most 4 run at once)", count)
+	}
+	if count := startCounts[5].Load(); count != 0 {
+		t.Fatalf("Candidate 6 started %d times before release, want 0", count)
+	}
+	select {
+	case <-backend.uploadEntered:
+		t.Fatal("unexpected 5th upload entered gate")
+	default:
+	}
+
+	// Step 2: Release ONE upload.
+	// When one finishes, exactly one more candidate (Candidate 5) must be started.
+	backend.uploadTokens <- struct{}{}
+	select {
+	case <-backend.uploadEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for 5th candidate upload to enter gate after releasing one")
+	}
+	waitForDrainPass(t, server, 2)
+
+	if count := startCounts[4].Load(); count != 1 {
+		t.Fatalf("Candidate 5 started %d times after releasing one, want 1", count)
+	}
+	if count := startCounts[5].Load(); count != 0 {
+		t.Fatalf("Candidate 6 started %d times after releasing one, want 0", count)
+	}
+	select {
+	case <-backend.uploadEntered:
+		t.Fatal("unexpected 6th upload entered gate")
+	default:
+	}
+
+	// Verify order of starts is strictly largest staged bytes first: 1, 2, 3, 4, 5.
+	startOrderMu.Lock()
+	currentOrder := append([]string(nil), startOrder...)
+	startOrderMu.Unlock()
+	wantOrder := []string{
+		candidates[0].volumeID,
+		candidates[1].volumeID,
+		candidates[2].volumeID,
+		candidates[3].volumeID,
+		candidates[4].volumeID,
+	}
+	if len(currentOrder) != len(wantOrder) {
+		t.Fatalf("startOrder length = %d, want %d: %v", len(currentOrder), len(wantOrder), currentOrder)
+	}
+	for i, want := range wantOrder {
+		if currentOrder[i] != want {
+			t.Fatalf("startOrder[%d] = %s, want %s (order of starts must be by staged bytes)", i, currentOrder[i], want)
+		}
+	}
+
+	// Step 3: Release all remaining gated uploads to allow clean drain down to low-water mark.
+	close(backend.releaseAll)
+	waitStagedAtOrBelow(t, server, 16384*1024)
+
+	// Candidate 6 was never started because projection reached low-water mark with Candidate 5.
+	if count := startCounts[5].Load(); count != 0 {
+		t.Fatalf("Candidate 6 started %d times after drain completion, want 0", count)
+	}
+}
+
+// TestStagingDrain_ExternalSyncsDoNotCountTowardLimit verifies that syncs not started by the drain
+// (such as external coalesce syncs, timer syncs, fsyncs, or ceiling syncs) do not count toward
+// the drain concurrency limit of four, so the drain still starts four syncs of its own while
+// external syncs are running. Driven entirely by signals with no sleeps.
+func TestStagingDrain_ExternalSyncsDoNotCountTowardLimit(t *testing.T) {
+	ctx := t.Context()
+	backend := newTokenGateBackend(NewMemoryBackend())
+	ceilingBytes := int64(32 * 1024 * 1024)
+	server := NewTestServer(t, backend, WithServerMaxLocalStagingBytes(ceilingBytes), WithServerSyncCoalesceWindow(10*time.Minute))
+
+	// Ceiling: 32 MiB (32768 KiB). High-water (75%): 24576 KiB. Low-water (50%): 16384 KiB.
+	// Minimum eligible for background drain: 1 MiB (1024 KiB).
+	// Base: 20 volumes of 800 KiB = 16000 KiB (< 1 MiB minimum, ineligible for drain).
+	for i := 0; i < 20; i++ {
+		setupTestVolume(ctx, t, server, fmt.Sprintf("test-ext-limit-base-%d", i), 800*1024, nil)
+	}
+
+	// Two external volumes that start syncs directly (not via drain), e.g. from timer, fsync or ceiling.
+	externalVolume1 := setupTestVolume(ctx, t, server, "test-ext-limit-vol-1", 1100*1024, nil)
+	externalVolume2 := setupTestVolume(ctx, t, server, "test-ext-limit-vol-2", 1100*1024, nil)
+
+	externalVolume1SyncError := make(chan error, 1)
+	externalVolume2SyncError := make(chan error, 1)
+
+	// Start external syncs on both volumes and wait for both to enter the upload gate.
+	go func() {
+		externalVolume1SyncError <- externalVolume1.runCoalesceSync()
+	}()
+	go func() {
+		externalVolume2SyncError <- externalVolume2.runCoalesceSync()
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-backend.uploadEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for external sync %d to enter upload gate", i+1)
+		}
+	}
+
+	// 5 drain candidate volumes.
+	type candidateInfo struct {
+		volumeID    string
+		stagedBytes int64
+	}
+	candidates := []candidateInfo{
+		{volumeID: "test-ext-limit-cand-1", stagedBytes: 1500 * 1024},
+		{volumeID: "test-ext-limit-cand-2", stagedBytes: 1400 * 1024},
+		{volumeID: "test-ext-limit-cand-3", stagedBytes: 1300 * 1024},
+		{volumeID: "test-ext-limit-cand-4", stagedBytes: 1200 * 1024},
+		{volumeID: "test-ext-limit-cand-5", stagedBytes: 1100 * 1024},
+	}
+
+	var startCounts [5]atomic.Int32
+	for candidateIndex, candidate := range candidates {
+		index := candidateIndex
+		hook := func() {
+			startCounts[index].Add(1)
+		}
+		setupTestVolume(ctx, t, server, candidate.volumeID, candidate.stagedBytes, hook)
+	}
+
+	// Writing Candidate 5 crossed the 75% high-water mark (24700 KiB >= 24576 KiB).
+	// Even though two external syncs are already running and gated, the drain must NOT count them
+	// toward its limit of four, and must start four syncs of its own (Candidates 1-4).
+	for i := 0; i < 4; i++ {
+		select {
+		case <-backend.uploadEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for drain candidate %d to enter upload gate", i+1)
+		}
+	}
+	waitForDrainPass(t, server, 1)
+
+	// Exactly four drain-started candidates must be running.
+	for i := 0; i < 4; i++ {
+		if count := startCounts[i].Load(); count != 1 {
+			t.Fatalf("Candidate %d started %d times, want 1 (drain must start 4 of its own)", i+1, count)
+		}
+	}
+	// Candidate 5 must NOT be started because the drain reached its limit of four.
+	if count := startCounts[4].Load(); count != 0 {
+		t.Fatalf("Candidate 5 started %d times, want 0", count)
+	}
+	select {
+	case <-backend.uploadEntered:
+		t.Fatal("unexpected upload entered gate")
+	default:
+	}
+
+	// Release all uploads (both external and drain) to allow clean shutdown.
+	close(backend.releaseAll)
+
+	select {
+	case err := <-externalVolume1SyncError:
+		if err != nil {
+			t.Fatalf("externalVolume1.runCoalesceSync returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for externalVolume1 sync to complete")
+	}
+
+	select {
+	case err := <-externalVolume2SyncError:
+		if err != nil {
+			t.Fatalf("externalVolume2.runCoalesceSync returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for externalVolume2 sync to complete")
+	}
+
+	waitStagedAtOrBelow(t, server, 16384*1024)
+}
