@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -197,18 +198,50 @@ type serverMetadataConfig struct {
 type serverDiskLimits struct {
 	// mu guards controller-wide disk accounting fields and coordinates spaceAvailable.
 	mu sync.Mutex
-	// stagedBytes tracks the controller-wide total of unuploaded staged write bytes across all volumes.
+	// stagedBytes tracks the controller-wide total of unuploaded staged write bytes across all volumes. Guarded by mu.
 	stagedBytes int64
-	// maxStagingBytes configures the controller-wide ceiling of unuploaded staged write bytes across all volumes (0 disables).
+	// maxStagingBytes configures the controller-wide ceiling of unuploaded staged write bytes across all volumes (0 disables). Guarded by mu.
 	maxStagingBytes int64
 	// spaceAvailable coordinates writers waiting for unuploaded staged bytes to fall below maxStagingBytes.
 	spaceAvailable *sync.Cond
-	// lastCeilingLog records the last time the ceiling log line was emitted for rate limiting.
+	// lastCeilingLog records the last time the ceiling log line was emitted for rate limiting. Guarded by mu.
 	lastCeilingLog time.Time
 }
 
-// DefaultMaxLocalStagingBytes sets the default controller-wide ceiling of unuploaded staged bytes (16 GiB).
-const DefaultMaxLocalStagingBytes int64 = 16 * 1024 * 1024 * 1024
+// stagingDrain coordinates background draining of staged writes across volumes.
+type stagingDrain struct {
+	Runnable
+	// wake signals the drainLoop goroutine to evaluate staging marks. Requires no lock.
+	wake chan struct{}
+	// loopDone is closed when drainLoop exits. Requires no lock.
+	loopDone chan struct{}
+	// passCount is atomic and tracks completed evaluation passes for test synchronization.
+	passCount atomic.Int64
+}
+
+// wakeDrain sends a non-blocking signal to wake the drain loop.
+// Safe to call with any or no locks held.
+func (d *stagingDrain) wakeDrain() {
+	select {
+	case d.wake <- struct{}{}:
+	default:
+	}
+}
+
+const (
+	// DefaultMaxLocalStagingBytes sets the default controller-wide ceiling of unuploaded staged bytes (16 GiB).
+	DefaultMaxLocalStagingBytes int64 = 16 * 1024 * 1024 * 1024
+
+	// stagingHighWaterPercent is the percentage of maxStagingBytes at which background draining begins (75%).
+	stagingHighWaterPercent = 75
+
+	// stagingLowWaterPercent is the percentage of maxStagingBytes at or below which background draining stops (50%).
+	stagingLowWaterPercent = 50
+
+	// stagingDrainMinimumBytes is the minimum unuploaded staged bytes a volume must hold to be eligible
+	// for background drain syncing (1 MiB).
+	stagingDrainMinimumBytes int64 = 1024 * 1024
+)
 
 type Server struct {
 	pb.UnimplementedObjectFSControllerServer
@@ -236,6 +269,9 @@ type Server struct {
 
 	// diskLimits groups configuration, accounting, and synchronization for controller-wide staging limits.
 	diskLimits serverDiskLimits
+
+	// drain coordinates background draining of staged writes across volumes.
+	drain stagingDrain
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -491,6 +527,8 @@ func WithServerTempWALDir(dir string) ServerOption {
 	}
 }
 
+// NewServer creates a new Server. Callers must call Server.Start(ctx) to start background
+// loops (including the staging drain loop).
 func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if backend == nil {
 		backend = NewMemoryBackend()
@@ -514,6 +552,10 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 			maxStagingBytes: DefaultMaxLocalStagingBytes,
 		},
 		restoring: make(map[string]bool),
+		drain: stagingDrain{
+			wake:     make(chan struct{}, 1),
+			loopDone: make(chan struct{}),
+		},
 	}
 	s.diskLimits.spaceAvailable = sync.NewCond(&s.diskLimits.mu)
 	for _, opt := range opts {
@@ -658,12 +700,25 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	return volume, nil
 }
 
-// Close stops periodic flushing and closes all active volumes and streams.
+// Start starts background loops tied to ctx lifecycle. Callers must call Server.Start
+// to enable the staging drain loop.
+// Returns an error if called more than once or after the server is closed.
+// Requires no locks held.
+func (s *Server) Start(ctx context.Context) error {
+	if err := s.drain.Start(ctx, s.drainLoop); err != nil {
+		return fmt.Errorf("server %w", err)
+	}
+	return nil
+}
+
+// Close stops background loops, periodic flushing, and closes all active volumes and streams.
 func (s *Server) Close() error {
 	var errs []error
 	var ran bool
 	s.closeOnce.Do(func() {
 		ran = true
+		s.drain.Stop()
+
 		if err := s.StopPeriodicFlush(); err != nil {
 			errs = append(errs, err)
 		}
@@ -721,6 +776,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if err := s.StopPeriodicFlush(); err != nil {
 		errs = append(errs, err)
 	}
+
+	s.drain.Stop()
 
 	s.mu.RLock()
 	volumes := make([]*Volume, 0, len(s.volumes))
@@ -2092,12 +2149,28 @@ func (s *Server) Stats() ServerStats {
 	}
 }
 
-// add adds delta to the controller-wide total of unuploaded staged bytes.
+// addStagedDiskBytes adds delta to the controller-wide staged byte count and wakes
+// the background drain loop if the total is at or above the high-water mark.
+func (s *Server) addStagedDiskBytes(delta int64) {
+	if s.diskLimits.add(delta) {
+		s.drain.wakeDrain()
+	}
+}
+
+// onStagedBytesReleased notifies the server that a volume released staged bytes after a sync,
+// waking the drain loop to evaluate whether further draining is needed.
+func (s *Server) onStagedBytesReleased() {
+	s.drain.wakeDrain()
+}
+
+// add adds delta to the controller-wide total of unuploaded staged bytes
+// and returns whether the new total is at or above the high-water mark.
 // Always called with the volume's stagingMu held. Lock order: Server.mu, then Volume.stagingMu, then serverDiskLimits.mu.
-func (l *serverDiskLimits) add(delta int64) {
+func (l *serverDiskLimits) add(delta int64) bool {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.stagedBytes += delta
-	l.mu.Unlock()
+	return l.maxStagingBytes > 0 && l.stagedBytes >= (l.maxStagingBytes*stagingHighWaterPercent/100)
 }
 
 // subtract subtracts delta from the controller-wide total of unuploaded staged bytes
@@ -2253,5 +2326,154 @@ func (s *Server) triggerStagedVolumesSync() {
 
 	for _, entry := range stagedVolumes {
 		entry.volume.triggerSyncIfStaged()
+	}
+}
+
+// volumeDrainResult reports the outcome of an individual volume coalesce sync started by the drain loop.
+type volumeDrainResult struct {
+	// volumeID identifies the volume whose sync finished.
+	volumeID string
+	// err is the error result from the sync, or nil on success.
+	err error
+}
+
+// drainLoop runs a background loop responding to staging wake-up signals until ctx is cancelled.
+// Draining starts when unuploaded staged bytes cross the 75% high-water mark, and stops
+// once unuploaded staged bytes fall at or below the 50% low-water mark.
+// Requires no locks held upon entry.
+func (s *Server) drainLoop(ctx context.Context) {
+	defer close(s.drain.loopDone)
+
+	draining := false
+	skippedThisEpisode := make(map[string]bool)
+	activeDrainSyncs := make(map[string]int64)
+	drainDone := make(chan volumeDrainResult, 16)
+
+	handleDrainResult := func(result volumeDrainResult) {
+		delete(activeDrainSyncs, result.volumeID)
+		if result.err != nil {
+			if draining {
+				skippedThisEpisode[result.volumeID] = true
+			}
+			scoped.Log(ctx).Error(result.err, "drain sync failed", "volume", result.volumeID)
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.drain.wake:
+		case result := <-drainDone:
+			handleDrainResult(result)
+		}
+
+		for drainingMore := true; drainingMore; {
+			select {
+			case result := <-drainDone:
+				handleDrainResult(result)
+			default:
+				drainingMore = false
+			}
+		}
+
+		s.diskLimits.mu.Lock()
+		maxStagingBytes := s.diskLimits.maxStagingBytes
+		stagedBytes := s.diskLimits.stagedBytes
+		s.diskLimits.mu.Unlock()
+
+		if maxStagingBytes <= 0 {
+			draining = false
+			clear(skippedThisEpisode)
+			s.drain.passCount.Add(1)
+			continue
+		}
+
+		highWaterBytes := maxStagingBytes * stagingHighWaterPercent / 100
+		lowWaterBytes := maxStagingBytes * stagingLowWaterPercent / 100
+
+		if stagedBytes <= lowWaterBytes {
+			draining = false
+			clear(skippedThisEpisode)
+			s.drain.passCount.Add(1)
+			continue
+		}
+
+		if stagedBytes >= highWaterBytes {
+			if !draining {
+				draining = true
+				clear(skippedThisEpisode)
+			}
+		}
+
+		if !draining {
+			s.drain.passCount.Add(1)
+			continue
+		}
+
+		s.mu.RLock()
+		volumes := make([]*Volume, 0, len(s.volumes))
+		for _, registeredVolume := range s.volumes {
+			volumes = append(volumes, registeredVolume)
+		}
+		s.mu.RUnlock()
+
+		var totalInFlight int64
+		for _, activeBytes := range activeDrainSyncs {
+			totalInFlight += activeBytes
+		}
+
+		candidates := make([]volumeStagedBytes, 0, len(volumes))
+		for _, candidateVolume := range volumes {
+			candidateStagedBytes, isSyncRunning := candidateVolume.stagingStatus()
+			if isSyncRunning {
+				if _, isTrackedByDrain := activeDrainSyncs[candidateVolume.volumeID]; !isTrackedByDrain {
+					totalInFlight += candidateStagedBytes
+				}
+				continue
+			}
+			if candidateStagedBytes <= 0 || skippedThisEpisode[candidateVolume.volumeID] {
+				continue
+			}
+			if _, isTrackedByDrain := activeDrainSyncs[candidateVolume.volumeID]; isTrackedByDrain {
+				continue
+			}
+			if candidateStagedBytes < stagingDrainMinimumBytes {
+				continue
+			}
+			candidates = append(candidates, volumeStagedBytes{
+				volume:      candidateVolume,
+				stagedBytes: candidateStagedBytes,
+			})
+		}
+
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].stagedBytes != candidates[j].stagedBytes {
+				return candidates[i].stagedBytes > candidates[j].stagedBytes
+			}
+			return candidates[i].volume.volumeID < candidates[j].volume.volumeID
+		})
+
+		for _, candidate := range candidates {
+			if stagedBytes-totalInFlight <= lowWaterBytes {
+				break
+			}
+			targetVolume := candidate.volume
+			targetVolumeID := targetVolume.volumeID
+			stagedBytesToDrain := targetVolume.triggerDrainSync()
+			if stagedBytesToDrain > 0 {
+				activeDrainSyncs[targetVolumeID] = stagedBytesToDrain
+				totalInFlight += stagedBytesToDrain
+				go func(syncVolume *Volume, syncVolumeID string) {
+					syncErr := syncVolume.runCoalesceSync()
+					select {
+					case drainDone <- volumeDrainResult{volumeID: syncVolumeID, err: syncErr}:
+					case <-ctx.Done():
+					}
+				}(targetVolume, targetVolumeID)
+			}
+		}
+
+		s.drain.passCount.Add(1)
 	}
 }

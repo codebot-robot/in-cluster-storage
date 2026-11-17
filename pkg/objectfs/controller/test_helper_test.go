@@ -66,6 +66,10 @@ func NewTestServer(t testing.TB, backend ObjectStorageBackend, opts ...ServerOpt
 		server = NewServer(backend, testOpts...)
 	}
 
+	if err := server.Start(t.Context()); err != nil {
+		t.Fatalf("server.Start failed: %v", err)
+	}
+
 	t.Cleanup(func() {
 		if err := server.Close(); err != nil {
 			t.Errorf("server.Close failed on test cleanup: %v", err)
