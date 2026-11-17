@@ -39,6 +39,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/waldurability"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
@@ -219,43 +220,73 @@ func (c *syncCoalesceState) failWaiters(err error) {
 // volumeSettings groups per-volume configuration options and policies.
 type volumeSettings struct {
 	// consistencyMode controls the consistency model (e.g. STANDARD or CLOSE_TO_OPEN) for this volume.
-	// Written by WithConsistencyMode, SetConsistencyMode, PersistConsistencyMode, loadFromBackendMetadataLocked,
-	// and loadVolumeInfoLocked. Guarded by Volume.mu.
 	consistencyMode pb.ConsistencyMode
 
 	// metadataDurability controls whether metadata operations wait for durability per operation or at barriers.
-	// Effective runtime value used for operations. Defaults to OPERATION. Written by WithMetadataDurability,
-	// PersistMetadataDurability, loadFromBackendMetadataLocked, and loadVolumeInfoLocked. Guarded by Volume.mu.
 	metadataDurability pb.MetadataDurability
 
-	// storedMetadataDurability tracks the durability mode explicitly persisted in the volume's info row,
-	// or METADATA_DURABILITY_UNSPECIFIED if no mode was stored at creation. Persisted to SDS VolumeInfo
-	// in PersistMetadataDurability, and set by loadFromBackendMetadataLocked and loadVolumeInfoLocked.
-	// Guarded by Volume.mu.
-	storedMetadataDurability pb.MetadataDurability
+	// walDurability controls the sync durability level for volume WAL streams.
+	walDurability pb.WalDurability
+}
 
+// volumeLimits groups construction-time timeouts and byte bounds.
+// Immutable after construction; safe to read without holding Volume.mu.
+type volumeLimits struct {
 	// syncTimeout sets the timeout duration for coalesced background sync operations.
-	// Defaults to 10 minutes. Immutable after construction.
+	// Defaults to 10 minutes.
 	syncTimeout time.Duration
 
 	// openBarrierTimeout sets the timeout duration for the open-side barrier on close-to-open volumes.
-	// Defaults to 30 seconds. Immutable after construction.
+	// Defaults to 30 seconds.
 	openBarrierTimeout time.Duration
 
 	// maxStagingBytes sets the maximum byte bound for in-memory staged writes on this volume.
-	// Defaults to 64 MiB. Immutable after construction.
+	// Defaults to 64 MiB.
 	maxStagingBytes int64
+}
 
-	// durability sets the default sync durability level requested for volume WAL streams.
-	// Defaults to Local. Immutable after construction.
-	durability walclient.Level
+// resolveEffectiveSettings produces the active volumeSettings by resolving
+// any unspecified fields in configured against controller defaults.
+func resolveEffectiveSettings(configured, defaults volumeSettings) volumeSettings {
+	effective := configured
+	if effective.consistencyMode == pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+		effective.consistencyMode = defaults.consistencyMode
+	}
+	if effective.metadataDurability == pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+		effective.metadataDurability = defaults.metadataDurability
+	}
+	if effective.walDurability == pb.WalDurability_WAL_DURABILITY_UNSPECIFIED {
+		effective.walDurability = defaults.walDurability
+	}
+	return effective
+}
+
+// recomputeEffectiveLocked updates effective settings from configured and controller defaults.
+// Requires v.mu held (or called during construction before concurrency).
+func (v *Volume) recomputeEffectiveLocked() {
+	v.effective = resolveEffectiveSettings(v.configured, v.defaults)
 }
 
 type Volume struct {
 	server *Server
 
-	// settings groups per-volume configuration options and policies.
-	settings volumeSettings
+	// configured holds settings explicitly persisted in the volume's VolumeInfo row.
+	// A zero or UNSPECIFIED field means nothing was stored; use controller defaults.
+	// Guarded by mu.
+	configured volumeSettings
+
+	// effective holds the active settings resolved from configured and controller defaults.
+	// Every field is fully resolved; none is UNSPECIFIED.
+	// Guarded by mu.
+	effective volumeSettings
+
+	// defaults holds the controller's default settings passed at construction.
+	// Every field is fully resolved. Immutable after construction.
+	defaults volumeSettings
+
+	// limits holds construction-time timeouts and staging bounds.
+	// Immutable after construction; safe to read without holding mu.
+	limits volumeLimits
 
 	// Lock order: stagingMu may be held while taking mu for reading; mu must never be held while taking stagingMu.
 	mu           sync.RWMutex
@@ -367,7 +398,7 @@ func WithSyncCoalesceWindow(d time.Duration) VolumeOption {
 func WithMaxStagingBytes(b int64) VolumeOption {
 	return func(v *Volume) {
 		if b > 0 {
-			v.settings.maxStagingBytes = b
+			v.limits.maxStagingBytes = b
 		}
 	}
 }
@@ -385,7 +416,7 @@ func WithBlobStore(store *blob.Store) VolumeOption {
 func WithSyncTimeout(d time.Duration) VolumeOption {
 	return func(v *Volume) {
 		if d > 0 {
-			v.settings.syncTimeout = d
+			v.limits.syncTimeout = d
 		}
 	}
 }
@@ -394,24 +425,26 @@ func WithSyncTimeout(d time.Duration) VolumeOption {
 func WithOpenBarrierTimeout(d time.Duration) VolumeOption {
 	return func(v *Volume) {
 		if d > 0 {
-			v.settings.openBarrierTimeout = d
+			v.limits.openBarrierTimeout = d
 		}
 	}
 }
 
-// WithConsistencyMode sets the consistency mode for the volume.
+// WithConsistencyMode sets the default consistency mode for the volume.
 func WithConsistencyMode(mode pb.ConsistencyMode) VolumeOption {
 	return func(v *Volume) {
-		v.settings.consistencyMode = mode
+		if mode != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+			v.defaults.consistencyMode = mode
+		}
 	}
 }
 
-// WithMetadataDurability sets the metadata durability mode for the volume.
+// WithMetadataDurability sets the default metadata durability mode for the volume.
 // Takes no locks.
 func WithMetadataDurability(mode pb.MetadataDurability) VolumeOption {
 	return func(v *Volume) {
 		if mode != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
-			v.settings.metadataDurability = mode
+			v.defaults.metadataDurability = mode
 		}
 	}
 }
@@ -451,10 +484,12 @@ func WithStream(stream walclient.Stream) VolumeOption {
 	}
 }
 
-// WithDurability sets the default durability level for metadata changes.
-func WithDurability(level walclient.Level) VolumeOption {
+// WithWalDurability sets the default WAL durability level for the volume.
+func WithWalDurability(durability pb.WalDurability) VolumeOption {
 	return func(v *Volume) {
-		v.settings.durability = level
+		if durability != pb.WalDurability_WAL_DURABILITY_UNSPECIFIED {
+			v.defaults.walDurability = durability
+		}
 	}
 }
 
@@ -657,12 +692,15 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	}
 
 	v := &Volume{
-		settings: volumeSettings{
-			durability:         walclient.Local,
+		defaults: volumeSettings{
+			consistencyMode:    pb.ConsistencyMode_STANDARD,
 			metadataDurability: pb.MetadataDurability_OPERATION,
-			maxStagingBytes:    64 * 1024 * 1024,
+			walDurability:      pb.WalDurability_LOCAL,
+		},
+		limits: volumeLimits{
 			syncTimeout:        10 * time.Minute,
 			openBarrierTimeout: 30 * time.Second,
+			maxStagingBytes:    64 * 1024 * 1024,
 		},
 		volumeID:        volumeID,
 		rootInodeID:     1,
@@ -695,6 +733,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 	for _, opt := range opts {
 		opt(v)
 	}
+	v.recomputeEffectiveLocked()
 
 	if v.localStorageDir == "" {
 		return nil, errors.New("volume requires local storage directory for metadata and write staging (use WithLocalStorageDir)")
@@ -751,7 +790,7 @@ func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 			eligible = append(eligible, packID)
 		}
 	}
-	if total+neededBytes <= v.settings.maxStagingBytes || len(eligible) == 0 {
+	if total+neededBytes <= v.limits.maxStagingBytes || len(eligible) == 0 {
 		return
 	}
 	sort.Slice(eligible, func(i, j int) bool { return eligible[i] < eligible[j] })
@@ -763,7 +802,7 @@ func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 		}
 		v.deletePackLocked(packID)
 		total -= packSize
-		if total+neededBytes <= v.settings.maxStagingBytes {
+		if total+neededBytes <= v.limits.maxStagingBytes {
 			break
 		}
 	}
@@ -970,7 +1009,7 @@ func (v *Volume) triggerCoalesceSync() {
 	}
 	v.closeInodes = nil
 
-	timeout := v.settings.syncTimeout
+	timeout := v.limits.syncTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
@@ -1030,7 +1069,7 @@ func (v *Volume) triggerCloseSync() {
 	targetInodes := v.closeInodes
 	v.closeInodes = make(map[uint64]struct{})
 
-	timeout := v.settings.syncTimeout
+	timeout := v.limits.syncTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
@@ -1623,8 +1662,8 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 		return 0, v.finishRealSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 	}
 
-	reqLevel := v.settings.durability
-	waitFn := v.makeWaitFn(commitSeq, &reqLevel)
+	walDurability := v.effective.walDurability
+	waitFn := v.makeWaitFn(commitSeq, walDurability)
 	v.mu.Unlock()
 
 	v.stagingMu.Lock()
@@ -1893,11 +1932,12 @@ func (v *Volume) StreamID() uuid.UUID {
 	return v.streamID
 }
 
-// Durability returns the default durability level configured on this volume.
-func (v *Volume) Durability() walclient.Level {
+// WalDurability returns the effective WAL durability level for this volume.
+// Reads effective.walDurability; takes v.mu for reading.
+func (v *Volume) WalDurability() pb.WalDurability {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.settings.durability
+	return v.effective.walDurability
 }
 
 // Degraded returns the DegradedError if the underlying WAL stream is degraded, or nil if healthy.
@@ -1919,42 +1959,55 @@ func (v *Volume) ResetStream(stream walclient.Stream) error {
 	return v.registerMetadataTypesLocked(context.Background(), nil)
 }
 
-// ConsistencyMode returns the configured consistency mode for this volume.
+// ConsistencyMode returns the effective consistency mode for this volume.
+// Reads effective.consistencyMode; takes v.mu for reading.
 func (v *Volume) ConsistencyMode() pb.ConsistencyMode {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.settings.consistencyMode
+	return v.effective.consistencyMode
+}
+
+// StoredConsistencyMode returns the consistency mode stored in the volume's info row,
+// or CONSISTENCY_MODE_UNSPECIFIED if no mode has been stored.
+// Reads configured.consistencyMode; takes v.mu for reading.
+func (v *Volume) StoredConsistencyMode() pb.ConsistencyMode {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.configured.consistencyMode
 }
 
 // SetConsistencyMode updates the consistency mode for this volume.
+// Takes v.mu for writing.
 func (v *Volume) SetConsistencyMode(mode pb.ConsistencyMode) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.settings.consistencyMode = mode
+	v.configured.consistencyMode = mode
+	v.recomputeEffectiveLocked()
 }
 
-// MetadataDurability returns the configured metadata durability mode for this volume.
-// Takes v.mu for reading.
+// MetadataDurability returns the effective metadata durability mode for this volume.
+// Reads effective.metadataDurability; takes v.mu for reading.
 func (v *Volume) MetadataDurability() pb.MetadataDurability {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.settings.metadataDurability
+	return v.effective.metadataDurability
 }
 
 // StoredMetadataDurability returns the metadata durability mode stored in the volume's info row,
 // or METADATA_DURABILITY_UNSPECIFIED if no mode has been stored.
-// Takes v.mu for reading.
+// Reads configured.metadataDurability; takes v.mu for reading.
 func (v *Volume) StoredMetadataDurability() pb.MetadataDurability {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.settings.storedMetadataDurability
+	return v.configured.metadataDurability
 }
 
 // PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store,
 // waiting until the persisted VolumeInfo record reaches the volume's durability level.
 func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
 	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
-		v.settings.consistencyMode = mode
+		v.configured.consistencyMode = mode
+		v.recomputeEffectiveLocked()
 		volumeInfo.ConsistencyMode = mode
 	})
 	if err != nil {
@@ -1973,8 +2026,8 @@ func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.Consistency
 // waiting until the persisted VolumeInfo record reaches the volume's durability level.
 func (v *Volume) PersistMetadataDurability(ctx context.Context, mode pb.MetadataDurability) error {
 	commitSequence, err := v.persistVolumeInfo(ctx, func(volumeInfo *pb.VolumeInfo) {
-		v.settings.metadataDurability = mode
-		v.settings.storedMetadataDurability = mode
+		v.configured.metadataDurability = mode
+		v.recomputeEffectiveLocked()
 		volumeInfo.MetadataDurability = mode
 	})
 	if err != nil {
@@ -2288,56 +2341,40 @@ func (v *Volume) Close() error {
 	return firstErr
 }
 
-// logMutationLocked appends a mutation record to the WAL stream under v.mu.
-// It returns a wait function that blocks until the requested durability level is reached.
-// The wait function MUST be invoked outside v.mu so that WAL durability waits do not
-// block concurrent volume operations.
-//
-// If the durability wait fails (e.g. context cancelled, stream closed), the mutation
-// has already been applied to in-memory state and appended locally, so no rollback is
-// attempted; the error is returned to inform the caller that durability was not achieved.
-//
-// makeWaitFn only builds the wait and records nothing.
-func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(context.Context) error {
+// makeWaitFn returns a durability wait function for commitSeq using the specified WAL durability.
+// Where code needs a walclient.Level, it is computed from the effective proto value at the point of use.
+// An unspecified or unknown value produces an error from the wait, not a silent "local".
+func (v *Volume) makeWaitFn(commitSeq uint64, durability pb.WalDurability) func(context.Context) error {
 	if commitSeq == 0 {
 		return nil
 	}
-	durability := v.settings.durability
-	if reqLevel != nil {
-		durability = *reqLevel
-	}
-
 	return func(waitCtx context.Context) error {
-		switch durability {
-		case walclient.Permanent:
-			return v.stream.Wait(waitCtx, commitSeq, walclient.Permanent, true)
-		case walclient.Witness:
-			return v.stream.Wait(waitCtx, commitSeq, walclient.Witness, false)
-		case walclient.Local:
-			return v.stream.Wait(waitCtx, commitSeq, walclient.Local, false)
+		level, err := waldurability.ToLevel(durability)
+		if err != nil {
+			return err
 		}
-		return nil
+		return v.stream.Wait(waitCtx, commitSeq, level, level == walclient.Permanent)
 	}
 }
 
 // makeMetadataWaitFn returns a durability wait function for a metadata operation.
 // In barrier mode it returns nil without waiting. In per-operation mode it delegates
-// to makeWaitFn.
+// to makeWaitFn using the effective WAL durability.
 //
 // In barrier mode, operations past rejectMutation() that commit after Volume.Stop reads
 // the newest sequence do not wait, leaving them uncovered by Stop's durability wait;
 // callers must quiesce mutations before initiating graceful shutdown.
 // Requires v.mu held.
 func (v *Volume) makeMetadataWaitFn(commitSeq uint64) func(context.Context) error {
-	if v.settings.metadataDurability == pb.MetadataDurability_BARRIER {
+	if v.effective.metadataDurability == pb.MetadataDurability_BARRIER {
 		return nil
 	}
-	return v.makeWaitFn(commitSeq, nil)
+	return v.makeWaitFn(commitSeq, v.effective.walDurability)
 }
 
-// waitForSequence waits until sequence reaches the volume's configured durability level.
+// waitForSequence waits until sequence reaches the volume's effective WAL durability level.
 func (v *Volume) waitForSequence(ctx context.Context, sequence uint64) error {
-	if waitFn := v.makeWaitFn(sequence, nil); waitFn != nil {
+	if waitFn := v.makeWaitFn(sequence, v.WalDurability()); waitFn != nil {
 		return waitFn(ctx)
 	}
 	return nil
@@ -2755,7 +2792,7 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
 	}
-	waitFn := v.makeWaitFn(commitSeq, nil)
+	waitFn := v.makeWaitFn(commitSeq, v.effective.walDurability)
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
 			return 0, fmt.Errorf("failed to wait for orphan deletion sync: %w", err)
@@ -4797,7 +4834,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 		v.stagingMu.Unlock()
 		return 0, 0, time.Time{}, 0, err
 	}
-	if v.stagedBytes+dataLength > v.settings.maxStagingBytes {
+	if v.stagedBytes+dataLength > v.limits.maxStagingBytes {
 		v.stagingMu.Unlock()
 		return 0, 0, time.Time{}, 0, syscall.ENOSPC
 	}
@@ -4852,7 +4889,7 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	if err := v.rejectMutationLocked(); err != nil {
 		return 0, 0, time.Time{}, 0, err
 	}
-	if v.stagedBytes+dataLength > v.settings.maxStagingBytes {
+	if v.stagedBytes+dataLength > v.limits.maxStagingBytes {
 		return 0, 0, time.Time{}, 0, syscall.ENOSPC
 	}
 
@@ -6000,7 +6037,7 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 		return syscall.EIO
 	}
 
-	timeout := v.settings.openBarrierTimeout
+	timeout := v.limits.openBarrierTimeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -6090,7 +6127,7 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 func (v *Volume) Open(ctx context.Context, inodeID uint64, flags uint32) (uint64, *pb.EntryAttr, uint64, error) {
 	v.mu.RLock()
 	inodeID = v.normalizeInodeID(inodeID)
-	isCloseToOpen := v.settings.consistencyMode == pb.ConsistencyMode_CLOSE_TO_OPEN
+	isCloseToOpen := v.effective.consistencyMode == pb.ConsistencyMode_CLOSE_TO_OPEN
 	v.mu.RUnlock()
 
 	if isCloseToOpen {
@@ -6191,7 +6228,7 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 		flushCtx := ctx
 		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 			var cancel context.CancelFunc
-			flushTimeout := v.settings.syncTimeout
+			flushTimeout := v.limits.syncTimeout
 			if flushTimeout <= 0 {
 				flushTimeout = 10 * time.Minute
 			}
@@ -6925,12 +6962,12 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			if ch.TypeName == VolumeInfoTypeName {
 				if volumeInfo, ok := ch.Row.(*pb.VolumeInfo); ok && volumeInfo != nil {
 					if volumeInfo.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-						v.settings.consistencyMode = volumeInfo.GetConsistencyMode()
+						v.configured.consistencyMode = volumeInfo.GetConsistencyMode()
 					}
 					if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
-						v.settings.metadataDurability = volumeInfo.GetMetadataDurability()
-						v.settings.storedMetadataDurability = volumeInfo.GetMetadataDurability()
+						v.configured.metadataDurability = volumeInfo.GetMetadataDurability()
 					}
+					v.recomputeEffectiveLocked()
 				}
 			}
 		}
@@ -7142,12 +7179,12 @@ func (v *Volume) loadVolumeInfoLocked(ctx context.Context) error {
 	if ok && storedMessage != nil {
 		if volumeInfo, ok := storedMessage.(*pb.VolumeInfo); ok && volumeInfo != nil {
 			if volumeInfo.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-				v.settings.consistencyMode = volumeInfo.GetConsistencyMode()
+				v.configured.consistencyMode = volumeInfo.GetConsistencyMode()
 			}
 			if volumeInfo.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
-				v.settings.metadataDurability = volumeInfo.GetMetadataDurability()
-				v.settings.storedMetadataDurability = volumeInfo.GetMetadataDurability()
+				v.configured.metadataDurability = volumeInfo.GetMetadataDurability()
 			}
+			v.recomputeEffectiveLocked()
 		}
 	}
 	return nil

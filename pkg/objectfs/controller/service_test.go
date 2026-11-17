@@ -2027,8 +2027,8 @@ func TestCreateVolume_ConsistencyMode(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: getOrCreateVolume failed: %v", testCase.name, err)
 			}
-			if vol.ConsistencyMode() != testCase.wantMode {
-				t.Errorf("%s: volume mode = %v, want %v", testCase.name, vol.ConsistencyMode(), testCase.wantMode)
+			if vol.StoredConsistencyMode() != testCase.wantMode {
+				t.Errorf("%s: volume mode = %v, want %v", testCase.name, vol.StoredConsistencyMode(), testCase.wantMode)
 			}
 		}
 	}
@@ -5302,7 +5302,7 @@ func TestChunkFetchFailurePropagated(t *testing.T) {
 
 	vol := MustNewVolume(t, volumeID, backend, NewEventBroadcaster(),
 		WithChunkSize(chunkSize),
-		WithDurability(walclient.Local),
+		WithWalDurability(pb.WalDurability_LOCAL),
 	)
 	defer vol.Close()
 
@@ -5491,7 +5491,7 @@ func TestChunkFetchFailurePropagated(t *testing.T) {
 		t.Fatalf("Commit legacy Inode failed: %v", err)
 	}
 	vol.applyTxChangesLocked(ctx, legacyTx)
-	waitFn := vol.makeWaitFn(commitSeq, nil)
+	waitFn := vol.makeWaitFn(commitSeq, vol.effective.walDurability)
 	vol.mu.Unlock()
 	if waitFn != nil {
 		_ = waitFn(ctx)
