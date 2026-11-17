@@ -28,7 +28,6 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
-	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 )
 
 func TestParseEndpoint(t *testing.T) {
@@ -126,17 +125,21 @@ func TestWalDurabilityFlag(t *testing.T) {
 	if err := f.Value.Set("witness"); err != nil {
 		t.Fatalf("Set witness failed: %v", err)
 	}
-	if options.WALDurability != walclient.Witness {
-		t.Errorf("options.WALDurability = %v, want %v", options.WALDurability, walclient.Witness)
+	if options.WALDurability != pb.WalDurability_WITNESS {
+		t.Errorf("options.WALDurability = %v, want %v", options.WALDurability, pb.WalDurability_WITNESS)
 	}
 	if err := f.Value.Set("permanent"); err != nil {
 		t.Fatalf("Set permanent failed: %v", err)
 	}
-	if options.WALDurability != walclient.Permanent {
-		t.Errorf("options.WALDurability = %v, want %v", options.WALDurability, walclient.Permanent)
+	if options.WALDurability != pb.WalDurability_PERMANENT {
+		t.Errorf("options.WALDurability = %v, want %v", options.WALDurability, pb.WalDurability_PERMANENT)
 	}
-	if err := f.Value.Set("invalid"); err == nil {
-		t.Fatal("expected error for invalid durability")
+	err := f.Value.Set("invalid")
+	if err == nil || !strings.Contains(err.Error(), "local") || !strings.Contains(err.Error(), "witness") || !strings.Contains(err.Error(), "permanent") {
+		t.Errorf("Set invalid error = %v, want error naming accepted values local, witness, permanent", err)
+	}
+	if err := flagSet.Parse([]string{"--wal-durability=invalid"}); err == nil {
+		t.Fatal("expected flagSet.Parse to fail for --wal-durability=invalid")
 	}
 }
 
@@ -228,7 +231,7 @@ func TestOptionsParseAndValidate(t *testing.T) {
 
 	if options.Backend != "memory://" || options.MetadataDir != "/tmp/metadata" ||
 		options.WALDir != "/tmp/wal" || options.WALTarget != "127.0.0.1:50051" ||
-		options.Port != 8080 || options.WALDurability != walclient.Permanent ||
+		options.Port != 8080 || options.WALDurability != pb.WalDurability_PERMANENT ||
 		options.MetadataDurability != pb.MetadataDurability_BARRIER ||
 		options.CSIEndpoint != "unix:///tmp/csi.sock" {
 		t.Fatalf("parsed options mismatch: %+v", options)

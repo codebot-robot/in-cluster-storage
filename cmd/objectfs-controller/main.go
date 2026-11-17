@@ -36,12 +36,12 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/metadatadurability"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/waldurability"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
-	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
 )
@@ -58,7 +58,7 @@ type Options struct {
 	FlushInterval             time.Duration
 	WALDir                    string
 	WALTarget                 string
-	WALDurability             walclient.Level
+	WALDurability             pb.WalDurability
 	MetadataDurability        pb.MetadataDurability
 	MetadataIndex             string
 	MetadataIndexCacheMB      int
@@ -83,7 +83,7 @@ func NewOptions() *Options {
 		Port:                     50051,
 		ServerCertDir:            "/etc/objectfs/certs/server",
 		FlushInterval:            1 * time.Hour,
-		WALDurability:            walclient.Local,
+		WALDurability:            pb.WalDurability_LOCAL,
 		MetadataDurability:       pb.MetadataDurability_OPERATION,
 		MetadataIndex:            "sqlite",
 		MetadataIndexCacheMB:     64,
@@ -137,7 +137,7 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.DurationVar(&o.FlushInterval, "flush-interval", o.FlushInterval, "Periodic flush interval to backend object storage")
 	flagSet.StringVar(&o.WALDir, "wal-dir", o.WALDir, "Local directory for caching WAL segments (enables Streams metadata change-log if set)")
 	flagSet.StringVar(&o.WALTarget, "wal-target", o.WALTarget, "Target gRPC address for central WAL buffer (e.g. wal-buffer-client:50051)")
-	flagSet.Var(walclient.NewLevelValue(&o.WALDurability), "wal-durability", "Default WAL durability level (local, witness, permanent)")
+	flagSet.Var(waldurability.NewValue(&o.WALDurability), waldurability.ParameterName, "Default WAL durability level (local, witness, permanent)")
 	flagSet.Var(metadatadurability.NewValue(&o.MetadataDurability), "metadata-durability", "Default metadata durability mode (barrier mode returns before the change is durable, durability is collected by fsync and at shutdown; operation mode waits for WAL durability per operation)")
 	flagSet.Var(&metadataIndexValue{target: &o.MetadataIndex}, "metadata-index", "Metadata local index type (sqlite, table)")
 	flagSet.IntVar(&o.MetadataIndexCacheMB, "metadata-index-cache-mb", o.MetadataIndexCacheMB, "Pebble shared block cache size in megabytes for table metadata index")
@@ -311,7 +311,11 @@ func run(options Options) error {
 		serverOptions = append(serverOptions, controller.WithServerAcceptUnversioned(true))
 	}
 	serverOptions = append(serverOptions, controller.WithServerMetadataDurability(options.MetadataDurability))
-	serverOptions = append(serverOptions, controller.WithServerWAL(options.WALDir, options.WALTarget, options.WALDurability))
+	walDurabilityLevel, err := waldurability.ToLevel(options.WALDurability)
+	if err != nil {
+		return fmt.Errorf("invalid WAL durability: %w", err)
+	}
+	serverOptions = append(serverOptions, controller.WithServerWAL(options.WALDir, options.WALTarget, walDurabilityLevel))
 
 	var grpcServer *grpc.Server
 	if options.Insecure {
