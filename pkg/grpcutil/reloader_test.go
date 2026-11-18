@@ -199,20 +199,70 @@ func generateLeafCert(t *testing.T, b bundle, leafCN string, isServer bool, seri
 	}
 }
 
+func writeFileAtomic(t *testing.T, filename string, data []byte, permissions os.FileMode) {
+	t.Helper()
+	directory := filepath.Dir(filename)
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		t.Fatalf("failed to create directory %s: %v", directory, err)
+	}
+	tempFile, err := os.CreateTemp(directory, filepath.Base(filename)+".*.tmp")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	tempFilePath := tempFile.Name()
+	defer func() {
+		if removeErr := os.Remove(tempFilePath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			t.Logf("cleanup temp file %s: %v", tempFilePath, removeErr)
+		}
+	}()
+	if _, err := tempFile.Write(data); err != nil {
+		if closeErr := tempFile.Close(); closeErr != nil {
+			t.Fatalf("failed to write temp file %s: %v (close error: %v)", tempFilePath, err, closeErr)
+		}
+		t.Fatalf("failed to write temp file %s: %v", tempFilePath, err)
+	}
+	if err := tempFile.Chmod(permissions); err != nil {
+		if closeErr := tempFile.Close(); closeErr != nil {
+			t.Fatalf("failed to chmod temp file %s: %v (close error: %v)", tempFilePath, err, closeErr)
+		}
+		t.Fatalf("failed to chmod temp file %s: %v", tempFilePath, err)
+	}
+	if err := tempFile.Close(); err != nil {
+		t.Fatalf("failed to close temp file %s: %v", tempFilePath, err)
+	}
+	if err := os.Rename(tempFilePath, filename); err != nil {
+		t.Fatalf("failed to rename %s to %s: %v", tempFilePath, filename, err)
+	}
+}
+
 func writeMaterial(t *testing.T, dir string, certPEM, keyPEM, caPEM []byte) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, "tls.key"), keyPEM, 0600); err != nil {
-		t.Fatalf("failed to write tls.key: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "tls.crt"), certPEM, 0644); err != nil {
-		t.Fatalf("failed to write tls.crt: %v", err)
-	}
-	trustDir := filepath.Join(dir, "trust")
-	if err := os.MkdirAll(trustDir, 0755); err != nil {
-		t.Fatalf("failed to create trust dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(trustDir, "ca.crt"), caPEM, 0644); err != nil {
-		t.Fatalf("failed to write ca.crt: %v", err)
+	writeFileAtomic(t, filepath.Join(dir, "tls.key"), keyPEM, 0600)
+	writeFileAtomic(t, filepath.Join(dir, "tls.crt"), certPEM, 0644)
+	writeFileAtomic(t, filepath.Join(dir, "trust", "ca.crt"), caPEM, 0644)
+}
+
+func waitForCertSerial(t *testing.T, reloader *CertReloader, wantSerial *big.Int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		cert, err := reloader.GetCertificate(nil)
+		if err == nil && cert != nil && len(cert.Certificate) > 0 {
+			parsed, err := x509.ParseCertificate(cert.Certificate[0])
+			if err == nil && parsed.SerialNumber.Cmp(wantSerial) == 0 {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			var gotSerial any = "<nil>"
+			if cert, err := reloader.GetCertificate(nil); err == nil && cert != nil && len(cert.Certificate) > 0 {
+				if parsed, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+					gotSerial = parsed.SerialNumber
+				}
+			}
+			t.Fatalf("timed out waiting for reloader to load certificate serial %v (last observed: %v)", wantSerial, gotSerial)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -289,15 +339,13 @@ func TestServerCertReload_NoRestart(t *testing.T) {
 
 	// Update client trust directory with CA2 so new clients trust the new server cert
 	trust2 := append(b1.caPEM, b2.caPEM...)
-	if err := os.WriteFile(filepath.Join(clientDir, "trust", "ca.crt"), trust2, 0644); err != nil {
-		t.Fatalf("failed to update client trust: %v", err)
-	}
+	writeFileAtomic(t, filepath.Join(clientDir, "trust", "ca.crt"), trust2, 0644)
 
 	// Swap server material without restarting server
 	writeMaterial(t, serverDir, b2.certPEM, b2.keyPEM, bClient.caPEM)
 
-	// Wait briefly for fsnotify or trigger reload
-	time.Sleep(100 * time.Millisecond)
+	// Wait for server to reload rotated material
+	waitForCertSerial(t, serverCreds.(interface{ Reloader() *CertReloader }).Reloader(), b2.serial, 5*time.Second)
 
 	// 3. New handshake without restarting server observes ServerCert2
 	clientCreds2, err := NewClientTLSFromDir(ctx, clientDir)
@@ -402,7 +450,9 @@ func TestClientCertReload_NoRestart(t *testing.T) {
 
 	// Swap client certificate files to client-identity-2 without restarting client or server
 	writeMaterial(t, clientDir, bClient2.certPEM, bClient2.keyPEM, bServer.caPEM)
-	time.Sleep(100 * time.Millisecond)
+
+	// Wait for client to reload rotated material
+	waitForCertSerial(t, clientCreds.(interface{ Reloader() *CertReloader }).Reloader(), bClient2.serial, 5*time.Second)
 
 	// Next handshake uses client-identity-2
 	conn2, err := grpc.NewClient(lis.Addr().String(),
@@ -474,12 +524,12 @@ func TestClientCAReload_OnVerificationFailure(t *testing.T) {
 
 	// Rotate server to Server2 (signed by CA2)
 	writeMaterial(t, serverDir, bServer2.certPEM, bServer2.keyPEM, bClient.caPEM)
-	time.Sleep(100 * time.Millisecond)
+
+	// Wait for server to reload rotated material
+	waitForCertSerial(t, serverCreds.(interface{ Reloader() *CertReloader }).Reloader(), bServer2.serial, 5*time.Second)
 
 	// Update client trust directory with CA2 file
-	if err := os.WriteFile(filepath.Join(clientDir, "trust", "ca2.crt"), bServer2.caPEM, 0644); err != nil {
-		t.Fatalf("failed to write ca2.crt: %v", err)
-	}
+	writeFileAtomic(t, filepath.Join(clientDir, "trust", "ca2.crt"), bServer2.caPEM, 0644)
 
 	// Dialing server triggers handshake with Server2; client detects verification failure
 	// against old CA pool and forces an immediate reload of trust/, succeeding on connection retry.
