@@ -35,20 +35,10 @@ func TestCounter_Basic(t *testing.T) {
 		t.Errorf("after Inc(), Value() = %d, want 1", got)
 	}
 
-	c.Add(5)
-	if got := c.Value(); got != 6 {
-		t.Errorf("after Add(5), Value() = %d, want 6", got)
+	c.Inc()
+	if got := c.Value(); got != 2 {
+		t.Errorf("after second Inc(), Value() = %d, want 2", got)
 	}
-}
-
-func TestCounter_NegativeAddPanics(t *testing.T) {
-	c := NewCounter("negative_test")
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("Add(-1) did not panic")
-		}
-	}()
-	c.Add(-1)
 }
 
 func TestCounter_Concurrent(t *testing.T) {
@@ -74,17 +64,4 @@ func TestCounter_Concurrent(t *testing.T) {
 	if got := c.Value(); got != want {
 		t.Fatalf("Value() = %d, want %d", got, want)
 	}
-}
-
-func TestCounter_NilSafe(t *testing.T) {
-	var c *Counter
-	if got := c.Name(); got != "" {
-		t.Errorf("nil Counter Name() = %q, want empty", got)
-	}
-	if got := c.Value(); got != 0 {
-		t.Errorf("nil Counter Value() = %d, want 0", got)
-	}
-	// Should not panic on nil receiver.
-	c.Inc()
-	c.Add(10)
 }

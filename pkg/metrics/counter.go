@@ -38,32 +38,15 @@ func NewCounter(name string) *Counter {
 
 // Name returns the counter's name.
 func (c *Counter) Name() string {
-	if c == nil {
-		return ""
-	}
 	return c.name
 }
 
 // Value returns the current value of the counter.
 func (c *Counter) Value() int64 {
-	if c == nil {
-		return 0
-	}
 	return c.value.Load()
 }
 
 // Inc increments the counter by 1.
 func (c *Counter) Inc() {
-	c.Add(1)
-}
-
-// Add increments the counter by delta. If delta is negative, Add panics.
-func (c *Counter) Add(delta int64) {
-	if delta < 0 {
-		panic("metrics: counter value cannot decrease")
-	}
-	if c == nil {
-		return
-	}
-	c.value.Add(delta)
+	c.value.Add(1)
 }

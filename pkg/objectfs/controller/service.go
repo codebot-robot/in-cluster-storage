@@ -216,10 +216,10 @@ type stagingDrain struct {
 	wake chan struct{}
 	// loopDone is closed when drainLoop exits. Requires no lock.
 	loopDone chan struct{}
-	// drainPassesCompleted counts evaluation passes completed by the drain loop.
-	drainPassesCompleted *metrics.Counter
-	// volumeDrainResultsHandled counts volume drain results handled by the drain loop.
-	volumeDrainResultsHandled *metrics.Counter
+	// passesCompleted counts evaluation passes completed by the drain loop.
+	passesCompleted *metrics.Counter
+	// volumeResultsHandled counts volume drain results handled by the drain loop.
+	volumeResultsHandled *metrics.Counter
 }
 
 // wakeDrain sends a non-blocking signal to wake the drain loop.
@@ -561,10 +561,10 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		},
 		restoring: make(map[string]bool),
 		drain: stagingDrain{
-			wake:                      make(chan struct{}, 1),
-			loopDone:                  make(chan struct{}),
-			drainPassesCompleted:      metrics.NewCounter("drain_passes_completed"),
-			volumeDrainResultsHandled: metrics.NewCounter("volume_drain_results_handled"),
+			wake:                 make(chan struct{}, 1),
+			loopDone:             make(chan struct{}),
+			passesCompleted:      metrics.NewCounter("staging_drain_passes_completed"),
+			volumeResultsHandled: metrics.NewCounter("staging_drain_volume_results_handled"),
 		},
 	}
 	s.diskLimits.spaceAvailable = sync.NewCond(&s.diskLimits.mu)
@@ -2371,7 +2371,7 @@ func (s *Server) drainLoop(ctx context.Context) {
 	drainDone := make(chan volumeDrainResult, 16)
 
 	handleDrainResult := func(result volumeDrainResult) {
-		s.drain.volumeDrainResultsHandled.Inc()
+		s.drain.volumeResultsHandled.Inc()
 		delete(activeDrainSyncs, result.volumeID)
 		if result.err != nil {
 			if draining {
@@ -2407,7 +2407,7 @@ func (s *Server) drainLoop(ctx context.Context) {
 		if maxStagingBytes <= 0 {
 			draining = false
 			clear(skippedThisEpisode)
-			s.drain.drainPassesCompleted.Inc()
+			s.drain.passesCompleted.Inc()
 			continue
 		}
 
@@ -2417,7 +2417,7 @@ func (s *Server) drainLoop(ctx context.Context) {
 		if stagedBytes <= lowWaterBytes {
 			draining = false
 			clear(skippedThisEpisode)
-			s.drain.drainPassesCompleted.Inc()
+			s.drain.passesCompleted.Inc()
 			continue
 		}
 
@@ -2429,7 +2429,7 @@ func (s *Server) drainLoop(ctx context.Context) {
 		}
 
 		if !draining {
-			s.drain.drainPassesCompleted.Inc()
+			s.drain.passesCompleted.Inc()
 			continue
 		}
 
@@ -2501,6 +2501,6 @@ func (s *Server) drainLoop(ctx context.Context) {
 			}
 		}
 
-		s.drain.drainPassesCompleted.Inc()
+		s.drain.passesCompleted.Inc()
 	}
 }
