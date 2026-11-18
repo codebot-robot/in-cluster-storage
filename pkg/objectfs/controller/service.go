@@ -27,7 +27,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,6 +35,7 @@ import (
 	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/metrics"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/waldurability"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
@@ -216,10 +216,10 @@ type stagingDrain struct {
 	wake chan struct{}
 	// loopDone is closed when drainLoop exits. Requires no lock.
 	loopDone chan struct{}
-	// passCount is atomic and tracks completed evaluation passes for test synchronization.
-	passCount atomic.Int64
-	// resultCount is atomic and tracks handled volume drain results for test synchronization.
-	resultCount atomic.Int64
+	// drainPassesCompleted counts evaluation passes completed by the drain loop.
+	drainPassesCompleted *metrics.Counter
+	// volumeDrainResultsHandled counts volume drain results handled by the drain loop.
+	volumeDrainResultsHandled *metrics.Counter
 }
 
 // wakeDrain sends a non-blocking signal to wake the drain loop.
@@ -561,8 +561,10 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		},
 		restoring: make(map[string]bool),
 		drain: stagingDrain{
-			wake:     make(chan struct{}, 1),
-			loopDone: make(chan struct{}),
+			wake:                      make(chan struct{}, 1),
+			loopDone:                  make(chan struct{}),
+			drainPassesCompleted:      metrics.NewCounter("drain_passes_completed"),
+			volumeDrainResultsHandled: metrics.NewCounter("volume_drain_results_handled"),
 		},
 	}
 	s.diskLimits.spaceAvailable = sync.NewCond(&s.diskLimits.mu)
@@ -2369,7 +2371,7 @@ func (s *Server) drainLoop(ctx context.Context) {
 	drainDone := make(chan volumeDrainResult, 16)
 
 	handleDrainResult := func(result volumeDrainResult) {
-		s.drain.resultCount.Add(1)
+		s.drain.volumeDrainResultsHandled.Inc()
 		delete(activeDrainSyncs, result.volumeID)
 		if result.err != nil {
 			if draining {
@@ -2405,7 +2407,7 @@ func (s *Server) drainLoop(ctx context.Context) {
 		if maxStagingBytes <= 0 {
 			draining = false
 			clear(skippedThisEpisode)
-			s.drain.passCount.Add(1)
+			s.drain.drainPassesCompleted.Inc()
 			continue
 		}
 
@@ -2415,7 +2417,7 @@ func (s *Server) drainLoop(ctx context.Context) {
 		if stagedBytes <= lowWaterBytes {
 			draining = false
 			clear(skippedThisEpisode)
-			s.drain.passCount.Add(1)
+			s.drain.drainPassesCompleted.Inc()
 			continue
 		}
 
@@ -2427,7 +2429,7 @@ func (s *Server) drainLoop(ctx context.Context) {
 		}
 
 		if !draining {
-			s.drain.passCount.Add(1)
+			s.drain.drainPassesCompleted.Inc()
 			continue
 		}
 
@@ -2499,6 +2501,6 @@ func (s *Server) drainLoop(ctx context.Context) {
 			}
 		}
 
-		s.drain.passCount.Add(1)
+		s.drain.drainPassesCompleted.Inc()
 	}
 }

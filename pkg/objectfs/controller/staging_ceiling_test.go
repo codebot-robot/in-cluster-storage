@@ -167,7 +167,7 @@ func setupTestVolume(ctx context.Context, t *testing.T, server *Server, volumeID
 
 // drainPassCount returns the number of evaluation passes completed by the drain loop (testing only).
 func (s *Server) drainPassCount() int64 {
-	return s.drain.passCount.Load()
+	return s.drain.drainPassesCompleted.Value()
 }
 
 // waitForDrainPass waits until the drain loop has completed at least targetPass passes.
@@ -185,7 +185,7 @@ func waitForDrainPass(t *testing.T, server *Server, targetPass int64) {
 
 // drainResultCount returns the number of volume drain results handled by the drain loop (testing only).
 func (s *Server) drainResultCount() int64 {
-	return s.drain.resultCount.Load()
+	return s.drain.volumeDrainResultsHandled.Value()
 }
 
 // waitForDrainResult waits until the drain loop has handled at least targetResult drain results.
