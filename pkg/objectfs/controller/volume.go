@@ -319,6 +319,9 @@ type Volume struct {
 	stagedMtimes  map[uint64]time.Time
 	stagedBytes   int64
 	lastSyncError map[uint64]error
+	// syncFailed tracks whether the volume's last real sync operation failed.
+	// Guarded by stagingMu.
+	syncFailed bool
 
 	coalesce    syncCoalesceState
 	closeTimer  *time.Timer
@@ -860,10 +863,12 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 	}
 
 	if err != nil {
+		v.syncFailed = true
 		for sIno := range snapshotChunks {
 			v.lastSyncError[sIno] = err
 		}
 	} else {
+		v.syncFailed = false
 		v.evictUploadedPacksLocked(0)
 
 		for ino, chunks := range snapshotChunks {
@@ -912,7 +917,10 @@ func (v *Volume) finishEmptySync(snapshotSeq uint64, err error, pos uint64, inod
 	defer v.stagingMu.Unlock()
 
 	if err == nil {
+		v.syncFailed = false
 		v.evictUploadedPacksLocked(0)
+	} else {
+		v.syncFailed = true
 	}
 
 	v.completeWaitersAndRearmLocked(snapshotSeq, err, pos, inodeFilter)
@@ -996,13 +1004,19 @@ func (v *Volume) stagedSyncEligibleLocked() (eligible bool, stagedBytes int64, h
 	return true, v.stagedBytes, v.syncTriggerHook
 }
 
-// triggerSyncIfStaged initiates a coalesce sync in the background if the volume holds staged chunks and no sync is in flight.
+// triggerSyncIfStaged initiates a coalesce sync in the background if the volume holds staged chunks,
+// no sync is in flight, and uploads are not currently failing. While uploads are failing, it declines
+// to start a new sync so a blocked writer at the ceiling does not retry faster than the volume's own
+// coalesce retry window.
 // If a syncTriggerHook is configured, it runs with no locks held, before the sync goroutine is started, and only
 // when a sync is actually initiated (not on early returns).
 // Requires no locks held; acquires stagingMu.
 func (v *Volume) triggerSyncIfStaged() {
 	v.stagingMu.Lock()
 	eligible, _, hook := v.stagedSyncEligibleLocked()
+	if eligible && v.syncFailed {
+		eligible = false
+	}
 	v.stagingMu.Unlock()
 
 	if !eligible {
