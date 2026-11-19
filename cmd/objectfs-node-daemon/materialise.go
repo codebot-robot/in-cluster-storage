@@ -30,6 +30,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
 )
 
 type dirMeta struct {
@@ -276,14 +277,14 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 		if err := applyXAttrs(ctx, client, volumeID, dm.inode, dm.path, dm.xattrCount); err != nil {
 			return err
 		}
-		if dm.mode != 0 {
-			if err := os.Chmod(dm.path, os.FileMode(dm.mode&07777)); err != nil {
-				log.Info("chmod", "path", dm.path, "err", err)
-			}
-		}
 		if dm.uid != 0 || dm.gid != 0 {
 			if err := os.Chown(dm.path, int(dm.uid), int(dm.gid)); err != nil {
 				log.V(4).Info("chown", "path", dm.path, "err", err)
+			}
+		}
+		if dm.mode != 0 {
+			if err := unix.Chmod(dm.path, dm.mode&07777); err != nil {
+				log.Info("chmod", "path", dm.path, "err", err)
 			}
 		}
 		if !dm.mtime.IsZero() {
@@ -327,17 +328,18 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 	}
 
 	if f.size == 0 {
-		mode := os.FileMode(f.mode & 07777)
-		if mode == 0 {
-			mode = 0644
-		}
 		tmpPath := fmt.Sprintf("%s.tmp.%d", f.path, time.Now().UnixNano())
-		if err := os.WriteFile(tmpPath, nil, mode); err != nil {
+		if err := os.WriteFile(tmpPath, nil, 0644); err != nil {
 			return fmt.Errorf("write empty temp file %s: %w", tmpPath, err)
 		}
 		if f.uid != 0 || f.gid != 0 {
 			if chownErr := os.Chown(tmpPath, int(f.uid), int(f.gid)); chownErr != nil {
 				scoped.Log(ctx).V(4).Info("chown", "path", tmpPath, "err", chownErr)
+			}
+		}
+		if f.mode != 0 {
+			if chmodErr := unix.Chmod(tmpPath, f.mode&07777); chmodErr != nil {
+				scoped.Log(ctx).Info("chmod", "path", tmpPath, "err", chmodErr)
 			}
 		}
 		if !f.mtime.IsZero() {
@@ -358,7 +360,7 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 	}
 
 	tmpPath := fmt.Sprintf("%s.tmp.%d", f.path, time.Now().UnixNano())
-	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(f.mode&07777))
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("create temp file %s: %w", tmpPath, err)
 	}
@@ -452,14 +454,14 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 		}
 	}
 
-	if f.mode != 0 {
-		if chmodErr := os.Chmod(tmpPath, os.FileMode(f.mode&07777)); chmodErr != nil {
-			scoped.Log(ctx).Info("chmod", "path", tmpPath, "err", chmodErr)
-		}
-	}
 	if f.uid != 0 || f.gid != 0 {
 		if chownErr := os.Chown(tmpPath, int(f.uid), int(f.gid)); chownErr != nil {
 			scoped.Log(ctx).V(4).Info("chown", "path", tmpPath, "err", chownErr)
+		}
+	}
+	if f.mode != 0 {
+		if chmodErr := unix.Chmod(tmpPath, f.mode&07777); chmodErr != nil {
+			scoped.Log(ctx).Info("chmod", "path", tmpPath, "err", chmodErr)
 		}
 	}
 	if !f.mtime.IsZero() {

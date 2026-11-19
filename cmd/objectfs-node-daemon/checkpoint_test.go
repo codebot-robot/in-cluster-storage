@@ -860,3 +860,40 @@ func TestReplayOperations_RemoveXAttrENODATA(t *testing.T) {
 		t.Fatalf("expected ReplayOperations to fail on non-ENODATA error, got nil")
 	}
 }
+
+func TestScanUpperLayer_SpecialBits(t *testing.T) {
+	ctx := t.Context()
+	lowerDir, upperDir := t.TempDir(), t.TempDir()
+
+	sgidDir := filepath.Join(upperDir, "sgid_dir")
+	if err := os.Mkdir(sgidDir, 0755); err != nil {
+		t.Fatalf("Mkdir sgid_dir failed: %v", err)
+	}
+	if err := os.Chmod(sgidDir, 0755|os.ModeSetgid); err != nil {
+		t.Fatalf("Chmod sgid_dir failed: %v", err)
+	}
+
+	stickyDir := filepath.Join(upperDir, "sticky_dir")
+	if err := os.Mkdir(stickyDir, 0777); err != nil {
+		t.Fatalf("Mkdir sticky_dir failed: %v", err)
+	}
+	if err := os.Chmod(stickyDir, 0777|os.ModeSticky); err != nil {
+		t.Fatalf("Chmod sticky_dir failed: %v", err)
+	}
+
+	ops, err := ScanUpperLayer(ctx, lowerDir, upperDir)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer failed: %v", err)
+	}
+
+	modes := make(map[string]uint32)
+	for _, op := range ops {
+		modes[op.Path] = op.Mode
+	}
+	if got := modes["sgid_dir"]; got != 02755 {
+		t.Errorf("sgid_dir mode = %#o, want %#o", got, 02755)
+	}
+	if got := modes["sticky_dir"]; got != 01777 {
+		t.Errorf("sticky_dir mode = %#o, want %#o", got, 01777)
+	}
+}

@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
 	"golang.org/x/sys/unix"
@@ -1474,5 +1476,95 @@ func TestMaterialiseVolume_FailingSetXAttrReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "setxattr") || !strings.Contains(err.Error(), "user.test_attr") || !strings.Contains(err.Error(), "file.txt") {
 		t.Errorf("expected error naming path and attribute, got: %v", err)
+	}
+}
+
+func TestMaterialiseVolume_SpecialBits(t *testing.T) {
+	ctx := t.Context()
+	server := controllertest.NewTestServer(nil)
+	volumeID := "test-mat-special-bits-vol"
+
+	listener := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("grpcServer.Serve failed: %v", err)
+		}
+	}()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient failed: %v", err)
+	}
+	defer errutil.CloseAndLog(conn, "grpc connection")
+	client := pb.NewObjectFSControllerClient(conn)
+
+	testUID, testGID := uint32(1000), uint32(1000)
+	if os.Getuid() != 0 {
+		testUID, testGID = uint32(os.Getuid()), uint32(os.Getgid())
+	}
+
+	mkdirResp, err := client.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, ParentInode: 1, Name: "sgid_dir", Mode: 02755, Uid: testUID, Gid: testGID})
+	if err != nil || mkdirResp.GetError() != 0 {
+		t.Fatalf("Mkdir sgid_dir failed: %v, resp: %v", err, mkdirResp)
+	}
+	mkdirResp, err = client.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, ParentInode: 1, Name: "sticky_dir", Mode: 01777, Uid: testUID, Gid: testGID})
+	if err != nil || mkdirResp.GetError() != 0 {
+		t.Fatalf("Mkdir sticky_dir failed: %v, resp: %v", err, mkdirResp)
+	}
+
+	createResp, err := client.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId: volumeID, ParentInode: 1, Name: "sgid_file.txt", Mode: 02755, InitialContent: []byte("file content"),
+		Uid: testUID, Gid: testGID,
+	})
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile sgid_file.txt failed: %v, resp: %v", err, createResp)
+	}
+	createResp, err = client.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId: volumeID, ParentInode: 1, Name: "sgid_empty.txt", Mode: 02755,
+		Uid: testUID, Gid: testGID,
+	})
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile sgid_empty.txt failed: %v, resp: %v", err, createResp)
+	}
+
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	if err != nil {
+		t.Fatalf("newDriver failed: %v", err)
+	}
+	defer errutil.CloseAndLog(driver, "driver")
+
+	lowerPath := filepath.Join(t.TempDir(), "lower")
+	if err := os.MkdirAll(lowerPath, 0755); err != nil {
+		t.Fatalf("MkdirAll lowerPath failed: %v", err)
+	}
+
+	if err := driver.materialiseVolume(ctx, client, volumeID, lowerPath); err != nil {
+		t.Fatalf("materialiseVolume failed: %v", err)
+	}
+
+	entries := []struct {
+		name     string
+		wantMode os.FileMode
+	}{
+		{"sgid_dir", 0755 | os.ModeSetgid},
+		{"sticky_dir", 0777 | os.ModeSticky},
+		{"sgid_file.txt", 0755 | os.ModeSetgid},
+		{"sgid_empty.txt", 0755 | os.ModeSetgid},
+	}
+	const modeMask = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	for _, entry := range entries {
+		info, err := os.Stat(filepath.Join(lowerPath, entry.name))
+		if err != nil {
+			t.Fatalf("Stat %s failed: %v", entry.name, err)
+		}
+		if got := info.Mode() & modeMask; got != entry.wantMode {
+			t.Errorf("%s mode = %v, want %v", entry.name, got, entry.wantMode)
+		}
 	}
 }

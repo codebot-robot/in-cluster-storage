@@ -513,14 +513,14 @@ func scanModificationsAndCreations(ctx context.Context, lowerDir, upperDir strin
 			return nil
 		}
 
-		mode := uint32(info.Mode() & 07777)
-		fileType := info.Mode() & os.ModeType
-
-		var uid, gid uint32
-		if sys, ok := info.Sys().(*syscall.Stat_t); ok {
-			uid = sys.Uid
-			gid = sys.Gid
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("stat %s: failed to get sys Stat_t", path)
 		}
+		mode := uint32(stat.Mode & 07777)
+		fileType := info.Mode() & os.ModeType
+		uid := stat.Uid
+		gid := stat.Gid
 
 		parent, name := splitRelPath(relPath)
 		lowerPath := filepath.Join(lowerDir, relPath)
