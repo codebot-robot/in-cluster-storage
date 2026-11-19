@@ -31,6 +31,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -110,6 +111,22 @@ func parseMountGroup(capability *csi.VolumeCapability) (groupID uint32, present 
 
 // applyMountGroup changes the group ownership of targetPath to groupID,
 // and sets the group-write and setgid permission bits.
+//
+// CSI specification for VolumeCapability.MountVolume.volume_mount_group
+// (https://github.com/container-storage-interface/spec/blob/master/spec.md):
+//
+//	"If SP has VOLUME_MOUNT_GROUP node capability and CO provides this field then
+//	SP MUST ensure that the volume_mount_group parameter is passed as the group
+//	identifier to the underlying operating system mount system call, with the
+//	understanding that the set of available mount call parameters and/or mount
+//	implementations may vary across operating systems. Additionally, new file
+//	and/or directory entries written to the underlying filesystem SHOULD be
+//	permission-labeled in such a manner, unless otherwise modified by a workload,
+//	that they are both readable and writable by said mount group identifier."
+//
+// An overlay mount has no group option, so the group cannot be passed to the mount
+// call. The setgid, group-writable root is how new entries come to be readable and
+// writable by the group.
 func applyMountGroup(targetPath string, groupID uint32) error {
 	if err := os.Chown(targetPath, -1, int(groupID)); err != nil {
 		return fmt.Errorf("failed to chown %s to group %d: %w", targetPath, groupID, err)
@@ -118,7 +135,12 @@ func applyMountGroup(targetPath string, groupID uint32) error {
 	if err != nil {
 		return fmt.Errorf("failed to stat %s: %w", targetPath, err)
 	}
-	if err := os.Chmod(targetPath, fileInfo.Mode()|0020|os.ModeSetgid); err != nil {
+	stat, ok := fileInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("stat %s: failed to get sys Stat_t", targetPath)
+	}
+	mode := (stat.Mode & 07777) | 0020 | 02000
+	if err := unix.Chmod(targetPath, mode); err != nil {
 		return fmt.Errorf("failed to chmod %s: %w", targetPath, err)
 	}
 	return nil

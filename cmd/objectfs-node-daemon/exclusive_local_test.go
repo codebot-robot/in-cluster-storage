@@ -562,8 +562,33 @@ func TestApplyMountGroup(t *testing.T) {
 	if !ok {
 		t.Fatalf("fileInfoAfter.Sys() is not *syscall.Stat_t")
 	}
+	if statAfter.Mode&07777 != 02775 {
+		t.Errorf("expected mode 02775, got %04o", statAfter.Mode&07777)
+	}
 	if statAfter.Gid != targetGID {
 		t.Errorf("expected gid %d, got %d", targetGID, statAfter.Gid)
+	}
+
+	stickyDir := t.TempDir()
+	if err := unix.Chmod(stickyDir, 01750); err != nil {
+		t.Fatalf("chmod failed: %v", err)
+	}
+	if err := applyMountGroup(stickyDir, targetGID); err != nil {
+		t.Fatalf("applyMountGroup failed: %v", err)
+	}
+	stickyInfoAfter, err := os.Stat(stickyDir)
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+	stickyStatAfter, ok := stickyInfoAfter.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("stickyInfoAfter.Sys() is not *syscall.Stat_t")
+	}
+	if stickyStatAfter.Mode&07777 != 03770 {
+		t.Errorf("expected mode 03770, got %04o", stickyStatAfter.Mode&07777)
+	}
+	if stickyStatAfter.Gid != targetGID {
+		t.Errorf("expected gid %d, got %d", targetGID, stickyStatAfter.Gid)
 	}
 }
 
