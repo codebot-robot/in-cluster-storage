@@ -131,6 +131,15 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	mountID := targetPath
 	log.Info("publishing ObjectFS volume in exclusive-local mode", "target", targetPath)
 
+	notMnt, err := isNotMountPoint(targetPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check if %s is a mount point: %w", targetPath, err)
+	}
+	if !notMnt {
+		log.Info("volume already mounted", "target", targetPath)
+		return &csi.NodePublishVolumeResponse{}, nil
+	}
+
 	groupID, groupPresent, err := parseMountGroup(req.GetVolumeCapability())
 	if err != nil {
 		return nil, err
@@ -223,16 +232,6 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create target path %s: %w", targetPath, err)
-	}
-
-	notMnt, err := isNotMountPoint(targetPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check if %s is a mount point: %w", targetPath, err)
-	}
-	if !notMnt {
-		log.Info("volume already mounted", "target", targetPath)
-		publishSuccess = true
-		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerPath, upperPath, workPath)
