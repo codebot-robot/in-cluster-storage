@@ -3980,6 +3980,23 @@ spec:
 	if err != nil || !strings.Contains(out, "fsgroup-ok") {
 		t.Fatalf("Failed to create dir/file in volume: err=%v, out=%s", err, out)
 	}
-	h.DeletePod(podName, "default")
-}
 
+	rootStat, err := h.RunInPod(podName, "default", "stat", "-c", "%g %a", "/data")
+	if err != nil {
+		t.Fatalf("stat /data failed: %v, out=%s", err, rootStat)
+	}
+	if strings.TrimSpace(rootStat) != "2000 2775" {
+		t.Fatalf("expected /data stat '2000 2775', got %q", strings.TrimSpace(rootStat))
+	}
+
+	dirStat, err := h.RunInPod(podName, "default", "stat", "-c", "%g %a", "/data/testdir")
+	if err != nil {
+		t.Fatalf("stat /data/testdir failed: %v, out=%s", err, dirStat)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(dirStat), "2000 ") {
+		t.Fatalf("expected /data/testdir group 2000, got %q", strings.TrimSpace(dirStat))
+	}
+
+	h.DeletePod(podName, "default")
+	h.DeletePVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+}

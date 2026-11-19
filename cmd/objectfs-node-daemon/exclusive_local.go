@@ -92,28 +92,33 @@ func unmountTarget(ctx context.Context, targetPath string) error {
 	return nil
 }
 
-func parseMountGroup(cap *csi.VolumeCapability) (*int, error) {
-	if cap == nil || cap.GetMount() == nil || cap.GetMount().GetVolumeMountGroup() == "" {
-		return nil, nil
+// parseMountGroup parses the volume mount group from capability.
+// It returns the group ID and true if a valid group was specified, false if unspecified,
+// or an InvalidArgument error if the group is not a valid 32-bit unsigned numeric group ID
+// or is 4294967295 (which corresponds to -1 in chown).
+func parseMountGroup(capability *csi.VolumeCapability) (groupID uint32, present bool, err error) {
+	if capability == nil || capability.GetMount() == nil || capability.GetMount().GetVolumeMountGroup() == "" {
+		return 0, false, nil
 	}
-	mountGroup := cap.GetMount().GetVolumeMountGroup()
-	gid, err := strconv.ParseInt(mountGroup, 10, 64)
-	if err != nil || gid < 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid volume mount group %q", mountGroup)
+	mountGroup := capability.GetMount().GetVolumeMountGroup()
+	parsed, parseErr := strconv.ParseUint(mountGroup, 10, 32)
+	if parseErr != nil || parsed == 4294967295 {
+		return 0, false, status.Errorf(codes.InvalidArgument, "invalid volume mount group %q", mountGroup)
 	}
-	g := int(gid)
-	return &g, nil
+	return uint32(parsed), true, nil
 }
 
-func applyMountGroup(targetPath string, gid int) error {
-	if err := os.Chown(targetPath, -1, gid); err != nil {
-		return fmt.Errorf("failed to chown %s to group %d: %w", targetPath, gid, err)
+// applyMountGroup changes the group ownership of targetPath to groupID,
+// and sets the group-write and setgid permission bits.
+func applyMountGroup(targetPath string, groupID uint32) error {
+	if err := os.Chown(targetPath, -1, int(groupID)); err != nil {
+		return fmt.Errorf("failed to chown %s to group %d: %w", targetPath, groupID, err)
 	}
-	fi, err := os.Stat(targetPath)
+	fileInfo, err := os.Stat(targetPath)
 	if err != nil {
 		return fmt.Errorf("failed to stat %s: %w", targetPath, err)
 	}
-	if err := os.Chmod(targetPath, fi.Mode()|0020|os.ModeSetgid); err != nil {
+	if err := os.Chmod(targetPath, fileInfo.Mode()|0020|os.ModeSetgid); err != nil {
 		return fmt.Errorf("failed to chmod %s: %w", targetPath, err)
 	}
 	return nil
@@ -126,7 +131,7 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	mountID := targetPath
 	log.Info("publishing ObjectFS volume in exclusive-local mode", "target", targetPath)
 
-	mountGID, err := parseMountGroup(req.GetVolumeCapability())
+	groupID, groupPresent, err := parseMountGroup(req.GetVolumeCapability())
 	if err != nil {
 		return nil, err
 	}
@@ -224,26 +229,24 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	if err != nil {
 		return nil, fmt.Errorf("failed to check if %s is a mount point: %w", targetPath, err)
 	}
-	if notMnt {
-		opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerPath, upperPath, workPath)
-		if err := syscall.Mount("overlay", targetPath, "overlay", 0, opts); err != nil {
-			return nil, fmt.Errorf("failed to mount overlayfs at %s: %w", targetPath, err)
-		}
-	} else {
+	if !notMnt {
 		log.Info("volume already mounted", "target", targetPath)
+		publishSuccess = true
+		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
-	if mountGID != nil {
-		if err := applyMountGroup(targetPath, *mountGID); err != nil {
-			if uerr := unmountTarget(ctx, targetPath); uerr != nil {
-				log.Info("failed to unmount target after mount group failure", "err", uerr)
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerPath, upperPath, workPath)
+	if err := syscall.Mount("overlay", targetPath, "overlay", 0, opts); err != nil {
+		return nil, fmt.Errorf("failed to mount overlayfs at %s: %w", targetPath, err)
+	}
+
+	if groupPresent {
+		if err := applyMountGroup(targetPath, groupID); err != nil {
+			if unmountErr := unmountTarget(ctx, targetPath); unmountErr != nil {
+				log.Error(unmountErr, "failed to unmount target after mount group failure", "target", targetPath)
 			}
 			return nil, err
 		}
-	}
-	if !notMnt {
-		publishSuccess = true
-		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
 	// Parse checkpointInterval from volume context (e.g. "10s", "1m"). Default off (0).
