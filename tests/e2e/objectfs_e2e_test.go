@@ -3933,3 +3933,70 @@ spec:
 	t.Logf("Deleting Pod B on Node 2")
 	h.DeletePod(podBName, "default")
 }
+
+func TestObjectFSExclusiveLocalFSGroupE2E(t *testing.T) {
+	requireE2EGroup(t, "exclusive")
+
+	h, node1, _ := setupObjectFSMultiNodeCluster(t)
+	volumeID, podName := "exclusive-local-fsgroup-vol", "exclusive-fsgroup-pod"
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+		}
+	})
+
+	pvcYaml := fmt.Sprintf(`apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: %[1]s-pvc}
+spec:
+  accessModes: [ReadWriteOncePod]
+  storageClassName: objectfs-exclusive-local
+  resources: {requests: {storage: 1Gi}}`, volumeID)
+	h.KubectlApplyContent("exclusive-fsgroup-pvc", pvcYaml)
+
+	podYaml := fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata: {name: %[1]s}
+spec:
+  nodeSelector: {kubernetes.io/hostname: %[2]s}
+  securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 2000}
+  containers:
+  - name: app
+    image: alpine
+    command: ["/bin/sh", "-c", "sleep 3600"]
+    volumeMounts: [{name: data, mountPath: /data}]
+  volumes:
+  - name: data
+    persistentVolumeClaim: {claimName: %[3]s-pvc}`, podName, node1, volumeID)
+
+	h.KubectlApplyContent(podName, podYaml)
+	if err := h.WaitForPodReady(podName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Pod failed to start: %v", err)
+	}
+
+	out, err := h.RunInPod(podName, "default", "/bin/sh", "-c", "mkdir /data/testdir && echo 'fsgroup-ok' > /data/testdir/testfile.txt && cat /data/testdir/testfile.txt")
+	if err != nil || !strings.Contains(out, "fsgroup-ok") {
+		t.Fatalf("Failed to create dir/file in volume: err=%v, out=%s", err, out)
+	}
+
+	rootStat, err := h.RunInPod(podName, "default", "stat", "-c", "%g %a", "/data")
+	if err != nil {
+		t.Fatalf("stat /data failed: %v, out=%s", err, rootStat)
+	}
+	if strings.TrimSpace(rootStat) != "2000 2775" {
+		t.Fatalf("expected /data stat '2000 2775', got %q", strings.TrimSpace(rootStat))
+	}
+
+	dirStat, err := h.RunInPod(podName, "default", "stat", "-c", "%g %a", "/data/testdir")
+	if err != nil {
+		t.Fatalf("stat /data/testdir failed: %v, out=%s", err, dirStat)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(dirStat), "2000 ") {
+		t.Fatalf("expected /data/testdir group 2000, got %q", strings.TrimSpace(dirStat))
+	}
+
+	h.DeletePod(podName, "default")
+	h.DeletePVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+}

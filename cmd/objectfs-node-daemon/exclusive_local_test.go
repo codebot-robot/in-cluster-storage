@@ -367,6 +367,7 @@ func TestNodePublish_AccessModeValidation(t *testing.T) {
 		name       string
 		mode       string
 		accessMode csi.VolumeCapability_AccessMode_Mode
+		mountGroup string
 		wantErr    bool
 		wantCode   codes.Code
 	}{
@@ -391,16 +392,31 @@ func TestNodePublish_AccessModeValidation(t *testing.T) {
 			wantErr:    true,
 			wantCode:   codes.InvalidArgument,
 		},
+		{
+			name:       "exclusive-local with invalid volume mount group (rejected)",
+			mode:       "exclusive-local",
+			accessMode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+			mountGroup: "invalid-group",
+			wantErr:    true,
+			wantCode:   codes.InvalidArgument,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			mountVolume := &csi.VolumeCapability_MountVolume{}
+			if tt.mountGroup != "" {
+				mountVolume.VolumeMountGroup = tt.mountGroup
+			}
 			req := &csi.NodePublishVolumeRequest{
 				VolumeId:   "test-vol",
 				TargetPath: filepath.Join(t.TempDir(), "target"),
 				VolumeCapability: &csi.VolumeCapability{
 					AccessMode: &csi.VolumeCapability_AccessMode{
 						Mode: tt.accessMode,
+					},
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: mountVolume,
 					},
 				},
 				VolumeContext: map[string]string{
@@ -413,16 +429,16 @@ func TestNodePublish_AccessModeValidation(t *testing.T) {
 				if err == nil {
 					t.Fatalf("Expected error, got nil")
 				}
-				st, ok := status.FromError(err)
-				if !ok || st.Code() != tt.wantCode {
-					t.Errorf("Expected grpc error code %v, got %v (err: %v)", tt.wantCode, st.Code(), err)
+				statusErr, ok := status.FromError(err)
+				if !ok || statusErr.Code() != tt.wantCode {
+					t.Errorf("Expected grpc error code %v, got %v (err: %v)", tt.wantCode, statusErr.Code(), err)
 				}
 			}
 		})
 	}
 }
 
-// TestNodeGetCapabilities_IncludesSingleNodeMultiWriter verifies advertising capability for ReadWriteOncePod.
+// TestNodeGetCapabilities_IncludesSingleNodeMultiWriter verifies advertising capability for ReadWriteOncePod and VOLUME_MOUNT_GROUP.
 func TestNodeGetCapabilities_IncludesSingleNodeMultiWriter(t *testing.T) {
 	ctx := t.Context()
 	driver, err := newDriver(ctx, "test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
@@ -436,15 +452,118 @@ func TestNodeGetCapabilities_IncludesSingleNodeMultiWriter(t *testing.T) {
 		t.Fatalf("NodeGetCapabilities failed: %v", err)
 	}
 
-	found := false
-	for _, cap := range resp.GetCapabilities() {
-		if cap.GetRpc().GetType() == csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER {
-			found = true
-			break
+	capabilities := make(map[csi.NodeServiceCapability_RPC_Type]bool)
+	for _, capability := range resp.GetCapabilities() {
+		capabilities[capability.GetRpc().GetType()] = true
+	}
+	for _, want := range []csi.NodeServiceCapability_RPC_Type{
+		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+		csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
+	} {
+		if !capabilities[want] {
+			t.Errorf("Expected capability %v in NodeGetCapabilities", want)
 		}
 	}
-	if !found {
-		t.Errorf("Expected capability SINGLE_NODE_MULTI_WRITER in NodeGetCapabilities")
+}
+
+func TestParseMountGroup(t *testing.T) {
+	mountCapability := func(mountGroup string) *csi.VolumeCapability {
+		return &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{
+					VolumeMountGroup: mountGroup,
+				},
+			},
+		}
+	}
+	tests := []struct {
+		name        string
+		capability  *csi.VolumeCapability
+		wantGroupID uint32
+		wantPresent bool
+		wantErr     bool
+	}{
+		{name: "nil", capability: nil, wantGroupID: 0, wantPresent: false, wantErr: false},
+		{name: "empty", capability: mountCapability(""), wantGroupID: 0, wantPresent: false, wantErr: false},
+		{name: "valid", capability: mountCapability("2000"), wantGroupID: 2000, wantPresent: true, wantErr: false},
+		{name: "valid-zero", capability: mountCapability("0"), wantGroupID: 0, wantPresent: true, wantErr: false},
+		{name: "non-numeric", capability: mountCapability("not-a-number"), wantErr: true},
+		{name: "plus-sign", capability: mountCapability("+2000"), wantErr: true},
+		{name: "negative", capability: mountCapability("-1"), wantErr: true},
+		{name: "leave-unchanged-sentinel", capability: mountCapability("4294967295"), wantErr: true},
+		{name: "above-uint32-max", capability: mountCapability("4294967296"), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			groupID, present, err := parseMountGroup(tt.capability)
+			if tt.wantErr {
+				if statusErr, ok := status.FromError(err); !ok || statusErr.Code() != codes.InvalidArgument {
+					t.Fatalf("expected InvalidArgument, got %v", err)
+				}
+				return
+			}
+			if err != nil || groupID != tt.wantGroupID || present != tt.wantPresent {
+				t.Fatalf("got (%d, %t, %v), want (%d, %t, nil)", groupID, present, err, tt.wantGroupID, tt.wantPresent)
+			}
+		})
+	}
+}
+
+func TestApplyMountGroup(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatalf("chmod failed: %v", err)
+	}
+	fileInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+	stat, ok := fileInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("fileInfo.Sys() is not *syscall.Stat_t")
+	}
+	initialGID := stat.Gid
+
+	var targetGID uint32
+	if os.Geteuid() == 0 {
+		targetGID = 2000
+		if uint32(initialGID) == 2000 {
+			targetGID = 2001
+		}
+	} else {
+		groups, err := os.Getgroups()
+		if err != nil {
+			t.Fatalf("failed to get supplementary groups: %v", err)
+		}
+		found := false
+		for _, group := range groups {
+			if uint32(group) != uint32(initialGID) {
+				targetGID = uint32(group)
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Skip("skipping test: process has no supplementary group different from directory group")
+		}
+	}
+
+	if err := applyMountGroup(dir, targetGID); err != nil {
+		t.Fatalf("applyMountGroup failed: %v", err)
+	}
+	fileInfoAfter, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+	if fileInfoAfter.Mode()&0020 == 0 || fileInfoAfter.Mode()&os.ModeSetgid == 0 {
+		t.Errorf("expected group-write and setgid bits, got mode %o", fileInfoAfter.Mode())
+	}
+	statAfter, ok := fileInfoAfter.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("fileInfoAfter.Sys() is not *syscall.Stat_t")
+	}
+	if statAfter.Gid != targetGID {
+		t.Errorf("expected gid %d, got %d", targetGID, statAfter.Gid)
 	}
 }
 

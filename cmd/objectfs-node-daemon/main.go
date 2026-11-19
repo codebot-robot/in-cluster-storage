@@ -506,6 +506,13 @@ func (d *objectFSDriver) NodeGetCapabilities(ctx context.Context, req *csi.NodeG
 					},
 				},
 			},
+			{
+				Type: &csi.NodeServiceCapability_Rpc{
+					Rpc: &csi.NodeServiceCapability_RPC{
+						Type: csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
+					},
+				},
+			},
 		},
 	}, nil
 }

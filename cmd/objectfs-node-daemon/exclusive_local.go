@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -91,12 +92,49 @@ func unmountTarget(ctx context.Context, targetPath string) error {
 	return nil
 }
 
+// parseMountGroup parses the volume mount group from capability.
+// It returns the group ID and true if a valid group was specified, false if unspecified,
+// or an InvalidArgument error if the group is not a valid 32-bit unsigned numeric group ID
+// or is 4294967295 (which corresponds to -1 in chown).
+func parseMountGroup(capability *csi.VolumeCapability) (groupID uint32, present bool, err error) {
+	if capability == nil || capability.GetMount() == nil || capability.GetMount().GetVolumeMountGroup() == "" {
+		return 0, false, nil
+	}
+	mountGroup := capability.GetMount().GetVolumeMountGroup()
+	parsed, parseErr := strconv.ParseUint(mountGroup, 10, 32)
+	if parseErr != nil || parsed == 4294967295 {
+		return 0, false, status.Errorf(codes.InvalidArgument, "invalid volume mount group %q", mountGroup)
+	}
+	return uint32(parsed), true, nil
+}
+
+// applyMountGroup changes the group ownership of targetPath to groupID,
+// and sets the group-write and setgid permission bits.
+func applyMountGroup(targetPath string, groupID uint32) error {
+	if err := os.Chown(targetPath, -1, int(groupID)); err != nil {
+		return fmt.Errorf("failed to chown %s to group %d: %w", targetPath, groupID, err)
+	}
+	fileInfo, err := os.Stat(targetPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat %s: %w", targetPath, err)
+	}
+	if err := os.Chmod(targetPath, fileInfo.Mode()|0020|os.ModeSetgid); err != nil {
+		return fmt.Errorf("failed to chmod %s: %w", targetPath, err)
+	}
+	return nil
+}
+
 func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.NodePublishVolumeRequest, volumeID string) (*csi.NodePublishVolumeResponse, error) {
 	log := scoped.Log(ctx).WithValues("volume", volumeID)
 	ctx = scoped.WithLog(ctx, log)
 	targetPath := req.GetTargetPath()
 	mountID := targetPath
 	log.Info("publishing ObjectFS volume in exclusive-local mode", "target", targetPath)
+
+	groupID, groupPresent, err := parseMountGroup(req.GetVolumeCapability())
+	if err != nil {
+		return nil, err
+	}
 
 	volumeDir := filepath.Join(d.cacheDir, volumeID)
 	lowerPath := filepath.Join(volumeDir, "lower")
@@ -200,6 +238,15 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerPath, upperPath, workPath)
 	if err := syscall.Mount("overlay", targetPath, "overlay", 0, opts); err != nil {
 		return nil, fmt.Errorf("failed to mount overlayfs at %s: %w", targetPath, err)
+	}
+
+	if groupPresent {
+		if err := applyMountGroup(targetPath, groupID); err != nil {
+			if unmountErr := unmountTarget(ctx, targetPath); unmountErr != nil {
+				log.Error(unmountErr, "failed to unmount target after mount group failure", "target", targetPath)
+			}
+			return nil, err
+		}
 	}
 
 	// Parse checkpointInterval from volume context (e.g. "10s", "1m"). Default off (0).
