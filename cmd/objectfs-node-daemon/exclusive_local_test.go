@@ -861,6 +861,224 @@ func TestPublishExclusiveLocal_RecoversLeftoverUpper(t *testing.T) {
 	}
 }
 
+// TestPublishExclusiveLocal_DuplicatePublishIsNoOp verifies that a repeated NodePublishVolume
+// for a target that is already mounted returns success without replaying or deleting the upper layer.
+func TestPublishExclusiveLocal_DuplicatePublishIsNoOp(t *testing.T) {
+	ctx := t.Context()
+	server := controllertest.NewTestServer(nil)
+	volumeID := "dup-publish-vol"
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewObjectFSControllerClient(conn)
+
+	baseDir := t.TempDir()
+	// In containerized environments where rootfs is overlayfs, mounting a tmpfs
+	// enables overlayfs to be mounted inside baseDir.
+	if err := syscall.Mount("tmpfs", baseDir, "tmpfs", 0, ""); err == nil {
+		t.Cleanup(func() {
+			_ = syscall.Unmount(baseDir, syscall.MNT_DETACH)
+		})
+	}
+
+	cacheDir := filepath.Join(baseDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("mkdir cacheDir: %v", err)
+	}
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", cacheDir, 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	if err != nil {
+		t.Fatalf("newDriver failed: %v", err)
+	}
+	defer func() { _ = driver.Close() }()
+	driver.client = client
+	driver.clientConn = conn
+
+	targetPath := filepath.Join(baseDir, "target")
+	req := &csi.NodePublishVolumeRequest{
+		VolumeId:   volumeID,
+		TargetPath: targetPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+			},
+		},
+		VolumeContext: map[string]string{
+			"volumeID": volumeID,
+			"mode":     "exclusive-local",
+		},
+	}
+
+	_, err = driver.NodePublishVolume(ctx, req)
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "permission denied") {
+			t.Skip("skipping test: overlay mount requires root privileges (CAP_SYS_ADMIN)")
+		}
+		t.Fatalf("first NodePublishVolume failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = unmountTarget(ctx, targetPath)
+	})
+
+	testFile := filepath.Join(targetPath, "active_file.txt")
+	testData := []byte("content written through live mount")
+	if err := os.WriteFile(testFile, testData, 0644); err != nil {
+		t.Fatalf("failed to write through mount: %v", err)
+	}
+
+	_, err = driver.NodePublishVolume(ctx, req)
+	if err != nil {
+		t.Fatalf("second NodePublishVolume failed: %v", err)
+	}
+
+	// 1. File is still readable through the mount
+	gotData, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("failed to read file through mount after duplicate publish: %v", err)
+	}
+	if string(gotData) != string(testData) {
+		t.Fatalf("expected file content %q, got %q", string(testData), string(gotData))
+	}
+
+	// 2. Upper directory still contains it
+	upperFile := filepath.Join(cacheDir, volumeID, "upper", "active_file.txt")
+	if _, err := os.Stat(upperFile); err != nil {
+		t.Fatalf("upper directory does not contain file after duplicate publish: %v", err)
+	}
+
+	// 3. Nothing was replayed by the second call
+	lookupResp, err := client.Lookup(ctx, &pb.LookupRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "active_file.txt",
+	})
+	if err == nil && lookupResp.GetError() == 0 {
+		t.Fatalf("expected file NOT to be replayed to controller on duplicate publish, but Lookup succeeded: %v", lookupResp)
+	}
+}
+
+// TestPublishExclusiveLocal_AlreadyMountedTargetIsNoOp verifies that if the target path is
+// already a mount point, NodePublishVolume is an immediate no-op returning success without
+// acquiring hold, replaying uncommitted upper files, or deleting the volume directory.
+func TestPublishExclusiveLocal_AlreadyMountedTargetIsNoOp(t *testing.T) {
+	targetPath := "/dev/shm"
+	notMnt, err := isNotMountPoint(targetPath)
+	if err != nil || notMnt {
+		t.Skipf("skipping: %s is not recognized as a mount point in this environment", targetPath)
+	}
+
+	ctx := t.Context()
+	server := controllertest.NewTestServer(nil)
+	volumeID := "already-mounted-vol"
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewObjectFSControllerClient(conn)
+
+	cacheDir := t.TempDir()
+	volumeDir := filepath.Join(cacheDir, volumeID)
+	upperDir := filepath.Join(volumeDir, "upper")
+	lowerDir := filepath.Join(volumeDir, "lower")
+	if err := os.MkdirAll(upperDir, 0755); err != nil {
+		t.Fatalf("mkdir upper: %v", err)
+	}
+	if err := os.MkdirAll(lowerDir, 0755); err != nil {
+		t.Fatalf("mkdir lower: %v", err)
+	}
+
+	// Put an uncommitted file in upper
+	testFile := filepath.Join(upperDir, "uncommitted.txt")
+	testData := []byte("uncommitted data that must not be deleted or replayed")
+	if err := os.WriteFile(testFile, testData, 0644); err != nil {
+		t.Fatalf("write uncommitted file: %v", err)
+	}
+
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", cacheDir, 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	if err != nil {
+		t.Fatalf("newDriver failed: %v", err)
+	}
+	defer func() { _ = driver.Close() }()
+	driver.client = client
+	driver.clientConn = conn
+
+	req := &csi.NodePublishVolumeRequest{
+		VolumeId:   volumeID,
+		TargetPath: targetPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+			},
+		},
+		VolumeContext: map[string]string{
+			"volumeID": volumeID,
+			"mode":     "exclusive-local",
+		},
+	}
+
+	resp, err := driver.NodePublishVolume(ctx, req)
+	if err != nil {
+		t.Fatalf("NodePublishVolume failed on already-mounted target: %v", err)
+	}
+	if resp == nil {
+		t.Fatalf("expected non-nil response")
+	}
+
+	// 1. Upper directory still contains the uncommitted file
+	data, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("expected upper file to remain intact, but read failed: %v", err)
+	}
+	if string(data) != string(testData) {
+		t.Fatalf("unexpected content: %q", string(data))
+	}
+
+	// 2. Controller did NOT receive the file (no replay happened)
+	lookupResp, err := client.Lookup(ctx, &pb.LookupRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "uncommitted.txt",
+	})
+	if err == nil && lookupResp.GetError() == 0 {
+		t.Fatalf("expected uncommitted.txt NOT to be replayed to controller, but Lookup succeeded: %v", lookupResp)
+	}
+
+	// 3. Exclusive hold was not acquired on controller
+	holdResp, err := client.GetExclusiveHold(ctx, &pb.GetExclusiveHoldRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("GetExclusiveHold: %v", err)
+	}
+	if holdResp.GetHold() != nil {
+		t.Fatalf("expected no exclusive hold to be acquired for already-mounted target, got: %v", holdResp.GetHold())
+	}
+}
+
 type failingReplayServer struct {
 	*controller.Server
 }
