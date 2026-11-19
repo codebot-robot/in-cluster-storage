@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -91,12 +92,44 @@ func unmountTarget(ctx context.Context, targetPath string) error {
 	return nil
 }
 
+func parseMountGroup(cap *csi.VolumeCapability) (*int, error) {
+	if cap == nil || cap.GetMount() == nil || cap.GetMount().GetVolumeMountGroup() == "" {
+		return nil, nil
+	}
+	mountGroup := cap.GetMount().GetVolumeMountGroup()
+	gid, err := strconv.ParseInt(mountGroup, 10, 64)
+	if err != nil || gid < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid volume mount group %q", mountGroup)
+	}
+	g := int(gid)
+	return &g, nil
+}
+
+func applyMountGroup(targetPath string, gid int) error {
+	if err := os.Chown(targetPath, -1, gid); err != nil {
+		return fmt.Errorf("failed to chown %s to group %d: %w", targetPath, gid, err)
+	}
+	fi, err := os.Stat(targetPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat %s: %w", targetPath, err)
+	}
+	if err := os.Chmod(targetPath, fi.Mode()|0020|os.ModeSetgid); err != nil {
+		return fmt.Errorf("failed to chmod %s: %w", targetPath, err)
+	}
+	return nil
+}
+
 func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.NodePublishVolumeRequest, volumeID string) (*csi.NodePublishVolumeResponse, error) {
 	log := scoped.Log(ctx).WithValues("volume", volumeID)
 	ctx = scoped.WithLog(ctx, log)
 	targetPath := req.GetTargetPath()
 	mountID := targetPath
 	log.Info("publishing ObjectFS volume in exclusive-local mode", "target", targetPath)
+
+	mountGID, err := parseMountGroup(req.GetVolumeCapability())
+	if err != nil {
+		return nil, err
+	}
 
 	volumeDir := filepath.Join(d.cacheDir, volumeID)
 	lowerPath := filepath.Join(volumeDir, "lower")
@@ -191,15 +224,26 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	if err != nil {
 		return nil, fmt.Errorf("failed to check if %s is a mount point: %w", targetPath, err)
 	}
-	if !notMnt {
+	if notMnt {
+		opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerPath, upperPath, workPath)
+		if err := syscall.Mount("overlay", targetPath, "overlay", 0, opts); err != nil {
+			return nil, fmt.Errorf("failed to mount overlayfs at %s: %w", targetPath, err)
+		}
+	} else {
 		log.Info("volume already mounted", "target", targetPath)
-		publishSuccess = true
-		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerPath, upperPath, workPath)
-	if err := syscall.Mount("overlay", targetPath, "overlay", 0, opts); err != nil {
-		return nil, fmt.Errorf("failed to mount overlayfs at %s: %w", targetPath, err)
+	if mountGID != nil {
+		if err := applyMountGroup(targetPath, *mountGID); err != nil {
+			if uerr := unmountTarget(ctx, targetPath); uerr != nil {
+				log.Info("failed to unmount target after mount group failure", "err", uerr)
+			}
+			return nil, err
+		}
+	}
+	if !notMnt {
+		publishSuccess = true
+		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
 	// Parse checkpointInterval from volume context (e.g. "10s", "1m"). Default off (0).

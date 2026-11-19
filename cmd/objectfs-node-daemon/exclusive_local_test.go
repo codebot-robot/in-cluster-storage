@@ -365,6 +365,7 @@ func TestNodePublish_AccessModeValidation(t *testing.T) {
 		name       string
 		mode       string
 		accessMode csi.VolumeCapability_AccessMode_Mode
+		mountGroup string
 		wantErr    bool
 		wantCode   codes.Code
 	}{
@@ -389,16 +390,31 @@ func TestNodePublish_AccessModeValidation(t *testing.T) {
 			wantErr:    true,
 			wantCode:   codes.InvalidArgument,
 		},
+		{
+			name:       "exclusive-local with invalid volume mount group (rejected)",
+			mode:       "exclusive-local",
+			accessMode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+			mountGroup: "invalid-group",
+			wantErr:    true,
+			wantCode:   codes.InvalidArgument,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			mountVolume := &csi.VolumeCapability_MountVolume{}
+			if tt.mountGroup != "" {
+				mountVolume.VolumeMountGroup = tt.mountGroup
+			}
 			req := &csi.NodePublishVolumeRequest{
 				VolumeId:   "test-vol",
 				TargetPath: filepath.Join(t.TempDir(), "target"),
 				VolumeCapability: &csi.VolumeCapability{
 					AccessMode: &csi.VolumeCapability_AccessMode{
 						Mode: tt.accessMode,
+					},
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: mountVolume,
 					},
 				},
 				VolumeContext: map[string]string{
@@ -420,7 +436,7 @@ func TestNodePublish_AccessModeValidation(t *testing.T) {
 	}
 }
 
-// TestNodeGetCapabilities_IncludesSingleNodeMultiWriter verifies advertising capability for ReadWriteOncePod.
+// TestNodeGetCapabilities_IncludesSingleNodeMultiWriter verifies advertising capability for ReadWriteOncePod and VOLUME_MOUNT_GROUP.
 func TestNodeGetCapabilities_IncludesSingleNodeMultiWriter(t *testing.T) {
 	ctx := t.Context()
 	driver, err := newDriver(ctx, "test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
@@ -434,15 +450,69 @@ func TestNodeGetCapabilities_IncludesSingleNodeMultiWriter(t *testing.T) {
 		t.Fatalf("NodeGetCapabilities failed: %v", err)
 	}
 
-	found := false
+	caps := make(map[csi.NodeServiceCapability_RPC_Type]bool)
 	for _, cap := range resp.GetCapabilities() {
-		if cap.GetRpc().GetType() == csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER {
-			found = true
-			break
+		caps[cap.GetRpc().GetType()] = true
+	}
+	for _, want := range []csi.NodeServiceCapability_RPC_Type{
+		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+		csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
+	} {
+		if !caps[want] {
+			t.Errorf("Expected capability %v in NodeGetCapabilities", want)
 		}
 	}
-	if !found {
-		t.Errorf("Expected capability SINGLE_NODE_MULTI_WRITER in NodeGetCapabilities")
+}
+
+func TestParseMountGroup(t *testing.T) {
+	mountCap := func(g string) *csi.VolumeCapability {
+		return &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{VolumeMountGroup: g}},
+		}
+	}
+	g2000 := 2000
+	tests := []struct {
+		name    string
+		cap     *csi.VolumeCapability
+		wantGID *int
+		wantErr bool
+	}{
+		{"nil", nil, nil, false},
+		{"empty", mountCap(""), nil, false},
+		{"valid", mountCap("2000"), &g2000, false},
+		{"non-numeric", mountCap("not-a-number"), nil, true},
+		{"negative", mountCap("-1"), nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gid, err := parseMountGroup(tt.cap)
+			if tt.wantErr {
+				if st, ok := status.FromError(err); !ok || st.Code() != codes.InvalidArgument {
+					t.Fatalf("expected InvalidArgument, got %v", err)
+				}
+			} else if err != nil || (gid == nil) != (tt.wantGID == nil) || (gid != nil && *gid != *tt.wantGID) {
+				t.Fatalf("got (%v, %v), want (%v, nil)", gid, err, tt.wantGID)
+			}
+		})
+	}
+}
+
+func TestApplyMountGroup(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.Chmod(dir, 0755)
+	gid := os.Getgid()
+	if err := applyMountGroup(dir, gid); err != nil {
+		t.Fatalf("applyMountGroup failed: %v", err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+	if fi.Mode()&0020 == 0 || fi.Mode()&os.ModeSetgid == 0 {
+		t.Errorf("expected group-write and setgid bits, got mode %o", fi.Mode())
+	}
+	if stat, ok := fi.Sys().(*syscall.Stat_t); ok && int(stat.Gid) != gid {
+		t.Errorf("expected gid %d, got %d", gid, stat.Gid)
 	}
 }
 
