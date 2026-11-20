@@ -237,7 +237,7 @@ func TestMetadataStreamTypeResolution_NewStreamRoundTrip(t *testing.T) {
 
 func TestSyncCoalesceState(t *testing.T) {
 	var state syncCoalesceState
-	state.window = 50 * time.Millisecond
+	state.coalesceWindow = 50 * time.Millisecond
 
 	state.armTimer(func() {})
 	if state.timer == nil {

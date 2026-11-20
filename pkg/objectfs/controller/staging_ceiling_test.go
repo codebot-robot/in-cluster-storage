@@ -1457,8 +1457,8 @@ func TestSyncCoalesceState_IsBackingOffAfterFailedSync(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			state := syncCoalesceState{
-				window:       window,
-				lastRealSync: tc.lastRealSync,
+				coalesceWindow: window,
+				lastRealSync:   tc.lastRealSync,
 			}
 			if got := state.isBackingOffAfterFailedSync(tc.now); got != tc.want {
 				t.Errorf("isBackingOffAfterFailedSync(%v) = %v, want %v", tc.now, got, tc.want)
