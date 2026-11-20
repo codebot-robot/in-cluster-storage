@@ -295,9 +295,6 @@ type Server struct {
 
 	restoringMu sync.Mutex
 	restoring   map[string]bool
-
-	triggerSyncHookMu sync.RWMutex
-	triggerSyncHook   func()
 }
 
 // ExclusiveHold tracks an active exclusive-local hold on a volume.
@@ -2348,20 +2345,6 @@ func (s *Server) triggerStagedVolumesSync() {
 	for _, entry := range stagedVolumes {
 		entry.volume.triggerSyncIfStaged()
 	}
-
-	s.triggerSyncHookMu.RLock()
-	hook := s.triggerSyncHook
-	s.triggerSyncHookMu.RUnlock()
-	if hook != nil {
-		hook()
-	}
-}
-
-// setTriggerSyncHook configures a callback invoked after triggerStagedVolumesSync evaluates staged volumes (testing only).
-func (s *Server) setTriggerSyncHook(hook func()) {
-	s.triggerSyncHookMu.Lock()
-	defer s.triggerSyncHookMu.Unlock()
-	s.triggerSyncHook = hook
 }
 
 // volumeDrainResult reports the outcome of an individual volume coalesce sync started by the drain loop.

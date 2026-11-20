@@ -1265,10 +1265,16 @@ func TestStagingDrain_ExternalSyncsDoNotCountTowardLimit(t *testing.T) {
 	waitStagedAtOrBelow(t, server, 16384*1024)
 }
 
+// failPacksCountingBackend wraps an ObjectStorageBackend to optionally inject failures on pack uploads
+// and count the total number of pack upload attempts.
 type failPacksCountingBackend struct {
+	// ObjectStorageBackend provides the underlying storage implementation.
 	ObjectStorageBackend
-	mu             sync.Mutex
-	failPacks      bool
+	// mu guards failPacks and uploadAttempts.
+	mu sync.Mutex
+	// failPacks controls whether PutObject fails for packfiles.
+	failPacks bool
+	// uploadAttempts tracks the number of PutObject calls for packfiles.
 	uploadAttempts int
 }
 
@@ -1295,12 +1301,11 @@ func (b *failPacksCountingBackend) attempts() int {
 // TestStagingCeiling_FailingBackendDoesNotReTriggerUploadsOnWake verifies that when a writer is blocked
 // at the controller-wide staging ceiling and backend uploads fail, subsequent wake-ups of the blocked
 // writer do not re-trigger syncs or upload attempts on failing volumes faster than the volume's own
-// coalesce retry window. When uploads succeed, the blocked writer is released promptly.
-// Driven by signals with no sleeps.
+// coalesce retry window. When uploads succeed, running a coalesce sync releases the blocked writer.
 // Requires no locks held.
 func TestStagingCeiling_FailingBackendDoesNotReTriggerUploadsOnWake(t *testing.T) {
 	ctx := t.Context()
-	ceilingBytes := int64(8 * 1024 * 1024)
+	ceilingBytes := int64(10 * 1024 * 1024)
 	backend := &failPacksCountingBackend{
 		ObjectStorageBackend: NewMemoryBackend(),
 		failPacks:            true,
@@ -1310,90 +1315,154 @@ func TestStagingCeiling_FailingBackendDoesNotReTriggerUploadsOnWake(t *testing.T
 	volume1ID := "test-fail-retry-vol1"
 	volume2ID := "test-fail-retry-vol2"
 
-	var vol1Starts, vol2Starts atomic.Int32
-	vol1 := setupTestVolume(ctx, t, server, volume1ID, 3*1024*1024, func() { vol1Starts.Add(1) })
-	vol2 := setupTestVolume(ctx, t, server, volume2ID, 3*1024*1024, func() { vol2Starts.Add(1) })
+	var volume1Starts, volume2Starts atomic.Int32
+	// Total staged: 3 MiB + 3 MiB = 6 MiB (6144 KiB), strictly below the 75% high-water mark (7680 KiB)
+	// so the background drain loop does not start syncs.
+	volume1 := setupTestVolume(ctx, t, server, volume1ID, 3*1024*1024, func() { volume1Starts.Add(1) })
+	volume2 := setupTestVolume(ctx, t, server, volume2ID, 3*1024*1024, func() { volume2Starts.Add(1) })
 
-	syncTriggered := make(chan struct{}, 1)
-	server.setTriggerSyncHook(func() {
-		select {
-		case syncTriggered <- struct{}{}:
-		default:
-		}
-	})
-
-	// Start a writer that requires 3 MiB on volume 3: total staged (6 MiB) + 3 MiB = 9 MiB > 8 MiB ceiling.
-	// The writer enters serverDiskLimits.wait, triggers syncs on volume 1 and volume 2, and blocks on spaceAvailable.
+	// Start a writer that requires 5 MiB on volume 3: total staged (6 MiB) + 5 MiB = 11 MiB > 10 MiB ceiling.
+	// The writer enters serverDiskLimits.wait, initiates pass 1 which triggers syncs on volume 1 and volume 2,
+	// and blocks on spaceAvailable.
 	waiterVolumeID := "test-fail-retry-vol3"
 	waiterInode := createTestInode(ctx, t, server, waiterVolumeID, "/waiter.bin")
-	writeResponseChannel, errorChannel := startAsyncWrite(ctx, server, waiterVolumeID, waiterInode, make([]byte, 3*1024*1024))
+	writeResponseChannel, errorChannel := startAsyncWrite(ctx, server, waiterVolumeID, waiterInode, make([]byte, 5*1024*1024))
 
-	// Await the initial sync trigger evaluation pass from the waiting writer.
-	select {
-	case <-syncTriggered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for initial sync trigger evaluation")
+	// Await the initial upload attempts triggered by the waiting writer on entry.
+	entryDeadline := time.Now().Add(5 * time.Second)
+	for backend.attempts() < 2 {
+		if time.Now().After(entryDeadline) {
+			t.Fatalf("timed out waiting for the initial upload attempts (attempts: %d)", backend.attempts())
+		}
+		time.Sleep(time.Millisecond)
 	}
 
 	// Wait for the initial syncs to finish their failed upload attempts.
-	vol1.stagingMu.Lock()
-	vol1.waitForSyncIdleLocked()
-	vol1.stagingMu.Unlock()
+	volume1.stagingMu.Lock()
+	volume1.waitForSyncIdleLocked()
+	volume1.stagingMu.Unlock()
 
-	vol2.stagingMu.Lock()
-	vol2.waitForSyncIdleLocked()
-	vol2.stagingMu.Unlock()
+	volume2.stagingMu.Lock()
+	volume2.waitForSyncIdleLocked()
+	volume2.stagingMu.Unlock()
 
-	// Initial sync attempts: exactly 1 on vol1 and 1 on vol2.
-	if s1 := vol1Starts.Load(); s1 != 1 {
-		t.Fatalf("vol1 initial sync starts = %d, want 1", s1)
+	// Initial sync attempts: exactly 1 on volume 1 and 1 on volume 2.
+	if starts1 := volume1Starts.Load(); starts1 != 1 {
+		t.Fatalf("volume1 initial sync starts = %d, want 1", starts1)
 	}
-	if s2 := vol2Starts.Load(); s2 != 1 {
-		t.Fatalf("vol2 initial sync starts = %d, want 1", s2)
+	if starts2 := volume2Starts.Load(); starts2 != 1 {
+		t.Fatalf("volume2 initial sync starts = %d, want 1", starts2)
 	}
 	if attempts := backend.attempts(); attempts != 2 {
 		t.Fatalf("initial upload attempts = %d, want 2", attempts)
 	}
 
-	// Signal a fixed number of wake-ups on spaceAvailable (e.g. 10 wake-ups).
-	// Because uploads are failing on both volumes and their 10-minute coalesce retry timer
+	// A successful empty sync does not touch the backend and must not clear the failure back-off.
+	if err := volume1.finishEmptySync(0, nil, 0, map[uint64]struct{}{}); err != nil {
+		t.Fatalf("empty sync failed: %v", err)
+	}
+
+	// Drive trigger passes directly, as a writer waking at the ceiling does.
+	// Because uploads failed on both volumes and their 10-minute coalesce retry timer
 	// has not fired, triggerSyncIfStaged must decline to start new syncs.
 	// Upload attempts must remain strictly bounded at 2.
 	const fixedWakeUps = 10
 	for i := 0; i < fixedWakeUps; i++ {
-		server.diskLimits.mu.Lock()
-		server.diskLimits.spaceAvailable.Broadcast()
-		server.diskLimits.mu.Unlock()
-
-		select {
-		case <-syncTriggered:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for wake-up %d to evaluate sync triggers", i)
-		}
+		server.triggerStagedVolumesSync()
 	}
 
 	// Assert that sync starts and upload attempts did not increase over the 10 wake-ups.
-	if s1 := vol1Starts.Load(); s1 != 1 {
-		t.Fatalf("vol1 sync starts after %d wake-ups = %d, want 1", fixedWakeUps, s1)
+	if starts1 := volume1Starts.Load(); starts1 != 1 {
+		t.Fatalf("volume1 sync starts after %d wake-ups = %d, want 1", fixedWakeUps, starts1)
 	}
-	if s2 := vol2Starts.Load(); s2 != 1 {
-		t.Fatalf("vol2 sync starts after %d wake-ups = %d, want 1", fixedWakeUps, s2)
+	if starts2 := volume2Starts.Load(); starts2 != 1 {
+		t.Fatalf("volume2 sync starts after %d wake-ups = %d, want 1", fixedWakeUps, starts2)
 	}
 	if attempts := backend.attempts(); attempts != 2 {
 		t.Fatalf("upload attempts after %d wake-ups = %d, want 2", fixedWakeUps, attempts)
 	}
 
-	// When uploads succeed, the volume's sync succeeds, frees staged bytes, and releases the blocked writer.
+	// When backend uploads succeed, running a coalesce sync uploads staged bytes,
+	// drops staged chunks, and unblocks the waiting writer.
 	backend.mu.Lock()
 	backend.failPacks = false
 	backend.mu.Unlock()
 
-	if syncErr := vol1.runCoalesceSync(); syncErr != nil {
-		t.Fatalf("vol1 coalesce sync failed after clearing backend failure: %v", syncErr)
+	if syncErr := volume1.runCoalesceSync(); syncErr != nil {
+		t.Fatalf("volume1 coalesce sync failed after clearing backend failure: %v", syncErr)
 	}
 
-	// Releasing vol1's 3 MiB drops total staged to 3 MiB; 3 MiB + 3 MiB needed <= 8 MiB ceiling.
-	// The blocked writer must unblock promptly and complete.
+	// Releasing volume1's 3 MiB drops total staged to 3 MiB; 3 MiB + 5 MiB needed <= 10 MiB ceiling.
+	// The blocked writer unblocks and completes.
 	awaitWriteResult(t, writeResponseChannel, errorChannel)
 }
 
+// TestSyncCoalesceState_IsBackingOffAfterFailedSync verifies with literal times that a volume backs off
+// after a failed sync until the coalesce window expires, and does not back off when never synced, after
+// a successful sync, or once the window has elapsed.
+func TestSyncCoalesceState_IsBackingOffAfterFailedSync(t *testing.T) {
+	baseTime := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	window := 1 * time.Second
+
+	tests := []struct {
+		name         string
+		lastRealSync *syncInfo
+		now          time.Time
+		want         bool
+	}{
+		{
+			name:         "never synced",
+			lastRealSync: nil,
+			now:          baseTime,
+			want:         false,
+		},
+		{
+			name: "last sync succeeded",
+			lastRealSync: &syncInfo{
+				err:        nil,
+				finishedAt: baseTime,
+			},
+			now:  baseTime.Add(100 * time.Millisecond),
+			want: false,
+		},
+		{
+			name: "failed and inside window",
+			lastRealSync: &syncInfo{
+				err:        errors.New("injected backend upload error"),
+				finishedAt: baseTime,
+			},
+			now:  baseTime.Add(500 * time.Millisecond),
+			want: true,
+		},
+		{
+			name: "failed and exactly at window boundary",
+			lastRealSync: &syncInfo{
+				err:        errors.New("injected backend upload error"),
+				finishedAt: baseTime,
+			},
+			now:  baseTime.Add(window),
+			want: false,
+		},
+		{
+			name: "failed and past window",
+			lastRealSync: &syncInfo{
+				err:        errors.New("injected backend upload error"),
+				finishedAt: baseTime,
+			},
+			now:  baseTime.Add(window + 100*time.Millisecond),
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state := syncCoalesceState{
+				window:       window,
+				lastRealSync: tc.lastRealSync,
+			}
+			if got := state.isBackingOffAfterFailedSync(tc.now); got != tc.want {
+				t.Errorf("isBackingOffAfterFailedSync(%v) = %v, want %v", tc.now, got, tc.want)
+			}
+		})
+	}
+}

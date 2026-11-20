@@ -143,6 +143,14 @@ type packInfo struct {
 	uploadError    error
 }
 
+// syncInfo records the outcome and completion time of a sync operation.
+type syncInfo struct {
+	// err is the error result of the sync, or nil on success.
+	err error
+	// finishedAt records when the sync operation completed.
+	finishedAt time.Time
+}
+
 // syncCoalesceState groups the state used to coalesce non-blocking sync requests
 // across a configurable time window, batching multiple writes and fsync calls into
 // a single durable pack upload and metadata commit to reduce I/O overhead.
@@ -152,6 +160,12 @@ type syncCoalesceState struct {
 	// timer triggers a background coalesce sync when the coalesce window expires,
 	// or is nil if no timer is currently active.
 	timer *time.Timer
+
+	// lastRealSync records the result and timestamp of the most recently completed real sync
+	// that uploaded packs to the backend, or is nil if no real sync has completed yet.
+	// Empty syncs do not upload data and therefore do not update this field.
+	// Guarded by Volume.stagingMu.
+	lastRealSync *syncInfo
 
 	// waiters holds callers waiting for a staged sync sequence to commit,
 	// including both volume-wide non-blocking syncs and close-triggered syncs
@@ -178,6 +192,17 @@ func (c *syncCoalesceState) stopTimer() {
 		c.timer.Stop()
 		c.timer = nil
 	}
+}
+
+// isBackingOffAfterFailedSync reports whether the volume is in a back-off period following
+// a failed sync at time now. A volume backs off while its most recent real sync completed with an
+// error and now is before finishedAt plus the coalesce window.
+// Must be called with Volume.stagingMu held.
+func (c *syncCoalesceState) isBackingOffAfterFailedSync(now time.Time) bool {
+	if c.lastRealSync == nil || c.lastRealSync.err == nil {
+		return false
+	}
+	return now.Before(c.lastRealSync.finishedAt.Add(c.window))
 }
 
 // addWaiter records a waiter waiting for a sync sequence to commit.
@@ -319,9 +344,6 @@ type Volume struct {
 	stagedMtimes  map[uint64]time.Time
 	stagedBytes   int64
 	lastSyncError map[uint64]error
-	// syncFailed tracks whether the volume's last real sync operation failed.
-	// Guarded by stagingMu.
-	syncFailed bool
 
 	coalesce    syncCoalesceState
 	closeTimer  *time.Timer
@@ -863,12 +885,10 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 	}
 
 	if err != nil {
-		v.syncFailed = true
 		for sIno := range snapshotChunks {
 			v.lastSyncError[sIno] = err
 		}
 	} else {
-		v.syncFailed = false
 		v.evictUploadedPacksLocked(0)
 
 		for ino, chunks := range snapshotChunks {
@@ -879,6 +899,11 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 			}
 			delete(v.lastSyncError, ino)
 		}
+	}
+
+	v.coalesce.lastRealSync = &syncInfo{
+		err:        err,
+		finishedAt: time.Now(),
 	}
 
 	v.completeWaitersAndRearmLocked(snapshotSeq, err, pos, inodeFilter)
@@ -917,10 +942,7 @@ func (v *Volume) finishEmptySync(snapshotSeq uint64, err error, pos uint64, inod
 	defer v.stagingMu.Unlock()
 
 	if err == nil {
-		v.syncFailed = false
 		v.evictUploadedPacksLocked(0)
-	} else {
-		v.syncFailed = true
 	}
 
 	v.completeWaitersAndRearmLocked(snapshotSeq, err, pos, inodeFilter)
@@ -1005,16 +1027,16 @@ func (v *Volume) stagedSyncEligibleLocked() (eligible bool, stagedBytes int64, h
 }
 
 // triggerSyncIfStaged initiates a coalesce sync in the background if the volume holds staged chunks,
-// no sync is in flight, and uploads are not currently failing. While uploads are failing, it declines
-// to start a new sync so a blocked writer at the ceiling does not retry faster than the volume's own
-// coalesce retry window.
+// no sync is in flight, and the volume is not backing off after a failed sync. While backing off,
+// it declines to start a new sync so a blocked writer at the ceiling does not retry faster than
+// the volume's own coalesce retry window.
 // If a syncTriggerHook is configured, it runs with no locks held, before the sync goroutine is started, and only
 // when a sync is actually initiated (not on early returns).
 // Requires no locks held; acquires stagingMu.
 func (v *Volume) triggerSyncIfStaged() {
 	v.stagingMu.Lock()
 	eligible, _, hook := v.stagedSyncEligibleLocked()
-	if eligible && v.syncFailed {
+	if eligible && v.coalesce.isBackingOffAfterFailedSync(time.Now()) {
 		eligible = false
 	}
 	v.stagingMu.Unlock()
