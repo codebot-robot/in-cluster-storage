@@ -30,14 +30,28 @@ import (
 
 // streamEpochStore manages durable storage of the highest accepted writer epoch per stream.
 type streamEpochStore struct {
-	dir, filePath string
-	streamID      uuid.UUID
-	noFsync       bool
+	// dir is the stream directory containing the epoch file.
+	dir string
+
+	// filePath is the absolute path to the epoch file.
+	filePath string
+
+	// streamID identifies the stream owning this epoch store.
+	streamID uuid.UUID
+
+	// noFsync disables filesystem syncing during tests.
+	noFsync bool
 }
 
+// newStreamEpochStore creates a new streamEpochStore for streamID under dataDir.
 func newStreamEpochStore(dataDir string, streamID uuid.UUID, noFsync bool) *streamEpochStore {
 	dir := filepath.Join(dataDir, "streams", streamID.String())
-	return &streamEpochStore{dir: dir, filePath: filepath.Join(dir, "epoch"), streamID: streamID, noFsync: noFsync}
+	return &streamEpochStore{
+		dir:      dir,
+		filePath: filepath.Join(dir, "epoch"),
+		streamID: streamID,
+		noFsync:  noFsync,
+	}
 }
 
 // Load reads the highest accepted epoch from disk. A missing file returns 0 and nil.
@@ -102,7 +116,7 @@ func (s *streamEpochStore) Save(epoch uint64) (err error) {
 		if openErr != nil {
 			return fmt.Errorf("open stream dir %s: %w", s.dir, openErr)
 		}
-		defer errutil.CloseWithErr(dirFile, &err)
+		defer errutil.CloseAndLog(dirFile, s.dir)
 		if syncErr := dirFile.Sync(); syncErr != nil {
 			return fmt.Errorf("sync stream dir %s: %w", s.dir, syncErr)
 		}

@@ -303,3 +303,70 @@ func TestAppend_InFlightRecordFromSupersededSessionDiscarded(t *testing.T) {
 		t.Fatalf("expected inFlight 0, got %d", inFlight)
 	}
 }
+
+// TestAppend_EpochSurvivesBufferRestart verifies that after a buffer restart on the same data directory,
+// a session with a lower epoch is refused with the Fenced detail and a session with an equal epoch is accepted.
+func TestAppend_EpochSurvivesBufferRestart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+	streamID := uuid.New()
+
+	_, address1, cleanup1 := startTestServer(t, backend, dataDir)
+	firstSession, _, err := openSession(ctx, t, address1, streamID, 2)
+	if err != nil {
+		t.Fatalf("first session with epoch 2 failed: %v", err)
+	}
+	firstSession.close(t)
+	cleanup1()
+
+	_, address2, cleanup2 := startTestServer(t, backend, dataDir)
+	defer cleanup2()
+
+	refusedSession, _, err := openSession(ctx, t, address2, streamID, 1)
+	if refusedSession != nil {
+		defer refusedSession.close(t)
+	}
+	assertFencedError(t, err, streamID, 1, 2)
+
+	acceptedSession, _, err := openSession(ctx, t, address2, streamID, 2)
+	if err != nil {
+		t.Fatalf("session with epoch 2 failed after restart: %v", err)
+	}
+	defer acceptedSession.close(t)
+}
+
+// TestAppend_EpochSurvivesIdleStreamEviction verifies that after a stream is evicted for idleness,
+// a session with a lower epoch is refused with the Fenced detail and a session with an equal epoch is accepted.
+func TestAppend_EpochSurvivesIdleStreamEviction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	backend := inmemorystorage.New()
+	server, address, cleanup := startTestServer(t, backend, t.TempDir())
+	defer cleanup()
+
+	streamID := uuid.New()
+
+	state, _, _, err := server.attachSession(ctx, streamID, 2)
+	if err != nil {
+		t.Fatalf("attachSession with epoch 2 failed: %v", err)
+	}
+	server.detachSession(state)
+
+	server.evictIdleStreams()
+
+	refusedSession, _, err := openSession(ctx, t, address, streamID, 1)
+	if refusedSession != nil {
+		defer refusedSession.close(t)
+	}
+	assertFencedError(t, err, streamID, 1, 2)
+
+	acceptedSession, _, err := openSession(ctx, t, address, streamID, 2)
+	if err != nil {
+		t.Fatalf("session with epoch 2 failed after eviction: %v", err)
+	}
+	defer acceptedSession.close(t)
+}

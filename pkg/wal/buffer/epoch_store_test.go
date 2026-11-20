@@ -55,8 +55,11 @@ func TestStreamEpochStore_CorruptFiles(t *testing.T) {
 	for name, content := range map[string][]byte{"empty": nil, "unterminated": []byte("42"), "garbage": []byte("abc\n")} {
 		t.Run(name, func(t *testing.T) {
 			store := newStreamEpochStore(t.TempDir(), uuid.New(), false)
-			if err := os.MkdirAll(store.dir, 0755); err != nil || os.WriteFile(store.filePath, content, 0644) != nil {
-				t.Fatal("setup failed")
+			if err := os.MkdirAll(store.dir, 0755); err != nil {
+				t.Fatalf("failed to create store dir %s: %v", store.dir, err)
+			}
+			if err := os.WriteFile(store.filePath, content, 0644); err != nil {
+				t.Fatalf("failed to write test epoch file %s: %v", store.filePath, err)
 			}
 			_, err := store.Load()
 			if err == nil || !strings.Contains(err.Error(), store.filePath) || !strings.Contains(err.Error(), store.streamID.String()) {

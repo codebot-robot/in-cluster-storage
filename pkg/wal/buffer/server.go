@@ -98,15 +98,26 @@ type streamState struct {
 	// waiters is the number of goroutines currently waiting on cond. Guarded by mu.
 	waiters int
 
-	// epoch is the highest accepted writer epoch for this stream. Guarded by mu.
+	// epoch is the highest accepted writer epoch for this stream.
+	// Written only while holding both epochMu and mu; may be read under either.
 	epoch uint64
+
+	// epochStore manages durable on-disk storage of the stream's accepted writer epoch.
+	epochStore *streamEpochStore
+
+	// epochMu serializes epoch loading and durable advancement. The epoch mutex is taken before mu and is never held while the server lock is requested.
+	epochMu sync.Mutex
+
+	// epochLoaded records whether the stored epoch has been loaded from disk. Guarded by epochMu.
+	epochLoaded bool
 }
 
-// newStreamState creates a new streamState initialized with watermarks.
-func newStreamState(witnessSeq, s3Seq uint64) *streamState {
+// newStreamState creates a new streamState initialized with watermarks and an epoch store.
+func newStreamState(witnessSeq, s3Seq uint64, epochStore *streamEpochStore) *streamState {
 	st := &streamState{
 		witnessSeq: witnessSeq,
 		s3Seq:      s3Seq,
+		epochStore: epochStore,
 	}
 	st.cond = sync.NewCond(&st.mu)
 	return st
@@ -121,6 +132,52 @@ func (st *streamState) raiseWatermarksLocked(uploadedTo uint64) {
 	if uploadedTo > st.s3Seq {
 		st.s3Seq = uploadedTo
 	}
+}
+
+// acceptEpoch validates and durably advances the stream's accepted writer epoch under epochMu.
+// epoch is written only while holding both epochMu and st.mu, and may be read under either.
+// The epoch mutex is taken before the stream's mu and is never held while the server lock is requested.
+func (st *streamState) acceptEpoch(sessionEpoch uint64) error {
+	st.epochMu.Lock()
+	defer st.epochMu.Unlock()
+
+	if !st.epochLoaded {
+		if st.epochStore != nil {
+			stored, err := st.epochStore.Load()
+			if err != nil {
+				return err
+			}
+			st.mu.Lock()
+			st.epoch = stored
+			st.mu.Unlock()
+		}
+		st.epochLoaded = true
+	}
+
+	if sessionEpoch < st.epoch {
+		var streamID uuid.UUID
+		if st.epochStore != nil {
+			streamID = st.epochStore.streamID
+		}
+		return fencedStatus(streamID, sessionEpoch, st.epoch)
+	}
+
+	if sessionEpoch == st.epoch {
+		return nil
+	}
+
+	if st.epochStore != nil {
+		if err := st.epochStore.Save(sessionEpoch); err != nil {
+			return err
+		}
+	}
+
+	st.mu.Lock()
+	st.epoch = sessionEpoch
+	st.cond.Broadcast()
+	st.mu.Unlock()
+
+	return nil
 }
 
 // fencedStatus creates a gRPC status error with code FailedPrecondition carrying pb.Fenced details.
@@ -383,7 +440,14 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 	// Populate initial streams state
 	for sid, watermark := range streamWatermarks {
-		s.streams[sid] = newStreamState(watermark, backendWatermarks[sid])
+		var epochStore *streamEpochStore
+		streamID, err := uuid.Parse(sid)
+		if err != nil {
+			klog.Warningf("Failed to parse stream ID %s during startup recovery: %v", sid, err)
+		} else {
+			epochStore = newStreamEpochStore(cfg.DataDir, streamID, cfg.NoFsync)
+		}
+		s.streams[sid] = newStreamState(watermark, backendWatermarks[sid], epochStore)
 	}
 	s.streamStore.SetEvictHook(s.evictIdleStreams)
 
@@ -539,7 +603,8 @@ func (s *Server) getOrCreateStreamLocked(streamID uuid.UUID, uploadedTo uint64) 
 	streamKey := streamID.String()
 	state, exists := s.streams[streamKey]
 	if !exists {
-		state = newStreamState(uploadedTo, uploadedTo)
+		epochStore := newStreamEpochStore(s.cfg.DataDir, streamID, s.cfg.NoFsync)
+		state = newStreamState(uploadedTo, uploadedTo, epochStore)
 		s.streams[streamKey] = state
 	}
 	return state
@@ -573,11 +638,12 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 // between lookup and attachment, leaving the session attached to an orphaned state
 // invisible to subsequent sessions and commitItems.
 //
-// Under s.mu, state.mu is acquired exactly once for all field changes: raising the
-// watermarks to the discovered value, validating that the session epoch is not lower
-// than the stream's accepted epoch (refusing lower epochs with the Fenced status),
-// raising the accepted epoch and broadcasting on a higher one, incrementing
-// state.attachments, and reading witness and object-store watermarks.
+// Under s.mu, state.mu is acquired to raise watermarks to the discovered value,
+// increment state.attachments, and read witness and object-store watermarks in one
+// critical section. Both locks are released before calling acceptEpoch, which
+// lazily loads and durably advances the stream's accepted epoch under the stream's
+// epoch mutex without holding s.mu. If acceptEpoch refuses the session, detachSession
+// rolls back the attachment.
 func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionEpoch uint64) (*streamState, uint64, uint64, error) {
 	var uploadedTo uint64
 	if s.streamStore != nil {
@@ -595,23 +661,16 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 	// controls. A refused session must not change anything else.
 	state.raiseWatermarksLocked(uploadedTo)
 
-	if sessionEpoch < state.epoch {
-		acceptedEpoch := state.epoch
-		state.mu.Unlock()
-		s.mu.Unlock()
-		return nil, 0, 0, fencedStatus(streamID, sessionEpoch, acceptedEpoch)
-	}
-
-	if sessionEpoch > state.epoch {
-		state.epoch = sessionEpoch
-		state.cond.Broadcast()
-	}
-
 	state.attachments++
 	witnessSeq := state.witnessSeq
 	s3Seq := state.s3Seq
 	state.mu.Unlock()
 	s.mu.Unlock()
+
+	if err := state.acceptEpoch(sessionEpoch); err != nil {
+		s.detachSession(state)
+		return nil, 0, 0, err
+	}
 
 	return state, witnessSeq, s3Seq, nil
 }
@@ -1010,7 +1069,8 @@ func (s *Server) planBatchLocked(items []incomingItem) *batchPlan {
 		if stream == nil {
 			streamState := s.streams[streamID]
 			if streamState == nil {
-				streamState = newStreamState(0, 0)
+				epochStore := newStreamEpochStore(s.cfg.DataDir, item.streamID, s.cfg.NoFsync)
+				streamState = newStreamState(0, 0, epochStore)
 				s.streams[streamID] = streamState
 			}
 			streamState.mu.Lock()
