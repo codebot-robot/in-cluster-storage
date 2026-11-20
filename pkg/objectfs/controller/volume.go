@@ -172,16 +172,17 @@ type syncCoalesceState struct {
 	// that are filtered and answered by inode ID.
 	waiters []*syncWaiter
 
-	// window is the duration to batch non-blocking sync requests before triggering
-	// an asynchronous sync operation.
-	window time.Duration
+	// coalesceWindow is the duration to batch non-blocking sync requests before triggering
+	// an asynchronous sync operation. Because a failed sync re-arms the coalesce timer,
+	// coalesceWindow is also the volume's retry delay before retrying on its own.
+	coalesceWindow time.Duration
 }
 
 // armTimer arms the coalesce timer with trigger if it is not already armed.
 // Must be called with Volume.stagingMu held.
 func (c *syncCoalesceState) armTimer(trigger func()) {
 	if c.timer == nil {
-		c.timer = time.AfterFunc(c.window, trigger)
+		c.timer = time.AfterFunc(c.coalesceWindow, trigger)
 	}
 }
 
@@ -194,15 +195,23 @@ func (c *syncCoalesceState) stopTimer() {
 	}
 }
 
+// failedSyncBackoff returns the back-off duration applied after a failed sync.
+// It equals coalesceWindow on purpose: because a failed sync re-arms the coalesce
+// timer with coalesceWindow, the staging-ceiling path must not retry a failing
+// volume sooner than the volume's own coalesce timer would retry.
+func (c *syncCoalesceState) failedSyncBackoff() time.Duration {
+	return c.coalesceWindow
+}
+
 // isBackingOffAfterFailedSync reports whether the volume is in a back-off period following
 // a failed sync at time now. A volume backs off while its most recent real sync completed with an
-// error and now is before finishedAt plus the coalesce window.
+// error and now is before finishedAt plus the failed-sync back-off duration.
 // Must be called with Volume.stagingMu held.
 func (c *syncCoalesceState) isBackingOffAfterFailedSync(now time.Time) bool {
 	if c.lastRealSync == nil || c.lastRealSync.err == nil {
 		return false
 	}
-	return now.Before(c.lastRealSync.finishedAt.Add(c.window))
+	return now.Before(c.lastRealSync.finishedAt.Add(c.failedSyncBackoff()))
 }
 
 // addWaiter records a waiter waiting for a sync sequence to commit.
@@ -417,7 +426,7 @@ func WithAcceptUnversioned(accept bool) VolumeOption {
 func WithSyncCoalesceWindow(d time.Duration) VolumeOption {
 	return func(v *Volume) {
 		if d > 0 {
-			v.coalesce.window = d
+			v.coalesce.coalesceWindow = d
 		}
 	}
 }
@@ -750,7 +759,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		lastSyncError:   make(map[uint64]error),
 		packs:           make(map[uint64]*packInfo),
 		uploadSemaphore: make(chan struct{}, 2),
-		coalesce:        syncCoalesceState{window: 1 * time.Second},
+		coalesce:        syncCoalesceState{coalesceWindow: 1 * time.Second},
 	}
 	uploadContext, cancelUpload := context.WithCancel(context.Background())
 	v.uploadContext = uploadContext
