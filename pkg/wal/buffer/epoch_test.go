@@ -279,8 +279,11 @@ func TestAppend_InFlightRecordFromSupersededSessionDiscarded(t *testing.T) {
 
 	server.mu.RLock()
 	lastPosition := server.lastPosition
-	unflushedCount := len(server.unflushedRecords)
 	server.mu.RUnlock()
+
+	server.unflushedMu.Lock()
+	unflushedCount := len(server.unflushedRecords)
+	server.unflushedMu.Unlock()
 
 	stream.mu.Lock()
 	witnessSeq := stream.witnessSeq

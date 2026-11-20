@@ -1264,6 +1264,7 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 	if lastPos > s.lastFlushedPosition {
 		s.lastFlushedPosition = lastPos
 	}
+	lastFlushedPosition := s.lastFlushedPosition
 
 	var notifiedStreams []*streamState
 	for sid, maxSeq := range streamMaxSeq {
@@ -1282,12 +1283,13 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 	s.checkAggregatedSegmentGC(ctx)
 
 	// 4. Clean up local segment files that have been flushed to permanent storage
-	if err := s.localStore.DeleteSegmentsThrough(s.lastFlushedPosition, s.cfg.TailCacheBytes); err != nil {
+	if err := s.localStore.DeleteSegmentsThrough(lastFlushedPosition, s.cfg.TailCacheBytes); err != nil {
 		klog.Warningf("Error cleaning local segment files: %v", err)
 	}
 
 	// 5. Notify streams whose S3 acks advanced
 	for _, st := range notifiedStreams {
+		// Calling Broadcast without holding st.mu is allowed for sync.Cond; safe because the watermark was changed under the lock just before.
 		st.cond.Broadcast()
 	}
 
