@@ -147,6 +147,142 @@ func dumpAllDiagnosticLogs(t *testing.T, h *Harness, pod1, pod2 string) {
 		t.Logf("Pod 2 (%s) fsx Logs:\n%s", pod2, out)
 	}
 	t.Log("===================================")
+	captureGoroutineDumpsOnHang(t, h)
+}
+
+var hangDumpOnce sync.Once
+
+// captureGoroutineDumpsOnHang captures a full goroutine dump from the controller pod
+// and from each node daemon pod using Go's built-in SIGQUIT behavior.
+// It is called after diagnostic logs are captured so pre-hang logs are not overwritten.
+func captureGoroutineDumpsOnHang(t *testing.T, h *Harness) {
+	hangDumpOnce.Do(func() {
+		t.Log("======= CAPTURING GOROUTINE DUMPS ON HANG DETECTED =======")
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		type podTarget struct {
+			pod       string
+			container string
+			role      string
+		}
+
+		var targets []podTarget
+
+		controllerPods := h.getPodNames("app=objectfs-controller", "default")
+		if len(controllerPods) == 0 {
+			t.Log("Warning: no controller pods found to capture goroutine dumps")
+		}
+		for _, pod := range controllerPods {
+			targets = append(targets, podTarget{
+				pod:       pod,
+				container: "objectfs-controller",
+				role:      "Controller",
+			})
+		}
+
+		daemonPods := h.getPodNames("app=objectfs-node-daemon", "default")
+		if len(daemonPods) == 0 {
+			t.Log("Warning: no node daemon pods found to capture goroutine dumps")
+		}
+		for _, pod := range daemonPods {
+			targets = append(targets, podTarget{
+				pod:       pod,
+				container: "objectfs-node-daemon",
+				role:      "Node Daemon",
+			})
+		}
+
+		if len(targets) == 0 {
+			return
+		}
+
+		type captureResult struct {
+			target podTarget
+			dump   string
+			err    error
+		}
+		results := make([]captureResult, len(targets))
+		var waitGroup sync.WaitGroup
+
+		for index, target := range targets {
+			waitGroup.Add(1)
+			go func(targetIndex int, targetPod podTarget) {
+				defer waitGroup.Done()
+				dump, err := capturePodGoroutineDump(ctx, t, targetPod.pod, targetPod.container)
+				results[targetIndex] = captureResult{target: targetPod, dump: dump, err: err}
+			}(index, target)
+		}
+		waitGroup.Wait()
+
+		for _, result := range results {
+			if result.err != nil {
+				t.Logf("Failed to capture goroutine dump from %s (%s / %s): %v",
+					result.target.role, result.target.pod, result.target.container, result.err)
+			} else {
+				t.Logf("======= GOROUTINE DUMP: %s (%s / %s) =======\n%s\n=======================================================",
+					result.target.role, result.target.pod, result.target.container, result.dump)
+			}
+		}
+		t.Log("==========================================================")
+	})
+}
+
+// capturePodGoroutineDump delivers SIGQUIT to PID 1 inside the target container and polls
+// container logs for the resulting Go goroutine dump.
+func capturePodGoroutineDump(ctx context.Context, t *testing.T, pod, container string) (string, error) {
+	signalCtx, signalCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer signalCancel()
+
+	command := exec.CommandContext(signalCtx, "kubectl", "exec", pod, "-n", "default", "-c", container, "--", "/bin/sh", "-c", "kill -QUIT 1")
+	if executeError := command.Run(); executeError != nil {
+		// The container process exits immediately on SIGQUIT, so kubectl exec returning an error is expected.
+		t.Logf("Note: kubectl exec kill -QUIT 1 on %s/%s returned: %v (expected on process termination)", pod, container, executeError)
+	}
+
+	pollDeadline := time.Now().Add(5 * time.Second)
+	var lastLogs string
+	for time.Now().Before(pollDeadline) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		logCommand := exec.CommandContext(ctx, "kubectl", "logs", pod, "-n", "default", "-c", container)
+		output, err := logCommand.CombinedOutput()
+		if err == nil {
+			lastLogs = string(output)
+			if dump := extractGoroutineTrace(lastLogs); dump != "" {
+				return dump, nil
+			}
+		}
+
+		previousLogCommand := exec.CommandContext(ctx, "kubectl", "logs", pod, "-n", "default", "-c", container, "--previous")
+		previousOutput, previousErr := previousLogCommand.CombinedOutput()
+		if previousErr == nil {
+			lastLogs = string(previousOutput)
+			if dump := extractGoroutineTrace(lastLogs); dump != "" {
+				return dump, nil
+			}
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if lastLogs == "" {
+		return "", fmt.Errorf("no logs retrieved for pod %s/%s after SIGQUIT", pod, container)
+	}
+	return "", fmt.Errorf("goroutine dump not found in pod logs after SIGQUIT for pod %s/%s (last logs retrieved: %d bytes)", pod, container, len(lastLogs))
+}
+
+// extractGoroutineTrace locates and extracts the goroutine stack trace from raw container log output.
+func extractGoroutineTrace(s string) string {
+	if index := strings.LastIndex(s, "SIGQUIT: quit"); index != -1 {
+		return strings.TrimSpace(s[index:])
+	}
+	return ""
 }
 
 func copyFsxToPod(t *testing.T, h *Harness, podName string) {

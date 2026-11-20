@@ -423,3 +423,58 @@ func TestSharedClusterSystemPodRetention(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractGoroutineTrace(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		wantSub  string
+		wantNone bool
+	}{
+		{
+			name: "sigquit header with goroutine trace",
+			input: `2026-11-20T02:08:09.332 uploaded sealed pack
+2026-11-20T02:08:39.000 timeout waiting
+SIGQUIT: quit
+PC=0x40d96e m=0 sigcode=0
+
+goroutine 1 [select]:
+main.main()
+	/app/cmd/objectfs-controller/main.go:429
+`,
+			wantSub: "SIGQUIT: quit\nPC=0x40d96e m=0 sigcode=0\n\ngoroutine 1 [select]:\nmain.main()",
+		},
+		{
+			name: "multiple sigquit dumps returns latest",
+			input: `SIGQUIT: quit
+earlier crash trace
+SIGQUIT: quit
+latest crash trace
+goroutine 42 [sleep]:
+`,
+			wantSub: "SIGQUIT: quit\nlatest crash trace\ngoroutine 42 [sleep]:",
+		},
+		{
+			name: "normal logs without crash dump",
+			input: `2026-11-20T02:08:09 uploaded sealed pack
+2026-11-20T02:08:10 sync completed
+`,
+			wantNone: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractGoroutineTrace(tc.input)
+			if tc.wantNone {
+				if got != "" {
+					t.Fatalf("expected empty trace, got: %q", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.wantSub) {
+				t.Fatalf("expected extracted trace to contain %q, got: %q", tc.wantSub, got)
+			}
+		})
+	}
+}
