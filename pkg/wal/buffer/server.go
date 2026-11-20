@@ -459,16 +459,30 @@ func (s *Server) evictIdleStreams() {
 	}
 }
 
-func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *streamState {
-	s.mu.Lock()
-	sid := streamID.String()
-	st, exists := s.streams[sid]
-	if exists {
-		s.mu.Unlock()
-		return st
+// getOrCreateStreamLocked finds or creates the stream state for streamID under s.mu,
+// initializing or raising watermarks with the discovered uploadedTo sequence.
+// Requires s.mu to be held.
+func (s *Server) getOrCreateStreamLocked(streamID uuid.UUID, uploadedTo uint64) *streamState {
+	streamKey := streamID.String()
+	state, exists := s.streams[streamKey]
+	if !exists {
+		state = newStreamState(uploadedTo, uploadedTo)
+		s.streams[streamKey] = state
+		return state
 	}
-	s.mu.Unlock()
 
+	state.mu.Lock()
+	if uploadedTo > state.witnessSeq {
+		state.witnessSeq = uploadedTo
+	}
+	if uploadedTo > state.s3Seq {
+		state.s3Seq = uploadedTo
+	}
+	state.mu.Unlock()
+	return state
+}
+
+func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *streamState {
 	var uploadedTo uint64
 	if s.streamStore != nil {
 		uploadedTo = s.streamStore.EnsureDiscovered(ctx, streamID)
@@ -476,36 +490,22 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, exists = s.streams[sid]; exists {
-		st.mu.Lock()
-		if uploadedTo > st.witnessSeq {
-			st.witnessSeq = uploadedTo
-		}
-		if uploadedTo > st.s3Seq {
-			st.s3Seq = uploadedTo
-		}
-		st.mu.Unlock()
-		return st
-	}
-
-	st = newStreamState(uploadedTo, uploadedTo)
-	s.streams[sid] = st
-	return st
+	return s.getOrCreateStreamLocked(streamID, uploadedTo)
 }
 
 // attachSession attaches an Append session to its stream state.
 //
-// Lookup and attach must be performed in one critical section under s.mu and st.mu:
-// if lookup released s.mu before incrementing st.attachments, idle-stream eviction
-// (evictIdleStreams) could remove the streamState from s.streams between lookup and
-// attachment, leaving the session attached to an orphaned state invisible to subsequent
-// sessions and commitItems.
+// Lookup and attach must be performed in one critical section under s.mu and the
+// stream state's lock: if lookup released s.mu before incrementing state.attachments,
+// idle-stream eviction (evictIdleStreams) could remove the streamState from s.streams
+// between lookup and attachment, leaving the session attached to an orphaned state
+// invisible to subsequent sessions and commitItems.
 //
 // Remote discovery (EnsureDiscovered) performs backend I/O and must happen before
-// acquiring s.mu. Under s.mu and st.mu, the method finds or creates the stream state,
+// acquiring s.mu. Under s.mu and state.mu, the method finds or creates the stream state,
 // validates that the session epoch is not lower than the stream's accepted epoch
 // (refusing lower epochs with the Fenced status), raises the accepted epoch and
-// broadcasts on a higher one, increments st.attachments, and returns the stream state
+// broadcasts on a higher one, increments state.attachments, and returns the stream state
 // with witness and object-store watermarks read under the same lock.
 func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionEpoch uint64) (*streamState, uint64, uint64, error) {
 	var uploadedTo uint64
@@ -514,42 +514,37 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 	}
 
 	s.mu.Lock()
-	sid := streamID.String()
-	st, exists := s.streams[sid]
-	if !exists {
-		st = newStreamState(uploadedTo, uploadedTo)
-		s.streams[sid] = st
-	}
+	state := s.getOrCreateStreamLocked(streamID, uploadedTo)
 
-	st.mu.Lock()
-	if exists {
-		if uploadedTo > st.witnessSeq {
-			st.witnessSeq = uploadedTo
-		}
-		if uploadedTo > st.s3Seq {
-			st.s3Seq = uploadedTo
-		}
-	}
-
-	if sessionEpoch < st.epoch {
-		acceptedEpoch := st.epoch
-		st.mu.Unlock()
+	state.mu.Lock()
+	if sessionEpoch < state.epoch {
+		acceptedEpoch := state.epoch
+		state.mu.Unlock()
 		s.mu.Unlock()
 		return nil, 0, 0, fencedStatus(streamID, sessionEpoch, acceptedEpoch)
 	}
 
-	if sessionEpoch > st.epoch {
-		st.epoch = sessionEpoch
-		st.cond.Broadcast()
+	if sessionEpoch > state.epoch {
+		state.epoch = sessionEpoch
+		state.cond.Broadcast()
 	}
 
-	st.attachments++
-	witnessSeq := st.witnessSeq
-	s3Seq := st.s3Seq
-	st.mu.Unlock()
+	state.attachments++
+	witnessSeq := state.witnessSeq
+	s3Seq := state.s3Seq
+	state.mu.Unlock()
 	s.mu.Unlock()
 
-	return st, witnessSeq, s3Seq, nil
+	return state, witnessSeq, s3Seq, nil
+}
+
+// detachSession detaches an Append session from its stream state and wakes
+// waiters that may be waiting on attachment state changes.
+func (s *Server) detachSession(state *streamState) {
+	state.mu.Lock()
+	state.attachments--
+	state.cond.Broadcast()
+	state.mu.Unlock()
 }
 
 type appendServerWithContext struct {
@@ -595,12 +590,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		return err
 	}
 
-	defer func() {
-		st.mu.Lock()
-		st.attachments--
-		st.cond.Broadcast()
-		st.mu.Unlock()
-	}()
+	defer s.detachSession(st)
 
 	scoped.Log(ctx).Info("WAL buffer: Hello received", "witnessWatermark", witnessSeq, "s3Watermark", s3Seq)
 
