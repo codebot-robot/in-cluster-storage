@@ -36,7 +36,9 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // Level represents the durability level of an appended record.
@@ -101,7 +103,8 @@ type Stream interface {
 	// Append writes locally, then returns the stream_seq.
 	Append(ctx context.Context, payload []byte) (uint64, error)
 	// Wait blocks until seq has reached level. If requestFlush is true and level is Permanent,
-	// a Flush RPC is issued (coalesced server-side) before waiting instead of relying on the periodic flush.
+	// a Flush RPC is triggered on the active buffer once seq reaches Witness durability,
+	// rather than relying solely on the periodic flush.
 	Wait(ctx context.Context, seq uint64, level Level, requestFlush bool) error
 	// Flush asks the service to flush to permanent storage and waits for the permanent ack of everything appended so far.
 	Flush(ctx context.Context) error
@@ -207,9 +210,10 @@ func WithGRPCClient(client pb.WalBufferClient) Option {
 }
 
 type syncWaiter struct {
-	seq   uint64
-	level Level
-	done  chan error
+	seq          uint64
+	level        Level
+	requestFlush bool // indicates whether caller requested an active flush for Permanent durability
+	done         chan error
 }
 
 type streamImpl struct {
@@ -220,15 +224,19 @@ type streamImpl struct {
 
 	store SegmentStore
 
-	mu                  sync.RWMutex
-	cond                *sync.Cond
-	localSeq            uint64
-	witnessSeq          uint64
-	s3Seq               uint64
-	retainedBytes       int64
-	waiters             []*syncWaiter
-	degradedTruncateSeq uint64
-	reconciling         bool
+	mu            sync.RWMutex
+	cond          *sync.Cond
+	localSeq      uint64
+	witnessSeq    uint64
+	s3Seq         uint64
+	retainedBytes int64
+	waiters       []*syncWaiter
+	// flushInFlight tracks whether a Flush RPC is currently executing.
+	flushInFlight bool
+	// flushRequestedWhileInFlight tracks whether a flush was requested while a Flush RPC was in flight.
+	flushRequestedWhileInFlight bool
+	degradedTruncateSeq         uint64
+	reconciling                 bool
 
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
@@ -457,7 +465,8 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 }
 
 // waitFor blocks until seq has reached level (Witness or Permanent).
-func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error {
+// If requestFlush is true and level is Permanent, triggerFlushLocked is called.
+func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level, requestFlush bool) error {
 	if level > s.replicationLevel {
 		return fmt.Errorf("durability level %s requested but %w", level, ErrDurabilityUnavailable)
 	}
@@ -486,11 +495,15 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 	}
 
 	w := &syncWaiter{
-		seq:   seq,
-		level: level,
-		done:  make(chan error, 1),
+		seq:          seq,
+		level:        level,
+		requestFlush: requestFlush,
+		done:         make(chan error, 1),
 	}
 	s.waiters = append(s.waiters, w)
+	if level == Permanent && requestFlush {
+		s.triggerFlushLocked()
+	}
 	s.mu.Unlock()
 
 	select {
@@ -504,6 +517,51 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 	case err := <-w.done:
 		return err
 	}
+}
+
+// triggerFlushLocked initiates a Flush RPC on the active WAL buffer if there
+// are pending permanent waiters that requested a flush and whose records have
+// reached witness durability. s.mu must be held by the caller. The Flush RPC
+// runs asynchronously in its own goroutine with no locks held.
+func (s *streamImpl) triggerFlushLocked() {
+	if s.closed.Load() {
+		return
+	}
+	if s.flushInFlight {
+		s.flushRequestedWhileInFlight = true
+		return
+	}
+	var needed bool
+	for _, w := range s.waiters {
+		if w.level == Permanent && w.requestFlush && w.seq <= s.witnessSeq && w.seq > s.s3Seq {
+			needed = true
+			break
+		}
+	}
+	if !needed {
+		return
+	}
+	s.flushInFlight = true
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		ctx, cancel := context.WithTimeout(s.cancelCtx, 30*time.Second)
+		defer cancel()
+
+		_, err := s.grpcClient.Flush(ctx, &pb.FlushRequest{})
+		if err != nil && status.Code(err) != codes.Canceled && !errors.Is(err, context.Canceled) {
+			scoped.Log(s.cancelCtx).Info("WalBuffer.Flush RPC error (will still wait for permanent ack)", "err", err, "stream", s.streamID)
+		}
+
+		s.mu.Lock()
+		s.flushInFlight = false
+		if s.flushRequestedWhileInFlight {
+			s.flushRequestedWhileInFlight = false
+			s.triggerFlushLocked()
+		}
+		s.mu.Unlock()
+	}()
 }
 
 func (s *streamImpl) removeWaiterLocked(target *syncWaiter) {
@@ -528,7 +586,8 @@ func (s *streamImpl) notifyWaitersLocked() {
 }
 
 // Wait blocks until seq has reached level. If requestFlush is true and level is Permanent,
-// a Flush RPC is issued (coalesced server-side) before waiting instead of relying on the periodic flush.
+// a Flush RPC is triggered on the active buffer once seq reaches Witness durability,
+// rather than relying solely on the periodic flush.
 func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestFlush bool) error {
 	if s.closed.Load() {
 		return ErrClosed
@@ -566,23 +625,19 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 	}
 
 	// 1. Always reach Witness first, even for Permanent.
-	if err := s.waitFor(ctx, seq, Witness); err != nil {
+	if err := s.waitFor(ctx, seq, Witness, false); err != nil {
 		return err
 	}
 	if level == Witness {
 		return nil
 	}
 
-	// 2. Only now is the record guaranteed to be in the server's unflushed set
-	//    (commitItems appends to unflushedRecords before sending the ack).
-	if requestFlush {
-		if _, err := s.grpcClient.Flush(ctx, &pb.FlushRequest{}); err != nil {
-			scoped.Log(ctx).Info("WalBuffer.Flush RPC error (will still wait for permanent ack)", "err", err, "stream", s.streamID)
-		}
-	}
-
-	// 3. Wait for the permanent watermark.
-	return s.waitFor(ctx, seq, Permanent)
+	// 2. Request flush and wait for the permanent watermark.
+	// Reaching Witness on the current server guarantees the record is in that server's
+	// unflushed set. However, across a buffer restart, the replacement server only has
+	// the record in its unflushed set after reconnect and replay witness acknowledgment,
+	// at which point triggerFlushLocked re-requests the flush.
+	return s.waitFor(ctx, seq, Permanent, requestFlush)
 }
 
 // Flush asks the service to flush to permanent storage and waits for the permanent ack of everything appended so far.
@@ -616,17 +671,12 @@ func (s *streamImpl) Flush(ctx context.Context) error {
 	}
 
 	// 1. Wait for everything appended so far to reach Witness
-	if err := s.waitFor(ctx, targetSeq, Witness); err != nil {
+	if err := s.waitFor(ctx, targetSeq, Witness, false); err != nil {
 		return err
 	}
 
-	// 2. Issue Flush RPC
-	if _, err := s.grpcClient.Flush(ctx, &pb.FlushRequest{}); err != nil {
-		scoped.Log(ctx).Info("WalBuffer.Flush RPC error (will still wait for permanent ack)", "err", err, "stream", s.streamID)
-	}
-
-	// 3. Wait for permanent watermark
-	return s.waitFor(ctx, targetSeq, Permanent)
+	// 2. Request flush and wait for permanent watermark
+	return s.waitFor(ctx, targetSeq, Permanent, true)
 }
 
 // ReplicationLevel returns the maximum durability level supported by this stream's replication configuration.
@@ -1091,6 +1141,7 @@ func (s *streamImpl) handleHelloAck(ctx context.Context, helloAck *pb.HelloAck) 
 	if s.cond != nil {
 		s.cond.Broadcast()
 	}
+	s.triggerFlushLocked()
 	s.initialHelloAckOnce.Do(func() {
 		close(s.initialHelloAckDone)
 	})
@@ -1114,6 +1165,8 @@ func (s *streamImpl) handleAck(ctx context.Context, ack *pb.Ack) {
 	if s.cond != nil {
 		s.cond.Broadcast()
 	}
+
+	s.triggerFlushLocked()
 }
 
 func (s *streamImpl) cleanupS3AckedLocked(ctx context.Context, s3AckedSeq uint64) {
