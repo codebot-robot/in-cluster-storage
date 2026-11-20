@@ -590,8 +590,12 @@ func TestTailMemoryBounded(t *testing.T) {
 		t.Errorf("expected 0 unflushed records in memory after flush, got %d", unflushedLen)
 	}
 
-	if st.witnessSeq != recordCount {
-		t.Errorf("expected witness watermark %d, got %d", recordCount, st.witnessSeq)
+	st.mu.Lock()
+	witnessSeq := st.witnessSeq
+	st.mu.Unlock()
+
+	if witnessSeq != recordCount {
+		t.Errorf("expected witness watermark %d, got %d", recordCount, witnessSeq)
 	}
 }
 
