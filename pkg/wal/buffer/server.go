@@ -95,6 +95,17 @@ func newStreamState(witnessSeq, s3Seq uint64) *streamState {
 	return st
 }
 
+// raiseWatermarksLocked advances witnessSeq and s3Seq to uploadedTo if uploadedTo is higher.
+// Requires streamState.mu to be held.
+func (st *streamState) raiseWatermarksLocked(uploadedTo uint64) {
+	if uploadedTo > st.witnessSeq {
+		st.witnessSeq = uploadedTo
+	}
+	if uploadedTo > st.s3Seq {
+		st.s3Seq = uploadedTo
+	}
+}
+
 // fencedStatus creates a gRPC status error with code FailedPrecondition carrying pb.Fenced details.
 // Attaching the details must not fail silently.
 func fencedStatus(streamID uuid.UUID, writerEpoch, acceptedEpoch uint64) error {
@@ -459,26 +470,16 @@ func (s *Server) evictIdleStreams() {
 	}
 }
 
-// getOrCreateStreamLocked finds or creates the stream state for streamID under s.mu,
-// initializing or raising watermarks with the discovered uploadedTo sequence.
-// Requires s.mu to be held.
+// getOrCreateStreamLocked finds or creates the stream state for streamID in s.streams.
+// A new state is initialized with the discovered uploadedTo watermark.
+// Requires s.mu to be held. Returns the streamState unlocked without modifying its fields.
 func (s *Server) getOrCreateStreamLocked(streamID uuid.UUID, uploadedTo uint64) *streamState {
 	streamKey := streamID.String()
 	state, exists := s.streams[streamKey]
 	if !exists {
 		state = newStreamState(uploadedTo, uploadedTo)
 		s.streams[streamKey] = state
-		return state
 	}
-
-	state.mu.Lock()
-	if uploadedTo > state.witnessSeq {
-		state.witnessSeq = uploadedTo
-	}
-	if uploadedTo > state.s3Seq {
-		state.s3Seq = uploadedTo
-	}
-	state.mu.Unlock()
 	return state
 }
 
@@ -489,24 +490,32 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.getOrCreateStreamLocked(streamID, uploadedTo)
+	state := s.getOrCreateStreamLocked(streamID, uploadedTo)
+	s.mu.Unlock()
+
+	state.mu.Lock()
+	state.raiseWatermarksLocked(uploadedTo)
+	state.mu.Unlock()
+
+	return state
 }
 
 // attachSession attaches an Append session to its stream state.
 //
-// Lookup and attach must be performed in one critical section under s.mu and the
-// stream state's lock: if lookup released s.mu before incrementing state.attachments,
-// idle-stream eviction (evictIdleStreams) could remove the streamState from s.streams
+// Remote discovery (EnsureDiscovered) performs backend I/O and must happen before
+// acquiring s.mu.
+//
+// Then, the server lock (s.mu) is held across both find-or-create and attach to
+// exclude idle-stream eviction (evictIdleStreams); if s.mu were released before
+// incrementing state.attachments, eviction could remove the streamState from s.streams
 // between lookup and attachment, leaving the session attached to an orphaned state
 // invisible to subsequent sessions and commitItems.
 //
-// Remote discovery (EnsureDiscovered) performs backend I/O and must happen before
-// acquiring s.mu. Under s.mu and state.mu, the method finds or creates the stream state,
-// validates that the session epoch is not lower than the stream's accepted epoch
-// (refusing lower epochs with the Fenced status), raises the accepted epoch and
-// broadcasts on a higher one, increments state.attachments, and returns the stream state
-// with witness and object-store watermarks read under the same lock.
+// Under s.mu, state.mu is acquired exactly once for all field changes: raising the
+// watermarks to the discovered value, validating that the session epoch is not lower
+// than the stream's accepted epoch (refusing lower epochs with the Fenced status),
+// raising the accepted epoch and broadcasting on a higher one, incrementing
+// state.attachments, and reading witness and object-store watermarks.
 func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionEpoch uint64) (*streamState, uint64, uint64, error) {
 	var uploadedTo uint64
 	if s.streamStore != nil {
@@ -517,6 +526,8 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 	state := s.getOrCreateStreamLocked(streamID, uploadedTo)
 
 	state.mu.Lock()
+	state.raiseWatermarksLocked(uploadedTo)
+
 	if sessionEpoch < state.epoch {
 		acceptedEpoch := state.epoch
 		state.mu.Unlock()
