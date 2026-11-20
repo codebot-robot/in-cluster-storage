@@ -40,23 +40,35 @@ import (
 )
 
 type testServerHandle struct {
+	t          testing.TB
 	srv        *buffer.Server
 	addr       string
 	grpcServer *grpc.Server
 	listener   net.Listener
+	closeOnce  sync.Once
 }
 
 func (h *testServerHandle) StopGraceful() {
-	h.grpcServer.Stop()
-	_ = h.srv.Close()
-	_ = h.listener.Close()
+	h.t.Helper()
+	h.closeOnce.Do(func() {
+		h.grpcServer.Stop()
+		if err := h.srv.Close(); err != nil {
+			h.t.Errorf("srv.Close failed: %v", err)
+		}
+		if err := h.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			h.t.Errorf("listener.Close failed: %v", err)
+		}
+	})
 }
 
 // StopWithoutClose stops the gRPC listener and server WITHOUT calling srv.Close(),
 // simulating an ungraceful crash where no final flush occurs.
 func (h *testServerHandle) StopWithoutClose() {
+	h.t.Helper()
 	h.grpcServer.Stop()
-	_ = h.listener.Close()
+	if err := h.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		h.t.Errorf("listener.Close failed: %v", err)
+	}
 }
 
 func startBufferServer(t *testing.T, backend objectstore.Backend, dataDir string) *testServerHandle {
@@ -83,12 +95,17 @@ func startBufferServer(t *testing.T, backend objectstore.Backend, dataDir string
 		_ = grpcServer.Serve(listener)
 	}()
 
-	return &testServerHandle{
+	handle := &testServerHandle{
+		t:          t,
 		srv:        srv,
 		addr:       listener.Addr().String(),
 		grpcServer: grpcServer,
 		listener:   listener,
 	}
+	t.Cleanup(func() {
+		handle.StopGraceful()
+	})
+	return handle
 }
 
 // 1. Append, witness ack, then permanent ack after Flush; local file deleted only after permanent ack.
@@ -1411,12 +1428,17 @@ func startBufferServerOnAddr(t *testing.T, backend objectstore.Backend, dataDir 
 		_ = grpcServer.Serve(listener)
 	}()
 
-	return &testServerHandle{
+	handle := &testServerHandle{
+		t:          t,
 		srv:        srv,
 		addr:       listener.Addr().String(),
 		grpcServer: grpcServer,
 		listener:   listener,
 	}
+	t.Cleanup(func() {
+		handle.StopGraceful()
+	})
+	return handle
 }
 
 func TestClientReconnectAfterBufferCrash(t *testing.T) {
