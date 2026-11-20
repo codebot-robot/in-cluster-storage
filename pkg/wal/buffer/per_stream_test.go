@@ -1947,3 +1947,117 @@ func TestServerStreams_ReconnectAfterEvictionReportsWatermarks(t *testing.T) {
 			witnessAfter, s3After, witnessBefore, s3Before)
 	}
 }
+
+// TestServerStreams_AttachSessionDuringEvictionAttachedToMapState verifies that a session
+// that attaches while eviction runs is attached to the streamState that is in Server.streams
+// afterwards, never an orphaned state evicted from the map.
+func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	server, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close() error: %v", err)
+		}
+	}()
+
+	// 1. Synchronous ordering: idle stream in map, attachSession then evictIdleStreams.
+	// The attached session must pin the streamState in Server.streams against eviction.
+	streamID := uuid.New()
+	_ = server.getOrCreateStream(ctx, streamID)
+
+	state, _, _, err := server.attachSession(ctx, streamID, 1)
+	if err != nil {
+		t.Fatalf("attachSession failed: %v", err)
+	}
+
+	server.evictIdleStreams()
+
+	server.mu.RLock()
+	mapState := server.streams[streamID.String()]
+	server.mu.RUnlock()
+
+	if mapState == nil {
+		t.Fatal("expected streamState to remain in Server.streams while session is attached, but was evicted")
+	}
+	if mapState != state {
+		t.Fatalf("expected attached streamState %p to be in map, got %p", state, mapState)
+	}
+
+	server.detachSession(state)
+
+	server.evictIdleStreams()
+
+	server.mu.RLock()
+	mapStateAfter := server.streams[streamID.String()]
+	server.mu.RUnlock()
+
+	if mapStateAfter != nil {
+		t.Fatalf("expected streamState to be evicted after session detach, but still in map: %p", mapStateAfter)
+	}
+
+	// 2. Concurrent execution: attachSession and evictIdleStreams run concurrently across
+	// multiple iterations with pre-existing idle streams. Regardless of scheduling,
+	// the session that attaches must always be attached to the state in Server.streams afterwards,
+	// and a subsequent attachSession for the same stream must return the same state.
+	for i := 0; i < 50; i++ {
+		concurrentStreamID := uuid.New()
+		_ = server.getOrCreateStream(ctx, concurrentStreamID)
+
+		var (
+			attached  *streamState
+			attachErr error
+			wg        sync.WaitGroup
+		)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			attached, _, _, attachErr = server.attachSession(ctx, concurrentStreamID, 1)
+		}()
+		go func() {
+			defer wg.Done()
+			server.evictIdleStreams()
+		}()
+		wg.Wait()
+
+		if attachErr != nil {
+			t.Fatalf("iteration %d: attachSession failed: %v", i, attachErr)
+		}
+		if attached == nil {
+			t.Fatalf("iteration %d: expected non-nil attached streamState", i)
+		}
+
+		server.mu.RLock()
+		inMap := server.streams[concurrentStreamID.String()]
+		server.mu.RUnlock()
+
+		if inMap != attached {
+			t.Fatalf("iteration %d: attached state %p is not the state in Server.streams %p (inMap == nil: %v)",
+				i, attached, inMap, inMap == nil)
+		}
+
+		secondAttached, _, _, err := server.attachSession(ctx, concurrentStreamID, 1)
+		if err != nil {
+			t.Fatalf("iteration %d: second attachSession failed: %v", i, err)
+		}
+		if secondAttached != attached {
+			t.Fatalf("iteration %d: expected second attachSession to return same state %p, got %p",
+				i, attached, secondAttached)
+		}
+
+		server.detachSession(attached)
+		server.detachSession(secondAttached)
+		server.evictIdleStreams()
+	}
+}
