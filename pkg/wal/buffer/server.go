@@ -870,6 +870,118 @@ func (s *Server) groupCommitLoop(ctx context.Context) {
 	}
 }
 
+// batchStream tracks per-stream planning and progress within a single commit batch.
+type batchStream struct {
+	// count is the total number of items submitted for this stream in the batch (including duplicates).
+	count int
+	// firstSeq is the stream sequence of the first record accepted in this batch.
+	firstSeq uint64
+	// lastSeq is the stream sequence of the last record accepted in this batch.
+	lastSeq uint64
+	// accepted is the highest sequence accepted for the stream so far in this batch, starting from the witness watermark.
+	accepted uint64
+	// written indicates whether any record of this stream was accepted in this batch.
+	written bool
+}
+
+// batchPlan holds the per-stream planning state and the log records to be written for a commit batch.
+type batchPlan struct {
+	// streams maps stream ID strings to their per-stream batch planning state.
+	streams map[string]*batchStream
+	// records contains the deduplicated log records to append to storage.
+	records []*wal.LogRecord
+}
+
+// planBatch builds the per-stream batch planning state and constructs deduplicated log records.
+// It must be called with s.mu held. planBatch assigns log positions (it advances s.lastPosition)
+// and creates the stream state in s.streams if it is missing.
+func (s *Server) planBatch(items []incomingItem) *batchPlan {
+	plan := &batchPlan{
+		streams: make(map[string]*batchStream),
+	}
+
+	for _, item := range items {
+		streamID := item.streamID.String()
+		stream := plan.streams[streamID]
+		if stream == nil {
+			streamState := s.streams[streamID]
+			if streamState == nil {
+				streamState = newStreamState(0, 0)
+				s.streams[streamID] = streamState
+			}
+			streamState.mu.Lock()
+			witnessSeq := streamState.witnessSeq
+			streamState.mu.Unlock()
+
+			stream = &batchStream{
+				accepted: witnessSeq,
+			}
+			plan.streams[streamID] = stream
+		}
+		stream.count++
+
+		if item.streamSeq > stream.accepted {
+			stream.accepted = item.streamSeq
+			if !stream.written {
+				stream.firstSeq = item.streamSeq
+				stream.written = true
+			}
+			stream.lastSeq = item.streamSeq
+
+			s.lastPosition++
+			record := &wal.LogRecord{
+				Position:  s.lastPosition,
+				StreamID:  item.streamID,
+				StreamSeq: item.streamSeq,
+				Payload:   item.payload,
+			}
+			record.CRC32C = record.ComputeCRC32C()
+			plan.records = append(plan.records, record)
+		}
+	}
+
+	return plan
+}
+
+// applyBatch updates the per-stream state after writing records or upon a write failure.
+// It must be called with s.mu held. On error, applyBatch sets commitErr on each stream in the plan.
+// On success, it advances witnessSeq to lastSeq if records were written, and sets ackNeeded if a stream
+// had only skipped records. For both error and success, it decrements inFlight by count,
+// broadcasts on the stream condition variable, and logs accepted records on success.
+func (s *Server) applyBatch(plan *batchPlan, err error) {
+	for streamID, stream := range plan.streams {
+		streamState := s.streams[streamID]
+		streamState.mu.Lock()
+		if err != nil {
+			if streamState.commitErr == nil {
+				streamState.commitErr = err
+			}
+		} else {
+			if stream.written && stream.lastSeq > streamState.witnessSeq {
+				streamState.witnessSeq = stream.lastSeq
+			}
+			if !stream.written {
+				streamState.ackNeeded = true
+			}
+		}
+		streamState.inFlight -= stream.count
+		if streamState.inFlight < 0 {
+			// A negative inFlight count indicates counter imbalance. This can only
+			// happen spuriously if a stream was evicted by evictIdleStreams and recreated
+			// in commitItems while items were still queued.
+			klog.Errorf("WAL buffer stream %s: negative inFlight count %d after committing %d items", streamID, streamState.inFlight, stream.count)
+		}
+		streamState.cond.Broadcast()
+		witnessSeq := streamState.witnessSeq
+		streamState.mu.Unlock()
+
+		if err == nil && stream.written {
+			klog.Infof("WAL buffer stream %s: accepted %d records (%d..%d, witness watermark=%d)",
+				streamID, stream.count, stream.firstSeq, stream.lastSeq, witnessSeq)
+		}
+	}
+}
+
 func (s *Server) commitItems(ctx context.Context, items []incomingItem) {
 	if len(items) == 0 {
 		return
@@ -929,49 +1041,25 @@ func (s *Server) commitItems(ctx context.Context, items []incomingItem) {
 	}
 	items = validItems
 
-	var recordsToStore []*wal.LogRecord
-
-	for _, item := range items {
-		s.lastPosition++
-		rec := &wal.LogRecord{
-			Position:  s.lastPosition,
-			StreamID:  item.streamID,
-			StreamSeq: item.streamSeq,
-			Payload:   item.payload,
-		}
-		rec.CRC32C = rec.ComputeCRC32C()
-		recordsToStore = append(recordsToStore, rec)
-	}
+	// De-duplicate replayed in-flight records: accept a record only if its
+	// sequence is above the highest one accepted so far in this commit
+	// (starting at the stream's witness watermark).
+	plan := s.planBatch(items)
 
 	// 1. Write batch to local log segment store and fsync
-	if err := s.localStore.AppendBatch(recordsToStore); err != nil {
+	if err := s.localStore.AppendBatch(plan.records); err != nil {
 		klog.Errorf("Failed writing batch to local log segment store: %v", err)
-		streamCounts := make(map[string]int)
-		for _, item := range items {
-			streamCounts[item.streamID.String()]++
-		}
-		for sid, count := range streamCounts {
-			st := s.streams[sid]
-			if st != nil {
-				st.mu.Lock()
-				if st.commitErr == nil {
-					st.commitErr = err
-				}
-				st.inFlight -= count
-				st.cond.Broadcast()
-				st.mu.Unlock()
-			}
-		}
+		s.applyBatch(plan, err)
 		return
 	}
 
-	s.streamStore.AppendRecords(recordsToStore)
+	s.streamStore.AppendRecords(plan.records)
 
 	// 2. Add to unflushed queue and notify tail waiters
 	s.unflushedMu.Lock()
-	for _, rec := range recordsToStore {
-		s.unflushedRecords = append(s.unflushedRecords, rec)
-		s.unflushedBytes += int64(wal.LogHeaderSize + len(rec.Payload))
+	for _, record := range plan.records {
+		s.unflushedRecords = append(s.unflushedRecords, record)
+		s.unflushedBytes += int64(wal.LogHeaderSize + len(record.Payload))
 	}
 	triggerFlush := s.unflushedBytes >= s.cfg.FlushBytes
 	s.unflushedMu.Unlock()
@@ -986,48 +1074,7 @@ func (s *Server) commitItems(ctx context.Context, items []incomingItem) {
 	s.tailMu.Unlock()
 
 	// 3. Update stream witness watermarks, decrement inFlight, and broadcast
-	streamCounts := make(map[string]int)
-	streamMinSeq := make(map[string]uint64)
-	streamMaxSeq := make(map[string]uint64)
-
-	for i := range items {
-		rec := recordsToStore[i]
-		sid := rec.StreamID.String()
-		st := s.streams[sid]
-		if st == nil {
-			st = newStreamState(rec.StreamSeq, 0)
-			s.streams[sid] = st
-		}
-
-		streamCounts[sid]++
-		if _, ok := streamMinSeq[sid]; !ok || rec.StreamSeq < streamMinSeq[sid] {
-			streamMinSeq[sid] = rec.StreamSeq
-		}
-		if rec.StreamSeq > streamMaxSeq[sid] {
-			streamMaxSeq[sid] = rec.StreamSeq
-		}
-	}
-
-	for sid, count := range streamCounts {
-		st := s.streams[sid]
-		st.mu.Lock()
-		maxSeq := streamMaxSeq[sid]
-		if maxSeq > st.witnessSeq {
-			st.witnessSeq = maxSeq
-		}
-		st.inFlight -= count
-		if st.inFlight < 0 {
-			// A negative inFlight count indicates counter imbalance. This can only
-			// happen spuriously if a stream was evicted by evictIdleStreams and recreated
-			// in commitItems while items were still queued.
-			klog.Errorf("WAL buffer stream %s: negative inFlight count %d after committing %d items", sid, st.inFlight, count)
-		}
-		st.cond.Broadcast()
-		wSeq := st.witnessSeq
-		st.mu.Unlock()
-		klog.Infof("WAL buffer stream %s: accepted %d records (%d..%d, witness watermark=%d)",
-			sid, count, streamMinSeq[sid], streamMaxSeq[sid], wSeq)
-	}
+	s.applyBatch(plan, nil)
 
 	if triggerFlush {
 		s.backgroundFlushWg.Add(1)
