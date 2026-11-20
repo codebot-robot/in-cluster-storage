@@ -803,6 +803,9 @@ func (v *Volume) deletePackLocked(packID uint64) {
 	if !ok {
 		return
 	}
+	if info.state == packUploaded && info.pack != nil && v.server != nil {
+		v.server.subLocalPackCacheBytes(info.pack.ByteSize())
+	}
 	if info.pack != nil {
 		errutil.CloseAndLog(info.pack, "uploaded pack")
 	}
@@ -1376,6 +1379,9 @@ func (v *Volume) uploadPacks(ctx context.Context, packIDsToUpload []uint64) (int
 					info.state = packUploaded
 					info.key = packKey
 					info.uploadError = nil
+					if v.server != nil && info.pack != nil {
+						v.server.addLocalPackCacheBytes(info.pack.ByteSize())
+					}
 				}
 				v.syncCond.Broadcast()
 				v.stagingMu.Unlock()
@@ -4694,13 +4700,8 @@ func (v *Volume) removeStagingDirLocked() error {
 		errutil.CloseAndLog(v.activePack, "active scratch pack")
 		v.activePack = nil
 	}
-	for _, info := range v.packs {
-		if info.pack != nil {
-			errutil.CloseAndLog(info.pack, "staged pack")
-		}
-		if info.key != "" && v.blobStore != nil {
-			v.blobStore.UnregisterLocalPack(info.key)
-		}
+	for packID := range v.packs {
+		v.deletePackLocked(packID)
 	}
 	v.packs = make(map[uint64]*packInfo)
 	if removeErr := os.RemoveAll(v.stagingDir); removeErr != nil && !os.IsNotExist(removeErr) {
@@ -4829,6 +4830,9 @@ func (v *Volume) startPackUploadLocked(packID uint64) {
 			info.state = packUploaded
 			info.key = packKey
 			info.uploadError = nil
+			if v.server != nil && info.pack != nil {
+				v.server.addLocalPackCacheBytes(info.pack.ByteSize())
+			}
 		}
 		v.syncCond.Broadcast()
 	}()

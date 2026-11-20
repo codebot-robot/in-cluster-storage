@@ -195,7 +195,7 @@ type serverMetadataConfig struct {
 	viewOpts []view.Option
 }
 
-// serverDiskLimits groups configuration, accounting, and synchronization for controller-wide staging limits.
+// serverDiskLimits groups configuration, accounting, and synchronization for controller-wide staging limits and local pack cache accounting.
 type serverDiskLimits struct {
 	// mu guards controller-wide disk accounting fields and coordinates spaceAvailable.
 	mu sync.Mutex
@@ -203,6 +203,10 @@ type serverDiskLimits struct {
 	stagedBytes int64
 	// maxStagingBytes configures the controller-wide ceiling of unuploaded staged write bytes across all volumes (0 disables). Guarded by mu.
 	maxStagingBytes int64
+	// packCacheBytes tracks the controller-wide total of uploaded pack bytes kept in the local cache across all volumes. Guarded by mu.
+	packCacheBytes int64
+	// packCacheUnderflows tracks occurrences of packCacheBytes falling below zero, which indicates an accounting bug since the total is clamped to zero afterwards. Guarded by mu.
+	packCacheUnderflows *metrics.Counter
 	// spaceAvailable coordinates writers waiting for unuploaded staged bytes to fall below maxStagingBytes.
 	spaceAvailable *sync.Cond
 	// lastCeilingLog records the last time the ceiling log line was emitted for rate limiting. Guarded by mu.
@@ -557,7 +561,8 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 			defaultDurability: pb.MetadataDurability_OPERATION,
 		},
 		diskLimits: serverDiskLimits{
-			maxStagingBytes: DefaultMaxLocalStagingBytes,
+			maxStagingBytes:     DefaultMaxLocalStagingBytes,
+			packCacheUnderflows: metrics.NewCounter("pack_cache_underflow_total"),
 		},
 		restoring: make(map[string]bool),
 		drain: stagingDrain{
@@ -2153,6 +2158,7 @@ func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) 
 type ServerStats struct {
 	LocalStagingBytes    int64
 	MaxLocalStagingBytes int64
+	LocalPackCacheBytes  int64
 }
 
 // Stats returns a snapshot of controller operational and capacity metrics.
@@ -2164,7 +2170,30 @@ func (s *Server) Stats() ServerStats {
 	return ServerStats{
 		LocalStagingBytes:    s.diskLimits.stagedBytes,
 		MaxLocalStagingBytes: s.diskLimits.maxStagingBytes,
+		LocalPackCacheBytes:  s.diskLimits.packCacheBytes,
 	}
+}
+
+// addLocalPackCacheBytes adds delta to the controller-wide total of uploaded pack bytes kept in the local cache across all volumes.
+// Always called with the volume's stagingMu held; requires no Server lock held. Acquires diskLimits.mu.
+// Lock order: Server.mu, then Volume.stagingMu, then serverDiskLimits.mu.
+func (s *Server) addLocalPackCacheBytes(delta int64) {
+	s.diskLimits.mu.Lock()
+	s.diskLimits.packCacheBytes += delta
+	s.diskLimits.mu.Unlock()
+}
+
+// subLocalPackCacheBytes subtracts delta from the controller-wide total of uploaded pack bytes kept in the local cache across all volumes.
+// Always called with the volume's stagingMu held; requires no Server lock held. Acquires diskLimits.mu.
+// Lock order: Server.mu, then Volume.stagingMu, then serverDiskLimits.mu.
+func (s *Server) subLocalPackCacheBytes(delta int64) {
+	s.diskLimits.mu.Lock()
+	s.diskLimits.packCacheBytes -= delta
+	if s.diskLimits.packCacheBytes < 0 {
+		s.diskLimits.packCacheBytes = 0
+		s.diskLimits.packCacheUnderflows.Inc()
+	}
+	s.diskLimits.mu.Unlock()
 }
 
 // addStagedDiskBytes adds delta to the controller-wide staged byte count and wakes
