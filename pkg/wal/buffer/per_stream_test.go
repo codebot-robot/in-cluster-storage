@@ -1947,3 +1947,141 @@ func TestServerStreams_ReconnectAfterEvictionReportsWatermarks(t *testing.T) {
 			witnessAfter, s3After, witnessBefore, s3Before)
 	}
 }
+
+// TestServerStreams_AttachSessionDuringEvictionAttachedToMapState verifies that a session
+// that attaches while eviction runs is attached to the streamState that is in Server.streams
+// afterwards, never an orphaned state evicted from the map.
+func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Close()
+
+	// 1. Synchronous ordering: idle stream in map, attachSession then evictIdleStreams.
+	// The attached session must pin the streamState in Server.streams against eviction.
+	streamID1 := uuid.New()
+	_ = srv.getOrCreateStream(ctx, streamID1)
+
+	st1, _, _, err := srv.attachSession(ctx, streamID1, 1)
+	if err != nil {
+		t.Fatalf("attachSession failed: %v", err)
+	}
+
+	srv.evictIdleStreams()
+
+	srv.mu.RLock()
+	mapState1 := srv.streams[streamID1.String()]
+	srv.mu.RUnlock()
+
+	if mapState1 == nil {
+		t.Fatal("expected streamState to remain in Server.streams while session is attached, but was evicted")
+	}
+	if mapState1 != st1 {
+		t.Fatalf("expected attached streamState %p to be in map, got %p", st1, mapState1)
+	}
+
+	// Once the session detaches, eviction removes it from the map.
+	st1.mu.Lock()
+	st1.attachments--
+	st1.mu.Unlock()
+
+	srv.evictIdleStreams()
+
+	srv.mu.RLock()
+	mapState1After := srv.streams[streamID1.String()]
+	srv.mu.RUnlock()
+
+	if mapState1After != nil {
+		t.Fatalf("expected streamState to be evicted after session detach, but still in map: %p", mapState1After)
+	}
+
+	// 2. Synchronous ordering: eviction runs before attachSession.
+	// Eviction deletes the idle state, then attachSession creates and attaches to a new state in the map.
+	streamID2 := uuid.New()
+	stOld := srv.getOrCreateStream(ctx, streamID2)
+	srv.evictIdleStreams()
+
+	srv.mu.RLock()
+	mapState2Before := srv.streams[streamID2.String()]
+	srv.mu.RUnlock()
+	if mapState2Before != nil {
+		t.Fatalf("expected idle stream to be evicted before attach, got %p", mapState2Before)
+	}
+
+	st2, _, _, err := srv.attachSession(ctx, streamID2, 1)
+	if err != nil {
+		t.Fatalf("attachSession failed: %v", err)
+	}
+	if st2 == stOld {
+		t.Fatalf("expected attachSession to create a fresh streamState, got old evicted state %p", stOld)
+	}
+
+	srv.mu.RLock()
+	mapState2After := srv.streams[streamID2.String()]
+	srv.mu.RUnlock()
+	if mapState2After != st2 {
+		t.Fatalf("expected attached streamState %p in map, got %p", st2, mapState2After)
+	}
+
+	st2.mu.Lock()
+	st2.attachments--
+	st2.mu.Unlock()
+	srv.evictIdleStreams()
+
+	// 3. Concurrent execution: attachSession and evictIdleStreams run concurrently across
+	// multiple iterations with pre-existing idle streams. Regardless of scheduling,
+	// the session that attaches must always be attached to the state in Server.streams afterwards.
+	for i := 0; i < 50; i++ {
+		sid := uuid.New()
+		_ = srv.getOrCreateStream(ctx, sid)
+
+		var (
+			attached  *streamState
+			attachErr error
+			wg        sync.WaitGroup
+		)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			attached, _, _, attachErr = srv.attachSession(ctx, sid, 1)
+		}()
+		go func() {
+			defer wg.Done()
+			srv.evictIdleStreams()
+		}()
+		wg.Wait()
+
+		if attachErr != nil {
+			t.Fatalf("iteration %d: attachSession failed: %v", i, attachErr)
+		}
+		if attached == nil {
+			t.Fatalf("iteration %d: expected non-nil attached streamState", i)
+		}
+
+		srv.mu.RLock()
+		inMap := srv.streams[sid.String()]
+		srv.mu.RUnlock()
+
+		if inMap != attached {
+			t.Fatalf("iteration %d: attached state %p is not the state in Server.streams %p (inMap == nil: %v)",
+				i, attached, inMap, inMap == nil)
+		}
+
+		// Detach and evict for cleanup
+		attached.mu.Lock()
+		attached.attachments--
+		attached.mu.Unlock()
+		srv.evictIdleStreams()
+	}
+}

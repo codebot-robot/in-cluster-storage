@@ -493,6 +493,65 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 	return st
 }
 
+// attachSession attaches an Append session to its stream state.
+//
+// Lookup and attach must be performed in one critical section under s.mu and st.mu:
+// if lookup released s.mu before incrementing st.attachments, idle-stream eviction
+// (evictIdleStreams) could remove the streamState from s.streams between lookup and
+// attachment, leaving the session attached to an orphaned state invisible to subsequent
+// sessions and commitItems.
+//
+// Remote discovery (EnsureDiscovered) performs backend I/O and must happen before
+// acquiring s.mu. Under s.mu and st.mu, the method finds or creates the stream state,
+// validates that the session epoch is not lower than the stream's accepted epoch
+// (refusing lower epochs with the Fenced status), raises the accepted epoch and
+// broadcasts on a higher one, increments st.attachments, and returns the stream state
+// with witness and object-store watermarks read under the same lock.
+func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionEpoch uint64) (*streamState, uint64, uint64, error) {
+	var uploadedTo uint64
+	if s.streamStore != nil {
+		uploadedTo = s.streamStore.EnsureDiscovered(ctx, streamID)
+	}
+
+	s.mu.Lock()
+	sid := streamID.String()
+	st, exists := s.streams[sid]
+	if !exists {
+		st = newStreamState(uploadedTo, uploadedTo)
+		s.streams[sid] = st
+	}
+
+	st.mu.Lock()
+	if exists {
+		if uploadedTo > st.witnessSeq {
+			st.witnessSeq = uploadedTo
+		}
+		if uploadedTo > st.s3Seq {
+			st.s3Seq = uploadedTo
+		}
+	}
+
+	if sessionEpoch < st.epoch {
+		acceptedEpoch := st.epoch
+		st.mu.Unlock()
+		s.mu.Unlock()
+		return nil, 0, 0, fencedStatus(streamID, sessionEpoch, acceptedEpoch)
+	}
+
+	if sessionEpoch > st.epoch {
+		st.epoch = sessionEpoch
+		st.cond.Broadcast()
+	}
+
+	st.attachments++
+	witnessSeq := st.witnessSeq
+	s3Seq := st.s3Seq
+	st.mu.Unlock()
+	s.mu.Unlock()
+
+	return st, witnessSeq, s3Seq, nil
+}
+
 type appendServerWithContext struct {
 	pb.WalBuffer_AppendServer
 	ctx context.Context
@@ -531,33 +590,10 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		ctx:                    ctx,
 	}
 
-	st := s.getOrCreateStream(ctx, streamID)
-
-	s.mu.Lock()
-	streamKey := streamID.String()
-	if currentStreamState, exists := s.streams[streamKey]; exists {
-		st = currentStreamState
-	} else {
-		s.streams[streamKey] = st
+	st, witnessSeq, s3Seq, err := s.attachSession(ctx, streamID, sessionEpoch)
+	if err != nil {
+		return err
 	}
-	st.mu.Lock()
-	if sessionEpoch < st.epoch {
-		acceptedEpoch := st.epoch
-		st.mu.Unlock()
-		s.mu.Unlock()
-		return fencedStatus(streamID, sessionEpoch, acceptedEpoch)
-	}
-
-	if sessionEpoch > st.epoch {
-		st.epoch = sessionEpoch
-		st.cond.Broadcast()
-	}
-
-	st.attachments++
-	witnessSeq := st.witnessSeq
-	s3Seq := st.s3Seq
-	st.mu.Unlock()
-	s.mu.Unlock()
 
 	defer func() {
 		st.mu.Lock()
