@@ -892,10 +892,10 @@ type batchPlan struct {
 	records []*wal.LogRecord
 }
 
-// planBatch builds the per-stream batch planning state and constructs deduplicated log records.
-// It must be called with s.mu held. planBatch assigns log positions (it advances s.lastPosition)
+// planBatchLocked builds the per-stream batch planning state and constructs deduplicated log records.
+// It must be called with s.mu held. planBatchLocked assigns log positions (it advances s.lastPosition)
 // and creates the stream state in s.streams if it is missing.
-func (s *Server) planBatch(items []incomingItem) *batchPlan {
+func (s *Server) planBatchLocked(items []incomingItem) *batchPlan {
 	plan := &batchPlan{
 		streams: make(map[string]*batchStream),
 	}
@@ -943,12 +943,12 @@ func (s *Server) planBatch(items []incomingItem) *batchPlan {
 	return plan
 }
 
-// applyBatch updates the per-stream state after writing records or upon a write failure.
-// It must be called with s.mu held. On error, applyBatch sets commitErr on each stream in the plan.
+// applyBatchLocked updates the per-stream state after writing records or upon a write failure.
+// It must be called with s.mu held. On error, applyBatchLocked sets commitErr on each stream in the plan.
 // On success, it advances witnessSeq to lastSeq if records were written, and sets ackNeeded if a stream
 // had only skipped records. For both error and success, it decrements inFlight by count,
 // broadcasts on the stream condition variable, and logs accepted records on success.
-func (s *Server) applyBatch(plan *batchPlan, err error) {
+func (s *Server) applyBatchLocked(plan *batchPlan, err error) {
 	for streamID, stream := range plan.streams {
 		streamState := s.streams[streamID]
 		streamState.mu.Lock()
@@ -1044,12 +1044,12 @@ func (s *Server) commitItems(ctx context.Context, items []incomingItem) {
 	// De-duplicate replayed in-flight records: accept a record only if its
 	// sequence is above the highest one accepted so far in this commit
 	// (starting at the stream's witness watermark).
-	plan := s.planBatch(items)
+	plan := s.planBatchLocked(items)
 
 	// 1. Write batch to local log segment store and fsync
 	if err := s.localStore.AppendBatch(plan.records); err != nil {
 		klog.Errorf("Failed writing batch to local log segment store: %v", err)
-		s.applyBatch(plan, err)
+		s.applyBatchLocked(plan, err)
 		return
 	}
 
@@ -1074,7 +1074,7 @@ func (s *Server) commitItems(ctx context.Context, items []incomingItem) {
 	s.tailMu.Unlock()
 
 	// 3. Update stream witness watermarks, decrement inFlight, and broadcast
-	s.applyBatch(plan, nil)
+	s.applyBatchLocked(plan, nil)
 
 	if triggerFlush {
 		s.backgroundFlushWg.Add(1)
