@@ -51,6 +51,19 @@ message AppendRequest {
 
 message Hello {
   bytes stream_id = 1;
+  // Epoch is the writer epoch. The WAL buffer tracks the highest epoch
+  // accepted for each stream and fences any writer presenting a lower epoch.
+  // Defaults to 0.
+  uint64 epoch = 2;
+}
+
+// Fenced is carried as a gRPC status detail when a stream writer is refused
+// or a live session is superseded because its epoch is lower than the highest
+// epoch accepted by the WAL buffer for the stream.
+message Fenced {
+  bytes stream_id = 1;
+  uint64 writer_epoch = 2;
+  uint64 accepted_epoch = 3;
 }
 
 message AppendResponse {

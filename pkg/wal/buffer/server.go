@@ -66,6 +66,8 @@ type incomingItem struct {
 	streamID  uuid.UUID
 	streamSeq uint64
 	payload   []byte
+	// epoch is the writer epoch presented by the session that submitted this item.
+	epoch uint64
 }
 
 type streamState struct {
@@ -78,8 +80,12 @@ type streamState struct {
 	ackNeeded   bool
 	attachments int
 	waiters     int
+	// epoch is the highest accepted writer epoch for this stream.
+	// Guarded by mu.
+	epoch uint64
 }
 
+// newStreamState creates a new streamState initialized with watermarks.
 func newStreamState(witnessSeq, s3Seq uint64) *streamState {
 	st := &streamState{
 		witnessSeq: witnessSeq,
@@ -87,6 +93,21 @@ func newStreamState(witnessSeq, s3Seq uint64) *streamState {
 	}
 	st.cond = sync.NewCond(&st.mu)
 	return st
+}
+
+// fencedStatus creates a gRPC status error with code FailedPrecondition carrying pb.Fenced details.
+// Attaching the details must not fail silently.
+func fencedStatus(streamID uuid.UUID, writerEpoch, acceptedEpoch uint64) error {
+	statusObject := status.New(codes.FailedPrecondition, fmt.Sprintf("stream %s writer epoch %d is lower than accepted epoch %d", streamID, writerEpoch, acceptedEpoch))
+	statusWithDetails, err := statusObject.WithDetails(&pb.Fenced{
+		StreamId:      streamID[:],
+		WriterEpoch:   writerEpoch,
+		AcceptedEpoch: acceptedEpoch,
+	})
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to attach Fenced detail to status: %v", err)
+	}
+	return statusWithDetails.Err()
 }
 
 // Server implements the WalBuffer gRPC service.
@@ -305,7 +326,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	// Start background group commit worker
 	s.groupCommitWg.Add(1)
 	s.activeLoops.Add(1)
-	go s.groupCommitLoop()
+	go s.groupCommitLoop(ctx)
 
 	// Start background flush worker
 	if cfg.FlushInterval > 0 {
@@ -501,8 +522,9 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	}
 	var streamID uuid.UUID
 	copy(streamID[:], hello.StreamId)
+	sessionEpoch := hello.GetEpoch()
 
-	logger := scoped.Log(ctx).WithValues("stream", streamID.String())
+	logger := scoped.Log(ctx).WithValues("stream", streamID.String(), "epoch", sessionEpoch)
 	ctx = scoped.WithLog(ctx, logger)
 	stream = &appendServerWithContext{
 		WalBuffer_AppendServer: stream,
@@ -511,11 +533,32 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 
 	st := s.getOrCreateStream(ctx, streamID)
 
+	s.mu.Lock()
+	streamKey := streamID.String()
+	if currentStreamState, exists := s.streams[streamKey]; exists {
+		st = currentStreamState
+	} else {
+		s.streams[streamKey] = st
+	}
 	st.mu.Lock()
+	if sessionEpoch < st.epoch {
+		acceptedEpoch := st.epoch
+		st.mu.Unlock()
+		s.mu.Unlock()
+		return fencedStatus(streamID, sessionEpoch, acceptedEpoch)
+	}
+
+	if sessionEpoch > st.epoch {
+		st.epoch = sessionEpoch
+		st.cond.Broadcast()
+	}
+
 	st.attachments++
 	witnessSeq := st.witnessSeq
 	s3Seq := st.s3Seq
 	st.mu.Unlock()
+	s.mu.Unlock()
+
 	defer func() {
 		st.mu.Lock()
 		st.attachments--
@@ -582,7 +625,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		lastAckedS3 := s3Seq
 		for {
 			st.mu.Lock()
-			for st.witnessSeq <= lastAckedWitness && st.s3Seq <= lastAckedS3 && !st.ackNeeded && st.commitErr == nil {
+			for st.witnessSeq <= lastAckedWitness && st.s3Seq <= lastAckedS3 && !st.ackNeeded && st.commitErr == nil && sessionEpoch >= st.epoch {
 				select {
 				case <-ctx.Done():
 					st.mu.Unlock()
@@ -595,6 +638,16 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 				st.waiters++
 				st.cond.Wait()
 				st.waiters--
+			}
+
+			if sessionEpoch < st.epoch {
+				acceptedEpoch := st.epoch
+				st.mu.Unlock()
+				select {
+				case forwarderErrChan <- fencedStatus(streamID, sessionEpoch, acceptedEpoch):
+				default:
+				}
+				return
 			}
 
 			if st.commitErr != nil {
@@ -761,6 +814,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 			streamID:  streamID,
 			streamSeq: pbRec.StreamSeq,
 			payload:   pbRec.Payload,
+			epoch:     sessionEpoch,
 		}:
 		case <-ctx.Done():
 			decInFlight()
@@ -778,7 +832,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	}
 }
 
-func (s *Server) groupCommitLoop() {
+func (s *Server) groupCommitLoop(ctx context.Context) {
 	defer s.groupCommitWg.Done()
 	defer s.activeLoops.Add(-1)
 
@@ -792,7 +846,7 @@ func (s *Server) groupCommitLoop() {
 		if len(batch) == 0 {
 			return
 		}
-		s.commitItems(batch)
+		s.commitItems(ctx, batch)
 		batch = nil
 		batchBytes = 0
 	}
@@ -816,13 +870,64 @@ func (s *Server) groupCommitLoop() {
 	}
 }
 
-func (s *Server) commitItems(items []incomingItem) {
+func (s *Server) commitItems(ctx context.Context, items []incomingItem) {
 	if len(items) == 0 {
 		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// We check the writer epoch again at commit under s.mu and discard
+	// in-flight records from superseded sessions whose epoch is lower than
+	// the stream's highest accepted epoch.
+	//
+	// Why nothing can slip between:
+	// s.mu is held across the entirety of commitItems and is also held
+	// during the Hello handshake when validating and updating st.epoch.
+	// Therefore, batch commit and epoch acceptance are mutually exclusive.
+	// Any in-flight record already queued by an earlier session was either
+	// fully committed before the higher epoch was accepted, or st.epoch
+	// was updated first, in which case this check discards the record before
+	// it can be appended to localStore or advance st.witnessSeq. Thus, no
+	// record from a superseded session is ever committed after the new
+	// session's HelloAck, and the new session will never receive an
+	// acknowledgement for a record it did not send.
+	var validItems []incomingItem
+	for _, item := range items {
+		streamKey := item.streamID.String()
+		stream := s.streams[streamKey]
+		var acceptedEpoch uint64
+		if stream != nil {
+			stream.mu.Lock()
+			acceptedEpoch = stream.epoch
+			stream.mu.Unlock()
+		}
+		if item.epoch < acceptedEpoch {
+			if stream != nil {
+				stream.mu.Lock()
+				stream.inFlight--
+				stream.cond.Broadcast()
+				stream.mu.Unlock()
+			}
+			scoped.Log(ctx).Info("WAL buffer: discarded in-flight record from superseded session",
+				"stream", streamKey, "recordEpoch", item.epoch, "acceptedEpoch", acceptedEpoch, "streamSeq", item.streamSeq)
+			// The discarded item is dropped without sending a per-record error.
+			// The session that submitted it learns of the fence at session level:
+			// the Hello handshake that accepted the higher epoch broadcast the
+			// stream's condition, causing the superseded session's forwarder to
+			// terminate the session with the Fenced status. If the stream state
+			// was evicted, no session remains attached.
+			// Asserted by TestAppend_InFlightRecordFromSupersededSessionDiscarded.
+			continue
+		}
+		validItems = append(validItems, item)
+	}
+
+	if len(validItems) == 0 {
+		return
+	}
+	items = validItems
 
 	var recordsToStore []*wal.LogRecord
 

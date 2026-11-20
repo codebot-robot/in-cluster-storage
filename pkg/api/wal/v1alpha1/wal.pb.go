@@ -170,8 +170,12 @@ func (*AppendRequest_Hello) isAppendRequest_Msg() {}
 func (*AppendRequest_Record) isAppendRequest_Msg() {}
 
 type Hello struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	StreamId      []byte                 `protobuf:"bytes,1,opt,name=stream_id,json=streamId,proto3" json:"stream_id,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	StreamId []byte                 `protobuf:"bytes,1,opt,name=stream_id,json=streamId,proto3" json:"stream_id,omitempty"`
+	// Epoch is the writer epoch. The WAL buffer tracks the highest epoch
+	// accepted for each stream and fences any writer presenting a lower epoch.
+	// Defaults to 0.
+	Epoch         uint64 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -213,6 +217,76 @@ func (x *Hello) GetStreamId() []byte {
 	return nil
 }
 
+func (x *Hello) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+// Fenced is carried as a gRPC status detail when a stream writer is refused
+// or a live session is superseded because its epoch is lower than the highest
+// epoch accepted by the WAL buffer for the stream.
+type Fenced struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	StreamId      []byte                 `protobuf:"bytes,1,opt,name=stream_id,json=streamId,proto3" json:"stream_id,omitempty"`
+	WriterEpoch   uint64                 `protobuf:"varint,2,opt,name=writer_epoch,json=writerEpoch,proto3" json:"writer_epoch,omitempty"`
+	AcceptedEpoch uint64                 `protobuf:"varint,3,opt,name=accepted_epoch,json=acceptedEpoch,proto3" json:"accepted_epoch,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Fenced) Reset() {
+	*x = Fenced{}
+	mi := &file_proto_wal_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Fenced) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Fenced) ProtoMessage() {}
+
+func (x *Fenced) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_wal_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Fenced.ProtoReflect.Descriptor instead.
+func (*Fenced) Descriptor() ([]byte, []int) {
+	return file_proto_wal_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *Fenced) GetStreamId() []byte {
+	if x != nil {
+		return x.StreamId
+	}
+	return nil
+}
+
+func (x *Fenced) GetWriterEpoch() uint64 {
+	if x != nil {
+		return x.WriterEpoch
+	}
+	return 0
+}
+
+func (x *Fenced) GetAcceptedEpoch() uint64 {
+	if x != nil {
+		return x.AcceptedEpoch
+	}
+	return 0
+}
+
 type AppendResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Msg:
@@ -226,7 +300,7 @@ type AppendResponse struct {
 
 func (x *AppendResponse) Reset() {
 	*x = AppendResponse{}
-	mi := &file_proto_wal_proto_msgTypes[2]
+	mi := &file_proto_wal_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -238,7 +312,7 @@ func (x *AppendResponse) String() string {
 func (*AppendResponse) ProtoMessage() {}
 
 func (x *AppendResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_wal_proto_msgTypes[2]
+	mi := &file_proto_wal_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -251,7 +325,7 @@ func (x *AppendResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppendResponse.ProtoReflect.Descriptor instead.
 func (*AppendResponse) Descriptor() ([]byte, []int) {
-	return file_proto_wal_proto_rawDescGZIP(), []int{2}
+	return file_proto_wal_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *AppendResponse) GetMsg() isAppendResponse_Msg {
@@ -305,7 +379,7 @@ type HelloAck struct {
 
 func (x *HelloAck) Reset() {
 	*x = HelloAck{}
-	mi := &file_proto_wal_proto_msgTypes[3]
+	mi := &file_proto_wal_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -317,7 +391,7 @@ func (x *HelloAck) String() string {
 func (*HelloAck) ProtoMessage() {}
 
 func (x *HelloAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_wal_proto_msgTypes[3]
+	mi := &file_proto_wal_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -330,7 +404,7 @@ func (x *HelloAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HelloAck.ProtoReflect.Descriptor instead.
 func (*HelloAck) Descriptor() ([]byte, []int) {
-	return file_proto_wal_proto_rawDescGZIP(), []int{3}
+	return file_proto_wal_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *HelloAck) GetWitnessAckedStreamSeq() uint64 {
@@ -358,7 +432,7 @@ type AppendRecord struct {
 
 func (x *AppendRecord) Reset() {
 	*x = AppendRecord{}
-	mi := &file_proto_wal_proto_msgTypes[4]
+	mi := &file_proto_wal_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -370,7 +444,7 @@ func (x *AppendRecord) String() string {
 func (*AppendRecord) ProtoMessage() {}
 
 func (x *AppendRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_wal_proto_msgTypes[4]
+	mi := &file_proto_wal_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -383,7 +457,7 @@ func (x *AppendRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppendRecord.ProtoReflect.Descriptor instead.
 func (*AppendRecord) Descriptor() ([]byte, []int) {
-	return file_proto_wal_proto_rawDescGZIP(), []int{4}
+	return file_proto_wal_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *AppendRecord) GetStreamSeq() uint64 {
@@ -417,7 +491,7 @@ type Ack struct {
 
 func (x *Ack) Reset() {
 	*x = Ack{}
-	mi := &file_proto_wal_proto_msgTypes[5]
+	mi := &file_proto_wal_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -429,7 +503,7 @@ func (x *Ack) String() string {
 func (*Ack) ProtoMessage() {}
 
 func (x *Ack) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_wal_proto_msgTypes[5]
+	mi := &file_proto_wal_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -442,7 +516,7 @@ func (x *Ack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ack.ProtoReflect.Descriptor instead.
 func (*Ack) Descriptor() ([]byte, []int) {
-	return file_proto_wal_proto_rawDescGZIP(), []int{5}
+	return file_proto_wal_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Ack) GetWitnessAckedStreamSeq() uint64 {
@@ -467,7 +541,7 @@ type FlushRequest struct {
 
 func (x *FlushRequest) Reset() {
 	*x = FlushRequest{}
-	mi := &file_proto_wal_proto_msgTypes[6]
+	mi := &file_proto_wal_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -479,7 +553,7 @@ func (x *FlushRequest) String() string {
 func (*FlushRequest) ProtoMessage() {}
 
 func (x *FlushRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_wal_proto_msgTypes[6]
+	mi := &file_proto_wal_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -492,7 +566,7 @@ func (x *FlushRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushRequest.ProtoReflect.Descriptor instead.
 func (*FlushRequest) Descriptor() ([]byte, []int) {
-	return file_proto_wal_proto_rawDescGZIP(), []int{6}
+	return file_proto_wal_proto_rawDescGZIP(), []int{7}
 }
 
 type FlushResponse struct {
@@ -504,7 +578,7 @@ type FlushResponse struct {
 
 func (x *FlushResponse) Reset() {
 	*x = FlushResponse{}
-	mi := &file_proto_wal_proto_msgTypes[7]
+	mi := &file_proto_wal_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -516,7 +590,7 @@ func (x *FlushResponse) String() string {
 func (*FlushResponse) ProtoMessage() {}
 
 func (x *FlushResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_wal_proto_msgTypes[7]
+	mi := &file_proto_wal_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -529,7 +603,7 @@ func (x *FlushResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushResponse.ProtoReflect.Descriptor instead.
 func (*FlushResponse) Descriptor() ([]byte, []int) {
-	return file_proto_wal_proto_rawDescGZIP(), []int{7}
+	return file_proto_wal_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *FlushResponse) GetLastPosition() uint64 {
@@ -550,7 +624,7 @@ type TailRequest struct {
 
 func (x *TailRequest) Reset() {
 	*x = TailRequest{}
-	mi := &file_proto_wal_proto_msgTypes[8]
+	mi := &file_proto_wal_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -562,7 +636,7 @@ func (x *TailRequest) String() string {
 func (*TailRequest) ProtoMessage() {}
 
 func (x *TailRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_wal_proto_msgTypes[8]
+	mi := &file_proto_wal_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -575,7 +649,7 @@ func (x *TailRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TailRequest.ProtoReflect.Descriptor instead.
 func (*TailRequest) Descriptor() ([]byte, []int) {
-	return file_proto_wal_proto_rawDescGZIP(), []int{8}
+	return file_proto_wal_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *TailRequest) GetFromPosition() uint64 {
@@ -612,7 +686,7 @@ type LogRecord struct {
 
 func (x *LogRecord) Reset() {
 	*x = LogRecord{}
-	mi := &file_proto_wal_proto_msgTypes[9]
+	mi := &file_proto_wal_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -624,7 +698,7 @@ func (x *LogRecord) String() string {
 func (*LogRecord) ProtoMessage() {}
 
 func (x *LogRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_wal_proto_msgTypes[9]
+	mi := &file_proto_wal_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -637,7 +711,7 @@ func (x *LogRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogRecord.ProtoReflect.Descriptor instead.
 func (*LogRecord) Descriptor() ([]byte, []int) {
-	return file_proto_wal_proto_rawDescGZIP(), []int{9}
+	return file_proto_wal_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *LogRecord) GetPosition() uint64 {
@@ -685,7 +759,7 @@ type TailResponse struct {
 
 func (x *TailResponse) Reset() {
 	*x = TailResponse{}
-	mi := &file_proto_wal_proto_msgTypes[10]
+	mi := &file_proto_wal_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -697,7 +771,7 @@ func (x *TailResponse) String() string {
 func (*TailResponse) ProtoMessage() {}
 
 func (x *TailResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_wal_proto_msgTypes[10]
+	mi := &file_proto_wal_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -710,7 +784,7 @@ func (x *TailResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TailResponse.ProtoReflect.Descriptor instead.
 func (*TailResponse) Descriptor() ([]byte, []int) {
-	return file_proto_wal_proto_rawDescGZIP(), []int{10}
+	return file_proto_wal_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *TailResponse) GetRecord() *LogRecord {
@@ -735,9 +809,14 @@ const file_proto_wal_proto_rawDesc = "" +
 	"\rAppendRequest\x12+\n" +
 	"\x05hello\x18\x01 \x01(\v2\x13.wal.v1alpha1.HelloH\x00R\x05hello\x124\n" +
 	"\x06record\x18\x02 \x01(\v2\x1a.wal.v1alpha1.AppendRecordH\x00R\x06recordB\x05\n" +
-	"\x03msg\"$\n" +
+	"\x03msg\":\n" +
 	"\x05Hello\x12\x1b\n" +
-	"\tstream_id\x18\x01 \x01(\fR\bstreamId\"u\n" +
+	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x12\x14\n" +
+	"\x05epoch\x18\x02 \x01(\x04R\x05epoch\"o\n" +
+	"\x06Fenced\x12\x1b\n" +
+	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x12!\n" +
+	"\fwriter_epoch\x18\x02 \x01(\x04R\vwriterEpoch\x12%\n" +
+	"\x0eaccepted_epoch\x18\x03 \x01(\x04R\racceptedEpoch\"u\n" +
 	"\x0eAppendResponse\x125\n" +
 	"\thello_ack\x18\x01 \x01(\v2\x16.wal.v1alpha1.HelloAckH\x00R\bhelloAck\x12%\n" +
 	"\x03ack\x18\x02 \x01(\v2\x11.wal.v1alpha1.AckH\x00R\x03ackB\x05\n" +
@@ -793,33 +872,34 @@ func file_proto_wal_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_wal_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_wal_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_proto_wal_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_proto_wal_proto_goTypes = []any{
 	(DurabilityLevel)(0),   // 0: wal.v1alpha1.DurabilityLevel
 	(*AppendRequest)(nil),  // 1: wal.v1alpha1.AppendRequest
 	(*Hello)(nil),          // 2: wal.v1alpha1.Hello
-	(*AppendResponse)(nil), // 3: wal.v1alpha1.AppendResponse
-	(*HelloAck)(nil),       // 4: wal.v1alpha1.HelloAck
-	(*AppendRecord)(nil),   // 5: wal.v1alpha1.AppendRecord
-	(*Ack)(nil),            // 6: wal.v1alpha1.Ack
-	(*FlushRequest)(nil),   // 7: wal.v1alpha1.FlushRequest
-	(*FlushResponse)(nil),  // 8: wal.v1alpha1.FlushResponse
-	(*TailRequest)(nil),    // 9: wal.v1alpha1.TailRequest
-	(*LogRecord)(nil),      // 10: wal.v1alpha1.LogRecord
-	(*TailResponse)(nil),   // 11: wal.v1alpha1.TailResponse
+	(*Fenced)(nil),         // 3: wal.v1alpha1.Fenced
+	(*AppendResponse)(nil), // 4: wal.v1alpha1.AppendResponse
+	(*HelloAck)(nil),       // 5: wal.v1alpha1.HelloAck
+	(*AppendRecord)(nil),   // 6: wal.v1alpha1.AppendRecord
+	(*Ack)(nil),            // 7: wal.v1alpha1.Ack
+	(*FlushRequest)(nil),   // 8: wal.v1alpha1.FlushRequest
+	(*FlushResponse)(nil),  // 9: wal.v1alpha1.FlushResponse
+	(*TailRequest)(nil),    // 10: wal.v1alpha1.TailRequest
+	(*LogRecord)(nil),      // 11: wal.v1alpha1.LogRecord
+	(*TailResponse)(nil),   // 12: wal.v1alpha1.TailResponse
 }
 var file_proto_wal_proto_depIdxs = []int32{
 	2,  // 0: wal.v1alpha1.AppendRequest.hello:type_name -> wal.v1alpha1.Hello
-	5,  // 1: wal.v1alpha1.AppendRequest.record:type_name -> wal.v1alpha1.AppendRecord
-	4,  // 2: wal.v1alpha1.AppendResponse.hello_ack:type_name -> wal.v1alpha1.HelloAck
-	6,  // 3: wal.v1alpha1.AppendResponse.ack:type_name -> wal.v1alpha1.Ack
-	10, // 4: wal.v1alpha1.TailResponse.record:type_name -> wal.v1alpha1.LogRecord
+	6,  // 1: wal.v1alpha1.AppendRequest.record:type_name -> wal.v1alpha1.AppendRecord
+	5,  // 2: wal.v1alpha1.AppendResponse.hello_ack:type_name -> wal.v1alpha1.HelloAck
+	7,  // 3: wal.v1alpha1.AppendResponse.ack:type_name -> wal.v1alpha1.Ack
+	11, // 4: wal.v1alpha1.TailResponse.record:type_name -> wal.v1alpha1.LogRecord
 	1,  // 5: wal.v1alpha1.WalBuffer.Append:input_type -> wal.v1alpha1.AppendRequest
-	7,  // 6: wal.v1alpha1.WalBuffer.Flush:input_type -> wal.v1alpha1.FlushRequest
-	9,  // 7: wal.v1alpha1.WalBuffer.Tail:input_type -> wal.v1alpha1.TailRequest
-	3,  // 8: wal.v1alpha1.WalBuffer.Append:output_type -> wal.v1alpha1.AppendResponse
-	8,  // 9: wal.v1alpha1.WalBuffer.Flush:output_type -> wal.v1alpha1.FlushResponse
-	11, // 10: wal.v1alpha1.WalBuffer.Tail:output_type -> wal.v1alpha1.TailResponse
+	8,  // 6: wal.v1alpha1.WalBuffer.Flush:input_type -> wal.v1alpha1.FlushRequest
+	10, // 7: wal.v1alpha1.WalBuffer.Tail:input_type -> wal.v1alpha1.TailRequest
+	4,  // 8: wal.v1alpha1.WalBuffer.Append:output_type -> wal.v1alpha1.AppendResponse
+	9,  // 9: wal.v1alpha1.WalBuffer.Flush:output_type -> wal.v1alpha1.FlushResponse
+	12, // 10: wal.v1alpha1.WalBuffer.Tail:output_type -> wal.v1alpha1.TailResponse
 	8,  // [8:11] is the sub-list for method output_type
 	5,  // [5:8] is the sub-list for method input_type
 	5,  // [5:5] is the sub-list for extension type_name
@@ -836,7 +916,7 @@ func file_proto_wal_proto_init() {
 		(*AppendRequest_Hello)(nil),
 		(*AppendRequest_Record)(nil),
 	}
-	file_proto_wal_proto_msgTypes[2].OneofWrappers = []any{
+	file_proto_wal_proto_msgTypes[3].OneofWrappers = []any{
 		(*AppendResponse_HelloAck)(nil),
 		(*AppendResponse_Ack)(nil),
 	}
@@ -846,7 +926,7 @@ func file_proto_wal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_wal_proto_rawDesc), len(file_proto_wal_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
