@@ -1791,3 +1791,226 @@ func TestAppendDefersFsyncToWait(t *testing.T) {
 		t.Fatalf("expected exactly 1 sync after Wait(Local), got %d", syncsAfterWait)
 	}
 }
+
+// 18. Wait(Permanent, requestFlush=true) straddling a buffer restart completes promptly after reconnect.
+func TestWaitPermanentAcrossBufferRestart(t *testing.T) {
+	backend := inmemorystorage.New()
+	bufferDirectory1 := t.TempDir()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve port: %v", err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("failed to close listener: %v", err)
+	}
+
+	handle1 := startBufferServerOnAddr(t, backend, bufferDirectory1, address)
+
+	clientDir := t.TempDir()
+	streamID := uuid.New()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	flushAttempted := make(chan struct{}, 1)
+	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		err := invoker(ctx, method, req, reply, cc, opts...)
+		if method == "/wal.v1alpha1.WalBuffer/Flush" {
+			select {
+			case flushAttempted <- struct{}{}:
+			default:
+			}
+		}
+		return err
+	}
+
+	stream, err := Open(ctx, clientDir, streamID, address, WithDialOptions(grpc.WithUnaryInterceptor(interceptor)))
+	if err != nil {
+		t.Fatalf("failed to open stream: %v", err)
+	}
+	defer func() {
+		if err := stream.Close(); err != nil {
+			t.Errorf("failed to close stream: %v", err)
+		}
+	}()
+
+	// 1. Append a record and wait for witness on buffer 1
+	seq, err := stream.Append(ctx, []byte("record-1"))
+	if err != nil {
+		t.Fatalf("append failed: %v", err)
+	}
+	if err := stream.Wait(ctx, seq, Witness, false); err != nil {
+		t.Fatalf("wait witness failed: %v", err)
+	}
+
+	// 2. Stop buffer 1 without closing it (simulating ungraceful crash)
+	handle1.StopWithoutClose()
+
+	// 3. Start Wait(seq, Permanent, true)
+	waitErrCh := make(chan error, 1)
+	go func() {
+		waitErrCh <- stream.Wait(ctx, seq, Permanent, true)
+	}()
+
+	// Ensure the initial Flush RPC was attempted (and failed against the stopped buffer 1)
+	select {
+	case <-flushAttempted:
+	case <-ctx.Done():
+		t.Fatalf("context cancelled waiting for flush RPC attempt: %v", ctx.Err())
+	}
+
+	// 4. Start buffer 2 on the same address with an empty data directory (successor flush interval is 10s)
+	handle2 := startBufferServerOnAddr(t, backend, t.TempDir(), address)
+	defer handle2.StopGraceful()
+
+	// Wait(Permanent) must complete well inside the 10s flush interval
+	select {
+	case err := <-waitErrCh:
+		if err != nil {
+			t.Fatalf("Wait(Permanent) failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Wait(Permanent) did not complete within 3s; stalled waiting for successor periodic flush")
+	}
+
+	_, _, permanent := stream.Watermarks()
+	if permanent < seq {
+		t.Fatalf("expected permanent watermark >= %d, got %d", seq, permanent)
+	}
+}
+
+type notifyingContext struct {
+	context.Context
+	onDone func()
+}
+
+func (c *notifyingContext) Done() <-chan struct{} {
+	if c.onDone != nil {
+		c.onDone()
+	}
+	return c.Context.Done()
+}
+
+// 19. A flush requested while a Flush RPC is in flight triggers a trailing flush on completion.
+func TestWaitPermanentWhileFlushInFlight(t *testing.T) {
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir()) // 10s flush interval
+	defer handle.StopGraceful()
+
+	clientDir := t.TempDir()
+	streamID := uuid.New()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	firstFlushRunning := make(chan struct{})
+	releaseFirstFlush := make(chan struct{})
+	var flushCount atomic.Int32
+
+	interceptor := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if method == "/wal.v1alpha1.WalBuffer/Flush" {
+			if flushCount.Add(1) == 1 {
+				err := invoker(ctx, method, req, reply, cc, opts...)
+				close(firstFlushRunning)
+				<-releaseFirstFlush
+				return err
+			}
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+
+	stream, err := Open(ctx, clientDir, streamID, handle.addr, WithDialOptions(grpc.WithUnaryInterceptor(interceptor)))
+	if err != nil {
+		t.Fatalf("failed to open stream: %v", err)
+	}
+	defer func() {
+		if err := stream.Close(); err != nil {
+			t.Errorf("stream.Close failed: %v", err)
+		}
+	}()
+
+	// 1. Append record 1 and wait for witness
+	seq1, err := stream.Append(ctx, []byte("record-1"))
+	if err != nil {
+		t.Fatalf("append 1 failed: %v", err)
+	}
+	if err := stream.Wait(ctx, seq1, Witness, false); err != nil {
+		t.Fatalf("wait witness 1 failed: %v", err)
+	}
+
+	// 2. Start Wait(seq1, Permanent, true). This triggers the first Flush RPC.
+	wait1ErrCh := make(chan error, 1)
+	go func() {
+		wait1ErrCh <- stream.Wait(ctx, seq1, Permanent, true)
+	}()
+
+	// 3. Wait until the first Flush RPC has executed on the server and is held in the interceptor.
+	select {
+	case <-firstFlushRunning:
+	case <-ctx.Done():
+		t.Fatalf("context cancelled waiting for first flush to start: %v", ctx.Err())
+	}
+
+	// 4. Append record 2 and wait for witness while the first Flush RPC is still in flight on the client.
+	seq2, err := stream.Append(ctx, []byte("record-2"))
+	if err != nil {
+		t.Fatalf("append 2 failed: %v", err)
+	}
+	if err := stream.Wait(ctx, seq2, Witness, false); err != nil {
+		t.Fatalf("wait witness 2 failed: %v", err)
+	}
+
+	// 5. Register the second permanent waiter while the first Flush RPC is still in flight.
+	waiter2Registered := make(chan struct{})
+	var notifyOnce sync.Once
+	hookCtx := &notifyingContext{
+		Context: ctx,
+		onDone: func() {
+			notifyOnce.Do(func() {
+				close(waiter2Registered)
+			})
+		},
+	}
+
+	wait2ErrCh := make(chan error, 1)
+	go func() {
+		wait2ErrCh <- stream.Wait(hookCtx, seq2, Permanent, true)
+	}()
+
+	select {
+	case <-waiter2Registered:
+	case <-ctx.Done():
+		t.Fatalf("context cancelled waiting for second waiter to register: %v", ctx.Err())
+	}
+
+	// 6. Release the first Flush RPC. On completion, triggerFlushLocked must see
+	// flushRequestedWhileInFlight and immediately issue a second Flush RPC for record 2.
+	close(releaseFirstFlush)
+
+	select {
+	case err := <-wait1ErrCh:
+		if err != nil {
+			t.Fatalf("Wait(Permanent) 1 failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Wait(Permanent) 1 timed out")
+	}
+
+	select {
+	case err := <-wait2ErrCh:
+		if err != nil {
+			t.Fatalf("Wait(Permanent) 2 failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Wait(Permanent) 2 did not complete within 3s; stalled waiting for periodic flush")
+	}
+
+	if count := flushCount.Load(); count != 2 {
+		t.Fatalf("expected 2 Flush RPCs issued, got %d", count)
+	}
+
+	_, _, permanent := stream.Watermarks()
+	if permanent < seq2 {
+		t.Fatalf("expected permanent watermark >= %d, got %d", seq2, permanent)
+	}
+}
