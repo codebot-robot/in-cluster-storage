@@ -55,8 +55,8 @@ func TestStreamEpochStore_CorruptFiles(t *testing.T) {
 	for name, content := range map[string][]byte{"empty": nil, "unterminated": []byte("42"), "garbage": []byte("abc\n")} {
 		t.Run(name, func(t *testing.T) {
 			store := newStreamEpochStore(t.TempDir(), uuid.New(), false)
-			if err := os.MkdirAll(store.dir, 0755); err != nil {
-				t.Fatalf("failed to create store dir %s: %v", store.dir, err)
+			if err := os.MkdirAll(store.directory, 0755); err != nil {
+				t.Fatalf("failed to create store dir %s: %v", store.directory, err)
 			}
 			if err := os.WriteFile(store.filePath, content, 0644); err != nil {
 				t.Fatalf("failed to write test epoch file %s: %v", store.filePath, err)
@@ -79,11 +79,36 @@ func TestStreamEpochStore_FailedSaveLeavesOldValueReadable(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("x"), 0644); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
-	failing := &streamEpochStore{dir: filepath.Join(blocker, "s"), filePath: store.filePath, streamID: store.streamID}
+	failing := &streamEpochStore{directory: filepath.Join(blocker, "s"), filePath: store.filePath, streamID: store.streamID}
 	if err := failing.Save(3); err == nil {
 		t.Fatal("expected Save to fail before rename, got nil")
 	}
 	if epoch, err := store.Load(); err != nil || epoch != 2 {
 		t.Fatalf("expected old epoch 2 readable after failed save, got epoch=%d, err=%v", epoch, err)
+	}
+}
+
+func TestStreamEpochStore_EqualSaveSyncsDirectory(t *testing.T) {
+	dataDir := t.TempDir()
+	streamID := uuid.New()
+	store := newStreamEpochStore(dataDir, streamID, false)
+	if err := store.Save(5); err != nil {
+		t.Fatalf("initial Save(5) failed: %v", err)
+	}
+
+	// Make directory path point to an unopenable location to verify syncDirectory is called on equal save
+	failing := &streamEpochStore{
+		directory: filepath.Join(dataDir, "nonexistent"),
+		filePath:  store.filePath,
+		streamID:  streamID,
+		noFsync:   false,
+	}
+	if err := failing.Save(5); err == nil {
+		t.Fatal("expected equal Save with unopenable directory to fail directory sync, got nil")
+	}
+
+	// Normal equal save succeeds
+	if err := store.Save(5); err != nil {
+		t.Fatalf("equal Save(5) failed: %v", err)
 	}
 }

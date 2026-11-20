@@ -30,8 +30,8 @@ import (
 
 // streamEpochStore manages durable storage of the highest accepted writer epoch per stream.
 type streamEpochStore struct {
-	// dir is the stream directory containing the epoch file.
-	dir string
+	// directory is the stream directory containing the epoch file.
+	directory string
 
 	// filePath is the absolute path to the epoch file.
 	filePath string
@@ -39,18 +39,18 @@ type streamEpochStore struct {
 	// streamID identifies the stream owning this epoch store.
 	streamID uuid.UUID
 
-	// noFsync disables filesystem syncing during tests.
+	// noFsync controls whether fsync calls to the file and parent directory are skipped.
 	noFsync bool
 }
 
 // newStreamEpochStore creates a new streamEpochStore for streamID under dataDir.
 func newStreamEpochStore(dataDir string, streamID uuid.UUID, noFsync bool) *streamEpochStore {
-	dir := filepath.Join(dataDir, "streams", streamID.String())
+	directory := filepath.Join(dataDir, "streams", streamID.String())
 	return &streamEpochStore{
-		dir:      dir,
-		filePath: filepath.Join(dir, "epoch"),
-		streamID: streamID,
-		noFsync:  noFsync,
+		directory: directory,
+		filePath:  filepath.Join(directory, "epoch"),
+		streamID:  streamID,
+		noFsync:   noFsync,
 	}
 }
 
@@ -74,7 +74,24 @@ func (s *streamEpochStore) Load() (uint64, error) {
 	return epoch, nil
 }
 
-// Save durably writes epoch to disk before returning. Lower epoch is an error; 0 and equal are no-ops.
+// syncDirectory flushes directory metadata changes to durable storage.
+func (s *streamEpochStore) syncDirectory() error {
+	if s.noFsync {
+		return nil
+	}
+	directoryFile, openErr := os.Open(s.directory)
+	if openErr != nil {
+		return fmt.Errorf("open stream dir %s: %w", s.directory, openErr)
+	}
+	defer errutil.CloseAndLog(directoryFile, s.directory)
+	if syncErr := directoryFile.Sync(); syncErr != nil {
+		return fmt.Errorf("sync stream dir %s: %w", s.directory, syncErr)
+	}
+	return nil
+}
+
+// Save durably writes epoch to disk before returning. Lower epoch is an error; 0 is a no-op;
+// equal epoch syncs the directory before returning.
 // Failure semantics: before rename nothing has changed on disk; if directory fsync fails after rename,
 // the file may hold the new epoch, the caller must refuse the session, and restart may read either value.
 func (s *streamEpochStore) Save(epoch uint64) (err error) {
@@ -89,37 +106,27 @@ func (s *streamEpochStore) Save(epoch uint64) (err error) {
 		return fmt.Errorf("refusing to save epoch %d lower than stored %d for stream %s (file: %s)", epoch, stored, s.streamID, s.filePath)
 	}
 	if epoch == stored {
-		return nil
+		return s.syncDirectory()
 	}
-	if err := os.MkdirAll(s.dir, 0755); err != nil {
-		return fmt.Errorf("create stream dir %s: %w", s.dir, err)
+	if err := os.MkdirAll(s.directory, 0755); err != nil {
+		return fmt.Errorf("create stream dir %s: %w", s.directory, err)
 	}
-	tmp, err := tempfile.Create(s.dir, "epoch.*.tmp")
+	temporaryFile, err := tempfile.Create(s.directory, "epoch.*.tmp")
 	if err != nil {
-		return fmt.Errorf("create temp epoch file in %s: %w", s.dir, err)
+		return fmt.Errorf("create temp epoch file in %s: %w", s.directory, err)
 	}
-	defer errutil.CloseWithErr(tmp, &err)
+	defer errutil.CloseWithErr(temporaryFile, &err)
 
-	if _, err := fmt.Fprintf(tmp, "%d\n", epoch); err != nil {
-		return fmt.Errorf("write epoch to %s: %w", tmp.Name(), err)
+	if _, err := fmt.Fprintf(temporaryFile, "%d\n", epoch); err != nil {
+		return fmt.Errorf("write epoch to %s: %w", temporaryFile.Name(), err)
 	}
 	if !s.noFsync {
-		if err := tmp.Sync(); err != nil {
-			return fmt.Errorf("sync temp epoch file %s: %w", tmp.Name(), err)
+		if err := temporaryFile.Sync(); err != nil {
+			return fmt.Errorf("sync temp epoch file %s: %w", temporaryFile.Name(), err)
 		}
 	}
-	if err := tmp.RenameTo(s.filePath); err != nil {
+	if err := temporaryFile.RenameTo(s.filePath); err != nil {
 		return fmt.Errorf("rename temp epoch file to %s: %w", s.filePath, err)
 	}
-	if !s.noFsync {
-		dirFile, openErr := os.Open(s.dir)
-		if openErr != nil {
-			return fmt.Errorf("open stream dir %s: %w", s.dir, openErr)
-		}
-		defer errutil.CloseAndLog(dirFile, s.dir)
-		if syncErr := dirFile.Sync(); syncErr != nil {
-			return fmt.Errorf("sync stream dir %s: %w", s.dir, syncErr)
-		}
-	}
-	return nil
+	return s.syncDirectory()
 }

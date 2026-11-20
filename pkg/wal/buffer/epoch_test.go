@@ -20,6 +20,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -369,4 +372,136 @@ func TestAppend_EpochSurvivesIdleStreamEviction(t *testing.T) {
 		t.Fatalf("session with epoch 2 failed after eviction: %v", err)
 	}
 	defer acceptedSession.close(t)
+}
+
+// TestAppend_SupersededWriterRecordCannotCommitDuringHandshake verifies that when an epoch-2
+// Hello handshake is in progress and held between its save and its in-memory raise, a record
+// submitted by an epoch-1 writer cannot commit without being reflected in the epoch-2 HelloAck
+// witness watermark.
+func TestAppend_SupersededWriterRecordCannotCommitDuringHandshake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	backend := inmemorystorage.New()
+	server, address, cleanup := startTestServer(t, backend, t.TempDir())
+	defer cleanup()
+
+	streamID := uuid.New()
+
+	firstSession, _, err := openSession(ctx, t, address, streamID, 1)
+	if err != nil {
+		t.Fatalf("first session with epoch 1 failed: %v", err)
+	}
+	defer firstSession.close(t)
+
+	server.mu.RLock()
+	st := server.streams[streamID.String()]
+	server.mu.RUnlock()
+	if st == nil {
+		t.Fatalf("stream state not found for %s", streamID)
+	}
+
+	// Hold the stream's epoch mutex from the test to simulate the handshake being held
+	// between save and in-memory raise.
+	st.epochMu.Lock()
+
+	type helloResult struct {
+		session  *session
+		helloAck *pb.HelloAck
+		err      error
+	}
+	resCh := make(chan helloResult, 1)
+	go func() {
+		s2, ack, err := openSession(ctx, t, address, streamID, 2)
+		resCh <- helloResult{session: s2, helloAck: ack, err: err}
+	}()
+
+	// Bounded poll of attachments to ensure session 2 has attached.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st.mu.Lock()
+		attachments := st.attachments
+		st.mu.Unlock()
+		if attachments == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			st.epochMu.Unlock()
+			t.Fatal("timed out waiting for session 2 to attach")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Epoch-1 writer submits a record meanwhile.
+	ack, err := firstSession.appendRecord(1, []byte("record-1"))
+	if err != nil || ack == nil || ack.WitnessAckedStreamSeq < 1 {
+		st.epochMu.Unlock()
+		t.Fatalf("first session append failed: ack=%v, err=%v", ack, err)
+	}
+
+	// Release epoch mutex.
+	st.epochMu.Unlock()
+
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("second session failed: %v", res.err)
+	}
+	if res.session != nil {
+		defer res.session.close(t)
+	}
+
+	st.mu.Lock()
+	streamWitnessWatermark := st.witnessSeq
+	st.mu.Unlock()
+
+	if res.helloAck.WitnessAckedStreamSeq != streamWitnessWatermark {
+		t.Fatalf("HelloAck witness watermark %d does not equal stream witness watermark %d",
+			res.helloAck.WitnessAckedStreamSeq, streamWitnessWatermark)
+	}
+}
+
+// TestAppend_CorruptEpochFileReturnsInternalWithoutFilePath verifies that a corrupt epoch file
+// causes the Hello handshake to fail with codes.Internal and a short message that does not leak
+// the server's file path to the client.
+func TestAppend_CorruptEpochFileReturnsInternalWithoutFilePath(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	dataDir := t.TempDir()
+	streamID := uuid.New()
+
+	// Pre-create a corrupt epoch file on disk
+	streamDir := filepath.Join(dataDir, "streams", streamID.String())
+	if err := os.MkdirAll(streamDir, 0755); err != nil {
+		t.Fatalf("failed to create stream dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(streamDir, "epoch"), []byte("corrupt-not-a-number"), 0644); err != nil {
+		t.Fatalf("failed to write corrupt epoch file: %v", err)
+	}
+
+	backend := inmemorystorage.New()
+	_, address, cleanup := startTestServer(t, backend, dataDir)
+	defer cleanup()
+
+	sess, _, err := openSession(ctx, t, address, streamID, 1)
+	if sess != nil {
+		defer sess.close(t)
+	}
+	if err == nil {
+		t.Fatal("expected error on corrupt epoch file, got nil")
+	}
+
+	statusObj, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected gRPC status error, got: %v", err)
+	}
+	if statusObj.Code() != codes.Internal {
+		t.Fatalf("expected codes.Internal, got %v: %v", statusObj.Code(), err)
+	}
+	if strings.Contains(statusObj.Message(), dataDir) || strings.Contains(statusObj.Message(), streamDir) {
+		t.Fatalf("error message leaks server file path: %q", statusObj.Message())
+	}
+	if statusObj.Message() != "failed to read stream epoch" {
+		t.Fatalf("expected short message %q, got %q", "failed to read stream epoch", statusObj.Message())
+	}
 }

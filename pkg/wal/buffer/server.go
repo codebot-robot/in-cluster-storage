@@ -71,6 +71,26 @@ type incomingItem struct {
 }
 
 type streamState struct {
+	// Immutable fields (never change after construction).
+
+	// streamID identifies the stream owning this state.
+	streamID uuid.UUID
+
+	// epochStore manages durable on-disk storage of the stream's accepted writer epoch.
+	epochStore *streamEpochStore
+
+	// epochMu serializes epoch loading and durable advancement.
+	// Lock order is epochMu, then Server.mu, then streamState.mu.
+	// Nothing may take epochMu while holding either Server.mu or streamState.mu.
+	epochMu sync.Mutex
+
+	// epochLoaded records whether the stored epoch has been loaded from disk. Guarded by epochMu.
+	epochLoaded bool
+
+	// durableEpoch is the highest epoch known to be on disk and is what a new session is judged against.
+	// Guarded by epochMu.
+	durableEpoch uint64
+
 	// mu guards all mutable fields below.
 	mu sync.Mutex
 
@@ -98,23 +118,16 @@ type streamState struct {
 	// waiters is the number of goroutines currently waiting on cond. Guarded by mu.
 	waiters int
 
-	// epoch is the highest accepted writer epoch for this stream.
-	// Written only while holding both epochMu and mu; may be read under either.
+	// epoch is the highest epoch a session has attached with since this state was created,
+	// is what the commit path and the forwarders enforce, and is never higher than durableEpoch.
+	// Advanced under epochMu, Server.mu, and mu in attachSession; may be read under any of those locks.
 	epoch uint64
-
-	// epochStore manages durable on-disk storage of the stream's accepted writer epoch.
-	epochStore *streamEpochStore
-
-	// epochMu serializes epoch loading and durable advancement. The epoch mutex is taken before mu and is never held while the server lock is requested.
-	epochMu sync.Mutex
-
-	// epochLoaded records whether the stored epoch has been loaded from disk. Guarded by epochMu.
-	epochLoaded bool
 }
 
-// newStreamState creates a new streamState initialized with watermarks and an epoch store.
-func newStreamState(witnessSeq, s3Seq uint64, epochStore *streamEpochStore) *streamState {
+// newStreamState creates a new streamState initialized with streamID, watermarks, and an epoch store.
+func newStreamState(streamID uuid.UUID, witnessSeq, s3Seq uint64, epochStore *streamEpochStore) *streamState {
 	st := &streamState{
+		streamID:   streamID,
 		witnessSeq: witnessSeq,
 		s3Seq:      s3Seq,
 		epochStore: epochStore,
@@ -135,47 +148,32 @@ func (st *streamState) raiseWatermarksLocked(uploadedTo uint64) {
 }
 
 // acceptEpoch validates and durably advances the stream's accepted writer epoch under epochMu.
-// epoch is written only while holding both epochMu and st.mu, and may be read under either.
-// The epoch mutex is taken before the stream's mu and is never held while the server lock is requested.
-func (st *streamState) acceptEpoch(sessionEpoch uint64) error {
-	st.epochMu.Lock()
-	defer st.epochMu.Unlock()
-
+// It loads the stored epoch lazily on first use, refuses lower epochs with Fenced status,
+// and saves higher epochs durably before returning. It does not raise epoch in memory;
+// attachSession raises epoch under Server.mu and streamState.mu in one critical section.
+// Caller must hold st.epochMu.
+func (st *streamState) acceptEpoch(ctx context.Context, sessionEpoch uint64) error {
 	if !st.epochLoaded {
-		if st.epochStore != nil {
-			stored, err := st.epochStore.Load()
-			if err != nil {
-				return err
-			}
-			st.mu.Lock()
-			st.epoch = stored
-			st.mu.Unlock()
+		stored, err := st.epochStore.Load()
+		if err != nil {
+			scoped.Log(ctx).Error(err, "failed to load stream epoch", "stream", st.streamID.String())
+			return status.Errorf(codes.Internal, "failed to read stream epoch")
 		}
+		st.durableEpoch = stored
 		st.epochLoaded = true
 	}
 
-	if sessionEpoch < st.epoch {
-		var streamID uuid.UUID
-		if st.epochStore != nil {
-			streamID = st.epochStore.streamID
-		}
-		return fencedStatus(streamID, sessionEpoch, st.epoch)
+	if sessionEpoch < st.durableEpoch {
+		return fencedStatus(st.streamID, sessionEpoch, st.durableEpoch)
 	}
 
-	if sessionEpoch == st.epoch {
-		return nil
-	}
-
-	if st.epochStore != nil {
+	if sessionEpoch > st.durableEpoch {
 		if err := st.epochStore.Save(sessionEpoch); err != nil {
-			return err
+			scoped.Log(ctx).Error(err, "failed to save stream epoch", "stream", st.streamID.String())
+			return status.Errorf(codes.Internal, "failed to save stream epoch")
 		}
+		st.durableEpoch = sessionEpoch
 	}
-
-	st.mu.Lock()
-	st.epoch = sessionEpoch
-	st.cond.Broadcast()
-	st.mu.Unlock()
 
 	return nil
 }
@@ -440,14 +438,12 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 	// Populate initial streams state
 	for sid, watermark := range streamWatermarks {
-		var epochStore *streamEpochStore
 		streamID, err := uuid.Parse(sid)
 		if err != nil {
-			klog.Warningf("Failed to parse stream ID %s during startup recovery: %v", sid, err)
-		} else {
-			epochStore = newStreamEpochStore(cfg.DataDir, streamID, cfg.NoFsync)
+			return nil, fmt.Errorf("failed to parse stream ID %q during startup recovery: %w", sid, err)
 		}
-		s.streams[sid] = newStreamState(watermark, backendWatermarks[sid], epochStore)
+		epochStore := newStreamEpochStore(cfg.DataDir, streamID, cfg.NoFsync)
+		s.streams[sid] = newStreamState(streamID, watermark, backendWatermarks[sid], epochStore)
 	}
 	s.streamStore.SetEvictHook(s.evictIdleStreams)
 
@@ -604,7 +600,7 @@ func (s *Server) getOrCreateStreamLocked(streamID uuid.UUID, uploadedTo uint64) 
 	state, exists := s.streams[streamKey]
 	if !exists {
 		epochStore := newStreamEpochStore(s.cfg.DataDir, streamID, s.cfg.NoFsync)
-		state = newStreamState(uploadedTo, uploadedTo, epochStore)
+		state = newStreamState(streamID, uploadedTo, uploadedTo, epochStore)
 		s.streams[streamKey] = state
 	}
 	return state
@@ -632,18 +628,26 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 // Remote discovery (EnsureDiscovered) performs backend I/O and must happen before
 // acquiring s.mu.
 //
-// Then, the server lock (s.mu) is held across both find-or-create and attach to
-// exclude idle-stream eviction (evictIdleStreams); if s.mu were released before
-// incrementing state.attachments, eviction could remove the streamState from s.streams
-// between lookup and attachment, leaving the session attached to an orphaned state
-// invisible to subsequent sessions and commitItems.
+// Then, the server lock (s.mu) is held across find-or-create, raising watermarks
+// to the discovered value, and incrementing state.attachments. Both locks are
+// released before entering the epoch section.
 //
-// Under s.mu, state.mu is acquired to raise watermarks to the discovered value,
-// increment state.attachments, and read witness and object-store watermarks in one
-// critical section. Both locks are released before calling acceptEpoch, which
-// lazily loads and durably advances the stream's accepted epoch under the stream's
-// epoch mutex without holding s.mu. If acceptEpoch refuses the session, detachSession
-// rolls back the attachment.
+// Next, state.epochMu is acquired and held until attachSession returns. Under epochMu,
+// acceptEpoch lazily loads and durably advances the accepted epoch on disk without
+// raising epoch in memory.
+//
+// Still under epochMu, s.mu and state.mu are acquired together in one critical section
+// to raise state.epoch in memory if the session's epoch is higher, broadcast state.cond,
+// and read the witness and object-store watermarks returned in HelloAck.
+//
+// Holding epochMu across acceptEpoch and the subsequent (s.mu, state.mu) critical section
+// guarantees that batch commit (commitItems, which holds s.mu) cannot commit an in-flight
+// record from a superseded session after watermarks are read.
+//
+// Lock order: state.epochMu, then s.mu, then state.mu. Nothing may take epochMu while
+// holding either s.mu or state.mu.
+//
+// If acceptEpoch refuses the session, detachSession rolls back the attachment.
 func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionEpoch uint64) (*streamState, uint64, uint64, error) {
 	var uploadedTo uint64
 	if s.streamStore != nil {
@@ -660,17 +664,28 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 	// for a session that is then refused as fenced changes nothing a stale writer
 	// controls. A refused session must not change anything else.
 	state.raiseWatermarksLocked(uploadedTo)
-
 	state.attachments++
+	state.mu.Unlock()
+	s.mu.Unlock()
+
+	state.epochMu.Lock()
+	defer state.epochMu.Unlock()
+
+	if err := state.acceptEpoch(ctx, sessionEpoch); err != nil {
+		s.detachSession(state)
+		return nil, 0, 0, err
+	}
+
+	s.mu.Lock()
+	state.mu.Lock()
+	if sessionEpoch > state.epoch {
+		state.epoch = sessionEpoch
+		state.cond.Broadcast()
+	}
 	witnessSeq := state.witnessSeq
 	s3Seq := state.s3Seq
 	state.mu.Unlock()
 	s.mu.Unlock()
-
-	if err := state.acceptEpoch(sessionEpoch); err != nil {
-		s.detachSession(state)
-		return nil, 0, 0, err
-	}
 
 	return state, witnessSeq, s3Seq, nil
 }
@@ -1070,7 +1085,7 @@ func (s *Server) planBatchLocked(items []incomingItem) *batchPlan {
 			streamState := s.streams[streamID]
 			if streamState == nil {
 				epochStore := newStreamEpochStore(s.cfg.DataDir, item.streamID, s.cfg.NoFsync)
-				streamState = newStreamState(0, 0, epochStore)
+				streamState = newStreamState(item.streamID, 0, 0, epochStore)
 				s.streams[streamID] = streamState
 			}
 			streamState.mu.Lock()
@@ -1159,15 +1174,21 @@ func (s *Server) commitItems(ctx context.Context, items []incomingItem) {
 	// the stream's highest accepted epoch.
 	//
 	// Why nothing can slip between:
-	// s.mu is held across the entirety of commitItems and is also held
-	// during the Hello handshake when validating and updating st.epoch.
-	// Therefore, batch commit and epoch acceptance are mutually exclusive.
-	// Any in-flight record already queued by an earlier session was either
-	// fully committed before the higher epoch was accepted, or st.epoch
-	// was updated first, in which case this check discards the record before
-	// it can be appended to localStore or advance st.witnessSeq. Thus, no
-	// record from a superseded session is ever committed after the new
-	// session's HelloAck, and the new session will never receive an
+	// Lock order requires epochMu to be acquired before s.mu and state.mu.
+	// s.mu is held across the entirety of commitItems. In attachSession,
+	// after durably saving the epoch under epochMu, s.mu and state.mu are
+	// acquired together in one critical section to raise state.epoch in memory,
+	// broadcast cond, and read the watermarks returned in HelloAck.
+	//
+	// Therefore, batch commit and the watermark read + in-memory epoch raise
+	// are mutually exclusive under s.mu. Any in-flight record already queued
+	// by an earlier session was either fully committed before the higher epoch
+	// was raised in memory (in which case the watermarks read by attachSession
+	// reflect that commit), or attachSession acquired s.mu first, raising
+	// state.epoch before commitItems begins, in which case this check discards
+	// the record before it can be appended to localStore or advance witnessSeq.
+	// Thus, no record from a superseded session is ever committed after the
+	// new session's HelloAck, and the new session will never receive an
 	// acknowledgement for a record it did not send.
 	var validItems []incomingItem
 	for _, item := range items {
