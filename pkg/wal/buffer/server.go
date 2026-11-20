@@ -71,17 +71,34 @@ type incomingItem struct {
 }
 
 type streamState struct {
-	mu          sync.Mutex
-	cond        *sync.Cond
-	witnessSeq  uint64
-	s3Seq       uint64
-	commitErr   error
-	inFlight    int
-	ackNeeded   bool
+	// mu guards all mutable fields below.
+	mu sync.Mutex
+
+	// cond coordinates waiters on stream watermark advances and state changes.
+	cond *sync.Cond
+
+	// witnessSeq is the highest sequence number committed to local storage for this stream. Guarded by mu.
+	witnessSeq uint64
+
+	// s3Seq is the highest sequence number flushed to object storage for this stream. Guarded by mu.
+	s3Seq uint64
+
+	// commitErr is the terminal error encountered during batch commit, if any. Guarded by mu.
+	commitErr error
+
+	// inFlight is the number of append requests currently queued or committing for this stream. Guarded by mu.
+	inFlight int
+
+	// ackNeeded indicates an acknowledgement must be sent to attached sessions even if watermarks have not advanced. Guarded by mu.
+	ackNeeded bool
+
+	// attachments is the number of active client sessions attached to this stream. Guarded by mu.
 	attachments int
-	waiters     int
-	// epoch is the highest accepted writer epoch for this stream.
-	// Guarded by mu.
+
+	// waiters is the number of goroutines currently waiting on cond. Guarded by mu.
+	waiters int
+
+	// epoch is the highest accepted writer epoch for this stream. Guarded by mu.
 	epoch uint64
 }
 
@@ -123,42 +140,87 @@ func fencedStatus(streamID uuid.UUID, writerEpoch, acceptedEpoch uint64) error {
 
 // Server implements the WalBuffer gRPC service.
 type Server struct {
+	// UnimplementedWalBufferServer provides forward-compatible gRPC server stubs.
 	pb.UnimplementedWalBufferServer
 
-	cfg     ServerConfig
+	// Immutable fields (never change after construction).
+
+	// cfg holds the buffer server configuration options.
+	cfg ServerConfig
+
+	// backend is the object storage backend used for flushing segments and stream discovery.
 	backend objectstore.Backend
 
-	mu                  sync.RWMutex
-	lastPosition        uint64
-	lastFlushedPosition uint64
-	flushedSegments     []string
-	streams             map[string]*streamState // streamID string -> streamState
-	streamStore         *StreamStore
+	// streamStore manages per-stream file storage, sealing, and object storage uploads.
+	streamStore *StreamStore
 
+	// localStore is the node-local append-only log segment store for micro-batched commits.
 	localStore *wal.LogSegmentStore
 
+	// incomingChan buffers incoming append items from client sessions for group commit batching.
 	incomingChan chan incomingItem
 
-	unflushedMu      sync.Mutex
-	unflushedRecords []*wal.LogRecord
-	unflushedBytes   int64
+	// mu guards global log sequencing, flushed segment tracking, and active stream state mappings.
+	mu sync.RWMutex
 
-	// Tail broadcasting
-	tailMu      sync.RWMutex
+	// lastPosition is the highest global position assigned to any committed log record. Guarded by mu.
+	lastPosition uint64
+
+	// lastFlushedPosition is the highest global position successfully flushed to object storage. Guarded by mu.
+	lastFlushedPosition uint64
+
+	// flushedSegments lists segment object paths successfully uploaded to object storage. Guarded by mu.
+	flushedSegments []string
+
+	// streams maps stream ID strings to active streamState instances. Guarded by mu.
+	streams map[string]*streamState
+
+	// unflushedMu guards in-memory unflushed log records awaiting upload to object storage.
+	unflushedMu sync.Mutex
+
+	// unflushedRecords holds committed records retained in memory until flushed to object storage. Guarded by unflushedMu.
+	unflushedRecords []*wal.LogRecord
+
+	// unflushedBytes is the total byte size of unflushedRecords, used to trigger threshold flushes. Guarded by unflushedMu.
+	unflushedBytes int64
+
+	// tailMu guards tail wait channels registered by streaming readers.
+	tailMu sync.RWMutex
+
+	// tailWaiters tracks notification channels signaled when new records are committed. Guarded by tailMu.
 	tailWaiters map[chan struct{}]struct{}
 
-	flushMu    sync.Mutex
-	flushCond  *sync.Cond
-	isFlushing bool
-	flushSeq   uint64 // incremented on each successful flush
+	// flushMu coordinates flushes of buffered records to object storage.
+	flushMu sync.Mutex
 
+	// flushCond coordinates goroutines waiting for an in-progress flush to complete.
+	flushCond *sync.Cond
+
+	// isFlushing indicates whether a flush to object storage is currently in progress. Guarded by flushMu.
+	isFlushing bool
+
+	// flushSeq is incremented on each successful flush. Guarded by flushMu.
+	flushSeq uint64
+
+	// Lifecycle and background worker coordination (self-synchronized; not guarded by a mutex).
+
+	// stopChan is closed on Server.Close to signal background workers and sessions to terminate.
 	stopChan chan struct{}
+
+	// stopOnce ensures stopChan is closed exactly once during Close.
 	stopOnce sync.Once
 
-	groupCommitWg     sync.WaitGroup
-	periodicFlushWg   sync.WaitGroup
+	// groupCommitWg coordinates graceful shutdown of the groupCommitLoop worker goroutine.
+	groupCommitWg sync.WaitGroup
+
+	// periodicFlushWg coordinates graceful shutdown of the periodicFlushLoop worker goroutine.
+	periodicFlushWg sync.WaitGroup
+
+	// backgroundFlushWg coordinates graceful shutdown of threshold-triggered background flush goroutines.
 	backgroundFlushWg sync.WaitGroup
-	activeLoops       atomic.Int32
+
+	// activeLoops tracks the number of running background loop goroutines atomically.
+	activeLoops atomic.Int32
 }
 
 // NewServer creates and initializes a new WAL buffer Server.
@@ -526,6 +588,11 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 	state := s.getOrCreateStreamLocked(streamID, uploadedTo)
 
 	state.mu.Lock()
+	// raiseWatermarksLocked runs before the epoch check because uploadedTo comes
+	// from what EnsureDiscovered found in object storage for the stream, not from
+	// the connecting writer. It only moves the watermarks up, so applying it even
+	// for a session that is then refused as fenced changes nothing a stale writer
+	// controls. A refused session must not change anything else.
 	state.raiseWatermarksLocked(uploadedTo)
 
 	if sessionEpoch < state.epoch {
