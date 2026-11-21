@@ -157,6 +157,9 @@ type Server struct {
 	// localStore is the node-local append-only log segment store for micro-batched commits.
 	localStore *wal.LogSegmentStore
 
+	// dataDirectoryLock holds the exclusive advisory lock on cfg.DataDir.
+	dataDirectoryLock *directoryLock
+
 	// incomingChan buffers incoming append items from client sessions for group commit batching.
 	incomingChan chan incomingItem
 
@@ -252,6 +255,16 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	if cfg.StreamSealBytes <= 0 {
 		cfg.StreamSealBytes = DefaultStreamSealBytes
 	}
+
+	dataDirectoryLock, err := acquireDirectoryLock(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if dataDirectoryLock != nil {
+			errutil.CloseAndLog(dataDirectoryLock, "directory lock")
+		}
+	}()
 
 	dataDir := cfg.DataDir
 	streamStore := NewStreamStore(dataDir, cfg.Backend, cfg.StreamSealInterval, cfg.StreamSealBytes)
@@ -408,6 +421,9 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		go s.periodicFlushLoop(cfg.FlushInterval)
 	}
 
+	s.dataDirectoryLock = dataDirectoryLock
+	dataDirectoryLock = nil
+
 	return s, nil
 }
 
@@ -476,6 +492,13 @@ func (s *Server) Close() error {
 	if s.localStore != nil {
 		if err := s.localStore.Close(); err != nil {
 			klog.Warningf("Error closing local store: %v", err)
+			errs = append(errs, err)
+		}
+	}
+
+	if s.dataDirectoryLock != nil {
+		if err := s.dataDirectoryLock.Close(); err != nil {
+			klog.Warningf("Error releasing data directory lock: %v", err)
 			errs = append(errs, err)
 		}
 	}

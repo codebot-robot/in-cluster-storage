@@ -123,6 +123,9 @@ func (h *testBufferHandle) StopWithoutFlush() {
 	if h.srv.localStore != nil {
 		_ = h.srv.localStore.Close()
 	}
+	if h.srv.dataDirectoryLock != nil {
+		_ = h.srv.dataDirectoryLock.Close()
+	}
 }
 
 func startTestServerHandle(t *testing.T, backend objectstore.Backend, dataDir string) *testBufferHandle {

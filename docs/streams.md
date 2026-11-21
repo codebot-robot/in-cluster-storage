@@ -106,6 +106,7 @@ volumes/<pvc>/stream.id       PVC to stream pointers
 
 2. **Central Buffer Service (`cmd/wal-buffer`, `pkg/wal/buffer`):**
    - Deployed as a Kubernetes `StatefulSet` or Service (`wal-buffer`).
+   - Takes an exclusive advisory lock (`flock`) on its data directory to ensure only one stream server process serves from it at a time.
    - Merges concurrent appends from multiple independent streams into a single globally ordered sequence of log records identified by a monotonic 64-bit `position` (the shared log).
    - Uses a micro-batched **group commit loop** (`batchMaxDelay`, `batchMaxSize`) to fsync batches to the shared log on local disk (`LogSegmentStore`).
    - Periodically packages committed records into immutable, self-describing shared log segment objects in cloud storage (`streams/wal/segments/<first_pos>-<last_pos>.wal`).
