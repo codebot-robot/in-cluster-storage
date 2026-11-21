@@ -45,6 +45,7 @@ var (
 	batchMaxDelay             = flag.Duration("batch-max-delay", 5*time.Millisecond, "Maximum delay for group commit batching")
 	batchMaxSize              = flag.Int64("batch-max-size", 1024*1024, "Maximum byte size for group commit batching")
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments and streams for one-time upgrade")
+	writerLockGrace           = flag.Duration("writer-lock-grace", buffer.DefaultWriterLockGrace, "Grace period for stream writer lock reservation after holder disconnects")
 )
 
 func main() {
@@ -76,6 +77,7 @@ func main() {
 		BatchMaxDelay:      *batchMaxDelay,
 		BatchMaxSize:       *batchMaxSize,
 		AcceptUnversioned:  *acceptUnversionedSegments,
+		WriterLockGrace:    *writerLockGrace,
 	}
 
 	srv, err := buffer.NewServer(ctx, cfg)

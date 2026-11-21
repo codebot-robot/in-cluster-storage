@@ -40,12 +40,25 @@ import (
 )
 
 const (
-	DefaultFlushInterval = 60 * time.Second
-	DefaultFlushBytes    = 64 * 1024 * 1024
-	DefaultTailCache     = 64 * 1024 * 1024
-	DefaultBatchDelay    = 5 * time.Millisecond
-	DefaultBatchSize     = 1024 * 1024
+	DefaultFlushInterval   = 60 * time.Second
+	DefaultFlushBytes      = 64 * 1024 * 1024
+	DefaultTailCache       = 64 * 1024 * 1024
+	DefaultBatchDelay      = 5 * time.Millisecond
+	DefaultBatchSize       = 1024 * 1024
+	DefaultWriterLockGrace = 15 * time.Second
 )
+
+// Clock provides time operations for Server.
+type Clock interface {
+	Now() time.Time
+}
+
+// realClock implements Clock using the standard time package.
+type realClock struct{}
+
+func (realClock) Now() time.Time {
+	return time.Now()
+}
 
 // ServerConfig configures the WAL Buffer service.
 type ServerConfig struct {
@@ -61,6 +74,8 @@ type ServerConfig struct {
 	StreamSealBytes    int64
 	AcceptUnversioned  bool
 	NoFsync            bool
+	WriterLockGrace    time.Duration
+	Clock              Clock
 }
 
 type incomingItem struct {
@@ -107,18 +122,45 @@ type streamState struct {
 
 	// holderSessions is the number of active sessions for holder attached to this stream. Guarded by mu.
 	holderSessions int
+
+	// lastSessionEnd records when the holder's last session ended. Guarded by mu.
+	lastSessionEnd time.Time
+}
+
+// grantDecisionInputs holds the stream writer lock state evaluated by grantDecision.
+type grantDecisionInputs struct {
+	// holder is the clientID currently holding the stream writer lock.
+	holder string
+
+	// attachedSessions is the number of active sessions for holder attached to this stream.
+	attachedSessions int
+
+	// inFlight is the number of records currently queued or committing for this stream.
+	inFlight int
+
+	// lastSessionEnd records when the holder's last session ended.
+	lastSessionEnd time.Time
+
+	// gracePeriod is the duration the writer lock stays reserved for holder after disconnect.
+	gracePeriod time.Duration
 }
 
 // grantDecision determines whether the writer lock can be granted to requester, and if so,
-// whether it is a resumed grant.
-func grantDecision(holder string, attachedSessions, inFlight int, requester string) (granted bool, resumed bool) {
-	if requester == "" || holder == "" {
-		return true, false
+// whether it is a resumed grant. It also returns when the grant decision can next change by time alone.
+func grantDecision(inputs grantDecisionInputs, requester string, now time.Time) (granted bool, resumed bool, nextWake time.Time) {
+	if requester == "" || inputs.holder == "" {
+		return true, false, time.Time{}
 	}
-	if holder == requester {
-		return true, true
+	if inputs.holder == requester {
+		return true, true, time.Time{}
 	}
-	return attachedSessions == 0 && inFlight == 0, false
+	if inputs.attachedSessions != 0 || inputs.inFlight != 0 {
+		return false, false, time.Time{}
+	}
+	if inputs.gracePeriod > 0 && !inputs.lastSessionEnd.IsZero() && now.Before(inputs.lastSessionEnd.Add(inputs.gracePeriod)) {
+		return false, false, inputs.lastSessionEnd.Add(inputs.gracePeriod)
+	}
+	return true, false, time.Time{}
 }
 
 // newStreamState creates a new streamState initialized with watermarks.
@@ -166,6 +208,12 @@ type Server struct {
 
 	// cfg holds the buffer server configuration options.
 	cfg ServerConfig
+
+	// writerLockGrace is the duration a writer lock stays reserved for its holder after disconnect.
+	writerLockGrace time.Duration
+
+	// clock provides time operations for lock grace periods.
+	clock Clock
 
 	// backend is the object storage backend used for flushing segments and stream discovery.
 	backend objectstore.Backend
@@ -285,6 +333,10 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		}
 	}()
 
+	if cfg.Clock == nil {
+		cfg.Clock = realClock{}
+	}
+
 	dataDir := cfg.DataDir
 	streamStore := NewStreamStore(dataDir, cfg.Backend, cfg.StreamSealInterval, cfg.StreamSealBytes)
 	if cfg.AcceptUnversioned {
@@ -399,6 +451,8 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	s := &Server{
 		cfg:                 cfg,
 		backend:             cfg.Backend,
+		writerLockGrace:     cfg.WriterLockGrace,
+		clock:               cfg.Clock,
 		lastPosition:        localMaxPos,
 		lastFlushedPosition: lastFlushedPos,
 		flushedSegments:     discoveredSegments,
@@ -550,7 +604,8 @@ func (s *Server) evictIdleStreams() {
 
 	for sid, st := range s.streams {
 		st.mu.Lock()
-		active := st.attachments > 0 || st.waiters > 0 || st.inFlight > 0
+		inGrace := st.holder != "" && s.writerLockGrace > 0 && !st.lastSessionEnd.IsZero() && s.clock.Now().Before(st.lastSessionEnd.Add(s.writerLockGrace))
+		active := st.attachments > 0 || st.waiters > 0 || st.inFlight > 0 || inGrace
 		witnessSeq := st.witnessSeq
 		s3Seq := st.s3Seq
 		st.mu.Unlock()
@@ -618,8 +673,8 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 // releases s.mu and waits on state.cond while retaining its count in state.waiters.
 // A waiter is woken when the holder's last session detaches, when the in-flight
 // record count reaches zero, upon context cancellation, or upon server shutdown.
-// When waking, the two locks are retaken in the canonical order: s.mu first, then
-// state.mu.
+// A claimant held back only by the grace period is refused and retries. When waking,
+// the two locks are retaken in the canonical order: s.mu first, then state.mu.
 //
 // The lock is decided first; the session epoch is checked only once the writer lock
 // is granted. For sessions presenting a client ID, a different client with a higher
@@ -672,7 +727,16 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 			return nil, 0, 0, false, err
 		}
 
-		if granted, resumed := grantDecision(state.holder, state.holderSessions, state.inFlight, clientID); granted {
+		inputs := grantDecisionInputs{
+			holder:           state.holder,
+			attachedSessions: state.holderSessions,
+			inFlight:         state.inFlight,
+			lastSessionEnd:   state.lastSessionEnd,
+			gracePeriod:      s.writerLockGrace,
+		}
+		now := s.clock.Now()
+		granted, resumed, nextWake := grantDecision(inputs, clientID, now)
+		if granted {
 			state.waiters--
 			if sessionEpoch < state.epoch {
 				acceptedEpoch := state.epoch
@@ -687,12 +751,24 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 			if clientID != "" {
 				state.holder = clientID
 				state.holderSessions++
+				state.lastSessionEnd = time.Time{}
 			}
 			state.attachments++
 			witnessSeq, s3Seq := state.witnessSeq, state.s3Seq
 			state.mu.Unlock()
 			s.mu.Unlock()
 			return state, witnessSeq, s3Seq, resumed, nil
+		}
+
+		if !nextWake.IsZero() {
+			state.waiters--
+			state.mu.Unlock()
+			s.mu.Unlock()
+			remaining := nextWake.Sub(now)
+			if remaining < 0 {
+				remaining = 0
+			}
+			return nil, 0, 0, false, status.Errorf(codes.Unavailable, "stream writer lock is reserved for its previous holder for %v", remaining)
 		}
 
 		s.mu.Unlock()
@@ -711,6 +787,9 @@ func (s *Server) detachSession(state *streamState, clientID string) {
 	state.attachments--
 	if clientID != "" && state.holder == clientID && state.holderSessions > 0 {
 		state.holderSessions--
+		if state.holderSessions == 0 {
+			state.lastSessionEnd = s.clock.Now()
+		}
 	}
 	state.cond.Broadcast()
 	state.mu.Unlock()
