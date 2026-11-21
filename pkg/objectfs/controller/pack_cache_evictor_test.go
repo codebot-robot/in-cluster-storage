@@ -434,15 +434,20 @@ func TestPackCacheEviction_RecheckBeforeDelete_PackGainsLiveReferenceOrDeleted(t
 
 		setLocalPackCacheTargetBytesForTest(server, 1)
 
-		// Simulate the pack gaining a live reference after the scan has collected it as a candidate,
-		// but before its turn to be deleted.
-		server.evictor.afterScanHook = func() {
-			volume.stagingMu.Lock()
-			volume.packs[1].liveReferences = 1
-			volume.stagingMu.Unlock()
+		candidate := evictablePackCandidate{
+			volume: volume,
+			packID: 1,
 		}
 
-		server.runPackCacheEvictionPass(t.Context())
+		// Give the pack a live reference before its turn to be deleted.
+		volume.stagingMu.Lock()
+		volume.packs[1].liveReferences = 1
+		volume.stagingMu.Unlock()
+
+		evicted, _ := server.evictCandidatePack(candidate)
+		if evicted {
+			t.Fatal("expected pack that gained live reference before deletion not to be evicted")
+		}
 
 		volume.stagingMu.Lock()
 		packInfo, exists := volume.packs[1]
@@ -476,16 +481,22 @@ func TestPackCacheEviction_RecheckBeforeDelete_PackGainsLiveReferenceOrDeleted(t
 
 		setLocalPackCacheTargetBytesForTest(server, 1)
 
-		// Simulate the pack being deleted by volume-level eviction after scan, before its turn.
-		server.evictor.afterScanHook = func() {
-			volume.stagingMu.Lock()
-			volume.deletePackLocked(1)
-			volume.stagingMu.Unlock()
+		candidate := evictablePackCandidate{
+			volume: volume,
+			packID: 1,
 		}
 
-		server.runPackCacheEvictionPass(t.Context())
+		// Simulate the pack being deleted by volume-level eviction before evictCandidatePack is called.
+		volume.stagingMu.Lock()
+		volume.deletePackLocked(1)
+		volume.stagingMu.Unlock()
 
-		// Total should reflect the deletion performed in the hook, and should NOT be subtracted twice.
+		evicted, _ := server.evictCandidatePack(candidate)
+		if evicted {
+			t.Fatal("expected already-deleted pack not to be reported as evicted")
+		}
+
+		// Total should reflect the deletion performed by deletePackLocked, and should NOT be subtracted twice.
 		if current := server.Stats().LocalPackCacheBytes; current != 0 {
 			t.Fatalf("expected pack cache bytes = 0, got %d (packSize was %d)", current, packSize)
 		}

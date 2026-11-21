@@ -31,8 +31,6 @@ type packCacheEvictor struct {
 	wake chan struct{}
 	// passesCompleted counts evaluation passes completed by the evictor loop.
 	passesCompleted *metrics.Counter
-	// afterScanHook is called after evictable candidates have been collected and sorted (testing only).
-	afterScanHook func()
 }
 
 // wakeEvictor sends a non-blocking signal to wake the evictor loop.
@@ -68,21 +66,17 @@ type evictablePackCandidate struct {
 	lastRead time.Time
 }
 
-// runPackCacheEvictionPass runs a single pass of local pack cache eviction across all volumes.
-// It removes evictable packs (uploaded, no live references) least recently read first across
-// all volumes, lower pack ID breaking ties, until the total is at or under the target or
-// nothing is evictable.
+// collectEvictablePackCandidates scans all volumes for evictable uploaded packs (state uploaded and no live references),
+// returning them sorted least recently read first with lower pack ID breaking ties.
 // Requires no locks held upon entry.
-func (s *Server) runPackCacheEvictionPass(ctx context.Context) {
-	defer s.evictor.passesCompleted.Inc()
-
+func (s *Server) collectEvictablePackCandidates(ctx context.Context) []evictablePackCandidate {
 	s.diskLimits.mu.Lock()
 	targetBytes := s.diskLimits.packCacheTargetBytes
 	totalBytes := s.diskLimits.packCacheBytes
 	s.diskLimits.mu.Unlock()
 
 	if targetBytes <= 0 || totalBytes <= targetBytes {
-		return
+		return nil
 	}
 
 	s.mu.RLock()
@@ -95,7 +89,7 @@ func (s *Server) runPackCacheEvictionPass(ctx context.Context) {
 	var candidates []evictablePackCandidate
 	for _, volume := range volumes {
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
 		volume.stagingMu.Lock()
 		for packID, packInfo := range volume.packs {
@@ -115,7 +109,7 @@ func (s *Server) runPackCacheEvictionPass(ctx context.Context) {
 	}
 
 	if len(candidates) == 0 {
-		return
+		return nil
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
@@ -128,8 +122,55 @@ func (s *Server) runPackCacheEvictionPass(ctx context.Context) {
 		return candidates[i].volume.volumeID < candidates[j].volume.volumeID
 	})
 
-	if s.evictor.afterScanHook != nil {
-		s.evictor.afterScanHook()
+	return candidates
+}
+
+// evictCandidatePack acquires the candidate volume's stagingMu, verifies whether the total is still
+// over target and the pack remains uploaded without live references, and deletes the pack if so.
+// Returns whether the pack was evicted and whether the target is reached (signaling the pass can stop).
+// Requires no locks held upon entry.
+func (s *Server) evictCandidatePack(candidate evictablePackCandidate) (evicted bool, targetReached bool) {
+	candidate.volume.stagingMu.Lock()
+	defer candidate.volume.stagingMu.Unlock()
+
+	s.diskLimits.mu.Lock()
+	target := s.diskLimits.packCacheTargetBytes
+	total := s.diskLimits.packCacheBytes
+	s.diskLimits.mu.Unlock()
+
+	if target <= 0 || total <= target {
+		return false, true
+	}
+
+	packInfo, exists := candidate.volume.packs[candidate.packID]
+	if !exists || packInfo.state != packUploaded || packInfo.liveReferences > 0 {
+		return false, false
+	}
+
+	candidate.volume.deletePackLocked(candidate.packID)
+
+	s.diskLimits.mu.Lock()
+	target = s.diskLimits.packCacheTargetBytes
+	total = s.diskLimits.packCacheBytes
+	s.diskLimits.mu.Unlock()
+
+	if target <= 0 || total <= target {
+		return true, true
+	}
+	return true, false
+}
+
+// runPackCacheEvictionPass runs a single pass of local pack cache eviction across all volumes.
+// It removes evictable packs (uploaded, no live references) least recently read first across
+// all volumes, lower pack ID breaking ties, until the total is at or under the target or
+// nothing is evictable.
+// Requires no locks held upon entry.
+func (s *Server) runPackCacheEvictionPass(ctx context.Context) {
+	defer s.evictor.passesCompleted.Inc()
+
+	candidates := s.collectEvictablePackCandidates(ctx)
+	if len(candidates) == 0 {
+		return
 	}
 
 	for _, candidate := range candidates {
@@ -137,34 +178,8 @@ func (s *Server) runPackCacheEvictionPass(ctx context.Context) {
 			return
 		}
 
-		candidate.volume.stagingMu.Lock()
-
-		s.diskLimits.mu.Lock()
-		target := s.diskLimits.packCacheTargetBytes
-		total := s.diskLimits.packCacheBytes
-		s.diskLimits.mu.Unlock()
-
-		if target <= 0 || total <= target {
-			candidate.volume.stagingMu.Unlock()
-			return
-		}
-
-		packInfo, exists := candidate.volume.packs[candidate.packID]
-		if !exists || packInfo.state != packUploaded || packInfo.liveReferences > 0 {
-			candidate.volume.stagingMu.Unlock()
-			continue
-		}
-
-		candidate.volume.deletePackLocked(candidate.packID)
-
-		s.diskLimits.mu.Lock()
-		target = s.diskLimits.packCacheTargetBytes
-		total = s.diskLimits.packCacheBytes
-		s.diskLimits.mu.Unlock()
-
-		candidate.volume.stagingMu.Unlock()
-
-		if target <= 0 || total <= target {
+		_, targetReached := s.evictCandidatePack(candidate)
+		if targetReached {
 			return
 		}
 	}
