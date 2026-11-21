@@ -55,6 +55,9 @@ message Hello {
   // accepted for each stream and fences any writer presenting a lower epoch.
   // Defaults to 0.
   uint64 epoch = 2;
+  // Client ID of the stream client instance (UUID made once per process).
+  // An empty client ID preserves legacy multi-session behavior.
+  bytes client_id = 3;
 }
 
 // Fenced is carried as a gRPC status detail when a stream writer is refused
@@ -76,6 +79,8 @@ message AppendResponse {
 message HelloAck {
   uint64 witness_acked_stream_seq = 1;  // what the service has on local disk
   uint64 s3_acked_stream_seq = 2;       // permanent object storage watermark
+  // Resumed is true when the writer lock is granted to the client that already held it.
+  bool resumed = 3;
 }
 
 message AppendRecord {
