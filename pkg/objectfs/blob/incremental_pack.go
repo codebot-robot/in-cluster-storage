@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
@@ -41,6 +43,10 @@ type IncrementalPack struct {
 	offset  int64
 	sealed  bool
 	entries []BlobEntry
+
+	// lastReadNanoseconds holds the Unix nanosecond timestamp when this pack was last read or uploaded.
+	// Accessed atomically without locks.
+	lastReadNanoseconds atomic.Int64
 }
 
 // NewIncrementalPackFromFile creates an IncrementalPack directly over an existing open destination file.
@@ -217,6 +223,27 @@ func (p *IncrementalPack) Entries() []BlobEntry {
 
 func (p *IncrementalPack) Count() int      { p.mu.Lock(); defer p.mu.Unlock(); return len(p.entries) }
 func (p *IncrementalPack) ByteSize() int64 { p.mu.Lock(); defer p.mu.Unlock(); return p.offset }
+
+// RecordRead records readTime as the last time this pack was read or uploaded.
+// Recording a read is lock-free and performs no I/O.
+func (p *IncrementalPack) RecordRead(readTime time.Time) {
+	if p == nil {
+		return
+	}
+	p.lastReadNanoseconds.Store(readTime.UnixNano())
+}
+
+// LastRead returns the time when this pack was last read, or its upload time if never read since upload.
+func (p *IncrementalPack) LastRead() time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	nanoseconds := p.lastReadNanoseconds.Load()
+	if nanoseconds == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanoseconds)
+}
 
 func (p *IncrementalPack) Close() error {
 	if p == nil {

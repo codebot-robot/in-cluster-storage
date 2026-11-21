@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestIncrementalPack(t *testing.T) {
@@ -33,6 +34,15 @@ func TestIncrementalPack(t *testing.T) {
 		t.Fatalf("NewIncrementalPack: %v", err)
 	}
 	defer pack.Close()
+
+	if !pack.LastRead().IsZero() {
+		t.Fatalf("expected initial LastRead to be zero, got %v", pack.LastRead())
+	}
+	uploadTime := time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)
+	pack.RecordRead(uploadTime)
+	if !pack.LastRead().Equal(uploadTime) {
+		t.Fatalf("expected LastRead %v, got %v", uploadTime, pack.LastRead())
+	}
 
 	c1, c2 := []byte("gamma"), []byte("alpha")
 	for _, c := range [][]byte{c1, c2} {

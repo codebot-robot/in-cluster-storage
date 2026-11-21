@@ -821,26 +821,42 @@ func (v *Volume) deletePackLocked(packID uint64) {
 
 func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 	var total int64
-	var eligible []uint64
+	type eligiblePack struct {
+		packID   uint64
+		lastRead time.Time
+	}
+	var eligible []eligiblePack
 	for packID, info := range v.packs {
 		if info.pack != nil {
 			total += info.pack.ByteSize()
 		}
 		if info.state == packUploaded && info.liveReferences <= 0 {
-			eligible = append(eligible, packID)
+			var lastRead time.Time
+			if info.pack != nil {
+				lastRead = info.pack.LastRead()
+			}
+			eligible = append(eligible, eligiblePack{
+				packID:   packID,
+				lastRead: lastRead,
+			})
 		}
 	}
 	if total+neededBytes <= v.limits.maxStagingBytes || len(eligible) == 0 {
 		return
 	}
-	sort.Slice(eligible, func(i, j int) bool { return eligible[i] < eligible[j] })
-	for _, packID := range eligible {
-		info := v.packs[packID]
+	sort.Slice(eligible, func(i, j int) bool {
+		if !eligible[i].lastRead.Equal(eligible[j].lastRead) {
+			return eligible[i].lastRead.Before(eligible[j].lastRead)
+		}
+		return eligible[i].packID < eligible[j].packID
+	})
+	for _, candidate := range eligible {
+		info := v.packs[candidate.packID]
 		var packSize int64
 		if info != nil && info.pack != nil {
 			packSize = info.pack.ByteSize()
 		}
-		v.deletePackLocked(packID)
+		v.deletePackLocked(candidate.packID)
 		total -= packSize
 		if total+neededBytes <= v.limits.maxStagingBytes {
 			break

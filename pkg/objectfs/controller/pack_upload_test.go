@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/binary"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,10 +58,15 @@ func waitForPackState(t *testing.T, vol *Volume, packID uint64, want packState) 
 
 func fillAndSealPack(t *testing.T, vol *Volume, ctx context.Context, inodeID uint64) {
 	t.Helper()
+	fillAndSealPackWithSeed(t, vol, ctx, inodeID, 0)
+}
+
+func fillAndSealPackWithSeed(t *testing.T, vol *Volume, ctx context.Context, inodeID uint64, seed uint64) {
+	t.Helper()
 	for i := 0; i < int(blob.DefaultPackSlots); i++ {
 		data := make([]byte, 16)
-		binary.BigEndian.PutUint64(data[0:8], uint64(i))
-		binary.BigEndian.PutUint64(data[8:16], uint64(i+1))
+		binary.BigEndian.PutUint64(data[0:8], uint64(i)+seed)
+		binary.BigEndian.PutUint64(data[8:16], uint64(i+1)+seed)
 		offset := int64(i) * 64 * 1024
 		if _, _, _, _, err := vol.WriteFileWithEpoch(ctx, inodeID, offset, data, pb.WriteMode_LAZY); err != nil {
 			t.Fatalf("WriteFileWithEpoch chunk %d failed: %v", i, err)
@@ -362,5 +368,156 @@ func TestSync_DoesNotPayForPacksSealedEarlier(t *testing.T) {
 	putsAfterFsync := backend.getPackCount()
 	if putsAfterFsync != putsBeforeFsync {
 		t.Fatalf("expected no blob Put to occur during Fsync (got %d puts, want %d)", putsAfterFsync, putsBeforeFsync)
+	}
+}
+
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(duration)
+}
+
+func createAndUploadPack(t *testing.T, server *Server, volume *Volume, filePath string, seed uint64, packID uint64) uint64 {
+	t.Helper()
+	ctx := t.Context()
+	createResponse, err := testCreateFile(ctx, server, volume.volumeID, filePath, 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile %s failed: %v", filePath, err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+	fillAndSealPackWithSeed(t, volume, ctx, inodeID, seed)
+	if err := volume.Fsync(ctx, inodeID); err != nil {
+		t.Fatalf("Fsync %s failed: %v", filePath, err)
+	}
+	waitForPackState(t, volume, packID, packUploaded)
+	return inodeID
+}
+
+func setupTwoUploadedPacks(t *testing.T, clock *testClock, betweenUploads func(volume *Volume, inodeID1 uint64)) (*Server, *Volume, uint64) {
+	t.Helper()
+	server := NewTestServer(t, newRecordingBackend(NewMemoryBackend()), WithServerClock(clock))
+	volume, err := server.getOrCreateVolume("test-eviction-volume")
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	inodeID1 := createAndUploadPack(t, server, volume, "/file1.bin", 0, 1)
+	if betweenUploads != nil {
+		betweenUploads(volume, inodeID1)
+	}
+	createAndUploadPack(t, server, volume, "/file2.bin", 1000000, 2)
+	return server, volume, inodeID1
+}
+
+func evictSinglePack(volume *Volume) (bool, bool) {
+	volume.stagingMu.Lock()
+	defer volume.stagingMu.Unlock()
+	neededBytes := volume.limits.maxStagingBytes - (volume.packs[1].pack.ByteSize() + volume.packs[2].pack.ByteSize()) + 1
+	volume.evictUploadedPacksLocked(neededBytes)
+	_, pack1Exists := volume.packs[1]
+	_, pack2Exists := volume.packs[2]
+	return pack1Exists, pack2Exists
+}
+
+func TestEviction_LeastRecentlyReadFirst(t *testing.T) {
+	clock := &testClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+	server, volume, inodeID1 := setupTwoUploadedPacks(t, clock, func(volume *Volume, inodeID1 uint64) {
+		clock.Advance(10 * time.Minute)
+	})
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
+
+	clock.Advance(10 * time.Minute)
+	if _, _, _, err := volume.ReadFile(t.Context(), inodeID1, 0, 16); err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+
+	pack1Exists, pack2Exists := evictSinglePack(volume)
+	if !pack1Exists {
+		t.Fatal("expected older pack 1 (recently read) to be retained")
+	}
+	if pack2Exists {
+		t.Fatal("expected newer pack 2 (least recently read) to be evicted")
+	}
+}
+
+func TestEviction_NoReads_LowerIDFirst(t *testing.T) {
+	clock := &testClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+	server, volume, _ := setupTwoUploadedPacks(t, clock, nil)
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
+
+	pack1Exists, pack2Exists := evictSinglePack(volume)
+	if pack1Exists {
+		t.Fatal("expected pack 1 to be evicted first because it has lower pack ID")
+	}
+	if !pack2Exists {
+		t.Fatal("expected pack 2 to be retained")
+	}
+}
+
+func TestEviction_UnreadPackCountsAsReadAtUploadTime(t *testing.T) {
+	clock := &testClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+	server, volume, _ := setupTwoUploadedPacks(t, clock, func(volume *Volume, inodeID1 uint64) {
+		clock.Advance(10 * time.Minute)
+		if _, _, _, err := volume.ReadFile(t.Context(), inodeID1, 0, 16); err != nil {
+			t.Fatalf("ReadFile failed: %v", err)
+		}
+		clock.Advance(10 * time.Minute)
+	})
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
+
+	pack1Exists, pack2Exists := evictSinglePack(volume)
+	if pack1Exists {
+		t.Fatal("expected pack 1 (read before pack 2 upload) to be evicted")
+	}
+	if !pack2Exists {
+		t.Fatal("expected unread pack 2 (uploaded after pack 1 read) to be retained")
+	}
+}
+
+func TestEviction_LiveReferencesNeverEvicted(t *testing.T) {
+	clock := &testClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+	server, volume, _ := setupTwoUploadedPacks(t, clock, func(volume *Volume, inodeID1 uint64) {
+		clock.Advance(10 * time.Minute)
+	})
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
+
+	volume.stagingMu.Lock()
+	volume.packs[1].liveReferences = 1
+	volume.evictUploadedPacksLocked(100 * 1024 * 1024)
+	_, pack1Exists := volume.packs[1]
+	_, pack2Exists := volume.packs[2]
+	volume.stagingMu.Unlock()
+
+	if !pack1Exists {
+		t.Fatal("expected pack 1 with live references to never be evicted")
+	}
+	if pack2Exists {
+		t.Fatal("expected unreferenced pack 2 to be evicted")
 	}
 }
