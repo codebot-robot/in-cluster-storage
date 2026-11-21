@@ -1976,7 +1976,7 @@ func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.
 	streamID := uuid.New()
 	_ = server.getOrCreateStream(ctx, streamID)
 
-	state, _, _, err := server.attachSession(ctx, streamID, 1)
+	state, _, _, _, err := server.attachSession(ctx, streamID, 1, "")
 	if err != nil {
 		t.Fatalf("attachSession failed: %v", err)
 	}
@@ -1994,7 +1994,7 @@ func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.
 		t.Fatalf("expected attached streamState %p to be in map, got %p", state, mapState)
 	}
 
-	server.detachSession(state)
+	server.detachSession(state, "")
 
 	server.evictIdleStreams()
 
@@ -2023,7 +2023,7 @@ func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			attached, _, _, attachErr = server.attachSession(ctx, concurrentStreamID, 1)
+			attached, _, _, _, attachErr = server.attachSession(ctx, concurrentStreamID, 1, "")
 		}()
 		go func() {
 			defer wg.Done()
@@ -2047,7 +2047,7 @@ func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.
 				i, attached, inMap, inMap == nil)
 		}
 
-		secondAttached, _, _, err := server.attachSession(ctx, concurrentStreamID, 1)
+		secondAttached, _, _, _, err := server.attachSession(ctx, concurrentStreamID, 1, "")
 		if err != nil {
 			t.Fatalf("iteration %d: second attachSession failed: %v", i, err)
 		}
@@ -2056,8 +2056,8 @@ func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.
 				i, attached, secondAttached)
 		}
 
-		server.detachSession(attached)
-		server.detachSession(secondAttached)
+		server.detachSession(attached, "")
+		server.detachSession(secondAttached, "")
 		server.evictIdleStreams()
 	}
 }
@@ -2089,11 +2089,11 @@ func TestServerStreams_InFlightRecordPinsStateAgainstEviction(t *testing.T) {
 	streamID := uuid.New()
 	_ = server.getOrCreateStream(ctx, streamID)
 
-	state, _, _, err := server.attachSession(ctx, streamID, 1)
+	state, _, _, _, err := server.attachSession(ctx, streamID, 1, "")
 	if err != nil {
 		t.Fatalf("attachSession failed: %v", err)
 	}
-	server.detachSession(state)
+	server.detachSession(state, "")
 
 	state.mu.Lock()
 	state.inFlight = 1

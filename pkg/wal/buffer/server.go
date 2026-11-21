@@ -100,6 +100,24 @@ type streamState struct {
 
 	// epoch is the highest accepted writer epoch for this stream. Guarded by mu.
 	epoch uint64
+
+	// holder is the client ID holding the writer lock for this stream. Guarded by mu.
+	holder string
+
+	// holderSessions is the number of active sessions for holder attached to this stream. Guarded by mu.
+	holderSessions int
+}
+
+// grantDecision determines whether the writer lock can be granted to requester, and if so,
+// whether it is a resumed grant.
+func grantDecision(holder string, attachedSessions, inFlight int, requester string) (granted bool, resumed bool) {
+	if requester == "" || holder == "" {
+		return true, false
+	}
+	if holder == requester {
+		return true, true
+	}
+	return attachedSessions == 0 && inFlight == 0, false
 }
 
 // newStreamState creates a new streamState initialized with watermarks.
@@ -562,23 +580,35 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 	return state
 }
 
-// attachSession attaches an Append session to its stream state.
+// attachSession attaches an Append session to its stream state after acquiring
+// the writer lock if a client ID is provided.
 //
 // Remote discovery (EnsureDiscovered) performs backend I/O and must happen before
 // acquiring s.mu.
 //
-// Then, the server lock (s.mu) is held across both find-or-create and attach to
-// exclude idle-stream eviction (evictIdleStreams); if s.mu were released before
-// incrementing state.attachments, eviction could remove the streamState from s.streams
-// between lookup and attachment, leaving the session attached to an orphaned state
-// invisible to subsequent sessions and commitItems.
+// Then, the server lock (s.mu) is held across both find-or-create and registering
+// as a waiter (state.waiters++) to exclude idle-stream eviction (evictIdleStreams);
+// while state.waiters > 0, idle eviction will not evict the stream state.
 //
-// Under s.mu, state.mu is acquired exactly once for all field changes: raising the
-// watermarks to the discovered value, validating that the session epoch is not lower
-// than the stream's accepted epoch (refusing lower epochs with the Fenced status),
-// raising the accepted epoch and broadcasting on a higher one, incrementing
-// state.attachments, and reading witness and object-store watermarks.
-func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionEpoch uint64) (*streamState, uint64, uint64, error) {
+// When the writer lock cannot be granted immediately (another client is attached,
+// or the holder detached but records are still queued or committing), the session
+// releases s.mu and waits on state.cond while retaining its count in state.waiters.
+// A waiter is woken when the holder's last session detaches, when the in-flight
+// record count reaches zero, upon context cancellation, or upon server shutdown.
+// When waking, the two locks are retaken in the canonical order: s.mu first, then
+// state.mu.
+//
+// The lock is decided first; the session epoch is checked only once the writer lock
+// is granted. For sessions presenting a client ID, a different client with a higher
+// epoch waits like any other requester rather than superseding the active holder,
+// and a client with a lower epoch is refused as fenced only when its turn arrives.
+// Sessions with an empty client ID bypass the lock and evaluate the epoch check
+// immediately as before.
+//
+// The lock grant, epoch check, and watermark read happen atomically in one section
+// under both locks (s.mu and state.mu), ensuring a batch commit cannot interleave
+// between granting the lock and reading witnessSeq and s3Seq.
+func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionEpoch uint64, clientID string) (*streamState, uint64, uint64, bool, error) {
 	var uploadedTo uint64
 	if s.streamStore != nil {
 		uploadedTo = s.streamStore.EnsureDiscovered(ctx, streamID)
@@ -594,33 +624,71 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 	// for a session that is then refused as fenced changes nothing a stale writer
 	// controls. A refused session must not change anything else.
 	state.raiseWatermarksLocked(uploadedTo)
+	state.waiters++
 
-	if sessionEpoch < state.epoch {
-		acceptedEpoch := state.epoch
-		state.mu.Unlock()
-		s.mu.Unlock()
-		return nil, 0, 0, fencedStatus(streamID, sessionEpoch, acceptedEpoch)
-	}
-
-	if sessionEpoch > state.epoch {
-		state.epoch = sessionEpoch
+	stopWatcher := context.AfterFunc(ctx, func() {
+		state.mu.Lock()
 		state.cond.Broadcast()
+		state.mu.Unlock()
+	})
+	defer stopWatcher()
+
+	for {
+		var err error
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-s.stopChan:
+			err = status.Errorf(codes.Unavailable, "server shutting down")
+		default:
+		}
+		if err != nil {
+			state.waiters--
+			state.mu.Unlock()
+			s.mu.Unlock()
+			return nil, 0, 0, false, err
+		}
+
+		if granted, resumed := grantDecision(state.holder, state.holderSessions, state.inFlight, clientID); granted {
+			state.waiters--
+			if sessionEpoch < state.epoch {
+				acceptedEpoch := state.epoch
+				state.mu.Unlock()
+				s.mu.Unlock()
+				return nil, 0, 0, false, fencedStatus(streamID, sessionEpoch, acceptedEpoch)
+			}
+			if sessionEpoch > state.epoch {
+				state.epoch = sessionEpoch
+				state.cond.Broadcast()
+			}
+			if clientID != "" {
+				state.holder = clientID
+				state.holderSessions++
+			}
+			state.attachments++
+			witnessSeq, s3Seq := state.witnessSeq, state.s3Seq
+			state.mu.Unlock()
+			s.mu.Unlock()
+			return state, witnessSeq, s3Seq, resumed, nil
+		}
+
+		s.mu.Unlock()
+		state.cond.Wait()
+		state.mu.Unlock()
+
+		s.mu.Lock()
+		state.mu.Lock()
 	}
-
-	state.attachments++
-	witnessSeq := state.witnessSeq
-	s3Seq := state.s3Seq
-	state.mu.Unlock()
-	s.mu.Unlock()
-
-	return state, witnessSeq, s3Seq, nil
 }
 
 // detachSession detaches an Append session from its stream state and wakes
 // waiters that may be waiting on attachment state changes.
-func (s *Server) detachSession(state *streamState) {
+func (s *Server) detachSession(state *streamState, clientID string) {
 	state.mu.Lock()
 	state.attachments--
+	if clientID != "" && state.holder == clientID && state.holderSessions > 0 {
+		state.holderSessions--
+	}
 	state.cond.Broadcast()
 	state.mu.Unlock()
 }
@@ -655,6 +723,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 	var streamID uuid.UUID
 	copy(streamID[:], hello.StreamId)
 	sessionEpoch := hello.GetEpoch()
+	clientID := string(hello.GetClientId())
 
 	logger := scoped.Log(ctx).WithValues("stream", streamID.String(), "epoch", sessionEpoch)
 	ctx = scoped.WithLog(ctx, logger)
@@ -663,12 +732,12 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		ctx:                    ctx,
 	}
 
-	st, witnessSeq, s3Seq, err := s.attachSession(ctx, streamID, sessionEpoch)
+	st, witnessSeq, s3Seq, resumed, err := s.attachSession(ctx, streamID, sessionEpoch, clientID)
 	if err != nil {
 		return err
 	}
 
-	defer s.detachSession(st)
+	defer s.detachSession(st, clientID)
 
 	scoped.Log(ctx).Info("WAL buffer: Hello received", "witnessWatermark", witnessSeq, "s3Watermark", s3Seq)
 
@@ -705,6 +774,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 			HelloAck: &pb.HelloAck{
 				WitnessAckedStreamSeq: witnessSeq,
 				S3AckedStreamSeq:      s3Seq,
+				Resumed:               resumed,
 			},
 		},
 	}:

@@ -175,7 +175,10 @@ type Hello struct {
 	// Epoch is the writer epoch. The WAL buffer tracks the highest epoch
 	// accepted for each stream and fences any writer presenting a lower epoch.
 	// Defaults to 0.
-	Epoch         uint64 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Epoch uint64 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	// Client ID of the stream client instance (UUID made once per process).
+	// An empty client ID preserves legacy multi-session behavior.
+	ClientId      []byte `protobuf:"bytes,3,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -222,6 +225,13 @@ func (x *Hello) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
+}
+
+func (x *Hello) GetClientId() []byte {
+	if x != nil {
+		return x.ClientId
+	}
+	return nil
 }
 
 // Fenced is carried as a gRPC status detail when a stream writer is refused
@@ -373,8 +383,10 @@ type HelloAck struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
 	WitnessAckedStreamSeq uint64                 `protobuf:"varint,1,opt,name=witness_acked_stream_seq,json=witnessAckedStreamSeq,proto3" json:"witness_acked_stream_seq,omitempty"` // what the service has on local disk
 	S3AckedStreamSeq      uint64                 `protobuf:"varint,2,opt,name=s3_acked_stream_seq,json=s3AckedStreamSeq,proto3" json:"s3_acked_stream_seq,omitempty"`                // permanent object storage watermark
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Resumed is true when the writer lock is granted to the client that already held it.
+	Resumed       bool `protobuf:"varint,3,opt,name=resumed,proto3" json:"resumed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HelloAck) Reset() {
@@ -419,6 +431,13 @@ func (x *HelloAck) GetS3AckedStreamSeq() uint64 {
 		return x.S3AckedStreamSeq
 	}
 	return 0
+}
+
+func (x *HelloAck) GetResumed() bool {
+	if x != nil {
+		return x.Resumed
+	}
+	return false
 }
 
 type AppendRecord struct {
@@ -809,10 +828,11 @@ const file_proto_wal_proto_rawDesc = "" +
 	"\rAppendRequest\x12+\n" +
 	"\x05hello\x18\x01 \x01(\v2\x13.wal.v1alpha1.HelloH\x00R\x05hello\x124\n" +
 	"\x06record\x18\x02 \x01(\v2\x1a.wal.v1alpha1.AppendRecordH\x00R\x06recordB\x05\n" +
-	"\x03msg\":\n" +
+	"\x03msg\"W\n" +
 	"\x05Hello\x12\x1b\n" +
 	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x12\x14\n" +
-	"\x05epoch\x18\x02 \x01(\x04R\x05epoch\"o\n" +
+	"\x05epoch\x18\x02 \x01(\x04R\x05epoch\x12\x1b\n" +
+	"\tclient_id\x18\x03 \x01(\fR\bclientId\"o\n" +
 	"\x06Fenced\x12\x1b\n" +
 	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x12!\n" +
 	"\fwriter_epoch\x18\x02 \x01(\x04R\vwriterEpoch\x12%\n" +
@@ -820,10 +840,11 @@ const file_proto_wal_proto_rawDesc = "" +
 	"\x0eAppendResponse\x125\n" +
 	"\thello_ack\x18\x01 \x01(\v2\x16.wal.v1alpha1.HelloAckH\x00R\bhelloAck\x12%\n" +
 	"\x03ack\x18\x02 \x01(\v2\x11.wal.v1alpha1.AckH\x00R\x03ackB\x05\n" +
-	"\x03msg\"r\n" +
+	"\x03msg\"\x8c\x01\n" +
 	"\bHelloAck\x127\n" +
 	"\x18witness_acked_stream_seq\x18\x01 \x01(\x04R\x15witnessAckedStreamSeq\x12-\n" +
-	"\x13s3_acked_stream_seq\x18\x02 \x01(\x04R\x10s3AckedStreamSeq\"_\n" +
+	"\x13s3_acked_stream_seq\x18\x02 \x01(\x04R\x10s3AckedStreamSeq\x12\x18\n" +
+	"\aresumed\x18\x03 \x01(\bR\aresumed\"_\n" +
 	"\fAppendRecord\x12\x1d\n" +
 	"\n" +
 	"stream_seq\x18\x01 \x01(\x04R\tstreamSeq\x12\x18\n" +
