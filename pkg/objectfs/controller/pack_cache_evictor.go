@@ -29,10 +29,10 @@ type packCacheEvictor struct {
 	Runnable
 	// wake signals the evictorLoop goroutine to evaluate local pack cache targets. Requires no lock.
 	wake chan struct{}
-	// loopDone is closed when evictorLoop exits. Requires no lock.
-	loopDone chan struct{}
 	// passesCompleted counts evaluation passes completed by the evictor loop.
 	passesCompleted *metrics.Counter
+	// afterScanHook is called after evictable candidates have been collected and sorted (testing only).
+	afterScanHook func()
 }
 
 // wakeEvictor sends a non-blocking signal to wake the evictor loop.
@@ -47,8 +47,6 @@ func (e *packCacheEvictor) wakeEvictor() {
 // evictorLoop runs a background loop responding to pack cache wake-up signals until ctx is cancelled.
 // Requires no locks held upon entry.
 func (s *Server) evictorLoop(ctx context.Context) {
-	defer close(s.evictor.loopDone)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -62,8 +60,11 @@ func (s *Server) evictorLoop(ctx context.Context) {
 
 // evictablePackCandidate tracks a single uploaded pack eligible for eviction.
 type evictablePackCandidate struct {
-	volume   *Volume
-	packID   uint64
+	// volume is the volume that owns the candidate pack.
+	volume *Volume
+	// packID identifies the pack within the volume.
+	packID uint64
+	// lastRead records when this pack was last read, or its upload time if never read since upload.
 	lastRead time.Time
 }
 
@@ -126,6 +127,10 @@ func (s *Server) runPackCacheEvictionPass(ctx context.Context) {
 		}
 		return candidates[i].volume.volumeID < candidates[j].volume.volumeID
 	})
+
+	if s.evictor.afterScanHook != nil {
+		s.evictor.afterScanHook()
+	}
 
 	for _, candidate := range candidates {
 		if ctx.Err() != nil {

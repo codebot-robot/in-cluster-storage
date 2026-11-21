@@ -595,7 +595,6 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		},
 		evictor: packCacheEvictor{
 			wake:            make(chan struct{}, 1),
-			loopDone:        make(chan struct{}),
 			passesCompleted: metrics.NewCounter("pack_cache_evictor_passes_completed"),
 		},
 	}

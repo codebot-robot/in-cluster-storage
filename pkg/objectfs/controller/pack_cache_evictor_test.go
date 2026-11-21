@@ -283,6 +283,18 @@ func TestPackCacheEviction_TargetZeroEvictsNothing(t *testing.T) {
 func TestPackCacheEviction_CloseAndShutdownDoNotDeadlockWithPendingWake(t *testing.T) {
 	t.Run("Close", func(t *testing.T) {
 		server := NewTestServer(t, NewMemoryBackend())
+		volume, err := server.getOrCreateVolume("test-deadlock-close-vol")
+		if err != nil {
+			t.Fatalf("getOrCreateVolume failed: %v", err)
+		}
+		_ = createAndUploadPack(t, server, volume, "/file1.bin", 0, 1)
+		_ = createAndUploadPack(t, server, volume, "/file2.bin", 1000000, 2)
+		volume.stagingMu.Lock()
+		volume.packs[2].liveReferences = 1
+		volume.stagingMu.Unlock()
+		setLocalPackCacheTargetBytesForTest(server, 1)
+
+		closeDone := make(chan error, 1)
 		stopWake := make(chan struct{})
 		var wakeWaitGroup sync.WaitGroup
 		wakeWaitGroup.Add(1)
@@ -298,7 +310,6 @@ func TestPackCacheEviction_CloseAndShutdownDoNotDeadlockWithPendingWake(t *testi
 			}
 		}()
 
-		closeDone := make(chan error, 1)
 		go func() {
 			closeDone <- server.Close()
 		}()
@@ -318,6 +329,17 @@ func TestPackCacheEviction_CloseAndShutdownDoNotDeadlockWithPendingWake(t *testi
 
 	t.Run("Shutdown", func(t *testing.T) {
 		server := NewTestServer(t, NewMemoryBackend())
+		volume, err := server.getOrCreateVolume("test-deadlock-shutdown-vol")
+		if err != nil {
+			t.Fatalf("getOrCreateVolume failed: %v", err)
+		}
+		_ = createAndUploadPack(t, server, volume, "/file1.bin", 0, 1)
+		_ = createAndUploadPack(t, server, volume, "/file2.bin", 1000000, 2)
+		volume.stagingMu.Lock()
+		volume.packs[2].liveReferences = 1
+		volume.stagingMu.Unlock()
+		setLocalPackCacheTargetBytesForTest(server, 1)
+
 		stopWake := make(chan struct{})
 		var wakeWaitGroup sync.WaitGroup
 		wakeWaitGroup.Add(1)
@@ -349,5 +371,123 @@ func TestPackCacheEviction_CloseAndShutdownDoNotDeadlockWithPendingWake(t *testi
 
 		close(stopWake)
 		wakeWaitGroup.Wait()
+	})
+}
+
+// TestPackCacheEviction_RealWriteFsync_EndsAtOrUnderTarget verifies that in the normal path
+// with a target set, a real write and fsync wakes the evictor when the pack's live references
+// drop to zero, bringing the total pack cache bytes at or under the target.
+func TestPackCacheEviction_RealWriteFsync_EndsAtOrUnderTarget(t *testing.T) {
+	server := NewTestServer(t, newRecordingBackend(NewMemoryBackend()), WithServerLocalPackCacheTargetBytes(1))
+
+	volume, err := server.getOrCreateVolume("test-evict-real-write-vol")
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	ctx := t.Context()
+	createResponse, err := testCreateFile(ctx, server, volume.volumeID, "/real.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	fillAndSealPack(t, volume, ctx, inodeID)
+	if err := volume.Fsync(ctx, inodeID); err != nil {
+		t.Fatalf("Fsync failed: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if server.Stats().LocalPackCacheBytes <= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for pack cache bytes <= 1, got %d", server.Stats().LocalPackCacheBytes)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if current := server.Stats().LocalPackCacheBytes; current > 1 {
+		t.Fatalf("expected pack cache bytes <= 1, got %d", current)
+	}
+}
+
+// TestPackCacheEviction_RecheckBeforeDelete_PackGainsLiveReferenceOrDeleted verifies that if a pack
+// is evictable at scan time but gains a live reference or is deleted before its turn,
+// it is not evicted and the total pack cache bytes are not changed for it.
+func TestPackCacheEviction_RecheckBeforeDelete_PackGainsLiveReferenceOrDeleted(t *testing.T) {
+	t.Run("GainsLiveReference", func(t *testing.T) {
+		clock := &testClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+		server := NewTestServer(t, newRecordingBackend(NewMemoryBackend()), WithServerClock(clock))
+
+		volume, err := server.getOrCreateVolume("test-evict-recheck-ref")
+		if err != nil {
+			t.Fatalf("getOrCreateVolume failed: %v", err)
+		}
+
+		_ = createAndUploadPack(t, server, volume, "/file.bin", 0, 1)
+
+		volume.stagingMu.Lock()
+		packSize := volume.packs[1].pack.ByteSize()
+		volume.stagingMu.Unlock()
+
+		setLocalPackCacheTargetBytesForTest(server, 1)
+
+		// Simulate the pack gaining a live reference after the scan has collected it as a candidate,
+		// but before its turn to be deleted.
+		server.evictor.afterScanHook = func() {
+			volume.stagingMu.Lock()
+			volume.packs[1].liveReferences = 1
+			volume.stagingMu.Unlock()
+		}
+
+		server.runPackCacheEvictionPass(t.Context())
+
+		volume.stagingMu.Lock()
+		packInfo, exists := volume.packs[1]
+		volume.stagingMu.Unlock()
+
+		if !exists {
+			t.Fatal("expected pack that gained live reference before deletion to be retained")
+		}
+		if packInfo.liveReferences != 1 {
+			t.Fatalf("expected pack live references = 1, got %d", packInfo.liveReferences)
+		}
+		if current := server.Stats().LocalPackCacheBytes; current != packSize {
+			t.Fatalf("expected pack cache bytes unchanged = %d, got %d", packSize, current)
+		}
+	})
+
+	t.Run("AlreadyDeleted", func(t *testing.T) {
+		clock := &testClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+		server := NewTestServer(t, newRecordingBackend(NewMemoryBackend()), WithServerClock(clock))
+
+		volume, err := server.getOrCreateVolume("test-evict-recheck-del")
+		if err != nil {
+			t.Fatalf("getOrCreateVolume failed: %v", err)
+		}
+
+		_ = createAndUploadPack(t, server, volume, "/file.bin", 0, 1)
+
+		volume.stagingMu.Lock()
+		packSize := volume.packs[1].pack.ByteSize()
+		volume.stagingMu.Unlock()
+
+		setLocalPackCacheTargetBytesForTest(server, 1)
+
+		// Simulate the pack being deleted by volume-level eviction after scan, before its turn.
+		server.evictor.afterScanHook = func() {
+			volume.stagingMu.Lock()
+			volume.deletePackLocked(1)
+			volume.stagingMu.Unlock()
+		}
+
+		server.runPackCacheEvictionPass(t.Context())
+
+		// Total should reflect the deletion performed in the hook, and should NOT be subtracted twice.
+		if current := server.Stats().LocalPackCacheBytes; current != 0 {
+			t.Fatalf("expected pack cache bytes = 0, got %d (packSize was %d)", current, packSize)
+		}
 	})
 }
