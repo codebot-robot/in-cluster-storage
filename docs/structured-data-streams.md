@@ -18,7 +18,7 @@ Once the log is the source of truth, every other representation is a **projectio
 
 The log is authoritative and append-only. Snapshots are derived, rebuildable, and interchangeable: a consumer restores state from *any* snapshot at position `P` and replays the log from `P` forward. This is the architecture of Delta Lake (JSON action log plus parquet checkpoints) and Iceberg (metadata log plus manifests), with a durable low-latency log underneath and a first-class OLTP projection that those systems lack.
 
-The design has four layers, each independent of the ones above it:
+The design is layered, each layer independent of the ones above it:
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -31,12 +31,15 @@ The design has four layers, each independent of the ones above it:
 |  Layer 1: Record typing                                                           |
 |     payload = varint(type_id) body ; type 1 defines new types in-band             |
 +-----------------------------------------------------------------------------------+
-|  Layer 0: Streams transport (existing, unchanged)                                 |
-|     WALC/WALL framing, CRC32C, stream_seq, Local/Witness/Permanent durability      |
+|  Stream                                                                           |
+|     named sequence of opaque records, stream_seq, duplicate seq treated as retry  |
++-----------------------------------------------------------------------------------+
+|  Shared log                                                                       |
+|     interleaved records from all streams, local buffering, batch flush to S3/GCS   |
 +-----------------------------------------------------------------------------------+
 ```
 
-Layer 0 never inspects a payload. Everything above it is a client-side convention, which is also what allows payloads to be encrypted end to end (see [Encryption](#encryption)).
+Neither the stream nor the shared log inspects a payload. Everything above them is a client-side convention, which is also what allows payloads to be encrypted end to end (see [Encryption](#encryption)). For details on the storage layers, see [Layers in `docs/streams.md`](streams.md#layers).
 
 ---
 

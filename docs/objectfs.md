@@ -9,7 +9,7 @@ This document describes the design, architecture, metadata management, storage l
 **ObjectFS** is a high-performance, POSIX-like distributed filesystem engineered to run natively on Kubernetes clusters. The ultimate source of truth and persistent backing store for ObjectFS is cloud object storage (such as Google Cloud Storage or Amazon S3).
 
 ObjectFS is built around the fundamental architectural principle of **splitting metadata storage from object payload storage**:
-1. **Metadata Layer:** Tracks the hierarchical directory tree, file inodes, attributes, permissions, and timestamps. Metadata updates are recorded in an append-only change-log using the **Streams** service ([`docs/streams.md`](streams.md)) for low-latency persistence, combined with periodic immutable **EROFS** snapshots to avoid long replay times during recovery.
+1. **Metadata Layer:** Tracks the hierarchical directory tree, file inodes, attributes, permissions, and timestamps. Metadata updates are recorded in an append-only change-log using a **stream** ([`docs/streams.md`](streams.md)) for low-latency persistence, combined with periodic immutable **EROFS** snapshots to avoid long replay times during recovery.
 2. **Object/Blob Layer:** Stores file contents as deduplicated, immutable content-addressable blobs identified by their SHA-256 digests. ObjectFS adopts a storage strategy inspired by **Git**: large files are written as standalone loose blobs, while smaller files are aggregated into indexed packfiles (`.pack`) to eliminate small-object metadata overhead and API throttling in cloud object storage.
 
 Mounting on Kubernetes worker nodes is currently handled via a user-space **FUSE** driver (`go-fuse`) that communicates with a cluster controller service. ObjectFS provides near-instant volume readiness, intelligent local node caching, push-based invalidations, and high-throughput data access without requiring cloud storage credentials to be distributed to worker nodes.
@@ -69,7 +69,7 @@ For deployment and installation instructions with real object storage (GCS/S3) a
 |                                                                                         |
 |  Metadata (Snapshots & WAL):                                                            |
 |    volumes/<volID>/meta/<stream_seq, 20 digits>.erofs (Immutable EROFS snapshot projection) |
-|    streams/wal/segments/<first_pos>-<last_pos>.wal    (Streams WAL segment logs)             |
+|    streams/wal/segments/<first_pos>-<last_pos>.wal    (Shared log segments)                 |
 |                                                                                         |
 |  Data Blobs:                                                                            |
 |    blobs/<sha256>                                (Standalone loose blob for > 64MB)     |
@@ -92,7 +92,7 @@ For deployment and installation instructions with real object storage (GCS/S3) a
    - Embeds a fast `NodeCache` supporting LRU read caching, dirty write buffering, and write-through synchronization modes (TODO: cache blobs in allocated fixed-size local scratch storage on an LRU basis; similarly, the controller should cache blobs locally).
    - Subscribes to the controller's `WatchVolume` notification stream to proactively invalidate cached node attributes and file blocks upon remote concurrent writes.
 
-3. **Metadata Change-Log & Streams Integration (`pkg/wal`, `docs/streams.md`):**
+3. **Metadata Change-Log & Stream Integration (`pkg/wal`, `docs/streams.md`):**
    - Serves as the write-ahead log for all filesystem mutations (file creations, writes, truncates, renames, unlinks).
    - Enables fast multi-tier acknowledgements (`Local`, `Witness`, `Permanent`) for write operations before large EROFS snapshot generation.
 
@@ -187,7 +187,7 @@ ObjectFS supports two distinct mount modes, selected via the `mode` parameter in
 
 A core strength of ObjectFS is separating metadata operations from data payloads, eliminating the high latency and eventual-consistency hazards typical of naive object-storage-backed filesystems.
 
-### 1. The Metadata Change-Log (Streams Layer)
+### 1. The Metadata Change-Log (Stream)
 
 Every filesystem operation that mutates state—such as `mkdir`, `create`, `write`, `truncate`, `rename`, or `unlink`—is modeled as a discrete record appended to the volume's metadata change-log.
 
@@ -203,16 +203,16 @@ Every filesystem operation that mutates state—such as `mkdir`, `create`, `writ
 +-----------------------------------------------------------------------------------+
 ```
 
-- **Low Latency & High Durability:** Mutations are immediately durable upon being written to the Streams buffer without waiting for full cloud object flush cycles.
-- **Ordered Replay & Recovery:** If the controller crashes or restarts, the filesystem state is deterministically reconstructed by loading the last EROFS snapshot and replaying subsequent change-log records from the Streams layer.
+- **Low Latency & High Durability:** Mutations are immediately durable upon being written to the stream without waiting for full cloud object flush cycles.
+- **Ordered Replay & Recovery:** If the controller crashes or restarts, the filesystem state is deterministically reconstructed by loading the last EROFS snapshot and replaying subsequent change-log records from the stream.
 - **Cross-Node Event Notification:** The change-log acts as the event source driving `WatchVolume` invalidation notifications across all cluster worker nodes.
 
 > **Partial Writes on Large Files (TODO):** An important architectural trade-off is how to handle partial writes or in-place modifications to large files (e.g. updating a 4KB block in a 100MB file). Potential approaches include:
 > - **Full Copy-on-Write Rewrite:** Simple and preserves single-blob integrity, but incurs write amplification on small edits to large files.
 > - **Chunked Blobs / Extent Maps:** Splitting large files into fixed-size or Content-Defined Chunking (CDC) blocks, updating only dirty chunks and indexing chunk hashes in metadata.
-> - **Append-Only Delta Log:** Recording write deltas in the Streams change-log and compacting them during periodic snapshot creation.
+> - **Append-Only Delta Log:** Recording write deltas in the stream change-log and compacting them during periodic snapshot creation.
 
-> **Note on Implementation Roadmap:** ObjectFS currently maintains volume state in memory and flushes snapshots periodically to object storage. Integrating the Streams layer ([`docs/streams.md`](streams.md)) as the live, authoritative change-log is the primary next step for ObjectFS metadata durability and multi-writer synchronization.
+> **Note on Implementation Roadmap:** ObjectFS currently maintains volume state in memory and flushes snapshots periodically to object storage. Integrating a stream ([`docs/streams.md`](streams.md)) as the live, authoritative change-log is the primary next step for ObjectFS metadata durability and multi-writer synchronization.
 
 ### 2. SQLite Metadata Storage, In-Memory Read Cache & Write-Behind Architecture
 
@@ -635,9 +635,9 @@ Artefacts in ObjectFS are categorized as either **Derived** or **Only Copy**:
 
 The following items represent the planned roadmap and architectural evolution for ObjectFS:
 
-### 1. Integration with the Streams Layer (Metadata Change-Log)
-- [x] **Wire Streams as Authoritative Change-Log:** Replace the current in-memory mutation log with the Streams service ([`docs/streams.md`](streams.md)). Every `mkdir`, `create`, `write`, `rename`, and `unlink` will be logged as an append-only Streams record with configurable durability (`Local`, `Witness`, `Permanent`).
-- [x] **Deterministic Crash Recovery:** Rebuild controller memory on startup by mounting the latest EROFS snapshot and replaying outstanding change-log records from the Streams log.
+### 1. Integration with a Stream (Metadata Change-Log)
+- [x] **Wire a Stream as Authoritative Change-Log:** Replace the current in-memory mutation log with a stream ([`docs/streams.md`](streams.md)). Every `mkdir`, `create`, `write`, `rename`, and `unlink` will be logged as an append-only stream record with configurable durability (`Local`, `Witness`, `Permanent`).
+- [x] **Deterministic Crash Recovery:** Rebuild controller memory on startup by mounting the latest EROFS snapshot and replaying outstanding change-log records from the stream.
 - [ ] **Multi-Writer Ordering:** Use the central Streams buffer sequence numbers to establish linearizable ordering across multiple concurrent node writers.
 - [x] **Eliminate "latest" Snapshot Pointer Object:** Remove the `volumes/<volID>/meta/latest` pointer file; discover the most recent valid snapshot via lexicographical listing or timestamp markers to avoid single-object update contention.
 - [x] **Tiered Metadata Caching (Hot in Memory, Cold on Disk):** Refactor the controller metadata engine so only "hot" active directories and inodes are kept in RAM, while the full metadata state resides on fast local disk (replicated from cloud EROFS snapshots) to scale to millions of files without unbounded memory usage.
