@@ -287,6 +287,9 @@ type Server struct {
 	// drain coordinates background draining of staged writes across volumes.
 	drain stagingDrain
 
+	// evictor coordinates background eviction of uploaded packs in the local cache across volumes.
+	evictor packCacheEvictor
+
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
 	flushWg     sync.WaitGroup
@@ -590,6 +593,11 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 			passesCompleted:      metrics.NewCounter("staging_drain_passes_completed"),
 			volumeResultsHandled: metrics.NewCounter("staging_drain_volume_results_handled"),
 		},
+		evictor: packCacheEvictor{
+			wake:            make(chan struct{}, 1),
+			loopDone:        make(chan struct{}),
+			passesCompleted: metrics.NewCounter("pack_cache_evictor_passes_completed"),
+		},
 	}
 	s.diskLimits.spaceAvailable = sync.NewCond(&s.diskLimits.mu)
 	for _, opt := range opts {
@@ -742,11 +750,15 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 }
 
 // Start starts background loops tied to ctx lifecycle. Callers must call Server.Start
-// to enable the staging drain loop.
+// to enable the staging drain loop and local pack cache evictor loop.
 // Returns an error if called more than once or after the server is closed.
 // Requires no locks held.
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.drain.Start(ctx, s.drainLoop); err != nil {
+		return fmt.Errorf("server %w", err)
+	}
+	if err := s.evictor.Start(ctx, s.evictorLoop); err != nil {
+		s.drain.Stop()
 		return fmt.Errorf("server %w", err)
 	}
 	return nil
@@ -759,6 +771,7 @@ func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		ran = true
 		s.drain.Stop()
+		s.evictor.Stop()
 
 		if err := s.StopPeriodicFlush(); err != nil {
 			errs = append(errs, err)
@@ -819,6 +832,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	s.drain.Stop()
+	s.evictor.Stop()
 
 	s.mu.RLock()
 	volumes := make([]*Volume, 0, len(s.volumes))
@@ -2201,7 +2215,11 @@ func (s *Server) Stats() ServerStats {
 func (s *Server) addLocalPackCacheBytes(delta int64) {
 	s.diskLimits.mu.Lock()
 	s.diskLimits.packCacheBytes += delta
+	wake := s.diskLimits.packCacheTargetBytes > 0 && s.diskLimits.packCacheBytes > s.diskLimits.packCacheTargetBytes
 	s.diskLimits.mu.Unlock()
+	if wake {
+		s.evictor.wakeEvictor()
+	}
 }
 
 // subLocalPackCacheBytes subtracts delta from the controller-wide total of uploaded pack bytes kept in the local cache across all volumes.
