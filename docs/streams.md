@@ -16,8 +16,26 @@ Streams supports flexible acknowledgement modes depending on application consist
 Streams enables workloads to achieve:
 - **Sub-millisecond write latency:** Workloads can write locally and achieve immediate durability against local process crashes.
 - **Resilient in-cluster durability:** Changes are asynchronously streamed over bidirectional gRPC to a central witness buffer (`wal-buffer`) that performs group commits with fsync.
-- **Cost-effective permanent retention:** The buffer service aggregates multiple client streams into consolidated log segments and periodically flushes them to object storage as immutable self-describing segments.
-- **Unified catch-up and real-time tailing:** Consumers can tail merged records in global position order seamlessly across historical object storage segments, buffered local disk segments, and live in-flight memory commits.
+- **Cost-effective permanent retention:** The WAL buffer multiplexes multiple client streams into a shared log and periodically flushes shared log segments to object storage as immutable self-describing segments.
+- **Unified catch-up and real-time tailing:** Consumers can tail merged records in global position order seamlessly across historical object storage segments, shared log local disk segments, and live in-flight memory commits.
+
+---
+
+## Layers
+
+The storage stack is divided into five layers:
+
+| # | Name | What it is | Where |
+|---|---|---|---|
+| 1 | **Object store** | S3/GCS. Durable; each write is slow and costs money. | external |
+| 2 | **Shared log** | One log per buffer process. Records from all streams are interleaved, written to local disk first, then flushed to the object store in batches. This layer does both the local buffering and the multiplexing. | `pkg/wal/buffer` |
+| 3 | **Stream** | What a client sees: a named sequence of opaque records, numbered by `stream_seq`, with one writer. The writer holds an `Append` session to the buffer over gRPC and is acknowledged as records reach local disk and then the object store. | `pkg/wal/buffer`, `pkg/wal/client` |
+| 4 | **Structured data stream** | A convention inside the record payload: a type id plus a protobuf body, and above that the change log and snapshots. The buffer never looks inside a payload. | `pkg/sds` |
+| 5 | **Application** | The ObjectFS controller, with one metadata stream per volume. | `pkg/objectfs/controller` |
+
+The WAL buffer is the process and binary (`cmd/wal-buffer`, `pkg/wal/buffer`) that implements the shared log and serves streams. Layers 2 and 3 are distinct: the shared log is about batching and durability across multiple streams, while a stream is about one writer's ordered records.
+
+In `Local` acknowledgement mode, the writer's client (`pkg/wal/client`) first appends to a log on its own node-local disk and replicates to the buffer afterwards. That client-side local log belongs to layer 3 (it holds one stream's records, kept by that stream's writer), not to the shared log.
 
 ---
 
@@ -67,13 +85,13 @@ An object storage bucket is divided into top-level prefixes by subsystem:
 
 ```
 streams/<uuid>/...            per-stream files and snapshots
-streams/wal/segments/...      the aggregated log all per-stream files derive from
+streams/wal/segments/...      the shared log all per-stream files derive from
 blobs/                        content-addressed file data
 volumes/<pvc>/stream.id       PVC to stream pointers
 ```
 
 - `streams/<uuid>/`: Per-stream WAL files (`from<from>-to<to>.wal`) and projection snapshots (`snapshots/<format>/...`).
-- `streams/wal/segments/`: Aggregated WAL segment files (`<first_pos>-<last_pos>.wal`) committed across all streams.
+- `streams/wal/segments/`: Shared log segment files (`<first_pos>-<last_pos>.wal`) committed across all streams.
 - `blobs/`: Content-addressed data chunks and packfiles managed by the blob store.
 - `volumes/`: Metadata mapping PVCs / volume IDs to stream IDs.
 
@@ -88,15 +106,15 @@ volumes/<pvc>/stream.id       PVC to stream pointers
 
 2. **Central Buffer Service (`cmd/wal-buffer`, `pkg/wal/buffer`):**
    - Deployed as a Kubernetes `StatefulSet` or Service (`wal-buffer`).
-   - Merges concurrent appends from multiple independent client streams into a single globally ordered sequence of log records identified by a monotonic 64-bit `position`.
-   - Uses a micro-batched **group commit loop** (`batchMaxDelay`, `batchMaxSize`) to fsync batches to local disk (`LogSegmentStore`).
-   - Periodically packages committed records into immutable, self-describing segment objects in cloud storage (`streams/wal/segments/<first_pos>-<last_pos>.wal`).
+   - Merges concurrent appends from multiple independent streams into a single globally ordered sequence of log records identified by a monotonic 64-bit `position` (the shared log).
+   - Uses a micro-batched **group commit loop** (`batchMaxDelay`, `batchMaxSize`) to fsync batches to the shared log on local disk (`LogSegmentStore`).
+   - Periodically packages committed records into immutable, self-describing shared log segment objects in cloud storage (`streams/wal/segments/<first_pos>-<last_pos>.wal`).
 
 3. **Unified Tail Reader (`WalBuffer.Tail`):**
    - Provides a continuous stream of merged records ordered by `position`.
    - Reads transparently across three tiers in chronological order:
      1. Flushed segment objects from object storage (`GetObject`).
-     2. Committed log segments from the buffer service's local disk (`LogSegmentStore.ReadFrom`).
+     2. Committed shared log segments from the buffer service's local disk (`LogSegmentStore.ReadFrom`).
      3. Live in-flight commits via real-time waiter notifications.
 
 ---
@@ -108,7 +126,7 @@ Streams defines three progressive durability levels:
 | Level | Watermark Name | Description | Latency Profile |
 | :--- | :--- | :--- | :--- |
 | **`Local`** | `localSeq` | Record is written and fsynced to the client node's local disk. | < 1 ms (NVMe / SSD) |
-| **`Witness`** | `witnessSeq` | Record is received by the central buffer service, assigned a global `position`, and fsynced to the buffer's disk. | Network RTT + Group Commit Fsync (~2–10 ms) |
+| **`Witness`** | `witnessSeq` | Record is received by the central buffer service, assigned a global `position`, and fsynced to the shared log on the buffer's disk. | Network RTT + Group Commit Fsync (~2–10 ms) |
 | **`Permanent`** | `s3Seq` | Record is included in a sealed segment uploaded to object storage. | Typical cloud object store write latency (~200 ms – 2 s on-demand `Flush()`, or 10–60 s periodic background flush) |
 
 ### Lifecycle of an Append
@@ -123,7 +141,7 @@ Client Appends Payload
 2. Send AppendRecord over gRPC stream
        │
        ▼
-3. Server batches with other streams & fsyncs to local disk ──> Sends Ack(witnessSeq) (Mode 2)
+3. Server batches with other streams into shared log & fsyncs to local disk ──> Sends Ack(witnessSeq) (Mode 2)
        │
        ▼
 4. Server uploads segment to Object Storage ──> Sends Ack(s3Seq) (Mode 3)
@@ -159,9 +177,9 @@ Stored in client node segment files (`stream-<uuid>-<firstSeq>.wal`):
 - **Checksum:** Computed over the 36-byte header (with CRC32C field zeroed during calculation) and the payload bytes using Castagnoli CRC32C.
 - **Torn Write Protection:** On startup/recovery, `ScanClientSegmentFile` detects trailing partial or corrupted records, creates a backup snapshot (`<file>.<timestamp>.recover`), and truncates the file back to the last clean record boundary.
 
-### 2. Witness & Segment Log Record Format (`WALL`)
+### 2. Shared Log Record Format (`WALL`)
 
-Stored in buffer service local cache segments and permanent object store segments (`streams/wal/segments/<first>-<last>.wal`):
+Stored in shared log local cache segments and permanent object store segments (`streams/wal/segments/<first>-<last>.wal`):
 
 ```
 +---------------+--------------------+-------------------+--------------------+------------------+------------------+-------------------------+
@@ -171,7 +189,7 @@ Stored in buffer service local cache segments and permanent object store segment
 |<------------------------------------------ Fixed 44-Byte Header ------------------------------------------------->|
 ```
 
-- **Position:** 64-bit monotonically increasing sequence number assigned globally by the buffer service.
+- **Position:** 64-bit monotonically increasing sequence number assigned globally by the buffer service in the shared log.
 
 ### 3. Permanent Segment Storage & Discovery (`streams/wal/segments/`)
 
@@ -183,7 +201,7 @@ streams/wal/segments/000000000501-000000001000.wal
 ```
 
 - **Self-Describing Range:** Segment file keys use fixed-width, 12-digit zero-padded integers (`%012d-%012d.wal`). This guarantees that lexicographical key ordering matches numeric sequence position ordering across all object stores (GCS, S3, filesystem).
-- **Manifest-Free Discovery:** The buffer service and tail readers discover existing segments and calculate the current durable watermarks (`last_flushed_position` and per-stream `s3_acked_stream_seq`) via object storage prefix listing (`streams/wal/segments/`) and segment record recovery.
+- **Manifest-Free Discovery:** The buffer service and tail readers discover existing shared log segments and calculate the current durable watermarks (`last_flushed_position` and per-stream `s3_acked_stream_seq`) via object storage prefix listing (`streams/wal/segments/`) and segment record recovery.
 - **Skew Prevention & Contention Free:** Eliminating the separate central manifest file (`streams/wal/manifest.json`) avoids dual-write consistency skew (where one file succeeds but the other fails) and removes single-object write contention/bottlenecks in cloud object storage.
 
 ---
@@ -214,10 +232,10 @@ The `wal-buffer` daemon exposes the following flags to tune archiving and cache 
 
 ### Archival Lifecycle
 
-1. **Micro-batched Group Commit:** Incoming client records are validated, assigned global monotonic sequence numbers (`position`), and appended to the local `LogSegmentStore` with `fsync`.
-2. **Segment Packaging:** When `flushBytes` accumulates or `flushInterval` elapses (or an explicit client `Flush` RPC is received), all unflushed `WALL` records are serialized into a sealed segment file: `streams/wal/segments/<first_pos>-<last_pos>.wal`.
-3. **Atomic Object Put:** The sealed segment is uploaded via `Backend.PutObject` to cloud object storage as a single atomic transaction. No secondary manifest file is written.
-4. **Watermark Advancement & Local Cleanup:** The buffer service advances its in-memory flushed position and stream watermarks, and cleans up local segment files that are fully flushed.
+1. **Micro-batched Group Commit:** Incoming client records are validated, assigned global monotonic sequence numbers (`position`), and appended to the shared log (`LogSegmentStore`) on local disk with `fsync`.
+2. **Segment Packaging:** When `flushBytes` accumulates or `flushInterval` elapses (or an explicit client `Flush` RPC is received), all unflushed `WALL` records are serialized into a sealed shared log segment file: `streams/wal/segments/<first_pos>-<last_pos>.wal`.
+3. **Atomic Object Put:** The sealed shared log segment is uploaded via `Backend.PutObject` to cloud object storage as a single atomic transaction. No secondary manifest file is written.
+4. **Watermark Advancement & Local Cleanup:** The buffer service advances its in-memory flushed position and stream watermarks, and cleans up local shared log segment files that are fully flushed.
 5. **Client Notification & GC:** Stream clients receive `Ack(s3Seq)` updates, permitting them to safely garbage-collect local client segment files (`stream-<id>-*.wal`) whose records have been durably committed to permanent object storage.
 
 ---
@@ -237,7 +255,7 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 
 - **Positions above `last_flushed_position` are provisional:** In the event of a witness crash before flushing to object storage, provisional positions may be reassigned upon restart.
 - **Tail clamping:** If a `Tail` request specifies `from_position > last_flushed_position + 1`, the server clamps it to `last_flushed_position + 1` and returns the effective starting position in `resumed_from`.
-- **Consumer deduplication:** Consumers of merged `Tail` streams must deduplicate records based on `(stream_id, stream_seq)`.
+- **Consumer deduplication:** Consumers tailing the shared log must deduplicate records based on `(stream_id, stream_seq)`.
 - **Per-Stream Tail & Filtering:** `TailRequest` allows filtering server-side by `stream_id` and resuming from a known sequence number `from_stream_seq` (returning records where `stream_seq > from_stream_seq`). When `stream_id` is set, the buffer filters records across all tiers (object storage segments, local disk segments, and live commits). `from_position` serves as an optional lower-bound position hint. Resuming by `stream_seq` is robust against server restarts and position reassignments because `stream_seq` is assigned by the stream writer and immutable.
 - **Client Helper:** The client package (`pkg/wal/client`) provides `TailStream(ctx, target, streamID, fromSeq)` returning a Go iterator (`iter.Seq2[uint64, []byte]`) yielding `(stream_seq, payload)` pairs.
 
@@ -261,7 +279,7 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 - Avoids the resource and operational overhead of provisioning and managing dedicated Kafka, Pulsar, or ZooKeeper clusters for in-cluster streaming.
 
 ### 4. Distributed State Machine Replication
-- Serves as the shared append-only log for distributed controllers, leader election state synchronization, and reproducible workflow execution logs.
+- Serves as the shared log for distributed controllers, leader election state synchronization, and reproducible workflow execution logs.
 
 ### 5. Structured Data Streams (SQL / OLTP / OLAP)
 - A typed payload format (varint type id + proto body, with table schemas defined in-band) turns a stream into a logical row-change log, with SQLite and Parquet snapshots as derived projections. See [`docs/structured-data-streams.md`](structured-data-streams.md).
@@ -272,7 +290,7 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 
 - [ ] **Package & Name Refactoring:** Rename `wal` package, proto services, CLI binaries, Docker images, and Kubernetes manifests to `streams` (e.g. `streams-buffer`, `streams-client`, `proto/streams.proto`).
 - [x] **Eliminate Manifest File:** Remove central `streams/wal/manifest.json` from object storage to avoid atomic single-object contention, race conditions, dual-write skew, and consistency bottlenecks; use self-describing segment files and object prefix listing instead.
-- [ ] **Opaque Stream Offsets (Hide Global Monotonic Positions):** Hide global buffer monotonic positions from individual stream clients. Clients should only reason about their own `stream_id` and `stream_seq`. Expose global positions only as opaque resumption tokens/cookies for consumers.
+- [ ] **Opaque Stream Offsets (Hide Global Monotonic Positions):** Hide global shared log monotonic positions from individual stream clients. Clients should only reason about their own `stream_id` and `stream_seq`. Expose global positions only as opaque resumption tokens/cookies for consumers.
 - [ ] **Stress & Chaos Testing:**
   - High-concurrency randomized multi-client benchmark tests to stress group commits and tail subscribers.
   - Chaos testing with simulated network partitions, abrupt client/server pod terminations (`SIGKILL`), and disk full conditions.

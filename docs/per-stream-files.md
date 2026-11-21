@@ -1,4 +1,4 @@
-# Periodic Per-Stream Files from Aggregated WAL
+# Periodic Per-Stream Files from Shared Log
 
 This document describes the design and lifecycle for periodic per-stream WAL files in `wal-buffer`, enabling cheap per-stream history reads, fast crash recovery, and snapshot-then-trim retention policies.
 
@@ -6,13 +6,13 @@ This document describes the design and lifecycle for periodic per-stream WAL fil
 
 ## Background & Problem
 
-The `wal-buffer` aggregates incoming records across all active streams into a unified write-ahead log. It commits batches with `fsync` locally and flushes aggregated segments to object storage under `streams/wal/segments/<first_pos>-<last_pos>.wal`.
+The `wal-buffer` aggregates incoming records across all active streams into a shared log. It commits batches with `fsync` locally and flushes shared log segments to object storage under `streams/wal/segments/<first_pos>-<last_pos>.wal`.
 
-While aggregating all streams maximizes write throughput via group commits, reading historical records for a single stream (e.g. controller recovery after failover (#185), stream replay, or `sds cat`) previously required listing and scanning every aggregated segment since position $P$. The scan cost was proportional to the total cluster traffic across all streams rather than the specific stream being read.
+While the shared log maximizes write throughput via group commits, reading historical records for a single stream (e.g. controller recovery after failover (#185), stream replay, or `sds cat`) previously required listing and scanning every shared log segment since position $P$. The scan cost was proportional to the total cluster traffic across all streams rather than the specific stream being read.
 
 ## Architecture & Lifecycle
 
-Instead of splitting aggregated segments asynchronously after flushing, the only synchronous write on the critical path is to the aggregated WAL file. As records arrive, `wal-buffer` asynchronously writes them off the critical path to per-stream local files, uses the local filesystem as a per-stream cache, and periodically uploads those per-stream files to object storage upon sealing.
+Instead of splitting shared log segments asynchronously after flushing, the only synchronous write on the critical path is to the shared log file. As records arrive, `wal-buffer` asynchronously writes them off the critical path to per-stream local files, uses the local filesystem as a per-stream cache, and periodically uploads those per-stream files to object storage upon sealing.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -23,7 +23,7 @@ Instead of splitting aggregated segments asynchronously after flushing, the only
 |         +------------------------+                                                |
 |         |                        |                                                |
 |         v (Critical Path)        v (Off Critical Path Write-Behind)               |
-|  [ Aggregated WAL ]       [ In-Memory Stream Buffer ]                             |
+|  [ Shared Log ]           [ In-Memory Stream Buffer ]                             |
 |  (Local Fsync Commit)            |                                                |
 |         |                        v (Append to Local Cache)                        |
 |         |                 streams/<uuid>/from<from>.wal (Open)                    |
@@ -40,10 +40,10 @@ Instead of splitting aggregated segments asynchronously after flushing, the only
 
 ### 1. Write Path
 
-1. **Aggregated Log (Source of Truth):**
+1. **Shared Log (Source of Truth):**
    - Incoming records from all streams are batched, sequenced with a monotonic global `position`, written to `LogSegmentStore`, and `fsync`ed.
-   - The witness acknowledgement (`witness_acked_stream_seq`) is returned to the client as soon as the aggregated batch fsync completes.
-   - The aggregated log remains the authoritative source of truth for all records that have not yet been sealed into immutable per-stream files.
+   - The witness acknowledgement (`witness_acked_stream_seq`) is returned to the client as soon as the shared log batch fsync completes.
+   - The shared log remains the authoritative source of truth for all records that have not yet been sealed into immutable per-stream files.
 
 2. **Per-Stream Open File (Write-Behind Cache):**
    - Each committed record is concurrently queued into an in-memory per-stream buffer.
@@ -58,7 +58,7 @@ An object storage bucket is divided into top-level prefixes by subsystem:
 
 ```
 streams/<uuid>/...            per-stream files and snapshots
-streams/wal/segments/...      the aggregated log all per-stream files derive from
+streams/wal/segments/...      the shared log all per-stream files derive from
 blobs/                        content-addressed file data
 volumes/<pvc>/stream.id       PVC to stream pointers
 ```
@@ -95,7 +95,7 @@ Per-stream files are sealed when either of the following conditions is met:
 - **Open files:** On buffer service restart:
   - If a trailing torn record exists due to an abrupt node crash, `ScanLogSegmentFile` truncates the file back to the last valid record boundary and backs up the corrupted version.
   - The highest valid `stream_seq` in the open file (or `to` of the latest sealed file if no open file exists) is determined.
-  - Any subsequent records present in the local aggregated log or flushed aggregated segments are re-appended to catch up the per-stream file.
+  - Any subsequent records present in the local shared log or flushed shared log segments are re-appended to catch up the per-stream file.
 - **Idempotent uploads:** Uploading a sealed file is idempotent because the filename deterministically reflects the exact stream sequence range `[from, to]`.
 
 ### 5. Reads (`Tail` by `stream_id`)
@@ -106,13 +106,13 @@ When a client calls `Tail` specifying `stream_id` and `from_stream_seq`:
    - Check object storage listing under `streams/<stream-id>/` for older files evicted locally.
    - Check the local open file for recent records.
    - Listen for live incoming records from the in-memory commit notifications.
-2. Stream records directly without scanning irrelevant aggregated segments.
+2. Stream records directly without scanning irrelevant shared log segments.
 
-This eliminates the full-WAL scan overhead on controller failover and stream replay. Global (unfiltered) `Tail` requests serve as a position-ordered tooling/debug path (used only by `wal-client-test` and tests), while all stream consumers use the per-stream path.
+This eliminates the shared-log scan overhead on controller failover and stream replay. Global (unfiltered) `Tail` requests serve as a position-ordered tooling/debug path (used only by `wal-client-test` and tests), while all stream consumers use the per-stream path.
 
 ### 6. Retention and Garbage Collection
 
-- **Aggregated Segments:** An aggregated segment `streams/wal/segments/<first>-<last>.wal` becomes safe to delete once every stream that contributed records to that segment has a sealed per-stream file covering at least up to its highest sequence in that segment.
+- **Shared Log Segments:** A shared log segment `streams/wal/segments/<first>-<last>.wal` becomes safe to delete once every stream that contributed records to that segment has a sealed per-stream file covering at least up to its highest sequence in that segment.
 - **Local Per-Stream Files:** Once uploaded to object storage, local sealed files can be evicted under an LRU disk space budget and re-downloaded on demand if needed.
 - **Object Storage Retention ("Snapshot-Then-Trim"):**
   - **Default:** Retain all history indefinitely. No records are deleted automatically.
