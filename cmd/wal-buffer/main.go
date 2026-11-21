@@ -37,6 +37,7 @@ import (
 var (
 	port                      = flag.Int("port", 50051, "gRPC server port")
 	dataDir                   = flag.String("data-dir", "/data", "Local directory for caching WAL segments")
+	dataDirLockTimeout        = flag.Duration("data-dir-lock-timeout", 30*time.Second, "How long to wait for data directory lock before failing (0 fails immediately)")
 	backendType               = flag.String("backend", "", "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
 	flushInterval             = flag.Duration("flush-interval", 60*time.Second, "Periodic flush interval to backend object storage")
 	flushBytes                = flag.Int64("flush-bytes", 64*1024*1024, "Unflushed bytes threshold to trigger S3 flush")
@@ -45,6 +46,11 @@ var (
 	batchMaxSize              = flag.Int64("batch-max-size", 1024*1024, "Maximum byte size for group commit batching")
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments and streams for one-time upgrade")
 )
+
+func init() {
+	flag.DurationVar(dataDirLockTimeout, "data-dir-lock-wait", 30*time.Second, "Alias for --data-dir-lock-timeout")
+	flag.DurationVar(dataDirLockTimeout, "data-directory-lock-timeout", 30*time.Second, "Alias for --data-dir-lock-timeout")
+}
 
 func main() {
 	klog.InitFlags(nil)
@@ -66,14 +72,15 @@ func main() {
 	}
 
 	cfg := buffer.ServerConfig{
-		Backend:           backend,
-		DataDir:           *dataDir,
-		FlushInterval:     *flushInterval,
-		FlushBytes:        *flushBytes,
-		TailCacheBytes:    *tailCacheBytes,
-		BatchMaxDelay:     *batchMaxDelay,
-		BatchMaxSize:      *batchMaxSize,
-		AcceptUnversioned: *acceptUnversionedSegments,
+		Backend:            backend,
+		DataDir:            *dataDir,
+		DataDirLockTimeout: *dataDirLockTimeout,
+		FlushInterval:      *flushInterval,
+		FlushBytes:         *flushBytes,
+		TailCacheBytes:     *tailCacheBytes,
+		BatchMaxDelay:      *batchMaxDelay,
+		BatchMaxSize:       *batchMaxSize,
+		AcceptUnversioned:  *acceptUnversionedSegments,
 	}
 
 	srv, err := buffer.NewServer(ctx, cfg)

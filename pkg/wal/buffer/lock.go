@@ -17,13 +17,16 @@ limitations under the License.
 package buffer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"golang.org/x/sys/unix"
 )
 
@@ -46,9 +49,11 @@ type directoryLock struct {
 	file *os.File
 }
 
-// acquireDirectoryLock acquires an exclusive, non-blocking advisory lock on the data directory.
+// acquireDirectoryLock acquires an exclusive advisory lock on the data directory.
+// If another process holds the lock, it retries until acquired, the wait duration
+// passes, or the context is cancelled. If wait is zero, it fails immediately.
 // The lock file itself is never deleted.
-func acquireDirectoryLock(dataDirectory string) (*directoryLock, error) {
+func acquireDirectoryLock(ctx context.Context, dataDirectory string, wait time.Duration) (*directoryLock, error) {
 	if err := os.MkdirAll(dataDirectory, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory %s: %w", dataDirectory, err)
 	}
@@ -59,15 +64,50 @@ func acquireDirectoryLock(dataDirectory string) (*directoryLock, error) {
 		return nil, fmt.Errorf("failed to open lock file %s: %w", lockPath, err)
 	}
 
-	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
+		return &directoryLock{file: file}, nil
+	} else if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
 		errutil.CloseAndLog(file, "directory lock file")
-		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
-			return nil, fmt.Errorf("%s: %w", dataDirectory, ErrDataDirectoryInUse)
-		}
 		return nil, fmt.Errorf("failed to lock data directory %s: %w", dataDirectory, err)
 	}
 
-	return &directoryLock{file: file}, nil
+	if wait <= 0 {
+		errutil.CloseAndLog(file, "directory lock file")
+		return nil, fmt.Errorf("%s: %w", dataDirectory, ErrDataDirectoryInUse)
+	}
+
+	if err := ctx.Err(); err != nil {
+		errutil.CloseAndLog(file, "directory lock file")
+		return nil, err
+	}
+
+	scoped.Log(ctx).Info("Data directory is held by another process; waiting for lock", "directory", dataDirectory, "wait", wait)
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			errutil.CloseAndLog(file, "directory lock file")
+			return nil, ctx.Err()
+		case <-timer.C:
+			errutil.CloseAndLog(file, "directory lock file")
+			return nil, fmt.Errorf("%s: %w", dataDirectory, ErrDataDirectoryInUse)
+		case <-ticker.C:
+			if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+				if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+					continue
+				}
+				errutil.CloseAndLog(file, "directory lock file")
+				return nil, fmt.Errorf("failed to lock data directory %s: %w", dataDirectory, err)
+			}
+			return &directoryLock{file: file}, nil
+		}
+	}
 }
 
 // Close releases the directory lock by unlocking and closing the underlying file.

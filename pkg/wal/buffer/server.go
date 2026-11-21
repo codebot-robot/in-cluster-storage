@@ -51,6 +51,7 @@ const (
 type ServerConfig struct {
 	Backend            objectstore.Backend
 	DataDir            string
+	DataDirLockTimeout time.Duration
 	FlushInterval      time.Duration
 	FlushBytes         int64
 	TailCacheBytes     int64
@@ -256,7 +257,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		cfg.StreamSealBytes = DefaultStreamSealBytes
 	}
 
-	dataDirectoryLock, err := acquireDirectoryLock(cfg.DataDir)
+	dataDirectoryLock, err := acquireDirectoryLock(ctx, cfg.DataDir, cfg.DataDirLockTimeout)
 	if err != nil {
 		return nil, err
 	}
