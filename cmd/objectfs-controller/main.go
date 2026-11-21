@@ -71,6 +71,7 @@ type Options struct {
 	SyncCoalesceWindow        time.Duration
 	MaxStagingBytes           int64
 	MaxLocalStagingBytes      int64
+	LocalPackCacheTargetBytes int64
 	ControllerSyncTimeout     time.Duration
 	OpenBarrierTimeout        time.Duration
 	ShutdownTimeout           time.Duration
@@ -150,6 +151,7 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.DurationVar(&o.SyncCoalesceWindow, "sync-coalesce-window", o.SyncCoalesceWindow, "Coalescing window for non-blocking sync requests")
 	flagSet.Int64Var(&o.MaxStagingBytes, "max-staging-bytes", o.MaxStagingBytes, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
 	flagSet.Int64Var(&o.MaxLocalStagingBytes, "max-local-staging-bytes", o.MaxLocalStagingBytes, "Maximum byte size of unuploaded staged writes across all volumes before backpressure (0 disables)")
+	flagSet.Int64Var(&o.LocalPackCacheTargetBytes, "local-pack-cache-target-bytes", o.LocalPackCacheTargetBytes, "Target byte size for local pack cache across all volumes before background eviction (0 disables)")
 	flagSet.DurationVar(&o.ControllerSyncTimeout, "controller-sync-timeout", o.ControllerSyncTimeout, "Timeout for controller coalesced background sync operations")
 	flagSet.DurationVar(&o.OpenBarrierTimeout, "open-barrier-timeout", o.OpenBarrierTimeout, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
 	flagSet.DurationVar(&o.ShutdownTimeout, "shutdown-timeout", o.ShutdownTimeout, "Timeout for graceful volume drain during controller shutdown (must stay below the pod's termination grace period)")
@@ -301,6 +303,7 @@ func run(options Options) error {
 		serverOptions = append(serverOptions, controller.WithServerMaxStagingBytes(options.MaxStagingBytes))
 	}
 	serverOptions = append(serverOptions, controller.WithServerMaxLocalStagingBytes(options.MaxLocalStagingBytes))
+	serverOptions = append(serverOptions, controller.WithServerLocalPackCacheTargetBytes(options.LocalPackCacheTargetBytes))
 	if options.ControllerSyncTimeout > 0 {
 		serverOptions = append(serverOptions, controller.WithServerSyncTimeout(options.ControllerSyncTimeout))
 	}

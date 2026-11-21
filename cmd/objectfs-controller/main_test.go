@@ -111,6 +111,20 @@ func TestMaxLocalStagingBytesFlag(t *testing.T) {
 	}
 }
 
+// TestLocalPackCacheTargetBytesFlag verifies that --local-pack-cache-target-bytes is registered with a 0 default.
+func TestLocalPackCacheTargetBytesFlag(t *testing.T) {
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	options.AddFlags(flagSet)
+	flagOption := flagSet.Lookup("local-pack-cache-target-bytes")
+	if flagOption == nil {
+		t.Fatal("flag --local-pack-cache-target-bytes not registered")
+	}
+	if flagOption.DefValue != "0" {
+		t.Errorf("default value = %q, want 0", flagOption.DefValue)
+	}
+}
+
 func TestWalDurabilityFlag(t *testing.T) {
 	options := NewOptions()
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)

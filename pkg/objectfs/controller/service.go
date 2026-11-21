@@ -205,6 +205,8 @@ type serverDiskLimits struct {
 	maxStagingBytes int64
 	// packCacheBytes tracks the controller-wide total of uploaded pack bytes kept in the local cache across all volumes. Guarded by mu.
 	packCacheBytes int64
+	// packCacheTargetBytes configures the controller-wide target byte size for uploaded pack bytes kept in the local cache across all volumes (0 disables). Guarded by mu.
+	packCacheTargetBytes int64
 	// packCacheUnderflows tracks occurrences of packCacheBytes falling below zero, which indicates an accounting bug since the total is clamped to zero afterwards. Guarded by mu.
 	packCacheUnderflows *metrics.Counter
 	// spaceAvailable coordinates writers waiting for unuploaded staged bytes to fall below maxStagingBytes.
@@ -490,6 +492,14 @@ func WithServerMaxStagingBytes(b int64) ServerOption {
 func WithServerMaxLocalStagingBytes(bytes int64) ServerOption {
 	return func(s *Server) {
 		s.diskLimits.maxStagingBytes = bytes
+	}
+}
+
+// WithServerLocalPackCacheTargetBytes configures the controller-wide target byte size for uploaded packs kept in the local cache across all volumes (0 disables).
+// Requires no locks held.
+func WithServerLocalPackCacheTargetBytes(bytes int64) ServerOption {
+	return func(s *Server) {
+		s.diskLimits.packCacheTargetBytes = bytes
 	}
 }
 
@@ -2165,9 +2175,10 @@ func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) 
 
 // ServerStats contains aggregated operational and capacity metrics for the controller server.
 type ServerStats struct {
-	LocalStagingBytes    int64
-	MaxLocalStagingBytes int64
-	LocalPackCacheBytes  int64
+	LocalStagingBytes         int64
+	MaxLocalStagingBytes      int64
+	LocalPackCacheBytes       int64
+	LocalPackCacheTargetBytes int64
 }
 
 // Stats returns a snapshot of controller operational and capacity metrics.
@@ -2177,9 +2188,10 @@ func (s *Server) Stats() ServerStats {
 	defer s.diskLimits.mu.Unlock()
 
 	return ServerStats{
-		LocalStagingBytes:    s.diskLimits.stagedBytes,
-		MaxLocalStagingBytes: s.diskLimits.maxStagingBytes,
-		LocalPackCacheBytes:  s.diskLimits.packCacheBytes,
+		LocalStagingBytes:         s.diskLimits.stagedBytes,
+		MaxLocalStagingBytes:      s.diskLimits.maxStagingBytes,
+		LocalPackCacheBytes:       s.diskLimits.packCacheBytes,
+		LocalPackCacheTargetBytes: s.diskLimits.packCacheTargetBytes,
 	}
 }
 

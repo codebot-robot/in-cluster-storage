@@ -58,6 +58,9 @@ func TestControllerPackCacheBytesAccounting(t *testing.T) {
 	if cacheBytes := server.Stats().LocalPackCacheBytes; cacheBytes != 0 {
 		t.Fatalf("expected initial localPackCacheBytes = 0, got %d", cacheBytes)
 	}
+	if targetBytes := server.Stats().LocalPackCacheTargetBytes; targetBytes != 0 {
+		t.Fatalf("expected initial LocalPackCacheTargetBytes = 0, got %d", targetBytes)
+	}
 
 	volume1ID := "test-cache-bytes-volume-1"
 	volume1, err := server.getOrCreateVolume(volume1ID)
@@ -132,5 +135,19 @@ func TestControllerPackCacheBytesAccounting(t *testing.T) {
 	statsAfterClose := server.Stats()
 	if statsAfterClose.LocalPackCacheBytes != 0 {
 		t.Fatalf("expected LocalPackCacheBytes = 0 after server.Close, got %d", statsAfterClose.LocalPackCacheBytes)
+	}
+}
+
+func TestControllerPackCacheTargetStats(t *testing.T) {
+	backend := newRecordingBackend(NewMemoryBackend())
+	server := NewTestServer(t, backend, WithServerLocalPackCacheTargetBytes(1024*1024))
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
+
+	if target := server.Stats().LocalPackCacheTargetBytes; target != 1024*1024 {
+		t.Fatalf("expected LocalPackCacheTargetBytes = 1048576, got %d", target)
 	}
 }
