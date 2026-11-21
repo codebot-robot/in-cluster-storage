@@ -112,7 +112,9 @@ func TestDataDirectoryLock_WaitsUntilReleased(t *testing.T) {
 	// Verify second NewServer is still waiting while the first server is open.
 	select {
 	case server := <-serverChan:
-		_ = server.Close()
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
 		t.Fatalf("second NewServer succeeded while first was still open")
 	case err := <-errChan:
 		t.Fatalf("second NewServer failed while first was still open: %v", err)
@@ -176,7 +178,9 @@ func TestDataDirectoryLock_WaitTimeout(t *testing.T) {
 	})
 	elapsed := time.Since(startTime)
 	if err == nil {
-		_ = secondServer.Close()
+		if closeError := secondServer.Close(); closeError != nil {
+			t.Errorf("secondServer.Close failed: %v", closeError)
+		}
 		t.Fatalf("second NewServer unexpectedly succeeded while first was open")
 	}
 

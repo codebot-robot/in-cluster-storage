@@ -47,11 +47,6 @@ var (
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments and streams for one-time upgrade")
 )
 
-func init() {
-	flag.DurationVar(dataDirLockTimeout, "data-dir-lock-wait", 30*time.Second, "Alias for --data-dir-lock-timeout")
-	flag.DurationVar(dataDirLockTimeout, "data-directory-lock-timeout", 30*time.Second, "Alias for --data-dir-lock-timeout")
-}
-
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
