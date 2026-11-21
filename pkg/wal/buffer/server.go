@@ -498,7 +498,6 @@ func (s *Server) Close() error {
 
 	if s.dataDirectoryLock != nil {
 		if err := s.dataDirectoryLock.Close(); err != nil {
-			klog.Warningf("Error releasing data directory lock: %v", err)
 			errs = append(errs, err)
 		}
 	}

@@ -50,7 +50,7 @@ func TestDataDirectoryLock(t *testing.T) {
 		t.Fatalf("second NewServer on same data directory unexpectedly succeeded")
 	}
 
-	expectedMessage := fmt.Sprintf("data directory %s: another stream server process is using it", dataDirectory)
+	expectedMessage := fmt.Sprintf("%s: %s", dataDirectory, ErrDataDirectoryInUse)
 	if !strings.Contains(err.Error(), expectedMessage) {
 		t.Fatalf("expected error containing %q, got: %v", expectedMessage, err)
 	}
