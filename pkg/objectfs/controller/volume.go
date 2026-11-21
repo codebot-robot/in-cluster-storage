@@ -867,6 +867,9 @@ func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
 func (v *Volume) dropPackReferenceLocked(packID uint64) {
 	if info, ok := v.packs[packID]; ok {
 		info.liveReferences--
+		if info.liveReferences <= 0 && info.state == packUploaded && v.server != nil {
+			v.server.evictor.wakeEvictor()
+		}
 	}
 }
 
