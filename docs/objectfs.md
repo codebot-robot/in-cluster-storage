@@ -635,8 +635,8 @@ Artefacts in ObjectFS are categorized as either **Derived** or **Only Copy**:
 
 The following items represent the planned roadmap and architectural evolution for ObjectFS:
 
-### 1. Integration with Stream (Metadata Change-Log)
-- [x] **Wire Stream as Authoritative Change-Log:** Replace the current in-memory mutation log with a stream ([`docs/streams.md`](streams.md)). Every `mkdir`, `create`, `write`, `rename`, and `unlink` will be logged as an append-only stream record with configurable durability (`Local`, `Witness`, `Permanent`).
+### 1. Integration with a Stream (Metadata Change-Log)
+- [x] **Wire a Stream as Authoritative Change-Log:** Replace the current in-memory mutation log with a stream ([`docs/streams.md`](streams.md)). Every `mkdir`, `create`, `write`, `rename`, and `unlink` will be logged as an append-only stream record with configurable durability (`Local`, `Witness`, `Permanent`).
 - [x] **Deterministic Crash Recovery:** Rebuild controller memory on startup by mounting the latest EROFS snapshot and replaying outstanding change-log records from the stream.
 - [ ] **Multi-Writer Ordering:** Use the central Streams buffer sequence numbers to establish linearizable ordering across multiple concurrent node writers.
 - [x] **Eliminate "latest" Snapshot Pointer Object:** Remove the `volumes/<volID>/meta/latest` pointer file; discover the most recent valid snapshot via lexicographical listing or timestamp markers to avoid single-object update contention.

@@ -32,7 +32,7 @@ The design is layered, each layer independent of the ones above it:
 |     payload = varint(type_id) body ; type 1 defines new types in-band             |
 +-----------------------------------------------------------------------------------+
 |  Stream                                                                           |
-|     named sequence of opaque records, stream_seq, one writer                      |
+|     named sequence of opaque records, stream_seq, duplicate seq treated as retry  |
 +-----------------------------------------------------------------------------------+
 |  Shared log                                                                       |
 |     interleaved records from all streams, local buffering, batch flush to S3/GCS   |

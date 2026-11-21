@@ -29,13 +29,13 @@ The storage stack is divided into five layers:
 |---|---|---|---|
 | 1 | **Object store** | S3/GCS. Durable; each write is slow and costs money. | external |
 | 2 | **Shared log** | One log per buffer process. Records from all streams are interleaved, written to local disk first, then flushed to the object store in batches. This layer does both the local buffering and the multiplexing. | `pkg/wal/buffer` |
-| 3 | **Stream** | What a client sees: a named sequence of opaque records, numbered by `stream_seq`, with one writer. The writer holds an `Append` session to the buffer over gRPC and is acknowledged as records reach local disk and then the object store. | `pkg/wal/buffer`, `pkg/wal/client` |
-| 4 | **Structured data stream** | A convention inside the record payload: a type id plus a protobuf body, and above that the change log and snapshots. The buffer never looks inside a payload. | `pkg/sds` |
+| 3 | **Stream** | What a client sees: a named sequence of opaque records, numbered by `stream_seq`. The stream client holds an `Append` session to the stream server over gRPC and is acknowledged as records reach local disk and then the object store. Today the stream server treats a second append at a sequence number it already has as a retry, so it assumes one writer per stream; whether a stream may have one writer or several is decided by the layers above. | `pkg/wal/buffer`, `pkg/wal/client` |
+| 4 | **Structured data stream** | A convention inside the record payload: a type id plus a protobuf body, and above that the change log and snapshots. The stream server never looks inside a payload. | `pkg/sds` |
 | 5 | **Application** | The ObjectFS controller, with one metadata stream per volume. | `pkg/objectfs/controller` |
 
-The WAL buffer is the process and binary (`cmd/wal-buffer`, `pkg/wal/buffer`) that implements the shared log and serves streams. Layers 2 and 3 are distinct: the shared log is about batching and durability across multiple streams, while a stream is about one writer's ordered records.
+Layer 3 has two ends: the **stream client** is the library in the application's process (`pkg/wal/client`), and the **stream server** is the WAL buffer process (`cmd/wal-buffer`, `pkg/wal/buffer`) that serves streams and implements the shared log. Layers 2 and 3 are distinct: the shared log is about batching and durability across multiple streams, while a stream is about ordered records identified by `stream_seq`.
 
-In `Local` acknowledgement mode, the writer's client (`pkg/wal/client`) first appends to a log on its own node-local disk and replicates to the buffer afterwards. That client-side local log belongs to layer 3 (it holds one stream's records, kept by that stream's writer), not to the shared log.
+The stream client keeps its own copy of its records in its **local buffer** (records are kept in memory for sending and replay, and in segment files under the directory passed to `Open`), which belongs to layer 3, not the shared log; how much to keep locally is the client's trade of durability against speed. Each acknowledgement level defines where a record is placed: `Local` is the stream client's local buffer, `Witness` is the stream server's disk (the local part of the shared log), and `Permanent` is the object store.
 
 ---
 
@@ -256,7 +256,7 @@ The gRPC service contract is defined in [`proto/wal.proto`](../proto/wal.proto) 
 - **Positions above `last_flushed_position` are provisional:** In the event of a witness crash before flushing to object storage, provisional positions may be reassigned upon restart.
 - **Tail clamping:** If a `Tail` request specifies `from_position > last_flushed_position + 1`, the server clamps it to `last_flushed_position + 1` and returns the effective starting position in `resumed_from`.
 - **Consumer deduplication:** Consumers tailing the shared log must deduplicate records based on `(stream_id, stream_seq)`.
-- **Per-Stream Tail & Filtering:** `TailRequest` allows filtering server-side by `stream_id` and resuming from a known sequence number `from_stream_seq` (returning records where `stream_seq > from_stream_seq`). When `stream_id` is set, the buffer filters records across all tiers (object storage segments, local disk segments, and live commits). `from_position` serves as an optional lower-bound position hint. Resuming by `stream_seq` is robust against server restarts and position reassignments because `stream_seq` is assigned by the stream writer and immutable.
+- **Per-Stream Tail & Filtering:** `TailRequest` allows filtering server-side by `stream_id` and resuming from a known sequence number `from_stream_seq` (returning records where `stream_seq > from_stream_seq`). When `stream_id` is set, the buffer filters records across all tiers (object storage segments, local disk segments, and live commits). `from_position` serves as an optional lower-bound position hint. Resuming by `stream_seq` is robust against server restarts and position reassignments because `stream_seq` is assigned by the stream client and immutable.
 - **Client Helper:** The client package (`pkg/wal/client`) provides `TailStream(ctx, target, streamID, fromSeq)` returning a Go iterator (`iter.Seq2[uint64, []byte]`) yielding `(stream_seq, payload)` pairs.
 
 ---
