@@ -59,10 +59,24 @@ type BlobLocation struct {
 	Entry        BlobEntry
 }
 
+// Clock supplies the current time.
+type Clock interface {
+	Now() time.Time
+}
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time {
+	return time.Now()
+}
+
 // Store manages reading and writing blobs and packfiles.
 type Store struct {
 	backend        ObjectStorageBackend
 	largeThreshold int64
+
+	// clock supplies time for pack read and upload timestamps; set once before use.
+	clock Clock
 
 	mu            sync.RWMutex
 	packIndexes   map[string][]BlobEntry      // packKey -> sorted entries
@@ -78,10 +92,25 @@ func NewStore(backend ObjectStorageBackend, largeThreshold int64) *Store {
 	return &Store{
 		backend:        backend,
 		largeThreshold: largeThreshold,
+		clock:          systemClock{},
 		packIndexes:    make(map[string][]BlobEntry),
 		shaToLocation:  make(map[string]BlobLocation),
 		localPacks:     make(map[string]*IncrementalPack),
 	}
+}
+
+// SetClock sets the clock used for pack read and upload timestamps.
+func (s *Store) SetClock(clock Clock) {
+	if clock != nil {
+		s.clock = clock
+	}
+}
+
+func (s *Store) now() time.Time {
+	if s.clock != nil {
+		return s.clock.Now()
+	}
+	return time.Now()
 }
 
 func (s *Store) blobKey(sha256Hex string) string {
@@ -113,6 +142,7 @@ func (s *Store) PutPackFile(ctx context.Context, packKey string, stream ByteStre
 	s.mu.Lock()
 	s.packIndexes[packKey] = entries
 	if localPack != nil {
+		localPack.RecordRead(s.now())
 		s.localPacks[packKey] = localPack
 	}
 	for _, entry := range entries {
@@ -348,6 +378,7 @@ func (s *Store) GetBlob(ctx context.Context, sha256Hex string) (ByteStream, erro
 
 	if found {
 		if localPack != nil {
+			localPack.RecordRead(s.now())
 			stream, err := localPack.ReadBlob(ctx, loc.Entry)
 			if err != nil {
 				if errors.Is(err, ErrPackClosed) {

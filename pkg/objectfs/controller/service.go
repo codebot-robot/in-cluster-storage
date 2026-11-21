@@ -335,6 +335,15 @@ func WithExclusiveLeaseTTL(ttl time.Duration) ServerOption {
 // ServerOption configures the controller Server.
 type ServerOption func(*Server)
 
+// WithServerClock sets the clock used for pack read and upload timestamps.
+func WithServerClock(clock blob.Clock) ServerOption {
+	return func(s *Server) {
+		if s.blobStore != nil {
+			s.blobStore.SetClock(clock)
+		}
+	}
+}
+
 // WithServerMutationCheck enables debug mutation checking on metadata views created by the server.
 func WithServerMutationCheck() ServerOption {
 	return func(s *Server) {
