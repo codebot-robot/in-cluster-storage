@@ -19,6 +19,7 @@ package controller
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -643,4 +644,54 @@ func TestPackCacheEviction_RecheckBeforeDelete_PackGainsLiveReferenceOrDeleted(t
 			t.Fatalf("expected pack cache bytes = 0, got %d (packSize was %d)", current, packSize)
 		}
 	})
+}
+
+// TestPackCacheEviction_NoInlineEviction_AllPacksRetainedWhenTargetZero verifies that when
+// background eviction is disabled (target 0) and the per-volume staging bound fits one
+// staged pack but not two packs on disk, three packs written and uploaded one after another
+// are all retained on local disk (failing if per-volume inline eviction is present).
+func TestPackCacheEviction_NoInlineEviction_AllPacksRetainedWhenTargetZero(t *testing.T) {
+	server := NewTestServer(t, newRecordingBackend(NewMemoryBackend()),
+		WithServerLocalPackCacheTargetBytes(0),
+	)
+	defer func() {
+		if closeError := server.Close(); closeError != nil {
+			t.Errorf("server.Close failed: %v", closeError)
+		}
+	}()
+
+	volume, err := server.getOrCreateVolume("test-no-inline-evict")
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	// Write and upload pack 1 to determine pack size on disk.
+	_ = createAndUploadPack(t, server, volume, "/file1.bin", 0, 1)
+
+	volume.stagingMu.Lock()
+	pack1DiskSize := volume.packs[1].pack.ByteSize()
+	volume.stagingMu.Unlock()
+
+	// Configure per-volume staging bound to fit 1 pack on disk but not 2 packs on disk.
+	volume.limits.maxStagingBytes = pack1DiskSize + pack1DiskSize/2
+
+	// Write and upload pack 2 and pack 3 one after another.
+	_ = createAndUploadPack(t, server, volume, "/file2.bin", 1000000, 2)
+	_ = createAndUploadPack(t, server, volume, "/file3.bin", 2000000, 3)
+
+	// All three packs must still be on local disk.
+	volume.stagingMu.Lock()
+	for packID := uint64(1); packID <= 3; packID++ {
+		info, exists := volume.packs[packID]
+		if !exists || info.state != packUploaded {
+			volume.stagingMu.Unlock()
+			t.Fatalf("expected pack %d to exist in packUploaded state", packID)
+		}
+		path := volume.scratchPackPath(packID)
+		if _, err := os.Stat(path); err != nil {
+			volume.stagingMu.Unlock()
+			t.Fatalf("expected pack %d to exist on local disk at %s: %v", packID, path, err)
+		}
+	}
+	volume.stagingMu.Unlock()
 }

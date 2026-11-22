@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"os"
 	"runtime"
 	"strings"
@@ -130,10 +131,51 @@ func TestNewTestServer_CleanupClosesWALClientStreams(t *testing.T) {
 }
 
 func (v *Volume) evictAllUploadedPacksForTest() {
-	v.stagingMu.Lock()
-	defer v.stagingMu.Unlock()
-	originalMaxStagingBytes := v.limits.maxStagingBytes
-	v.limits.maxStagingBytes = 0
-	v.evictUploadedPacksLocked(0)
-	v.limits.maxStagingBytes = originalMaxStagingBytes
+	if v.server == nil {
+		v.stagingMu.Lock()
+		for packID, packInfo := range v.packs {
+			if packInfo.state == packUploaded && packInfo.liveReferences <= 0 {
+				v.deletePackLocked(packID)
+			}
+		}
+		v.stagingMu.Unlock()
+		return
+	}
+
+	server := v.server
+	server.diskLimits.mu.Lock()
+	originalTarget := server.diskLimits.packCacheTargetBytes
+	server.diskLimits.mu.Unlock()
+	defer func() {
+		server.diskLimits.mu.Lock()
+		server.diskLimits.packCacheTargetBytes = originalTarget
+		server.diskLimits.mu.Unlock()
+	}()
+
+	for {
+		server.diskLimits.mu.Lock()
+		currentTotal := server.diskLimits.packCacheBytes
+		if currentTotal <= 0 {
+			server.diskLimits.mu.Unlock()
+			break
+		}
+		server.diskLimits.packCacheTargetBytes = currentTotal - 1
+		server.diskLimits.mu.Unlock()
+
+		candidates := server.collectEvictablePackCandidates(context.Background())
+		var candidate *evictablePackCandidate
+		for i := range candidates {
+			if candidates[i].volume == v {
+				candidate = &candidates[i]
+				break
+			}
+		}
+		if candidate == nil {
+			break
+		}
+		evicted, _ := server.evictCandidatePack(*candidate)
+		if !evicted {
+			break
+		}
+	}
 }

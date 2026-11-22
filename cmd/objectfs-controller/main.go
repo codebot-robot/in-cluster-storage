@@ -150,7 +150,7 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.BoolVar(&o.DebugMutationCheck, "debug-mutation-check", o.DebugMutationCheck, "Enable debug mutation checking on metadata view (for test/CI gates)")
 	flagSet.BoolVar(&o.DebugStatsCheck, "debug-stats-check", o.DebugStatsCheck, "Enable debug volume stats checking (for test/CI gates)")
 	flagSet.DurationVar(&o.SyncCoalesceWindow, "sync-coalesce-window", o.SyncCoalesceWindow, "Coalescing window for non-blocking sync requests")
-	flagSet.Int64Var(&o.MaxStagingBytes, "max-staging-bytes", o.MaxStagingBytes, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
+	flagSet.Int64Var(&o.MaxStagingBytes, "max-staging-bytes", o.MaxStagingBytes, "Maximum byte size of unuploaded staged writes per volume before rejection")
 	flagSet.Int64Var(&o.MaxLocalStagingBytes, "max-local-staging-bytes", o.MaxLocalStagingBytes, "Maximum byte size of unuploaded staged writes across all volumes before backpressure (0 disables)")
 	flagSet.Int64Var(&o.LocalPackCacheTargetBytes, "local-pack-cache-target-bytes", o.LocalPackCacheTargetBytes, "Target byte size for local pack cache across all volumes before background eviction (default 1 GiB, 0 disables)")
 	flagSet.DurationVar(&o.ControllerSyncTimeout, "controller-sync-timeout", o.ControllerSyncTimeout, "Timeout for controller coalesced background sync operations")

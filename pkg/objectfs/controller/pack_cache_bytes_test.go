@@ -111,10 +111,8 @@ func TestControllerPackCacheBytesAccounting(t *testing.T) {
 		t.Fatalf("expected LocalPackCacheBytes = %d, got %d", totalDiskBytes, statsAfterUpload.LocalPackCacheBytes)
 	}
 
-	// Trigger existing per-volume eviction on volume 1.
-	volume1.stagingMu.Lock()
-	volume1.evictUploadedPacksLocked(100 * 1024 * 1024)
-	volume1.stagingMu.Unlock()
+	// Evict uploaded packs on volume 1.
+	volume1.evictAllUploadedPacksForTest()
 
 	// Pack 1 on volume 1 should be deleted from disk.
 	diskBytes1After := uploadedPackBytesOnDisk(t, volume1)
@@ -125,7 +123,7 @@ func TestControllerPackCacheBytesAccounting(t *testing.T) {
 	// Reported total drops by the deleted pack and equals remaining packs on disk (volume 2).
 	statsAfterEviction := server.Stats()
 	if statsAfterEviction.LocalPackCacheBytes != diskBytes2 {
-		t.Fatalf("expected LocalPackCacheBytes = %d after per-volume eviction, got %d", diskBytes2, statsAfterEviction.LocalPackCacheBytes)
+		t.Fatalf("expected LocalPackCacheBytes = %d after eviction, got %d", diskBytes2, statsAfterEviction.LocalPackCacheBytes)
 	}
 
 	// After Server.Close, the reported total is 0.
