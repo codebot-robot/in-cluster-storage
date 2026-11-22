@@ -81,22 +81,23 @@ type Options struct {
 // NewOptions returns an Options struct populated with defaults.
 func NewOptions() *Options {
 	return &Options{
-		Port:                     50051,
-		ServerCertDir:            "/etc/objectfs/certs/server",
-		FlushInterval:            1 * time.Hour,
-		WALDurability:            pb.WalDurability_LOCAL,
-		MetadataDurability:       pb.MetadataDurability_OPERATION,
-		MetadataIndex:            "sqlite",
-		MetadataIndexCacheMB:     64,
-		MetadataCacheBytes:       64 * 1024 * 1024,
-		MetadataOverlayMaxBytes:  64 * 1024 * 1024,
-		MetadataApplierBatchSize: 100,
-		SyncCoalesceWindow:       1 * time.Second,
-		MaxStagingBytes:          64 * 1024 * 1024,
-		MaxLocalStagingBytes:     16 * 1024 * 1024 * 1024,
-		ControllerSyncTimeout:    10 * time.Minute,
-		OpenBarrierTimeout:       30 * time.Second,
-		ShutdownTimeout:          20 * time.Second,
+		Port:                      50051,
+		ServerCertDir:             "/etc/objectfs/certs/server",
+		FlushInterval:             1 * time.Hour,
+		WALDurability:             pb.WalDurability_LOCAL,
+		MetadataDurability:        pb.MetadataDurability_OPERATION,
+		MetadataIndex:             "sqlite",
+		MetadataIndexCacheMB:      64,
+		MetadataCacheBytes:        64 * 1024 * 1024,
+		MetadataOverlayMaxBytes:   64 * 1024 * 1024,
+		MetadataApplierBatchSize:  100,
+		SyncCoalesceWindow:        1 * time.Second,
+		MaxStagingBytes:           64 * 1024 * 1024,
+		MaxLocalStagingBytes:      16 * 1024 * 1024 * 1024,
+		LocalPackCacheTargetBytes: controller.DefaultLocalPackCacheTargetBytes,
+		ControllerSyncTimeout:     10 * time.Minute,
+		OpenBarrierTimeout:        30 * time.Second,
+		ShutdownTimeout:           20 * time.Second,
 	}
 }
 
@@ -151,7 +152,7 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.DurationVar(&o.SyncCoalesceWindow, "sync-coalesce-window", o.SyncCoalesceWindow, "Coalescing window for non-blocking sync requests")
 	flagSet.Int64Var(&o.MaxStagingBytes, "max-staging-bytes", o.MaxStagingBytes, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
 	flagSet.Int64Var(&o.MaxLocalStagingBytes, "max-local-staging-bytes", o.MaxLocalStagingBytes, "Maximum byte size of unuploaded staged writes across all volumes before backpressure (0 disables)")
-	flagSet.Int64Var(&o.LocalPackCacheTargetBytes, "local-pack-cache-target-bytes", o.LocalPackCacheTargetBytes, "Target byte size for local pack cache across all volumes before background eviction (0 disables)")
+	flagSet.Int64Var(&o.LocalPackCacheTargetBytes, "local-pack-cache-target-bytes", o.LocalPackCacheTargetBytes, "Target byte size for local pack cache across all volumes before background eviction (default 1 GiB, 0 disables)")
 	flagSet.DurationVar(&o.ControllerSyncTimeout, "controller-sync-timeout", o.ControllerSyncTimeout, "Timeout for controller coalesced background sync operations")
 	flagSet.DurationVar(&o.OpenBarrierTimeout, "open-barrier-timeout", o.OpenBarrierTimeout, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
 	flagSet.DurationVar(&o.ShutdownTimeout, "shutdown-timeout", o.ShutdownTimeout, "Timeout for graceful volume drain during controller shutdown (must stay below the pod's termination grace period)")
