@@ -16,6 +16,8 @@ package buffer
 
 import (
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -176,7 +178,7 @@ func TestWriterLock_RefusedWhileHolderAttached(t *testing.T) {
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected codes.Unavailable, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "the lock is held by another client") {
+	if !strings.Contains(err.Error(), "stream writer lock is held by another client") {
 		t.Fatalf("expected lock held message, got %v", err)
 	}
 	if strings.Contains(err.Error(), "client-1") || strings.Contains(err.Error(), "client-2") {
@@ -203,7 +205,7 @@ func TestWriterLock_InFlightRefusedUntilCommitted(t *testing.T) {
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected codes.Unavailable, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "records of the previous holder are still being committed") {
+	if !strings.Contains(err.Error(), "stream writer lock is waiting for records of its previous holder to be committed") {
 		t.Fatalf("expected records in flight message, got %v", err)
 	}
 	if strings.Contains(err.Error(), "client-1") || strings.Contains(err.Error(), "client-2") {
@@ -536,11 +538,95 @@ func TestAppend_RefusedHelloOverWire(t *testing.T) {
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected codes.Unavailable, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "the lock is held by another client") {
+	if !strings.Contains(err.Error(), "stream writer lock is held by another client") {
 		t.Fatalf("expected lock held message, got %v", err)
 	}
 	if strings.Contains(err.Error(), "client-wire-1") || strings.Contains(err.Error(), "client-wire-2") {
 		t.Fatalf("message must not leak client IDs: %v", err)
+	}
+}
+
+func TestAppend_CleanlyEndedSessionExitsForwarder(t *testing.T) {
+	ctx := t.Context()
+	server, address, cleanup := startTestServer(t, inmemorystorage.New(), t.TempDir())
+	t.Cleanup(func() {
+		cleanup()
+	})
+
+	streamID := uuid.New()
+	clientID := []byte("client-clean-close")
+
+	connection, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer func() {
+		if err := connection.Close(); err != nil {
+			t.Errorf("connection.Close: %v", err)
+		}
+	}()
+
+	stream, err := pb.NewWalBufferClient(connection).Append(ctx)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	if err := stream.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{
+			Hello: &pb.Hello{
+				StreamId: streamID[:],
+				Epoch:    1,
+				ClientId: clientID,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Hello: %v", err)
+	}
+
+	response, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv HelloAck: %v", err)
+	}
+	if response.GetHelloAck() == nil {
+		t.Fatalf("expected HelloAck, got %v", response)
+	}
+
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+
+	// Read until the stream closes (io.EOF).
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv to end: %v", err)
+		}
+	}
+
+	// Verify that waiters and attachments reach zero.
+	server.mu.RLock()
+	st := server.streams[streamID.String()]
+	server.mu.RUnlock()
+
+	if st == nil {
+		t.Fatalf("stream state not found for %s", streamID)
+	}
+
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		st.mu.Lock()
+		waiters := st.waiters
+		attachments := st.attachments
+		st.mu.Unlock()
+
+		if waiters == 0 && attachments == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for forwarder to exit: waiters=%d, attachments=%d", waiters, attachments)
+		}
 	}
 }
 

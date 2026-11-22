@@ -149,9 +149,16 @@ type grantDecisionInputs struct {
 type grantRefusalReason int
 
 const (
+	// grantRefusalNone indicates that the lock is granted.
 	grantRefusalNone grantRefusalReason = iota
+
+	// grantRefusalLockHeld indicates the lock is currently held by active sessions of another client.
 	grantRefusalLockHeld
+
+	// grantRefusalRecordsInFlight indicates records of the previous holder are still queued or committing.
 	grantRefusalRecordsInFlight
+
+	// grantRefusalGracePeriod indicates the lock is reserved for its previous holder for the grace duration.
 	grantRefusalGracePeriod
 )
 
@@ -177,12 +184,13 @@ func grantDecision(inputs grantDecisionInputs, requester string, now time.Time) 
 	return true, false, grantRefusalNone, time.Time{}
 }
 
+// grantRefusalStatus converts a refusal reason to an Unavailable gRPC status with a descriptive message.
 func grantRefusalStatus(reason grantRefusalReason, remaining time.Duration) error {
 	switch reason {
 	case grantRefusalLockHeld:
-		return status.Errorf(codes.Unavailable, "the lock is held by another client")
+		return status.Errorf(codes.Unavailable, "stream writer lock is held by another client")
 	case grantRefusalRecordsInFlight:
-		return status.Errorf(codes.Unavailable, "records of the previous holder are still being committed")
+		return status.Errorf(codes.Unavailable, "stream writer lock is waiting for records of its previous holder to be committed")
 	case grantRefusalGracePeriod:
 		if remaining < 0 {
 			remaining = 0
@@ -891,6 +899,9 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		st.mu.Unlock()
 	})
 	defer stopCtxWatcher()
+	// Defers run LIFO: cancelling ctx here fires stopCtxWatcher under st.mu before
+	// stopCtxWatcher is unregistered or st is detached, waking the forwarder so it exits.
+	defer cancel()
 
 	// Forward watermark acks (witness and S3) to outCh
 	forwarderErrChan := make(chan error, 1)
