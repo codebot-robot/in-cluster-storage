@@ -79,42 +79,42 @@ func newTestServerWithGrace(t *testing.T, grace time.Duration, clock Clock) *Ser
 	return server
 }
 
-func TestGrantDecision(t *testing.T) {
+func TestDecideGrant(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	grace := 15 * time.Second
 
 	for _, testCase := range []struct {
-		name                  string
-		inputs                grantDecisionInputs
-		requester             string
-		now                   time.Time
-		wantGrant, wantResume bool
-		wantRefusal           grantRefusalReason
-		wantNextWake          time.Time
+		name         string
+		inputs       grantDecisionInputs
+		requester    string
+		now          time.Time
+		wantDecision grantDecision
+		wantResume   bool
+		wantNextWake time.Time
 	}{
-		{"empty requester", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "", t0, true, false, grantRefusalNone, time.Time{}},
-		{"empty holder", grantDecisionInputs{holder: "", lastSessionEnd: t0}, "client-1", t0, true, false, grantRefusalNone, time.Time{}},
-		{"same client reacquires with session", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "client-1", t0, true, true, grantRefusalNone, time.Time{}},
-		{"same client reacquires after detach", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0}, "client-1", t0, true, true, grantRefusalNone, time.Time{}},
-		{"another client refused while attached", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "client-2", t0, false, false, grantRefusalLockHeld, time.Time{}},
-		{"another client refused on in flight", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0}, "client-2", t0, false, false, grantRefusalRecordsInFlight, time.Time{}},
-		{"another client granted when free", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0}, "client-2", t0, true, false, grantRefusalNone, time.Time{}},
-		{"another client refused inside grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(5 * time.Second), false, false, grantRefusalGracePeriod, t0.Add(grace)},
-		{"another client granted at grace expiry", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(grace), true, false, grantRefusalNone, time.Time{}},
-		{"another client granted after grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(20 * time.Second), true, false, grantRefusalNone, time.Time{}},
-		{"same client granted inside grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-1", t0.Add(5 * time.Second), true, true, grantRefusalNone, time.Time{}},
-		{"same client granted after grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-1", t0.Add(20 * time.Second), true, true, grantRefusalNone, time.Time{}},
-		{"another client refused on in flight after grace period", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(20 * time.Second), false, false, grantRefusalRecordsInFlight, time.Time{}},
-		{"another client refused on in flight inside grace period", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(5 * time.Second), false, false, grantRefusalRecordsInFlight, time.Time{}},
-		{"zero lastSessionEnd with grace period is granted", grantDecisionInputs{holder: "client-1", gracePeriod: grace}, "client-2", t0, true, false, grantRefusalNone, time.Time{}},
+		{"empty requester", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "", t0, grantDecisionLockGranted, false, time.Time{}},
+		{"empty holder", grantDecisionInputs{holder: "", lastSessionEnd: t0}, "client-1", t0, grantDecisionLockGranted, false, time.Time{}},
+		{"same client reacquires with session", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "client-1", t0, grantDecisionLockGranted, true, time.Time{}},
+		{"same client reacquires after detach", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0}, "client-1", t0, grantDecisionLockGranted, true, time.Time{}},
+		{"another client refused while attached", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "client-2", t0, grantDecisionRefusedLockAlreadyHeld, false, time.Time{}},
+		{"another client refused on in flight", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0}, "client-2", t0, grantDecisionRefusedRecordsInFlight, false, time.Time{}},
+		{"another client granted when free", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0}, "client-2", t0, grantDecisionLockGranted, false, time.Time{}},
+		{"another client refused inside grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(5 * time.Second), grantDecisionRefusedGracePeriod, false, t0.Add(grace)},
+		{"another client granted at grace expiry", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(grace), grantDecisionLockGranted, false, time.Time{}},
+		{"another client granted after grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(20 * time.Second), grantDecisionLockGranted, false, time.Time{}},
+		{"same client granted inside grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-1", t0.Add(5 * time.Second), grantDecisionLockGranted, true, time.Time{}},
+		{"same client granted after grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-1", t0.Add(20 * time.Second), grantDecisionLockGranted, true, time.Time{}},
+		{"another client refused on in flight after grace period", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(20 * time.Second), grantDecisionRefusedRecordsInFlight, false, time.Time{}},
+		{"another client refused on in flight inside grace period", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(5 * time.Second), grantDecisionRefusedRecordsInFlight, false, time.Time{}},
+		{"zero lastSessionEnd with grace period is granted", grantDecisionInputs{holder: "client-1", gracePeriod: grace}, "client-2", t0, grantDecisionLockGranted, false, time.Time{}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			gotGrant, gotResume, gotRefusal, gotNextWake := grantDecision(testCase.inputs, testCase.requester, testCase.now)
-			if gotGrant != testCase.wantGrant || gotResume != testCase.wantResume || gotRefusal != testCase.wantRefusal || !gotNextWake.Equal(testCase.wantNextWake) {
-				t.Fatalf("grantDecision(%+v, %q, %v) = (%v, %v, %v, %v), want (%v, %v, %v, %v)",
+			gotDecision, gotResume, gotNextWake := decideGrant(testCase.inputs, testCase.requester, testCase.now)
+			if gotDecision != testCase.wantDecision || gotResume != testCase.wantResume || !gotNextWake.Equal(testCase.wantNextWake) {
+				t.Fatalf("decideGrant(%+v, %q, %v) = (%v, %v, %v), want (%v, %v, %v)",
 					testCase.inputs, testCase.requester, testCase.now,
-					gotGrant, gotResume, gotRefusal, gotNextWake,
-					testCase.wantGrant, testCase.wantResume, testCase.wantRefusal, testCase.wantNextWake)
+					gotDecision, gotResume, gotNextWake,
+					testCase.wantDecision, testCase.wantResume, testCase.wantNextWake)
 			}
 		})
 	}

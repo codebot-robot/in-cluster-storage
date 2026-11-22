@@ -127,7 +127,7 @@ type streamState struct {
 	lastSessionEnd time.Time
 }
 
-// grantDecisionInputs holds the stream writer lock state evaluated by grantDecision.
+// grantDecisionInputs holds the stream writer lock state evaluated by decideGrant.
 type grantDecisionInputs struct {
 	// holder is the clientID currently holding the stream writer lock.
 	holder string
@@ -145,53 +145,53 @@ type grantDecisionInputs struct {
 	gracePeriod time.Duration
 }
 
-// grantRefusalReason names the reason a stream writer lock cannot be granted.
-type grantRefusalReason int
+// grantDecision represents the outcome of evaluating a stream writer lock grant.
+type grantDecision int
 
 const (
-	// grantRefusalNone indicates that the lock is granted.
-	grantRefusalNone grantRefusalReason = iota
+	// grantDecisionLockGranted indicates that the writer lock is granted to the requester.
+	grantDecisionLockGranted grantDecision = iota
 
-	// grantRefusalLockHeld indicates the lock is currently held by active sessions of another client.
-	grantRefusalLockHeld
+	// grantDecisionRefusedLockAlreadyHeld indicates the lock is currently held by active sessions of another client.
+	grantDecisionRefusedLockAlreadyHeld
 
-	// grantRefusalRecordsInFlight indicates records of the previous holder are still queued or committing.
-	grantRefusalRecordsInFlight
+	// grantDecisionRefusedRecordsInFlight indicates records of the previous holder are still queued or committing.
+	grantDecisionRefusedRecordsInFlight
 
-	// grantRefusalGracePeriod indicates the lock is reserved for its previous holder for the grace duration.
-	grantRefusalGracePeriod
+	// grantDecisionRefusedGracePeriod indicates the lock is reserved for its previous holder for the grace duration.
+	grantDecisionRefusedGracePeriod
 )
 
-// grantDecision determines whether the writer lock can be granted to requester, and if so,
-// whether it is a resumed grant. When not granted, it returns the refusal reason and when
+// decideGrant determines whether the writer lock can be granted to requester, and if so,
+// whether it is a resumed grant. When refused, it returns the refusal decision and when
 // the grant decision can next change by time alone.
-func grantDecision(inputs grantDecisionInputs, requester string, now time.Time) (granted bool, resumed bool, refusal grantRefusalReason, nextWake time.Time) {
+func decideGrant(inputs grantDecisionInputs, requester string, now time.Time) (decision grantDecision, resumed bool, nextWake time.Time) {
 	if requester == "" || inputs.holder == "" {
-		return true, false, grantRefusalNone, time.Time{}
+		return grantDecisionLockGranted, false, time.Time{}
 	}
 	if inputs.holder == requester {
-		return true, true, grantRefusalNone, time.Time{}
+		return grantDecisionLockGranted, true, time.Time{}
 	}
 	if inputs.attachedSessions != 0 {
-		return false, false, grantRefusalLockHeld, time.Time{}
+		return grantDecisionRefusedLockAlreadyHeld, false, time.Time{}
 	}
 	if inputs.inFlight != 0 {
-		return false, false, grantRefusalRecordsInFlight, time.Time{}
+		return grantDecisionRefusedRecordsInFlight, false, time.Time{}
 	}
 	if inputs.gracePeriod > 0 && !inputs.lastSessionEnd.IsZero() && now.Before(inputs.lastSessionEnd.Add(inputs.gracePeriod)) {
-		return false, false, grantRefusalGracePeriod, inputs.lastSessionEnd.Add(inputs.gracePeriod)
+		return grantDecisionRefusedGracePeriod, false, inputs.lastSessionEnd.Add(inputs.gracePeriod)
 	}
-	return true, false, grantRefusalNone, time.Time{}
+	return grantDecisionLockGranted, false, time.Time{}
 }
 
-// grantRefusalStatus converts a refusal reason to an Unavailable gRPC status with a descriptive message.
-func grantRefusalStatus(reason grantRefusalReason, remaining time.Duration) error {
-	switch reason {
-	case grantRefusalLockHeld:
+// grantDecisionStatus converts a refused grant decision to an Unavailable gRPC status with a descriptive message.
+func grantDecisionStatus(decision grantDecision, remaining time.Duration) error {
+	switch decision {
+	case grantDecisionRefusedLockAlreadyHeld:
 		return status.Errorf(codes.Unavailable, "stream writer lock is held by another client")
-	case grantRefusalRecordsInFlight:
+	case grantDecisionRefusedRecordsInFlight:
 		return status.Errorf(codes.Unavailable, "stream writer lock is waiting for records of its previous holder to be committed")
-	case grantRefusalGracePeriod:
+	case grantDecisionRefusedGracePeriod:
 		if remaining < 0 {
 			remaining = 0
 		}
@@ -752,8 +752,8 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 		gracePeriod:      s.writerLockGrace,
 	}
 	now := s.clock.Now()
-	granted, resumed, refusal, nextWake := grantDecision(inputs, clientID, now)
-	if !granted {
+	decision, resumed, nextWake := decideGrant(inputs, clientID, now)
+	if decision != grantDecisionLockGranted {
 		state.mu.Unlock()
 		s.mu.Unlock()
 		var remaining time.Duration
@@ -763,7 +763,7 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 				remaining = 0
 			}
 		}
-		return nil, 0, 0, false, grantRefusalStatus(refusal, remaining)
+		return nil, 0, 0, false, grantDecisionStatus(decision, remaining)
 	}
 
 	if sessionEpoch < state.epoch {
@@ -899,8 +899,10 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		st.mu.Unlock()
 	})
 	defer stopCtxWatcher()
-	// Defers run LIFO: cancelling ctx here fires stopCtxWatcher under st.mu before
-	// stopCtxWatcher is unregistered or st is detached, waking the forwarder so it exits.
+	// Defers run LIFO: cancelling ctx here, while the watcher is still registered,
+	// guarantees the watcher's function starts; stopCtxWatcher cannot recall a
+	// function that has started; and the forwarder checks ctx.Done() under the stream
+	// lock before each wait, so it cannot miss the wake-up.
 	defer cancel()
 
 	// Forward watermark acks (witness and S3) to outCh
