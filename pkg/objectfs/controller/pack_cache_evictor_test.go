@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
+	"encoding/binary"
 	"sync"
 	"testing"
 	"time"
@@ -410,6 +412,146 @@ func TestPackCacheEviction_RealWriteFsync_EndsAtOrUnderTarget(t *testing.T) {
 
 	if current := server.Stats().LocalPackCacheBytes; current > 1 {
 		t.Fatalf("expected pack cache bytes <= 1, got %d", current)
+	}
+}
+
+// evictorPassCount returns the number of evaluation passes completed by the evictor loop (testing only).
+func (s *Server) evictorPassCount() int64 {
+	return s.evictor.passesCompleted.Value()
+}
+
+// waitForEvictorPass waits until the evictor loop has completed at least targetPass passes.
+// Requires no locks held.
+func waitForEvictorPass(t *testing.T, server *Server, targetPass int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for server.evictorPassCount() < targetPass {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for evictor pass %d (current: %d)", targetPass, server.evictorPassCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitForLocalPackCacheTarget waits until the local pack cache bytes fall at or below targetBytes.
+// Requires no locks held.
+func waitForLocalPackCacheTarget(t *testing.T, server *Server, targetBytes int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for server.Stats().LocalPackCacheBytes > targetBytes {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for pack cache bytes <= %d, current: %d", targetBytes, server.Stats().LocalPackCacheBytes)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestPackCacheEviction_TwoVolumes_RealWriteFsync verifies that in the normal path
+// with a small target set via WithServerLocalPackCacheTargetBytes, files written and fsynced
+// on two volumes until the total has exceeded the target trigger background eviction,
+// bringing the total at or under target, and that evicted data remains readable from object storage.
+func TestPackCacheEviction_TwoVolumes_RealWriteFsync(t *testing.T) {
+	// Each pack with DefaultPackSlots is ~82 KiB. Setting a target of 180 KiB (~2.2 packs' worth).
+	targetBytes := int64(180 * 1024)
+	server := NewTestServer(t, NewMemoryBackend(), WithServerLocalPackCacheTargetBytes(targetBytes))
+
+	volume1, err := server.getOrCreateVolume("test-evict-real-two-vol-1")
+	if err != nil {
+		t.Fatalf("getOrCreateVolume volume 1 failed: %v", err)
+	}
+	volume2, err := server.getOrCreateVolume("test-evict-real-two-vol-2")
+	if err != nil {
+		t.Fatalf("getOrCreateVolume volume 2 failed: %v", err)
+	}
+
+	ctx := t.Context()
+
+	// Write and fsync 4 packs (2 on volume 1, 2 on volume 2).
+	// Total unevicted uploaded size will be ~328 KiB, exceeding the 180 KiB target.
+	createResponse1, err := testCreateFile(ctx, server, volume1.volumeID, "/file1.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse1.GetError() != 0 {
+		t.Fatalf("CreateFile volume 1 file 1 failed: %v", err)
+	}
+	inodeID1 := createResponse1.GetAttr().GetInode().GetIno()
+	fillAndSealPackWithSeed(t, volume1, ctx, inodeID1, 0)
+	if err := volume1.Fsync(ctx, inodeID1); err != nil {
+		t.Fatalf("Fsync volume 1 file 1 failed: %v", err)
+	}
+
+	createResponse2, err := testCreateFile(ctx, server, volume2.volumeID, "/file2.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse2.GetError() != 0 {
+		t.Fatalf("CreateFile volume 2 file 2 failed: %v", err)
+	}
+	inodeID2 := createResponse2.GetAttr().GetInode().GetIno()
+	fillAndSealPackWithSeed(t, volume2, ctx, inodeID2, 1000000)
+	if err := volume2.Fsync(ctx, inodeID2); err != nil {
+		t.Fatalf("Fsync volume 2 file 2 failed: %v", err)
+	}
+
+	createResponse3, err := testCreateFile(ctx, server, volume1.volumeID, "/file3.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse3.GetError() != 0 {
+		t.Fatalf("CreateFile volume 1 file 3 failed: %v", err)
+	}
+	inodeID3 := createResponse3.GetAttr().GetInode().GetIno()
+	fillAndSealPackWithSeed(t, volume1, ctx, inodeID3, 2000000)
+	if err := volume1.Fsync(ctx, inodeID3); err != nil {
+		t.Fatalf("Fsync volume 1 file 3 failed: %v", err)
+	}
+
+	createResponse4, err := testCreateFile(ctx, server, volume2.volumeID, "/file4.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse4.GetError() != 0 {
+		t.Fatalf("CreateFile volume 2 file 4 failed: %v", err)
+	}
+	inodeID4 := createResponse4.GetAttr().GetInode().GetIno()
+	fillAndSealPackWithSeed(t, volume2, ctx, inodeID4, 3000000)
+	if err := volume2.Fsync(ctx, inodeID4); err != nil {
+		t.Fatalf("Fsync volume 2 file 4 failed: %v", err)
+	}
+
+	// Wait on the eviction counter and ensure total pack cache bytes end at or under target.
+	waitForEvictorPass(t, server, 1)
+	waitForLocalPackCacheTarget(t, server, targetBytes)
+
+	if current := server.Stats().LocalPackCacheBytes; current > targetBytes {
+		t.Fatalf("expected pack cache bytes <= %d, got %d", targetBytes, current)
+	}
+
+	// Verify that at least one pack was evicted from local disk.
+	var remainingPacks int
+	volume1.stagingMu.Lock()
+	remainingPacks += len(volume1.packs)
+	volume1.stagingMu.Unlock()
+	volume2.stagingMu.Lock()
+	remainingPacks += len(volume2.packs)
+	volume2.stagingMu.Unlock()
+
+	if remainingPacks >= 4 {
+		t.Fatalf("expected fewer than 4 packs remaining after eviction, got %d", remainingPacks)
+	}
+
+	// Verify that data from all files (including evicted packs fetched from object storage) is readable and intact.
+	testFiles := []struct {
+		volume  *Volume
+		inodeID uint64
+		seed    uint64
+	}{
+		{volume: volume1, inodeID: inodeID1, seed: 0},
+		{volume: volume2, inodeID: inodeID2, seed: 1000000},
+		{volume: volume1, inodeID: inodeID3, seed: 2000000},
+		{volume: volume2, inodeID: inodeID4, seed: 3000000},
+	}
+
+	for _, testFile := range testFiles {
+		data, _, _, err := testFile.volume.ReadFile(ctx, testFile.inodeID, 0, 16)
+		if err != nil {
+			t.Fatalf("ReadFile volume %s inode %d failed: %v", testFile.volume.volumeID, testFile.inodeID, err)
+		}
+		expected := make([]byte, 16)
+		binary.BigEndian.PutUint64(expected[0:8], testFile.seed)
+		binary.BigEndian.PutUint64(expected[8:16], testFile.seed+1)
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("ReadFile volume %s inode %d data mismatch: got %v, want %v", testFile.volume.volumeID, testFile.inodeID, data, expected)
+		}
 	}
 }
 

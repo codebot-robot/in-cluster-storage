@@ -241,6 +241,9 @@ const (
 	// DefaultMaxLocalStagingBytes sets the default controller-wide ceiling of unuploaded staged bytes (16 GiB).
 	DefaultMaxLocalStagingBytes int64 = 16 * 1024 * 1024 * 1024
 
+	// DefaultLocalPackCacheTargetBytes sets the default controller-wide target byte size for uploaded pack bytes kept in the local cache across all volumes (1 GiB).
+	DefaultLocalPackCacheTargetBytes int64 = 1024 * 1024 * 1024
+
 	// stagingHighWaterPercent is the percentage of maxStagingBytes at which background draining begins (75%).
 	stagingHighWaterPercent = 75
 
@@ -583,8 +586,9 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 			defaultDurability: pb.MetadataDurability_OPERATION,
 		},
 		diskLimits: serverDiskLimits{
-			maxStagingBytes:     DefaultMaxLocalStagingBytes,
-			packCacheUnderflows: metrics.NewCounter("pack_cache_underflow_total"),
+			maxStagingBytes:      DefaultMaxLocalStagingBytes,
+			packCacheTargetBytes: DefaultLocalPackCacheTargetBytes,
+			packCacheUnderflows:  metrics.NewCounter("pack_cache_underflow_total"),
 		},
 		restoring: make(map[string]bool),
 		drain: stagingDrain{

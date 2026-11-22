@@ -58,8 +58,8 @@ func TestControllerPackCacheBytesAccounting(t *testing.T) {
 	if cacheBytes := server.Stats().LocalPackCacheBytes; cacheBytes != 0 {
 		t.Fatalf("expected initial localPackCacheBytes = 0, got %d", cacheBytes)
 	}
-	if targetBytes := server.Stats().LocalPackCacheTargetBytes; targetBytes != 0 {
-		t.Fatalf("expected initial LocalPackCacheTargetBytes = 0, got %d", targetBytes)
+	if targetBytes := server.Stats().LocalPackCacheTargetBytes; targetBytes != DefaultLocalPackCacheTargetBytes {
+		t.Fatalf("expected initial LocalPackCacheTargetBytes = %d, got %d", DefaultLocalPackCacheTargetBytes, targetBytes)
 	}
 
 	volume1ID := "test-cache-bytes-volume-1"
