@@ -145,22 +145,52 @@ type grantDecisionInputs struct {
 	gracePeriod time.Duration
 }
 
+// grantRefusalReason names the reason a stream writer lock cannot be granted.
+type grantRefusalReason int
+
+const (
+	grantRefusalNone grantRefusalReason = iota
+	grantRefusalLockHeld
+	grantRefusalRecordsInFlight
+	grantRefusalGracePeriod
+)
+
 // grantDecision determines whether the writer lock can be granted to requester, and if so,
-// whether it is a resumed grant. It also returns when the grant decision can next change by time alone.
-func grantDecision(inputs grantDecisionInputs, requester string, now time.Time) (granted bool, resumed bool, nextWake time.Time) {
+// whether it is a resumed grant. When not granted, it returns the refusal reason and when
+// the grant decision can next change by time alone.
+func grantDecision(inputs grantDecisionInputs, requester string, now time.Time) (granted bool, resumed bool, refusal grantRefusalReason, nextWake time.Time) {
 	if requester == "" || inputs.holder == "" {
-		return true, false, time.Time{}
+		return true, false, grantRefusalNone, time.Time{}
 	}
 	if inputs.holder == requester {
-		return true, true, time.Time{}
+		return true, true, grantRefusalNone, time.Time{}
 	}
-	if inputs.attachedSessions != 0 || inputs.inFlight != 0 {
-		return false, false, time.Time{}
+	if inputs.attachedSessions != 0 {
+		return false, false, grantRefusalLockHeld, time.Time{}
+	}
+	if inputs.inFlight != 0 {
+		return false, false, grantRefusalRecordsInFlight, time.Time{}
 	}
 	if inputs.gracePeriod > 0 && !inputs.lastSessionEnd.IsZero() && now.Before(inputs.lastSessionEnd.Add(inputs.gracePeriod)) {
-		return false, false, inputs.lastSessionEnd.Add(inputs.gracePeriod)
+		return false, false, grantRefusalGracePeriod, inputs.lastSessionEnd.Add(inputs.gracePeriod)
 	}
-	return true, false, time.Time{}
+	return true, false, grantRefusalNone, time.Time{}
+}
+
+func grantRefusalStatus(reason grantRefusalReason, remaining time.Duration) error {
+	switch reason {
+	case grantRefusalLockHeld:
+		return status.Errorf(codes.Unavailable, "the lock is held by another client")
+	case grantRefusalRecordsInFlight:
+		return status.Errorf(codes.Unavailable, "records of the previous holder are still being committed")
+	case grantRefusalGracePeriod:
+		if remaining < 0 {
+			remaining = 0
+		}
+		return status.Errorf(codes.Unavailable, "stream writer lock is reserved for its previous holder for %v", remaining)
+	default:
+		return status.Errorf(codes.Unavailable, "stream writer lock is unavailable")
+	}
 }
 
 // newStreamState creates a new streamState initialized with watermarks.
@@ -664,22 +694,13 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 // Remote discovery (EnsureDiscovered) performs backend I/O and must happen before
 // acquiring s.mu.
 //
-// Then, the server lock (s.mu) is held across both find-or-create and registering
-// as a waiter (state.waiters++) to exclude idle-stream eviction (evictIdleStreams);
-// while state.waiters > 0, idle eviction will not evict the stream state.
-//
 // When the writer lock cannot be granted immediately (another client is attached,
-// or the holder detached but records are still queued or committing), the session
-// releases s.mu and waits on state.cond while retaining its count in state.waiters.
-// A waiter is woken when the holder's last session detaches, when the in-flight
-// record count reaches zero, upon context cancellation, or upon server shutdown.
-// A claimant held back only by the grace period is refused and retries. When waking,
-// the two locks are retaken in the canonical order: s.mu first, then state.mu.
+// records of the previous holder are still being committed, or the lock is reserved
+// for its previous holder during the grace period), the session returns at once with
+// codes.Unavailable naming the reason so the client retries with back-off.
 //
 // The lock is decided first; the session epoch is checked only once the writer lock
-// is granted. For sessions presenting a client ID, a different client with a higher
-// epoch waits like any other requester rather than superseding the active holder,
-// and a client with a lower epoch is refused as fenced only when its turn arrives.
+// is granted. A client with a lower epoch is refused as fenced once the lock is acquired.
 // Sessions with an empty client ID bypass the lock and evaluate the epoch check
 // immediately as before.
 //
@@ -702,86 +723,64 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 	// for a session that is then refused as fenced changes nothing a stale writer
 	// controls. A refused session must not change anything else.
 	state.raiseWatermarksLocked(uploadedTo)
-	state.waiters++
 
-	stopWatcher := context.AfterFunc(ctx, func() {
-		state.mu.Lock()
-		state.cond.Broadcast()
+	select {
+	case <-ctx.Done():
 		state.mu.Unlock()
-	})
-	defer stopWatcher()
+		s.mu.Unlock()
+		return nil, 0, 0, false, ctx.Err()
+	case <-s.stopChan:
+		state.mu.Unlock()
+		s.mu.Unlock()
+		return nil, 0, 0, false, status.Errorf(codes.Unavailable, "server shutting down")
+	default:
+	}
 
-	for {
-		var err error
-		select {
-		case <-ctx.Done():
-			err = ctx.Err()
-		case <-s.stopChan:
-			err = status.Errorf(codes.Unavailable, "server shutting down")
-		default:
-		}
-		if err != nil {
-			state.waiters--
-			state.mu.Unlock()
-			s.mu.Unlock()
-			return nil, 0, 0, false, err
-		}
-
-		inputs := grantDecisionInputs{
-			holder:           state.holder,
-			attachedSessions: state.holderSessions,
-			inFlight:         state.inFlight,
-			lastSessionEnd:   state.lastSessionEnd,
-			gracePeriod:      s.writerLockGrace,
-		}
-		now := s.clock.Now()
-		granted, resumed, nextWake := grantDecision(inputs, clientID, now)
-		if granted {
-			state.waiters--
-			if sessionEpoch < state.epoch {
-				acceptedEpoch := state.epoch
-				state.mu.Unlock()
-				s.mu.Unlock()
-				return nil, 0, 0, false, fencedStatus(streamID, sessionEpoch, acceptedEpoch)
-			}
-			if sessionEpoch > state.epoch {
-				state.epoch = sessionEpoch
-				state.cond.Broadcast()
-			}
-			if clientID != "" {
-				state.holder = clientID
-				state.holderSessions++
-				state.lastSessionEnd = time.Time{}
-			}
-			state.attachments++
-			witnessSeq, s3Seq := state.witnessSeq, state.s3Seq
-			state.mu.Unlock()
-			s.mu.Unlock()
-			return state, witnessSeq, s3Seq, resumed, nil
-		}
-
+	inputs := grantDecisionInputs{
+		holder:           state.holder,
+		attachedSessions: state.holderSessions,
+		inFlight:         state.inFlight,
+		lastSessionEnd:   state.lastSessionEnd,
+		gracePeriod:      s.writerLockGrace,
+	}
+	now := s.clock.Now()
+	granted, resumed, refusal, nextWake := grantDecision(inputs, clientID, now)
+	if !granted {
+		state.mu.Unlock()
+		s.mu.Unlock()
+		var remaining time.Duration
 		if !nextWake.IsZero() {
-			state.waiters--
-			state.mu.Unlock()
-			s.mu.Unlock()
-			remaining := nextWake.Sub(now)
+			remaining = nextWake.Sub(now)
 			if remaining < 0 {
 				remaining = 0
 			}
-			return nil, 0, 0, false, status.Errorf(codes.Unavailable, "stream writer lock is reserved for its previous holder for %v", remaining)
 		}
-
-		s.mu.Unlock()
-		state.cond.Wait()
-		state.mu.Unlock()
-
-		s.mu.Lock()
-		state.mu.Lock()
+		return nil, 0, 0, false, grantRefusalStatus(refusal, remaining)
 	}
+
+	if sessionEpoch < state.epoch {
+		acceptedEpoch := state.epoch
+		state.mu.Unlock()
+		s.mu.Unlock()
+		return nil, 0, 0, false, fencedStatus(streamID, sessionEpoch, acceptedEpoch)
+	}
+	if sessionEpoch > state.epoch {
+		state.epoch = sessionEpoch
+		state.cond.Broadcast()
+	}
+	if clientID != "" {
+		state.holder = clientID
+		state.holderSessions++
+		state.lastSessionEnd = time.Time{}
+	}
+	state.attachments++
+	witnessSeq, s3Seq := state.witnessSeq, state.s3Seq
+	state.mu.Unlock()
+	s.mu.Unlock()
+	return state, witnessSeq, s3Seq, resumed, nil
 }
 
-// detachSession detaches an Append session from its stream state and wakes
-// waiters that may be waiting on attachment state changes.
+// detachSession detaches an Append session from its stream state.
 func (s *Server) detachSession(state *streamState, clientID string) {
 	state.mu.Lock()
 	state.attachments--
@@ -791,7 +790,6 @@ func (s *Server) detachSession(state *streamState, clientID string) {
 			state.lastSessionEnd = s.clock.Now()
 		}
 	}
-	state.cond.Broadcast()
 	state.mu.Unlock()
 }
 

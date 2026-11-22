@@ -16,7 +16,6 @@ package buffer
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -78,19 +77,6 @@ func newTestServerWithGrace(t *testing.T, grace time.Duration, clock Clock) *Ser
 	return server
 }
 
-func pollWaiters(t *testing.T, state *streamState, target int) {
-	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
-		state.mu.Lock()
-		waiters := state.waiters
-		state.mu.Unlock()
-		if waiters == target {
-			return
-		}
-	}
-	t.Fatalf("waiters != %d", target)
-}
-
 func TestGrantDecision(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	grace := 15 * time.Second
@@ -101,31 +87,32 @@ func TestGrantDecision(t *testing.T) {
 		requester             string
 		now                   time.Time
 		wantGrant, wantResume bool
+		wantRefusal           grantRefusalReason
 		wantNextWake          time.Time
 	}{
-		{"empty requester", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "", t0, true, false, time.Time{}},
-		{"empty holder", grantDecisionInputs{holder: "", lastSessionEnd: t0}, "client-1", t0, true, false, time.Time{}},
-		{"same client reacquires with session", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "client-1", t0, true, true, time.Time{}},
-		{"same client reacquires after detach", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0}, "client-1", t0, true, true, time.Time{}},
-		{"another client waits while attached", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "client-2", t0, false, false, time.Time{}},
-		{"another client waits on in flight", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0}, "client-2", t0, false, false, time.Time{}},
-		{"another client granted when free", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0}, "client-2", t0, true, false, time.Time{}},
-		{"another client waits inside grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(5 * time.Second), false, false, t0.Add(grace)},
-		{"another client granted at grace expiry", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(grace), true, false, time.Time{}},
-		{"another client granted after grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(20 * time.Second), true, false, time.Time{}},
-		{"same client granted inside grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-1", t0.Add(5 * time.Second), true, true, time.Time{}},
-		{"same client granted after grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-1", t0.Add(20 * time.Second), true, true, time.Time{}},
-		{"another client waits on in flight after grace period", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(20 * time.Second), false, false, time.Time{}},
-		{"another client waits on in flight inside grace period", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(5 * time.Second), false, false, time.Time{}},
-		{"zero lastSessionEnd with grace period is granted", grantDecisionInputs{holder: "client-1", gracePeriod: grace}, "client-2", t0, true, false, time.Time{}},
+		{"empty requester", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "", t0, true, false, grantRefusalNone, time.Time{}},
+		{"empty holder", grantDecisionInputs{holder: "", lastSessionEnd: t0}, "client-1", t0, true, false, grantRefusalNone, time.Time{}},
+		{"same client reacquires with session", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "client-1", t0, true, true, grantRefusalNone, time.Time{}},
+		{"same client reacquires after detach", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0}, "client-1", t0, true, true, grantRefusalNone, time.Time{}},
+		{"another client refused while attached", grantDecisionInputs{holder: "client-1", attachedSessions: 1, lastSessionEnd: t0}, "client-2", t0, false, false, grantRefusalLockHeld, time.Time{}},
+		{"another client refused on in flight", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0}, "client-2", t0, false, false, grantRefusalRecordsInFlight, time.Time{}},
+		{"another client granted when free", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0}, "client-2", t0, true, false, grantRefusalNone, time.Time{}},
+		{"another client refused inside grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(5 * time.Second), false, false, grantRefusalGracePeriod, t0.Add(grace)},
+		{"another client granted at grace expiry", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(grace), true, false, grantRefusalNone, time.Time{}},
+		{"another client granted after grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(20 * time.Second), true, false, grantRefusalNone, time.Time{}},
+		{"same client granted inside grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-1", t0.Add(5 * time.Second), true, true, grantRefusalNone, time.Time{}},
+		{"same client granted after grace period", grantDecisionInputs{holder: "client-1", lastSessionEnd: t0, gracePeriod: grace}, "client-1", t0.Add(20 * time.Second), true, true, grantRefusalNone, time.Time{}},
+		{"another client refused on in flight after grace period", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(20 * time.Second), false, false, grantRefusalRecordsInFlight, time.Time{}},
+		{"another client refused on in flight inside grace period", grantDecisionInputs{holder: "client-1", inFlight: 1, lastSessionEnd: t0, gracePeriod: grace}, "client-2", t0.Add(5 * time.Second), false, false, grantRefusalRecordsInFlight, time.Time{}},
+		{"zero lastSessionEnd with grace period is granted", grantDecisionInputs{holder: "client-1", gracePeriod: grace}, "client-2", t0, true, false, grantRefusalNone, time.Time{}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			gotGrant, gotResume, gotNextWake := grantDecision(testCase.inputs, testCase.requester, testCase.now)
-			if gotGrant != testCase.wantGrant || gotResume != testCase.wantResume || !gotNextWake.Equal(testCase.wantNextWake) {
-				t.Fatalf("grantDecision(%+v, %q, %v) = (%v, %v, %v), want (%v, %v, %v)",
+			gotGrant, gotResume, gotRefusal, gotNextWake := grantDecision(testCase.inputs, testCase.requester, testCase.now)
+			if gotGrant != testCase.wantGrant || gotResume != testCase.wantResume || gotRefusal != testCase.wantRefusal || !gotNextWake.Equal(testCase.wantNextWake) {
+				t.Fatalf("grantDecision(%+v, %q, %v) = (%v, %v, %v, %v), want (%v, %v, %v, %v)",
 					testCase.inputs, testCase.requester, testCase.now,
-					gotGrant, gotResume, gotNextWake,
-					testCase.wantGrant, testCase.wantResume, testCase.wantNextWake)
+					gotGrant, gotResume, gotRefusal, gotNextWake,
+					testCase.wantGrant, testCase.wantResume, testCase.wantRefusal, testCase.wantNextWake)
 			}
 		})
 	}
@@ -143,98 +130,98 @@ func TestWriterLock_GrantAndResume(t *testing.T) {
 	if _, _, _, resumed, err = server.attachSession(ctx, streamID, 1, "client-1"); err != nil || !resumed {
 		t.Fatalf("second attach client-1: err=%v, resumed=%v", err, resumed)
 	}
-	var client2Resumed bool
-	var client2Err error
-	done := make(chan struct{})
-	go func() {
-		_, _, _, client2Resumed, client2Err = server.attachSession(ctx, streamID, 1, "client-2")
-		close(done)
-	}()
-	pollWaiters(t, state, 1)
-	server.detachSession(state, "client-1")
-	pollWaiters(t, state, 1)
-	server.detachSession(state, "client-1")
-	<-done
-	if client2Err != nil || client2Resumed {
-		t.Fatalf("attach client-2: err=%v, resumed=%v", client2Err, client2Resumed)
+
+	// Another client while client-1 is attached is refused with Unavailable.
+	if _, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2"); status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable while attached, got %v", err)
 	}
-	server.detachSession(state, "client-2")
+
+	server.detachSession(state, "client-1")
+
+	// Another client while client-1 still has one attached session is refused with Unavailable.
+	if _, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2"); status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable while first session attached, got %v", err)
+	}
+
+	server.detachSession(state, "client-1")
+
+	// Both sessions of client-1 detached: client-2 is granted.
+	client2State, _, _, resumed, err := server.attachSession(ctx, streamID, 1, "client-2")
+	if err != nil || resumed {
+		t.Fatalf("attach client-2: err=%v, resumed=%v", err, resumed)
+	}
+	server.detachSession(client2State, "client-2")
 	if _, _, _, resumed, err = server.attachSession(ctx, streamID, 1, "client-2"); err != nil || !resumed {
 		t.Fatalf("reacquire client-2: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(state, "client-2")
+	server.detachSession(client2State, "client-2")
 	if _, _, _, resumed, err = server.attachSession(ctx, streamID, 1, "client-1"); err != nil || resumed {
 		t.Fatalf("acquire client-1: err=%v, resumed=%v", err, resumed)
 	}
 	server.detachSession(state, "client-1")
 }
 
-func TestWriterLock_InFlightWaitsUntilCommitted(t *testing.T) {
+func TestWriterLock_RefusedWhileHolderAttached(t *testing.T) {
 	server := newTestServer(t)
 	ctx := t.Context()
 	streamID := uuid.New()
 
 	state, _, _, _, err := server.attachSession(ctx, streamID, 1, "client-1")
 	if err != nil {
-		t.Fatalf("attach: %v", err)
+		t.Fatalf("attach client-1: %v", err)
+	}
+	defer server.detachSession(state, "client-1")
+
+	_, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2")
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected codes.Unavailable, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "the lock is held by another client") {
+		t.Fatalf("expected lock held message, got %v", err)
+	}
+	if strings.Contains(err.Error(), "client-1") || strings.Contains(err.Error(), "client-2") {
+		t.Fatalf("message must not leak client IDs: %v", err)
+	}
+}
+
+func TestWriterLock_InFlightRefusedUntilCommitted(t *testing.T) {
+	server := newTestServer(t)
+	ctx := t.Context()
+	streamID := uuid.New()
+
+	state, _, _, _, err := server.attachSession(ctx, streamID, 1, "client-1")
+	if err != nil {
+		t.Fatalf("attach client-1: %v", err)
 	}
 	state.mu.Lock()
 	state.inFlight = 1
 	state.mu.Unlock()
 	server.detachSession(state, "client-1")
 
-	var witness uint64
-	done := make(chan error, 1)
-	go func() {
-		var resumed bool
-		_, witness, _, resumed, err = server.attachSession(ctx, streamID, 1, "client-2")
-		if resumed {
-			err = errors.New("expected resumed=false")
-		}
-		done <- err
-	}()
-	pollWaiters(t, state, 1)
+	// Another client while records are still in flight is refused with Unavailable.
+	_, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2")
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected codes.Unavailable, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "records of the previous holder are still being committed") {
+		t.Fatalf("expected records in flight message, got %v", err)
+	}
+	if strings.Contains(err.Error(), "client-1") || strings.Contains(err.Error(), "client-2") {
+		t.Fatalf("message must not leak client IDs: %v", err)
+	}
+
+	// Commit the in-flight item.
 	server.commitItems(ctx, []incomingItem{{streamID: streamID, streamSeq: 42, epoch: 1, payload: []byte("rec")}})
-	if err := <-done; err != nil || witness != 42 {
-		t.Fatalf("attach client-2: err=%v, witness=%d", err, witness)
-	}
-	server.detachSession(state, "client-2")
-}
 
-func TestWriterLock_CancelAndCloseWhileWaiting(t *testing.T) {
-	server := newTestServer(t)
-	ctx := t.Context()
-	streamID := uuid.New()
-
-	state, _, _, _, err := server.attachSession(ctx, streamID, 1, "client-1")
-	if err != nil {
-		t.Fatalf("attach: %v", err)
+	// Client-2 connects again: granted, and watermark equals stream's watermark (42).
+	client2State, witnessSeq, _, resumed, err := server.attachSession(ctx, streamID, 1, "client-2")
+	if err != nil || resumed {
+		t.Fatalf("attach client-2 after commit: err=%v, resumed=%v", err, resumed)
 	}
-	waitCtx, cancel := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	go func() {
-		_, _, _, _, err := server.attachSession(waitCtx, streamID, 1, "client-2")
-		done <- err
-	}()
-	pollWaiters(t, state, 1)
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
+	if witnessSeq != 42 {
+		t.Fatalf("expected witness watermark 42, got %d", witnessSeq)
 	}
-	pollWaiters(t, state, 0)
-
-	go func() {
-		_, _, _, _, err := server.attachSession(ctx, streamID, 1, "client-2")
-		done <- err
-	}()
-	pollWaiters(t, state, 1)
-	if err := server.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if err := <-done; err == nil {
-		t.Fatal("expected error on Close, got nil")
-	}
-	pollWaiters(t, state, 0)
+	server.detachSession(client2State, "client-2")
 }
 
 func TestWriterLock_EmptyClientID(t *testing.T) {
@@ -457,44 +444,6 @@ func TestWriterLock_GracePeriodRefusesOtherClient(t *testing.T) {
 	server.detachSession(client2State, "client-2")
 }
 
-func TestWriterLock_WaitingClientReleasedWithUnavailableOnHolderDetach(t *testing.T) {
-	clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
-	server := newTestServerWithGrace(t, 15*time.Second, clock)
-	streamID := uuid.New()
-	ctx := t.Context()
-
-	state, _, _, _, err := server.attachSession(ctx, streamID, 1, "client-1")
-	if err != nil {
-		t.Fatalf("attach client-1: %v", err)
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		_, _, _, _, err := server.attachSession(ctx, streamID, 1, "client-2")
-		done <- err
-	}()
-	pollWaiters(t, state, 1)
-
-	// Holder detaches: grace period starts, releasing waiting client with Unavailable.
-	server.detachSession(state, "client-1")
-
-	select {
-	case err := <-done:
-		if status.Code(err) != codes.Unavailable {
-			t.Fatalf("expected codes.Unavailable, got %v", err)
-		}
-		if !strings.Contains(err.Error(), "stream writer lock is reserved for its previous holder") {
-			t.Fatalf("expected reservation message, got %v", err)
-		}
-		if strings.Contains(err.Error(), "client-1") || strings.Contains(err.Error(), "client-2") {
-			t.Fatalf("message must not leak client IDs: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for client-2 to be released on holder detach")
-	}
-	pollWaiters(t, state, 0)
-}
-
 func TestWriterLock_SameClientGrantedInsideGracePeriod(t *testing.T) {
 	server, clock, state, streamID := setupGraceTest(t)
 
@@ -509,33 +458,90 @@ func TestWriterLock_SameClientGrantedInsideGracePeriod(t *testing.T) {
 	server.detachSession(state, "client-1")
 }
 
-func TestWriterLock_InFlightHoldsLockAfterGracePeriod(t *testing.T) {
-	server, clock, state, streamID := setupGraceTest(t)
+func TestAppend_RefusedHelloOverWire(t *testing.T) {
 	ctx := t.Context()
+	_, address, cleanup := startTestServer(t, inmemorystorage.New(), t.TempDir())
+	t.Cleanup(func() {
+		cleanup()
+	})
 
-	state.mu.Lock()
-	state.inFlight = 1
-	state.mu.Unlock()
+	streamID := uuid.New()
+	clientID1 := []byte("client-wire-1")
+	clientID2 := []byte("client-wire-2")
 
-	// Advance clock past grace period: inFlight still holds the lock back.
-	clock.Advance(20 * time.Second)
+	// Client 1 connects and attaches.
+	session1Ctx, cancel1 := context.WithCancel(ctx)
+	defer cancel1()
 
-	done := make(chan error, 1)
-	go func() {
-		_, _, _, resumed, err := server.attachSession(ctx, streamID, 1, "client-2")
-		if resumed {
-			err = errors.New("expected resumed=false")
-		}
-		done <- err
-	}()
-	pollWaiters(t, state, 1)
-
-	// Committing the item clears inFlight and wakes client-2.
-	server.commitItems(ctx, []incomingItem{{streamID: streamID, streamSeq: 42, epoch: 1, payload: []byte("rec")}})
-	if err := <-done; err != nil {
-		t.Fatalf("attach client-2 after in-flight commit: %v", err)
+	connection1, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
 	}
-	server.detachSession(state, "client-2")
+	defer func() {
+		if err := connection1.Close(); err != nil {
+			t.Errorf("connection1.Close: %v", err)
+		}
+	}()
+
+	stream1, err := pb.NewWalBufferClient(connection1).Append(session1Ctx)
+	if err != nil {
+		t.Fatalf("Append 1: %v", err)
+	}
+	if err := stream1.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{
+			Hello: &pb.Hello{
+				StreamId: streamID[:],
+				Epoch:    1,
+				ClientId: clientID1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Hello 1: %v", err)
+	}
+	response1, err := stream1.Recv()
+	if err != nil {
+		t.Fatalf("Recv HelloAck 1: %v", err)
+	}
+	if response1.GetHelloAck() == nil {
+		t.Fatalf("expected HelloAck, got %v", response1)
+	}
+
+	// Client 2 connects to the same stream: Hello is refused and ends RPC with Unavailable.
+	connection2, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer func() {
+		if err := connection2.Close(); err != nil {
+			t.Errorf("connection2.Close: %v", err)
+		}
+	}()
+
+	stream2, err := pb.NewWalBufferClient(connection2).Append(ctx)
+	if err != nil {
+		t.Fatalf("Append 2: %v", err)
+	}
+	if err := stream2.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{
+			Hello: &pb.Hello{
+				StreamId: streamID[:],
+				Epoch:    1,
+				ClientId: clientID2,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Hello 2: %v", err)
+	}
+	_, err = stream2.Recv()
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected codes.Unavailable, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "the lock is held by another client") {
+		t.Fatalf("expected lock held message, got %v", err)
+	}
+	if strings.Contains(err.Error(), "client-wire-1") || strings.Contains(err.Error(), "client-wire-2") {
+		t.Fatalf("message must not leak client IDs: %v", err)
+	}
 }
 
 func TestWriterLock_IdleEvictionKeepsStreamInsideGracePeriod(t *testing.T) {
