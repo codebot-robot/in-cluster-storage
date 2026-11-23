@@ -2413,7 +2413,10 @@ func (v *Volume) Close() error {
 	v.uploadWaitGroup.Wait()
 
 	v.stagingMu.Lock()
-	v.subtractStagedBytesLocked(v.stagedBytes)
+	// Close discards the staged state as a whole so the count and the chunk maps stay in step.
+	for inodeID := range v.stagedChunks {
+		v.dropStagedChunksLocked(inodeID)
+	}
 	if removeErr := v.removeStagingDirLocked(); removeErr != nil {
 		klog.Warningf("failed removing staging directory: %v", removeErr)
 	}
