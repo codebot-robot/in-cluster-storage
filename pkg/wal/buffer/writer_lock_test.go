@@ -990,16 +990,59 @@ func TestWriterLock_FailedSave(t *testing.T) {
 	if err != nil || !resumed {
 		t.Fatalf("repeat attach client-1: err=%v, resumed=%v", err, resumed)
 	}
-	defer server.detachSession(state2, "client-1")
 
 	if failingStore.saves.Load() != 2 {
 		t.Fatalf("repeat grant must not save, got %d saves", failingStore.saves.Load())
 	}
+
+	// 4. Detach all sessions of client-1: client-1 is now the previous holder.
+	server.detachSession(state, "client-1")
+	server.detachSession(state2, "client-1")
+
+	// 5. Client-2 attempts attach: client-2 is granted decision, but save fails.
+	failingStore.failSave.Store(true)
+	_, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2")
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable on failed save for client-2, got %v", err)
+	}
+	if failingStore.saves.Load() != 3 {
+		t.Fatalf("expected 3 save calls after client-2 failed save, got %d", failingStore.saves.Load())
+	}
+
+	// 6. Client-1 returns and is granted: because the previous save failed, save must be
+	// called for client-1 even though client-1 matches the existing file contents on disk.
+	state3, _, _, resumed, err := server.attachSession(ctx, streamID, 1, "client-1")
+	if err != nil {
+		t.Fatalf("attach client-1 after failed save of client-2: %v", err)
+	}
+	if !resumed {
+		t.Fatal("expected resumed=true for client-1, got false")
+	}
+	defer server.detachSession(state3, "client-1")
+
+	if failingStore.saves.Load() != 4 {
+		t.Fatalf("expected save to be called for client-1 after client-2 failed save (saves=4), got %d", failingStore.saves.Load())
+	}
 }
+
+type yieldingHolderStore struct {
+	writerLockStore
+}
+
+func (y *yieldingHolderStore) save(streamID uuid.UUID, clientID string) error {
+	runtime.Gosched()
+	return y.writerLockStore.save(streamID, clientID)
+}
+
+var (
+	_ writerLockStore = (*yieldingHolderStore)(nil)
+	_                 = (*yieldingHolderStore).save
+)
 
 func TestWriterLock_ContentionWithEviction(t *testing.T) {
 	ctx := t.Context()
 	server := newTestServer(t)
+	server.holderStore = &yieldingHolderStore{writerLockStore: server.holderStore}
 
 	streamID := uuid.New()
 	stopEviction := make(chan struct{})
@@ -1020,7 +1063,6 @@ func TestWriterLock_ContentionWithEviction(t *testing.T) {
 	}()
 
 	var activeHolders atomic.Int32
-	var maxConcurrentHolders atomic.Int32
 	var attachWg sync.WaitGroup
 
 	const targetGrants = 5
@@ -1037,11 +1079,12 @@ func TestWriterLock_ContentionWithEviction(t *testing.T) {
 					continue
 				}
 				current := activeHolders.Add(1)
-				for {
-					maxVal := maxConcurrentHolders.Load()
-					if current <= maxVal || maxConcurrentHolders.CompareAndSwap(maxVal, current) {
-						break
-					}
+				if current != 1 {
+					t.Errorf("expected 1 active holder, got %d", current)
+				}
+				loaded, err := server.holderStore.load(streamID)
+				if err != nil || loaded != clientID {
+					t.Errorf("file on disk has (%q, %v), want (%q, nil)", loaded, err, clientID)
 				}
 				grants++
 				runtime.Gosched()
@@ -1054,10 +1097,6 @@ func TestWriterLock_ContentionWithEviction(t *testing.T) {
 	attachWg.Wait()
 	close(stopEviction)
 	evictionWg.Wait()
-
-	if maxConcurrent := maxConcurrentHolders.Load(); maxConcurrent > 1 {
-		t.Fatalf("observed %d concurrent holders, want at most 1", maxConcurrent)
-	}
 }
 
 func TestWriterLock_CorruptAndUnreadableFile(t *testing.T) {
