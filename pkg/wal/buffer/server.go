@@ -87,6 +87,9 @@ type incomingItem struct {
 }
 
 type streamState struct {
+	// holderFile tracks the stream's writer lock holder file on disk.
+	holderFile holderFile
+
 	// mu guards all mutable fields below.
 	mu sync.Mutex
 
@@ -166,7 +169,10 @@ const (
 // whether it is a resumed grant. When refused, it returns the refusal decision and when
 // the grant decision can next change by time alone.
 func decideGrant(inputs grantDecisionInputs, requester string, now time.Time) (decision grantDecision, resumed bool, nextWake time.Time) {
-	if requester == "" || inputs.holder == "" {
+	if requester == "" {
+		return grantDecisionLockGranted, false, time.Time{}
+	}
+	if inputs.holder == "" {
 		return grantDecisionLockGranted, false, time.Time{}
 	}
 	if inputs.holder == requester {
@@ -252,6 +258,9 @@ type Server struct {
 
 	// clock provides time operations for lock grace periods.
 	clock Clock
+
+	// holderStore persists and loads stream writer lock holders.
+	holderStore writerLockStore
 
 	// backend is the object storage backend used for flushing segments and stream discovery.
 	backend objectstore.Backend
@@ -375,6 +384,8 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		cfg.Clock = realClock{}
 	}
 
+	holderStore := newDiskWriterLockStore(filepath.Join(cfg.DataDir, "writer-locks"))
+
 	dataDir := cfg.DataDir
 	streamStore := NewStreamStore(dataDir, cfg.Backend, cfg.StreamSealInterval, cfg.StreamSealBytes)
 	if cfg.AcceptUnversioned {
@@ -491,6 +502,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		backend:             cfg.Backend,
 		writerLockGrace:     cfg.WriterLockGrace,
 		clock:               cfg.Clock,
+		holderStore:         holderStore,
 		lastPosition:        localMaxPos,
 		lastFlushedPosition: lastFlushedPos,
 		flushedSegments:     discoveredSegments,
@@ -643,7 +655,9 @@ func (s *Server) evictIdleStreams() {
 	for sid, st := range s.streams {
 		st.mu.Lock()
 		inGrace := st.holder != "" && s.writerLockGrace > 0 && !st.lastSessionEnd.IsZero() && s.clock.Now().Before(st.lastSessionEnd.Add(s.writerLockGrace))
-		active := st.attachments > 0 || st.waiters > 0 || st.inFlight > 0 || inGrace
+		// The state must not be evicted if the holder file's last save failed or if an attach
+		// is currently in progress: the knowledge lives only in memory, so the state must outlive it.
+		active := st.attachments > 0 || st.waiters > 0 || st.inFlight > 0 || inGrace || !st.holderFile.contentsKnown()
 		witnessSeq := st.witnessSeq
 		s3Seq := st.s3Seq
 		st.mu.Unlock()
@@ -707,15 +721,11 @@ func (s *Server) getOrCreateStream(ctx context.Context, streamID uuid.UUID) *str
 // for its previous holder during the grace period), the session returns at once with
 // codes.Unavailable naming the reason so the client retries with back-off.
 //
-// The lock is decided first; the session epoch is checked only once the writer lock
-// is granted. A client with a lower epoch is refused as fenced once the lock is acquired.
-// Sessions with an empty client ID bypass the lock and evaluate the epoch check
-// immediately as before.
+// The stream's writer lock holder file (<dataDir>/writer-locks/<streamID>) is loaded
+// once after the stream state is created and written only when the holder changes.
 //
-// The lock grant, epoch check, and watermark read happen atomically in one section
-// under both locks (s.mu and state.mu), ensuring a batch commit cannot interleave
-// between granting the lock and reading witnessSeq and s3Seq.
-func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionEpoch uint64, clientID string) (*streamState, uint64, uint64, bool, error) {
+// Lock order: holderFile.mu, then Server.mu, then streamState.mu.
+func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionEpoch uint64, clientID string) (retState *streamState, retWitnessSeq uint64, retS3Seq uint64, retResumed bool, retErr error) {
 	var uploadedTo uint64
 	if s.streamStore != nil {
 		uploadedTo = s.streamStore.EnsureDiscovered(ctx, streamID)
@@ -731,6 +741,42 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 	// for a session that is then refused as fenced changes nothing a stale writer
 	// controls. A refused session must not change anything else.
 	state.raiseWatermarksLocked(uploadedTo)
+	state.attachments++
+	state.mu.Unlock()
+	s.mu.Unlock()
+
+	defer func() {
+		if retErr != nil {
+			state.mu.Lock()
+			state.attachments--
+			state.mu.Unlock()
+		}
+	}()
+
+	state.holderFile.mu.Lock()
+	defer state.holderFile.mu.Unlock()
+
+	var (
+		holder    string
+		firstLoad bool
+	)
+	if clientID != "" {
+		var err error
+		holder, firstLoad, err = state.holderFile.loadLocked(s.holderStore, streamID)
+		if err != nil {
+			scoped.Log(ctx).Error(err, "failed to load stream writer lock holder", "stream", streamID)
+			return nil, 0, 0, false, status.Errorf(codes.Internal, "failed to load stream writer lock holder")
+		}
+	}
+
+	s.mu.Lock()
+	state.mu.Lock()
+
+	if firstLoad && holder != "" {
+		state.holder = holder
+		state.holderSessions = 0
+		state.lastSessionEnd = s.clock.Now()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -772,6 +818,23 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 		s.mu.Unlock()
 		return nil, 0, 0, false, fencedStatus(streamID, sessionEpoch, acceptedEpoch)
 	}
+
+	if clientID != "" && state.holderFile.needsSaveLocked(clientID) {
+		// Unlock Server.mu and streamState.mu to perform file I/O.
+		// No re-checks are needed after the save: every attaching session of
+		// this stream is waiting on holderFile.mu, so no session attaches and the epoch cannot rise.
+		state.mu.Unlock()
+		s.mu.Unlock()
+
+		if err := state.holderFile.saveLocked(s.holderStore, streamID, clientID); err != nil {
+			scoped.Log(ctx).Error(err, "failed to save stream writer lock holder", "stream", streamID)
+			return nil, 0, 0, false, status.Errorf(codes.Unavailable, "failed to save stream writer lock holder")
+		}
+
+		s.mu.Lock()
+		state.mu.Lock()
+	}
+
 	if sessionEpoch > state.epoch {
 		state.epoch = sessionEpoch
 		state.cond.Broadcast()
@@ -781,7 +844,6 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 		state.holderSessions++
 		state.lastSessionEnd = time.Time{}
 	}
-	state.attachments++
 	witnessSeq, s3Seq := state.witnessSeq, state.s3Seq
 	state.mu.Unlock()
 	s.mu.Unlock()
