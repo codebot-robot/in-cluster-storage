@@ -851,13 +851,26 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 }
 
 // detachSession detaches an Append session from its stream state.
-func (s *Server) detachSession(state *streamState, clientID string) {
+//
+// released reports whether the session ended cleanly (the client half-closed the
+// stream, all in-flight records were committed, and Append returned nil). Only a
+// clean end-of-stream path sets released to true to release the writer lock
+// immediately, clearing the holder so the next client's Hello is granted at once.
+// Any other termination (context cancellation, severed connection, server shutdown,
+// or commit errors) leaves released false so the lock remains reserved for the
+// previous holder for the grace period.
+func (s *Server) detachSession(state *streamState, clientID string, released bool) {
 	state.mu.Lock()
 	state.attachments--
 	if clientID != "" && state.holder == clientID && state.holderSessions > 0 {
 		state.holderSessions--
 		if state.holderSessions == 0 {
-			state.lastSessionEnd = s.clock.Now()
+			if released {
+				state.holder = ""
+				state.lastSessionEnd = time.Time{}
+			} else {
+				state.lastSessionEnd = s.clock.Now()
+			}
 		}
 	}
 	state.mu.Unlock()
@@ -907,7 +920,10 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		return err
 	}
 
-	defer s.detachSession(st, clientID)
+	var released bool
+	defer func() {
+		s.detachSession(st, clientID, released)
+	}()
 
 	scoped.Log(ctx).Info("WAL buffer: Hello received", "witnessWatermark", witnessSeq, "s3Watermark", s3Seq)
 
@@ -1105,6 +1121,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 					return status.Errorf(codes.Internal, "commit failed: %v", commitErr)
 				}
 				st.mu.Unlock()
+				released = true
 				return nil
 			}
 			return result.err
