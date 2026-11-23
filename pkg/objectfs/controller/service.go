@@ -196,6 +196,10 @@ type serverMetadataConfig struct {
 }
 
 // serverDiskLimits groups configuration, accounting, and synchronization for controller-wide staging limits and local pack cache accounting.
+//
+// Local disk usage is bounded by two mechanisms: staged data is bounded by
+// --max-staging-bytes per volume and --max-local-staging-bytes controller-wide;
+// uploaded packs are kept near the controller-wide soft target only.
 type serverDiskLimits struct {
 	// mu guards controller-wide disk accounting fields and coordinates spaceAvailable.
 	mu sync.Mutex

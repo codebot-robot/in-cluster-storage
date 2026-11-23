@@ -274,8 +274,7 @@ type volumeLimits struct {
 	// Defaults to 30 seconds.
 	openBarrierTimeout time.Duration
 
-	// maxStagingBytes sets the maximum byte bound for in-memory staged writes on this volume.
-	// Defaults to 64 MiB.
+	// maxStagingBytes sets the maximum bytes of staged, not yet uploaded, data on this volume; defaults to 64 MiB.
 	maxStagingBytes int64
 }
 
@@ -819,51 +818,6 @@ func (v *Volume) deletePackLocked(packID uint64) {
 	delete(v.packs, packID)
 }
 
-func (v *Volume) evictUploadedPacksLocked(neededBytes int64) {
-	var total int64
-	type eligiblePack struct {
-		packID   uint64
-		lastRead time.Time
-	}
-	var eligible []eligiblePack
-	for packID, info := range v.packs {
-		if info.pack != nil {
-			total += info.pack.ByteSize()
-		}
-		if info.state == packUploaded && info.liveReferences <= 0 {
-			var lastRead time.Time
-			if info.pack != nil {
-				lastRead = info.pack.LastRead()
-			}
-			eligible = append(eligible, eligiblePack{
-				packID:   packID,
-				lastRead: lastRead,
-			})
-		}
-	}
-	if total+neededBytes <= v.limits.maxStagingBytes || len(eligible) == 0 {
-		return
-	}
-	sort.Slice(eligible, func(i, j int) bool {
-		if !eligible[i].lastRead.Equal(eligible[j].lastRead) {
-			return eligible[i].lastRead.Before(eligible[j].lastRead)
-		}
-		return eligible[i].packID < eligible[j].packID
-	})
-	for _, candidate := range eligible {
-		info := v.packs[candidate.packID]
-		var packSize int64
-		if info != nil && info.pack != nil {
-			packSize = info.pack.ByteSize()
-		}
-		v.deletePackLocked(candidate.packID)
-		total -= packSize
-		if total+neededBytes <= v.limits.maxStagingBytes {
-			break
-		}
-	}
-}
-
 func (v *Volume) dropPackReferenceLocked(packID uint64) {
 	if info, ok := v.packs[packID]; ok {
 		info.liveReferences--
@@ -888,10 +842,7 @@ func (v *Volume) dropPackReferenceLocked(packID uint64) {
 // staged, a subsequent retry will append them again.
 //
 // On success (err == nil):
-// It first calls evictUploadedPacksLocked(0) to delete unreferenced uploaded packfiles
-// from disk if total pack usage exceeds v.maxStagingBytes (because live references for
-// this sync's chunks are still held at this point, packs released by this sync are evicted
-// by a later call). For each chunk in snapshotChunks whose reference in v.stagedChunks has
+// For each chunk in snapshotChunks whose reference in v.stagedChunks has
 // not been overwritten by a newer write, it drops the reference via dropStagedChunkLocked
 // (lowering v.stagedBytes and the packfile's live references). It clears any prior
 // v.lastSyncError for those inodes.
@@ -920,8 +871,6 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 			v.lastSyncError[sIno] = err
 		}
 	} else {
-		v.evictUploadedPacksLocked(0)
-
 		for ino, chunks := range snapshotChunks {
 			for index, reference := range chunks {
 				if currentReference, ok := v.stagedChunks[ino][index]; ok && currentReference == reference {
@@ -956,10 +905,7 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 // Unlike finishRealSync, it records nothing in v.lastSyncError.
 //
 // On success (err == nil):
-// It calls evictUploadedPacksLocked(0) to delete unreferenced uploaded packfiles from disk
-// if total pack usage exceeds v.maxStagingBytes.
-//
-// Finally, it delegates to completeWaitersAndRearmLocked under v.stagingMu to deliver pos
+// It delegates to completeWaitersAndRearmLocked under v.stagingMu to deliver pos
 // and err to matching waiters.
 //
 // Parameters:
@@ -971,10 +917,6 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 func (v *Volume) finishEmptySync(snapshotSeq uint64, err error, pos uint64, inodeFilter map[uint64]struct{}) error {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
-
-	if err == nil {
-		v.evictUploadedPacksLocked(0)
-	}
 
 	v.completeWaitersAndRearmLocked(snapshotSeq, err, pos, inodeFilter)
 	return err
@@ -4858,7 +4800,6 @@ func (v *Volume) startPackUploadLocked(packID uint64) {
 }
 
 func (v *Volume) appendChunkLocked(ctx context.Context, data []byte) (stagedChunkReference, error) {
-	v.evictUploadedPacksLocked(int64(len(data)))
 	if v.activePack == nil {
 		v.nextPackID++
 		packID := v.nextPackID
