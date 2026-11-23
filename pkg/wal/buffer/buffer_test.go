@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -108,24 +109,53 @@ type testBufferHandle struct {
 	grpcServer *grpc.Server
 	listener   net.Listener
 	addr       string
+	stopOnce   sync.Once
 }
 
 func (h *testBufferHandle) StopGraceful() {
-	h.grpcServer.Stop()
-	_ = h.srv.Close()
-	_ = h.listener.Close()
+	h.stopOnce.Do(func() {
+		h.grpcServer.Stop()
+		_ = h.srv.Close()
+		_ = h.listener.Close()
+	})
 }
 
 func (h *testBufferHandle) StopWithoutFlush() {
-	h.grpcServer.Stop()
-	_ = h.listener.Close()
-	close(h.srv.stopChan)
-	if h.srv.localStore != nil {
-		_ = h.srv.localStore.Close()
-	}
-	if h.srv.dataDirectoryLock != nil {
-		_ = h.srv.dataDirectoryLock.Close()
-	}
+	h.stopOnce.Do(func() {
+		h.grpcServer.Stop()
+		_ = h.listener.Close()
+
+		var closed bool
+		h.srv.stopOnce.Do(func() {
+			close(h.srv.stopChan)
+			closed = true
+		})
+		if closed {
+			h.srv.mu.RLock()
+			for _, st := range h.srv.streams {
+				st.mu.Lock()
+				st.cond.Broadcast()
+				st.mu.Unlock()
+			}
+			h.srv.mu.RUnlock()
+
+			_ = waitWithTimeout(&h.srv.groupCommitWg, loopShutdownTimeout, "groupCommitLoop")
+			_ = waitWithTimeout(&h.srv.periodicFlushWg, loopShutdownTimeout, "periodicFlushLoop")
+			_ = waitWithTimeout(&h.srv.backgroundFlushWg, loopShutdownTimeout, "backgroundFlush")
+		}
+
+		if h.srv.streamStore != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), loopShutdownTimeout)
+			defer cancel()
+			_ = h.srv.streamStore.Close(ctx)
+		}
+		if h.srv.localStore != nil {
+			_ = h.srv.localStore.Close()
+		}
+		if h.srv.dataDirectoryLock != nil {
+			_ = h.srv.dataDirectoryLock.Close()
+		}
+	})
 }
 
 func startTestServerHandle(t *testing.T, backend objectstore.Backend, dataDir string) *testBufferHandle {
@@ -152,12 +182,16 @@ func startTestServerHandle(t *testing.T, backend objectstore.Backend, dataDir st
 		_ = grpcServer.Serve(listener)
 	}()
 
-	return &testBufferHandle{
+	handle := &testBufferHandle{
 		srv:        srv,
 		grpcServer: grpcServer,
 		listener:   listener,
 		addr:       listener.Addr().String(),
 	}
+	t.Cleanup(func() {
+		handle.StopGraceful()
+	})
+	return handle
 }
 
 func TestNewServerRequiresDataDir(t *testing.T) {
@@ -831,6 +865,25 @@ func TestRestartWithoutFlush_WitnessWatermarkNoRegression(t *testing.T) {
 
 	// Stop handle1 WITHOUT calling Flush or Close (simulate ungraceful restart with data on disk)
 	handle1.StopWithoutFlush()
+
+	// Assert handle1 stopped background loops and stream store without writing further
+	if loops := handle1.srv.ActiveLoops(); loops != 0 {
+		t.Fatalf("expected 0 active loops on handle1 after StopWithoutFlush, got %d", loops)
+	}
+	select {
+	case <-handle1.srv.streamStore.stopChan:
+	default:
+		t.Fatalf("expected handle1 streamStore to be stopped after StopWithoutFlush")
+	}
+
+	// Verify no segments were flushed to object storage backend before restart
+	discovered, _, err := ListSegmentsFromBackend(ctx, backend)
+	if err != nil {
+		t.Fatalf("ListSegmentsFromBackend failed: %v", err)
+	}
+	if len(discovered) != 0 {
+		t.Fatalf("expected 0 flushed segments in backend after ungraceful stop, got %d: %v", len(discovered), discovered)
+	}
 
 	// 2. Incarnation 2: restart on the same dataDir without prior flush
 	handle2 := startTestServerHandle(t, backend, dataDir)
