@@ -1036,6 +1036,8 @@ func (s *schedHolderStore) save(streamID uuid.UUID, clientID string) error {
 	return s.writerLockStore.save(streamID, clientID)
 }
 
+var _ = (*schedHolderStore).save
+
 func TestWriterLock_ContentionWithEviction(t *testing.T) {
 	ctx := t.Context()
 	server := newTestServer(t)
