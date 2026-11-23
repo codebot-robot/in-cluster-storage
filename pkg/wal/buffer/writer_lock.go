@@ -155,13 +155,13 @@ func (f *holderFile) loadLocked(store writerLockStore, streamID uuid.UUID) (hold
 	if f.loaded {
 		return f.contents, false, nil
 	}
-	holder, err = store.load(streamID)
+	recorded, err := store.load(streamID)
 	if err != nil {
 		return "", false, err
 	}
 	f.loaded = true
-	f.contents = holder
-	return holder, true, nil
+	f.contents = recorded
+	return recorded, true, nil
 }
 
 // needsSaveLocked reports whether the holder file needs to be saved for clientID.

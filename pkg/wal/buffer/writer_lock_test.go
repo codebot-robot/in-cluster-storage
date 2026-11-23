@@ -922,7 +922,8 @@ func TestWriterLock_BlockedSave(t *testing.T) {
 
 func TestWriterLock_FailedSave(t *testing.T) {
 	ctx := t.Context()
-	server := newTestServer(t)
+	clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	server := newTestServerWithGrace(t, 15*time.Second, clock)
 
 	failingStore := &testHolderStore{
 		writerLockStore: server.holderStore,
@@ -967,7 +968,6 @@ func TestWriterLock_FailedSave(t *testing.T) {
 	if resumed {
 		t.Fatal("expected resumed=false on first successful grant, got true")
 	}
-	defer server.detachSession(state, "client-1")
 
 	if failingStore.saves.Load() != 2 {
 		t.Fatalf("expected 2 save calls, got %d", failingStore.saves.Load())
@@ -995,54 +995,57 @@ func TestWriterLock_FailedSave(t *testing.T) {
 		t.Fatalf("repeat grant must not save, got %d saves", failingStore.saves.Load())
 	}
 
-	// 4. Detach all sessions of client-1: client-1 is now the previous holder.
+	// Detach both sessions of client A so holderSessions is 0.
 	server.detachSession(state, "client-1")
 	server.detachSession(state2, "client-1")
 
-	// 5. Client-2 attempts attach: client-2 is granted decision, but save fails.
+	// 4. Client A has detached. After the grace period, client B's save fails
+	// (the wrapper fails it after writing nothing).
+	clock.Advance(20 * time.Second)
 	failingStore.failSave.Store(true)
+
 	_, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2")
 	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("expected Unavailable on failed save for client-2, got %v", err)
+		t.Fatalf("expected Unavailable on client-2 failed save, got %v", err)
 	}
 	if failingStore.saves.Load() != 3 {
 		t.Fatalf("expected 3 save calls after client-2 failed save, got %d", failingStore.saves.Load())
 	}
 
-	// 6. Client-1 returns and is granted: because the previous save failed, save must be
-	// called for client-1 even though client-1 matches the existing file contents on disk.
-	state3, _, _, resumed, err := server.attachSession(ctx, streamID, 1, "client-1")
+	// Client A says Hello again: granted, and save must have been called for A,
+	// even though the file was last known to name A.
+	state3, _, _, _, err := server.attachSession(ctx, streamID, 1, "client-1")
 	if err != nil {
-		t.Fatalf("attach client-1 after failed save of client-2: %v", err)
-	}
-	if !resumed {
-		t.Fatal("expected resumed=true for client-1, got false")
+		t.Fatalf("attach client-1 after client-2 failed save: %v", err)
 	}
 	defer server.detachSession(state3, "client-1")
 
 	if failingStore.saves.Load() != 4 {
-		t.Fatalf("expected save to be called for client-1 after client-2 failed save (saves=4), got %d", failingStore.saves.Load())
+		t.Fatalf("expected 4 save calls (save must be called for client-1 after failed save), got %d", failingStore.saves.Load())
 	}
 }
 
-type yieldingHolderStore struct {
+// schedHolderStore wraps writerLockStore to yield execution inside save so
+// idle eviction can run while a save is in progress.
+type schedHolderStore struct {
 	writerLockStore
 }
 
-func (y *yieldingHolderStore) save(streamID uuid.UUID, clientID string) error {
+func (s *schedHolderStore) save(streamID uuid.UUID, clientID string) error {
 	runtime.Gosched()
-	return y.writerLockStore.save(streamID, clientID)
+	return s.writerLockStore.save(streamID, clientID)
 }
-
-var (
-	_ writerLockStore = (*yieldingHolderStore)(nil)
-	_                 = (*yieldingHolderStore).save
-)
 
 func TestWriterLock_ContentionWithEviction(t *testing.T) {
 	ctx := t.Context()
 	server := newTestServer(t)
-	server.holderStore = &yieldingHolderStore{writerLockStore: server.holderStore}
+
+	diskStore, ok := server.holderStore.(*diskWriterLockStore)
+	if !ok {
+		t.Fatalf("expected *diskWriterLockStore, got %T", server.holderStore)
+	}
+	locksDir := diskStore.directory
+	server.holderStore = &schedHolderStore{writerLockStore: server.holderStore}
 
 	streamID := uuid.New()
 	stopEviction := make(chan struct{})
@@ -1078,18 +1081,21 @@ func TestWriterLock_ContentionWithEviction(t *testing.T) {
 					runtime.Gosched()
 					continue
 				}
+				grants++
 				current := activeHolders.Add(1)
 				if current != 1 {
-					t.Errorf("expected 1 active holder, got %d", current)
+					t.Errorf("client %s: activeHolders = %d, want exactly 1", clientID, current)
 				}
-				loaded, err := server.holderStore.load(streamID)
-				if err != nil || loaded != clientID {
-					t.Errorf("file on disk has (%q, %v), want (%q, nil)", loaded, err, clientID)
+				freshStore := newDiskWriterLockStore(locksDir)
+				holder, err := freshStore.load(streamID)
+				if err != nil {
+					t.Errorf("client %s: freshStore.load failed: %v", clientID, err)
+				} else if holder != clientID {
+					t.Errorf("client %s: holder file on disk names %q, want %q", clientID, holder, clientID)
 				}
-				grants++
-				runtime.Gosched()
 				activeHolders.Add(-1)
 				server.detachSession(state, clientID)
+				runtime.Gosched()
 			}
 		}(clientID)
 	}
