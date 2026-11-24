@@ -3024,7 +3024,7 @@ func TestStageAndSync_EmptySyncFinishPreservesConcurrentSync(t *testing.T) {
 	volume.stagingMu.Unlock()
 }
 
-func TestServer_Shutdown_ParkedUploadsTimeoutAndCloseVolumes(t *testing.T) {
+func TestServer_Shutdown_ParkedUploadsTimeoutPreservesVolumes(t *testing.T) {
 	ctx := t.Context()
 	backend := newRecordingBackend(NewMemoryBackend())
 	gateEntered, gateRelease := make(chan struct{}, 2), make(chan struct{})
@@ -3073,7 +3073,7 @@ func TestServer_Shutdown_ParkedUploadsTimeoutAndCloseVolumes(t *testing.T) {
 
 	shutdownDone := make(chan error, 1)
 	go func() {
-		shutdownDone <- server.Shutdown(shutdownCtx)
+		shutdownDone <- server.Shutdown(shutdownCtx, 50*time.Millisecond, 10*time.Millisecond)
 	}()
 
 	shutdownErr := waitSyncDone(t, shutdownDone)
@@ -3095,10 +3095,13 @@ func TestServer_Shutdown_ParkedUploadsTimeoutAndCloseVolumes(t *testing.T) {
 	volume2Closed := volume2.closed
 	volume2.mu.Unlock()
 
-	if !volume1Closed || !volume2Closed {
-		t.Fatalf("expected both volumes closed after Shutdown, got volume1Closed=%v volume2Closed=%v", volume1Closed, volume2Closed)
+	if volume1Closed || volume2Closed {
+		t.Fatalf("expected neither volume closed after cancelled Shutdown, got volume1Closed=%v volume2Closed=%v", volume1Closed, volume2Closed)
 	}
 
+	if err := server.Close(); err != nil {
+		t.Fatalf("server.Close failed: %v", err)
+	}
 	unblock()
 	if err := waitSyncDone(t, syncDone1); !errors.Is(err, context.Canceled) && !errors.Is(err, ErrVolumeStopping) {
 		t.Fatalf("expected cancellation or stopping error for volume 1, got: %v", err)
@@ -3139,7 +3142,7 @@ func TestServer_Shutdown_FlushesStagedData(t *testing.T) {
 
 	shutdownDone := make(chan error, 1)
 	go func() {
-		shutdownDone <- server.Shutdown(shutdownCtx)
+		shutdownDone <- server.Shutdown(shutdownCtx, 5*time.Second, time.Second)
 	}()
 
 	if shutdownErr := waitSyncDone(t, shutdownDone); shutdownErr != nil {

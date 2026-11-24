@@ -779,7 +779,7 @@ func (s *Server) Start(ctx context.Context) error {
 //
 // Close discards unsynced staged writes; Server.Close alone does not drain.
 // Writes that were staged but not yet acknowledged by an fsync are lost; Close
-// has crash semantics. A caller who wants them kept must call Shutdown(ctx)
+// has crash semantics. A caller who wants them kept must call Shutdown
 // as the draining path and check its error. Close does not call Stop itself
 // because it must never block (that is what lets it be used when the stream or
 // the object store is unreachable).
@@ -843,18 +843,32 @@ func (s *Server) closeVolumes(volumes []*Volume) []error {
 	return closeErrors
 }
 
-func (s *Server) stopVolumes(ctx context.Context, volumes []*Volume) []error {
+// stopVolumes runs Volume.Stop concurrently on volumes under timeout and returns
+// the volumes that failed along with their errors.
+func (s *Server) stopVolumes(ctx context.Context, volumes []*Volume, timeout time.Duration) ([]*Volume, []error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	stopErrors := make([]error, len(volumes))
 	var waitGroup sync.WaitGroup
 	for index, volume := range volumes {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
-			stopErrors[index] = volume.Stop(ctx)
+			stopErrors[index] = volume.Stop(attemptCtx)
 		}()
 	}
 	waitGroup.Wait()
-	return stopErrors
+
+	var failed []*Volume
+	var failedErrors []error
+	for index, volume := range volumes {
+		if err := stopErrors[index]; err != nil {
+			failed = append(failed, volume)
+			failedErrors = append(failedErrors, err)
+		}
+	}
+	return failed, failedErrors
 }
 
 // BeginShutdown marks the server as shutting down so open WatchVolume streams
@@ -869,33 +883,50 @@ func (s *Server) BeginShutdown() {
 	})
 }
 
-// Shutdown gracefully stops periodic flushing, drains all volumes concurrently
-// under ctx with Volume.Stop, reports all drain errors joined together, and then
-// releases everything by calling Close.
-func (s *Server) Shutdown(ctx context.Context) error {
+// Shutdown marks the server as shutting down, stops background loops, and drains
+// all volumes with Volume.Stop in a loop until every volume has drained or ctx
+// is cancelled. Each attempt waits up to attemptTimeout per volume; failed
+// volumes are logged once per attempt and retried after retryInterval. Close is
+// called only after every volume has drained, so an early cancellation never
+// discards staged data.
+func (s *Server) Shutdown(ctx context.Context, attemptTimeout, retryInterval time.Duration) error {
 	s.BeginShutdown()
-	var errs []error
-	if err := s.StopPeriodicFlush(); err != nil {
-		errs = append(errs, err)
-	}
-
+	s.stopPeriodicFlushLoop()
 	s.drain.Stop()
 	s.evictor.Stop()
 
 	s.mu.RLock()
-	volumes := make([]*Volume, 0, len(s.volumes))
+	pending := make([]*Volume, 0, len(s.volumes))
 	for _, volume := range s.volumes {
-		volumes = append(volumes, volume)
+		pending = append(pending, volume)
 	}
 	s.mu.RUnlock()
 
-	errs = append(errs, s.stopVolumes(ctx, volumes)...)
+	var lastErrors []error
+	for attempt := 1; len(pending) > 0; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("shutdown cancelled with %d undrained volumes: %w", len(pending), errors.Join(append(lastErrors, err)...))
+		}
 
-	if err := s.Close(); err != nil {
-		errs = append(errs, err)
+		pending, lastErrors = s.stopVolumes(ctx, pending, attemptTimeout)
+		if len(pending) == 0 {
+			break
+		}
+		if ctx.Err() != nil {
+			continue
+		}
+
+		scoped.Log(ctx).Error(errors.Join(lastErrors...), "volume drain attempt failed; retrying", "attempt", attempt, "retryIn", retryInterval)
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
 	}
 
-	return errors.Join(errs...)
+	return s.Close()
 }
 
 func (s *Server) FlushAll(ctx context.Context) error {
@@ -949,7 +980,11 @@ func (s *Server) StartPeriodicFlush(ctx context.Context, interval time.Duration)
 	}()
 }
 
-func (s *Server) StopPeriodicFlush() error {
+// stopPeriodicFlushLoop stops the periodic flush ticker and waits for its
+// goroutine to exit without running a final FlushAll. It reports whether
+// periodic flushing was active. Shutdown calls this directly so volumes are
+// drained under its retry loop instead of an unbounded FlushAll.
+func (s *Server) stopPeriodicFlushLoop() bool {
 	s.mu.Lock()
 	hadTicker := (s.flushTicker != nil)
 	if hadTicker {
@@ -960,7 +995,11 @@ func (s *Server) StopPeriodicFlush() error {
 	}
 	s.mu.Unlock()
 	s.flushWg.Wait()
-	if hadTicker {
+	return hadTicker
+}
+
+func (s *Server) StopPeriodicFlush() error {
+	if s.stopPeriodicFlushLoop() {
 		return s.FlushAll(context.Background())
 	}
 	return nil

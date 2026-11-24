@@ -2255,7 +2255,12 @@ func (v *Volume) rejectMutationLocked() error {
 // to reach its durability level, bounded by ctx.
 // If ctx is already done, Stop returns immediately without marking the volume
 // stopping or starting a sync, preserving crash semantics when followed by Close.
-// It is idempotent; subsequent calls wait for the active drain without starting another sync.
+// Stop may be retried after a failure: if a sync is still in flight (for example,
+// after a previous Stop timed out waiting for a slow upload), a subsequent call
+// waits for that sync without starting another; if no sync is in flight and
+// staged chunks remain (for example, after a failed upload), a subsequent call
+// starts a new final sync. Once drained, subsequent calls only wait for metadata
+// durability.
 // No volume locks are held across the durability wait.
 func (v *Volume) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {

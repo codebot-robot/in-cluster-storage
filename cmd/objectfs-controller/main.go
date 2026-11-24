@@ -46,6 +46,9 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// shutdownRetryInterval is the delay between drain retry attempts on SIGTERM.
+const shutdownRetryInterval = 1 * time.Second
+
 // Options holds configuration for the ObjectFS controller.
 type Options struct {
 	Port                      int
@@ -155,7 +158,7 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.Int64Var(&o.LocalPackCacheTargetBytes, "local-pack-cache-target-bytes", o.LocalPackCacheTargetBytes, "Target byte size for local pack cache across all volumes before background eviction (default 1 GiB, 0 disables)")
 	flagSet.DurationVar(&o.ControllerSyncTimeout, "controller-sync-timeout", o.ControllerSyncTimeout, "Timeout for controller coalesced background sync operations")
 	flagSet.DurationVar(&o.OpenBarrierTimeout, "open-barrier-timeout", o.OpenBarrierTimeout, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
-	flagSet.DurationVar(&o.ShutdownTimeout, "shutdown-timeout", o.ShutdownTimeout, "Timeout for graceful volume drain during controller shutdown (must stay below the pod's termination grace period)")
+	flagSet.DurationVar(&o.ShutdownTimeout, "shutdown-timeout", o.ShutdownTimeout, "Timeout for each volume drain attempt during controller shutdown before logging and retrying")
 	flagSet.BoolVar(&o.AcceptUnversionedSegments, "accept-unversioned-segments", o.AcceptUnversionedSegments, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
 }
 
@@ -432,9 +435,7 @@ func run(options Options) error {
 
 	scoped.Log(ctx).Info("ObjectFS Controller listening", "port", options.Port, "flushInterval", options.FlushInterval)
 	serveErr := grpcServer.Serve(listener)
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), options.ShutdownTimeout)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	if err := server.Shutdown(ctx, options.ShutdownTimeout, shutdownRetryInterval); err != nil {
 		scoped.Log(ctx).Error(err, "failed to shutdown server")
 		klog.Flush()
 		os.Exit(1)
