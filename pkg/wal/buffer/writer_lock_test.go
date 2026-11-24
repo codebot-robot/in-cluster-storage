@@ -145,29 +145,29 @@ func TestWriterLock_GrantAndResume(t *testing.T) {
 		t.Fatalf("expected Unavailable while attached, got %v", err)
 	}
 
-	server.detachSession(state, "client-1")
+	server.detachSession(state, "client-1", false)
 
 	// Another client while client-1 still has one attached session is refused with Unavailable.
 	if _, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2"); status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected Unavailable while first session attached, got %v", err)
 	}
 
-	server.detachSession(state, "client-1")
+	server.detachSession(state, "client-1", false)
 
 	// Both sessions of client-1 detached: client-2 is granted.
 	client2State, _, _, resumed, err := server.attachSession(ctx, streamID, 1, "client-2")
 	if err != nil || resumed {
 		t.Fatalf("attach client-2: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(client2State, "client-2")
+	server.detachSession(client2State, "client-2", false)
 	if _, _, _, resumed, err = server.attachSession(ctx, streamID, 1, "client-2"); err != nil || !resumed {
 		t.Fatalf("reacquire client-2: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(client2State, "client-2")
+	server.detachSession(client2State, "client-2", false)
 	if _, _, _, resumed, err = server.attachSession(ctx, streamID, 1, "client-1"); err != nil || resumed {
 		t.Fatalf("acquire client-1: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(state, "client-1")
+	server.detachSession(state, "client-1", false)
 }
 
 func TestWriterLock_RefusedWhileHolderAttached(t *testing.T) {
@@ -179,7 +179,7 @@ func TestWriterLock_RefusedWhileHolderAttached(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attach client-1: %v", err)
 	}
-	defer server.detachSession(state, "client-1")
+	defer server.detachSession(state, "client-1", false)
 
 	_, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2")
 	if status.Code(err) != codes.Unavailable {
@@ -205,7 +205,7 @@ func TestWriterLock_InFlightRefusedUntilCommitted(t *testing.T) {
 	state.mu.Lock()
 	state.inFlight = 1
 	state.mu.Unlock()
-	server.detachSession(state, "client-1")
+	server.detachSession(state, "client-1", false)
 
 	// Another client while records are still in flight is refused with Unavailable.
 	_, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2")
@@ -230,7 +230,7 @@ func TestWriterLock_InFlightRefusedUntilCommitted(t *testing.T) {
 	if witnessSeq != 42 {
 		t.Fatalf("expected witness watermark 42, got %d", witnessSeq)
 	}
-	server.detachSession(client2State, "client-2")
+	server.detachSession(client2State, "client-2", false)
 }
 
 func TestWriterLock_EmptyClientID(t *testing.T) {
@@ -242,12 +242,12 @@ func TestWriterLock_EmptyClientID(t *testing.T) {
 	if err != nil || resumed1 {
 		t.Fatalf("attach 1: err=%v, resumed=%v", err, resumed1)
 	}
-	defer server.detachSession(state1, "")
+	defer server.detachSession(state1, "", false)
 	state2, _, _, resumed2, err := server.attachSession(ctx, streamID, 1, "")
 	if err != nil || resumed2 {
 		t.Fatalf("attach 2: err=%v, resumed=%v", err, resumed2)
 	}
-	defer server.detachSession(state2, "")
+	defer server.detachSession(state2, "", false)
 	state1.mu.Lock()
 	defer state1.mu.Unlock()
 	if state1.holder != "" || state1.holderSessions != 0 || state1.attachments != 2 {
@@ -265,7 +265,7 @@ func TestWriterLock_FencedLeavesNoHolderOrSessionCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial attach: %v", err)
 	}
-	server.detachSession(state, "client-1")
+	server.detachSession(state, "client-1", false)
 
 	// Attempt attach with a lower epoch. The lock is evaluated and granted first,
 	// but the epoch check fails and returns fencedStatus.
@@ -406,7 +406,7 @@ func setupGraceTest(t *testing.T) (*Server, *fakeClock, *streamState, uuid.UUID)
 	if err != nil {
 		t.Fatalf("attach client-1: %v", err)
 	}
-	server.detachSession(state, "client-1")
+	server.detachSession(state, "client-1", false)
 	return server, clock, state, streamID
 }
 
@@ -440,7 +440,7 @@ func TestWriterLock_GracePeriodRefusesOtherClient(t *testing.T) {
 	if err != nil || !resumed {
 		t.Fatalf("attach client-1 within grace: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(holderState, "client-1")
+	server.detachSession(holderState, "client-1", false)
 
 	// Advance clock past the grace period.
 	clock.Advance(20 * time.Second)
@@ -450,7 +450,7 @@ func TestWriterLock_GracePeriodRefusesOtherClient(t *testing.T) {
 	if err != nil || resumed {
 		t.Fatalf("attach client-2 after grace period: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(client2State, "client-2")
+	server.detachSession(client2State, "client-2", false)
 }
 
 func TestWriterLock_SameClientGrantedInsideGracePeriod(t *testing.T) {
@@ -464,7 +464,7 @@ func TestWriterLock_SameClientGrantedInsideGracePeriod(t *testing.T) {
 	if err != nil || !resumed {
 		t.Fatalf("attach client-1 within grace: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(state, "client-1")
+	server.detachSession(state, "client-1", false)
 }
 
 func TestAppend_RefusedHelloOverWire(t *testing.T) {
@@ -635,6 +635,237 @@ func TestAppend_CleanlyEndedSessionExitsForwarder(t *testing.T) {
 			t.Fatalf("timed out waiting for forwarder to exit: waiters=%d, attachments=%d", waiters, attachments)
 		}
 	}
+}
+
+func TestAppend_CleanEndReleasesWriterLock(t *testing.T) {
+	ctx := t.Context()
+	clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	server, address, cleanup := startTestServerWithConfig(t, ServerConfig{
+		Backend:         inmemorystorage.New(),
+		DataDir:         t.TempDir(),
+		WriterLockGrace: 15 * time.Second,
+		Clock:           clock,
+	})
+	t.Cleanup(cleanup)
+
+	openAppendStream := func(sessionCtx context.Context) (*grpc.ClientConn, pb.WalBuffer_AppendClient) {
+		conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatalf("grpc.NewClient: %v", err)
+		}
+		stream, err := pb.NewWalBufferClient(conn).Append(sessionCtx)
+		if err != nil {
+			errutil.CloseAndLog(conn, "client connection")
+			t.Fatalf("Append: %v", err)
+		}
+		return conn, stream
+	}
+
+	sendHello := func(stream pb.WalBuffer_AppendClient, streamID uuid.UUID, clientID []byte) error {
+		return stream.Send(&pb.AppendRequest{
+			Msg: &pb.AppendRequest_Hello{
+				Hello: &pb.Hello{
+					StreamId: streamID[:],
+					Epoch:    1,
+					ClientId: clientID,
+				},
+			},
+		})
+	}
+
+	recvHelloAck := func(stream pb.WalBuffer_AppendClient) (*pb.HelloAck, error) {
+		resp, err := stream.Recv()
+		if err != nil {
+			return nil, err
+		}
+		ack := resp.GetHelloAck()
+		if ack == nil {
+			return nil, fmt.Errorf("expected HelloAck, got %v", resp)
+		}
+		return ack, nil
+	}
+
+	closeSendAndDrainEOF := func(stream pb.WalBuffer_AppendClient) {
+		if err := stream.CloseSend(); err != nil {
+			t.Fatalf("CloseSend: %v", err)
+		}
+		for {
+			_, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Recv until EOF: %v", err)
+			}
+		}
+	}
+
+	// 1. Client 1 says Hello, half-closes, the handler returns; client 2's Hello is granted, not resumed.
+	t.Run("clean end releases lock", func(t *testing.T) {
+		streamID := uuid.New()
+		clientID1 := []byte("client-1")
+		clientID2 := []byte("client-2")
+
+		conn1, stream1 := openAppendStream(ctx)
+		defer func() {
+			_ = conn1.Close()
+		}()
+
+		if err := sendHello(stream1, streamID, clientID1); err != nil {
+			t.Fatalf("sendHello client-1: %v", err)
+		}
+		ack1, err := recvHelloAck(stream1)
+		if err != nil {
+			t.Fatalf("recvHelloAck client-1: %v", err)
+		}
+		if ack1.GetResumed() {
+			t.Fatalf("expected resumed=false for first client-1 attach, got true")
+		}
+
+		closeSendAndDrainEOF(stream1)
+
+		conn2, stream2 := openAppendStream(ctx)
+		defer func() {
+			_ = conn2.Close()
+		}()
+
+		if err := sendHello(stream2, streamID, clientID2); err != nil {
+			t.Fatalf("sendHello client-2: %v", err)
+		}
+		ack2, err := recvHelloAck(stream2)
+		if err != nil {
+			t.Fatalf("expected client-2 Hello to be granted, got: %v", err)
+		}
+		if ack2.GetResumed() {
+			t.Fatalf("expected client-2 Hello granted with resumed=false, got resumed=true")
+		}
+		closeSendAndDrainEOF(stream2)
+	})
+
+	// 2. Client 1 says Hello and its session is cancelled instead; client 2's Hello is refused with the grace-period reason.
+	t.Run("cancelled session retains lock for grace period", func(t *testing.T) {
+		streamID := uuid.New()
+		clientID1 := []byte("client-1")
+		clientID2 := []byte("client-2")
+
+		session1Ctx, cancel1 := context.WithCancel(ctx)
+		conn1, stream1 := openAppendStream(session1Ctx)
+		defer func() {
+			_ = conn1.Close()
+		}()
+
+		if err := sendHello(stream1, streamID, clientID1); err != nil {
+			t.Fatalf("sendHello client-1: %v", err)
+		}
+		ack1, err := recvHelloAck(stream1)
+		if err != nil {
+			t.Fatalf("recvHelloAck client-1: %v", err)
+		}
+		if ack1.GetResumed() {
+			t.Fatalf("expected resumed=false for first client-1 attach, got true")
+		}
+
+		cancel1()
+
+		// Wait for client 1 session to finish detaching on server.
+		server.mu.RLock()
+		st := server.streams[streamID.String()]
+		server.mu.RUnlock()
+		if st == nil {
+			t.Fatalf("stream state not found for %s", streamID)
+		}
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			st.mu.Lock()
+			sessions := st.holderSessions
+			st.mu.Unlock()
+			if sessions == 0 {
+				break
+			}
+		}
+		st.mu.Lock()
+		sessions := st.holderSessions
+		st.mu.Unlock()
+		if sessions != 0 {
+			t.Fatalf("timed out waiting for client 1 session to detach after cancel")
+		}
+
+		conn2, stream2 := openAppendStream(ctx)
+		defer func() {
+			_ = conn2.Close()
+		}()
+
+		if err := sendHello(stream2, streamID, clientID2); err != nil {
+			t.Fatalf("sendHello client-2: %v", err)
+		}
+		_, err = recvHelloAck(stream2)
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("expected codes.Unavailable inside grace period, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "stream writer lock is reserved for its previous holder") {
+			t.Fatalf("expected grace period reservation message, got %v", err)
+		}
+	})
+
+	// 3. Client 1 has two sessions and half-closes one; client 2 is refused as held by another client.
+	t.Run("two sessions and half-close one keeps lock held", func(t *testing.T) {
+		streamID := uuid.New()
+		clientID1 := []byte("client-1")
+		clientID2 := []byte("client-2")
+
+		session1Ctx, cancel1 := context.WithCancel(ctx)
+		defer cancel1()
+		conn1, stream1 := openAppendStream(session1Ctx)
+		defer func() {
+			_ = conn1.Close()
+		}()
+
+		if err := sendHello(stream1, streamID, clientID1); err != nil {
+			t.Fatalf("sendHello client-1 session 1: %v", err)
+		}
+		ack1, err := recvHelloAck(stream1)
+		if err != nil {
+			t.Fatalf("recvHelloAck client-1 session 1: %v", err)
+		}
+		if ack1.GetResumed() {
+			t.Fatalf("expected resumed=false for first session, got true")
+		}
+
+		session2Ctx, cancel2 := context.WithCancel(ctx)
+		defer cancel2()
+		conn2, stream2 := openAppendStream(session2Ctx)
+		defer func() {
+			_ = conn2.Close()
+		}()
+
+		if err := sendHello(stream2, streamID, clientID1); err != nil {
+			t.Fatalf("sendHello client-1 session 2: %v", err)
+		}
+		ack2, err := recvHelloAck(stream2)
+		if err != nil {
+			t.Fatalf("recvHelloAck client-1 session 2: %v", err)
+		}
+		if !ack2.GetResumed() {
+			t.Fatalf("expected resumed=true for second session with same client ID, got false")
+		}
+
+		closeSendAndDrainEOF(stream1)
+
+		conn3, stream3 := openAppendStream(ctx)
+		defer func() {
+			_ = conn3.Close()
+		}()
+
+		if err := sendHello(stream3, streamID, clientID2); err != nil {
+			t.Fatalf("sendHello client-2: %v", err)
+		}
+		_, err = recvHelloAck(stream3)
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("expected codes.Unavailable while another session is held, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "stream writer lock is held by another client") {
+			t.Fatalf("expected lock held message, got %v", err)
+		}
+	})
 }
 
 func TestWriterLock_IdleEvictionKeepsStreamInsideGracePeriod(t *testing.T) {
@@ -996,8 +1227,8 @@ func TestWriterLock_FailedSave(t *testing.T) {
 	}
 
 	// Detach both sessions of client A so holderSessions is 0.
-	server.detachSession(state, "client-1")
-	server.detachSession(state2, "client-1")
+	server.detachSession(state, "client-1", false)
+	server.detachSession(state2, "client-1", false)
 
 	// 4. Client A has detached. After the grace period, client B's save fails
 	// (the wrapper fails it after writing nothing).
@@ -1018,7 +1249,7 @@ func TestWriterLock_FailedSave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attach client-1 after client-2 failed save: %v", err)
 	}
-	defer server.detachSession(state3, "client-1")
+	defer server.detachSession(state3, "client-1", false)
 
 	if failingStore.saves.Load() != 4 {
 		t.Fatalf("expected 4 save calls (save must be called for client-1 after failed save), got %d", failingStore.saves.Load())
@@ -1096,7 +1327,7 @@ func TestWriterLock_ContentionWithEviction(t *testing.T) {
 					t.Errorf("client %s: holder file on disk names %q, want %q", clientID, holder, clientID)
 				}
 				activeHolders.Add(-1)
-				server.detachSession(state, clientID)
+				server.detachSession(state, clientID, false)
 				runtime.Gosched()
 			}
 		}(clientID)
