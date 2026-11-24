@@ -52,17 +52,14 @@ lost when the process exits.
 
 ## Simulating outages
 
-Tests can simulate an unreachable object store without restarting the server or
-losing stored objects. While an outage is in effect, every S3 request is answered
-with `503 Service Unavailable` (`ServiceUnavailable` error body) and changes
-nothing. When the outage ends, stored objects are served normally again.
+While an outage is active, every S3 request returns `503 Service Unavailable`
+(`ServiceUnavailable` error body) and changes nothing; stored objects remain
+intact and are served again once the outage ends.
 
-The outage switch is available over HTTP on the same listener via `/_fakes3/outage`
-(the `/_fakes3/` path prefix is reserved and never treated as a bucket):
+The switch is served over HTTP on the same listener under the reserved
+`/_fakes3/` prefix (never a bucket), accepts `GET` and `POST`, and responds in
+plain text with the remaining duration and a newline:
 
-- `POST /_fakes3/outage?duration=45s`: starts an outage for the specified duration.
-  The outage ends automatically once the duration has passed.
+- `POST /_fakes3/outage?duration=45s`: starts an outage that ends on its own.
 - `POST /_fakes3/outage?duration=0s`: ends an active outage immediately.
-- `GET /_fakes3/outage`: reports the remaining outage duration (e.g. `45s`, or `0s`
-  when no outage is active).
-
+- `GET /_fakes3/outage`: reports the remaining duration (e.g. `45s`, or `0s`).

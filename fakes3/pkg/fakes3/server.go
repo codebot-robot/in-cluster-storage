@@ -37,7 +37,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -62,14 +61,6 @@ type Clock interface {
 	Now() time.Time
 }
 
-// ClockFunc adapts a func() time.Time to the Clock interface.
-type ClockFunc func() time.Time
-
-// Now implements Clock.
-func (f ClockFunc) Now() time.Time {
-	return f()
-}
-
 // Server is an http.Handler implementing the fake S3 API.
 type Server struct {
 	mu                sync.RWMutex
@@ -77,8 +68,10 @@ type Server struct {
 	autoCreateBuckets bool
 	logf              func(format string, args ...any)
 	region            string
-	clock             Clock
-	outageUntil       time.Time
+	// clock supplies the current time; nil falls back to time.Now.
+	clock Clock
+	// outageUntil is when an active outage ends, guarded by mu; zero means none.
+	outageUntil time.Time
 }
 
 type bucket struct {
@@ -102,10 +95,10 @@ type Option func(*Server)
 func WithBuckets(names ...string) Option {
 	return func(s *Server) {
 		for _, n := range names {
-			if n == "" || isReservedBucket(n) {
+			if n == "" {
 				continue
 			}
-			s.buckets[n] = s.newBucket()
+			s.buckets[n] = newBucket()
 		}
 	}
 }
@@ -127,7 +120,7 @@ func WithRegion(region string) Option {
 	return func(s *Server) { s.region = region }
 }
 
-// WithClock sets the clock used for time-dependent operations.
+// WithClock sets the clock used for outage timing.
 func WithClock(clock Clock) Option {
 	return func(s *Server) { s.clock = clock }
 }
@@ -144,10 +137,11 @@ func New(opts ...Option) *Server {
 	return s
 }
 
-func isReservedBucket(name string) bool {
-	return name == "_fakes3" || strings.HasPrefix(name, "_fakes3")
+func newBucket() *bucket {
+	return &bucket{created: time.Now().UTC(), objects: make(map[string]*object)}
 }
 
+// now returns the current time from the configured clock, or time.Now if unset.
 func (s *Server) now() time.Time {
 	if s.clock != nil {
 		return s.clock.Now()
@@ -155,107 +149,50 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 
-func (s *Server) newBucket() *bucket {
-	return &bucket{created: s.now().UTC(), objects: make(map[string]*object)}
-}
-
-func (s *Server) isOutageActive() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return !s.outageUntil.IsZero() && s.now().Before(s.outageUntil)
-}
-
+// remainingOutage returns how long the active outage has left, or 0 if none is active.
 func (s *Server) remainingOutage() time.Duration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.outageUntil.IsZero() {
 		return 0
 	}
-	now := s.now()
-	if !now.Before(s.outageUntil) {
-		return 0
-	}
-	return s.outageUntil.Sub(now)
+	return max(0, s.outageUntil.Sub(s.now()))
 }
 
-func (s *Server) setOutage(d time.Duration) {
+// setOutage schedules an outage for duration from now, or clears it when duration is zero or less.
+func (s *Server) setOutage(duration time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if d <= 0 {
+	if duration <= 0 {
 		s.outageUntil = time.Time{}
 		return
 	}
-	s.outageUntil = s.now().Add(d)
+	s.outageUntil = s.now().Add(duration)
 }
 
+// handleOutage serves GET and POST requests for the /_fakes3/outage control endpoint.
 func (s *Server) handleOutage(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
-	case http.MethodGet, http.MethodHead:
-		rem := s.remainingOutage()
-		writeOutageResponse(w, r, rem)
+	case http.MethodGet:
 	case http.MethodPost:
-		dStr := r.URL.Query().Get("duration")
-		if dStr == "" {
-			dStr = r.FormValue("duration")
-		}
-		if dStr == "" {
-			http.Error(w, "missing required query parameter: duration", http.StatusBadRequest)
+		durationText := r.URL.Query().Get("duration")
+		duration, err := time.ParseDuration(durationText)
+		if durationText == "" || err != nil || duration < 0 {
+			http.Error(w, "invalid or missing duration query parameter", http.StatusBadRequest)
 			return
 		}
-		d, err := time.ParseDuration(dStr)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("invalid duration: %v", err), http.StatusBadRequest)
-			return
-		}
-		if d < 0 {
-			http.Error(w, "duration must not be negative", http.StatusBadRequest)
-			return
-		}
-		s.setOutage(d)
-		rem := s.remainingOutage()
-		writeOutageResponse(w, r, rem)
+		s.setOutage(duration)
 	default:
-		w.Header().Set("Allow", "GET, POST, HEAD")
+		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func writeOutageResponse(w http.ResponseWriter, r *http.Request, rem time.Duration) {
-	if r.Header.Get("Accept") == "application/json" || r.URL.Query().Get("format") == "json" {
-		res := struct {
-			Active           bool    `json:"active"`
-			Remaining        string  `json:"remaining"`
-			RemainingSeconds float64 `json:"remaining_seconds"`
-		}{
-			Active:           rem > 0,
-			Remaining:        rem.String(),
-			RemainingSeconds: rem.Seconds(),
-		}
-		data, err := json.Marshal(res)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		data = append(data, '\n')
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-		w.WriteHeader(http.StatusOK)
-		if r.Method != http.MethodHead {
-			if _, err := w.Write(data); err != nil {
-				log.Printf("fakes3: write JSON response: %v (client went away?)", err)
-			}
-		}
 		return
 	}
-
-	body := []byte(rem.String() + "\n")
+	body := []byte(s.remainingOutage().String() + "\n")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
-	if r.Method != http.MethodHead {
-		if _, err := w.Write(body); err != nil {
-			log.Printf("fakes3: write text response: %v (client went away?)", err)
-		}
+	if _, err := w.Write(body); err != nil {
+		log.Printf("fakes3: write outage response: %v (client went away?)", err)
 	}
 }
 
@@ -267,15 +204,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 
-	if r.URL.Path == "/_fakes3/outage" || r.URL.Path == "/_fakes3/outage/" {
-		s.handleOutage(rw, r)
+	if r.URL.Path == "/_fakes3" || strings.HasPrefix(r.URL.Path, "/_fakes3/") {
+		if r.URL.Path == "/_fakes3/outage" || r.URL.Path == "/_fakes3/outage/" {
+			s.handleOutage(rw, r)
+		} else {
+			http.NotFound(rw, r)
+		}
 		if s.logf != nil {
 			s.logf("%s %s -> %d", r.Method, r.URL.RequestURI(), rw.status)
 		}
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, "/_fakes3/") || r.URL.Path == "/_fakes3" {
-		http.NotFound(rw, r)
+
+	if s.remainingOutage() > 0 {
+		writeError(rw, r, http.StatusServiceUnavailable, "ServiceUnavailable", "Service is unavailable. Please retry.", strings.TrimPrefix(r.URL.Path, "/"))
 		if s.logf != nil {
 			s.logf("%s %s -> %d", r.Method, r.URL.RequestURI(), rw.status)
 		}
@@ -283,22 +225,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bucketName, key, err := s.resolve(r)
-	if err != nil && !s.isOutageActive() {
+	if err != nil {
 		writeError(rw, r, http.StatusBadRequest, "InvalidArgument", "Invalid Host header: "+err.Error(), "")
 		if s.logf != nil {
 			s.logf("%s %s host=%q -> %d", r.Method, r.URL.RequestURI(), r.Host, rw.status)
-		}
-		return
-	}
-
-	if s.isOutageActive() {
-		resource := bucketName
-		if key != "" {
-			resource = bucketName + "/" + key
-		}
-		writeError(rw, r, http.StatusServiceUnavailable, "ServiceUnavailable", "Service is unavailable. Please retry.", resource)
-		if s.logf != nil {
-			s.logf("%s %s bucket=%q key=%q -> %d", r.Method, r.URL.RequestURI(), bucketName, key, rw.status)
 		}
 		return
 	}
@@ -461,10 +391,6 @@ func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 var fakeOwner = owner{ID: "fakes3", DisplayName: "fakes3"}
 
 func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, name string) {
-	if isReservedBucket(name) {
-		writeError(w, r, http.StatusBadRequest, "InvalidBucketName", "The specified bucket is not valid.", name)
-		return
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.buckets[name]; exists {
@@ -474,7 +400,7 @@ func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, name strin
 		writeError(w, r, http.StatusConflict, "BucketAlreadyOwnedByYou", "Your previous request to create the named bucket succeeded and you already own it.", name)
 		return
 	}
-	s.buckets[name] = s.newBucket()
+	s.buckets[name] = newBucket()
 	w.Header().Set("Location", "/"+name)
 	w.WriteHeader(http.StatusOK)
 }
@@ -749,7 +675,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucketName, k
 	obj := &object{
 		data:        body,
 		etag:        hexMD5(body),
-		modTime:     s.now().UTC().Truncate(time.Millisecond),
+		modTime:     time.Now().UTC().Truncate(time.Millisecond),
 		contentType: r.Header.Get("Content-Type"),
 		metadata:    userMetadata(r.Header),
 		checksums:   checksums,
@@ -758,12 +684,12 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucketName, k
 	s.mu.Lock()
 	b, exists := s.buckets[bucketName]
 	if !exists {
-		if !s.autoCreateBuckets || isReservedBucket(bucketName) {
+		if !s.autoCreateBuckets {
 			s.mu.Unlock()
 			writeError(w, r, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.", bucketName)
 			return
 		}
-		b = s.newBucket()
+		b = newBucket()
 		s.buckets[bucketName] = b
 	}
 	b.objects[key] = obj
@@ -819,7 +745,7 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucketName, 
 	dst := &object{
 		data:        append([]byte(nil), src.data...),
 		etag:        src.etag,
-		modTime:     s.now().UTC().Truncate(time.Millisecond),
+		modTime:     time.Now().UTC().Truncate(time.Millisecond),
 		contentType: src.contentType,
 		metadata:    src.metadata,
 		checksums:   src.checksums,
