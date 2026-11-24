@@ -25,6 +25,8 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestControllerStagedBytesAccounting(t *testing.T) {
@@ -281,8 +283,8 @@ func TestControllerStagedBytesAccounting_CloseVolumeWithInFlightSync(t *testing.
 	// Wait for sync to finish.
 	select {
 	case err := <-syncDone:
-		if err != nil {
-			t.Fatalf("sync returned unexpected error: %v", err)
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("expected Unavailable from sync after Close, got: %v", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for sync to finish")

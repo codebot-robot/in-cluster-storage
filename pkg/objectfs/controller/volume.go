@@ -1717,6 +1717,10 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	}
 
 	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return 0, v.finishRealSync(operation, snapshotSeq, ErrVolumeStopping, snapshotChunks, 0, inodeFilter)
+	}
 	commitSeq, recordsAppended, modifiedAttrs, err := v.appendSyncRecordsLocked(syncCtx, snapshotChunks, snapshotSizes, snapshotMtimes)
 	if err != nil {
 		v.mu.Unlock()
