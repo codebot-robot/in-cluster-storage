@@ -29,6 +29,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/filesystemstorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/gcsstorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/internal/storeerrors"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/s3storage"
 )
 
@@ -37,7 +38,11 @@ var (
 	// is not supported by the underlying storage backend.
 	ErrNotSupported = errors.New("operation not supported by backend")
 	// ErrNotFound is returned when the requested object does not exist.
-	ErrNotFound = errors.New("object not found")
+	ErrNotFound = storeerrors.ErrNotFound
+	// ErrUnavailable is returned when the store could not be reached or answered
+	// that it is temporarily unable to serve the request, so the same request may
+	// succeed later.
+	ErrUnavailable = storeerrors.ErrUnavailable
 )
 
 // ObjectEntry represents an object entry returned by ListObjects.
