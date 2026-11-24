@@ -792,11 +792,11 @@ func (s *Server) Close() error {
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		volumes := make([]*Volume, 0, len(s.volumes))
 		for _, volume := range s.volumes {
-			if err := volume.Close(); err != nil {
-				errs = append(errs, err)
-			}
+			volumes = append(volumes, volume)
 		}
+		errs = append(errs, s.closeVolumes(volumes)...)
 		clear(s.volumes)
 		if s.wal.conn != nil {
 			if err := s.wal.conn.Close(); err != nil {
@@ -820,6 +820,23 @@ func (s *Server) Close() error {
 		return nil
 	}
 	return errors.Join(errs...)
+}
+
+// closeVolumes closes all volumes concurrently so shutdown time scales with the
+// slowest volume (for example, when closing a stream waits on an unresponsive
+// stream server) rather than summing across volumes.
+func (s *Server) closeVolumes(volumes []*Volume) []error {
+	closeErrors := make([]error, len(volumes))
+	var waitGroup sync.WaitGroup
+	for index, volume := range volumes {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			closeErrors[index] = volume.Close()
+		}()
+	}
+	waitGroup.Wait()
+	return closeErrors
 }
 
 func (s *Server) stopVolumes(ctx context.Context, volumes []*Volume) []error {
