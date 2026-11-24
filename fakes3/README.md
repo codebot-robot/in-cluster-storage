@@ -49,3 +49,17 @@ GETs since signatures are never checked.
 Not supported: authentication, multipart uploads, versioning, ACLs,
 lifecycle, and other bucket sub-resources. Nothing is persisted; all data is
 lost when the process exits.
+
+## Simulating outages
+
+While an outage is active, every S3 request returns `503 Service Unavailable`
+(`ServiceUnavailable` error body) and changes nothing; stored objects remain
+intact and are served again once the outage ends.
+
+The switch is served over HTTP on the same listener under the reserved
+`/_fakes3/` prefix (never a bucket), accepts `GET` and `POST`, and responds in
+plain text with the remaining duration and a newline:
+
+- `POST /_fakes3/outage?duration=45s`: starts an outage that ends on its own.
+- `POST /_fakes3/outage?duration=0s`: ends an active outage immediately.
+- `GET /_fakes3/outage`: reports the remaining duration (e.g. `45s`, or `0s`).

@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,6 +53,7 @@ func newTestClient(t *testing.T, opts ...Option) (*s3.Client, *httptest.Server) 
 	cfg, err := config.LoadDefaultConfig(t.Context(),
 		config.WithRegion("us-east-1"),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("fakes3", "fakes3", "")),
+		config.WithRetryer(func() aws.Retryer { return aws.NopRetryer{} }),
 	)
 	if err != nil {
 		t.Fatalf("LoadDefaultConfig: %v", err)
@@ -681,6 +683,131 @@ func TestListObjectsMetadata(t *testing.T) {
 	if firstEntry.LastModified.After(*secondEntry.LastModified) {
 		t.Errorf("expected LastModified ordered: first (%v) after second (%v)", firstEntry.LastModified, secondEntry.LastModified)
 	}
+}
+
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) advance(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(duration)
+}
+
+func assertServiceUnavailable(t *testing.T, operation string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s during outage succeeded, want 503 ServiceUnavailable", operation)
+	}
+	if code := apiErrorCode(err); code != "ServiceUnavailable" {
+		t.Errorf("%s error code = %q, want ServiceUnavailable", operation, code)
+	}
+	var responseErr interface{ HTTPStatusCode() int }
+	if !errors.As(err, &responseErr) || responseErr.HTTPStatusCode() != http.StatusServiceUnavailable {
+		t.Errorf("%s HTTP status = %v, want 503", operation, err)
+	}
+}
+
+func expectOutage(t *testing.T, method, targetURL string, wantStatus int, wantBody string) {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), method, targetURL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(%s %s): %v", method, targetURL, err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, targetURL, err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	if closeErr := response.Body.Close(); closeErr != nil {
+		t.Errorf("close body: %v", closeErr)
+	}
+	if readErr != nil {
+		t.Fatalf("ReadAll: %v", readErr)
+	}
+	if response.StatusCode != wantStatus || (wantBody != "" && string(body) != wantBody) {
+		t.Fatalf("%s %s = %d %q, want %d %q", method, targetURL, response.StatusCode, body, wantStatus, wantBody)
+	}
+}
+
+func TestOutage(t *testing.T) {
+	ctx := t.Context()
+	clock := &testClock{now: time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)}
+	client, server := newTestClient(t, WithBuckets("b"), WithClock(clock))
+	outageURL := server.URL + "/_fakes3/outage"
+
+	original := []byte("original content")
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("b"), Key: aws.String("existing.txt"), Body: bytes.NewReader(original),
+	}); err != nil {
+		t.Fatalf("PutObject pre-outage: %v", err)
+	}
+	expectOutage(t, http.MethodGet, outageURL, http.StatusOK, "0s\n")
+	expectOutage(t, http.MethodPost, outageURL+"?duration=45s", http.StatusOK, "45s\n")
+
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("b"), Key: aws.String("during.txt"), Body: strings.NewReader("dropped"),
+	})
+	assertServiceUnavailable(t, "PutObject", err)
+	_, err = client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("b"), Key: aws.String("existing.txt")})
+	assertServiceUnavailable(t, "GetObject", err)
+	_, err = client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String("b")})
+	assertServiceUnavailable(t, "ListObjectsV2", err)
+
+	clock.advance(30 * time.Second)
+	expectOutage(t, http.MethodGet, outageURL, http.StatusOK, "15s\n")
+	clock.advance(15 * time.Second)
+	expectOutage(t, http.MethodGet, outageURL, http.StatusOK, "0s\n")
+
+	got, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("b"), Key: aws.String("existing.txt")})
+	if err != nil {
+		t.Fatalf("GetObject after outage: %v", err)
+	}
+	data, readErr := io.ReadAll(got.Body)
+	if closeErr := got.Body.Close(); closeErr != nil {
+		t.Errorf("close body: %v", closeErr)
+	}
+	if readErr != nil || !bytes.Equal(data, original) {
+		t.Fatalf("GetObject after outage = %q (err=%v), want %q", data, readErr, original)
+	}
+	if _, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("b"), Key: aws.String("during.txt")}); apiErrorCode(err) != "NoSuchKey" {
+		t.Fatalf("GetObject during.txt = %q, want NoSuchKey", apiErrorCode(err))
+	}
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("b"), Key: aws.String("after.txt"), Body: strings.NewReader("stored"),
+	}); err != nil {
+		t.Fatalf("PutObject after outage: %v", err)
+	}
+
+	// duration=0s ends an active outage at once.
+	expectOutage(t, http.MethodPost, outageURL+"?duration=60s", http.StatusOK, "1m0s\n")
+	_, err = client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("b"), Key: aws.String("existing.txt")})
+	assertServiceUnavailable(t, "GetObject before cancel", err)
+	expectOutage(t, http.MethodPost, outageURL+"?duration=0s", http.StatusOK, "0s\n")
+	if _, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String("b")}); err != nil {
+		t.Fatalf("ListObjectsV2 after duration=0s: %v", err)
+	}
+}
+
+func TestOutageEndpointErrors(t *testing.T) {
+	server := httptest.NewServer(New())
+	t.Cleanup(server.Close)
+	outageURL := server.URL + "/_fakes3/outage"
+
+	expectOutage(t, http.MethodPost, outageURL, http.StatusBadRequest, "")
+	expectOutage(t, http.MethodPost, outageURL+"?duration=bogus", http.StatusBadRequest, "")
+	expectOutage(t, http.MethodPost, outageURL+"?duration=-5s", http.StatusBadRequest, "")
+	expectOutage(t, http.MethodHead, outageURL, http.StatusMethodNotAllowed, "")
+	expectOutage(t, http.MethodDelete, outageURL, http.StatusMethodNotAllowed, "")
+	expectOutage(t, http.MethodGet, server.URL+"/_fakes3/other", http.StatusNotFound, "")
 }
 
 var _ = context.Background

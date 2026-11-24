@@ -56,6 +56,11 @@ import (
 
 const s3Namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
 
+// Clock supplies the current time.
+type Clock interface {
+	Now() time.Time
+}
+
 // Server is an http.Handler implementing the fake S3 API.
 type Server struct {
 	mu                sync.RWMutex
@@ -63,6 +68,10 @@ type Server struct {
 	autoCreateBuckets bool
 	logf              func(format string, args ...any)
 	region            string
+	// clock supplies the current time; nil falls back to time.Now.
+	clock Clock
+	// outageUntil is when an active outage ends, guarded by mu; zero means none.
+	outageUntil time.Time
 }
 
 type bucket struct {
@@ -111,6 +120,11 @@ func WithRegion(region string) Option {
 	return func(s *Server) { s.region = region }
 }
 
+// WithClock sets the clock used for outage timing.
+func WithClock(clock Clock) Option {
+	return func(s *Server) { s.clock = clock }
+}
+
 // New returns a Server with no buckets unless WithBuckets is given.
 func New(opts ...Option) *Server {
 	s := &Server{
@@ -127,6 +141,61 @@ func newBucket() *bucket {
 	return &bucket{created: time.Now().UTC(), objects: make(map[string]*object)}
 }
 
+// now returns the current time from the configured clock, or time.Now if unset.
+func (s *Server) now() time.Time {
+	if s.clock != nil {
+		return s.clock.Now()
+	}
+	return time.Now()
+}
+
+// remainingOutage returns how long the active outage has left, or 0 if none is active.
+func (s *Server) remainingOutage() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.outageUntil.IsZero() {
+		return 0
+	}
+	return max(0, s.outageUntil.Sub(s.now()))
+}
+
+// setOutage schedules an outage for duration from now, or clears it when duration is zero or less.
+func (s *Server) setOutage(duration time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if duration <= 0 {
+		s.outageUntil = time.Time{}
+		return
+	}
+	s.outageUntil = s.now().Add(duration)
+}
+
+// handleOutage serves GET and POST requests for the /_fakes3/outage control endpoint.
+func (s *Server) handleOutage(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+	case http.MethodPost:
+		durationText := r.URL.Query().Get("duration")
+		duration, err := time.ParseDuration(durationText)
+		if durationText == "" || err != nil || duration < 0 {
+			http.Error(w, "invalid or missing duration query parameter", http.StatusBadRequest)
+			return
+		}
+		s.setOutage(duration)
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body := []byte(s.remainingOutage().String() + "\n")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		log.Printf("fakes3: write outage response: %v (client went away?)", err)
+	}
+}
+
 // ServeHTTP dispatches an S3 REST request.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := newRequestID()
@@ -134,6 +203,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Server", "fakes3")
 
 	rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
+	if r.URL.Path == "/_fakes3" || strings.HasPrefix(r.URL.Path, "/_fakes3/") {
+		if r.URL.Path == "/_fakes3/outage" || r.URL.Path == "/_fakes3/outage/" {
+			s.handleOutage(rw, r)
+		} else {
+			http.NotFound(rw, r)
+		}
+		if s.logf != nil {
+			s.logf("%s %s -> %d", r.Method, r.URL.RequestURI(), rw.status)
+		}
+		return
+	}
+
+	if s.remainingOutage() > 0 {
+		writeError(rw, r, http.StatusServiceUnavailable, "ServiceUnavailable", "Service is unavailable. Please retry.", strings.TrimPrefix(r.URL.Path, "/"))
+		if s.logf != nil {
+			s.logf("%s %s -> %d", r.Method, r.URL.RequestURI(), rw.status)
+		}
+		return
+	}
 
 	bucketName, key, err := s.resolve(r)
 	if err != nil {
