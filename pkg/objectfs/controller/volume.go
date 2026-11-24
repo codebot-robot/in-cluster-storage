@@ -2391,7 +2391,13 @@ func (v *Volume) closeStagingLocked() bool {
 }
 
 // Close closes the volume, local storage, and any underlying WAL streams.
-// Close never blocks on the object store or the WAL.
+//
+// Close discards unsynced staged writes and deletes the staging directory.
+// Writes that were staged but not yet acknowledged by an fsync are lost; Close
+// has crash semantics. A caller who wants them kept must call Stop(ctx) first
+// and check its error. Close does not call Stop itself because it must never
+// block (that is what lets it be used when the stream or the object store is
+// unreachable).
 func (v *Volume) Close() error {
 	v.mu.Lock()
 	if v.closed {

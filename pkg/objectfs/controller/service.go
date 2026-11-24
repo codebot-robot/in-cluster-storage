@@ -772,6 +772,13 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // Close stops background loops, periodic flushing, and closes all active volumes and streams.
+//
+// Close discards unsynced staged writes; Server.Close alone does not drain.
+// Writes that were staged but not yet acknowledged by an fsync are lost; Close
+// has crash semantics. A caller who wants them kept must call Shutdown(ctx)
+// as the draining path and check its error. Close does not call Stop itself
+// because it must never block (that is what lets it be used when the stream or
+// the object store is unreachable).
 func (s *Server) Close() error {
 	var errs []error
 	var ran bool
