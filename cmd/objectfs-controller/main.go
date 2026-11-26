@@ -325,7 +325,10 @@ func run(options Options) error {
 	if options.Insecure {
 		scoped.Log(ctx).Info("Serving plaintext gRPC without TLS or authentication (--insecure is set)")
 		grpcServer = grpc.NewServer(
-			grpc.UnaryInterceptor(grpcutil.UnaryServerInterceptor()),
+			grpc.ChainUnaryInterceptor(
+				grpcutil.UnaryServerInterceptor(),
+				grpcutil.RequestIDUnaryServerInterceptor(),
+			),
 			grpc.StreamInterceptor(grpcutil.StreamServerInterceptor()),
 		)
 	} else {
@@ -366,7 +369,11 @@ func run(options Options) error {
 		})
 		grpcServer = grpc.NewServer(
 			grpc.Creds(tlsCreds),
-			grpc.ChainUnaryInterceptor(grpcutil.UnaryServerInterceptor(), authInterceptor.UnaryServerInterceptor()),
+			grpc.ChainUnaryInterceptor(
+				grpcutil.UnaryServerInterceptor(),
+				authInterceptor.UnaryServerInterceptor(),
+				grpcutil.RequestIDUnaryServerInterceptor(),
+			),
 			grpc.ChainStreamInterceptor(grpcutil.StreamServerInterceptor(), authInterceptor.StreamServerInterceptor()),
 		)
 	}
