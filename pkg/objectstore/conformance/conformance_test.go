@@ -18,6 +18,11 @@ package conformance
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +31,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/smithy-go"
+	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/filesystemstorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/gcsstorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
@@ -166,4 +175,111 @@ func startFakeS3(t *testing.T, bucket string) string {
 		t.Setenv("AWS_SECRET_ACCESS_KEY", "fakes3")
 	}
 	return endpoint
+}
+
+func setFakeS3Outage(t *testing.T, endpoint, duration string) {
+	t.Helper()
+
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, endpoint+"/_fakes3/outage?duration="+duration, nil)
+	if err != nil {
+		t.Fatalf("build outage request: %v", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("set fakes3 outage=%s: %v", duration, err)
+	}
+	defer errutil.CloseAndLog(response.Body, "fakes3 outage response")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("set fakes3 outage=%s: unexpected status %d", duration, response.StatusCode)
+	}
+}
+
+func TestS3BackendUnavailable(t *testing.T) {
+	ctx := t.Context()
+	bucket := "outage-test-bucket"
+	endpoint := startFakeS3(t, bucket)
+
+	backend, err := s3storage.New(ctx, s3storage.Config{
+		Bucket:       bucket,
+		Prefix:       "outage-test",
+		Endpoint:     endpoint,
+		Region:       "us-east-1",
+		UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("initialize S3 backend: %v", err)
+	}
+
+	t.Run("OutageSwitchOnAndOff", func(t *testing.T) {
+		setFakeS3Outage(t, endpoint, "1m")
+
+		_, putErr := backend.PutObject(ctx, "vol", "key", blob.NewByteStreamFromBytes([]byte("payload")))
+		if !errors.Is(putErr, objectstore.ErrUnavailable) {
+			t.Fatalf("PutObject during outage: got %v, want ErrUnavailable", putErr)
+		}
+		var apiError smithy.APIError
+		if !errors.As(putErr, &apiError) {
+			t.Errorf("PutObject during outage: original smithy.APIError missing from chain: %v", putErr)
+		}
+
+		var buffer bytes.Buffer
+		getErr := backend.GetObject(ctx, "vol", "key", 0, 0, &buffer)
+		if !errors.Is(getErr, objectstore.ErrUnavailable) {
+			t.Fatalf("GetObject during outage: got %v, want ErrUnavailable", getErr)
+		}
+
+		_, listErr := backend.ListObjects(ctx, "vol", "")
+		if !errors.Is(listErr, objectstore.ErrUnavailable) {
+			t.Fatalf("ListObjects during outage: got %v, want ErrUnavailable", listErr)
+		}
+
+		setFakeS3Outage(t, endpoint, "0s")
+
+		missingErr := backend.GetObject(ctx, "vol", "missing-key", 0, 0, &buffer)
+		if !errors.Is(missingErr, objectstore.ErrNotFound) {
+			t.Fatalf("GetObject missing key: got %v, want ErrNotFound", missingErr)
+		}
+		if errors.Is(missingErr, objectstore.ErrUnavailable) {
+			t.Fatalf("GetObject missing key: must not be ErrUnavailable: %v", missingErr)
+		}
+	})
+
+	t.Run("ClosedPort", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen ephemeral port: %v", err)
+		}
+		closedAddress := listener.Addr().String()
+		if err := listener.Close(); err != nil {
+			t.Fatalf("close listener: %v", err)
+		}
+
+		closedBackend, err := s3storage.New(ctx, s3storage.Config{
+			Bucket:       bucket,
+			Endpoint:     "http://" + closedAddress,
+			Region:       "us-east-1",
+			UsePathStyle: true,
+		})
+		if err != nil {
+			t.Fatalf("initialize closed-port S3 backend: %v", err)
+		}
+
+		_, err = closedBackend.PutObject(ctx, "vol", "key", blob.NewByteStreamFromBytes([]byte("payload")))
+		if !errors.Is(err, objectstore.ErrUnavailable) {
+			t.Fatalf("PutObject to closed port: got %v, want ErrUnavailable", err)
+		}
+	})
+
+	t.Run("CancelledCallerContext", func(t *testing.T) {
+		cancelledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		_, err := backend.PutObject(cancelledCtx, "vol", "key", blob.NewByteStreamFromBytes([]byte("payload")))
+		if err == nil {
+			t.Fatal("PutObject with cancelled context: expected error, got nil")
+		}
+		if errors.Is(err, objectstore.ErrUnavailable) {
+			t.Fatalf("PutObject with cancelled context: must not be ErrUnavailable: %v", err)
+		}
+	})
 }

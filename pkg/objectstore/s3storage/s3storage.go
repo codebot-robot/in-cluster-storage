@@ -26,12 +26,15 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/internal/storeerrors"
 )
 
 // Config holds configuration options for initializing an S3 backend.
@@ -148,7 +151,7 @@ func (b *Backend) PutObject(ctx context.Context, volumeID, key string, stream bl
 
 	out, err := b.client.PutObject(ctx, input)
 	if err != nil {
-		return "", fmt.Errorf("failed to put s3 object %s: %w", s3Key, err)
+		return "", fmt.Errorf("failed to put s3 object %s: %w", s3Key, classifyError(ctx, err))
 	}
 
 	etag := ""
@@ -177,26 +180,26 @@ func (b *Backend) GetObject(ctx context.Context, volumeID, key string, offset, l
 
 	out, err := b.client.GetObject(ctx, input)
 	if err != nil {
-		var respErr *s3types.NoSuchKey
-		if errors.As(err, &respErr) {
-			return fmt.Errorf("object %s not found in volume %s: %w", key, volumeID, err)
+		var noSuchKeyError *s3types.NoSuchKey
+		if errors.As(err, &noSuchKeyError) {
+			return fmt.Errorf("object %s not found in volume %s: %w: %w", key, volumeID, storeerrors.ErrNotFound, err)
 		}
-		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) {
-			if apiErr.ErrorCode() == "NoSuchKey" || apiErr.ErrorCode() == "NotFound" {
-				return fmt.Errorf("object %s not found in volume %s: %w", key, volumeID, err)
+		var apiError smithy.APIError
+		if errors.As(err, &apiError) {
+			if apiError.ErrorCode() == "NoSuchKey" || apiError.ErrorCode() == "NotFound" {
+				return fmt.Errorf("object %s not found in volume %s: %w: %w", key, volumeID, storeerrors.ErrNotFound, err)
 			}
 			// HTTP 416 Requested Range Not Satisfiable: offset >= size -> 0 bytes
-			if apiErr.ErrorCode() == "InvalidRange" {
+			if apiError.ErrorCode() == "InvalidRange" {
 				return nil
 			}
 		}
-		return fmt.Errorf("failed to get s3 object %s: %w", s3Key, err)
+		return fmt.Errorf("failed to get s3 object %s: %w", s3Key, classifyError(ctx, err))
 	}
 	defer errutil.CloseAndLog(out.Body, "s3 response body")
 
 	if _, err := io.Copy(w, out.Body); err != nil {
-		return fmt.Errorf("failed to stream s3 object %s: %w", s3Key, err)
+		return fmt.Errorf("failed to stream s3 object %s: %w", s3Key, classifyError(ctx, err))
 	}
 	return nil
 }
@@ -209,7 +212,7 @@ func (b *Backend) DeleteObject(ctx context.Context, volumeID, key string) error 
 	}
 	_, err := b.client.DeleteObject(ctx, input)
 	if err != nil {
-		return fmt.Errorf("failed to delete s3 object %s: %w", s3Key, err)
+		return fmt.Errorf("failed to delete s3 object %s: %w", s3Key, classifyError(ctx, err))
 	}
 	return nil
 }
@@ -222,7 +225,7 @@ func (b *Backend) GetRedirectURL(ctx context.Context, volumeID, key string) (str
 	}
 	req, err := b.presignClient.PresignGetObject(ctx, input, s3.WithPresignExpires(15*time.Minute))
 	if err != nil {
-		return "", fmt.Errorf("failed to presign s3 object %s: %w", s3Key, err)
+		return "", fmt.Errorf("failed to presign s3 object %s: %w", s3Key, classifyError(ctx, err))
 	}
 	return req.URL, nil
 }
@@ -238,7 +241,7 @@ func (backend *Backend) ListObjects(ctx context.Context, volumeID, prefix string
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list s3 objects with prefix %s: %w", fullPrefix, err)
+			return nil, fmt.Errorf("failed to list s3 objects with prefix %s: %w", fullPrefix, classifyError(ctx, err))
 		}
 		for _, objectItem := range page.Contents {
 			if objectItem.Key != nil {
@@ -259,4 +262,44 @@ func (backend *Backend) ListObjects(ctx context.Context, volumeID, prefix string
 		}
 	}
 	return matches, nil
+}
+
+func classifyError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isUnavailable(ctx, err) {
+		return fmt.Errorf("%w: %w", storeerrors.ErrUnavailable, err)
+	}
+	return err
+}
+
+func isUnavailable(ctx context.Context, err error) bool {
+	if err == nil || storeerrors.IsCallerContextError(ctx, err) {
+		return false
+	}
+
+	var responseError *smithyhttp.ResponseError
+	if errors.As(err, &responseError) && responseError.Response != nil {
+		if storeerrors.IsHTTPStatusUnavailable(responseError.HTTPStatusCode()) {
+			return true
+		}
+	}
+
+	var apiError smithy.APIError
+	if errors.As(err, &apiError) {
+		code := apiError.ErrorCode()
+		if _, throttled := retry.DefaultThrottleErrorCodes[code]; throttled {
+			return true
+		}
+		if _, retryable := retry.DefaultRetryableErrorCodes[code]; retryable {
+			return true
+		}
+		if apiError.ErrorFault() == smithy.FaultServer {
+			return true
+		}
+		return false
+	}
+
+	return storeerrors.IsTransportUnavailable(err)
 }

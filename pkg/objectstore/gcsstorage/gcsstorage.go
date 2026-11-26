@@ -27,7 +27,11 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/internal/storeerrors"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -97,10 +101,10 @@ func (b *Backend) PutObject(ctx context.Context, volumeID, key string, stream bl
 
 	if _, err := io.Copy(w, stream); err != nil {
 		errutil.CloseAndLog(w, "gcs writer")
-		return "", fmt.Errorf("failed to write gcs object %s: %w", gcsKey, err)
+		return "", fmt.Errorf("failed to write gcs object %s: %w", gcsKey, classifyError(ctx, err))
 	}
 	if err := w.Close(); err != nil {
-		return "", fmt.Errorf("failed to close gcs writer %s: %w", gcsKey, err)
+		return "", fmt.Errorf("failed to close gcs writer %s: %w", gcsKey, classifyError(ctx, err))
 	}
 
 	attrs, err := obj.Attrs(ctx)
@@ -128,14 +132,14 @@ func (b *Backend) GetObject(ctx context.Context, volumeID, key string, offset, l
 
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
-			return fmt.Errorf("object %s not found in volume %s: %w", key, volumeID, err)
+			return fmt.Errorf("object %s not found in volume %s: %w: %w", key, volumeID, storeerrors.ErrNotFound, err)
 		}
-		return fmt.Errorf("failed to get gcs object %s: %w", gcsKey, err)
+		return fmt.Errorf("failed to get gcs object %s: %w", gcsKey, classifyError(ctx, err))
 	}
 	defer errutil.CloseAndLog(r, "gcs reader")
 
 	if _, err := io.Copy(w, r); err != nil {
-		return fmt.Errorf("failed to stream gcs object %s: %w", gcsKey, err)
+		return fmt.Errorf("failed to stream gcs object %s: %w", gcsKey, classifyError(ctx, err))
 	}
 	return nil
 }
@@ -144,7 +148,7 @@ func (b *Backend) DeleteObject(ctx context.Context, volumeID, key string) error 
 	gcsKey := b.fullKey(volumeID, key)
 	err := b.client.Bucket(b.bucket).Object(gcsKey).Delete(ctx)
 	if err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
-		return fmt.Errorf("failed to delete gcs object %s: %w", gcsKey, err)
+		return fmt.Errorf("failed to delete gcs object %s: %w", gcsKey, classifyError(ctx, err))
 	}
 	return nil
 }
@@ -176,7 +180,7 @@ func (backend *Backend) ListObjects(ctx context.Context, volumeID, prefix string
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("failed to list gcs objects with prefix %s: %w", fullPrefix, err)
+			return nil, fmt.Errorf("failed to list gcs objects with prefix %s: %w", fullPrefix, classifyError(ctx, err))
 		}
 		matches = append(matches, blob.ObjectEntry{
 			Key:          backend.relativeKey(attrs.Name),
@@ -185,4 +189,48 @@ func (backend *Backend) ListObjects(ctx context.Context, volumeID, prefix string
 		})
 	}
 	return matches, nil
+}
+
+func classifyError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isUnavailable(ctx, err) {
+		return fmt.Errorf("%w: %w", storeerrors.ErrUnavailable, err)
+	}
+	return err
+}
+
+func isUnavailable(ctx context.Context, err error) bool {
+	if err == nil || storeerrors.IsCallerContextError(ctx, err) {
+		return false
+	}
+
+	var apiError *googleapi.Error
+	if errors.As(err, &apiError) {
+		if storeerrors.IsHTTPStatusUnavailable(apiError.Code) {
+			return true
+		}
+		for _, item := range apiError.Errors {
+			if item.Reason == "rateLimitExceeded" || item.Reason == "userRateLimitExceeded" {
+				return true
+			}
+		}
+		return false
+	}
+
+	if grpcStatus, ok := status.FromError(err); ok {
+		switch grpcStatus.Code() {
+		case codes.Unavailable, codes.ResourceExhausted, codes.Internal, codes.DeadlineExceeded:
+			return true
+		default:
+			return false
+		}
+	}
+
+	if storeerrors.IsTransportUnavailable(err) {
+		return true
+	}
+
+	return storage.ShouldRetry(err)
 }
