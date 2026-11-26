@@ -855,11 +855,23 @@ func (s *Server) attachSession(ctx context.Context, streamID uuid.UUID, sessionE
 // released reports whether the session ended cleanly (the client half-closed the
 // stream, all in-flight records were committed, and Append returned nil). Only a
 // clean end-of-stream path sets released to true to release the writer lock
-// immediately, clearing the holder so the next client's Hello is granted at once.
-// Any other termination (context cancellation, severed connection, server shutdown,
-// or commit errors) leaves released false so the lock remains reserved for the
-// previous holder for the grace period.
-func (s *Server) detachSession(state *streamState, clientID string, released bool) {
+// immediately, clearing the holder in memory and removing its holder file so the
+// release survives idle eviction and server restarts. Any other termination
+// (context cancellation, severed connection, server shutdown, or commit errors)
+// leaves released false so the lock remains reserved for the previous holder for
+// the grace period.
+//
+// Lock order: holderFile.mu, then Server.mu, then streamState.mu.
+// Taking holderFile.mu here cannot deadlock against an attach in progress:
+// attachSession takes the same locks in the same order and never waits for a
+// session to end.
+func (s *Server) detachSession(ctx context.Context, streamID uuid.UUID, state *streamState, clientID string, released bool) {
+	if released && clientID != "" {
+		state.holderFile.mu.Lock()
+		defer state.holderFile.mu.Unlock()
+	}
+
+	var clearHolder bool
 	state.mu.Lock()
 	state.attachments--
 	if clientID != "" && state.holder == clientID && state.holderSessions > 0 {
@@ -868,12 +880,19 @@ func (s *Server) detachSession(state *streamState, clientID string, released boo
 			if released {
 				state.holder = ""
 				state.lastSessionEnd = time.Time{}
+				clearHolder = true
 			} else {
 				state.lastSessionEnd = s.clock.Now()
 			}
 		}
 	}
 	state.mu.Unlock()
+
+	if clearHolder {
+		if err := state.holderFile.clearLocked(s.holderStore, streamID); err != nil {
+			scoped.Log(ctx).Error(err, "failed to remove stream writer lock holder", "stream", streamID)
+		}
+	}
 }
 
 type appendServerWithContext struct {
@@ -922,7 +941,7 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 
 	var released bool
 	defer func() {
-		s.detachSession(st, clientID, released)
+		s.detachSession(ctx, streamID, st, clientID, released)
 	}()
 
 	scoped.Log(ctx).Info("WAL buffer: Hello received", "witnessWatermark", witnessSeq, "s3Watermark", s3Seq)

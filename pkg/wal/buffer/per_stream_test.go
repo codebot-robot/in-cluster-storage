@@ -1994,7 +1994,7 @@ func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.
 		t.Fatalf("expected attached streamState %p to be in map, got %p", state, mapState)
 	}
 
-	server.detachSession(state, "", false)
+	server.detachSession(ctx, streamID, state, "", false)
 
 	server.evictIdleStreams()
 
@@ -2056,8 +2056,8 @@ func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.
 				i, attached, secondAttached)
 		}
 
-		server.detachSession(attached, "", false)
-		server.detachSession(secondAttached, "", false)
+		server.detachSession(ctx, concurrentStreamID, attached, "", false)
+		server.detachSession(ctx, concurrentStreamID, secondAttached, "", false)
 		server.evictIdleStreams()
 	}
 }
@@ -2093,7 +2093,7 @@ func TestServerStreams_InFlightRecordPinsStateAgainstEviction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attachSession failed: %v", err)
 	}
-	server.detachSession(state, "", false)
+	server.detachSession(ctx, streamID, state, "", false)
 
 	state.mu.Lock()
 	state.inFlight = 1

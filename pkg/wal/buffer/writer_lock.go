@@ -39,6 +39,9 @@ type writerLockStore interface {
 	// save writes the clientID as a hex-encoded string followed by a newline to directory/<streamID>
 	// using a temporary file, fsync, atomic rename, and directory fsync.
 	save(streamID uuid.UUID, clientID string) error
+
+	// remove deletes the stream's writer lock holder file from disk, treating a missing file as success.
+	remove(streamID uuid.UUID) error
 }
 
 // diskWriterLockStore persists writer lock holders as small files under <dataDir>/writer-locks/<streamID>.
@@ -57,6 +60,7 @@ var (
 	_ writerLockStore = (*diskWriterLockStore)(nil)
 	_                 = (*diskWriterLockStore).load
 	_                 = (*diskWriterLockStore).save
+	_                 = (*diskWriterLockStore).remove
 )
 
 // load reads the stream's writer lock holder from disk. If the file does not exist,
@@ -133,11 +137,23 @@ func (s *diskWriterLockStore) save(streamID uuid.UUID, clientID string) error {
 	return nil
 }
 
+// remove deletes the stream's writer lock holder file from disk, treating a missing file as success.
+// No fsync is performed: a file that reappears after a crash costs a different client one grace
+// period and never produces two holders.
+func (s *diskWriterLockStore) remove(streamID uuid.UUID) error {
+	filePath := filepath.Join(s.directory, streamID.String())
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing writer lock holder file %s: %w", filePath, err)
+	}
+	return nil
+}
+
 // holderFile tracks what one stream's writer lock holder file is known to contain, so the
 // file is read once after the stream state is created and written only when the holder changes.
 type holderFile struct {
-	// mu serialises the attaching sessions of one stream and guards the fields below.
-	// It is held across the file I/O. Lock order: holderFile.mu, then Server.mu, then streamState.mu.
+	// mu serialises attaching sessions and clean-release removals of one stream and guards
+	// the fields below. It is held across the file I/O.
+	// Lock order: holderFile.mu, then Server.mu, then streamState.mu.
 	mu sync.Mutex
 	// loaded reports whether the file has been read since the stream state was created.
 	loaded bool
@@ -181,6 +197,19 @@ func (f *holderFile) saveLocked(store writerLockStore, streamID uuid.UUID, clien
 	}
 	f.saveFailed = false
 	f.contents = clientID
+	return nil
+}
+
+// clearLocked removes the stream's writer lock holder file from store.
+// On success it records that the file names nobody; on failure it leaves the last recorded holder
+// in place so a later grant to another client still rewrites the file.
+// Requires f.mu to be held.
+func (f *holderFile) clearLocked(store writerLockStore, streamID uuid.UUID) error {
+	if err := store.remove(streamID); err != nil {
+		return err
+	}
+	f.saveFailed = false
+	f.contents = ""
 	return nil
 }
 

@@ -145,29 +145,29 @@ func TestWriterLock_GrantAndResume(t *testing.T) {
 		t.Fatalf("expected Unavailable while attached, got %v", err)
 	}
 
-	server.detachSession(state, "client-1", false)
+	server.detachSession(ctx, streamID, state, "client-1", false)
 
 	// Another client while client-1 still has one attached session is refused with Unavailable.
 	if _, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2"); status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected Unavailable while first session attached, got %v", err)
 	}
 
-	server.detachSession(state, "client-1", false)
+	server.detachSession(ctx, streamID, state, "client-1", false)
 
 	// Both sessions of client-1 detached: client-2 is granted.
 	client2State, _, _, resumed, err := server.attachSession(ctx, streamID, 1, "client-2")
 	if err != nil || resumed {
 		t.Fatalf("attach client-2: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(client2State, "client-2", false)
+	server.detachSession(ctx, streamID, client2State, "client-2", false)
 	if _, _, _, resumed, err = server.attachSession(ctx, streamID, 1, "client-2"); err != nil || !resumed {
 		t.Fatalf("reacquire client-2: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(client2State, "client-2", false)
+	server.detachSession(ctx, streamID, client2State, "client-2", false)
 	if _, _, _, resumed, err = server.attachSession(ctx, streamID, 1, "client-1"); err != nil || resumed {
 		t.Fatalf("acquire client-1: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(state, "client-1", false)
+	server.detachSession(ctx, streamID, state, "client-1", false)
 }
 
 func TestWriterLock_RefusedWhileHolderAttached(t *testing.T) {
@@ -179,7 +179,7 @@ func TestWriterLock_RefusedWhileHolderAttached(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attach client-1: %v", err)
 	}
-	defer server.detachSession(state, "client-1", false)
+	defer server.detachSession(ctx, streamID, state, "client-1", false)
 
 	_, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2")
 	if status.Code(err) != codes.Unavailable {
@@ -205,7 +205,7 @@ func TestWriterLock_InFlightRefusedUntilCommitted(t *testing.T) {
 	state.mu.Lock()
 	state.inFlight = 1
 	state.mu.Unlock()
-	server.detachSession(state, "client-1", false)
+	server.detachSession(ctx, streamID, state, "client-1", false)
 
 	// Another client while records are still in flight is refused with Unavailable.
 	_, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2")
@@ -230,7 +230,7 @@ func TestWriterLock_InFlightRefusedUntilCommitted(t *testing.T) {
 	if witnessSeq != 42 {
 		t.Fatalf("expected witness watermark 42, got %d", witnessSeq)
 	}
-	server.detachSession(client2State, "client-2", false)
+	server.detachSession(ctx, streamID, client2State, "client-2", false)
 }
 
 func TestWriterLock_EmptyClientID(t *testing.T) {
@@ -242,12 +242,12 @@ func TestWriterLock_EmptyClientID(t *testing.T) {
 	if err != nil || resumed1 {
 		t.Fatalf("attach 1: err=%v, resumed=%v", err, resumed1)
 	}
-	defer server.detachSession(state1, "", false)
+	defer server.detachSession(ctx, streamID, state1, "", false)
 	state2, _, _, resumed2, err := server.attachSession(ctx, streamID, 1, "")
 	if err != nil || resumed2 {
 		t.Fatalf("attach 2: err=%v, resumed=%v", err, resumed2)
 	}
-	defer server.detachSession(state2, "", false)
+	defer server.detachSession(ctx, streamID, state2, "", false)
 	state1.mu.Lock()
 	defer state1.mu.Unlock()
 	if state1.holder != "" || state1.holderSessions != 0 || state1.attachments != 2 {
@@ -265,7 +265,7 @@ func TestWriterLock_FencedLeavesNoHolderOrSessionCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial attach: %v", err)
 	}
-	server.detachSession(state, "client-1", false)
+	server.detachSession(ctx, streamID, state, "client-1", false)
 
 	// Attempt attach with a lower epoch. The lock is evaluated and granted first,
 	// but the epoch check fails and returns fencedStatus.
@@ -406,7 +406,7 @@ func setupGraceTest(t *testing.T) (*Server, *fakeClock, *streamState, uuid.UUID)
 	if err != nil {
 		t.Fatalf("attach client-1: %v", err)
 	}
-	server.detachSession(state, "client-1", false)
+	server.detachSession(t.Context(), streamID, state, "client-1", false)
 	return server, clock, state, streamID
 }
 
@@ -440,7 +440,7 @@ func TestWriterLock_GracePeriodRefusesOtherClient(t *testing.T) {
 	if err != nil || !resumed {
 		t.Fatalf("attach client-1 within grace: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(holderState, "client-1", false)
+	server.detachSession(ctx, streamID, holderState, "client-1", false)
 
 	// Advance clock past the grace period.
 	clock.Advance(20 * time.Second)
@@ -450,7 +450,7 @@ func TestWriterLock_GracePeriodRefusesOtherClient(t *testing.T) {
 	if err != nil || resumed {
 		t.Fatalf("attach client-2 after grace period: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(client2State, "client-2", false)
+	server.detachSession(ctx, streamID, client2State, "client-2", false)
 }
 
 func TestWriterLock_SameClientGrantedInsideGracePeriod(t *testing.T) {
@@ -464,7 +464,7 @@ func TestWriterLock_SameClientGrantedInsideGracePeriod(t *testing.T) {
 	if err != nil || !resumed {
 		t.Fatalf("attach client-1 within grace: err=%v, resumed=%v", err, resumed)
 	}
-	server.detachSession(state, "client-1", false)
+	server.detachSession(t.Context(), streamID, state, "client-1", false)
 }
 
 func TestAppend_RefusedHelloOverWire(t *testing.T) {
@@ -1037,13 +1037,15 @@ func TestWriterLock_RestartRemembersHolder(t *testing.T) {
 	}
 }
 
-// testHolderStore wraps writerLockStore to allow blocking or failing save calls.
+// testHolderStore wraps writerLockStore to allow blocking or failing save and remove calls.
 type testHolderStore struct {
 	writerLockStore
 	saveStarted chan struct{}
 	unblockSave chan struct{}
 	failSave    atomic.Bool
 	saves       atomic.Int32
+	failRemove  atomic.Bool
+	removes     atomic.Int32
 }
 
 func (s *testHolderStore) save(streamID uuid.UUID, clientID string) error {
@@ -1064,7 +1066,18 @@ func (s *testHolderStore) save(streamID uuid.UUID, clientID string) error {
 	return s.writerLockStore.save(streamID, clientID)
 }
 
-var _ = (*testHolderStore).save
+func (s *testHolderStore) remove(streamID uuid.UUID) error {
+	s.removes.Add(1)
+	if s.failRemove.Swap(false) {
+		return errors.New("simulated remove failure")
+	}
+	return s.writerLockStore.remove(streamID)
+}
+
+var (
+	_ = (*testHolderStore).save
+	_ = (*testHolderStore).remove
+)
 
 func TestWriterLock_BlockedSave(t *testing.T) {
 	ctx := t.Context()
@@ -1227,8 +1240,8 @@ func TestWriterLock_FailedSave(t *testing.T) {
 	}
 
 	// Detach both sessions of client A so holderSessions is 0.
-	server.detachSession(state, "client-1", false)
-	server.detachSession(state2, "client-1", false)
+	server.detachSession(ctx, streamID, state, "client-1", false)
+	server.detachSession(ctx, streamID, state2, "client-1", false)
 
 	// 4. Client A has detached. After the grace period, client B's save fails
 	// (the wrapper fails it after writing nothing).
@@ -1249,10 +1262,65 @@ func TestWriterLock_FailedSave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attach client-1 after client-2 failed save: %v", err)
 	}
-	defer server.detachSession(state3, "client-1", false)
+	defer server.detachSession(ctx, streamID, state3, "client-1", false)
 
 	if failingStore.saves.Load() != 4 {
 		t.Fatalf("expected 4 save calls (save must be called for client-1 after failed save), got %d", failingStore.saves.Load())
+	}
+}
+
+func TestWriterLock_FailedRemove(t *testing.T) {
+	ctx := t.Context()
+	clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	server := newTestServerWithGrace(t, 15*time.Second, clock)
+
+	failingStore := &testHolderStore{
+		writerLockStore: server.holderStore,
+	}
+	server.holderStore = failingStore
+
+	streamID := uuid.New()
+
+	state, _, _, resumed, err := server.attachSession(ctx, streamID, 1, "client-1")
+	if err != nil || resumed {
+		t.Fatalf("attach client-1: err=%v, resumed=%v", err, resumed)
+	}
+
+	// Clean release with remove failing still frees the lock in memory.
+	failingStore.failRemove.Store(true)
+	server.detachSession(ctx, streamID, state, "client-1", true)
+
+	if failingStore.removes.Load() != 1 {
+		t.Fatalf("expected 1 remove call, got %d", failingStore.removes.Load())
+	}
+
+	state.mu.Lock()
+	holder := state.holder
+	state.mu.Unlock()
+	if holder != "" {
+		t.Fatalf("expected lock freed in memory after failed remove, got holder %q", holder)
+	}
+
+	state.holderFile.mu.Lock()
+	recordedContents := state.holderFile.contents
+	state.holderFile.mu.Unlock()
+	if recordedContents != "client-1" {
+		t.Fatalf("expected holderFile to keep last holder on failed remove, got %q", recordedContents)
+	}
+
+	// Without advancing the clock, another client is granted and writes the file.
+	client2State, _, _, resumed, err := server.attachSession(ctx, streamID, 1, "client-2")
+	if err != nil || resumed {
+		t.Fatalf("attach client-2 after failed remove: err=%v, resumed=%v", err, resumed)
+	}
+	defer server.detachSession(ctx, streamID, client2State, "client-2", false)
+
+	if failingStore.saves.Load() != 2 {
+		t.Fatalf("expected 2 save calls (client-1 then client-2), got %d", failingStore.saves.Load())
+	}
+	loaded, err := server.holderStore.load(streamID)
+	if err != nil || loaded != "client-2" {
+		t.Fatalf("load on disk after client-2 grant: got (%q, %v), want (client-2, nil)", loaded, err)
 	}
 }
 
@@ -1327,7 +1395,7 @@ func TestWriterLock_ContentionWithEviction(t *testing.T) {
 					t.Errorf("client %s: holder file on disk names %q, want %q", clientID, holder, clientID)
 				}
 				activeHolders.Add(-1)
-				server.detachSession(state, clientID, false)
+				server.detachSession(ctx, streamID, state, clientID, false)
 				runtime.Gosched()
 			}
 		}(clientID)
@@ -1401,4 +1469,134 @@ func TestWriterLock_CorruptAndUnreadableFile(t *testing.T) {
 	if strings.Contains(err.Error(), unreadablePath) || strings.Contains(err.Error(), dataDir) {
 		t.Fatalf("error message must not contain file paths: %v", err)
 	}
+}
+
+func TestAppend_CleanEndSurvivesEvictionAndRestart(t *testing.T) {
+	sayHelloAndClose := func(t *testing.T, address string, streamID uuid.UUID, clientID []byte) *pb.HelloAck {
+		t.Helper()
+		connection, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatalf("grpc.NewClient: %v", err)
+		}
+		defer func() {
+			if err := connection.Close(); err != nil {
+				t.Errorf("connection.Close: %v", err)
+			}
+		}()
+
+		stream, err := pb.NewWalBufferClient(connection).Append(t.Context())
+		if err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		if err := stream.Send(&pb.AppendRequest{
+			Msg: &pb.AppendRequest_Hello{
+				Hello: &pb.Hello{
+					StreamId: streamID[:],
+					Epoch:    1,
+					ClientId: clientID,
+				},
+			},
+		}); err != nil {
+			t.Fatalf("Send Hello: %v", err)
+		}
+		response, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("Recv HelloAck for %s: %v", clientID, err)
+		}
+		helloAck := response.GetHelloAck()
+		if helloAck == nil {
+			t.Fatalf("expected HelloAck, got %v", response)
+		}
+		if err := stream.CloseSend(); err != nil {
+			t.Fatalf("CloseSend: %v", err)
+		}
+		for {
+			_, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Recv until EOF: %v", err)
+			}
+		}
+		return helloAck
+	}
+
+	t.Run("idle eviction", func(t *testing.T) {
+		clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+		server, address, cleanup := startTestServerWithConfig(t, ServerConfig{
+			Backend:         inmemorystorage.New(),
+			DataDir:         t.TempDir(),
+			WriterLockGrace: 15 * time.Second,
+			Clock:           clock,
+		})
+		t.Cleanup(cleanup)
+
+		streamID := uuid.New()
+		helloAckA := sayHelloAndClose(t, address, streamID, []byte("client-A"))
+		if helloAckA.GetResumed() {
+			t.Fatalf("expected resumed=false for client-A, got true")
+		}
+
+		// Wait for the forwarder goroutine to exit before running the eviction pass.
+		server.mu.RLock()
+		state := server.streams[streamID.String()]
+		server.mu.RUnlock()
+		if state == nil {
+			t.Fatalf("expected stream state for %s before eviction", streamID)
+		}
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+			state.mu.Lock()
+			waiters := state.waiters
+			state.mu.Unlock()
+			if waiters == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for forwarder to exit: waiters=%d", waiters)
+			}
+		}
+
+		server.evictIdleStreams()
+		if count := server.StreamCount(); count != 0 {
+			t.Fatalf("expected stream state to be evicted, got count %d", count)
+		}
+
+		helloAckB := sayHelloAndClose(t, address, streamID, []byte("client-B"))
+		if helloAckB.GetResumed() {
+			t.Fatalf("expected resumed=false for client-B after eviction, got true")
+		}
+	})
+
+	t.Run("server restart", func(t *testing.T) {
+		clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+		backend := inmemorystorage.New()
+		dataDir := t.TempDir()
+		streamID := uuid.New()
+
+		_, address1, cleanup1 := startTestServerWithConfig(t, ServerConfig{
+			Backend:         backend,
+			DataDir:         dataDir,
+			WriterLockGrace: 15 * time.Second,
+			Clock:           clock,
+		})
+		helloAckA := sayHelloAndClose(t, address1, streamID, []byte("client-A"))
+		if helloAckA.GetResumed() {
+			t.Fatalf("expected resumed=false for client-A, got true")
+		}
+		cleanup1()
+
+		_, address2, cleanup2 := startTestServerWithConfig(t, ServerConfig{
+			Backend:         backend,
+			DataDir:         dataDir,
+			WriterLockGrace: 15 * time.Second,
+			Clock:           clock,
+		})
+		t.Cleanup(cleanup2)
+
+		helloAckB := sayHelloAndClose(t, address2, streamID, []byte("client-B"))
+		if helloAckB.GetResumed() {
+			t.Fatalf("expected resumed=false for client-B after restart, got true")
+		}
+	})
 }
