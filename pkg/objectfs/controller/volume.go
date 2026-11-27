@@ -6443,10 +6443,13 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 
 		v.handlesMu.Lock()
 		if fh != 0 {
-			if ino, ok := v.handles[fh]; ok {
-				inodeID = ino
-				delete(v.handles, fh)
+			ino, ok := v.handles[fh]
+			if !ok {
+				v.handlesMu.Unlock()
+				return nil, nil
 			}
+			inodeID = ino
+			delete(v.handles, fh)
 		}
 		if v.openInodes != nil {
 			if v.openInodes[inodeID] > 1 {
