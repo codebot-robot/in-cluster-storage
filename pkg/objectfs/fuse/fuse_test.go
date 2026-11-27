@@ -7541,6 +7541,11 @@ func (c *captureRequestIDClient) Link(_ context.Context, request *pb.LinkRequest
 	return &pb.LinkResponse{Error: int32(syscall.EIO)}, nil
 }
 
+func (c *captureRequestIDClient) CreateFile(_ context.Context, request *pb.CreateFileRequest, _ ...grpc.CallOption) (*pb.CreateFileResponse, error) {
+	c.keys = append(c.keys, request.GetRequestId())
+	return &pb.CreateFileResponse{Error: int32(syscall.EIO)}, nil
+}
+
 func TestFUSECreateOperationsSetDistinctRequestIDs(t *testing.T) {
 	capture := &captureRequestIDClient{}
 	rawFS := NewObjectFS(capture, "vol-1", pb.WriteMode_FSYNC, nil)
@@ -7550,9 +7555,10 @@ func TestFUSECreateOperationsSetDistinctRequestIDs(t *testing.T) {
 	rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, "d2", &entryOut)
 	rawFS.Symlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "/target", "sym", &entryOut)
 	rawFS.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Oldnodeid: 2}, "hard", &entryOut)
+	rawFS.Mknod(nil, &fuse.MknodIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: syscall.S_IFIFO | 0644}, "fifo", &entryOut)
 
-	if len(capture.keys) != 4 {
-		t.Fatalf("got %d captured request IDs, want 4", len(capture.keys))
+	if len(capture.keys) != 5 {
+		t.Fatalf("got %d captured request IDs, want 5", len(capture.keys))
 	}
 	for i, key := range capture.keys {
 		if len(key) != 16 {
@@ -7563,5 +7569,11 @@ func TestFUSECreateOperationsSetDistinctRequestIDs(t *testing.T) {
 				t.Fatalf("calls %d and %d received identical request ID %x", j, i, key)
 			}
 		}
+	}
+
+	var createOut fuse.CreateOut
+	rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, "reg", &createOut)
+	if len(capture.keys) != 6 || len(capture.keys[5]) != 0 {
+		t.Fatalf("Create request ID: got %x, want empty", capture.keys[len(capture.keys)-1])
 	}
 }
