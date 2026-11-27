@@ -749,6 +749,7 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 			return nil, fmt.Errorf("failed to create volume %s: %w", volumeID, err)
 		}
 		if err := volume.LoadFromBackend(context.Background()); err != nil {
+			errutil.CloseAndLog(volume, "unloaded volume")
 			return nil, fmt.Errorf("failed to load volume %s from backend: %w", volumeID, err)
 		}
 		if volume.IsDeleted() {

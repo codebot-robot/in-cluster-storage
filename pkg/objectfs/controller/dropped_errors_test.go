@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"iter"
 	"os"
 	"path/filepath"
@@ -505,5 +507,108 @@ func TestServer_Close_ReturnsAllErrorsJoined(t *testing.T) {
 
 	if err := server.Close(); err != nil {
 		t.Errorf("expected subsequent server.Close() to return nil, got: %v", err)
+	}
+}
+
+type snapshotFaultBackend struct {
+	objectstore.Backend
+	failList atomic.Bool
+	failGet  atomic.Bool
+}
+
+func (b *snapshotFaultBackend) ListObjects(ctx context.Context, volumeID, prefix string) ([]objectstore.ObjectEntry, error) {
+	if b.failList.Load() {
+		return nil, fmt.Errorf("injected list failure: %w", objectstore.ErrUnavailable)
+	}
+	return b.Backend.ListObjects(ctx, volumeID, prefix)
+}
+
+func (b *snapshotFaultBackend) GetObject(ctx context.Context, volumeID, key string, offset, length int64, writer io.Writer) error {
+	if b.failGet.Load() {
+		return fmt.Errorf("injected get failure: %w", objectstore.ErrUnavailable)
+	}
+	return b.Backend.GetObject(ctx, volumeID, key, offset, length, writer)
+}
+
+func TestVolumeLoad_SnapshotErrors(t *testing.T) {
+	cases := []struct {
+		name     string
+		failList bool
+		failGet  bool
+	}{
+		{name: "list_unavailable", failList: true},
+		{name: "read_unavailable", failGet: true},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := t.Context()
+			backend := &snapshotFaultBackend{Backend: inmemorystorage.New()}
+			volumeID := "test-vol-snapshot-" + testCase.name
+			wantContent := []byte("snapshot content for " + testCase.name)
+
+			writerServer := NewTestServer(t, backend)
+			writerVolume, err := writerServer.GetVolume(volumeID)
+			if err != nil {
+				t.Fatalf("writerServer.GetVolume failed: %v", err)
+			}
+			if _, err := writerVolume.CreateFile(ctx, 1, "hello.txt", 0644, wantContent, 0, 0, 0); err != nil {
+				t.Fatalf("CreateFile failed: %v", err)
+			}
+			if _, err := writerVolume.CreateSnapshot(ctx, "snap-1"); err != nil {
+				t.Fatalf("CreateSnapshot failed: %v", err)
+			}
+			if err := writerServer.Close(); err != nil {
+				t.Fatalf("writerServer.Close failed: %v", err)
+			}
+
+			readerServer := NewTestServer(t, backend)
+
+			backend.failList.Store(testCase.failList)
+			backend.failGet.Store(testCase.failGet)
+
+			_, err = readerServer.GetVolume(volumeID)
+			if !errors.Is(err, objectstore.ErrUnavailable) {
+				t.Fatalf("expected GetVolume error wrapping ErrUnavailable, got: %v", err)
+			}
+
+			readerServer.mu.Lock()
+			_, cached := readerServer.volumes[volumeID]
+			readerServer.mu.Unlock()
+			if cached {
+				t.Fatal("expected volume not to be cached after failed load")
+			}
+
+			backend.failList.Store(false)
+			backend.failGet.Store(false)
+
+			volume, err := readerServer.GetVolume(volumeID)
+			if err != nil {
+				t.Fatalf("GetVolume after store recovery failed: %v", err)
+			}
+			fileAttributes, err := volume.Lookup(ctx, 1, "hello.txt")
+			if err != nil {
+				t.Fatalf("Lookup after recovery failed: %v", err)
+			}
+			gotContent, _, _, err := volume.ReadFile(ctx, fileAttributes.GetInode().GetIno(), 0, int64(len(wantContent)))
+			if err != nil {
+				t.Fatalf("ReadFile after recovery failed: %v", err)
+			}
+			if !bytes.Equal(gotContent, wantContent) {
+				t.Fatalf("content mismatch: got %q, want %q", gotContent, wantContent)
+			}
+
+			backend.failList.Store(testCase.failList)
+			backend.failGet.Store(testCase.failGet)
+			rebuiltIndex, _, err := volume.rebuildIndex(ctx)
+			if rebuiltIndex != nil {
+				_ = rebuiltIndex.Close()
+			}
+			backend.failList.Store(false)
+			backend.failGet.Store(false)
+			if !errors.Is(err, objectstore.ErrUnavailable) {
+				t.Fatalf("expected rebuildIndex error wrapping ErrUnavailable, got: %v", err)
+			}
+		})
 	}
 }
