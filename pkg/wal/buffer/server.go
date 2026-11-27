@@ -46,6 +46,9 @@ const (
 	DefaultBatchDelay      = 5 * time.Millisecond
 	DefaultBatchSize       = 1024 * 1024
 	DefaultWriterLockGrace = 15 * time.Second
+
+	defaultStartupRetryInitialBackoff = 1 * time.Second
+	defaultStartupRetryMaxBackoff     = 15 * time.Second
 )
 
 // Clock provides time operations for Server.
@@ -387,15 +390,23 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	holderStore := newDiskWriterLockStore(filepath.Join(cfg.DataDir, "writer-locks"))
 
 	dataDir := cfg.DataDir
-	streamStore := NewStreamStore(dataDir, cfg.Backend, cfg.StreamSealInterval, cfg.StreamSealBytes)
-	if cfg.AcceptUnversioned {
-		streamStore.SetAcceptUnversioned(true)
-	}
 
 	// 1. Discover existing segments from backend
 	discoveredSegments, lastFlushedPos, err := ListSegmentsFromBackend(ctx, cfg.Backend)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list segments from backend: %w", err)
+	}
+
+	streamStore := NewStreamStore(dataDir, cfg.Backend, cfg.StreamSealInterval, cfg.StreamSealBytes)
+	defer func() {
+		if streamStore != nil {
+			if closeError := streamStore.Close(ctx); closeError != nil {
+				scoped.Log(ctx).Error(closeError, "failed to close stream store after startup error")
+			}
+		}
+	}()
+	if cfg.AcceptUnversioned {
+		streamStore.SetAcceptUnversioned(true)
 	}
 
 	minCoveredPos, err := streamStore.LoadCoverage()
@@ -546,8 +557,40 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 	s.dataDirectoryLock = dataDirectoryLock
 	dataDirectoryLock = nil
+	streamStore = nil
 
 	return s, nil
+}
+
+// NewServerWithRetry calls NewServer, retrying with exponential back-off (1s doubling to 15s)
+// while the error is objectstore.ErrUnavailable, until initialization succeeds or ctx ends.
+// Any other error is returned immediately.
+func NewServerWithRetry(ctx context.Context, config ServerConfig) (*Server, error) {
+	return newServerWithRetry(ctx, config, defaultStartupRetryInitialBackoff, defaultStartupRetryMaxBackoff)
+}
+
+// newServerWithRetry retries NewServer on objectstore.ErrUnavailable with exponential back-off
+// from initialBackoff up to maxBackoff until startup succeeds or ctx is cancelled.
+func newServerWithRetry(ctx context.Context, config ServerConfig, initialBackoff, maxBackoff time.Duration) (*Server, error) {
+	backoff := initialBackoff
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		server, err := NewServer(ctx, config)
+		if err == nil || !errors.Is(err, objectstore.ErrUnavailable) {
+			return server, err
+		}
+		scoped.Log(ctx).Error(err, "object store unavailable during WAL buffer startup; retrying", "backoff", backoff)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, maxBackoff)
+	}
 }
 
 const loopShutdownTimeout = 5 * time.Second

@@ -80,7 +80,7 @@ func main() {
 		WriterLockGrace:    *writerLockGrace,
 	}
 
-	srv, err := buffer.NewServer(ctx, cfg)
+	srv, err := buffer.NewServerWithRetry(ctx, cfg)
 	if err != nil {
 		klog.Fatalf("failed to initialize WAL buffer server: %v", err)
 	}
