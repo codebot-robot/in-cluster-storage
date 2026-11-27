@@ -169,7 +169,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	}
 
 	// 8. Rename
-	renamedAttr, err := vol.Rename(ctx, dirAttr.GetInode().GetIno(), "hello.txt", dirAttr.GetInode().GetIno(), "greeting.txt")
+	renamedAttr, err := vol.Rename(ctx, &pb.RenameRequest{OldParentInode: dirAttr.GetInode().GetIno(), OldName: "hello.txt", NewParentInode: dirAttr.GetInode().GetIno(), NewName: "greeting.txt"})
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
@@ -510,7 +510,7 @@ func TestSQLiteReadCacheCoherence(t *testing.T) {
 	}
 
 	// Rename file
-	_, err = vol.Rename(ctx, 1, "initial.txt", 1, "renamed.txt")
+	_, err = vol.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: "initial.txt", NewParentInode: 1, NewName: "renamed.txt"})
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
@@ -688,7 +688,7 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 				attr, err := vol.CreateFile(ctx, 1, name, 0644, []byte("data"), 0, 0, 0)
 				if err == nil {
 					renamed := fmt.Sprintf("w_%d_%d_renamed.txt", writerID, i)
-					_, _ = vol.Rename(ctx, 1, name, 1, renamed)
+					_, _ = vol.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: name, NewParentInode: 1, NewName: renamed})
 					_, _ = vol.GetAttr(ctx, attr.GetInode().GetIno())
 					_, _ = vol.Unlink(ctx, 1, renamed)
 				}
@@ -748,7 +748,7 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 	}
 
 	// Rename file2 to file2_renamed
-	_, err = vol.Rename(ctx, dirAttr.GetInode().GetIno(), "file2.txt", dirAttr.GetInode().GetIno(), "file2_renamed.txt")
+	_, err = vol.Rename(ctx, &pb.RenameRequest{OldParentInode: dirAttr.GetInode().GetIno(), OldName: "file2.txt", NewParentInode: dirAttr.GetInode().GetIno(), NewName: "file2_renamed.txt"})
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
@@ -1203,7 +1203,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 		return nil
 	})
 
-	_, err = vol.Rename(ctx, 1, "before_rename.txt", 1, "after_rename.txt")
+	_, err = vol.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: "before_rename.txt", NewParentInode: 1, NewName: "after_rename.txt"})
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}

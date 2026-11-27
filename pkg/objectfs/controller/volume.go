@@ -5921,7 +5921,12 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (
 	return commitSeq, nil
 }
 
-func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName string, newParentInodeID uint64, newName string) (*pb.EntryAttr, error) {
+func (v *Volume) Rename(ctx context.Context, request *pb.RenameRequest) (*pb.EntryAttr, error) {
+	oldParentInodeID := request.GetOldParentInode()
+	oldName := request.GetOldName()
+	newParentInodeID := request.GetNewParentInode()
+	newName := request.GetNewName()
+
 	if len(oldName) > MaxNameLength || len(newName) > MaxNameLength {
 		return nil, fmt.Errorf("name exceeds maximum length: %w", syscall.ENAMETOOLONG)
 	}

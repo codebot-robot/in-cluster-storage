@@ -306,7 +306,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 						from = "name_b.txt"
 						to = "name_a.txt"
 					}
-					_, err := vol.Rename(ctx, 1, from, 1, to)
+					_, err := vol.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: from, NewParentInode: 1, NewName: to})
 					if err != nil {
 						b.Fatalf("Rename failed: %v", err)
 					}
@@ -722,7 +722,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 			if i%2 == 1 {
 				from, to = "r_b.txt", "r_a.txt"
 			}
-			_, _ = vol.Rename(ctx, 1, from, 1, to)
+			_, _ = vol.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: from, NewParentInode: 1, NewName: to})
 		}
 		renameDur := time.Since(startRename)
 		_ = vol.FlushOverlay(ctx)
@@ -871,7 +871,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		for i := 0; i < numFiles; i++ {
 			from := fmt.Sprintf("gate_f%d.txt", i)
 			to := fmt.Sprintf("gate_renamed_%d.txt", i)
-			_, err := vol.Rename(ctx, 1, from, 1, to)
+			_, err := vol.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: from, NewParentInode: 1, NewName: to})
 			if err != nil {
 				t.Fatalf("[%s] Rename %d failed: %v", mode, i, err)
 			}

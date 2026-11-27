@@ -2782,7 +2782,9 @@ func TestVolume_Stop_RejectsMutations(t *testing.T) {
 		"PunchHole":          func() error { return retErr(volume.PunchHole(ctx, inodeID, 0, 1, false)) },
 		"Unlink":             func() error { return retErr(volume.Unlink(ctx, 1, "test.bin")) },
 		"Rmdir":              func() error { return retErr(volume.Rmdir(ctx, 1, "d")) },
-		"Rename":             func() error { return retErr(volume.Rename(ctx, 1, "a", 1, "b")) },
+		"Rename": func() error {
+			return retErr(volume.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: "a", NewParentInode: 1, NewName: "b"}))
+		},
 		"Symlink": func() error {
 			return retErr(volume.Symlink(ctx, &pb.SymlinkRequest{ParentInode: 1, Name: "s", Target: "t"}))
 		},

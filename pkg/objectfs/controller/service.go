@@ -1371,7 +1371,7 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	attr, err := vol.Rename(ctx, req.GetOldParentInode(), req.GetOldName(), req.GetNewParentInode(), req.GetNewName())
+	attr, err := vol.Rename(ctx, req)
 	if err != nil {
 		if rpcErr := checkRPCErr(err); rpcErr != nil {
 			return nil, rpcErr
