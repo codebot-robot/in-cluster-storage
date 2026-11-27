@@ -144,6 +144,45 @@ func TestCreateIdempotency_SymlinkAndLink(t *testing.T) {
 	}
 }
 
+func TestCreateIdempotency_SpecialFile(t *testing.T) {
+	ctx := t.Context()
+	server := NewTestServer(t, NewMemoryBackend())
+	const volumeID = "test-special-file-idempotency"
+	keyA, keyB := []byte("special-key-a"), []byte("special-key-b")
+
+	repeat := verifyCreateRepeat(t, "CreateFile special", keyA, keyB, func(requestID []byte) (*pb.EntryAttr, int32, error) {
+		response, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId: volumeID, ParentInode: 1, Name: "dev0", Mode: syscall.S_IFCHR | 0666, Rdev: 0x0103, RequestId: requestID,
+		})
+		return response.GetAttr(), response.GetError(), err
+	})
+	if repeat.GetInode().GetRdev() != 0x0103 {
+		t.Fatalf("repeat special file rdev: got %#x, want 0x103", repeat.GetInode().GetRdev())
+	}
+	volume := mustGetVolume(t, server, volumeID)
+	positionBefore := volume.Position()
+	if response, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId: volumeID, ParentInode: 1, Name: "dev0", Mode: syscall.S_IFCHR | 0666, Rdev: 0x0103, RequestId: keyA,
+	}); err != nil || response.GetError() != 0 || volume.Position() != positionBefore {
+		t.Fatalf("repeat special file wrote or failed: err=%v errno=%d position=%d want=%d", err, response.GetError(), volume.Position(), positionBefore)
+	}
+	if response, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId: volumeID, ParentInode: 1, Name: "dev0", Mode: syscall.S_IFIFO | 0644, RequestId: keyA,
+	}); err != nil || response.GetError() != int32(syscall.EEXIST) {
+		t.Fatalf("CreateFile different special kind: err=%v errno=%d, want EEXIST", err, response.GetError())
+	}
+	if regular, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId: volumeID, ParentInode: 1, Name: "regular.txt", Mode: 0644, RequestId: keyA,
+	}); err != nil || regular.GetError() != 0 {
+		t.Fatalf("CreateFile regular: err=%v errno=%d", err, regular.GetError())
+	}
+	if response, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId: volumeID, ParentInode: 1, Name: "regular.txt", Mode: syscall.S_IFIFO | 0644, RequestId: keyA,
+	}); err != nil || response.GetError() != int32(syscall.EEXIST) {
+		t.Fatalf("special-file CreateFile on regular file: err=%v errno=%d, want EEXIST", err, response.GetError())
+	}
+}
+
 func TestCreateIdempotency_RepeatWaitsForDurability(t *testing.T) {
 	ctx := t.Context()
 	stream := &recordingStream{}
