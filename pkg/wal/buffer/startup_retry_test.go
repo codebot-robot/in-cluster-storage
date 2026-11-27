@@ -20,7 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,94 +31,77 @@ import (
 	"github.com/google/uuid"
 )
 
+// faultyListBackend wraps an in-memory backend and fails ListObjects with listError until recovered is true.
 type faultyListBackend struct {
 	objectstore.Backend
-
-	mu             sync.Mutex
+	recovered      atomic.Bool
 	listError      error
-	listAttempts   int
-	attemptChannel chan int
+	listAttempts   atomic.Int32
+	attemptChannel chan struct{}
 }
 
-func newFaultyListBackend(initialError error) *faultyListBackend {
+func newFaultyListBackend(listError error) *faultyListBackend {
 	return &faultyListBackend{
 		Backend:        inmemorystorage.New(),
-		listError:      initialError,
-		attemptChannel: make(chan int, 32),
+		listError:      listError,
+		attemptChannel: make(chan struct{}, 1),
 	}
-}
-
-func (b *faultyListBackend) setListError(err error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.listError = err
-}
-
-func (b *faultyListBackend) attempts() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.listAttempts
 }
 
 func (b *faultyListBackend) ListObjects(ctx context.Context, volumeID, prefix string) ([]objectstore.ObjectEntry, error) {
-	b.mu.Lock()
-	b.listAttempts++
-	attempts := b.listAttempts
-	err := b.listError
-	b.mu.Unlock()
-
+	b.listAttempts.Add(1)
 	select {
-	case b.attemptChannel <- attempts:
+	case b.attemptChannel <- struct{}{}:
 	default:
 	}
-	if err != nil {
-		return nil, err
+	if !b.recovered.Load() {
+		return nil, b.listError
 	}
 	return b.Backend.ListObjects(ctx, volumeID, prefix)
 }
 
+// retryStartResult carries the return values of newServerWithRetry from a test goroutine.
 type retryStartResult struct {
 	server *Server
 	err    error
 }
 
+func closeServer(t *testing.T, server *Server) {
+	t.Helper()
+	if server != nil {
+		if err := server.Close(); err != nil {
+			t.Errorf("failed to close server: %v", err)
+		}
+	}
+}
+
 func TestNewServerWithRetry_UnavailableThenRecovers(t *testing.T) {
 	ctx := t.Context()
-	backend := newFaultyListBackend(fmt.Errorf("simulated 503: %w", objectstore.ErrUnavailable))
-	config := ServerConfig{
-		Backend:       backend,
-		DataDir:       t.TempDir(),
-		FlushInterval: 10 * time.Second,
-		BatchMaxDelay: 2 * time.Millisecond,
-	}
+	runtime.GC()
+	baselineGoroutines := runtime.NumGoroutine()
 
+	backend := newFaultyListBackend(fmt.Errorf("simulated 503: %w", objectstore.ErrUnavailable))
 	resultChannel := make(chan retryStartResult, 1)
 	go func() {
-		server, err := newServerWithRetry(ctx, config, 5*time.Millisecond, 20*time.Millisecond)
+		server, err := newServerWithRetry(ctx, ServerConfig{Backend: backend, DataDir: t.TempDir()}, 5*time.Millisecond, 20*time.Millisecond)
 		resultChannel <- retryStartResult{server: server, err: err}
 	}()
 
-	for attempts := 0; attempts < 2; {
+	for backend.listAttempts.Load() < 2 {
 		select {
-		case attempts = <-backend.attemptChannel:
+		case <-backend.attemptChannel:
 		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for at least 2 list attempts (got %d)", attempts)
+			t.Fatalf("timed out waiting for 2 list attempts (got %d)", backend.listAttempts.Load())
 		}
 	}
-
 	select {
 	case result := <-resultChannel:
-		if result.server != nil {
-			if closeError := result.server.Close(); closeError != nil {
-				t.Errorf("failed to close unexpected server: %v", closeError)
-			}
-		}
+		closeServer(t, result.server)
 		t.Fatalf("newServerWithRetry returned before backend recovered: err=%v", result.err)
 	default:
 	}
 
-	backend.setListError(nil)
-
+	backend.recovered.Store(true)
 	var result retryStartResult
 	select {
 	case result = <-resultChannel:
@@ -127,39 +111,35 @@ func TestNewServerWithRetry_UnavailableThenRecovers(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("newServerWithRetry failed after backend recovered: %v", result.err)
 	}
-	defer func() {
-		if closeError := result.server.Close(); closeError != nil {
-			t.Errorf("failed to close server: %v", closeError)
-		}
-	}()
+	defer closeServer(t, result.server)
 
 	appendDirectRecord(t, result.server, uuid.New(), 1, []byte("hello"))
 	flushResponse, err := result.server.Flush(ctx, &pb.FlushRequest{})
-	if err != nil {
-		t.Fatalf("Flush failed on recovered server: %v", err)
+	if err != nil || flushResponse.GetLastPosition() != 1 {
+		t.Fatalf("Flush() = (%v, %v), want last position 1", flushResponse, err)
 	}
-	if flushResponse.GetLastPosition() != 1 {
-		t.Fatalf("Flush LastPosition = %d, want 1", flushResponse.GetLastPosition())
+
+	closeServer(t, result.server)
+	for deadline := time.Now().Add(2 * time.Second); runtime.NumGoroutine() > baselineGoroutines && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > baselineGoroutines {
+		t.Fatalf("goroutine count after recovery and close = %d, want <= %d", got, baselineGoroutines)
 	}
 }
 
 func TestNewServerWithRetry_NonUnavailableFailsImmediately(t *testing.T) {
 	permanentError := errors.New("access denied")
 	backend := newFaultyListBackend(permanentError)
-	server, err := newServerWithRetry(t.Context(), ServerConfig{
-		Backend: backend,
-		DataDir: t.TempDir(),
-	}, 5*time.Millisecond, 20*time.Millisecond)
+	server, err := newServerWithRetry(t.Context(), ServerConfig{Backend: backend, DataDir: t.TempDir()}, 5*time.Millisecond, 20*time.Millisecond)
 	if server != nil {
-		if closeError := server.Close(); closeError != nil {
-			t.Errorf("failed to close unexpected server: %v", closeError)
-		}
+		closeServer(t, server)
 		t.Fatalf("expected nil server on permanent error")
 	}
 	if !errors.Is(err, permanentError) {
 		t.Fatalf("got error %v, want %v", err, permanentError)
 	}
-	if got := backend.attempts(); got != 1 {
+	if got := backend.listAttempts.Load(); got != 1 {
 		t.Fatalf("list attempts = %d, want 1", got)
 	}
 }
@@ -169,13 +149,11 @@ func TestNewServerWithRetry_ContextCanceledStopsRetrying(t *testing.T) {
 	defer cancel()
 
 	backend := newFaultyListBackend(fmt.Errorf("simulated 503: %w", objectstore.ErrUnavailable))
-	resultChannel := make(chan retryStartResult, 1)
+	errorChannel := make(chan error, 1)
 	go func() {
-		server, err := newServerWithRetry(ctx, ServerConfig{
-			Backend: backend,
-			DataDir: t.TempDir(),
-		}, 5*time.Second, 15*time.Second)
-		resultChannel <- retryStartResult{server: server, err: err}
+		server, err := newServerWithRetry(ctx, ServerConfig{Backend: backend, DataDir: t.TempDir()}, time.Minute, time.Minute)
+		closeServer(t, server)
+		errorChannel <- err
 	}()
 
 	select {
@@ -186,14 +164,9 @@ func TestNewServerWithRetry_ContextCanceledStopsRetrying(t *testing.T) {
 	cancel()
 
 	select {
-	case result := <-resultChannel:
-		if result.server != nil {
-			if closeError := result.server.Close(); closeError != nil {
-				t.Errorf("failed to close unexpected server: %v", closeError)
-			}
-		}
-		if !errors.Is(result.err, context.Canceled) {
-			t.Fatalf("got error %v, want context.Canceled", result.err)
+	case err := <-errorChannel:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got error %v, want context.Canceled", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for newServerWithRetry to exit after context cancellation")

@@ -569,26 +569,19 @@ func NewServerWithRetry(ctx context.Context, config ServerConfig) (*Server, erro
 	return newServerWithRetry(ctx, config, defaultStartupRetryInitialBackoff, defaultStartupRetryMaxBackoff)
 }
 
+// newServerWithRetry retries NewServer on objectstore.ErrUnavailable with exponential back-off
+// from initialBackoff up to maxBackoff until startup succeeds or ctx is cancelled.
 func newServerWithRetry(ctx context.Context, config ServerConfig, initialBackoff, maxBackoff time.Duration) (*Server, error) {
 	backoff := initialBackoff
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-
 		server, err := NewServer(ctx, config)
-		if err == nil {
-			return server, nil
+		if err == nil || !errors.Is(err, objectstore.ErrUnavailable) {
+			return server, err
 		}
-		if !errors.Is(err, objectstore.ErrUnavailable) {
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
 		scoped.Log(ctx).Error(err, "object store unavailable during WAL buffer startup; retrying", "backoff", backoff)
-
 		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
@@ -596,11 +589,7 @@ func newServerWithRetry(ctx context.Context, config ServerConfig, initialBackoff
 			return nil, ctx.Err()
 		case <-timer.C:
 		}
-
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
