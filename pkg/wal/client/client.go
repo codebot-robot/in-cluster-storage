@@ -264,7 +264,7 @@ type streamImpl struct {
 	flushRequestedWhileInFlight bool
 	degradedTruncateSeq         uint64
 	reconciling                 bool
-	// lockGranted reports whether this handle has completed an initial HelloAck grant. Guarded by mu.
+	// lockGranted is set after the first completed HelloAck and never cleared. Guarded by mu.
 	lockGranted bool
 	// unverifiedGrant records that a non-resumed reconnect grant has not yet finished
 	// checking for writes by another client (for example if Tail failed transiently). Guarded by mu.
@@ -1034,33 +1034,14 @@ func (s *streamImpl) runStreamSession() error {
 	}
 	s.helloAckReceived.Store(true)
 
-	if err := s.handleHelloAck(ctx, helloAck); err != nil {
-		if errors.Is(err, ErrWriterLockLost) {
-			s.releaseAppendStream(ctx, cancel, stream)
-			s.mu.Lock()
-			err = s.setDegradedLocked(ctx, ErrWriterLockLost, 0)
-			s.mu.Unlock()
-		}
+	err = s.handleHelloAck(ctx, helloAck)
+	lockLost := errors.Is(err, ErrWriterLockLost)
+	if err != nil && !lockLost {
 		s.initialHelloAckOnce.Do(func() {
 			s.initialHelloAckErr = err
 			close(s.initialHelloAckDone)
 		})
 		return fmt.Errorf("handleHelloAck failed: %w", err)
-	}
-	s.mu.Lock()
-	s.initialHelloAckErr = nil
-	s.lastSessionErr = nil
-	s.mu.Unlock()
-	s.initialHelloAckOnce.Do(func() {
-		close(s.initialHelloAckDone)
-	})
-
-	// The stream ID is kept in the message string because tests/e2e matches it verbatim.
-	if s.target != "" {
-		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID),
-			"target", s.target)
-	} else {
-		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID))
 	}
 
 	// 3. Concurrently receive Acks while replaying and sending newly appended records.
@@ -1075,7 +1056,7 @@ func (s *streamImpl) runStreamSession() error {
 				recvErrCh <- err
 				return
 			}
-			if ack := ackResp.GetAck(); ack != nil {
+			if ack := ackResp.GetAck(); ack != nil && !lockLost {
 				firstAck.Do(func() {
 					scoped.Log(ctx).Info("WAL client stream first ack after reconnect",
 						"witnessWatermark", ack.WitnessAckedStreamSeq, "s3Watermark", ack.S3AckedStreamSeq)
@@ -1089,15 +1070,52 @@ func (s *streamImpl) runStreamSession() error {
 		if err := stream.CloseSend(); err != nil {
 			return fmt.Errorf("failed to half-close Append stream: %w", err)
 		}
+		timeout := s.releaseTimeout
+		if timeout <= 0 {
+			timeout = releaseTimeout
+		}
+		releaseTimer := time.NewTimer(timeout)
+		defer releaseTimer.Stop()
 		select {
 		case err := <-recvErrCh:
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
+		case <-releaseTimer.C:
+			scoped.Log(ctx).Info("timed out waiting for WAL buffer to release writer lock; cancelling", "timeout", timeout)
+			cancel()
+			<-recvErrCh
+			return context.DeadlineExceeded
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+
+	if lockLost {
+		if closeErr := closeCleanly(); closeErr != nil {
+			scoped.Log(ctx).Info("failed to close Append stream cleanly after writer lock loss", "err", closeErr)
+		}
+		s.mu.Lock()
+		degradedErr := s.setDegradedLocked(ctx, ErrWriterLockLost, 0)
+		s.mu.Unlock()
+		return degradedErr
+	}
+
+	s.mu.Lock()
+	s.initialHelloAckErr = nil
+	s.lastSessionErr = nil
+	s.mu.Unlock()
+	s.initialHelloAckOnce.Do(func() {
+		close(s.initialHelloAckDone)
+	})
+
+	// The stream ID is kept in the message string because tests/e2e matches it verbatim.
+	if s.target != "" {
+		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID),
+			"target", s.target)
+	} else {
+		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID))
 	}
 
 	select {
@@ -1179,36 +1197,6 @@ func (s *streamImpl) runStreamSession() error {
 				nextSeqToSend = nextRec.StreamSeq + 1
 			}
 		}
-	}
-}
-
-func (s *streamImpl) releaseAppendStream(ctx context.Context, cancel context.CancelFunc, stream pb.WalBuffer_AppendClient) {
-	if err := stream.CloseSend(); err != nil {
-		scoped.Log(ctx).Info("failed to half-close Append stream after writer lock loss", "err", err)
-		return
-	}
-	receiveDone := make(chan error, 1)
-	go func() {
-		for {
-			if _, err := stream.Recv(); err != nil {
-				receiveDone <- err
-				return
-			}
-		}
-	}()
-	timer := time.NewTimer(s.releaseTimeout)
-	defer timer.Stop()
-	select {
-	case err := <-receiveDone:
-		if !errors.Is(err, io.EOF) {
-			scoped.Log(ctx).Info("Append stream ended with error after writer lock loss", "err", err)
-		}
-	case <-timer.C:
-		scoped.Log(ctx).Info("timed out waiting for WAL buffer to release writer lock after lock loss", "timeout", s.releaseTimeout)
-		cancel()
-		<-receiveDone
-	case <-ctx.Done():
-		<-receiveDone
 	}
 }
 

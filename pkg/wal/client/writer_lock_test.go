@@ -44,27 +44,46 @@ import (
 type appendFuncServer struct {
 	pb.WalBufferServer
 	appendFunc func(pb.WalBuffer_AppendServer) error
+	tailFunc   func(*pb.TailRequest, pb.WalBuffer_TailServer) error
 }
 
 func (s *appendFuncServer) Append(stream pb.WalBuffer_AppendServer) error {
 	return s.appendFunc(stream)
 }
 
+func (s *appendFuncServer) Tail(request *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
+	if s.tailFunc != nil {
+		return s.tailFunc(request, stream)
+	}
+	return s.WalBufferServer.Tail(request, stream)
+}
+
 type helloRecordingStream struct {
 	pb.WalBuffer_AppendServer
 	recorder *recordingBuffer
+	clientID string
 }
 
 func (s *helloRecordingStream) Recv() (*pb.AppendRequest, error) {
 	request, err := s.WalBuffer_AppendServer.Recv()
 	if err == nil {
 		if hello := request.GetHello(); hello != nil {
+			s.clientID = string(hello.GetClientId())
 			s.recorder.mu.Lock()
-			s.recorder.recordedIDs = append(s.recorder.recordedIDs, string(hello.GetClientId()))
+			s.recorder.recordedIDs = append(s.recorder.recordedIDs, s.clientID)
 			s.recorder.mu.Unlock()
 		}
 	}
 	return request, err
+}
+
+func (s *helloRecordingStream) Send(response *pb.AppendResponse) error {
+	if helloAck := response.GetHelloAck(); helloAck != nil {
+		s.recorder.mu.Lock()
+		s.recorder.recordedResumed[s.clientID] = append(s.recorder.recordedResumed[s.clientID], helloAck.GetResumed())
+		s.recorder.mu.Unlock()
+	}
+	return s.WalBuffer_AppendServer.Send(response)
 }
 
 type recordingBuffer struct {
@@ -72,9 +91,11 @@ type recordingBuffer struct {
 	dialOptions  []grpc.DialOption
 	listener     *bufconn.Listener
 	sessionEnded chan struct{}
+	failTailOnce atomic.Bool
 
-	mu          sync.Mutex
-	recordedIDs []string
+	mu              sync.Mutex
+	recordedIDs     []string
+	recordedResumed map[string][]bool
 }
 
 func (r *recordingBuffer) helloCount(clientID string) int {
@@ -95,11 +116,17 @@ func (r *recordingBuffer) allIDs() []string {
 	return append([]string(nil), r.recordedIDs...)
 }
 
-func serveWalBuffer(t *testing.T, base pb.WalBufferServer, appendFunc func(pb.WalBuffer_AppendServer) error) (*bufconn.Listener, []grpc.DialOption) {
+func (r *recordingBuffer) resumedFlags(clientID string) []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]bool(nil), r.recordedResumed[clientID]...)
+}
+
+func serveWalBuffer(t *testing.T, base pb.WalBufferServer, appendFunc func(pb.WalBuffer_AppendServer) error, tailFunc func(*pb.TailRequest, pb.WalBuffer_TailServer) error) (*bufconn.Listener, []grpc.DialOption) {
 	t.Helper()
 	listener := bufconn.Listen(4 * 1024 * 1024)
 	grpcServer := grpc.NewServer()
-	pb.RegisterWalBufferServer(grpcServer, &appendFuncServer{WalBufferServer: base, appendFunc: appendFunc})
+	pb.RegisterWalBufferServer(grpcServer, &appendFuncServer{WalBufferServer: base, appendFunc: appendFunc, tailFunc: tailFunc})
 	go func() { _ = grpcServer.Serve(listener) }()
 	t.Cleanup(func() {
 		grpcServer.Stop()
@@ -114,7 +141,7 @@ func serveWalBuffer(t *testing.T, base pb.WalBufferServer, appendFunc func(pb.Wa
 
 func serveAppendFunc(t *testing.T, appendFunc func(pb.WalBuffer_AppendServer) error) (*bufconn.Listener, []grpc.DialOption) {
 	t.Helper()
-	return serveWalBuffer(t, pb.UnimplementedWalBufferServer{}, appendFunc)
+	return serveWalBuffer(t, pb.UnimplementedWalBufferServer{}, appendFunc, nil)
 }
 
 func startRecordingBuffer(t *testing.T) *recordingBuffer {
@@ -122,17 +149,26 @@ func startRecordingBuffer(t *testing.T) *recordingBuffer {
 	clock := buffertest.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	bufferTest, _ := buffertest.Start(t.Context(), t, buffertest.WithWriterLockGrace(15*time.Second), buffertest.WithClock(clock))
 	recorder := &recordingBuffer{
-		clock:        clock,
-		sessionEnded: make(chan struct{}, 8),
+		clock:           clock,
+		sessionEnded:    make(chan struct{}, 8),
+		recordedResumed: make(map[string][]bool),
 	}
-	recorder.listener, recorder.dialOptions = serveWalBuffer(t, bufferTest.Server, func(stream pb.WalBuffer_AppendServer) error {
-		err := bufferTest.Server.Append(&helloRecordingStream{WalBuffer_AppendServer: stream, recorder: recorder})
-		select {
-		case recorder.sessionEnded <- struct{}{}:
-		default:
-		}
-		return err
-	})
+	recorder.listener, recorder.dialOptions = serveWalBuffer(t, bufferTest.Server,
+		func(stream pb.WalBuffer_AppendServer) error {
+			err := bufferTest.Server.Append(&helloRecordingStream{WalBuffer_AppendServer: stream, recorder: recorder})
+			select {
+			case recorder.sessionEnded <- struct{}{}:
+			default:
+			}
+			return err
+		},
+		func(request *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
+			if recorder.failTailOnce.CompareAndSwap(true, false) {
+				return status.Error(codes.Unavailable, "transient tail failure")
+			}
+			return bufferTest.Server.Tail(request, stream)
+		},
+	)
 	return recorder
 }
 
@@ -375,9 +411,12 @@ func waitForPendingWaiter(t *testing.T, implementation *streamImpl) {
 	}
 }
 
-func testWriterLockLost(t *testing.T, recordsByClientB int) {
+func testWriterLockLost(t *testing.T, recordsByClientB int, failFirstTail bool) {
 	t.Helper()
 	recorder := startRecordingBuffer(t)
+	if failFirstTail {
+		recorder.failTailOnce.Store(true)
+	}
 
 	var mu sync.Mutex
 	var connectionCut bool
@@ -462,8 +501,20 @@ func testWriterLockLost(t *testing.T, recordsByClientB int) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected client A replication loop to return after writer lock loss")
 	}
-	if got := recorder.helloCount("client-A"); got != 2 {
-		t.Fatalf("expected client A to stop after detecting loss (want 2 Hellos), got %d", got)
+
+	wantHellos := 2
+	if failFirstTail {
+		wantHellos = 3
+		if recorder.failTailOnce.Load() {
+			t.Fatal("expected injected first Tail failure to be triggered")
+		}
+		resumed := recorder.resumedFlags("client-A")
+		if len(resumed) != 3 || resumed[0] || resumed[1] || !resumed[2] {
+			t.Fatalf("expected client A HelloAck resumed flags [false false true], got %v", resumed)
+		}
+	}
+	if got := recorder.helloCount("client-A"); got != wantHellos {
+		t.Fatalf("expected client A to stop after detecting loss (want %d Hellos), got %d", wantHellos, got)
 	}
 
 	// Client A half-closed its reconnect session, so client C is granted without advancing the clock.
@@ -472,11 +523,15 @@ func testWriterLockLost(t *testing.T, recordsByClientB int) {
 }
 
 func TestWriterLock_LostEqualHeads(t *testing.T) {
-	testWriterLockLost(t, 1)
+	testWriterLockLost(t, 1, false)
 }
 
 func TestWriterLock_LostServerHeadBeyond(t *testing.T) {
-	testWriterLockLost(t, 2)
+	testWriterLockLost(t, 2, false)
+}
+
+func TestWriterLock_LostAfterTailErrorAndResumedReconnect(t *testing.T) {
+	testWriterLockLost(t, 1, true)
 }
 
 func TestWriterLock_NotLostOnServerRestart(t *testing.T) {
