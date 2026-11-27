@@ -1968,10 +1968,12 @@ func (x *PunchHoleResponse) GetStreamPosition() uint64 {
 }
 
 type UnlinkRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	ParentInode   uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
-	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId    string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	ParentInode uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name        string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	// Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+	RequestId     []byte `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2025,6 +2027,13 @@ func (x *UnlinkRequest) GetName() string {
 		return x.Name
 	}
 	return ""
+}
+
+func (x *UnlinkRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type UnlinkResponse struct {
@@ -2088,10 +2097,12 @@ func (x *UnlinkResponse) GetStreamPosition() uint64 {
 }
 
 type RmdirRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	ParentInode   uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
-	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId    string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	ParentInode uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name        string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	// Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+	RequestId     []byte `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2145,6 +2156,13 @@ func (x *RmdirRequest) GetName() string {
 		return x.Name
 	}
 	return ""
+}
+
+func (x *RmdirRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type RmdirResponse struct {
@@ -5834,8 +5852,10 @@ type Inode struct {
 	Rdev           uint32                 `protobuf:"varint,17,opt,name=rdev,proto3" json:"rdev,omitempty"`
 	ParentIno      *uint64                `protobuf:"varint,18,opt,name=parent_ino,json=parentIno,proto3,oneof" json:"parent_ino,omitempty"`
 	XattrCount     *uint32                `protobuf:"varint,19,opt,name=xattr_count,json=xattrCount,proto3,oneof" json:"xattr_count,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Idempotency key of the most recent unlink or rmdir of an entry in this directory.
+	LastRemovalRequestId []byte `protobuf:"bytes,20,opt,name=last_removal_request_id,json=lastRemovalRequestId,proto3" json:"last_removal_request_id,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *Inode) Reset() {
@@ -5999,6 +6019,13 @@ func (x *Inode) GetXattrCount() uint32 {
 		return *x.XattrCount
 	}
 	return 0
+}
+
+func (x *Inode) GetLastRemovalRequestId() []byte {
+	if x != nil {
+		return x.LastRemovalRequestId
+	}
+	return nil
 }
 
 type DirEntry struct {
@@ -6492,19 +6519,23 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x11PunchHoleResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
-	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"c\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\x82\x01\n" +
 	"\rUnlinkRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
-	"\x04name\x18\x03 \x01(\tR\x04name\"i\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x04 \x01(\fR\trequestId\"i\n" +
 	"\x0eUnlinkResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
-	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"b\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\x81\x01\n" +
 	"\fRmdirRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
-	"\x04name\x18\x03 \x01(\tR\x04name\"h\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x04 \x01(\fR\trequestId\"h\n" +
 	"\rRmdirResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
@@ -6779,7 +6810,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x17GetExclusiveHoldRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"P\n" +
 	"\x18GetExclusiveHoldResponse\x124\n" +
-	"\x04hold\x18\x01 \x01(\v2 .objectfs.v1alpha1.ExclusiveHoldR\x04hold\"\xf4\x04\n" +
+	"\x04hold\x18\x01 \x01(\v2 .objectfs.v1alpha1.ExclusiveHoldR\x04hold\"\xab\x05\n" +
 	"\x05Inode\x12\x15\n" +
 	"\x03ino\x18\x01 \x01(\x04H\x00R\x03ino\x88\x01\x01\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\rR\x04mode\x12\x12\n" +
@@ -6803,7 +6834,8 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\n" +
 	"parent_ino\x18\x12 \x01(\x04H\x01R\tparentIno\x88\x01\x01\x12$\n" +
 	"\vxattr_count\x18\x13 \x01(\rH\x02R\n" +
-	"xattrCount\x88\x01\x01B\x06\n" +
+	"xattrCount\x88\x01\x01\x125\n" +
+	"\x17last_removal_request_id\x18\x14 \x01(\fR\x14lastRemovalRequestIdB\x06\n" +
 	"\x04_inoB\r\n" +
 	"\v_parent_inoB\x0e\n" +
 	"\f_xattr_count\"\xbb\x01\n" +
