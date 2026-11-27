@@ -111,7 +111,8 @@ type IndexFactory interface {
 	// OpenLocal opens an existing local index in dir if present, returning (nil, false, nil) if none exists.
 	OpenLocal(ctx context.Context, streamID string, dir string) (LocalIndex, bool, error)
 
-	// FindLatestSnapshot finds the latest snapshot in object storage at or before maxPos.
+	// FindLatestSnapshot finds the latest snapshot in object storage at or before maxPos,
+	// returning ("", 0, nil) if no snapshot exists.
 	FindLatestSnapshot(ctx context.Context, backend objectstore.Backend, streamID string, maxPos uint64) (key string, pos uint64, err error)
 
 	// RestoreSnapshot downloads and restores a snapshot into dir, returning the populated LocalIndex and its position.
