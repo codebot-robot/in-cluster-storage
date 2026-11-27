@@ -184,6 +184,8 @@ message MkdirRequest {
   uint32 mode = 4;
   uint32 uid = 5;
   uint32 gid = 6;
+  // Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+  bytes request_id = 7;
 }
 
 message MkdirResponse {
@@ -366,6 +368,8 @@ message SymlinkRequest {
   string target = 4;
   uint32 uid = 5;
   uint32 gid = 6;
+  // Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+  bytes request_id = 7;
 }
 
 message SymlinkResponse {
@@ -389,6 +393,8 @@ message LinkRequest {
   uint64 old_inode = 2;
   uint64 new_parent_inode = 3;
   string new_name = 4;
+  // Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+  bytes request_id = 5;
 }
 
 message LinkResponse {
@@ -714,6 +720,8 @@ message DirEntry {
   uint64 ino = 3;
   bool is_dir = 4;
   uint32 mode = 5;
+  // Idempotency key of the creating request; set only by creates.
+  bytes request_id = 6;
 }
 
 message Content {

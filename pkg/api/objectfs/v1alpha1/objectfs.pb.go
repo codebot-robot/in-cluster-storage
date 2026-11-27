@@ -1078,13 +1078,15 @@ func (x *ReadDirResponse) GetError() int32 {
 }
 
 type MkdirRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	ParentInode   uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
-	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
-	Mode          uint32                 `protobuf:"varint,4,opt,name=mode,proto3" json:"mode,omitempty"`
-	Uid           uint32                 `protobuf:"varint,5,opt,name=uid,proto3" json:"uid,omitempty"`
-	Gid           uint32                 `protobuf:"varint,6,opt,name=gid,proto3" json:"gid,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId    string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	ParentInode uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name        string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	Mode        uint32                 `protobuf:"varint,4,opt,name=mode,proto3" json:"mode,omitempty"`
+	Uid         uint32                 `protobuf:"varint,5,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid         uint32                 `protobuf:"varint,6,opt,name=gid,proto3" json:"gid,omitempty"`
+	// Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+	RequestId     []byte `protobuf:"bytes,7,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1159,6 +1161,13 @@ func (x *MkdirRequest) GetGid() uint32 {
 		return x.Gid
 	}
 	return 0
+}
+
+func (x *MkdirRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type MkdirResponse struct {
@@ -2638,13 +2647,15 @@ func (x *WatchVolumeResponse) GetCheckpointRequestId() string {
 }
 
 type SymlinkRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	ParentInode   uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
-	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
-	Target        string                 `protobuf:"bytes,4,opt,name=target,proto3" json:"target,omitempty"`
-	Uid           uint32                 `protobuf:"varint,5,opt,name=uid,proto3" json:"uid,omitempty"`
-	Gid           uint32                 `protobuf:"varint,6,opt,name=gid,proto3" json:"gid,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId    string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	ParentInode uint64                 `protobuf:"varint,2,opt,name=parent_inode,json=parentInode,proto3" json:"parent_inode,omitempty"`
+	Name        string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	Target      string                 `protobuf:"bytes,4,opt,name=target,proto3" json:"target,omitempty"`
+	Uid         uint32                 `protobuf:"varint,5,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid         uint32                 `protobuf:"varint,6,opt,name=gid,proto3" json:"gid,omitempty"`
+	// Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+	RequestId     []byte `protobuf:"bytes,7,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2719,6 +2730,13 @@ func (x *SymlinkRequest) GetGid() uint32 {
 		return x.Gid
 	}
 	return 0
+}
+
+func (x *SymlinkRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type SymlinkResponse struct {
@@ -2891,8 +2909,10 @@ type LinkRequest struct {
 	OldInode       uint64                 `protobuf:"varint,2,opt,name=old_inode,json=oldInode,proto3" json:"old_inode,omitempty"`
 	NewParentInode uint64                 `protobuf:"varint,3,opt,name=new_parent_inode,json=newParentInode,proto3" json:"new_parent_inode,omitempty"`
 	NewName        string                 `protobuf:"bytes,4,opt,name=new_name,json=newName,proto3" json:"new_name,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+	RequestId     []byte `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *LinkRequest) Reset() {
@@ -2951,6 +2971,13 @@ func (x *LinkRequest) GetNewName() string {
 		return x.NewName
 	}
 	return ""
+}
+
+func (x *LinkRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type LinkResponse struct {
@@ -5966,12 +5993,14 @@ func (x *Inode) GetXattrCount() uint32 {
 }
 
 type DirEntry struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ParentIno     *uint64                `protobuf:"varint,1,opt,name=parent_ino,json=parentIno,proto3,oneof" json:"parent_ino,omitempty"`
-	Name          *string                `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
-	Ino           uint64                 `protobuf:"varint,3,opt,name=ino,proto3" json:"ino,omitempty"`
-	IsDir         bool                   `protobuf:"varint,4,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
-	Mode          uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ParentIno *uint64                `protobuf:"varint,1,opt,name=parent_ino,json=parentIno,proto3,oneof" json:"parent_ino,omitempty"`
+	Name      *string                `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	Ino       uint64                 `protobuf:"varint,3,opt,name=ino,proto3" json:"ino,omitempty"`
+	IsDir     bool                   `protobuf:"varint,4,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
+	Mode      uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
+	// Idempotency key of the creating request; set only by creates.
+	RequestId     []byte `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6039,6 +6068,13 @@ func (x *DirEntry) GetMode() uint32 {
 		return x.Mode
 	}
 	return 0
+}
+
+func (x *DirEntry) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type Content struct {
@@ -6374,14 +6410,16 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\"_\n" +
 	"\x0fReadDirResponse\x126\n" +
 	"\aentries\x18\x01 \x03(\v2\x1c.objectfs.v1alpha1.EntryAttrR\aentries\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"\x9a\x01\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"\xb9\x01\n" +
 	"\fMkdirRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
 	"\x04name\x18\x03 \x01(\tR\x04name\x12\x12\n" +
 	"\x04mode\x18\x04 \x01(\rR\x04mode\x12\x10\n" +
 	"\x03uid\x18\x05 \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\x06 \x01(\rR\x03gid\"\x80\x01\n" +
+	"\x03gid\x18\x06 \x01(\rR\x03gid\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\a \x01(\fR\trequestId\"\x80\x01\n" +
 	"\rMkdirResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
@@ -6499,14 +6537,16 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x10old_parent_inode\x18\x06 \x01(\x04R\x0eoldParentInode\x12\x19\n" +
 	"\bold_name\x18\a \x01(\tR\aoldName\x12'\n" +
 	"\x0fstream_position\x18\b \x01(\x04R\x0estreamPosition\x122\n" +
-	"\x15checkpoint_request_id\x18\t \x01(\tR\x13checkpointRequestId\"\xa0\x01\n" +
+	"\x15checkpoint_request_id\x18\t \x01(\tR\x13checkpointRequestId\"\xbf\x01\n" +
 	"\x0eSymlinkRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
 	"\x04name\x18\x03 \x01(\tR\x04name\x12\x16\n" +
 	"\x06target\x18\x04 \x01(\tR\x06target\x12\x10\n" +
 	"\x03uid\x18\x05 \x01(\rR\x03uid\x12\x10\n" +
-	"\x03gid\x18\x06 \x01(\rR\x03gid\"\x82\x01\n" +
+	"\x03gid\x18\x06 \x01(\rR\x03gid\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\a \x01(\fR\trequestId\"\x82\x01\n" +
 	"\x0fSymlinkResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
@@ -6516,12 +6556,14 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\"@\n" +
 	"\x10ReadlinkResponse\x12\x16\n" +
 	"\x06target\x18\x01 \x01(\tR\x06target\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\x05R\x05error\"\x8c\x01\n" +
+	"\x05error\x18\x02 \x01(\x05R\x05error\"\xab\x01\n" +
 	"\vLinkRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1b\n" +
 	"\told_inode\x18\x02 \x01(\x04R\boldInode\x12(\n" +
 	"\x10new_parent_inode\x18\x03 \x01(\x04R\x0enewParentInode\x12\x19\n" +
-	"\bnew_name\x18\x04 \x01(\tR\anewName\"\x7f\n" +
+	"\bnew_name\x18\x04 \x01(\tR\anewName\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x05 \x01(\fR\trequestId\"\x7f\n" +
 	"\fLinkResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
@@ -6753,14 +6795,16 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"xattrCount\x88\x01\x01B\x06\n" +
 	"\x04_inoB\r\n" +
 	"\v_parent_inoB\x0e\n" +
-	"\f_xattr_count\"\x9c\x01\n" +
+	"\f_xattr_count\"\xbb\x01\n" +
 	"\bDirEntry\x12\"\n" +
 	"\n" +
 	"parent_ino\x18\x01 \x01(\x04H\x00R\tparentIno\x88\x01\x01\x12\x17\n" +
 	"\x04name\x18\x02 \x01(\tH\x01R\x04name\x88\x01\x01\x12\x10\n" +
 	"\x03ino\x18\x03 \x01(\x04R\x03ino\x12\x15\n" +
 	"\x06is_dir\x18\x04 \x01(\bR\x05isDir\x12\x12\n" +
-	"\x04mode\x18\x05 \x01(\rR\x04modeB\r\n" +
+	"\x04mode\x18\x05 \x01(\rR\x04mode\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x06 \x01(\fR\trequestIdB\r\n" +
 	"\v_parent_inoB\a\n" +
 	"\x05_name\"E\n" +
 	"\aContent\x12\x1b\n" +
