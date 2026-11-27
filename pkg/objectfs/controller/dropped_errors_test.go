@@ -552,7 +552,7 @@ func TestVolumeLoad_SnapshotErrors(t *testing.T) {
 			if err != nil {
 				t.Fatalf("writerServer.GetVolume failed: %v", err)
 			}
-			if _, err := writerVolume.CreateFile(ctx, 1, "hello.txt", 0644, wantContent, 0, 0, 0); err != nil {
+			if _, err := writerVolume.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "hello.txt", Mode: 0644, InitialContent: wantContent}); err != nil {
 				t.Fatalf("CreateFile failed: %v", err)
 			}
 			if _, err := writerVolume.CreateSnapshot(ctx, "snap-1"); err != nil {
