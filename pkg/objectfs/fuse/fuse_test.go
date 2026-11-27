@@ -7520,3 +7520,48 @@ func TestFUSEOperationContextCarriesMountLogger(t *testing.T) {
 		t.Fatalf("expected logged sync args to contain volume key, got: %s", loggedArgs)
 	}
 }
+
+type captureRequestIDClient struct {
+	pb.ObjectFSControllerClient
+	keys [][]byte
+}
+
+func (c *captureRequestIDClient) Mkdir(_ context.Context, request *pb.MkdirRequest, _ ...grpc.CallOption) (*pb.MkdirResponse, error) {
+	c.keys = append(c.keys, request.GetRequestId())
+	return &pb.MkdirResponse{Error: int32(syscall.EIO)}, nil
+}
+
+func (c *captureRequestIDClient) Symlink(_ context.Context, request *pb.SymlinkRequest, _ ...grpc.CallOption) (*pb.SymlinkResponse, error) {
+	c.keys = append(c.keys, request.GetRequestId())
+	return &pb.SymlinkResponse{Error: int32(syscall.EIO)}, nil
+}
+
+func (c *captureRequestIDClient) Link(_ context.Context, request *pb.LinkRequest, _ ...grpc.CallOption) (*pb.LinkResponse, error) {
+	c.keys = append(c.keys, request.GetRequestId())
+	return &pb.LinkResponse{Error: int32(syscall.EIO)}, nil
+}
+
+func TestFUSECreateOperationsSetDistinctRequestIDs(t *testing.T) {
+	capture := &captureRequestIDClient{}
+	rawFS := NewObjectFS(capture, "vol-1", pb.WriteMode_FSYNC, nil)
+
+	var entryOut fuse.EntryOut
+	rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, "d1", &entryOut)
+	rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, "d2", &entryOut)
+	rawFS.Symlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "/target", "sym", &entryOut)
+	rawFS.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Oldnodeid: 2}, "hard", &entryOut)
+
+	if len(capture.keys) != 4 {
+		t.Fatalf("got %d captured request IDs, want 4", len(capture.keys))
+	}
+	for i, key := range capture.keys {
+		if len(key) != 16 {
+			t.Fatalf("call %d: got %d-byte request ID, want 16", i, len(key))
+		}
+		for j := range i {
+			if bytes.Equal(capture.keys[j], key) {
+				t.Fatalf("calls %d and %d received identical request ID %x", j, i, key)
+			}
+		}
+	}
+}

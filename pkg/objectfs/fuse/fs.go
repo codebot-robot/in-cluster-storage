@@ -18,7 +18,9 @@ package fuse
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"sort"
@@ -1123,6 +1125,24 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 	return fuse.Status(syscall.EOPNOTSUPP)
 }
 
+var (
+	requestIDPrefixOnce sync.Once
+	requestIDPrefix     [8]byte
+	requestIDCounter    atomic.Uint64
+)
+
+func nextRequestID() []byte {
+	requestIDPrefixOnce.Do(func() {
+		if _, err := rand.Read(requestIDPrefix[:]); err != nil {
+			panic(fmt.Sprintf("objectfs/fuse: failed to read random bytes for request ID prefix: %v", err))
+		}
+	})
+	var key [16]byte
+	copy(key[:8], requestIDPrefix[:])
+	binary.BigEndian.PutUint64(key[8:], requestIDCounter.Add(1))
+	return key[:]
+}
+
 func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
 	if len(name) > MaxNameLength {
 		return fuse.Status(syscall.ENAMETOOLONG)
@@ -1137,6 +1157,7 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 		Mode:        input.Mode,
 		Uid:         input.Uid,
 		Gid:         input.Gid,
+		RequestId:   nextRequestID(),
 	})
 	if err != nil {
 		return fs.grpcErrorToStatus(ctx, "Mkdir", err)
@@ -1454,6 +1475,7 @@ func (fs *ObjectFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, point
 		Target:      pointedTo,
 		Uid:         header.Uid,
 		Gid:         header.Gid,
+		RequestId:   nextRequestID(),
 	})
 	if err != nil {
 		return fs.grpcErrorToStatus(ctx, "Symlink", err)
@@ -1501,6 +1523,7 @@ func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename st
 		OldInode:       input.Oldnodeid,
 		NewParentInode: input.NodeId,
 		NewName:        filename,
+		RequestId:      nextRequestID(),
 	})
 	if err != nil {
 		return fs.grpcErrorToStatus(ctx, "Link", err)
