@@ -2032,6 +2032,13 @@ func (v *Volume) Degraded() *walclient.DegradedError {
 	return stream.Degraded()
 }
 
+// writerLockLost reports whether the volume's stream is degraded because it lost
+// its writer lock to another client.
+func (v *Volume) writerLockLost() bool {
+	degraded := v.Degraded()
+	return degraded != nil && errors.Is(degraded, walclient.ErrWriterLockLost)
+}
+
 // ResetStream updates the volume's underlying WAL stream after repair or reconfiguration.
 func (v *Volume) ResetStream(stream walclient.Stream) error {
 	v.mu.Lock()

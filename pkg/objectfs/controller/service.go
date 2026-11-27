@@ -742,6 +742,16 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	if ok && volume.IsDeleted() {
 		return nil, status.Errorf(codes.NotFound, "volume %s has been deleted", volumeID)
 	}
+	if ok && volume.writerLockLost() {
+		// Another controller wrote to the volume's stream, so everything this
+		// Volume holds in memory is stale. Close (not Stop: nothing may drain
+		// through the lost stream) and fall through to reload from the stream.
+		if err := volume.Close(); err != nil {
+			scoped.Log(context.Background()).Error(err, "failed to close volume after writer lock loss", "volume", volumeID)
+		}
+		delete(s.volumes, volumeID)
+		ok = false
+	}
 	if !ok {
 		var err error
 		volume, err = s.createVolumeInstanceLocked(volumeID)
