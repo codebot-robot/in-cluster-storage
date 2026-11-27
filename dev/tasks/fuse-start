@@ -204,7 +204,36 @@ cleanup() {
       echo "Wrote final snapshot ${snap}"
     fi
     kill -TERM "${CONTROLLER_PID}" 2>/dev/null
-    wait "${CONTROLLER_PID}" 2>/dev/null
+    local controller_exited=0
+    for _ in $(seq 1 300); do
+      if ! kill -0 "${CONTROLLER_PID}" 2>/dev/null; then
+        controller_exited=1
+        break
+      fi
+      sleep 0.1
+    done
+    if [[ "${controller_exited}" -eq 1 ]]; then
+      wait "${CONTROLLER_PID}" 2>/dev/null
+      local controller_exit=$?
+      if [[ "${controller_exit}" -ne 0 ]]; then
+        echo "objectfs-controller exited with status ${controller_exit} after SIGTERM; tail of ${CONTROLLER_LOG}:" >&2
+        tail -n 200 "${CONTROLLER_LOG}" >&2
+        if [[ "${exit_code}" -eq 0 ]]; then
+          exit_code=1
+        fi
+      fi
+    else
+      echo "objectfs-controller (pid ${CONTROLLER_PID}) did not exit within 30s after SIGTERM; sending SIGQUIT..." >&2
+      kill -QUIT "${CONTROLLER_PID}" 2>/dev/null
+      sleep 2
+      echo "tail of ${CONTROLLER_LOG}:" >&2
+      tail -n 200 "${CONTROLLER_LOG}" >&2
+      kill -KILL "${CONTROLLER_PID}" 2>/dev/null
+      wait "${CONTROLLER_PID}" 2>/dev/null
+      if [[ "${exit_code}" -eq 0 ]]; then
+        exit_code=1
+      fi
+    fi
   fi
 
   if [[ -n "${BUFFER_PID}" ]] && kill -0 "${BUFFER_PID}" 2>/dev/null; then
