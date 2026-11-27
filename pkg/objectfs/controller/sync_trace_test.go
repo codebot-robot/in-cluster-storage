@@ -60,7 +60,7 @@ func TestVolumeSyncTracing(t *testing.T) {
 	})
 
 	ctx := t.Context()
-	fileAttr, err := volume.CreateFile(ctx, 1, "data.bin", 0644, nil, 0, 0, 0)
+	fileAttr, err := volume.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "data.bin", Mode: 0644})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}

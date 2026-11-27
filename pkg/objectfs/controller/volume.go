@@ -3752,7 +3752,15 @@ func (v *Volume) Mkdir(ctx context.Context, request *pb.MkdirRequest) (*pb.Entry
 	return attr, nil
 }
 
-func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name string, mode uint32, initialContent []byte, uid, gid, rdev uint32) (*pb.EntryAttr, error) {
+func (v *Volume) CreateFile(ctx context.Context, request *pb.CreateFileRequest) (*pb.EntryAttr, error) {
+	parentInodeID := request.GetParentInode()
+	name := request.GetName()
+	mode := request.GetMode()
+	initialContent := request.GetInitialContent()
+	uid := request.GetUid()
+	gid := request.GetGid()
+	rdev := request.GetRdev()
+
 	if len(name) > MaxNameLength {
 		return nil, fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
 	}

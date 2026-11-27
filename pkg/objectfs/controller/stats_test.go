@@ -744,7 +744,7 @@ func TestVolume_CommitStepInfallibleFaultInjectedIndexGetCannotAffectCommit(t *t
 		t.Fatalf("LoadFromBackend failed: %v", err)
 	}
 
-	attr, err := vol.CreateFile(ctx, 1, "test.txt", 0644, []byte("hello"), 1000, 1000, 0)
+	attr, err := vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "test.txt", Mode: 0644, InitialContent: []byte("hello"), Uid: 1000, Gid: 1000})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}

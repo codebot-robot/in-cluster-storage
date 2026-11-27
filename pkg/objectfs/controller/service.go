@@ -1235,7 +1235,7 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	attr, err := vol.CreateFile(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetInitialContent(), req.GetUid(), req.GetGid(), req.GetRdev())
+	attr, err := vol.CreateFile(ctx, req)
 	if err != nil {
 		if rpcErr := checkRPCErr(err); rpcErr != nil {
 			return nil, rpcErr

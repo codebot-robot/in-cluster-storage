@@ -115,7 +115,7 @@ func TestWALDurability_WaitsUseEffectiveLevel(t *testing.T) {
 	}
 	assertWaitAdvanced(walclient.Witness)
 
-	fileAttr, err := volume.CreateFile(ctx, 1, "staged-file", 0644, nil, 0, 0, 0)
+	fileAttr, err := volume.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "staged-file", Mode: 0644})
 	if err != nil {
 		t.Fatalf("CreateFile: %v", err)
 	}

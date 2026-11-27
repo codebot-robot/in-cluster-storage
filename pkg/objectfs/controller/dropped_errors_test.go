@@ -201,7 +201,7 @@ func TestRegression_ChunkListScanFailure(t *testing.T) {
 
 	// Create file with content and flush overlay so chunks are in the index
 	data := []byte("hello chunk failure test data")
-	attr, err := vol.CreateFile(ctx, 1, "test.txt", 0644, data, 1000, 1000, 0)
+	attr, err := vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "test.txt", Mode: 0644, InitialContent: data, Uid: 1000, Gid: 1000})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestRegression_ReadDirEntryAttrFailure(t *testing.T) {
 		t.Fatalf("LoadFromBackend failed: %v", err)
 	}
 
-	_, err = vol.CreateFile(ctx, 1, "child.txt", 0644, []byte("content"), 1000, 1000, 0)
+	_, err = vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "child.txt", Mode: 0644, InitialContent: []byte("content"), Uid: 1000, Gid: 1000})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -375,7 +375,7 @@ func TestRegression_TruncateFilePutBlobsFailure(t *testing.T) {
 
 	// Create file spanning multiple chunks (> maxInlineLen of 4096)
 	data := bytes.Repeat([]byte("a"), 10000)
-	attr, err := vol.CreateFile(ctx, 1, "test.txt", 0644, data, 1000, 1000, 0)
+	attr, err := vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "test.txt", Mode: 0644, InitialContent: data, Uid: 1000, Gid: 1000})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -450,7 +450,7 @@ func TestRegression_ShutdownFlushFailureSurfacedInClose(t *testing.T) {
 	}
 
 	// Create a file to ensure there is state that needs flushing
-	_, err = vol.CreateFile(ctx, 1, "test.txt", 0644, []byte("data"), 1000, 1000, 0)
+	_, err = vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "test.txt", Mode: 0644, InitialContent: []byte("data"), Uid: 1000, Gid: 1000})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}

@@ -2776,7 +2776,9 @@ func TestVolume_Stop_RejectsMutations(t *testing.T) {
 		"Mkdir": func() error {
 			return retErr(volume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "d", Mode: 0755}))
 		},
-		"CreateFile":         func() error { return retErr(volume.CreateFile(ctx, 1, "f", 0644, nil, 0, 0, 0)) },
+		"CreateFile": func() error {
+			return retErr(volume.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "f", Mode: 0644}))
+		},
 		"WriteFileWithEpoch": func() error { return retErr5(volume.WriteFileWithEpoch(ctx, inodeID, 0, nil, 0)) },
 		"TruncateFile":       func() error { return retErr(volume.TruncateFile(ctx, inodeID, 0)) },
 		"PunchHole":          func() error { return retErr(volume.PunchHole(ctx, inodeID, 0, 1, false)) },
