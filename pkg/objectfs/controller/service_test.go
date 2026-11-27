@@ -278,7 +278,7 @@ func volCreateFile(ctx context.Context, vol *Volume, p string, mode uint32, init
 	if err != nil {
 		return nil, err
 	}
-	return vol.CreateFile(ctx, parentIno, path.Base(p), mode, initialContent, uid, gid, 0)
+	return vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: parentIno, Name: path.Base(p), Mode: mode, InitialContent: initialContent, Uid: uid, Gid: gid})
 }
 
 var (
@@ -1055,7 +1055,7 @@ func TestOverlayEntryKeepsRowAsOfChange(t *testing.T) {
 
 	// Create initial file
 	initialContent := []byte("initial-file-content")
-	attr1, err := vol.CreateFile(ctx, 1, "testfile.txt", 0644, initialContent, 1000, 1000, 0)
+	attr1, err := vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "testfile.txt", Mode: 0644, InitialContent: initialContent, Uid: 1000, Gid: 1000})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -1139,7 +1139,7 @@ func TestMutationCheckCatchesInPlaceInodeModification(t *testing.T) {
 	)
 	defer vol.Close()
 
-	attr, err := vol.CreateFile(ctx, 1, "testfile.txt", 0644, []byte("hello"), 1000, 1000, 0)
+	attr, err := vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "testfile.txt", Mode: 0644, InitialContent: []byte("hello"), Uid: 1000, Gid: 1000})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -2812,7 +2812,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	}
 
 	// Direct CreateFile
-	fileAttr, err := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), "foo.txt", 0644, []byte("test"), 0, 0, 0)
+	fileAttr, err := vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: dirAttr.GetInode().GetIno(), Name: "foo.txt", Mode: 0644, InitialContent: []byte("test")})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -2893,7 +2893,7 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	vol := MustNewVolume(t, "symlink-test", backend, NewEventBroadcaster())
 
 	// 1. Create a regular file
-	fileAttr, err := vol.CreateFile(ctx, 1, "orig.txt", 0644, []byte("contents"), 100, 200, 0)
+	fileAttr, err := vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "orig.txt", Mode: 0644, InitialContent: []byte("contents"), Uid: 100, Gid: 200})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
@@ -5202,7 +5202,7 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 		WithLocalStorageDir(filepath.Join(node1MetaDir, volumeID)),
 	)
 	_ = volStale.LoadFromBackend(ctx)
-	_, _ = volStale.CreateFile(ctx, 1, "stale_local_file.txt", 0644, []byte("stale-local-data"), 0, 0, 0)
+	_, _ = volStale.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "stale_local_file.txt", Mode: 0644, InitialContent: []byte("stale-local-data")})
 	_ = volStale.Close()
 	cleanupStale()
 

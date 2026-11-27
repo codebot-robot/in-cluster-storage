@@ -40,7 +40,7 @@ func TestMetadataStreamTypeResolution_ReversedTableOrder(t *testing.T) {
 	vol1 := MustNewVolume(t, volumeID, nil, broadcaster)
 
 	ctx := t.Context()
-	if _, err := vol1.CreateFile(ctx, 1, "test.txt", 0644, []byte("data"), 0, 0, 0); err != nil {
+	if _, err := vol1.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "test.txt", Mode: 0644, InitialContent: []byte("data")}); err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 	if err := vol1.PersistConsistencyMode(ctx, pb.ConsistencyMode_CLOSE_TO_OPEN); err != nil {
@@ -120,7 +120,7 @@ func TestMetadataStreamTypeResolution_SecondWriterRegistersOnlyVolumeInfo(t *tes
 	})
 
 	ctx := t.Context()
-	if _, err := vol.CreateFile(ctx, 1, "test.txt", 0644, []byte("data"), 0, 0, 0); err != nil {
+	if _, err := vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "test.txt", Mode: 0644, InitialContent: []byte("data")}); err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 	if err := vol.PersistConsistencyMode(ctx, pb.ConsistencyMode_CLOSE_TO_OPEN); err != nil {
@@ -179,7 +179,7 @@ func TestMetadataStreamTypeResolution_NewStreamRoundTrip(t *testing.T) {
 	})
 
 	ctx := t.Context()
-	fileAttr, err := vol.CreateFile(ctx, 1, "roundtrip.txt", 0644, []byte("roundtrip content"), 0, 0, 0)
+	fileAttr, err := vol.CreateFile(ctx, &pb.CreateFileRequest{ParentInode: 1, Name: "roundtrip.txt", Mode: 0644, InitialContent: []byte("roundtrip content")})
 	if err != nil {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
