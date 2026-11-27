@@ -6444,7 +6444,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 		v.handlesMu.Lock()
 		if fh != 0 {
 			ino, ok := v.handles[fh]
-			if !ok {
+			if !ok || ino != inodeID {
 				v.handlesMu.Unlock()
 				// A Release for a handle id this volume did not issue or has already
 				// released returns success and changes nothing. This happens when the
@@ -6458,7 +6458,6 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 				scoped.Log(ctx).V(2).Info("ignoring Release for unknown handle", "volume", v.volumeID, "inode", inodeID, "handle", fh)
 				return nil, nil
 			}
-			inodeID = ino
 			delete(v.handles, fh)
 		}
 		if v.openInodes != nil {
