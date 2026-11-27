@@ -5972,7 +5972,7 @@ type DirEntry struct {
 	Ino       uint64                 `protobuf:"varint,3,opt,name=ino,proto3" json:"ino,omitempty"`
 	IsDir     bool                   `protobuf:"varint,4,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
 	Mode      uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
-	// Idempotency key of the creating request; set only by creates (Mkdir, Symlink, Link, special-file CreateFile).
+	// Idempotency key of the request that wrote this entry; set by creates (Mkdir, Symlink, Link, special-file CreateFile) and Rename.
 	RequestId     []byte `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
