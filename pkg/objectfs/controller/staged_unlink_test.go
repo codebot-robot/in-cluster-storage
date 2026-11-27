@@ -89,7 +89,7 @@ func TestStagedChunks_UnlinkWithHardLinkPreservesData(t *testing.T) {
 	server, volume := newStagedDropVolume(t, NewMemoryBackend())
 	payload := []byte("hello-link")
 	inodeID := createClosedFile(t, server, volume, "/link1.bin")
-	if _, err := volume.Link(ctx, inodeID, 1, "link2.bin"); err != nil {
+	if _, err := volume.Link(ctx, &pb.LinkRequest{OldInode: inodeID, NewParentInode: 1, NewName: "link2.bin"}); err != nil {
 		t.Fatalf("Link failed: %v", err)
 	}
 	stageWrite(t, volume, inodeID, payload)

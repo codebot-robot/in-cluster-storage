@@ -3617,7 +3617,13 @@ func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) {
 	v.recordOverlayTxChangesLocked(tx) // always: the tx is committed
 }
 
-func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, mode uint32, uid, gid uint32) (*pb.EntryAttr, error) {
+func (v *Volume) Mkdir(ctx context.Context, request *pb.MkdirRequest) (*pb.EntryAttr, error) {
+	parentInodeID := request.GetParentInode()
+	name := request.GetName()
+	mode := request.GetMode()
+	uid := request.GetUid()
+	gid := request.GetGid()
+
 	if len(name) > MaxNameLength {
 		return nil, fmt.Errorf("directory name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
 	}
@@ -4073,7 +4079,13 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 	return attr, nil
 }
 
-func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string, target string, uid, gid uint32) (*pb.EntryAttr, error) {
+func (v *Volume) Symlink(ctx context.Context, request *pb.SymlinkRequest) (*pb.EntryAttr, error) {
+	parentInodeID := request.GetParentInode()
+	name := request.GetName()
+	target := request.GetTarget()
+	uid := request.GetUid()
+	gid := request.GetGid()
+
 	if len(name) > MaxNameLength {
 		return nil, fmt.Errorf("symlink name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
 	}
@@ -4204,7 +4216,11 @@ func (v *Volume) Readlink(ctx context.Context, inodeID uint64) (string, error) {
 	return node.Row.GetSymlinkTarget(), nil
 }
 
-func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID uint64, newName string) (*pb.EntryAttr, error) {
+func (v *Volume) Link(ctx context.Context, request *pb.LinkRequest) (*pb.EntryAttr, error) {
+	oldInodeID := request.GetOldInode()
+	newParentInodeID := request.GetNewParentInode()
+	newName := request.GetNewName()
+
 	if len(newName) > MaxNameLength {
 		return nil, fmt.Errorf("link name %q exceeds maximum length: %w", newName, syscall.ENAMETOOLONG)
 	}

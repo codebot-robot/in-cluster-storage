@@ -2801,7 +2801,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	vol := MustNewVolume(t, "apply-test", backend, NewEventBroadcaster())
 
 	// Direct Mkdir
-	dirAttr, err := vol.Mkdir(ctx, 1, "c", 0755, 0, 0)
+	dirAttr, err := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "c", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
@@ -2867,7 +2867,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	}
 
 	// Direct Symlink
-	symAttr, err := vol.Symlink(ctx, 1, "symlink.txt", "target.txt", 0, 0)
+	symAttr, err := vol.Symlink(ctx, &pb.SymlinkRequest{ParentInode: 1, Name: "symlink.txt", Target: "target.txt"})
 	if err != nil {
 		t.Fatalf("Symlink failed: %v", err)
 	}
@@ -2877,7 +2877,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	}
 
 	// Direct Link
-	_, err = vol.Link(ctx, symAttr.GetInode().GetIno(), 1, "symlink_link.txt")
+	_, err = vol.Link(ctx, &pb.LinkRequest{OldInode: symAttr.GetInode().GetIno(), NewParentInode: 1, NewName: "symlink_link.txt"})
 	if err != nil {
 		t.Fatalf("Link failed: %v", err)
 	}
@@ -2902,7 +2902,7 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	}
 
 	// 2. Create a hard link
-	linkAttr, err := vol.Link(ctx, fileAttr.GetInode().GetIno(), 1, "link1.txt")
+	linkAttr, err := vol.Link(ctx, &pb.LinkRequest{OldInode: fileAttr.GetInode().GetIno(), NewParentInode: 1, NewName: "link1.txt"})
 	if err != nil {
 		t.Fatalf("Link failed: %v", err)
 	}
@@ -2920,23 +2920,23 @@ func TestSymlinkAndHardlinkOperations(t *testing.T) {
 	}
 
 	// Hard link to a directory should fail with EPERM
-	dirAttr, err := vol.Mkdir(ctx, 1, "subdir", 0755, 0, 0)
+	dirAttr, err := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "subdir", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
-	_, err = vol.Link(ctx, dirAttr.GetInode().GetIno(), 1, "dirlink")
+	_, err = vol.Link(ctx, &pb.LinkRequest{OldInode: dirAttr.GetInode().GetIno(), NewParentInode: 1, NewName: "dirlink"})
 	if !errors.Is(err, syscall.EPERM) {
 		t.Fatalf("Expected EPERM for linking directory, got: %v", err)
 	}
 
 	// Hard link to an existing name should fail with EEXIST
-	_, err = vol.Link(ctx, fileAttr.GetInode().GetIno(), 1, "link1.txt")
+	_, err = vol.Link(ctx, &pb.LinkRequest{OldInode: fileAttr.GetInode().GetIno(), NewParentInode: 1, NewName: "link1.txt"})
 	if !errors.Is(err, syscall.EEXIST) {
 		t.Fatalf("Expected EEXIST for existing name, got: %v", err)
 	}
 
 	// 3. Create a symlink
-	symAttr, err := vol.Symlink(ctx, 1, "sym.lnk", "orig.txt", 100, 200)
+	symAttr, err := vol.Symlink(ctx, &pb.SymlinkRequest{ParentInode: 1, Name: "sym.lnk", Target: "orig.txt", Uid: 100, Gid: 200})
 	if err != nil {
 		t.Fatalf("Symlink failed: %v", err)
 	}

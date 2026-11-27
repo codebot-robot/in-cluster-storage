@@ -623,7 +623,7 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		}
 
 		// A. CreateFile
-		dirAttr, err := vol.Mkdir(ctx, 1, "test_dir", 0755, 0, 0)
+		dirAttr, err := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "test_dir", Mode: 0755})
 		if err != nil {
 			t.Fatalf("Mkdir failed: %v", err)
 		}
