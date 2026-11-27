@@ -163,7 +163,7 @@ func newWriterLockFixture(t *testing.T) *writerLockFixture {
 	}
 }
 
-func (f *writerLockFixture) startServer(clientID string, dialOptions []grpc.DialOption, wrapStream ...func(walclient.Stream) walclient.Stream) *Server {
+func (f *writerLockFixture) startServer(clientID string, dialOptions []grpc.DialOption) *Server {
 	f.t.Helper()
 	ctx := f.t.Context()
 	walDirectory := f.t.TempDir()
@@ -173,18 +173,11 @@ func (f *writerLockFixture) startServer(clientID string, dialOptions []grpc.Dial
 		WithServerMetadataDir(f.t.TempDir()),
 		WithServerWithoutFsync(),
 		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
-			stream, err := walclient.Open(ctx, walDirectory, StreamIDForVolume(volumeID), f.bufferTest.Target,
+			return walclient.Open(ctx, walDirectory, StreamIDForVolume(volumeID), f.bufferTest.Target,
 				walclient.WithDialOptions(dialOptions...),
 				walclient.WithoutFsync(),
 				walclient.WithClientID(clientID),
 			)
-			if err != nil {
-				return nil, err
-			}
-			for _, wrap := range wrapStream {
-				stream = wrap(stream)
-			}
-			return stream, nil
 		}),
 	)
 	if err := server.Start(ctx); err != nil {

@@ -20,14 +20,12 @@ import (
 	"context"
 	"errors"
 	"net"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
-	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -100,10 +98,10 @@ func runMidRequestWriterLockLoss(t *testing.T, withClientResend bool) (pb.Object
 		response *pb.MkdirResponse
 		err      error
 	}
-	resultCh := make(chan mkdirResult, 1)
+	results := make(chan mkdirResult, 1)
 	go func() {
 		response, err := client.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, ParentInode: 1, Name: "blocked-dir", Mode: 0755})
-		resultCh <- mkdirResult{response: response, err: err}
+		results <- mkdirResult{response: response, err: err}
 	}()
 
 	select {
@@ -115,7 +113,7 @@ func runMidRequestWriterLockLoss(t *testing.T, withClientResend bool) (pb.Object
 	fixture.handOffLockToB(volumeID, "/from-b.txt", []byte("from B"))
 
 	select {
-	case result := <-resultCh:
+	case result := <-results:
 		return client, result.response, result.err
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for blocked Mkdir to complete")
@@ -182,34 +180,11 @@ func TestServer_ResendInterceptorPreservesSuccessAfterLockLoss(t *testing.T) {
 	}
 }
 
-type injectableDegradedStream struct {
-	walclient.Stream
-	degraded atomic.Pointer[walclient.DegradedError]
-}
-
-func (s *injectableDegradedStream) Degraded() *walclient.DegradedError {
-	if err := s.degraded.Load(); err != nil {
-		return err
-	}
-	return s.Stream.Degraded()
-}
-
-func (s *injectableDegradedStream) Append(ctx context.Context, payload []byte) (uint64, error) {
-	if err := s.degraded.Load(); err != nil {
-		return 0, err
-	}
-	return s.Stream.Append(ctx, payload)
-}
-
 func TestServer_ResendInterceptorOnlyForLostLock(t *testing.T) {
 	ctx := t.Context()
 	const volumeID = "only-for-lost-lock-volume"
 	fixture := newWriterLockFixture(t)
-	var stream *injectableDegradedStream
-	server := fixture.startServer("controller-A", fixture.bufferTest.DialOpts, func(realStream walclient.Stream) walclient.Stream {
-		stream = &injectableDegradedStream{Stream: realStream}
-		return stream
-	})
+	server := fixture.startServer("controller-A", fixture.bufferTest.DialOpts)
 	client := serveAndDialController(t, server, false)
 
 	if response, err := client.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, ParentInode: 1, Name: "existing", Mode: 0755}); err != nil || response.GetError() != 0 {
@@ -221,7 +196,12 @@ func TestServer_ResendInterceptorOnlyForLostLock(t *testing.T) {
 	if response, err := client.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, ParentInode: 1, Name: "existing", Mode: 0755}); err != nil || response.GetError() != int32(syscall.EEXIST) {
 		t.Fatalf("second Mkdir: err=%v errno=%v, want EEXIST", err, syscall.Errno(response.GetError()))
 	}
-	stream.degraded.Store(&walclient.DegradedError{Cause: errors.New("segment store I/O error"), At: time.Now()})
+	volume := server.lookupVolume(volumeID)
+	faultStream := &faultInjectingStream{Stream: volume.Stream(), streamID: StreamIDForVolume(volumeID)}
+	if err := volume.ResetStream(faultStream); err != nil {
+		t.Fatalf("ResetStream failed: %v", err)
+	}
+	faultStream.degrade(errors.New("segment store I/O error"))
 	if response, err := client.Mkdir(ctx, &pb.MkdirRequest{VolumeId: volumeID, ParentInode: 1, Name: "after-degrade", Mode: 0755}); err != nil || response.GetError() != int32(syscall.EIO) {
 		t.Fatalf("Mkdir after non-lock-loss degrade: err=%v errno=%v, want EIO", err, syscall.Errno(response.GetError()))
 	}
