@@ -53,9 +53,14 @@ func (f *Factory) OpenLocal(ctx context.Context, streamID string, dir string) (s
 	return nil, false, nil
 }
 
-// FindLatestSnapshot finds the latest MemStore snapshot in object storage.
+// FindLatestSnapshot finds the latest MemStore snapshot in object storage,
+// returning ("", 0, nil) if no snapshot exists.
 func (f *Factory) FindLatestSnapshot(ctx context.Context, backend objectstore.Backend, streamID string, maxPos uint64) (string, uint64, error) {
-	return FindLatestSnapshot(ctx, backend, streamID, maxPos)
+	key, pos, err := FindLatestSnapshot(ctx, backend, streamID, maxPos)
+	if errors.Is(err, ErrSnapshotNotFound) {
+		return "", 0, nil
+	}
+	return key, pos, err
 }
 
 // RestoreSnapshot restores a MemStore snapshot from object storage.

@@ -6775,9 +6775,15 @@ func (v *Volume) rebuildIndex(ctx context.Context) (sds.LocalIndex, uint64, erro
 	// 1. Try to restore latest snapshot from object storage
 	if v.backend != nil {
 		snapKey, _, err := v.indexFactory.FindLatestSnapshot(ctx, v.backend, v.streamID.String(), 0)
-		if err == nil && snapKey != "" {
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to find latest snapshot: %w", err)
+		}
+		if snapKey != "" {
 			restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), snapKey, v.localStorageDir)
-			if err == nil && restoredIdx != nil {
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to restore latest snapshot: %w", err)
+			}
+			if restoredIdx != nil {
 				rebuiltIdx = restoredIdx
 				snapPos = rPos
 				snapshotKey = snapKey
@@ -7072,7 +7078,10 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 	var remoteSnapPos uint64
 	if v.backend != nil && v.indexFactory != nil {
 		snapKey, rPos, err := v.indexFactory.FindLatestSnapshot(ctx, v.backend, v.streamID.String(), 0)
-		if err == nil && snapKey != "" {
+		if err != nil {
+			return fmt.Errorf("failed to find latest snapshot: %w", err)
+		}
+		if snapKey != "" {
 			remoteSnapKey = snapKey
 			remoteSnapPos = rPos
 		}
@@ -7113,7 +7122,10 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			v.metadataView = nil
 		}
 		restoredIdx, rPos, err := v.indexFactory.RestoreSnapshot(ctx, v.backend, v.streamID.String(), remoteSnapKey, v.localStorageDir)
-		if err == nil && restoredIdx != nil {
+		if err != nil {
+			return fmt.Errorf("failed to restore latest snapshot: %w", err)
+		}
+		if restoredIdx != nil {
 			if err := v.importIndexRegistryLocked(restoredIdx); err != nil {
 				errutil.CloseAndLog(restoredIdx, "restored index")
 				return err

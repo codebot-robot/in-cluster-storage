@@ -887,9 +887,14 @@ func (f *Factory) OpenLocal(ctx context.Context, streamID string, dir string) (s
 	return db, true, nil
 }
 
-// FindLatestSnapshot finds the latest table snapshot in object storage at or before maxPos.
+// FindLatestSnapshot finds the latest table snapshot in object storage at or before maxPos,
+// returning ("", 0, nil) if no snapshot exists.
 func (f *Factory) FindLatestSnapshot(ctx context.Context, backend objectstore.Backend, streamID string, maxPos uint64) (string, uint64, error) {
-	return FindLatestSnapshot(ctx, backend, streamID, maxPos)
+	key, pos, err := FindLatestSnapshot(ctx, backend, streamID, maxPos)
+	if errors.Is(err, ErrSnapshotNotFound) {
+		return "", 0, nil
+	}
+	return key, pos, err
 }
 
 // RestoreSnapshot restores a table snapshot from object storage into dir.
