@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -88,19 +89,41 @@ func main() {
 	grpcServer := grpc.NewServer()
 	pb.RegisterWalBufferServer(grpcServer, srv)
 
-	// Graceful shutdown handling
+	// Graceful shutdown and fatal error handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	fatalErrorChan := make(chan error, 1)
 	go func() {
-		<-sigChan
-		scoped.Log(ctx).Info("Shutting down WAL buffer server...")
-		grpcServer.GracefulStop()
+		select {
+		case <-sigChan:
+			scoped.Log(ctx).Info("Shutting down WAL buffer server...")
+			grpcServer.GracefulStop()
+		case err := <-srv.FatalError():
+			var staleDiskError *buffer.StaleDiskError
+			if errors.As(err, &staleDiskError) {
+				scoped.Log(ctx).Error(err, "WAL buffer local disk is stale; stopping server",
+					"storeLastFlushedPosition", staleDiskError.StoreLastFlushedPosition,
+					"startupLocalPosition", staleDiskError.StartupLocalPosition)
+			} else {
+				scoped.Log(ctx).Error(err, "WAL buffer encountered fatal error; stopping server")
+			}
+			fatalErrorChan <- err
+			grpcServer.Stop()
+		}
 	}()
 
 	scoped.Log(ctx).Info("WAL Buffer Service listening", "port", *port, "lastPosition", srv.LastPosition(), "backend", *backendType, "dataDir", *dataDir)
 	serveErr := grpcServer.Serve(listener)
-	if err := srv.Close(); err != nil {
-		scoped.Log(ctx).Error(err, "failed to close server on shutdown")
+	closeError := srv.Close()
+	if closeError != nil {
+		scoped.Log(ctx).Error(closeError, "failed to close server on shutdown")
+	}
+	var fatalError error
+	select {
+	case fatalError = <-fatalErrorChan:
+	default:
+	}
+	if fatalError != nil || closeError != nil {
 		klog.Flush()
 		os.Exit(1)
 	}

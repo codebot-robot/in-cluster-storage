@@ -304,3 +304,110 @@ func TestOfflineStartup_StaleDiskRefusesFlush(t *testing.T) {
 		t.Fatalf("store objects changed on stale disk: got %v, want %v", objectsAfter, objectsBefore)
 	}
 }
+
+func TestOfflineStartup_StaleDiskFatalError(t *testing.T) {
+	seedDisk := func(t *testing.T) (objectstore.Backend, *switchableBackend, ServerConfig, uuid.UUID) {
+		t.Helper()
+		ctx := t.Context()
+		innerBackend := inmemorystorage.New()
+		backend := &switchableBackend{Backend: innerBackend}
+		config := ServerConfig{Backend: backend, DataDir: t.TempDir(), FlushInterval: 10 * time.Second, BatchMaxDelay: 2 * time.Millisecond}
+		streamID := uuid.New()
+		server1, err := NewServer(ctx, config)
+		if err != nil {
+			t.Fatalf("NewServer 1 failed: %v", err)
+		}
+		for sequence := uint64(1); sequence <= 3; sequence++ {
+			appendDirectRecord(t, server1, streamID, sequence, []byte(fmt.Sprintf("record-%d", sequence)))
+		}
+		if _, err := server1.Flush(ctx, &pb.FlushRequest{}); err != nil {
+			t.Fatalf("initial Flush failed: %v", err)
+		}
+		if err := server1.Close(); err != nil {
+			t.Fatalf("server1.Close failed: %v", err)
+		}
+		return innerBackend, backend, config, streamID
+	}
+
+	t.Run("stale_disk", func(t *testing.T) {
+		ctx := t.Context()
+		innerBackend, backend, config, streamID := seedDisk(t)
+
+		extraSegment := blob.NewByteStreamFromBytes(wal.DefaultSegmentHeader().Encode())
+		defer errutil.CloseAndLog(extraSegment, "extra segment")
+		if _, err := innerBackend.PutObject(ctx, "", SegmentsPrefix+"000000000004-000000000005.wal", extraSegment); err != nil {
+			t.Fatalf("PutObject extra segment failed: %v", err)
+		}
+		objectsBefore, err := innerBackend.ListObjects(ctx, "", "")
+		if err != nil {
+			t.Fatalf("ListObjects before failed: %v", err)
+		}
+
+		backend.unavailable.Store(true)
+		server2, err := NewServer(ctx, config)
+		if err != nil {
+			t.Fatalf("NewServer 2 failed: %v", err)
+		}
+		appendDirectRecord(t, server2, streamID, 4, []byte("stale-4"))
+
+		backend.unavailable.Store(false)
+		if _, err := server2.Flush(ctx, &pb.FlushRequest{}); err == nil {
+			t.Fatal("first Flush succeeded on stale disk, want error")
+		}
+		var staleError *StaleDiskError
+		select {
+		case err := <-server2.FatalError():
+			if !errors.As(err, &staleError) || staleError.StoreLastFlushedPosition != 5 || staleError.StartupLocalPosition != 3 {
+				t.Fatalf("FatalError() = %v, want *StaleDiskError{store=5, startup=3}", err)
+			}
+		default:
+			t.Fatal("expected fatal error on stale disk, got none")
+		}
+		if _, err := server2.Flush(ctx, &pb.FlushRequest{}); err == nil {
+			t.Fatal("second Flush succeeded on stale disk, want error")
+		}
+		if err := server2.Close(); err == nil {
+			t.Fatal("server2.Close succeeded on stale disk, want error")
+		}
+		select {
+		case err := <-server2.FatalError():
+			t.Fatalf("expected stale disk fatal error once, got second: %v", err)
+		default:
+		}
+		objectsAfter, err := innerBackend.ListObjects(ctx, "", "")
+		if err != nil {
+			t.Fatalf("ListObjects after failed: %v", err)
+		}
+		if !slices.Equal(objectsAfter, objectsBefore) {
+			t.Fatalf("store objects changed on stale disk: got %v, want %v", objectsAfter, objectsBefore)
+		}
+	})
+
+	t.Run("healthy_reconciliation", func(t *testing.T) {
+		ctx := t.Context()
+		_, backend, config, streamID := seedDisk(t)
+
+		backend.unavailable.Store(true)
+		server2, err := NewServer(ctx, config)
+		if err != nil {
+			t.Fatalf("NewServer 2 failed: %v", err)
+		}
+		appendDirectRecord(t, server2, streamID, 4, []byte("record-4"))
+
+		backend.unavailable.Store(false)
+		if _, err := server2.Flush(ctx, &pb.FlushRequest{}); err != nil {
+			t.Fatalf("reconciliation Flush failed: %v", err)
+		}
+		if err := server2.Close(); err != nil {
+			t.Fatalf("server2.Close failed: %v", err)
+		}
+		select {
+		case err := <-server2.FatalError():
+			t.Fatalf("unexpected fatal error on healthy reconciliation: %v", err)
+		default:
+		}
+		if server2.LastFlushedPosition() != 4 {
+			t.Fatalf("LastFlushedPosition() = %d, want 4", server2.LastFlushedPosition())
+		}
+	})
+}

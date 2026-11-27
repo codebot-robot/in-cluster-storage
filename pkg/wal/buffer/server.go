@@ -63,6 +63,20 @@ func (realClock) Now() time.Time {
 	return time.Now()
 }
 
+// StaleDiskError is reported when post-outage reconciliation discovers that
+// the object store already holds positions beyond the highest local position
+// seen at startup.
+type StaleDiskError struct {
+	StoreLastFlushedPosition uint64
+	StartupLocalPosition     uint64
+}
+
+// Error implements the error interface.
+func (e *StaleDiskError) Error() string {
+	return fmt.Sprintf("refusing to flush from stale local disk: object store has position %d beyond startup local position %d",
+		e.StoreLastFlushedPosition, e.StartupLocalPosition)
+}
+
 // ServerConfig configures the WAL Buffer service.
 type ServerConfig struct {
 	Backend            objectstore.Backend
@@ -328,7 +342,18 @@ type Server struct {
 	// Read and cleared only inside doFlush, which runs one at a time while isFlushing is true.
 	pendingListPosition uint64
 
+	// staleDiskError records a stale-disk reconciliation failure so subsequent flushes
+	// fail immediately without re-listing the store or reporting the condition again.
+	// Read and written only inside doFlush, which runs one at a time while isFlushing is true.
+	staleDiskError *StaleDiskError
+
 	// Lifecycle and background worker coordination (self-synchronized; not guarded by a mutex).
+
+	// fatalErrorChan receives at most one fatal error requiring the hosting process to exit.
+	fatalErrorChan chan error
+
+	// fatalErrorOnce ensures at most one fatal error is sent on fatalErrorChan.
+	fatalErrorOnce sync.Once
 
 	// stopChan is closed on Server.Close to signal background workers and sessions to terminate.
 	stopChan chan struct{}
@@ -555,6 +580,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		pendingListPosition: pendingListPosition,
 		incomingChan:        make(chan incomingItem, 1024),
 		tailWaiters:         make(map[chan struct{}]struct{}),
+		fatalErrorChan:      make(chan error, 1),
 		stopChan:            make(chan struct{}),
 	}
 	s.flushCond = sync.NewCond(&s.flushMu)
@@ -715,6 +741,20 @@ func (s *Server) LastFlushedPosition() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastFlushedPosition
+}
+
+// FatalError returns a channel that receives the first fatal error requiring
+// the hosting process to exit, such as *StaleDiskError when a local disk served
+// offline is found to be behind the object store. At most one error is ever
+// sent on the channel.
+func (s *Server) FatalError() <-chan error {
+	return s.fatalErrorChan
+}
+
+func (s *Server) reportFatalError(err error) {
+	s.fatalErrorOnce.Do(func() {
+		s.fatalErrorChan <- err
+	})
 }
 
 // StreamCount returns the current number of streams tracked in s.streams.
@@ -1653,6 +1693,9 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 	if len(records) == 0 {
 		return nil
 	}
+	if s.staleDiskError != nil {
+		return s.staleDiskError
+	}
 
 	var discoveredSegments []string
 	var storeLastFlushedPosition uint64
@@ -1664,8 +1707,16 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 			return fmt.Errorf("failed to list segments from backend before flush: %w", err)
 		}
 		if storeLastFlushedPosition > s.pendingListPosition {
-			return fmt.Errorf("refusing to flush from stale local disk: object store has position %d beyond startup local position %d",
-				storeLastFlushedPosition, s.pendingListPosition)
+			staleError := &StaleDiskError{
+				StoreLastFlushedPosition: storeLastFlushedPosition,
+				StartupLocalPosition:     s.pendingListPosition,
+			}
+			s.staleDiskError = staleError
+			scoped.Log(ctx).Error(staleError, "local disk is stale; cannot reconcile with object store",
+				"storeLastFlushedPosition", storeLastFlushedPosition,
+				"startupLocalPosition", s.pendingListPosition)
+			s.reportFatalError(staleError)
+			return staleError
 		}
 	}
 
