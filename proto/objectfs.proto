@@ -203,6 +203,8 @@ message CreateFileRequest {
   uint32 uid = 6;
   uint32 gid = 7;
   uint32 rdev = 8;
+  // Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+  bytes request_id = 9;
 }
 
 message CreateFileResponse {
