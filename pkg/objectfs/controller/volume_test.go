@@ -422,13 +422,13 @@ func TestRename_DirectoryIntoOwnSubtree_ColdVolumeFailsWithEINVAL(t *testing.T) 
 	}
 
 	// Renaming a into its direct child b must fail with EINVAL.
-	_, renameToChildError := coldVolume.Rename(ctx, 1, "a", directoryInodeIDB, "loop")
+	_, renameToChildError := coldVolume.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: "a", NewParentInode: directoryInodeIDB, NewName: "loop"})
 	if !errors.Is(renameToChildError, syscall.EINVAL) {
 		t.Fatalf("expected EINVAL when renaming a into child b, got: %v", renameToChildError)
 	}
 
 	// Renaming a into its grandchild c must fail with EINVAL.
-	_, renameToGrandchildError := coldVolume.Rename(ctx, 1, "a", directoryInodeIDC, "loop")
+	_, renameToGrandchildError := coldVolume.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: "a", NewParentInode: directoryInodeIDC, NewName: "loop"})
 	if !errors.Is(renameToGrandchildError, syscall.EINVAL) {
 		t.Fatalf("expected EINVAL when renaming a into grandchild c, got: %v", renameToGrandchildError)
 	}
@@ -534,7 +534,7 @@ func TestRename_DirectoryAncestryCycle_FailsWithELOOP(t *testing.T) {
 	// Attempting to move dir_target into dir_a must fail with ELOOP without hanging.
 	renameDoneChannel := make(chan error, 1)
 	go func() {
-		_, renameError := coldVolume.Rename(ctx, 1, "dir_target", directoryInodeIDA, "dir_target")
+		_, renameError := coldVolume.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: "dir_target", NewParentInode: directoryInodeIDA, NewName: "dir_target"})
 		renameDoneChannel <- renameError
 	}()
 
@@ -599,7 +599,7 @@ func TestRename_DirectoryMovedColdVolume_LookupDotDotReturnsNewParent(t *testing
 	}
 
 	// 3. Rename child_dir from parent1 to parent2.
-	_, err = initialVolume.Rename(ctx, parent1Ino, "child_dir", parent2Ino, "child_moved")
+	_, err = initialVolume.Rename(ctx, &pb.RenameRequest{OldParentInode: parent1Ino, OldName: "child_dir", NewParentInode: parent2Ino, NewName: "child_moved"})
 	if err != nil {
 		t.Fatalf("Rename child_dir to parent2 failed: %v", err)
 	}

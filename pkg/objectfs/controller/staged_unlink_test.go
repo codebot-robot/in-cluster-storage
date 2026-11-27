@@ -159,7 +159,7 @@ func TestStagedChunks_RenameOverStagedTargetDropsData(t *testing.T) {
 	}
 
 	createClosedFile(t, server, volume, "/src.bin")
-	if _, err := volume.Rename(ctx, 1, "src.bin", 1, "target.bin"); err != nil {
+	if _, err := volume.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: "src.bin", NewParentInode: 1, NewName: "target.bin"}); err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
 	if staged := volume.StagedBytes(); staged != 0 {

@@ -691,7 +691,7 @@ func TestBenchmarkMeasurements(t *testing.T) {
 			if i%2 == 1 {
 				from, to = "ren_b.txt", "ren_a.txt"
 			}
-			if _, err := vol.Rename(ctx, 1, from, 1, to); err != nil {
+			if _, err := vol.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: from, NewParentInode: 1, NewName: to}); err != nil {
 				t.Fatalf("Rename failed: %v", err)
 			}
 		}

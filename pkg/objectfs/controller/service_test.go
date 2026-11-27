@@ -2833,7 +2833,7 @@ func TestApplyRecordDirect(t *testing.T) {
 	}
 
 	// Direct Rename
-	_, err = vol.Rename(ctx, dirAttr.GetInode().GetIno(), "foo.txt", dirAttr.GetInode().GetIno(), "bar.txt")
+	_, err = vol.Rename(ctx, &pb.RenameRequest{OldParentInode: dirAttr.GetInode().GetIno(), OldName: "foo.txt", NewParentInode: dirAttr.GetInode().GetIno(), NewName: "bar.txt"})
 	if err != nil {
 		t.Fatalf("Rename failed: %v", err)
 	}
