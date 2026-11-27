@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -38,6 +39,7 @@ import (
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/waldurability"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
@@ -3603,6 +3605,19 @@ func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) {
 	v.recordOverlayTxChangesLocked(tx) // always: the tx is committed
 }
 
+// dirEntryCreatedByRequest reports whether entry was created by the request
+// carrying requestID with the given file type (syscall.S_IFMT bits).
+// A request without a key never matches.
+func dirEntryCreatedByRequest(entry *pb.DirEntry, requestID []byte, fileType uint32) bool {
+	if entry == nil || len(requestID) == 0 {
+		return false
+	}
+	if !bytes.Equal(entry.GetRequestId(), requestID) {
+		return false
+	}
+	return (entry.GetMode() & syscall.S_IFMT) == fileType
+}
+
 func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, mode uint32, uid, gid uint32) (*pb.EntryAttr, error) {
 	if len(name) > MaxNameLength {
 		return nil, fmt.Errorf("directory name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
@@ -3634,11 +3649,16 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
-		_, exists, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
+		requestID := grpcutil.RequestID(ctx)
+		existingEntry, exists, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, nil, err
 		}
 		if exists {
+			if dirEntryCreatedByRequest(existingEntry, requestID, syscall.S_IFDIR) {
+				attr, err := v.toEntryAttrLocked(ctx, tx, existingEntry.GetIno(), name)
+				return attr, v.makeMetadataWaitFn(v.lastCommitSeq), err
+			}
 			return nil, nil, fmt.Errorf("directory %s already exists under inode %d: %w", name, parentInodeID, syscall.EEXIST)
 		}
 
@@ -3688,6 +3708,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			Ino:       childInodeID,
 			IsDir:     true,
 			Mode:      mode,
+			RequestId: requestID,
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
@@ -3758,15 +3779,10 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
-		var existingChildIno uint64
-		var exists bool
-		de, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
+		requestID := grpcutil.RequestID(ctx)
+		existingEntry, exists, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, nil, err
-		}
-		if ok {
-			exists = true
-			existingChildIno = de.GetIno()
 		}
 
 		fileType := mode & syscall.S_IFMT
@@ -3802,7 +3818,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		}
 
 		if exists {
-			childInode, err := v.getOrLoadInodeLocked(ctx, tx, existingChildIno)
+			childInode, err := v.getOrLoadInodeLocked(ctx, tx, existingEntry.GetIno())
 			if err != nil {
 				return nil, nil, err
 			}
@@ -3810,6 +3826,9 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				return nil, nil, fmt.Errorf("cannot overwrite directory with file: %w", syscall.EISDIR)
 			}
 			if fileType != syscall.S_IFREG || (childInode.Row.GetMode()&syscall.S_IFMT) != syscall.S_IFREG {
+				if fileType != syscall.S_IFREG && dirEntryCreatedByRequest(existingEntry, requestID, fileType) {
+					return v.toEntryAttr(childInode.Row, name, childInode.RedirectURL), v.makeMetadataWaitFn(v.lastCommitSeq), nil
+				}
 				return nil, nil, fmt.Errorf("file %q already exists: %w", name, syscall.EEXIST)
 			}
 			if childInode.Data != nil {
@@ -4015,12 +4034,17 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("failed to log child inode creation: %w", err)
 		}
 
+		var entryRequestID []byte
+		if fileType != syscall.S_IFREG {
+			entryRequestID = requestID
+		}
 		dirEntryMsg := &pb.DirEntry{
 			ParentIno: proto.Uint64(parentInodeID),
 			Name:      proto.String(name),
 			Ino:       childInodeID,
 			IsDir:     false,
 			Mode:      mode,
+			RequestId: entryRequestID,
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
@@ -4090,11 +4114,16 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
-		_, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
+		requestID := grpcutil.RequestID(ctx)
+		existingEntry, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, nil, err
 		}
 		if ok {
+			if dirEntryCreatedByRequest(existingEntry, requestID, syscall.S_IFLNK) {
+				attr, err := v.toEntryAttrLocked(ctx, tx, existingEntry.GetIno(), name)
+				return attr, v.makeMetadataWaitFn(v.lastCommitSeq), err
+			}
 			return nil, nil, fmt.Errorf("entry %q already exists: %w", name, syscall.EEXIST)
 		}
 
@@ -4137,6 +4166,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			Ino:       childInodeID,
 			IsDir:     false,
 			Mode:      mode,
+			RequestId: requestID,
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)
@@ -4231,11 +4261,15 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", newParentInodeID, syscall.ENOTDIR)
 		}
 
-		_, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, newParentInodeID, newName)
+		requestID := grpcutil.RequestID(ctx)
+		existingEntry, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, newParentInodeID, newName)
 		if err != nil {
 			return nil, nil, err
 		}
 		if ok {
+			if dirEntryCreatedByRequest(existingEntry, requestID, oldNode.Row.GetMode()&syscall.S_IFMT) && existingEntry.GetIno() == oldNode.Row.GetIno() {
+				return v.toEntryAttr(oldNode.Row, newName, oldNode.RedirectURL), v.makeMetadataWaitFn(v.lastCommitSeq), nil
+			}
 			return nil, nil, fmt.Errorf("entry %q already exists: %w", newName, syscall.EEXIST)
 		}
 
@@ -4263,6 +4297,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			Ino:       oldNode.Row.GetIno(),
 			IsDir:     false,
 			Mode:      oldNode.Row.GetMode(),
+			RequestId: requestID,
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)

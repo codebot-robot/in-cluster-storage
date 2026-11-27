@@ -58,13 +58,13 @@ func (g *watchGateBackend) ListObjects(ctx context.Context, volumeID string, pre
 	return g.ObjectStorageBackend.ListObjects(ctx, volumeID, prefix)
 }
 
-// newWatchTestClient starts an in-memory gRPC server running server over bufconn
+// newTestClient starts an in-memory gRPC server running server over bufconn
 // and returns a client connected to it, cleaned up when t finishes.
-func newWatchTestClient(t *testing.T, server *Server) pb.ObjectFSControllerClient {
+func newTestClient(t *testing.T, server *Server, serverOptions ...grpc.ServerOption) pb.ObjectFSControllerClient {
 	t.Helper()
 
 	listener := bufconn.Listen(1024 * 1024)
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(serverOptions...)
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
 	go func() {
 		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
@@ -151,7 +151,7 @@ func TestWatchVolume_BookmarkWaitsForSubscribeGate(t *testing.T) {
 	}
 
 	server := NewTestServer(t, backend)
-	client := newWatchTestClient(t, server)
+	client := newTestClient(t, server)
 
 	watchCtx, cancelWatch := context.WithTimeout(ctx, 30*time.Second)
 	defer cancelWatch()
@@ -235,7 +235,7 @@ func TestWatchVolume_BookmarkWaitsForSubscribeGate(t *testing.T) {
 func TestWatchVolume_ConsistencyModeMismatch_SurfacesStatusError(t *testing.T) {
 	ctx := t.Context()
 	server := NewTestServer(t, NewMemoryBackend())
-	client := newWatchTestClient(t, server)
+	client := newTestClient(t, server)
 	volumeID := "test-watch-mismatch-vol"
 
 	volume, err := server.getOrCreateVolume(volumeID)
