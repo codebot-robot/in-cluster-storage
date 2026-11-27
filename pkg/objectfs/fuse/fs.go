@@ -1257,6 +1257,7 @@ func (fs *ObjectFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name s
 		VolumeId:    fs.volumeID,
 		ParentInode: header.NodeId,
 		Name:        name,
+		RequestId:   nextRequestID(),
 	})
 	if err != nil {
 		return fs.grpcErrorToStatus(ctx, "Unlink", err)
@@ -1281,6 +1282,7 @@ func (fs *ObjectFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name st
 		VolumeId:    fs.volumeID,
 		ParentInode: header.NodeId,
 		Name:        name,
+		RequestId:   nextRequestID(),
 	})
 	if err != nil {
 		return fs.grpcErrorToStatus(ctx, "Rmdir", err)
