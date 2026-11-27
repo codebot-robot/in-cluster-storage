@@ -324,6 +324,7 @@ type Server struct {
 
 	// pendingListPosition is non-zero when startup skipped the object store listing
 	// because the store was unavailable, recording the highest local position seen at startup.
+	// The stale-disk check compares positions only, not content.
 	// Read and cleared only inside doFlush, which runs one at a time while isFlushing is true.
 	pendingListPosition uint64
 

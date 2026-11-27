@@ -93,16 +93,18 @@ func TestOfflineStartup_ServesAndReconcilesOnFlush(t *testing.T) {
 		t.Fatalf("openSession failed: %v", err)
 	}
 	defer clientSession.close(t)
-	if got := helloAck.GetWitnessAckedStreamSeq(); got != 5 {
-		t.Fatalf("HelloAck witness watermark = %d, want 5", got)
+	if helloAck.GetWitnessAckedStreamSeq() != 5 || helloAck.GetS3AckedStreamSeq() != 0 {
+		t.Fatalf("HelloAck watermarks = (witness=%d, s3=%d), want (5, 0)",
+			helloAck.GetWitnessAckedStreamSeq(), helloAck.GetS3AckedStreamSeq())
 	}
 
 	ack, err := clientSession.appendRecord(6, []byte("record-6"))
 	if err != nil {
 		t.Fatalf("appendRecord 6 failed: %v", err)
 	}
-	if ack.GetWitnessAckedStreamSeq() != 6 || server2.LastPosition() != 6 {
-		t.Fatalf("after append 6: witness=%d position=%d, want 6 and 6", ack.GetWitnessAckedStreamSeq(), server2.LastPosition())
+	if ack.GetWitnessAckedStreamSeq() != 6 || ack.GetS3AckedStreamSeq() != 0 || server2.LastPosition() != 6 {
+		t.Fatalf("after append 6: witness=%d s3=%d position=%d, want 6, 0, and 6",
+			ack.GetWitnessAckedStreamSeq(), ack.GetS3AckedStreamSeq(), server2.LastPosition())
 	}
 	if _, err := server2.Flush(ctx, &pb.FlushRequest{}); !errors.Is(err, objectstore.ErrUnavailable) {
 		t.Fatalf("Flush during outage error = %v, want objectstore.ErrUnavailable", err)
@@ -135,6 +137,37 @@ func TestOfflineStartup_ServesAndReconcilesOnFlush(t *testing.T) {
 	if len(uploadedRecords) != 3 || uploadedRecords[0].Position != 4 || uploadedRecords[2].Position != 6 {
 		t.Fatalf("uploaded records count=%d range=%d..%d, want 3 (4..6)",
 			len(uploadedRecords), uploadedRecords[0].Position, uploadedRecords[len(uploadedRecords)-1].Position)
+	}
+
+	ack7, err := clientSession.appendRecord(7, []byte("record-7"))
+	if err != nil {
+		t.Fatalf("appendRecord 7 failed: %v", err)
+	}
+	if ack7.GetWitnessAckedStreamSeq() != 7 || server2.LastPosition() != 7 {
+		t.Fatalf("after append 7: witness=%d position=%d, want 7 and 7", ack7.GetWitnessAckedStreamSeq(), server2.LastPosition())
+	}
+	if _, err := server2.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("second Flush after reconciliation failed: %v", err)
+	}
+	response7, err := clientSession.stream.Recv()
+	if err != nil || response7.GetAck().GetS3AckedStreamSeq() != 7 {
+		t.Fatalf("permanent watermark Ack after record 7 = (%v, %v), want s3Seq 7", response7, err)
+	}
+
+	wantSegments = append(wantSegments, SegmentsPrefix+"000000000007-000000000007.wal")
+	segments, lastFlushed, err = ListSegmentsFromBackend(ctx, innerBackend)
+	if err != nil {
+		t.Fatalf("ListSegmentsFromBackend after record 7 failed: %v", err)
+	}
+	if !slices.Equal(segments, wantSegments) || lastFlushed != 7 {
+		t.Fatalf("segments after record 7 = %v (lastFlushed=%d), want %v (lastFlushed=7)", segments, lastFlushed, wantSegments)
+	}
+	uploadedRecord7, err := ReadSegmentFromBackend(ctx, innerBackend, wantSegments[2])
+	if err != nil {
+		t.Fatalf("ReadSegmentFromBackend record 7 failed: %v", err)
+	}
+	if len(uploadedRecord7) != 1 || uploadedRecord7[0].Position != 7 || uploadedRecord7[0].StreamSeq != 7 {
+		t.Fatalf("uploaded record 7 = %v, want single record at position 7 seq 7", uploadedRecord7)
 	}
 }
 
