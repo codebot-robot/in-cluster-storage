@@ -178,7 +178,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	}
 
 	// 9. Unlink
-	if _, err := vol.Unlink(ctx, dirAttr.GetInode().GetIno(), "greeting.txt"); err != nil {
+	if _, err := vol.Unlink(ctx, &pb.UnlinkRequest{ParentInode: dirAttr.GetInode().GetIno(), Name: "greeting.txt"}); err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
 	if _, err := vol.Lookup(ctx, dirAttr.GetInode().GetIno(), "greeting.txt"); err == nil {
@@ -195,10 +195,10 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	}
 
 	// 11. Clean up large.bin and Rmdir
-	if _, err := vol.Unlink(ctx, dirAttr.GetInode().GetIno(), "large.bin"); err != nil {
+	if _, err := vol.Unlink(ctx, &pb.UnlinkRequest{ParentInode: dirAttr.GetInode().GetIno(), Name: "large.bin"}); err != nil {
 		t.Fatalf("Unlink large.bin failed: %v", err)
 	}
-	if _, err := vol.Rmdir(ctx, 1, "mydir"); err != nil {
+	if _, err := vol.Rmdir(ctx, &pb.RmdirRequest{ParentInode: 1, Name: "mydir"}); err != nil {
 		t.Fatalf("Rmdir failed: %v", err)
 	}
 }
@@ -467,7 +467,7 @@ func TestSQLiteReadCacheHitRateAndNegativeCaching(t *testing.T) {
 	}
 
 	// 6. Delete file -> updates cache entry to negative
-	_, err = vol.Unlink(ctx, 1, "does_not_exist.txt")
+	_, err = vol.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "does_not_exist.txt"})
 	if err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
@@ -690,7 +690,7 @@ func TestSQLiteReadCacheConcurrentStress(t *testing.T) {
 					renamed := fmt.Sprintf("w_%d_%d_renamed.txt", writerID, i)
 					_, _ = vol.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: name, NewParentInode: 1, NewName: renamed})
 					_, _ = vol.GetAttr(ctx, attr.GetInode().GetIno())
-					_, _ = vol.Unlink(ctx, 1, renamed)
+					_, _ = vol.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: renamed})
 				}
 			}
 		}(w)
@@ -758,7 +758,7 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateFile 3 failed: %v", err)
 	}
-	if _, err := vol.Unlink(ctx, dirAttr.GetInode().GetIno(), "file3.txt"); err != nil {
+	if _, err := vol.Unlink(ctx, &pb.UnlinkRequest{ParentInode: dirAttr.GetInode().GetIno(), Name: "file3.txt"}); err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
 

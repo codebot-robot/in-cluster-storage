@@ -1336,7 +1336,7 @@ func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkR
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	pos, err := vol.Unlink(ctx, req.GetParentInode(), req.GetName())
+	pos, err := vol.Unlink(ctx, req)
 	if err != nil {
 		if rpcErr := checkRPCErr(err); rpcErr != nil {
 			return nil, rpcErr
@@ -1354,7 +1354,7 @@ func (s *Server) Rmdir(ctx context.Context, req *pb.RmdirRequest) (*pb.RmdirResp
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	pos, err := vol.Rmdir(ctx, req.GetParentInode(), req.GetName())
+	pos, err := vol.Rmdir(ctx, req)
 	if err != nil {
 		if rpcErr := checkRPCErr(err); rpcErr != nil {
 			return nil, rpcErr

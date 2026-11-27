@@ -66,7 +66,7 @@ func TestStagedChunks_UnlinkWhileOpenPreservesData(t *testing.T) {
 	inodeID, fileHandle := createFileHandle(t, server, "/open.bin")
 	stageWrite(t, volume, inodeID, payload)
 
-	if _, err := volume.Unlink(ctx, 1, "open.bin"); err != nil {
+	if _, err := volume.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "open.bin"}); err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
 	if err := volume.Fsync(ctx, inodeID); err != nil {
@@ -94,7 +94,7 @@ func TestStagedChunks_UnlinkWithHardLinkPreservesData(t *testing.T) {
 	}
 	stageWrite(t, volume, inodeID, payload)
 
-	if _, err := volume.Unlink(ctx, 1, "link1.bin"); err != nil {
+	if _, err := volume.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "link1.bin"}); err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
 	if err := volume.Fsync(ctx, inodeID); err != nil {
@@ -115,7 +115,7 @@ func TestStagedChunks_UnlinkLastLinkNoOpenHandleDropsData(t *testing.T) {
 		t.Fatal("expected non-zero staged bytes before unlink")
 	}
 
-	if _, err := volume.Unlink(ctx, 1, "last.bin"); err != nil {
+	if _, err := volume.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "last.bin"}); err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
 	if staged := volume.StagedBytes(); staged != 0 {
@@ -132,7 +132,7 @@ func TestStagedChunks_ReleaseDeletedOrphanDropsData(t *testing.T) {
 	inodeID, fileHandle := createFileHandle(t, server, "/orphan.bin")
 	stageWrite(t, volume, inodeID, []byte("orphan-data"))
 
-	if _, err := volume.Unlink(ctx, 1, "orphan.bin"); err != nil {
+	if _, err := volume.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "orphan.bin"}); err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
 	if volume.StagedBytes() == 0 {
@@ -196,7 +196,7 @@ func TestStagedChunks_SyncSkipsInodeDeletedDuringUpload(t *testing.T) {
 		t.Fatal("timed out waiting for pack upload gate")
 	}
 
-	if _, err := volume.Unlink(ctx, 1, "victim.bin"); err != nil {
+	if _, err := volume.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "victim.bin"}); err != nil {
 		t.Fatalf("Unlink victim failed: %v", err)
 	}
 	close(gateRelease)

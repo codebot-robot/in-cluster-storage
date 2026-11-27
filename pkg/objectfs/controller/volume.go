@@ -5718,7 +5718,10 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 	return attr, nil
 }
 
-func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) (uint64, error) {
+func (v *Volume) Unlink(ctx context.Context, request *pb.UnlinkRequest) (uint64, error) {
+	parentInodeID := request.GetParentInode()
+	name := request.GetName()
+
 	if len(name) > MaxNameLength {
 		return 0, fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
 	}
@@ -5859,7 +5862,10 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	return commitSeq, nil
 }
 
-func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (uint64, error) {
+func (v *Volume) Rmdir(ctx context.Context, request *pb.RmdirRequest) (uint64, error) {
+	parentInodeID := request.GetParentInode()
+	name := request.GetName()
+
 	if len(name) > MaxNameLength {
 		return 0, fmt.Errorf("directory name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
 	}
