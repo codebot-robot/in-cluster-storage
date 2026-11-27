@@ -3636,6 +3636,12 @@ func dirEntryCreatedByRequest(entry *pb.DirEntry, requestID []byte, fileType uin
 	return (entry.GetMode() & syscall.S_IFMT) == fileType
 }
 
+// parentRemovedByRequest reports whether parentInode records requestID as its
+// most recent entry removal. A request without a key never matches.
+func parentRemovedByRequest(parentInode *pb.Inode, requestID []byte) bool {
+	return parentInode != nil && len(requestID) > 0 && bytes.Equal(parentInode.GetLastRemovalRequestId(), requestID)
+}
+
 func (v *Volume) Mkdir(ctx context.Context, request *pb.MkdirRequest) (*pb.EntryAttr, error) {
 	parentInodeID := request.GetParentInode()
 	name := request.GetName()
@@ -5721,35 +5727,11 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 func (v *Volume) Unlink(ctx context.Context, request *pb.UnlinkRequest) (uint64, error) {
 	parentInodeID := request.GetParentInode()
 	name := request.GetName()
+	requestID := request.GetRequestId()
 
 	if len(name) > MaxNameLength {
 		return 0, fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
 	}
-
-	v.mu.Lock()
-	parentInodeID = v.normalizeInodeID(parentInodeID)
-
-	var childInodeID uint64
-	de, ok, err := v.getDirEntrySQLiteLocked(ctx, nil, parentInodeID, name)
-	if err != nil {
-		v.mu.Unlock()
-		return 0, err
-	}
-	if !ok {
-		v.mu.Unlock()
-		return 0, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
-	}
-	childInode, err := v.getOrLoadInodeLocked(ctx, nil, de.GetIno())
-	if err != nil {
-		v.mu.Unlock()
-		return 0, err
-	}
-	if childInode.Row.GetIsDir() {
-		v.mu.Unlock()
-		return 0, fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
-	}
-	childInodeID = childInode.Row.GetIno()
-	v.mu.Unlock()
 
 	var deletedInode uint64
 	waitFn, commitSeq, err := func() (func(context.Context) error, uint64, error) {
@@ -5765,17 +5747,32 @@ func (v *Volume) Unlink(ctx context.Context, request *pb.UnlinkRequest) (uint64,
 			return nil, 0, err
 		}
 
-		_, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
+		parentInodeID = v.normalizeInodeID(parentInodeID)
+
+		de, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, 0, err
 		}
 		if !ok {
+			if len(requestID) > 0 {
+				parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
+				if err != nil {
+					return nil, 0, err
+				}
+				if parentRemovedByRequest(parentInode.Row, requestID) {
+					return v.makeMetadataWaitFn(v.lastCommitSeq), v.lastCommitSeq, nil
+				}
+			}
 			return nil, 0, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 		}
 
+		childInodeID := de.GetIno()
 		childInode, err := v.getOrLoadInodeLocked(ctx, tx, childInodeID)
 		if err != nil {
 			return nil, 0, err
+		}
+		if childInode.Row.GetIsDir() {
+			return nil, 0, fmt.Errorf("cannot unlink directory %s: %w", name, syscall.EISDIR)
 		}
 
 		if childInode.Data != nil {
@@ -5802,6 +5799,9 @@ func (v *Volume) Unlink(ctx context.Context, request *pb.UnlinkRequest) (uint64,
 		parentInode.mutate(func(row *pb.Inode) {
 			row.Mtime = timestamppb.New(now)
 			row.Ctime = timestamppb.New(now)
+			if len(requestID) > 0 {
+				row.LastRemovalRequestId = requestID
+			}
 		})
 
 		var commitSeq uint64
@@ -5865,6 +5865,7 @@ func (v *Volume) Unlink(ctx context.Context, request *pb.UnlinkRequest) (uint64,
 func (v *Volume) Rmdir(ctx context.Context, request *pb.RmdirRequest) (uint64, error) {
 	parentInodeID := request.GetParentInode()
 	name := request.GetName()
+	requestID := request.GetRequestId()
 
 	if len(name) > MaxNameLength {
 		return 0, fmt.Errorf("directory name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
@@ -5891,6 +5892,15 @@ func (v *Volume) Rmdir(ctx context.Context, request *pb.RmdirRequest) (uint64, e
 			return nil, 0, err
 		}
 		if !ok {
+			if len(requestID) > 0 {
+				parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
+				if err != nil {
+					return nil, 0, err
+				}
+				if parentRemovedByRequest(parentInode.Row, requestID) {
+					return v.makeMetadataWaitFn(v.lastCommitSeq), v.lastCommitSeq, nil
+				}
+			}
 			return nil, 0, fmt.Errorf("directory %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 		}
 		childInodeID = de.GetIno()
@@ -5926,6 +5936,9 @@ func (v *Volume) Rmdir(ctx context.Context, request *pb.RmdirRequest) (uint64, e
 			}
 			row.Mtime = timestamppb.New(now)
 			row.Ctime = timestamppb.New(now)
+			if len(requestID) > 0 {
+				row.LastRemovalRequestId = requestID
+			}
 		})
 
 		if err := v.deleteInodeRowsLocked(ctx, tx, childInodeID); err != nil {
