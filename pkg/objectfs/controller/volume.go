@@ -3780,6 +3780,7 @@ func (v *Volume) CreateFile(ctx context.Context, request *pb.CreateFileRequest) 
 	uid := request.GetUid()
 	gid := request.GetGid()
 	rdev := request.GetRdev()
+	requestID := request.GetRequestId()
 
 	if len(name) > MaxNameLength {
 		return nil, fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
@@ -3811,15 +3812,9 @@ func (v *Volume) CreateFile(ctx context.Context, request *pb.CreateFileRequest) 
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
-		var existingChildIno uint64
-		var exists bool
-		de, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
+		existingEntry, exists, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, nil, err
-		}
-		if ok {
-			exists = true
-			existingChildIno = de.GetIno()
 		}
 
 		fileType := mode & syscall.S_IFMT
@@ -3855,7 +3850,11 @@ func (v *Volume) CreateFile(ctx context.Context, request *pb.CreateFileRequest) 
 		}
 
 		if exists {
-			childInode, err := v.getOrLoadInodeLocked(ctx, tx, existingChildIno)
+			if fileType != syscall.S_IFREG && dirEntryCreatedByRequest(existingEntry, requestID, fileType) {
+				attr, err := v.toEntryAttrLocked(ctx, tx, existingEntry.GetIno(), name)
+				return attr, v.makeMetadataWaitFn(v.lastCommitSeq), err
+			}
+			childInode, err := v.getOrLoadInodeLocked(ctx, tx, existingEntry.GetIno())
 			if err != nil {
 				return nil, nil, err
 			}
@@ -4074,6 +4073,9 @@ func (v *Volume) CreateFile(ctx context.Context, request *pb.CreateFileRequest) 
 			Ino:       childInodeID,
 			IsDir:     false,
 			Mode:      mode,
+		}
+		if fileType != syscall.S_IFREG {
+			dirEntryMsg.RequestId = requestID
 		}
 		if _, err := tx.Insert(ctx, dirEntryMsg); err != nil {
 			return nil, nil, fmt.Errorf("failed to log directory entry: %w", err)

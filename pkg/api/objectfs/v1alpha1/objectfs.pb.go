@@ -1240,8 +1240,10 @@ type CreateFileRequest struct {
 	Uid            uint32                 `protobuf:"varint,6,opt,name=uid,proto3" json:"uid,omitempty"`
 	Gid            uint32                 `protobuf:"varint,7,opt,name=gid,proto3" json:"gid,omitempty"`
 	Rdev           uint32                 `protobuf:"varint,8,opt,name=rdev,proto3" json:"rdev,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+	RequestId     []byte `protobuf:"bytes,9,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CreateFileRequest) Reset() {
@@ -1328,6 +1330,13 @@ func (x *CreateFileRequest) GetRdev() uint32 {
 		return x.Rdev
 	}
 	return 0
+}
+
+func (x *CreateFileRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type CreateFileResponse struct {
@@ -6423,7 +6432,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\rMkdirResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
-	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xdc\x01\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xfb\x01\n" +
 	"\x11CreateFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
@@ -6432,7 +6441,9 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x0finitial_content\x18\x05 \x01(\fR\x0einitialContent\x12\x10\n" +
 	"\x03uid\x18\x06 \x01(\rR\x03uid\x12\x10\n" +
 	"\x03gid\x18\a \x01(\rR\x03gid\x12\x12\n" +
-	"\x04rdev\x18\b \x01(\rR\x04rdev\"\x95\x01\n" +
+	"\x04rdev\x18\b \x01(\rR\x04rdev\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\t \x01(\fR\trequestId\"\x95\x01\n" +
 	"\x12CreateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12\x0e\n" +
