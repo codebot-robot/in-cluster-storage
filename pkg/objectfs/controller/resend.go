@@ -25,16 +25,20 @@ import (
 	"google.golang.org/grpc"
 )
 
+// writerLockLostResendDelay is the retry delay returned when a request fails due to writer lock loss.
 const writerLockLostResendDelay = 20 * time.Millisecond
 
+// volumeIDRequest is implemented by gRPC requests that carry a volume_id field.
 type volumeIDRequest interface {
 	GetVolumeId() string
 }
 
+// errnoResponse is implemented by gRPC responses that carry a POSIX errno in their error field.
 type errnoResponse interface {
 	GetError() int32
 }
 
+// lookupVolume returns the cached Volume for volumeID without creating or loading one.
 func (s *Server) lookupVolume(volumeID string) *Volume {
 	if volumeID == "" {
 		return nil
@@ -45,6 +49,7 @@ func (s *Server) lookupVolume(volumeID string) *Volume {
 	return volume
 }
 
+// responseFailed reports whether a unary handler failed via a gRPC error or a non-zero response errno.
 func responseFailed(response any, err error) bool {
 	if err != nil {
 		return true

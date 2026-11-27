@@ -36,11 +36,22 @@ import (
 
 type appendNotifyWalServer struct {
 	walpb.WalBufferServer
-	sessionEnded chan struct{}
+	sessionEnded    chan struct{}
+	mu              sync.Mutex
+	blockNextRecord bool
+	recordBlocked   chan struct{}
+}
+
+func (s *appendNotifyWalServer) armNextRecordBlock() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blockNextRecord = true
+	s.recordBlocked = make(chan struct{})
+	return s.recordBlocked
 }
 
 func (s *appendNotifyWalServer) Append(stream walpb.WalBuffer_AppendServer) error {
-	err := s.WalBufferServer.Append(stream)
+	err := s.WalBufferServer.Append(&blockingAppendStream{WalBuffer_AppendServer: stream, server: s})
 	select {
 	case s.sessionEnded <- struct{}{}:
 	default:
@@ -48,7 +59,41 @@ func (s *appendNotifyWalServer) Append(stream walpb.WalBuffer_AppendServer) erro
 	return err
 }
 
-func TestServer_ReloadsVolumeAfterWriterLockLost(t *testing.T) {
+type blockingAppendStream struct {
+	walpb.WalBuffer_AppendServer
+	server *appendNotifyWalServer
+}
+
+func (s *blockingAppendStream) Recv() (*walpb.AppendRequest, error) {
+	request, err := s.WalBuffer_AppendServer.Recv()
+	if err != nil || request.GetRecord() == nil {
+		return request, err
+	}
+	s.server.mu.Lock()
+	shouldBlock := s.server.blockNextRecord
+	blocked := s.server.recordBlocked
+	s.server.blockNextRecord = false
+	s.server.mu.Unlock()
+	if shouldBlock {
+		close(blocked)
+		<-s.Context().Done()
+		return nil, s.Context().Err()
+	}
+	return request, nil
+}
+
+type writerLockFixture struct {
+	t            *testing.T
+	backend      ObjectStorageBackend
+	clock        *buffertest.FakeClock
+	bufferTest   *buffertest.BufferTest
+	walServerA   *appendNotifyWalServer
+	dialOptionsA []grpc.DialOption
+	setCut       func(bool)
+}
+
+func newWriterLockFixture(t *testing.T) *writerLockFixture {
+	t.Helper()
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	clock := buffertest.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
@@ -59,12 +104,13 @@ func TestServer_ReloadsVolumeAfterWriterLockLost(t *testing.T) {
 	)
 
 	sessionEnded := make(chan struct{}, 8)
-	listenerA := bufconn.Listen(4 * 1024 * 1024)
-	grpcServerA := grpc.NewServer()
-	walpb.RegisterWalBufferServer(grpcServerA, &appendNotifyWalServer{
+	walServerA := &appendNotifyWalServer{
 		WalBufferServer: bufferTest.Server,
 		sessionEnded:    sessionEnded,
-	})
+	}
+	listenerA := bufconn.Listen(4 * 1024 * 1024)
+	grpcServerA := grpc.NewServer()
+	walpb.RegisterWalBufferServer(grpcServerA, walServerA)
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
@@ -99,32 +145,103 @@ func TestServer_ReloadsVolumeAfterWriterLockLost(t *testing.T) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	}
 
-	startServer := func(clientID string, dialOptions []grpc.DialOption) *Server {
-		walDirectory := t.TempDir()
-		server := NewServer(backend,
-			WithServerWAL(walDirectory, bufferTest.Target, walclient.Witness),
-			WithServerWALClient(bufferTest.Client),
-			WithServerMetadataDir(t.TempDir()),
-			WithServerWithoutFsync(),
-			WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
-				return walclient.Open(ctx, walDirectory, StreamIDForVolume(volumeID), bufferTest.Target,
-					walclient.WithDialOptions(dialOptions...),
-					walclient.WithoutFsync(),
-					walclient.WithClientID(clientID),
-				)
-			}),
-		)
-		if err := server.Start(ctx); err != nil {
-			t.Fatalf("server.Start (%s) failed: %v", clientID, err)
-		}
-		t.Cleanup(func() {
-			if err := server.Close(); err != nil {
-				t.Errorf("server.Close (%s) failed: %v", clientID, err)
+	return &writerLockFixture{
+		t: t, backend: backend, clock: clock, bufferTest: bufferTest, walServerA: walServerA, dialOptionsA: dialOptionsA,
+		setCut: func(cut bool) {
+			connectionMu.Lock()
+			connectionCut = cut
+			if cut {
+				for _, connection := range connectionsA {
+					if err := connection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+						t.Errorf("connection.Close failed: %v", err)
+					}
+				}
+				connectionsA = nil
 			}
-		})
-		return server
+			connectionMu.Unlock()
+		},
 	}
+}
+
+func (f *writerLockFixture) startServer(clientID string, dialOptions []grpc.DialOption, wrapStream ...func(walclient.Stream) walclient.Stream) *Server {
+	f.t.Helper()
+	ctx := f.t.Context()
+	walDirectory := f.t.TempDir()
+	server := NewServer(f.backend,
+		WithServerWAL(walDirectory, f.bufferTest.Target, walclient.Witness),
+		WithServerWALClient(f.bufferTest.Client),
+		WithServerMetadataDir(f.t.TempDir()),
+		WithServerWithoutFsync(),
+		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
+			stream, err := walclient.Open(ctx, walDirectory, StreamIDForVolume(volumeID), f.bufferTest.Target,
+				walclient.WithDialOptions(dialOptions...),
+				walclient.WithoutFsync(),
+				walclient.WithClientID(clientID),
+			)
+			if err != nil {
+				return nil, err
+			}
+			for _, wrap := range wrapStream {
+				stream = wrap(stream)
+			}
+			return stream, nil
+		}),
+	)
+	if err := server.Start(ctx); err != nil {
+		f.t.Fatalf("server.Start (%s) failed: %v", clientID, err)
+	}
+	f.t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			f.t.Errorf("server.Close (%s) failed: %v", clientID, err)
+		}
+	})
+	return server
+}
+
+func (f *writerLockFixture) shutdownServer(server *Server) {
+	f.t.Helper()
+	shutdownCtx, cancel := context.WithTimeout(f.t.Context(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx, 5*time.Second, time.Second); err != nil {
+		f.t.Fatalf("server.Shutdown failed: %v", err)
+	}
+}
+
+// handOffLockToB cuts controller A synchronously, advances past the grace
+// period so controller B takes over and writes path, shuts B down cleanly, and
+// heals A so its stream reconnects and observes writer lock loss.
+func (f *writerLockFixture) handOffLockToB(volumeID, path string, data []byte) {
+	f.t.Helper()
+	f.setCut(true)
+	select {
+	case <-f.walServerA.sessionEnded:
+	case <-time.After(5 * time.Second):
+		f.t.Fatal("timed out waiting for controller A's Append session to end")
+	}
+	f.clock.Advance(16 * time.Second)
+	serverB := f.startServer("controller-B", f.bufferTest.DialOpts)
+	response, err := testCreateFile(f.t.Context(), serverB, volumeID, path, 0644, data, 0, 0)
+	if err != nil || response.GetError() != 0 {
+		f.t.Fatalf("CreateFile(%s) on B failed: err=%v errno=%v", path, err, syscall.Errno(response.GetError()))
+	}
+	f.shutdownServer(serverB)
+	f.setCut(false)
+}
+
+func (f *writerLockFixture) waitWriterLockLost(volume *Volume) {
+	f.t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !volume.writerLockLost(); {
+		if time.Now().After(deadline) {
+			f.t.Fatalf("timed out waiting for A's stream to report writer lock lost; degraded=%v", volume.Degraded())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestServer_ReloadsVolumeAfterWriterLockLost(t *testing.T) {
+	ctx := t.Context()
 	const volumeID = "test-writer-lock-reload-volume"
+	fixture := newWriterLockFixture(t)
 	mustCreate := func(server *Server, name string, data []byte) {
 		t.Helper()
 		response, err := testCreateFile(ctx, server, volumeID, name, 0644, data, 0, 0)
@@ -139,64 +256,23 @@ func TestServer_ReloadsVolumeAfterWriterLockLost(t *testing.T) {
 			t.Fatalf("ReadFile(%s) failed: err=%v errno=%v data=%q", name, err, syscall.Errno(response.GetError()), string(response.GetData()))
 		}
 	}
-	mustShutdown := func(server *Server) {
-		t.Helper()
-		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx, 5*time.Second, time.Second); err != nil {
-			t.Fatalf("server.Shutdown failed: %v", err)
-		}
-	}
 
-	serverA := startServer("controller-A", dialOptionsA)
+	serverA := fixture.startServer("controller-A", fixture.dialOptionsA)
 	mustCreate(serverA, "/from-a-1.txt", []byte("written by A before lock loss"))
+	volumeA := serverA.lookupVolume(volumeID)
 
-	serverA.mu.RLock()
-	volumeA := serverA.volumes[volumeID]
-	serverA.mu.RUnlock()
-
-	// Cut A's connection synchronously so the server records session end before the clock advances.
-	connectionMu.Lock()
-	connectionCut = true
-	for _, connection := range connectionsA {
-		if err := connection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			t.Errorf("connection.Close failed: %v", err)
-		}
-	}
-	connectionsA = nil
-	connectionMu.Unlock()
-	select {
-	case <-sessionEnded:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for controller A's Append session to end")
-	}
-
-	// Advance past the 15s grace period, let B take over, write a second file, and shut down cleanly.
-	clock.Advance(16 * time.Second)
-	serverB := startServer("controller-B", bufferTest.DialOpts)
 	dataB := []byte("written by B after takeover")
-	mustCreate(serverB, "/from-b.txt", dataB)
-	mustShutdown(serverB)
-
-	// Heal A's connection and wait for A's existing stream to report writer lock loss.
-	connectionMu.Lock()
-	connectionCut = false
-	connectionMu.Unlock()
-	for deadline := time.Now().Add(5 * time.Second); !errors.Is(volumeA.Degraded(), walclient.ErrWriterLockLost); {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for A's stream to report writer lock lost; degraded=%v", volumeA.Degraded())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	fixture.handOffLockToB(volumeID, "/from-b.txt", dataB)
+	fixture.waitWriterLockLost(volumeA)
 
 	// A reloads on the next request: reading B's file and creating a new file both succeed.
 	dataA2 := []byte("written by A after reload")
 	mustRead(serverA, "/from-b.txt", dataB)
 	mustCreate(serverA, "/from-a-2.txt", dataA2)
-	mustShutdown(serverA)
+	fixture.shutdownServer(serverA)
 
 	// A third server opened afterwards sees both B's file and A's later file.
-	serverC := startServer("controller-C", bufferTest.DialOpts)
+	serverC := fixture.startServer("controller-C", fixture.bufferTest.DialOpts)
 	mustRead(serverC, "/from-b.txt", dataB)
 	mustRead(serverC, "/from-a-2.txt", dataA2)
 }

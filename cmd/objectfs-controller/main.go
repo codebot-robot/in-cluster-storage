@@ -411,7 +411,7 @@ func run(options Options) error {
 		}
 
 		csiServer = grpc.NewServer(
-			grpc.ChainUnaryInterceptor(grpcutil.UnaryServerInterceptor(), server.ResendUnaryServerInterceptor()),
+			grpc.UnaryInterceptor(grpcutil.UnaryServerInterceptor()),
 			grpc.StreamInterceptor(grpcutil.StreamServerInterceptor()),
 		)
 		csi.RegisterIdentityServer(csiServer, csiController)
