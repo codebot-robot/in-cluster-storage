@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -262,5 +263,120 @@ func TestWatchVolume_ConsistencyModeMismatch_SurfacesStatusError(t *testing.T) {
 	}
 	if status.Code(receiveErr) != codes.InvalidArgument {
 		t.Fatalf("stream.Recv() status code = %v, want %v; err: %v", status.Code(receiveErr), codes.InvalidArgument, receiveErr)
+	}
+}
+
+// TestWatchVolume_GracefulStopReachesShutdown verifies that BeginShutdown terminates
+// open WatchVolume streams with Unavailable so GracefulStop returns promptly and
+// Server.Shutdown drains staged volume data, and refuses watches arriving after shutdown begins.
+func TestWatchVolume_GracefulStopReachesShutdown(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewTestServer(t, backend)
+	volumeID := "test-watch-shutdown-vol"
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	serveErrors := make(chan error, 1)
+	go func() {
+		serveErrors <- grpcServer.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("listener.Close error: %v", err)
+		}
+	})
+
+	connection, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := connection.Close(); err != nil {
+			t.Errorf("connection.Close error: %v", err)
+		}
+	})
+	client := pb.NewObjectFSControllerClient(connection)
+
+	createResponse, err := client.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "staged.txt",
+		Mode:        0644,
+	})
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v (code %d)", err, createResponse.GetError())
+	}
+	stagedData := []byte("staged data drained after watch stream closes")
+	writeResponse, err := client.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     createResponse.GetAttr().GetInode().GetIno(),
+		Offset:    0,
+		Data:      stagedData,
+		WriteMode: pb.WriteMode_FSYNC,
+	})
+	if err != nil || writeResponse.GetError() != 0 {
+		t.Fatalf("WriteFile failed: %v (code %d)", err, writeResponse.GetError())
+	}
+
+	watchStream, err := client.WatchVolume(ctx, &pb.WatchVolumeRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+	})
+	if err != nil {
+		t.Fatalf("WatchVolume failed: %v", err)
+	}
+	bookmark, err := watchStream.Recv()
+	if err != nil || bookmark.GetEventType() != pb.WatchEventType_EVENT_BOOKMARK {
+		t.Fatalf("initial WatchVolume.Recv() = (%v, %v), want EVENT_BOOKMARK", bookmark, err)
+	}
+
+	watchEnded := make(chan error, 1)
+	go func() {
+		_, receiveError := watchStream.Recv()
+		watchEnded <- receiveError
+	}()
+
+	// Begin shutdown the same way the SIGTERM handler in cmd/objectfs-controller does.
+	server.BeginShutdown()
+	stopped := make(chan struct{})
+	go func() {
+		grpcServer.GracefulStop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("GracefulStop did not return within 1s while WatchVolume stream was open")
+	}
+	if err := <-serveErrors; err != nil {
+		t.Fatalf("grpcServer.Serve error: %v", err)
+	}
+	if receiveError := <-watchEnded; status.Code(receiveError) != codes.Unavailable {
+		t.Fatalf("WatchVolume ended with status %v, want Unavailable (err: %v)", status.Code(receiveError), receiveError)
+	}
+
+	// A WatchVolume arriving after shutdown began is refused the same way.
+	if lateError := server.WatchVolume(&pb.WatchVolumeRequest{VolumeId: volumeID, NodeId: "node-late"}, &mockWatchStream{ctx: ctx}); status.Code(lateError) != codes.Unavailable {
+		t.Fatalf("post-shutdown WatchVolume status = %v, want Unavailable (err: %v)", status.Code(lateError), lateError)
+	}
+
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatalf("server.Shutdown failed: %v", err)
+	}
+
+	recovered := NewTestServer(t, backend)
+	readResponse, err := testReadFile(ctx, recovered, volumeID, "/staged.txt", 0, int64(len(stagedData)))
+	if err != nil || readResponse.GetError() != 0 {
+		t.Fatalf("ReadFile from fresh server failed: %v (code %d)", err, readResponse.GetError())
+	}
+	if !bytes.Equal(readResponse.GetData(), stagedData) {
+		t.Fatalf("ReadFile data = %q, want %q", readResponse.GetData(), stagedData)
 	}
 }
