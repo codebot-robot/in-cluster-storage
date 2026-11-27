@@ -3605,17 +3605,17 @@ func (v *Volume) applyTxChangesLocked(ctx context.Context, tx *sds.Tx) {
 	v.recordOverlayTxChangesLocked(tx) // always: the tx is committed
 }
 
+// dirEntryMatchesRequest reports whether entry carries the non-empty
+// idempotency key requestID. A request without a key never matches.
+func dirEntryMatchesRequest(entry *pb.DirEntry, requestID []byte) bool {
+	return entry != nil && len(requestID) > 0 && bytes.Equal(entry.GetRequestId(), requestID)
+}
+
 // dirEntryCreatedByRequest reports whether entry was created by the request
 // carrying requestID with the given file type (syscall.S_IFMT bits).
 // A request without a key never matches.
 func dirEntryCreatedByRequest(entry *pb.DirEntry, requestID []byte, fileType uint32) bool {
-	if entry == nil || len(requestID) == 0 {
-		return false
-	}
-	if !bytes.Equal(entry.GetRequestId(), requestID) {
-		return false
-	}
-	return (entry.GetMode() & syscall.S_IFMT) == fileType
+	return dirEntryMatchesRequest(entry, requestID) && (entry.GetMode()&syscall.S_IFMT) == fileType
 }
 
 func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, mode uint32, uid, gid uint32) (*pb.EntryAttr, error) {
@@ -5940,11 +5940,22 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		var targetExists bool
 		var targetInodeID uint64
 
+		requestID := grpcutil.RequestID(ctx)
 		oldDe, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, oldParentInodeID, oldName)
 		if err != nil {
 			return nil, nil, err
 		}
 		if !ok {
+			if len(requestID) > 0 {
+				destinationEntry, destinationExists, err := v.getDirEntrySQLiteLocked(ctx, tx, newParentInodeID, newName)
+				if err != nil {
+					return nil, nil, err
+				}
+				if destinationExists && dirEntryMatchesRequest(destinationEntry, requestID) {
+					attr, err := v.toEntryAttrLocked(ctx, tx, destinationEntry.GetIno(), newName)
+					return attr, v.makeMetadataWaitFn(v.lastCommitSeq), err
+				}
+			}
 			return nil, nil, fmt.Errorf("source %s not found in parent %d: %w", oldName, oldParentInodeID, syscall.ENOENT)
 		}
 
@@ -6151,6 +6162,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			Ino:       childInode.Row.GetIno(),
 			IsDir:     childInode.Row.GetIsDir(),
 			Mode:      childInode.Row.GetMode(),
+			RequestId: requestID,
 		}); err != nil {
 			return nil, nil, fmt.Errorf("failed to log new dir entry insertion: %w", err)
 		}
