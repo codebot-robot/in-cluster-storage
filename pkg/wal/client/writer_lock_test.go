@@ -19,7 +19,10 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +31,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -38,7 +42,7 @@ import (
 )
 
 type appendFuncServer struct {
-	pb.UnimplementedWalBufferServer
+	pb.WalBufferServer
 	appendFunc func(pb.WalBuffer_AppendServer) error
 }
 
@@ -91,11 +95,11 @@ func (r *recordingBuffer) allIDs() []string {
 	return append([]string(nil), r.recordedIDs...)
 }
 
-func serveAppendFunc(t *testing.T, appendFunc func(pb.WalBuffer_AppendServer) error) (*bufconn.Listener, []grpc.DialOption) {
+func serveWalBuffer(t *testing.T, base pb.WalBufferServer, appendFunc func(pb.WalBuffer_AppendServer) error) (*bufconn.Listener, []grpc.DialOption) {
 	t.Helper()
 	listener := bufconn.Listen(4 * 1024 * 1024)
 	grpcServer := grpc.NewServer()
-	pb.RegisterWalBufferServer(grpcServer, &appendFuncServer{appendFunc: appendFunc})
+	pb.RegisterWalBufferServer(grpcServer, &appendFuncServer{WalBufferServer: base, appendFunc: appendFunc})
 	go func() { _ = grpcServer.Serve(listener) }()
 	t.Cleanup(func() {
 		grpcServer.Stop()
@@ -108,6 +112,11 @@ func serveAppendFunc(t *testing.T, appendFunc func(pb.WalBuffer_AppendServer) er
 	return listener, dialOptions
 }
 
+func serveAppendFunc(t *testing.T, appendFunc func(pb.WalBuffer_AppendServer) error) (*bufconn.Listener, []grpc.DialOption) {
+	t.Helper()
+	return serveWalBuffer(t, pb.UnimplementedWalBufferServer{}, appendFunc)
+}
+
 func startRecordingBuffer(t *testing.T) *recordingBuffer {
 	t.Helper()
 	clock := buffertest.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
@@ -116,7 +125,7 @@ func startRecordingBuffer(t *testing.T) *recordingBuffer {
 		clock:        clock,
 		sessionEnded: make(chan struct{}, 8),
 	}
-	recorder.listener, recorder.dialOptions = serveAppendFunc(t, func(stream pb.WalBuffer_AppendServer) error {
+	recorder.listener, recorder.dialOptions = serveWalBuffer(t, bufferTest.Server, func(stream pb.WalBuffer_AppendServer) error {
 		err := bufferTest.Server.Append(&helloRecordingStream{WalBuffer_AppendServer: stream, recorder: recorder})
 		select {
 		case recorder.sessionEnded <- struct{}{}:
@@ -335,5 +344,248 @@ func TestClose_StopsReconnectBackoff(t *testing.T) {
 	}
 	if got := attempts.Load(); got != 4 {
 		t.Fatalf("expected no reconnect attempt after Close (want 4), got %d", got)
+	}
+}
+
+type helloAckCountingStream struct {
+	pb.WalBuffer_AppendServer
+	nonResumedCount *atomic.Int32
+}
+
+func (s *helloAckCountingStream) Send(response *pb.AppendResponse) error {
+	if helloAck := response.GetHelloAck(); helloAck != nil && !helloAck.GetResumed() {
+		s.nonResumedCount.Add(1)
+	}
+	return s.WalBuffer_AppendServer.Send(response)
+}
+
+func waitForPendingWaiter(t *testing.T, implementation *streamImpl) {
+	t.Helper()
+	for start := time.Now(); ; {
+		implementation.mu.RLock()
+		waiting := len(implementation.waiters) > 0
+		implementation.mu.RUnlock()
+		if waiting {
+			return
+		}
+		if time.Since(start) > 2*time.Second {
+			t.Fatal("timed out waiting for pending Wait to register")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func testWriterLockLost(t *testing.T, recordsByClientB int) {
+	t.Helper()
+	recorder := startRecordingBuffer(t)
+
+	var mu sync.Mutex
+	var connectionCut bool
+	var connectionsA []net.Conn
+	dialOptionsA := []grpc.DialOption{
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if connectionCut {
+				return nil, errors.New("connection cut")
+			}
+			connection, err := recorder.listener.Dial()
+			if err == nil {
+				connectionsA = append(connectionsA, connection)
+			}
+			return connection, err
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	}
+
+	streamID := uuid.New()
+	streamA := openTestStream(t, streamID, dialOptionsA, WithClientID("client-A"))
+	implementationA := streamA.(*streamImpl)
+
+	// Cut client A's connection synchronously before advancing the clock, then let A
+	// append record 1 locally so A has local head 1 and a pending Wait.
+	mu.Lock()
+	connectionCut = true
+	for _, connection := range connectionsA {
+		_ = connection.Close()
+	}
+	mu.Unlock()
+	<-recorder.sessionEnded
+
+	sequenceA1, err := streamA.Append(t.Context(), []byte("from-client-A-1"))
+	if err != nil {
+		t.Fatalf("client A Append failed: %v", err)
+	}
+	waitErrors := make(chan error, 1)
+	go func() {
+		waitErrors <- streamA.Wait(t.Context(), sequenceA1, Witness, false)
+	}()
+	waitForPendingWaiter(t, implementationA)
+
+	// After the 15s grace period, client B is granted the lock, writes recordsByClientB
+	// acknowledged records, and releases the lock cleanly on Close.
+	recorder.clock.Advance(15 * time.Second)
+	streamB := openTestStream(t, streamID, recorder.dialOptions, WithClientID("client-B"))
+	for i := 1; i <= recordsByClientB; i++ {
+		appendAndWaitWitness(t, streamB, fmt.Sprintf("from-client-B-%d", i))
+	}
+	if err := streamB.Close(); err != nil {
+		t.Fatalf("client B Close failed: %v", err)
+	}
+
+	// Let client A reconnect: it detects writer lock loss, returns the grant, and stops.
+	mu.Lock()
+	connectionCut = false
+	mu.Unlock()
+
+	select {
+	case err := <-waitErrors:
+		if !errors.Is(err, ErrWriterLockLost) {
+			t.Fatalf("expected pending Wait to fail with ErrWriterLockLost, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for client A pending Wait to fail")
+	}
+
+	if degraded := streamA.Degraded(); !errors.Is(degraded, ErrWriterLockLost) {
+		t.Fatalf("expected Degraded() to report ErrWriterLockLost, got: %v", degraded)
+	}
+	if _, err := streamA.Append(t.Context(), []byte("after-loss")); !errors.Is(err, ErrWriterLockLost) {
+		t.Fatalf("expected Append after loss to fail with ErrWriterLockLost, got: %v", err)
+	}
+	if err := streamA.Flush(t.Context()); !errors.Is(err, ErrWriterLockLost) {
+		t.Fatalf("expected Flush after loss to fail with ErrWriterLockLost, got: %v", err)
+	}
+
+	select {
+	case <-implementationA.replicationDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected client A replication loop to return after writer lock loss")
+	}
+	if got := recorder.helloCount("client-A"); got != 2 {
+		t.Fatalf("expected client A to stop after detecting loss (want 2 Hellos), got %d", got)
+	}
+
+	// Client A half-closed its reconnect session, so client C is granted without advancing the clock.
+	streamC := openTestStream(t, streamID, recorder.dialOptions, WithClientID("client-C"))
+	appendAndWaitWitness(t, streamC, "from-client-C")
+}
+
+func TestWriterLock_LostEqualHeads(t *testing.T) {
+	testWriterLockLost(t, 1)
+}
+
+func TestWriterLock_LostServerHeadBeyond(t *testing.T) {
+	testWriterLockLost(t, 2)
+}
+
+func TestWriterLock_NotLostOnServerRestart(t *testing.T) {
+	backend := inmemorystorage.New()
+	dataDirectory := t.TempDir()
+	clock := buffertest.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	var mu sync.Mutex
+	var activeListener *bufconn.Listener
+	dialOptions := []grpc.DialOption{
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			mu.Lock()
+			listener := activeListener
+			mu.Unlock()
+			if listener == nil {
+				return nil, errors.New("server stopped")
+			}
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	}
+
+	var nonResumedHellos atomic.Int32
+	startServer := func() func() {
+		bufferTest, stopBuffer := buffertest.Start(t.Context(), t,
+			buffertest.WithBackend(backend),
+			buffertest.WithDataDir(dataDirectory),
+			buffertest.WithWriterLockGrace(15*time.Second),
+			buffertest.WithClock(clock),
+		)
+		listener := bufconn.Listen(4 * 1024 * 1024)
+		grpcServer := grpc.NewServer()
+		pb.RegisterWalBufferServer(grpcServer, &appendFuncServer{
+			WalBufferServer: bufferTest.Server,
+			appendFunc: func(stream pb.WalBuffer_AppendServer) error {
+				return bufferTest.Server.Append(&helloAckCountingStream{
+					WalBuffer_AppendServer: stream,
+					nonResumedCount:        &nonResumedHellos,
+				})
+			},
+		})
+		go func() { _ = grpcServer.Serve(listener) }()
+		mu.Lock()
+		activeListener = listener
+		mu.Unlock()
+		var stopOnce sync.Once
+		stop := func() {
+			stopOnce.Do(func() {
+				mu.Lock()
+				if activeListener == listener {
+					activeListener = nil
+				}
+				mu.Unlock()
+				grpcServer.Stop()
+				_ = listener.Close()
+				stopBuffer()
+			})
+		}
+		t.Cleanup(stop)
+		return stop
+	}
+
+	stop1 := startServer()
+	streamID := uuid.New()
+	streamA := openTestStream(t, streamID, dialOptions, WithClientID("client-A"))
+	implementationA := streamA.(*streamImpl)
+	appendAndWaitWitness(t, streamA, "from-client-A-1")
+
+	// Restart the stream server on the same data directory while client A is connected.
+	stop1()
+	sequence2, err := streamA.Append(t.Context(), []byte("from-client-A-2"))
+	if err != nil {
+		t.Fatalf("client A Append while server stopped failed: %v", err)
+	}
+	waitErrors := make(chan error, 1)
+	go func() {
+		waitErrors <- streamA.Wait(t.Context(), sequence2, Witness, false)
+	}()
+	waitForPendingWaiter(t, implementationA)
+
+	stop2 := startServer()
+	select {
+	case err := <-waitErrors:
+		if err != nil {
+			t.Fatalf("expected pending Wait to complete after server restart, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for client A pending Wait after server restart")
+	}
+	if degraded := streamA.Degraded(); degraded != nil {
+		t.Fatalf("expected stream A not degraded after server restart, got: %v", degraded)
+	}
+
+	// Also verify a restart where the server forgets the lock holder (Resumed=false)
+	// and nobody else wrote: equal heads with matching record at head is not a lock loss.
+	stop2()
+	if err := os.RemoveAll(filepath.Join(dataDirectory, "writer-locks")); err != nil {
+		t.Fatalf("RemoveAll writer-locks failed: %v", err)
+	}
+	startServer()
+
+	for start := time.Now(); nonResumedHellos.Load() < 2; {
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("timed out waiting for non-resumed HelloAck after restart")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	appendAndWaitWitness(t, streamA, "from-client-A-3")
+	if degraded := streamA.Degraded(); degraded != nil {
+		t.Fatalf("expected stream A not degraded after non-resumed restart, got: %v", degraded)
 	}
 }

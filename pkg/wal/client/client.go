@@ -75,6 +75,10 @@ var ErrRecordDiscarded = errors.New("WAL record discarded due to history diverge
 // ErrClosed is returned when an operation is attempted on a closed stream or when the stream is closed while waiting.
 var ErrClosed = errors.New("stream closed")
 
+// ErrWriterLockLost is returned when a stream handle that previously held the writer
+// lock reconnects and finds that another client wrote to the stream in between.
+var ErrWriterLockLost = errors.New("writer lock lost")
+
 // processClientID is generated once per process and sent in Hello.client_id
 // so the WAL buffer can enforce per-process stream writer lock ownership.
 var processClientID = uuid.New().String()
@@ -83,8 +87,9 @@ var processClientID = uuid.New().String()
 // half-close and end cleanly with the WAL buffer before cancelling it.
 const releaseTimeout = 2 * time.Second
 
-// DegradedError indicates that the WAL stream encountered an unrecoverable local store failure
-// (such as segment truncation error) and cannot safely accept or wait for further writes.
+// DegradedError indicates that the WAL stream encountered an unrecoverable failure
+// (such as a segment truncation error or writer lock loss) and cannot safely accept
+// or wait for further writes.
 type DegradedError struct {
 	Cause error
 	At    time.Time
@@ -259,6 +264,11 @@ type streamImpl struct {
 	flushRequestedWhileInFlight bool
 	degradedTruncateSeq         uint64
 	reconciling                 bool
+	// lockGranted reports whether this handle has completed an initial HelloAck grant. Guarded by mu.
+	lockGranted bool
+	// unverifiedGrant records that a non-resumed reconnect grant has not yet finished
+	// checking for writes by another client (for example if Tail failed transiently). Guarded by mu.
+	unverifiedGrant bool
 	// lastSessionErr records the most recent error from a failed replication session. Guarded by mu.
 	lastSessionErr error
 
@@ -837,6 +847,13 @@ func (s *streamImpl) Close() error {
 }
 
 func (s *streamImpl) retryDegradedTruncate(ctx context.Context) bool {
+	s.mu.RLock()
+	permanent := errors.Is(s.degradedErr, ErrWriterLockLost)
+	s.mu.RUnlock()
+	if permanent {
+		return false
+	}
+
 	backoff := 1 * time.Second
 	if s.opts.degradedRetryInitialBackoff > 0 {
 		backoff = s.opts.degradedRetryInitialBackoff
@@ -1018,6 +1035,12 @@ func (s *streamImpl) runStreamSession() error {
 	s.helloAckReceived.Store(true)
 
 	if err := s.handleHelloAck(ctx, helloAck); err != nil {
+		if errors.Is(err, ErrWriterLockLost) {
+			s.releaseAppendStream(ctx, cancel, stream)
+			s.mu.Lock()
+			err = s.setDegradedLocked(ctx, ErrWriterLockLost, 0)
+			s.mu.Unlock()
+		}
 		s.initialHelloAckOnce.Do(func() {
 			s.initialHelloAckErr = err
 			close(s.initialHelloAckDone)
@@ -1159,19 +1182,58 @@ func (s *streamImpl) runStreamSession() error {
 	}
 }
 
+func (s *streamImpl) releaseAppendStream(ctx context.Context, cancel context.CancelFunc, stream pb.WalBuffer_AppendClient) {
+	if err := stream.CloseSend(); err != nil {
+		scoped.Log(ctx).Info("failed to half-close Append stream after writer lock loss", "err", err)
+		return
+	}
+	receiveDone := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := stream.Recv(); err != nil {
+				receiveDone <- err
+				return
+			}
+		}
+	}()
+	timer := time.NewTimer(s.releaseTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-receiveDone:
+		if !errors.Is(err, io.EOF) {
+			scoped.Log(ctx).Info("Append stream ended with error after writer lock loss", "err", err)
+		}
+	case <-timer.C:
+		scoped.Log(ctx).Info("timed out waiting for WAL buffer to release writer lock after lock loss", "timeout", s.releaseTimeout)
+		cancel()
+		<-receiveDone
+	case <-ctx.Done():
+		<-receiveDone
+	}
+}
+
 func (s *streamImpl) handleHelloAck(ctx context.Context, helloAck *pb.HelloAck) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	mayHaveLostLock := s.unverifiedGrant || (s.lockGranted && !helloAck.Resumed)
+	if mayHaveLostLock {
+		s.unverifiedGrant = true
+	}
+
 	witnessHead := helloAck.WitnessAckedStreamSeq
 	scoped.Log(ctx).Info("WAL client stream HelloAck received",
-		"witnessWatermark", witnessHead, "s3Watermark", helloAck.S3AckedStreamSeq, "localHead", s.localSeq)
+		"witnessWatermark", witnessHead, "s3Watermark", helloAck.S3AckedStreamSeq, "localHead", s.localSeq, "resumed", helloAck.Resumed)
 	if witnessHead > s.localSeq {
+		if mayHaveLostLock {
+			s.reconciling = true
+			return ErrWriterLockLost
+		}
 		scoped.Log(ctx).Info("buffer witness watermark is ahead of local stream head; continuing sequence numbering from buffer head",
 			"witnessWatermark", witnessHead, "localHead", s.localSeq)
 		s.localSeq = witnessHead
-	} else if witnessHead > 0 && s.localSeq > witnessHead {
-		// Local history has records above the buffer's witness watermark.
+	} else if witnessHead > 0 && (s.localSeq > witnessHead || (mayHaveLostLock && s.localSeq == witnessHead)) {
+		// Local history has records at or above the buffer's witness watermark.
 		// Check if local record at witnessHead matches the authoritative buffer record.
 		s.retainedMu.RLock()
 		var localRecAtHead *wal.ClientRecord
@@ -1206,8 +1268,12 @@ func (s *streamImpl) handleHelloAck(ctx context.Context, helloAck *pb.HelloAck) 
 				return fmt.Errorf("record at witness head %d not found in buffer stream tail", witnessHead)
 			}
 
-			// Only discard if buffer returns a record at witnessHead and its content differs
+			// Only diverge if buffer returns a record at witnessHead and its content differs
 			if !bytes.Equal(localRecAtHead.Payload, bufferPayload) {
+				if mayHaveLostLock {
+					s.reconciling = true
+					return ErrWriterLockLost
+				}
 				// 1. Order on-disk truncate before the memory mutation so that a failure
 				// leaves memory and disk consistent, allowing divergence to be re-detected on retry.
 				if s.store != nil {
@@ -1272,6 +1338,8 @@ func (s *streamImpl) handleHelloAck(ctx context.Context, helloAck *pb.HelloAck) 
 		s.cleanupS3AckedLocked(ctx, helloAck.S3AckedStreamSeq)
 	}
 
+	s.lockGranted = true
+	s.unverifiedGrant = false
 	s.notifyWaitersLocked()
 	s.reconciling = false
 	if s.cond != nil {
