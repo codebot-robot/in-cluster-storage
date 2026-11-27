@@ -1392,18 +1392,28 @@ func (v *Volume) appendSyncRecordsLocked(
 	tx := v.beginTxLocked("syncVolume")
 	var modifiedAttrs []*pb.EntryAttr
 
-	// Read phase: load all inodes before buffering any mutations in tx
+	// Read phase: load all inodes before buffering any mutations in tx.
+	// Skip inodes deleted (ENOENT) before the sync committed.
 	nodes := make(map[uint64]*CachedInode, len(snapshotChunks))
 	for ino := range snapshotChunks {
 		node, err := v.getOrLoadInodeLocked(appendCtx, tx, ino)
+		if errors.Is(err, syscall.ENOENT) {
+			continue
+		}
 		if err != nil {
 			return 0, 0, nil, err
 		}
 		nodes[ino] = node
 	}
+	if len(nodes) == 0 {
+		return v.lastCommitSeq, 0, nil, nil
+	}
 
 	for ino, chunks := range snapshotChunks {
 		node := nodes[ino]
+		if node == nil {
+			continue
+		}
 		cs := int64(v.chunkSize)
 		if cs == 0 {
 			cs = 64 * 1024
@@ -1513,6 +1523,9 @@ func (v *Volume) appendSyncRecordsLocked(
 
 	for ino := range snapshotChunks {
 		node := nodes[ino]
+		if node == nil {
+			continue
+		}
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		modifiedAttrs = append(modifiedAttrs, attr)
 	}
@@ -5670,10 +5683,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	childInodeID = childInode.Row.GetIno()
 	v.mu.Unlock()
 
-	v.stagingMu.Lock()
-	v.dropStagedChunksLocked(childInodeID)
-	v.stagingMu.Unlock()
-
+	var deletedInode uint64
 	waitFn, commitSeq, err := func() (func(context.Context) error, uint64, error) {
 		if err := v.rejectMutation(); err != nil {
 			return nil, 0, err
@@ -5727,7 +5737,8 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		})
 
 		var commitSeq uint64
-		if childInode.Row.GetNlink() == 0 && !v.hasOpenHandlesLocked(childInodeID) {
+		deletingChild := childInode.Row.GetNlink() == 0 && !v.hasOpenHandlesLocked(childInodeID)
+		if deletingChild {
 			if err := v.deleteInodeRowsLocked(ctx, tx, childInodeID); err != nil {
 				return nil, 0, err
 			}
@@ -5750,6 +5761,9 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
+		if deletingChild {
+			deletedInode = childInodeID
+		}
 
 		waitFn := v.makeMetadataWaitFn(commitSeq)
 
@@ -5765,6 +5779,11 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	}()
 	if err != nil {
 		return 0, err
+	}
+	if deletedInode != 0 {
+		v.stagingMu.Lock()
+		v.dropStagedChunksLocked(deletedInode)
+		v.stagingMu.Unlock()
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
@@ -5882,6 +5901,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		return nil, fmt.Errorf("name exceeds maximum length: %w", syscall.ENAMETOOLONG)
 	}
 
+	var deletedTargetInode uint64
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
 		if err := v.rejectMutation(); err != nil {
 			return nil, nil, err
@@ -6075,6 +6095,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		}
 
 		var commitSeq uint64
+		var deletingTargetFile uint64
 		if _, err := tx.Delete(ctx, &pb.DirEntry{ParentIno: proto.Uint64(oldParentInodeID), Name: proto.String(oldName)}); err != nil {
 			return nil, nil, fmt.Errorf("failed to log old dir entry deletion: %w", err)
 		}
@@ -6102,6 +6123,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 								return nil, nil, fmt.Errorf("failed to log chunk deletion for target inode %d: %w", targetInodeID, err)
 							}
 						}
+						deletingTargetFile = targetInodeID
 					}
 				} else {
 					if _, err := tx.Update(ctx, targetInode.Row); err != nil {
@@ -6138,6 +6160,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to commit rename transaction: %w", err)
 		}
+		deletedTargetInode = deletingTargetFile
 
 		waitFn := v.makeMetadataWaitFn(commitSeq)
 
@@ -6157,6 +6180,11 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 	}()
 	if err != nil {
 		return nil, err
+	}
+	if deletedTargetInode != 0 {
+		v.stagingMu.Lock()
+		v.dropStagedChunksLocked(deletedTargetInode)
+		v.stagingMu.Unlock()
 	}
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
@@ -6313,6 +6341,7 @@ func (v *Volume) Open(ctx context.Context, inodeID uint64, flags uint32) (uint64
 // Release closes an open file handle and deletes the inode if it was an unlinked orphan.
 // Takes v.mu for mutations and commits; durability wait is performed outside v.mu.
 func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
+	var deletedInode uint64
 	waitFn, err := func() (func(context.Context) error, error) {
 		v.mu.Lock()
 		defer v.mu.Unlock()
@@ -6351,12 +6380,18 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 			if err != nil {
 				return nil, fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
 			}
+			deletedInode = inodeID
 			return v.makeMetadataWaitFn(commitSeq), nil
 		}
 		return nil, nil
 	}()
 	if err != nil {
 		return err
+	}
+	if deletedInode != 0 {
+		v.stagingMu.Lock()
+		v.dropStagedChunksLocked(deletedInode)
+		v.stagingMu.Unlock()
 	}
 	if waitFn != nil {
 		// When the wait fails, the deletion has already been applied in memory
