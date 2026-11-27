@@ -76,6 +76,8 @@ func (ot *outageTracker) RecordResult(stepName, out string, err error) {
 	}
 	isEIO := strings.Contains(err.Error(), "Input/output error") ||
 		strings.Contains(out, "Input/output error") ||
+		strings.Contains(err.Error(), "I/O error") ||
+		strings.Contains(out, "I/O error") ||
 		strings.Contains(err.Error(), "exit status 5") ||
 		strings.Contains(out, "EIO")
 
@@ -131,6 +133,21 @@ func waitForNewPodReady(t *testing.T, h *Harness, podName, namespace, oldUID str
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("timed out waiting %v for pod %s to be replaced and ready (old UID: %s)", timeout, podName, oldUID)
+}
+
+func waitForObjectStoreUploadCatchUp(ctx context.Context, t *testing.T, h *Harness, podName string, timeout time.Duration) error {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if _, err := runInPodWithDeadline(ctx, h, podName, "post_outage_sync", 30*time.Second, "sync", "/data"); err == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out after %v waiting for uploads to catch up", timeout)
 }
 
 func dumpAllDiagnosticLogs(t *testing.T, h *Harness, pod1, pod2 string) {
@@ -542,7 +559,7 @@ func TestObjectFSTortureE2E(t *testing.T) {
 
 	t.Logf("================================================================================")
 	t.Logf("ObjectFS Torture Test: duration=%v, K=%d/node, masterSeed=%d", duration, kPerNode, masterSeed)
-	t.Logf("Disruptions active: controller kill (~90s), wal-buffer kill (~120s), outage, snapshot")
+	t.Logf("Disruptions active: controller kill (~90s), wal-buffer kill (~120s), controller outage, object store outage (~240s), snapshot")
 	t.Logf("Deferred disruptions: node daemon restart pending #132 (FUSE fd handoff)")
 	t.Logf("================================================================================")
 
@@ -742,8 +759,8 @@ spec:
 			churnCmd := fmt.Sprintf(`
 set -e
 mkdir -p /data/churn/dir_%d/sub
-dd if=/dev/urandom of=/data/churn/dir_%d/file1.bin bs=1k count=4 conv=fsync 2>/dev/null
-dd if=/dev/urandom of=/data/churn/dir_%d/sub/file2.bin bs=2k count=2 conv=fsync 2>/dev/null
+dd if=/dev/urandom of=/data/churn/dir_%d/file1.bin bs=1k count=4 conv=fsync status=none
+dd if=/dev/urandom of=/data/churn/dir_%d/sub/file2.bin bs=2k count=2 conv=fsync status=none
 ln -s file1.bin /data/churn/dir_%d/sym1 2>/dev/null || true
 mv /data/churn/dir_%d/sub/file2.bin /data/churn/dir_%d/sub/file2_renamed.bin
 sync /data/churn/dir_%d/sub/file2_renamed.bin
@@ -817,7 +834,7 @@ sync /data/churn
 			stepName := fmt.Sprintf("writer_ckpt_%d", ckptNum)
 			writeCmd := fmt.Sprintf(`
 set -e
-dd if=/dev/urandom of=%s bs=4k count=4 conv=fsync 2>/dev/null
+dd if=/dev/urandom of=%s bs=4k count=4 conv=fsync status=none
 sha256sum %s | awk '{print $1}'
 `, fullPath, fullPath)
 
@@ -871,7 +888,7 @@ sha256sum %s | awk '{print $1}'
 
 			for _, entry := range toCheck {
 				stepName := fmt.Sprintf("reader_check_%s", entry.path)
-				readCmd := fmt.Sprintf("dd if=/data/%s of=/tmp/reader.bin bs=4k 2>/dev/null && sha256sum /tmp/reader.bin | awk '{print $1}'", entry.path)
+				readCmd := fmt.Sprintf("dd if=/data/%s of=/tmp/reader.bin bs=4k status=none && sha256sum /tmp/reader.bin | awk '{print $1}'", entry.path)
 				out, err := runInPodWithDeadline(testCtx, h, pod2Name, stepName, stepDeadline, "/bin/sh", "-c", readCmd)
 				tracker.RecordResult(stepName, out, err)
 				if err != nil {
@@ -907,8 +924,8 @@ sha256sum %s | awk '{print $1}'
 				verifyCmd := fmt.Sprintf(`
 set -e
 [ -d %s ]
-h1=$(sha256sum %s 2>/dev/null | awk '{print $1}')
-h2=$(sha256sum %s 2>/dev/null | awk '{print $1}')
+h1=$(sha256sum %s) && h1=${h1%% *}
+h2=$(sha256sum %s) && h2=${h2%% *}
 echo "$h1 $h2"
 `, checkDir, f1Path, f2Path)
 
@@ -948,8 +965,24 @@ echo "$h1 $h2"
 
 	streamCount := countDistinctControllerReplicationStreams(h)
 
+	const (
+		// Keep the object store outage well under stepDeadline (60s): when
+		// fsync pauses and retries during an object store outage instead of
+		// failing immediately, a writer step that starts at the onset of the
+		// outage can be paused for the full outage duration. 30s leaves
+		// headroom under stepDeadline with either behaviour so Invariant 1
+		// does not report a false hang.
+		objectStoreOutageDuration = 30 * time.Second
+		objectStoreOutageInterval = 240 * time.Second
+	)
+
 	nextWalBufferKill := runStart.Add(45 * time.Second) // offset from controller kills
 	nextControllerKill := runStart.Add(120 * time.Second)
+	objectStoreOutageInitialDelay := 165 * time.Second
+	if maxDelay := duration / 4; maxDelay < objectStoreOutageInitialDelay {
+		objectStoreOutageInitialDelay = maxDelay
+	}
+	nextObjectStoreOutage := runStart.Add(objectStoreOutageInitialDelay)
 	outageTriggerTime := runStart.Add(duration / 3)
 	snapshotTriggerTime := runStart.Add(duration / 2)
 	outageDone := false
@@ -967,6 +1000,52 @@ disruptionLoop:
 			if testCtx.Err() != nil {
 				break disruptionLoop
 			}
+
+			// Disruption 4: Object store outage (fakes3 503).
+			// Checked before the higher-frequency controller/wal-buffer kills so 60s pushbacks
+			// after other disruptions cannot starve this rarer disruption.
+			// Counts as an outage window for Invariant 4 because Fsync synchronously uploads
+			// sealed packs to object storage and returns EIO while the store is unavailable.
+			if now.After(nextObjectStoreOutage) && time.Until(runDeadline) > objectStoreOutageDuration+30*time.Second {
+				t.Logf("[%s] DISRUPTION: Starting %v object store outage via fakes3 (starting outage window)", time.Now().Format("15:04:05"), objectStoreOutageDuration)
+				tracker.StartOutage()
+				outageURL := fmt.Sprintf("http://fakes3.default.svc:9000/_fakes3/outage?duration=%s", objectStoreOutageDuration)
+				out, err := runInPodWithDeadline(testCtx, h, pod1Name, "start_fakes3_outage", 30*time.Second, "wget", "-q", "-O", "-", "--post-data=", outageURL)
+				if err != nil {
+					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
+					t.Fatalf("Failed to start fakes3 outage: %v (out: %s)", err, strings.TrimSpace(out))
+				}
+				t.Logf("[%s] DISRUPTION: fakes3 outage active (remaining: %s)", time.Now().Format("15:04:05"), strings.TrimSpace(out))
+
+				outageTimer := time.NewTimer(objectStoreOutageDuration)
+				select {
+				case <-testCtx.Done():
+					outageTimer.Stop()
+					break disruptionLoop
+				case <-outageTimer.C:
+				}
+				t.Logf("[%s] DISRUPTION: Object store outage ended; waiting for uploads to catch up", time.Now().Format("15:04:05"))
+
+				if err := waitForObjectStoreUploadCatchUp(testCtx, t, h, pod1Name, 2*time.Minute); err != nil {
+					if testCtx.Err() != nil {
+						break disruptionLoop
+					}
+					dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
+					t.Fatalf("Uploads failed to catch up after object store outage: %v", err)
+				}
+				tracker.EndOutage(5 * time.Second)
+				t.Logf("[%s] DISRUPTION: Object store outage recovery and upload catch-up complete (5s recovery window bounded)", time.Now().Format("15:04:05"))
+
+				nextObjectStoreOutage = time.Now().Add(objectStoreOutageInterval)
+				if time.Until(nextControllerKill) < 60*time.Second {
+					nextControllerKill = time.Now().Add(60 * time.Second)
+				}
+				if time.Until(nextWalBufferKill) < 60*time.Second {
+					nextWalBufferKill = time.Now().Add(60 * time.Second)
+				}
+				continue
+			}
+
 			// Disruption 1: Force-kill objectfs-controller-0 (~90s)
 			if now.After(nextControllerKill) {
 				t.Logf("[%s] DISRUPTION: Force-killing objectfs-controller-0", now.Format("15:04:05"))
@@ -985,6 +1064,10 @@ disruptionLoop:
 				if time.Until(nextWalBufferKill) < 60*time.Second {
 					nextWalBufferKill = time.Now().Add(60 * time.Second)
 				}
+				if time.Until(nextObjectStoreOutage) < 60*time.Second {
+					nextObjectStoreOutage = time.Now().Add(60 * time.Second)
+				}
+				continue
 			}
 
 			// Disruption 2: Force-kill wal-buffer-0 (~120s, offset)
@@ -1008,6 +1091,10 @@ disruptionLoop:
 				if time.Until(nextControllerKill) < 60*time.Second {
 					nextControllerKill = time.Now().Add(60 * time.Second)
 				}
+				if time.Until(nextObjectStoreOutage) < 60*time.Second {
+					nextObjectStoreOutage = time.Now().Add(60 * time.Second)
+				}
+				continue
 			}
 
 			// Disruption 3: Outage (scale controller to 0 for >30s metadata timeout once per run)
@@ -1032,9 +1119,13 @@ disruptionLoop:
 				if time.Until(nextWalBufferKill) < 60*time.Second {
 					nextWalBufferKill = time.Now().Add(60 * time.Second)
 				}
+				if time.Until(nextObjectStoreOutage) < 60*time.Second {
+					nextObjectStoreOutage = time.Now().Add(60 * time.Second)
+				}
+				continue
 			}
 
-			// Disruption 4: Mid-run snapshot
+			// Disruption 5: Mid-run snapshot
 			if !snapshotDone && now.After(snapshotTriggerTime) {
 				snapshotDone = true
 				t.Logf("[%s] DISRUPTION: Creating mid-run snapshot via objectfsctl", now.Format("15:04:05"))
@@ -1179,7 +1270,7 @@ spec:
 
 	durabilityChecked := 0
 	for relPath, expectedHash := range manifestCopy {
-		checkCmd := fmt.Sprintf("dd if=/data/%s of=/tmp/durability.bin bs=4k 2>/dev/null && sha256sum /tmp/durability.bin | awk '{print $1}'", relPath)
+		checkCmd := fmt.Sprintf("dd if=/data/%s of=/tmp/durability.bin bs=4k status=none && sha256sum /tmp/durability.bin | awk '{print $1}'", relPath)
 		out, err := runInPodWithDeadline(testCtx, h, verifierPodName, "durability_verify_"+relPath, stepDeadline, "/bin/sh", "-c", checkCmd)
 		if err != nil {
 			dumpAllDiagnosticLogs(t, h, pod1Name, pod2Name)
