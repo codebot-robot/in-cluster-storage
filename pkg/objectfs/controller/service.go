@@ -1206,6 +1206,9 @@ func (s *Server) ReadFile(ctx context.Context, req *pb.ReadFileRequest) (*pb.Rea
 	}
 	data, totalSize, redirectURL, err := vol.ReadFile(ctx, req.GetInode(), req.GetOffset(), req.GetSize())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.ReadFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 
