@@ -225,6 +225,9 @@ func TestShutdownTimeoutFlag(t *testing.T) {
 	if options.ShutdownTimeout != 20*time.Second {
 		t.Errorf("options.ShutdownTimeout = %v, want 20s", options.ShutdownTimeout)
 	}
+	if !strings.Contains(shutdownFlag.Usage, "attempt") || !strings.Contains(shutdownFlag.Usage, "retry") {
+		t.Errorf("usage = %q, want per-attempt retry description", shutdownFlag.Usage)
+	}
 }
 
 func TestOptionsParseAndValidate(t *testing.T) {

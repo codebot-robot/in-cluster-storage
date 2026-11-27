@@ -360,7 +360,7 @@ func TestPackCacheEviction_CloseAndShutdownDoNotDeadlockWithPendingWake(t *testi
 
 		shutdownDone := make(chan error, 1)
 		go func() {
-			shutdownDone <- server.Shutdown(t.Context())
+			shutdownDone <- server.Shutdown(t.Context(), 5*time.Second, time.Second)
 		}()
 
 		select {

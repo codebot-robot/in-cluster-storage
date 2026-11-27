@@ -975,7 +975,7 @@ func TestStagingDrain_LoopStopsOnCloseAndShutdown(t *testing.T) {
 		// Verify loop is running by waiting for a pass.
 		wakeAndAwaitPass(t, server)
 
-		if err := server.Shutdown(ctx); err != nil {
+		if err := server.Shutdown(ctx, 5*time.Second, time.Second); err != nil {
 			t.Fatalf("server.Shutdown failed: %v", err)
 		}
 
