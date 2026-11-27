@@ -201,7 +201,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()
 
-				dirAttr, err := vol.Mkdir(ctx, 1, "dir", 0755, 0, 0)
+				dirAttr, err := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "dir", Mode: 0755})
 				if err != nil {
 					b.Fatalf("Mkdir failed: %v", err)
 				}
@@ -231,7 +231,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()
 
-				dirAttr, err := vol.Mkdir(ctx, 1, "dir1k", 0755, 0, 0)
+				dirAttr, err := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "dir1k", Mode: 0755})
 				if err != nil {
 					b.Fatalf("Mkdir failed: %v", err)
 				}
@@ -261,7 +261,7 @@ func BenchmarkMetadataStoreOperations(b *testing.B) {
 				_ = vol.LoadFromBackend(ctx)
 				defer vol.Close()
 
-				dirAttr, err := vol.Mkdir(ctx, 1, "dir10k", 0755, 0, 0)
+				dirAttr, err := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "dir10k", Mode: 0755})
 				if err != nil {
 					b.Fatalf("Mkdir failed: %v", err)
 				}
@@ -423,13 +423,13 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		_ = vol.LoadFromBackend(ctx)
 
 		// Empty directory addition
-		emptyDir, _ := vol.Mkdir(ctx, 1, "empty_dir", 0755, 0, 0)
+		emptyDir, _ := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "empty_dir", Mode: 0755})
 		start := time.Now()
 		_, _ = vol.CreateFile(ctx, emptyDir.GetInode().GetIno(), "first_entry.txt", 0644, []byte("x"), 0, 0, 0)
 		emptyDur := time.Since(start)
 
 		// Populate large directory with 10,000 entries
-		largeDir, _ := vol.Mkdir(ctx, 1, "large_dir", 0755, 0, 0)
+		largeDir, _ := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "large_dir", Mode: 0755})
 		for i := 0; i < 10000; i++ {
 			_, _ = vol.CreateFile(ctx, largeDir.GetInode().GetIno(), fmt.Sprintf("f%d.txt", i), 0644, []byte("x"), 0, 0, 0)
 		}
@@ -467,7 +467,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		var fileInos []uint64
 		// Create 15,000 files (exceeds legacy 10,000 cache capacity)
 		for d := 0; d < 150; d++ {
-			dirAttr, _ := vol.Mkdir(ctx, 1, fmt.Sprintf("dir_%d", d), 0755, 0, 0)
+			dirAttr, _ := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: fmt.Sprintf("dir_%d", d), Mode: 0755})
 			for f := 0; f < 100; f++ {
 				fAttr, _ := vol.CreateFile(ctx, dirAttr.GetInode().GetIno(), fmt.Sprintf("file_%d.txt", f), 0644, []byte("val"), 0, 0, 0)
 				fileInos = append(fileInos, fAttr.GetInode().GetIno())
@@ -649,7 +649,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		const opCount = 200
 
 		// --- A. Create Operations ---
-		dirAttr, _ := vol.Mkdir(ctx, 1, "hot_dir", 0755, 0, 0)
+		dirAttr, _ := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "hot_dir", Mode: 0755})
 		_ = vol.FlushOverlay(ctx)
 		streamBeforeCreate := getStreamBytes(ctx, vol)
 		_, walBeforeCreate := getDiskFootprint(localDir)
@@ -918,7 +918,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 			var dirInos [smokeDirs]uint64
 			for d := 0; d < smokeDirs; d++ {
-				dAttr, _ := vol.Mkdir(ctx, 1, fmt.Sprintf("d_%d", d), 0755, 0, 0)
+				dAttr, _ := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: fmt.Sprintf("d_%d", d), Mode: 0755})
 				dirInos[d] = dAttr.GetInode().GetIno()
 			}
 			for d := 0; d < smokeDirs; d++ {
@@ -960,7 +960,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 		var dirInos [numDirs]uint64
 		for d := 0; d < numDirs; d++ {
-			dAttr, _ := vol.Mkdir(ctx, 1, fmt.Sprintf("d_%d", d), 0755, 0, 0)
+			dAttr, _ := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: fmt.Sprintf("d_%d", d), Mode: 0755})
 			dirInos[d] = dAttr.GetInode().GetIno()
 		}
 

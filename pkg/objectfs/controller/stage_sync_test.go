@@ -2773,7 +2773,9 @@ func TestVolume_Stop_RejectsMutations(t *testing.T) {
 	}
 
 	for name, call := range map[string]func() error{
-		"Mkdir":              func() error { return retErr(volume.Mkdir(ctx, 1, "d", 0755, 0, 0)) },
+		"Mkdir": func() error {
+			return retErr(volume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "d", Mode: 0755}))
+		},
 		"CreateFile":         func() error { return retErr(volume.CreateFile(ctx, 1, "f", 0644, nil, 0, 0, 0)) },
 		"WriteFileWithEpoch": func() error { return retErr5(volume.WriteFileWithEpoch(ctx, inodeID, 0, nil, 0)) },
 		"TruncateFile":       func() error { return retErr(volume.TruncateFile(ctx, inodeID, 0)) },
@@ -2781,12 +2783,16 @@ func TestVolume_Stop_RejectsMutations(t *testing.T) {
 		"Unlink":             func() error { return retErr(volume.Unlink(ctx, 1, "test.bin")) },
 		"Rmdir":              func() error { return retErr(volume.Rmdir(ctx, 1, "d")) },
 		"Rename":             func() error { return retErr(volume.Rename(ctx, 1, "a", 1, "b")) },
-		"Symlink":            func() error { return retErr(volume.Symlink(ctx, 1, "s", "t", 0, 0)) },
-		"Link":               func() error { return retErr(volume.Link(ctx, 1, 1, "l")) },
-		"SetAttr":            func() error { return retErr(volume.SetAttr(ctx, 1, nil, nil, nil, nil, false, nil, false, nil, false)) },
-		"SetXAttr":           func() error { return volume.SetXAttr(ctx, 1, "k", nil, 0) },
-		"RemoveXAttr":        func() error { return volume.RemoveXAttr(ctx, 1, "k") },
-		"FsyncWithEpoch":     func() error { return retErr3(volume.FsyncWithEpoch(ctx, 1, true, 0, 0)) },
+		"Symlink": func() error {
+			return retErr(volume.Symlink(ctx, &pb.SymlinkRequest{ParentInode: 1, Name: "s", Target: "t"}))
+		},
+		"Link": func() error {
+			return retErr(volume.Link(ctx, &pb.LinkRequest{OldInode: 1, NewParentInode: 1, NewName: "l"}))
+		},
+		"SetAttr":        func() error { return retErr(volume.SetAttr(ctx, 1, nil, nil, nil, nil, false, nil, false, nil, false)) },
+		"SetXAttr":       func() error { return volume.SetXAttr(ctx, 1, "k", nil, 0) },
+		"RemoveXAttr":    func() error { return volume.RemoveXAttr(ctx, 1, "k") },
+		"FsyncWithEpoch": func() error { return retErr3(volume.FsyncWithEpoch(ctx, 1, true, 0, 0)) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := call(); !errors.Is(err, ErrVolumeStopping) {

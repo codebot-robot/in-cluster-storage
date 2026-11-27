@@ -1216,7 +1216,7 @@ func (s *Server) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MkdirResp
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	attr, err := vol.Mkdir(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetUid(), req.GetGid())
+	attr, err := vol.Mkdir(ctx, req)
 	if err != nil {
 		if rpcErr := checkRPCErr(err); rpcErr != nil {
 			return nil, rpcErr
@@ -1407,7 +1407,7 @@ func (s *Server) Symlink(ctx context.Context, req *pb.SymlinkRequest) (*pb.Symli
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	attr, err := vol.Symlink(ctx, req.GetParentInode(), req.GetName(), req.GetTarget(), req.GetUid(), req.GetGid())
+	attr, err := vol.Symlink(ctx, req)
 	if err != nil {
 		if rpcErr := checkRPCErr(err); rpcErr != nil {
 			return nil, rpcErr
@@ -1440,7 +1440,7 @@ func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkRespons
 	if err != nil {
 		return nil, volInitError(err)
 	}
-	attr, err := vol.Link(ctx, req.GetOldInode(), req.GetNewParentInode(), req.GetNewName())
+	attr, err := vol.Link(ctx, req)
 	if err != nil {
 		if rpcErr := checkRPCErr(err); rpcErr != nil {
 			return nil, rpcErr

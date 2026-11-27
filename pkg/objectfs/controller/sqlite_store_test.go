@@ -94,7 +94,7 @@ func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	}
 
 	// 2. Mkdir
-	dirAttr, err := vol.Mkdir(ctx, 1, "mydir", 0755, 1000, 1000)
+	dirAttr, err := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "mydir", Mode: 0755, Uid: 1000, Gid: 1000})
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestSQLiteMetadataStoreRecoveryFromLocalDB(t *testing.T) {
 		t.Fatalf("LoadFromBackend failed: %v", err)
 	}
 
-	dirAttr, err := vol1.Mkdir(ctx, 1, "data", 0755, 0, 0)
+	dirAttr, err := vol1.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "data", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestSQLiteMetadataStoreRecoveryFromPublishedSnapshot(t *testing.T) {
 		t.Fatalf("LoadFromBackend failed: %v", err)
 	}
 
-	dirAttr, err := vol1.Mkdir(ctx, 1, "snapdir", 0755, 0, 0)
+	dirAttr, err := vol1.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "snapdir", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestSQLiteMetadataStoreCrashRecoveryWithStream(t *testing.T) {
 	// Perform 10 operations
 	for i := 0; i < 10; i++ {
 		name := fmt.Sprintf("dir_%d", i)
-		_, err := vol1.Mkdir(ctx, 1, name, 0755, 0, 0)
+		_, err := vol1.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: name, Mode: 0755})
 		if err != nil {
 			t.Fatalf("Mkdir %s failed: %v", name, err)
 		}
@@ -732,7 +732,7 @@ func TestSQLiteAsyncApplierOverlayCommitAndReadsDuringLag(t *testing.T) {
 	}
 
 	// 1. Create directory and files while SQLite applier is stalled by fault hook
-	dirAttr, err := vol.Mkdir(ctx, 1, "testdir", 0755, 1000, 1000)
+	dirAttr, err := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "testdir", Mode: 0755, Uid: 1000, Gid: 1000})
 	if err != nil {
 		t.Fatalf("Mkdir failed despite log append commit: %v", err)
 	}
@@ -1346,7 +1346,7 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 	}
 
 	// 1. Create directory and files
-	dirAttr, err := vol.Mkdir(ctx, 1, "testdir", 0755, 0, 0)
+	dirAttr, err := vol.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "testdir", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir failed: %v", err)
 	}

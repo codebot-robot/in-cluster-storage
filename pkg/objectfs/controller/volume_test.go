@@ -307,7 +307,7 @@ func TestConcurrentGetAttrLookup_ColdVolume_NoDataRace(t *testing.T) {
 	var directoryNames []string
 	for index := 0; index < 4; index++ {
 		directoryName := fmt.Sprintf("test_dir_%d", index)
-		entryAttribute, err := initialVolume.Mkdir(ctx, 1, directoryName, 0755, 0, 0)
+		entryAttribute, err := initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: directoryName, Mode: 0755})
 		if err != nil {
 			t.Fatalf("Mkdir %s failed: %v", directoryName, err)
 		}
@@ -386,19 +386,19 @@ func TestRename_DirectoryIntoOwnSubtree_ColdVolumeFailsWithEINVAL(t *testing.T) 
 		t.Fatalf("LoadFromBackend failed on initial volume: %v", err)
 	}
 
-	entryAttributeA, err := initialVolume.Mkdir(ctx, 1, "a", 0755, 0, 0)
+	entryAttributeA, err := initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "a", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir a failed: %v", err)
 	}
 	directoryInodeIDA := entryAttributeA.GetInode().GetIno()
 
-	entryAttributeB, err := initialVolume.Mkdir(ctx, directoryInodeIDA, "b", 0755, 0, 0)
+	entryAttributeB, err := initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: directoryInodeIDA, Name: "b", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir b failed: %v", err)
 	}
 	directoryInodeIDB := entryAttributeB.GetInode().GetIno()
 
-	entryAttributeC, err := initialVolume.Mkdir(ctx, directoryInodeIDB, "c", 0755, 0, 0)
+	entryAttributeC, err := initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: directoryInodeIDB, Name: "c", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir c failed: %v", err)
 	}
@@ -449,19 +449,19 @@ func TestRename_DirectoryAncestryCycle_FailsWithELOOP(t *testing.T) {
 		t.Fatalf("LoadFromBackend failed on initial volume: %v", err)
 	}
 
-	entryAttributeA, err := initialVolume.Mkdir(ctx, 1, "dir_a", 0755, 0, 0)
+	entryAttributeA, err := initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "dir_a", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir dir_a failed: %v", err)
 	}
 	directoryInodeIDA := entryAttributeA.GetInode().GetIno()
 
-	entryAttributeB, err := initialVolume.Mkdir(ctx, 1, "dir_b", 0755, 0, 0)
+	entryAttributeB, err := initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "dir_b", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir dir_b failed: %v", err)
 	}
 	directoryInodeIDB := entryAttributeB.GetInode().GetIno()
 
-	_, err = initialVolume.Mkdir(ctx, 1, "dir_target", 0755, 0, 0)
+	_, err = initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "dir_target", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir dir_target failed: %v", err)
 	}
@@ -570,20 +570,20 @@ func TestRename_DirectoryMovedColdVolume_LookupDotDotReturnsNewParent(t *testing
 	}
 
 	// 1. Create parent1 and parent2 under root (inode 1).
-	parent1Attr, err := initialVolume.Mkdir(ctx, 1, "parent1", 0755, 0, 0)
+	parent1Attr, err := initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "parent1", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir parent1 failed: %v", err)
 	}
 	parent1Ino := parent1Attr.GetInode().GetIno()
 
-	parent2Attr, err := initialVolume.Mkdir(ctx, 1, "parent2", 0755, 0, 0)
+	parent2Attr, err := initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: 1, Name: "parent2", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir parent2 failed: %v", err)
 	}
 	parent2Ino := parent2Attr.GetInode().GetIno()
 
 	// 2. Create child_dir under parent1.
-	childAttr, err := initialVolume.Mkdir(ctx, parent1Ino, "child_dir", 0755, 0, 0)
+	childAttr, err := initialVolume.Mkdir(ctx, &pb.MkdirRequest{ParentInode: parent1Ino, Name: "child_dir", Mode: 0755})
 	if err != nil {
 		t.Fatalf("Mkdir child_dir failed: %v", err)
 	}
