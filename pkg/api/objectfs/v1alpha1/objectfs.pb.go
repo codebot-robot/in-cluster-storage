@@ -5966,12 +5966,14 @@ func (x *Inode) GetXattrCount() uint32 {
 }
 
 type DirEntry struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ParentIno     *uint64                `protobuf:"varint,1,opt,name=parent_ino,json=parentIno,proto3,oneof" json:"parent_ino,omitempty"`
-	Name          *string                `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
-	Ino           uint64                 `protobuf:"varint,3,opt,name=ino,proto3" json:"ino,omitempty"`
-	IsDir         bool                   `protobuf:"varint,4,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
-	Mode          uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ParentIno *uint64                `protobuf:"varint,1,opt,name=parent_ino,json=parentIno,proto3,oneof" json:"parent_ino,omitempty"`
+	Name      *string                `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	Ino       uint64                 `protobuf:"varint,3,opt,name=ino,proto3" json:"ino,omitempty"`
+	IsDir     bool                   `protobuf:"varint,4,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
+	Mode      uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
+	// Idempotency key of the creating request; set only by creates (Mkdir, Symlink, Link, special-file CreateFile).
+	RequestId     []byte `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6039,6 +6041,13 @@ func (x *DirEntry) GetMode() uint32 {
 		return x.Mode
 	}
 	return 0
+}
+
+func (x *DirEntry) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type Content struct {
@@ -6753,14 +6762,16 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"xattrCount\x88\x01\x01B\x06\n" +
 	"\x04_inoB\r\n" +
 	"\v_parent_inoB\x0e\n" +
-	"\f_xattr_count\"\x9c\x01\n" +
+	"\f_xattr_count\"\xbb\x01\n" +
 	"\bDirEntry\x12\"\n" +
 	"\n" +
 	"parent_ino\x18\x01 \x01(\x04H\x00R\tparentIno\x88\x01\x01\x12\x17\n" +
 	"\x04name\x18\x02 \x01(\tH\x01R\x04name\x88\x01\x01\x12\x10\n" +
 	"\x03ino\x18\x03 \x01(\x04R\x03ino\x12\x15\n" +
 	"\x06is_dir\x18\x04 \x01(\bR\x05isDir\x12\x12\n" +
-	"\x04mode\x18\x05 \x01(\rR\x04modeB\r\n" +
+	"\x04mode\x18\x05 \x01(\rR\x04mode\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x06 \x01(\fR\trequestIdB\r\n" +
 	"\v_parent_inoB\a\n" +
 	"\x05_name\"E\n" +
 	"\aContent\x12\x1b\n" +

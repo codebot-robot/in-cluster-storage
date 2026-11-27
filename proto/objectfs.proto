@@ -714,6 +714,8 @@ message DirEntry {
   uint64 ino = 3;
   bool is_dir = 4;
   uint32 mode = 5;
+  // Idempotency key of the creating request; set only by creates (Mkdir, Symlink, Link, special-file CreateFile).
+  bytes request_id = 6;
 }
 
 message Content {
