@@ -478,3 +478,42 @@ goroutine 42 [sleep]:
 		})
 	}
 }
+
+func TestOutageTracker_RecordResult(t *testing.T) {
+	cases := []struct {
+		name    string
+		out     string
+		err     error
+		wantEIO int
+	}{
+		{
+			name:    "musl I/O error counted",
+			out:     "dd: /data/ckpt/f_1.bin: I/O error\ncommand terminated with exit code 1",
+			err:     fmt.Errorf("exit status 1"),
+			wantEIO: 1,
+		},
+		{
+			name:    "non-EIO error ignored",
+			out:     "sha256sum: can't open '/data/churn/dir_1/file1.bin': No such file or directory",
+			err:     fmt.Errorf("exit status 1"),
+			wantEIO: 0,
+		},
+		{
+			name:    "nil error ignored",
+			out:     "I/O error",
+			err:     nil,
+			wantEIO: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var tracker outageTracker
+			tracker.StartOutage()
+			tracker.RecordResult("step", tc.out, tc.err)
+			if tracker.eioDuringOutage != tc.wantEIO || tracker.eioOutsideOutage != 0 {
+				t.Fatalf("got (during=%d, outside=%d), want (during=%d, outside=0)", tracker.eioDuringOutage, tracker.eioOutsideOutage, tc.wantEIO)
+			}
+		})
+	}
+}
