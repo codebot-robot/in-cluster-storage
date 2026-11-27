@@ -273,6 +273,9 @@ type Server struct {
 	blobStore   *blob.Store
 	broadcaster *EventBroadcaster
 
+	shuttingDownOnce sync.Once
+	shuttingDown     chan struct{}
+
 	// wal holds the WAL settings and the connection built from them.
 	wal serverWAL
 	// metadata groups configuration options for volume metadata indexing, caching, and views.
@@ -575,6 +578,7 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		backend = NewMemoryBackend()
 	}
 	s := &Server{
+		shuttingDown:      make(chan struct{}),
 		volumes:           make(map[string]*Volume),
 		backend:           backend,
 		blobStore:         blob.NewStore(backend, 0),
@@ -853,10 +857,23 @@ func (s *Server) stopVolumes(ctx context.Context, volumes []*Volume) []error {
 	return stopErrors
 }
 
+// BeginShutdown marks the server as shutting down so open WatchVolume streams
+// end promptly and new WatchVolume requests are refused with Unavailable.
+// Call this before grpc.Server.GracefulStop so GracefulStop can return once
+// in-flight unary calls finish. Safe to call more than once.
+func (s *Server) BeginShutdown() {
+	s.shuttingDownOnce.Do(func() {
+		if s.shuttingDown != nil {
+			close(s.shuttingDown)
+		}
+	})
+}
+
 // Shutdown gracefully stops periodic flushing, drains all volumes concurrently
 // under ctx with Volume.Stop, reports all drain errors joined together, and then
 // releases everything by calling Close.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.BeginShutdown()
 	var errs []error
 	if err := s.StopPeriodicFlush(); err != nil {
 		errs = append(errs, err)
@@ -1493,6 +1510,12 @@ func (s *Server) Broadcaster() *EventBroadcaster {
 }
 
 func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSController_WatchVolumeServer) error {
+	select {
+	case <-s.shuttingDown:
+		return status.Error(codes.Unavailable, "server shutting down")
+	default:
+	}
+
 	if !isValidVolumeID(req.GetVolumeId()) {
 		return status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", req.GetVolumeId())
 	}
@@ -1538,6 +1561,8 @@ func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSContr
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-s.shuttingDown:
+			return status.Error(codes.Unavailable, "server shutting down")
 		case event, ok := <-ch:
 			if !ok {
 				return nil

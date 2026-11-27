@@ -423,6 +423,7 @@ func run(options Options) error {
 	go func() {
 		<-sigChan
 		scoped.Log(ctx).Info("Shutting down ObjectFS controller...")
+		server.BeginShutdown()
 		if csiServer != nil {
 			csiServer.GracefulStop()
 		}
