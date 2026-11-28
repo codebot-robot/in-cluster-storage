@@ -7546,6 +7546,16 @@ func (c *captureRequestIDClient) CreateFile(_ context.Context, request *pb.Creat
 	return &pb.CreateFileResponse{Error: int32(syscall.EIO)}, nil
 }
 
+func (c *captureRequestIDClient) Unlink(_ context.Context, request *pb.UnlinkRequest, _ ...grpc.CallOption) (*pb.UnlinkResponse, error) {
+	c.keys = append(c.keys, request.GetRequestId())
+	return &pb.UnlinkResponse{Error: int32(syscall.EIO)}, nil
+}
+
+func (c *captureRequestIDClient) Rmdir(_ context.Context, request *pb.RmdirRequest, _ ...grpc.CallOption) (*pb.RmdirResponse, error) {
+	c.keys = append(c.keys, request.GetRequestId())
+	return &pb.RmdirResponse{Error: int32(syscall.EIO)}, nil
+}
+
 func TestFUSECreateOperationsSetDistinctRequestIDs(t *testing.T) {
 	capture := &captureRequestIDClient{}
 	rawFS := NewObjectFS(capture, "vol-1", pb.WriteMode_FSYNC, nil)
@@ -7575,5 +7585,30 @@ func TestFUSECreateOperationsSetDistinctRequestIDs(t *testing.T) {
 	rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0644}, "reg", &createOut)
 	if len(capture.keys) != 6 || len(capture.keys[5]) != 0 {
 		t.Fatalf("Create request ID: got %x, want empty", capture.keys[len(capture.keys)-1])
+	}
+}
+
+func TestFUSERemovalOperationsSetDistinctRequestIDs(t *testing.T) {
+	capture := &captureRequestIDClient{}
+	rawFS := NewObjectFS(capture, "vol-1", pb.WriteMode_FSYNC, nil)
+
+	header := &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}
+	rawFS.Unlink(nil, header, "a")
+	rawFS.Unlink(nil, header, "b")
+	rawFS.Rmdir(nil, header, "d1")
+	rawFS.Rmdir(nil, header, "d2")
+
+	if len(capture.keys) != 4 {
+		t.Fatalf("got %d captured request IDs, want 4", len(capture.keys))
+	}
+	for i, key := range capture.keys {
+		if len(key) != 16 {
+			t.Fatalf("call %d: got %d-byte request ID, want 16", i, len(key))
+		}
+		for j := range i {
+			if bytes.Equal(capture.keys[j], key) {
+				t.Fatalf("calls %d and %d received identical request ID %x", j, i, key)
+			}
+		}
 	}
 }

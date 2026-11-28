@@ -2782,8 +2782,8 @@ func TestVolume_Stop_RejectsMutations(t *testing.T) {
 		"WriteFileWithEpoch": func() error { return retErr5(volume.WriteFileWithEpoch(ctx, inodeID, 0, nil, 0)) },
 		"TruncateFile":       func() error { return retErr(volume.TruncateFile(ctx, inodeID, 0)) },
 		"PunchHole":          func() error { return retErr(volume.PunchHole(ctx, inodeID, 0, 1, false)) },
-		"Unlink":             func() error { return retErr(volume.Unlink(ctx, 1, "test.bin")) },
-		"Rmdir":              func() error { return retErr(volume.Rmdir(ctx, 1, "d")) },
+		"Unlink":             func() error { return retErr(volume.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "test.bin"})) },
+		"Rmdir":              func() error { return retErr(volume.Rmdir(ctx, &pb.RmdirRequest{ParentInode: 1, Name: "d"})) },
 		"Rename": func() error {
 			return retErr(volume.Rename(ctx, &pb.RenameRequest{OldParentInode: 1, OldName: "a", NewParentInode: 1, NewName: "b"}))
 		},

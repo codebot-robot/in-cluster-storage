@@ -54,7 +54,7 @@ func TestVolumeRelease_GetAttrCompletesWhileDurabilityWaitBlocked(t *testing.T) 
 		t.Fatalf("getOrCreateVolume failed: %v", err)
 	}
 
-	if _, err := volume.Unlink(ctx, 1, "orphan.txt"); err != nil {
+	if _, err := volume.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "orphan.txt"}); err != nil {
 		t.Fatalf("Unlink failed: %v", err)
 	}
 

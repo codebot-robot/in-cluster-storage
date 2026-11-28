@@ -276,6 +276,8 @@ message UnlinkRequest {
   string volume_id = 1;
   uint64 parent_inode = 2;
   string name = 3;
+  // Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+  bytes request_id = 4;
 }
 
 message UnlinkResponse {
@@ -288,6 +290,8 @@ message RmdirRequest {
   string volume_id = 1;
   uint64 parent_inode = 2;
   string name = 3;
+  // Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+  bytes request_id = 4;
 }
 
 message RmdirResponse {
@@ -714,6 +718,8 @@ message Inode {
   uint32 rdev = 17;
   optional uint64 parent_ino = 18;
   optional uint32 xattr_count = 19;
+  // Idempotency key of the most recent unlink or rmdir of an entry in this directory.
+  bytes last_removal_request_id = 20;
 }
 
 message DirEntry {
